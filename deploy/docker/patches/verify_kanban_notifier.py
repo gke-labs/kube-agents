@@ -1026,6 +1026,36 @@ finally:
     else:
         os.environ["SESSION_KV_API_KEY"] = _real_key
 
+# --- 11. The completion message and KAGE_SLACK_UX ------------------------------
+# gateway/slack_ux_reactions.py is installed later in the build than this
+# verifier runs, so here the flag reads as off whatever the environment says:
+# what this proves is the wiring, and that the message is still upstream's.
+# The flag-on text is covered by test_kanban_notifier.py.
+print("completion message:")
+from types import SimpleNamespace  # noqa: E402
+
+check(
+    "the notifier resolved the completion-text import",
+    hasattr(notifier, "_kanban_completion_text"),
+    "the trailer import did not execute",
+)
+check(
+    "the completion message is built by the patch",
+    "return _kanban_completion_text(n.head, n.title, handoff, n.platform_str)"
+    in NOTIFIER_SOURCE,
+)
+_completion_event = SimpleNamespace(payload={"summary": "Both pods are up."})
+for _platform in ("slack", "google_chat"):
+    _completion_card = SimpleNamespace(
+        head="[kage-management] Kanban t_1", title="checkout-gateway",
+        task=None, platform_str=_platform,
+    )
+    check(
+        f"a {_platform} completion is upstream's message with the flag off",
+        notifier._fmt_completed(_completion_event, _completion_card)[0]
+        == "✔ [kage-management] Kanban t_1 done — checkout-gateway\nBoth pods are up.",
+    )
+
 print()
 if FAILURES:
     print(f"verify_kanban_notifier: {len(FAILURES)} check(s) FAILED")

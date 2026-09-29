@@ -25,6 +25,9 @@ from pathlib import Path
 from unittest import mock
 
 from apply_kanban_notifier import (
+    COMPLETION_ANCHOR,
+    COMPLETION_CALL,
+    COMPLETION_PATCHED,
     HANDOFF_ANCHOR,
     HANDOFF_PATCHED,
     INCIDENT_ANCHOR,
@@ -40,7 +43,9 @@ from apply_kanban_notifier import (
 from apply_kanban_progress_lines import SEND_ANCHOR, SEND_PATCHED
 from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
+    COMPLETION_HEAD,
     DEFAULT_WAKE_KINDS,
+    EXPLAINED_KINDS,
     MAX_NOTES,
     NOTE_SIGNATURE,
     RESULT_LIMIT,
@@ -50,7 +55,9 @@ from kanban_notifier import (
     _warned_config,
     actionable_report,
     completion_note,
+    completion_text,
     creator_session_key,
+    explained_by_wake,
     handoff_with_result,
     note_suppressed_completion,
     resolve_wake_kinds,
@@ -1514,6 +1521,135 @@ class StoreIncidentReportTest(unittest.TestCase):
 
 
 # =============================================================================
+# Section 6: quieter delivery on Slack behind KAGE_SLACK_UX
+# =============================================================================
+
+
+class _SlackUxFlag:
+    """Fakes ``gateway.slack_ux_reactions`` in ``sys.modules`` with ``enabled()``.
+
+    ``None`` removes the module, which is an image built without it.
+    """
+
+    def __init__(self, test, on):
+        if on is None:
+            modules = {"gateway": None, "gateway.slack_ux_reactions": None}
+        else:
+            fake = types.SimpleNamespace(enabled=lambda: on)
+            modules = {"gateway": types.SimpleNamespace(slack_ux_reactions=fake),
+                       "gateway.slack_ux_reactions": fake}
+        patcher = mock.patch.dict(sys.modules, modules)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+
+
+HEAD = "[kage-management] @platform Kanban t_1d5250e4"
+TITLE = "checkout-gateway restarts in seeded-reliability"
+HANDOFF = "\nBoth pods have been up for 45h on seeded-a.\n\n---\nReport body"
+
+
+def upstream_completion(head, title, handoff):
+    """Upstream ``_fmt_completed``'s message, spelled as its f-string."""
+    return f"✔ {head} done — {title}{handoff}"
+
+
+class CompletionTextTest(unittest.TestCase):
+    def test_the_head_line_constant_is_upstreams(self):
+        self.assertEqual(COMPLETION_HEAD.format(head=HEAD, title=TITLE),
+                         upstream_completion(HEAD, TITLE, ""))
+
+    def test_flag_off_is_upstreams_message_on_every_platform(self):
+        _SlackUxFlag(self, False)
+        for platform in ("slack", "google_chat", None):
+            for handoff in (HANDOFF, ""):
+                self.assertEqual(
+                    completion_text(HEAD, TITLE, handoff, platform),
+                    upstream_completion(HEAD, TITLE, handoff),
+                )
+
+    def test_an_image_without_the_reactions_module_reads_as_flag_off(self):
+        _SlackUxFlag(self, None)
+        self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "slack"),
+                         upstream_completion(HEAD, TITLE, HANDOFF))
+
+    def test_flag_on_leaves_other_platforms_alone(self):
+        _SlackUxFlag(self, True)
+        self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "google_chat"),
+                         upstream_completion(HEAD, TITLE, HANDOFF))
+
+    def test_flag_on_slack_drops_the_head_line(self):
+        _SlackUxFlag(self, True)
+        text = completion_text(HEAD, TITLE, HANDOFF, "slack")
+        self.assertEqual(text, HANDOFF.strip())
+        self.assertNotIn("done —", text)
+
+    def test_flag_on_slack_keeps_the_head_line_when_there_is_nothing_else(self):
+        _SlackUxFlag(self, True)
+        for handoff in ("", "\n  \n"):
+            self.assertEqual(completion_text(HEAD, TITLE, handoff, "slack"),
+                             upstream_completion(HEAD, TITLE, handoff))
+
+    def test_a_flag_read_that_raises_reads_as_off(self):
+        def boom():
+            raise RuntimeError("env exploded")
+        fake = types.SimpleNamespace(enabled=boom)
+        with mock.patch.dict(sys.modules, {"gateway": types.SimpleNamespace(slack_ux_reactions=fake),
+                                           "gateway.slack_ux_reactions": fake}):
+            self.assertEqual(completion_text(HEAD, TITLE, HANDOFF, "slack"),
+                             upstream_completion(HEAD, TITLE, HANDOFF))
+
+
+def _sub(platform="slack", mode="notify+wake"):
+    sub = {"task_id": "t_e0c1", "platform": platform, "chat_id": "C1", "thread_id": "1.2"}
+    if mode is not None:
+        sub["delivery_mode"] = mode
+    return sub
+
+
+class ExplainedByWakeTest(unittest.TestCase):
+    def test_flag_on_slack_waking_failure_is_explained(self):
+        _SlackUxFlag(self, True)
+        for kind in EXPLAINED_KINDS:
+            self.assertTrue(explained_by_wake(_sub(), kind, loader({"wake_on_events": FAILURE_ONLY})), kind)
+
+    def test_flag_off_never_explains(self):
+        _SlackUxFlag(self, False)
+        for kind in EXPLAINED_KINDS:
+            self.assertFalse(explained_by_wake(_sub(), kind, loader({"wake_on_events": FAILURE_ONLY})), kind)
+
+    def test_other_platforms_are_never_explained(self):
+        _SlackUxFlag(self, True)
+        self.assertFalse(explained_by_wake(_sub("google_chat"), "gave_up", loader({"wake_on_events": FAILURE_ONLY})))
+
+    def test_completion_and_review_kinds_always_post(self):
+        _SlackUxFlag(self, True)
+        for kind in ("completed",) + UNDELIVERED_OUTCOME_KINDS:
+            self.assertFalse(explained_by_wake(_sub(), kind, loader({})), kind)
+
+    def test_a_subscription_that_is_not_woken_keeps_its_line(self):
+        # mode="notify" (and the missing mode it defaults to) wakes nobody, so
+        # the ping is the only word the thread gets on the failure.
+        _SlackUxFlag(self, True)
+        for mode in ("notify", None):
+            self.assertFalse(explained_by_wake(_sub(mode=mode), "gave_up", loader({"wake_on_events": FAILURE_ONLY})), mode)
+
+    def test_a_kind_the_config_does_not_wake_for_keeps_its_line(self):
+        _SlackUxFlag(self, True)
+        self.assertFalse(
+            explained_by_wake(_sub(), "blocked", loader({"wake_on_events": ["gave_up"]}))
+        )
+        self.assertTrue(
+            explained_by_wake(_sub(), "gave_up", loader({"wake_on_events": ["gave_up"]}))
+        )
+
+    def test_the_default_wake_set_explains_every_failure_kind(self):
+        _SlackUxFlag(self, True)
+        for kind in EXPLAINED_KINDS:
+            self.assertTrue(explained_by_wake(_sub(), kind, loader({})), kind)
+        self.assertTrue(set(EXPLAINED_KINDS) <= set(DEFAULT_WAKE_KINDS))
+
+
+# =============================================================================
 # The applier
 # =============================================================================
 
@@ -1521,8 +1657,8 @@ class StoreIncidentReportTest(unittest.TestCase):
 # kept at their real nesting because all three anchors are indentation-
 # sensitive: ``_fmt_completed`` is module-level, ``build_wake_text`` and
 # ``_send_pings`` are methods of ``_KanbanNotification``. The ``return f"✔`` line
-# carries no anchor — it is here because the hook has to land between the clip
-# and it, and that ordering is the whole contract. ``_WAKE_KINDS`` stays at
+# is anchor 4, and the handoff hook has to land between the clip and it, which
+# is the whole contract of anchor 1. ``_WAKE_KINDS`` stays at
 # module level in the patched file too: ``build_wake_text`` still orders the
 # wake text's parts by it.
 UPSTREAM_NOTIFIER = '''\
@@ -1590,6 +1726,7 @@ class _KanbanNotification:
 HANDOFF_DRIFT = ("_first_line(str(payload_summary), 200)", "_first_line(str(payload_summary), 220)")
 WAKE_DRIFT = ("if ev.kind in _WAKE_KINDS}", "if ev.kind in _WAKE_KINDS and ev}")
 INCIDENT_DRIFT = ("                self.clear_failures()\n", "                self.clear_failures()  # noqa\n")
+COMPLETION_DRIFT = ("done — {n.title}{handoff}", "done: {n.title}{handoff}")
 
 
 def patch_tree(source):
@@ -1627,17 +1764,22 @@ def method_source(source, name):
 
 
 class ApplyTest(unittest.TestCase):
-    def test_all_three_anchors_match_upstream_exactly_once(self):
-        for anchor in (HANDOFF_ANCHOR, WAKE_ANCHOR, INCIDENT_ANCHOR):
+    def test_all_four_anchors_match_upstream_exactly_once(self):
+        for anchor in (HANDOFF_ANCHOR, WAKE_ANCHOR, INCIDENT_ANCHOR, COMPLETION_ANCHOR):
             self.assertEqual(UPSTREAM_NOTIFIER.count(anchor), 1, anchor)
 
-    def test_the_message_line_is_not_an_anchor(self):
-        # The old delivery applier had to match the `msg = (` f-strings —
-        # nested quotes and unicode — purely to find an insertion point after
-        # clip lines another patch owned. Owning the clip, this applier appends
-        # the hook to its own replacement instead, so upstream can reword the
-        # completion message freely.
+    def test_only_the_completion_anchor_holds_the_message_line(self):
+        # The handoff hook appends to its own replacement rather than matching
+        # the message f-string. Anchor 4 matches it on purpose, because it is
+        # the line KAGE_SLACK_UX changes; an upstream rewording fails the build
+        # there, by name, rather than anywhere else.
         self.assertNotIn("✔", HANDOFF_ANCHOR + WAKE_ANCHOR + INCIDENT_ANCHOR)
+        self.assertIn("✔", COMPLETION_ANCHOR)
+
+    def test_the_message_is_built_by_completion_text(self):
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        self.assertIn(f"return {COMPLETION_CALL}, wake_handoff, None", patched)
+        self.assertNotIn('return f"✔ {n.head} done', patched)
 
     def test_both_of_upstreams_hard_slices_are_replaced(self):
         patched = patch_tree(UPSTREAM_NOTIFIER)
@@ -1676,7 +1818,7 @@ class ApplyTest(unittest.TestCase):
         patched = patch_tree(UPSTREAM_NOTIFIER)
         clip = patched.rindex("wake_handoff = _clip_handoff(n.task.result)")
         hook = patched.index("handoff = _kanban_handoff_with_result(handoff, n.task)")
-        message = patched.index('return f"✔ {n.head} done')
+        message = patched.index(COMPLETION_CALL)
         self.assertTrue(clip < hook < message)
 
     def test_the_hook_replaces_the_handoff_rather_than_appending_to_it(self):
@@ -1688,6 +1830,7 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("from gateway.kanban_notifier import", patched)
         for name in (
             "clip_handoff as _clip_handoff",
+            "completion_text as _kanban_completion_text",
             "handoff_with_result as _kanban_handoff_with_result",
             "note_suppressed_completion as _kanban_note_suppressed",
             "store_incident_report as _kanban_store_incident",
@@ -1719,6 +1862,12 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("found 0", str(ctx.exception))
         self.assertIn("incident row", str(ctx.exception))
 
+    def test_a_drifted_completion_anchor_fails_loudly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            patch_tree(UPSTREAM_NOTIFIER.replace(*COMPLETION_DRIFT))
+        self.assertIn("found 0", str(ctx.exception))
+        self.assertIn("completion message", str(ctx.exception))
+
     def test_a_drifted_later_anchor_leaves_the_file_untouched(self):
         # The applier edits a string and writes once at the end, so a failure
         # on a later anchor must not leave the earlier edits on disk.
@@ -1749,6 +1898,7 @@ class ApplyTest(unittest.TestCase):
             patched.count("handoff = _kanban_handoff_with_result(handoff, n.task)"), 1
         )
         self.assertEqual(patched.count("from gateway.kanban_notifier import"), 1)
+        self.assertEqual(patched.count(COMPLETION_CALL), 1)
 
     def test_a_missing_file_fails_loudly(self):
         with self.assertRaises(SystemExit) as ctx:
@@ -1776,20 +1926,21 @@ class MinimalDiffTest(unittest.TestCase):
     superseded appliers byte for byte; those appliers never saw the v2026.9.14
     notifier, so that claim has nothing left to be checked against. What can
     still be pinned is that the patch is *only* its named blocks: the lines
-    removed from upstream are the two hard slices and the wake-set
-    comprehension, and the lines added are the replacements those three anchors
-    spell out plus the trailer. Anything else — a "while I was in there" — shows
+    removed from upstream are the two hard slices, the wake-set comprehension
+    and the completion message's return, and the lines added are the
+    replacements those four anchors spell out plus the trailer. Anything else — a "while I was in there" — shows
     up here as an unexplained line, which is what a behaviour change wearing a
     refactor's clothes looks like.
     """
 
-    def test_exactly_upstreams_three_lines_are_removed(self):
+    def test_exactly_upstreams_four_lines_are_removed(self):
         removed, _ = _diff_lines(UPSTREAM_NOTIFIER, patch_tree(UPSTREAM_NOTIFIER))
         self.assertEqual(
             removed,
             [
                 "        wake_handoff = _first_line(str(payload_summary), 200)",
                 "        wake_handoff = _first_line(n.task.result, 160)",
+                '    return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None',
                 '        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()',
             ],
         )
@@ -1801,6 +1952,7 @@ class MinimalDiffTest(unittest.TestCase):
             (HANDOFF_ANCHOR, HANDOFF_PATCHED),
             (WAKE_ANCHOR, WAKE_PATCHED),
             (INCIDENT_ANCHOR, INCIDENT_PATCHED),
+            (COMPLETION_ANCHOR, COMPLETION_PATCHED),
         ):
             expected += _diff_lines(anchor, patched)[1]
         expected += TRAILER.splitlines()

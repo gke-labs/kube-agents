@@ -35,6 +35,10 @@ The concerns, in the order the notifier reaches them:
    reply of ``apply Option A`` reaches an agent that can see what Option A was
    — or, where the report proposed a single unlettered fix, so that a bare
    ``apply`` reaches one that can see which fix it authorises.
+6. **Quiet** it on Slack with ``KAGE_SLACK_UX`` on: :func:`completion_text`
+   drops the head line above the report, and :func:`explained_by_wake` tells
+   ``kanban_progress_lines`` when a failure line can go because the wake will
+   explain it.
 
 Step 3 is only defensible because steps 1 and 2 happened, which is the clearest
 argument for keeping them together: ``kanban.wake_on_events`` may drop
@@ -1412,3 +1416,82 @@ def store_incident_report(
             exc_info=True,
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# 6. Quieter delivery on Slack, behind KAGE_SLACK_UX
+# ---------------------------------------------------------------------------
+#
+# Two lines a Slack thread reads as noise once the answer is in it. The
+# completion message opens with ``✔ <head> done — <title>``, a status line
+# above the report that repeats the card's title and says nothing the report
+# does not. And a failure is told twice: the notifier posts ``✖ … gave up``,
+# then the wake has the creator explain the same failure in its own words.
+#
+# Both are presentation and both are gated on the flag *and* on the Slack
+# platform, so Google Chat and a flag-off Slack get exactly upstream's text.
+# The flag is read through ``gateway.slack_ux_reactions.enabled()``, imported
+# when a delivery runs: that module is copied into the image after this one,
+# and an image without it reads as flag off.
+
+SLACK_PLATFORM = "slack"
+
+#: Upstream's completion head line, byte for byte. Kept whole when there is no
+#: handoff at all, since then it is the only thing the message would say.
+COMPLETION_HEAD = "✔ {head} done — {title}"
+
+#: The failure kinds the creator's wake narrates. Only these: ``completed`` is
+#: the report itself, and the review-flow kinds carry no explanation to give.
+EXPLAINED_KINDS: Tuple[str, ...] = ("blocked", "crashed", "timed_out", "gave_up")
+
+#: Upstream's ``wake_agent`` modes, and the default it applies when a
+#: subscription carries none.
+WAKING_MODES: Tuple[str, ...] = ("notify+wake", "wake")
+DEFAULT_DELIVERY_MODE = "notify"
+
+
+def slack_ux_on(platform: object) -> bool:
+    """Whether ``KAGE_SLACK_UX`` is on and ``platform`` is Slack."""
+    if str(platform or "").strip().lower() != SLACK_PLATFORM:
+        return False
+    try:
+        from gateway import slack_ux_reactions
+    except ImportError:
+        return False
+    try:
+        return bool(slack_ux_reactions.enabled())
+    except Exception:
+        logger.debug("kanban notifier: reading KAGE_SLACK_UX failed", exc_info=True)
+        return False
+
+
+def completion_text(head: str, title: str, handoff: str, platform: object = None) -> str:
+    """Return the completion message: upstream's, or on Slack the handoff alone.
+
+    Flag off, or any platform but Slack, this is upstream's f-string exactly.
+    On Slack it drops the head line and leads with the worker's summary and
+    report; a card that completed with neither keeps the head line, since an
+    empty message is worse than a terse one.
+    """
+    upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
+    if not slack_ux_on(platform):
+        return upstream
+    return str(handoff or "").strip() or upstream
+
+
+def explained_by_wake(
+    sub: dict, kind: str, load_config: Optional[Callable[[], object]] = None,
+) -> bool:
+    """Whether the creator's wake will narrate this failure, so the ping can go.
+
+    True only on Slack with the flag on, for a failure kind, on a subscription
+    that asked to be woken, when ``kanban.wake_on_events`` wakes for the kind.
+    Those are the conditions under which ``wake_kinds_for`` on a push adapter
+    puts the kind in the wake set, so the one message the thread gets is the
+    creator's explanation. Anything short of all four keeps upstream's line.
+    """
+    if kind not in EXPLAINED_KINDS or not slack_ux_on(sub.get("platform")):
+        return False
+    if (sub.get("delivery_mode") or DEFAULT_DELIVERY_MODE) not in WAKING_MODES:
+        return False
+    return kind in resolve_wake_kinds(load_config)

@@ -572,6 +572,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -qF 'wake_configured=self.wake_agent,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_kanban_store_incident(ev, self.task, self.sub, posted=self.send_passive)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'return _kanban_completion_text(n.head, n.title, handoff, n.platform_str)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
 sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \

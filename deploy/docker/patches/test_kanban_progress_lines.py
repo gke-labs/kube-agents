@@ -724,5 +724,97 @@ class SettleReactionHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent[-1][1], "✔ done")
 
 
+SLACK_SUB = {
+    "task_id": "t_e0c1",
+    "platform": "slack",
+    "chat_id": "C0BHY4P7DJM",
+    "thread_id": "1790717879.123899",
+    "delivery_mode": "notify+wake",
+}
+
+
+class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
+    """KAGE_SLACK_UX on a Slack card: the trail settles to one line, and a
+    failure the creator's wake explains posts nothing of its own.
+
+    ``gateway.slack_ux_reactions`` is faked as in :class:`SettleReactionHookTest`;
+    ``kanban_notifier`` is the real module, imported flat.
+    """
+
+    def setUp(self):
+        self.calls = []
+        self.flag = True
+        test = self
+
+        async def settle_delegated(adapter, sub, kind, board=None):
+            test.calls.append((sub["task_id"], kind))
+
+        fake = SimpleNamespace(enabled=lambda: test.flag, settle_delegated=settle_delegated)
+        patcher = mock.patch.dict(
+            sys.modules,
+            {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        wake = mock.patch(
+            "kanban_notifier.resolve_wake_kinds",
+            return_value=("gave_up", "crashed", "timed_out", "blocked"),
+        )
+        wake.start()
+        self.addCleanup(wake.stop)
+
+    async def _run(self, adapter, sub, kind, message):
+        watcher = SimpleNamespace()
+        await deliver(watcher, adapter, sub, "heartbeat", _beat(1, "Checking seeded-a."), "", None, HEADER)
+        await deliver(watcher, adapter, sub, "heartbeat", _beat(2, "Reading pod state."), "", None, HEADER)
+        return await deliver(watcher, adapter, sub, kind, _terminal(3, kind), message, None, HEADER)
+
+    async def test_a_completion_settles_the_trail_to_its_last_line(self):
+        adapter = _Adapter()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up.")
+        self.assertEqual(adapter.edits[-1][1], f"{FINISHED} [default] @platform Reading pod state.")
+        self.assertEqual(adapter.sent[-1][1], "Both pods are up.")
+
+    async def test_an_explained_failure_posts_nothing_and_still_settles(self):
+        adapter = _Adapter()
+        result = await self._run(adapter, SLACK_SUB, "gave_up", "✖ gave up")
+        self.assertIsNone(result)
+        self.assertEqual(len(adapter.sent), 1, "the gave-up line was posted")
+        self.assertEqual(adapter.edits[-1][1], f"{STOPPED} [default] @platform Reading pod state.")
+        self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+
+    async def test_a_failure_nobody_is_woken_for_still_posts(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        await self._run(adapter, sub, "gave_up", "✖ gave up")
+        self.assertEqual(adapter.sent[-1][1], "✖ gave up")
+
+    async def test_an_explained_by_wake_that_raises_posts_the_line(self):
+        adapter = _Adapter()
+        with mock.patch("kanban_notifier.resolve_wake_kinds", side_effect=RuntimeError("boom")):
+            await self._run(adapter, SLACK_SUB, "crashed", "✖ crashed")
+        self.assertEqual(adapter.sent[-1][1], "✖ crashed")
+
+    async def test_other_platforms_are_unchanged_with_the_flag_on(self):
+        on, off = _Adapter(), _Adapter()
+        await self._run(on, SUB, "gave_up", "✖ gave up")
+        self.flag = False
+        await self._run(off, SUB, "gave_up", "✖ gave up")
+        self.assertEqual((on.sent, on.edits), (off.sent, off.edits))
+
+    async def test_flag_off_slack_posts_exactly_what_it_did_before(self):
+        self.flag = False
+        for kind, message in (("completed", "✔ done"), ("gave_up", "✖ gave up")):
+            with_flag_module, without = _Adapter(), _Adapter()
+            await self._run(with_flag_module, SLACK_SUB, kind, message)
+            with mock.patch.dict(sys.modules, {"gateway": None, "gateway.slack_ux_reactions": None}):
+                await self._run(without, SLACK_SUB, kind, message)
+            self.assertEqual(
+                (with_flag_module.sent, with_flag_module.edits), (without.sent, without.edits), kind,
+            )
+            self.assertIn(STOPPED if kind == "gave_up" else FINISHED, with_flag_module.edits[-1][1])
+            self.assertIn(f"{BULLET}Checking seeded-a.", with_flag_module.edits[-1][1])
+
+
 if __name__ == "__main__":
     unittest.main()

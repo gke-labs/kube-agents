@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Wire gateway/kanban_notifier.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Three anchored
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Four anchored
 edits in ``gateway/kanban_watchers_notifier.py`` plus one import trailer. Two
 of the anchors are the same two sites this applier has always owned — the
-completion handoff and the wake set — and the third carries the incident-store
-call, which used to share the wake anchor and no longer can (below).
+completion handoff and the wake set — the third carries the incident-store
+call, which used to share the wake anchor and no longer can (below), and the
+fourth routes the completion message through ``completion_text`` so
+``KAGE_SLACK_UX`` can drop its head line on Slack.
 
 Where the sites live, as of v2026.9.14. Upstream's September decomposition
 (``fd2bfa1893``) moved the notifier's per-subscription delivery out of the
@@ -225,10 +227,33 @@ INCIDENT_PATCHED = (
     f"{PING_EXCEPT_INDENT}except Exception as exc:\n"
 )
 
+# --- Anchor 4: the completion message ------------------------------------------
+#
+# ``_fmt_completed``'s return, which prefixes the handoff with
+# ``✔ <head> done — <title>``. ``completion_text`` returns that same string
+# unless ``KAGE_SLACK_UX`` is on and the subscription is Slack, where it
+# returns the handoff alone. ``n.platform_str`` is upstream's lower-cased
+# platform, set in ``_KanbanNotification.__init__``. See section 6 of
+# gateway/kanban_notifier.py.
+
+COMPLETION_ANCHOR = (
+    f'{HANDOFF_INDENT}return f"✔ {{n.head}} done — {{n.title}}{{handoff}}", wake_handoff, None\n'
+)
+
+COMPLETION_CALL = (
+    "_kanban_completion_text(n.head, n.title, handoff, n.platform_str)"
+)
+
+COMPLETION_PATCHED = (
+    f"{HANDOFF_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
+    f"{HANDOFF_INDENT}return {COMPLETION_CALL}, wake_handoff, None\n"
+)
+
 EDITS = (
     ("completion handoff", HANDOFF_ANCHOR, HANDOFF_PATCHED),
     ("wake set", WAKE_ANCHOR, WAKE_PATCHED),
     ("incident row", INCIDENT_ANCHOR, INCIDENT_PATCHED),
+    ("completion message", COMPLETION_ANCHOR, COMPLETION_PATCHED),
 )
 
 # Appended rather than inserted: unlike a `check_fn=`, these names are resolved
@@ -238,6 +263,7 @@ TRAILER = (
     "\n\n# kube-agents patch: see gateway/kanban_notifier.py\n"
     "from gateway.kanban_notifier import (  # noqa: E402\n"
     "    clip_handoff as _clip_handoff,\n"
+    "    completion_text as _kanban_completion_text,\n"
     "    handoff_with_result as _kanban_handoff_with_result,\n"
     "    note_suppressed_completion as _kanban_note_suppressed,\n"
     "    store_incident_report as _kanban_store_incident,\n"
@@ -245,7 +271,7 @@ TRAILER = (
     ")\n"
 )
 
-#: Text that only exists after a successful run. All three anchors are
+#: Text that only exists after a successful run. All four anchors are
 #: destroyed by their own replacement, so a re-run would already fail on
 #: "found 0" — but that message blames upstream drift for what is actually a
 #: duplicated build step, and before the old delivery applier grew this guard a
@@ -260,6 +286,7 @@ SENTINELS = (
     'self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive',
     "_kanban_note_suppressed(",
     "_kanban_store_incident(",
+    COMPLETION_CALL,
 )
 
 

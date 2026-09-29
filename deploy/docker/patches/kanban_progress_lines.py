@@ -280,6 +280,39 @@ async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[s
         )
 
 
+def _slack_quiet(sub: dict) -> Any:
+    """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this Slack card, else None.
+
+    Imported when a delivery runs: ``gateway/kanban_notifier.py`` is copied into
+    the image after this module, and this one's build-time check runs before it
+    exists. Anything that goes wrong here reads as flag off.
+    """
+    try:
+        from gateway import kanban_notifier
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        except ImportError:
+            return None
+    try:
+        return kanban_notifier if kanban_notifier.slack_ux_on(sub.get("platform")) else None
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: reading KAGE_SLACK_UX failed: %s", exc)
+        return None
+
+
+def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
+    if quiet is None:
+        return False
+    try:
+        return bool(quiet.explained_by_wake(sub, kind))
+    except Exception as exc:  # noqa: BLE001 — fail towards posting the line
+        logger.debug(
+            "kanban progress: explained_by_wake for %s failed: %s", sub.get("task_id"), exc,
+        )
+        return False
+
+
 async def deliver(
     watcher: Any,
     adapter: Any,
@@ -304,6 +337,12 @@ async def deliver(
     message first, and that is best-effort: a failed cosmetic edit must not
     reach the notifier's ``except``, where it would rewind the cursor and count
     against the subscription's send-failure budget.
+
+    With ``KAGE_SLACK_UX`` on and a Slack card, the terminal path is quieter
+    in two ways. The rolling message settles to its last line rather than the
+    whole trail. And a failure the creator's wake will explain posts nothing,
+    returning ``None`` like the replay path, so the thread gets that failure
+    once, in the creator's words. See section 6 of ``gateway/kanban_notifier.py``.
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
@@ -312,12 +351,14 @@ async def deliver(
     event_id = int(getattr(ev, "id", 0) or 0)
 
     if kind not in ROLLING_KINDS:
+        quiet = _slack_quiet(sub)
         if entry and entry["message_id"] and entry["lines"]:
+            settled = entry["lines"][-1:] if quiet else entry["lines"]
             try:
                 await adapter.edit_message(
                     chat_id,
                     entry["message_id"],
-                    render(header, entry["lines"], settled_marker(kind)),
+                    render(header, settled, settled_marker(kind)),
                 )
             except Exception as exc:
                 logger.debug(
@@ -325,6 +366,9 @@ async def deliver(
                     "for %s: %s", sub.get("task_id"), exc,
                 )
         tracked.pop(key, None)
+        if _explained_by_wake(quiet, sub, kind):
+            await _settle_reaction(adapter, sub, kind, board)
+            return None
         result = await adapter.send(chat_id, message, metadata=metadata)
         await _settle_reaction(adapter, sub, kind, board)
         return result
