@@ -323,11 +323,21 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertIn("no worker picked up sweep card t_new within 900s", completed.stderr)
         self.assertNotIn("Board reads after", completed.stderr)
 
-    def test_step_1_refuses_a_paused_scan_job_before_re_arming(self):
-        completed, calls = self._run(STEP_1_STATE="paused")
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("cron job is paused", completed.stderr)
-        self.assertEqual([c for c in calls if c.endswith(("[rearm]", "[archive]", "[restore]"))], [])
+    def test_step_1_refuses_every_state_but_clear_before_re_arming(self):
+        # "" is a step-1 read that failed: only the catch-all arm stops it.
+        refusals = {
+            "aligned": ".user_aligned exists",
+            "completed": "onboarding already delivered",
+            "nojob": "is not in",
+            "paused": "cron job is paused",
+            "": "could not read the onboarding markers",
+        }
+        for state, message in refusals.items():
+            with self.subTest(state=state):
+                completed, calls = self._run(STEP_1_STATE=state)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
+                self.assertEqual([c for c in calls if c.endswith(("[rearm]", "[archive]", "[restore]"))], [])
 
     def test_the_trap_archives_a_sweep_the_leaders_gate_files_after_the_restore(self):
         # The gate never files within the plant's wait, so step 3 fails. The

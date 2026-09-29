@@ -110,8 +110,8 @@
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
 # 2026-09-29: the canary returned to the presubmit file held out (#2013) and
 # pdb-remediation-pr moved there held out beside it (#2016, seat opened
-# 2026-09-28), so this file's share is thirty-seven cases (111 units) of the
-# fifty-one-case, 153-unit matrix the additions through 2026-09-29 made it; the
+# 2026-09-28), so this file's share is thirty-eight cases (114 units) of the
+# fifty-two-case, 156-unit matrix the additions through 2026-09-29 made it; the
 # nightly runs both files, so its matrix and its price do not change.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
