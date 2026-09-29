@@ -78,6 +78,11 @@ From the `N-1` checkout, a dry run, then operator and harness back to back:
 ./upgrade.sh --upgrade-mode=harness --image-tag <N-1>
 ```
 
+Where `N-1` is a release after `0.7.0`, add `--drop-undeclared-values` to the operator and harness
+commands. Without it, their script stops before applying anything when the release records a value
+`N-1`'s chart does not declare, and names each one; with it, the script drops and names them. The
+scripts of `0.7.0` and earlier do not take the flag.
+
 `--dry-run` prints the target and the image references the step would apply, from the
 configuration alone, and contacts nothing. It refuses a checkout at the wrong commit, as the real
 run does, and only warns about uncommitted changes, which the real run refuses.
@@ -141,7 +146,8 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
   `0.7.0` the re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the
   values the install set on top. From the first release after `0.7.0` it is the same, less any
   value the install set that `N-1`'s values schema refuses as undeclared, which the script drops
-  and names before any of `N-1` is applied. `0.4.0` and earlier use `--reuse-values`, which
+  and names before any of `N-1` is applied when it is given `--drop-undeclared-values`, and names
+  and stops on when it is not. `0.4.0` and earlier use `--reuse-values`, which
   keeps every value `N`'s release computed, defaults included, so a chart default `N` changed
   stays at `N`'s value after a rollback to `0.4.0` even though the chart version reads `0.4.0`.
 
@@ -173,8 +179,8 @@ Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the
 them from the stored object, and `N-1`'s chart does not render them. The full mode discards the
 Helm values that produced them. A re-tag by the script of `0.7.0` or earlier keeps those values in
 the release's recorded values: a later forward re-tag renders them again, and the schema refusal
-below turns on them. A re-tag by a script from after `0.7.0` drops each one `N-1`'s values schema
-refuses as undeclared, so after such a rollback the release no longer records it, and the next
+below turns on them. A re-tag by a script from after `0.7.0`, run with `--drop-undeclared-values`,
+drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the release no longer records it, and the next
 forward re-tag renders it from `N`'s chart default until a full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
@@ -277,9 +283,10 @@ checks before it renders or applies anything, so the release itself keeps its la
   apply has already run: put `N`'s CRDs back from the `N` checkout with the same command the
   script uses, `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. For a
   pair whose `N-1` is `0.7.0` or earlier the Helm-only rollback therefore does not complete. From
-  the first release after `0.7.0` the re-tag drops each recorded key the schema refuses as
-  undeclared and prints its name, so the refusal no longer happens where `N-1` is that release or
-  later. The full mode completes either way, because its Helm release renders from the
+  the first release after `0.7.0` the re-tag checks the recorded values against the schema before
+  it applies anything, and names and stops on each key the schema refuses as undeclared. Given
+  `--drop-undeclared-values` it drops those keys instead, so with the flag the refusal no longer
+  happens where `N-1` is that release or later. The full mode completes either way, because its Helm release renders from the
   composition's values rather than the recorded ones (the section above), at the price of a
   GCP-level apply and the plan read that goes before it.
 

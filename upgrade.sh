@@ -76,6 +76,10 @@ PARAM_DRY_RUN="false"
 # environment has drifted from the composition on main.
 PARAM_PLAN="false"
 PARAM_KEEP_IMAGE_TAG="false"
+# Off by default: a key the target chart no longer declares is as often a
+# renamed setting as a newer release's addition, and dropping it silently would
+# take the setting off the release. A rollback to an older release passes it.
+PARAM_DROP_UNDECLARED_VALUES="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -302,6 +306,10 @@ Options:
                            the tag the install already serves. Use instead of
                            --image-tag, not alongside it; a script carrying a
                            baked release version already has one, and refuses it.
+  --drop-undeclared-values With --upgrade-mode=operator or harness, drop the
+                           release's recorded values the target chart's schema
+                           does not declare, instead of refusing the upgrade
+                           over them. For a rollback to an older release.
   --help, -h               Show this help message
 
 Examples:
@@ -606,7 +614,8 @@ harness_retag_keys() {
 }
 
 # Sets RETAG_VALUES_JSON to the values the release recorded, less every key the
-# chart this run applies would refuse as undeclared, and prints each key it
+# chart this run applies would refuse as undeclared. Refuses, naming each such
+# key, unless --drop-undeclared-values was passed; then prints each key it
 # drops. The values are those of the revision --reset-then-reuse-values would
 # reuse: the latest when it deployed, otherwise the last one that did, since a
 # failed upgrade leaves the revision before it serving. A rollback re-tags with N-1's chart, and a key N's install recorded
@@ -706,6 +715,19 @@ sys.stdout.buffer.write(text.encode("utf-8"))
     return 1
   fi
   rm -f "$stderr_file"
+  if [ ! -s "$dropped_file" ]; then
+    rm -f "$dropped_file"
+    return 0
+  fi
+  if [ "$PARAM_DROP_UNDECLARED_VALUES" != "true" ]; then
+    RETAG_VALUES_JSON=""
+    while IFS= read -r key; do
+      print_error "The release's recorded values set '${key}', which the chart this run applies does not declare."
+    done <"$dropped_file"
+    rm -f "$dropped_file"
+    print_error "Helm would refuse this upgrade over the keys above. If the target is an older release that predates them, re-run with --drop-undeclared-values to drop them; the settings they carry then leave the release until an --upgrade-mode=full run sets them again. If the target renamed or removed them, run --upgrade-mode=full instead."
+    return 1
+  fi
   while IFS= read -r key; do
     print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. A later release that declares it renders it from that chart's default until an --upgrade-mode=full run there sets it again."
   done <"$dropped_file"
@@ -1053,6 +1075,7 @@ parse_args() {
       --non-interactive|-y) PARAM_NON_INTERACTIVE="true"; shift ;;
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
+      --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -1324,6 +1347,10 @@ main() {
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
+  if [ "$PARAM_DROP_UNDECLARED_VALUES" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
+    exit 1
+  fi
 
   if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."

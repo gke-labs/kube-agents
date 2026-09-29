@@ -50,6 +50,9 @@ readonly OPERATOR_MANAGED_BY_LABEL="platformagent-controller"
 readonly HELM_MANAGED_BY_LABEL="Helm"
 readonly HELM_KEEP_ANNOTATION="helm.sh/resource-policy=keep"
 readonly OPERATOR_SCALE_TIMEOUT_SECONDS=120
+# The upgrade.sh flag that drops the recorded values the target chart's schema
+# does not declare. Releases from before it neither take it nor drop anything.
+readonly DROP_UNDECLARED_VALUES_FLAG="--drop-undeclared-values"
 # The last GA whose chart renders litellm-policy itself; from the next one on
 # the operator creates and owns it (#1195, #1488). The chart text is no guide:
 # the current template still names the object under a condition that is false
@@ -280,11 +283,17 @@ checkout_at() {
   git -C "${dir}" checkout --quiet --detach "${ref}"
 }
 
+# drop=true on the rollback leg only: there the keys N recorded that N-1 does
+# not declare are expected, while on the roll-forward a key the candidate no
+# longer declares is a rename the refusal has to surface.
 run_upgrade() {
-  local dir="$1" tag="$2" mode="$3"
+  local dir="$1" tag="$2" mode="$3" drop="${4:-false}" drop_flag=""
   local log="${DIAGNOSTICS_DIR}/upgrade-${mode}-${tag}.log"
-  echo "==> ${dir##*/}: ./upgrade.sh --non-interactive --upgrade-mode=${mode} --image-tag ${tag}"
-  (cd "${dir}" && ./upgrade.sh --non-interactive --upgrade-mode="${mode}" --image-tag "${tag}") 2>&1 | tee "${log}"
+  if [ "${drop}" = "true" ] && grep -qF -- "${DROP_UNDECLARED_VALUES_FLAG}" "${dir}/upgrade.sh"; then
+    drop_flag="${DROP_UNDECLARED_VALUES_FLAG}"
+  fi
+  echo "==> ${dir##*/}: ./upgrade.sh --non-interactive --upgrade-mode=${mode} --image-tag ${tag}${drop_flag:+ ${drop_flag}}"
+  (cd "${dir}" && ./upgrade.sh --non-interactive --upgrade-mode="${mode}" --image-tag "${tag}" ${drop_flag:+"${drop_flag}"}) 2>&1 | tee "${log}"
   return "${PIPESTATUS[0]}"
 }
 
@@ -450,12 +459,12 @@ CURRENT_STEP="rollback operator ${ROLLBACK_TAG}"
 # from here a failure leaves the target schema on the cluster until the
 # candidate's operator step puts the candidate's back.
 TARGET_CRDS_MAY_BE_APPLIED="true"
-run_upgrade "${ROLLBACK_CHECKOUT}" "${ROLLBACK_TAG}" operator
+run_upgrade "${ROLLBACK_CHECKOUT}" "${ROLLBACK_TAG}" operator true
 restart_operator_after_handoff
 record "rollback operator" "✅" "helm revision $(helm history "${HELM_RELEASE}" -n "${NAMESPACE}" -o json 2>/dev/null | jq -r '.[-1].revision // "?"')"
 
 CURRENT_STEP="rollback harness ${ROLLBACK_TAG}"
-run_upgrade "${ROLLBACK_CHECKOUT}" "${ROLLBACK_TAG}" harness
+run_upgrade "${ROLLBACK_CHECKOUT}" "${ROLLBACK_TAG}" harness true
 record "rollback harness" "✅" "helm revision $(helm history "${HELM_RELEASE}" -n "${NAMESPACE}" -o json 2>/dev/null | jq -r '.[-1].revision // "?"')"
 
 CURRENT_STEP="check ${ROLLBACK_TAG} is running"

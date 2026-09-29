@@ -7,6 +7,7 @@ after that decision.
 """
 
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -123,6 +124,48 @@ class RollbackEnvironmentResolveTest(unittest.TestCase):
         proc = self._run(CANDIDATE_SHA=self.commits[2], ROLLBACK_TAG="0.6.0")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("not in this checkout", proc.stderr)
+
+
+class RunUpgradeTest(unittest.TestCase):
+    """run_upgrade, lifted from the script, against a stub upgrade.sh that prints its arguments."""
+
+    def _run(self, drop, upgrade_script):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        checkout = pathlib.Path(tmp.name) / "checkout"
+        checkout.mkdir()
+        (checkout / "upgrade.sh").write_text(upgrade_script)
+        (checkout / "upgrade.sh").chmod(0o755)
+        text = _SCRIPT.read_text()
+        start = text.index("run_upgrade() {")
+        function = text[start : text.index("\n}\n", start) + len("\n}\n")]
+        flag = re.search(r"^readonly DROP_UNDECLARED_VALUES_FLAG=.*$", text, re.MULTILINE).group(0)
+        script = f"""
+set -euo pipefail
+DIAGNOSTICS_DIR={tmp.name}
+{flag}
+{function}
+run_upgrade {checkout} 0.7.0 operator {drop}
+"""
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+    def test_the_rollback_leg_passes_the_flag_to_a_script_that_takes_it(self):
+        stub = '#!/usr/bin/env bash\n# --drop-undeclared-values\necho "args=$*"\n'
+        proc = self._run("true", stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("args=--non-interactive --upgrade-mode=operator --image-tag 0.7.0 --drop-undeclared-values", proc.stdout)
+
+    def test_a_script_from_before_the_flag_is_not_given_it(self):
+        """Its parse_args refuses an unknown parameter."""
+        proc = self._run("true", '#!/usr/bin/env bash\necho "args=$*"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("args=--non-interactive --upgrade-mode=operator --image-tag 0.7.0\n", proc.stdout)
+
+    def test_the_roll_forward_leg_keeps_the_refusal(self):
+        stub = '#!/usr/bin/env bash\n# --drop-undeclared-values\necho "args=$*"\n'
+        proc = self._run("false", stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("--drop-undeclared-values", proc.stdout.split("args=")[1])
 
 
 class ImagePreCheckTest(unittest.TestCase):

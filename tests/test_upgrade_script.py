@@ -63,6 +63,14 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         self.assertEqual(proc.stderr.count("Upgrade error encountered"), 1, proc.stderr)
         self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
 
+    def test_drop_undeclared_values_is_refused_with_a_full_upgrade(self):
+        """A full upgrade renders the release from install.env, so there are no recorded values to drop."""
+        proc = self._run_upgrade_func(
+            "main --drop-undeclared-values --upgrade-mode=full --image-tag=0.3.0 --non-interactive"
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("--drop-undeclared-values applies to --upgrade-mode=operator and harness", proc.stdout)
+
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
             with self.subTest(ref=ref):
@@ -999,6 +1007,7 @@ class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
             )
         )
         snippet = (
+            "PARAM_DROP_UNDECLARED_VALUES=true\n"
             f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
             'harness_retag_keys "$RETAG_VALUES_JSON"\n'
             'printf "key=%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
@@ -1052,13 +1061,14 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
     }
     _VALUES_PREFIX = "values="
 
-    def _run(self, values_json, schema_text=None, helm_exit=0, **stub):
+    def _run(self, values_json, schema_text=None, helm_exit=0, drop=True, **stub):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         schema_path = pathlib.Path(tmp.name) / "values.schema.json"
         if schema_text != "":
             schema_path.write_text(schema_text or json.dumps(self._SCHEMA))
         snippet = (
+            f"PARAM_DROP_UNDECLARED_VALUES={'true' if drop else 'false'}\n"
             f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
             f'echo "{self._VALUES_PREFIX}$RETAG_VALUES_JSON"'
         )
@@ -1080,6 +1090,21 @@ class RetagValuesTest(_StubHelm, unittest.TestCase):
         self.assertEqual(self._values(proc), {"platformAgent": {"name": "p"}})
         self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
         self.assertIn("Dropping 'stray'", proc.stdout)
+
+    def test_without_the_flag_an_undeclared_key_is_refused_and_named(self):
+        """A key the target chart does not declare may be a renamed setting; dropping it is opt-in."""
+        proc = self._run('{"platformAgent":{"name":"p","scope":{"projects":[]}},"stray":1}', drop=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("'platformAgent.scope'", proc.stdout)
+        self.assertIn("'stray'", proc.stdout)
+        self.assertIn("--drop-undeclared-values", proc.stdout)
+        self.assertNotIn("Dropping", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_without_the_flag_values_the_schema_declares_pass(self):
+        values = {"platformAgent": {"name": "p"}, "open": {"anything": 1}}
+        self.assertEqual(self._values(self._run(json.dumps(values), drop=False)), values)
 
     def test_an_object_the_schema_leaves_open_keeps_every_key(self):
         values = {"open": {"anything": {"nested": 1}}}
@@ -1237,7 +1262,7 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         (chart / "templates" / "values.yaml").write_text(self._TEXT_TEMPLATE)
         return repo
 
-    def _retag(self, recorded, repo):
+    def _retag(self, recorded, repo, drop=True):
         bin_dir = self.base / "bin"
         bin_dir.mkdir(exist_ok=True)
         recorded_path = self.base / "recorded.json"
@@ -1274,6 +1299,8 @@ class RetagValuesAgainstHelmTest(unittest.TestCase):
         schema = repo / "charts" / "kube-agents" / "values.schema.json"
         script = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER" >&2' ERR
+PARAM_DROP_UNDECLARED_VALUES={'true' if drop else 'false'}
 retag_values kube-agents kubeagents-system {shlex.quote(str(schema))}
 {helm_retag}
 KUBE_AGENTS_HELM_RELEASE=kube-agents
@@ -1313,6 +1340,13 @@ helm_retag operator.image.tag
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
         self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
         self.assertIn("ci-cluster", proc.stdout)
+
+    def test_without_the_flag_the_run_stops_before_helm_upgrade(self):
+        proc = self._retag(self._RECORDED, self._rollback_chart(), drop=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("'platformAgent.scope'", proc.stdout)
+        self.assertIn("--drop-undeclared-values", proc.stdout)
+        self.assertNotIn("ci-cluster", proc.stdout)
 
     def test_every_character_reaches_the_chart_as_recorded(self):
         """Every code point, in a value between spaces and inside a key: the spellings Helm's parser alters."""
