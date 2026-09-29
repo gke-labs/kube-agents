@@ -1652,9 +1652,12 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
             )
             if policy_errors:
                 detail += f" -- read from a partial policy; the other could not be read: {policy_errors[0]}"
+            # The check passes on either builder, so the repair grants both,
+            # as provisioning does; granting one alone can close the finding
+            # while the account that builds still holds nothing.
             _drift(
                 details, findings, "artifact-registry/push", detail,
-                _project_binding(project_id, f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com", "roles/artifactregistry.writer"),
+                "\n".join(_project_binding(project_id, member, "roles/artifactregistry.writer") for member in sorted(build_sas)),
             )
 
         node_members, node_err = _host_cluster_node_members(project_id, project_number)

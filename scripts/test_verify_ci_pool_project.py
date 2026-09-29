@@ -3566,6 +3566,24 @@ class ReportDocumentTest(unittest.TestCase):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 60)
         self.assertEqual(iam.call_count, 1)
         self.assertTrue(all(r.message != "Not checked" for r in results))
+        # The mixed case: the project read finishes after the deadline, so it
+        # keeps its verdict and every check after it is not checked.
+        def slow_project_read(project_id):
+            time.sleep(0.2)
+            return "123", checker.CheckResult("p", True, "ok")
+        with mock.patch.object(checker, "check_project_and_apis", slow_project_read), \
+             mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
+             mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
+            results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 0.05)
+        self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
+        self.assertEqual(iam.call_count, 0)
+        by_id = {r.check_id: r for r in results}
+        self.assertEqual(by_id[checker.CHECK_PROJECT_AND_APIS].message, "ok")
+        self.assertEqual(checker.report_status(by_id[checker.CHECK_PROJECT_AND_APIS]), checker.REPORT_STATUS_PASS)
+        for check_id in checker.POOL_STATE_CHECKS[1:]:
+            r = by_id[check_id]
+            self.assertEqual((r.message, r.read), ("Not checked", False), check_id)
+            self.assertIn(checker.DEADLINE_PASSED, r.warnings[0])
 
     def test_the_deadline_cuts_a_command_inside_a_check_short(self):
         # A stall inside a check, not only between checks: a command started
@@ -3768,6 +3786,9 @@ class FindingsCarryRepairsTest(unittest.TestCase):
         self.assertEqual(ids["artifact-registry/cleanup-policy"], checker.REPAIR_CLEANUP_POLICY)
         self.assertEqual(ids["artifact-registry/cleanup-dry-run"], checker.REPAIR_CLEANUP_POLICY)
         self.assertIn("--role=roles/artifactregistry.writer", ids["artifact-registry/push"])
+        # Either builder satisfies the check, so the repair grants both.
+        self.assertIn("123456@cloudbuild.gserviceaccount.com", ids["artifact-registry/push"])
+        self.assertIn("123456-compute@developer.gserviceaccount.com", ids["artifact-registry/push"])
         versions = json.dumps([{"name": ".../cryptoKeyVersions/1", "state": "DISABLED"}])
         key = json.dumps({"purpose": checker.KMS_KEY_PURPOSE, "versionTemplate": {"algorithm": checker.KMS_KEY_ALGORITHM}, "importOnly": True})
         with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_chart_pinned_key_version", return_value=("1", "")):
