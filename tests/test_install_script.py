@@ -6282,6 +6282,8 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
         "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
+        "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
+        "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
         "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
         "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
     }
@@ -7370,7 +7372,7 @@ class BannerColourVariablesAreDefinedTest(unittest.TestCase):
 class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
     """The scope flags follow the install.env contract every other key does.
 
-    A first install records the three keys, empty included, so the file says
+    A first install records the five keys, empty included, so the file says
     where a project is declared. A re-run never rewrites the file, so a flag
     that disagrees with it gets the same one-run warning --agent-namespace and
     --enable-gke-backup-plan get, naming the line to add and the consequence:
@@ -7392,7 +7394,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             cwd=str(_REPO_ROOT),
         )
 
-    def test_a_first_install_records_the_three_keys_even_when_empty(self):
+    def test_a_first_install_records_the_five_keys_even_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = pathlib.Path(tmp) / "new.install.env"
             loaded = pathlib.Path(tmp) / "loaded.install.env"
@@ -7401,12 +7403,14 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             # Exported after the load, as main() exports the flags' values: the
             # loader drops an inherited key once an install.env exists.
             proc = self._run(
-                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
+                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_FOLDERS="123456789012" SCOPE_ORGANIZATIONS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
                 f'bootstrap_install_env_file "{dest}" some-tag >/dev/null\ncat "{dest}"',
                 env={"KUBE_AGENTS_INSTALL_ENV": str(loaded)},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_PROJECTS=payments-prod\\ payments-staging$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_FOLDERS=123456789012$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_ORGANIZATIONS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
 
@@ -7415,9 +7419,10 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         # shell-exported value applied for one run over a file that does not
         # record it is dropped again by the next run. A file that carries the
         # key sets it; a first install (no file) keeps the environment.
-        probe = 'echo "P=${PARAM_SCOPE_PROJECTS:-unset} X=${PARAM_SCOPE_EXCLUDE_PROJECTS:-unset} C=${PARAM_SCOPE_EXCLUDE_CLUSTERS:-unset}"'
-        stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
-                 "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
+        probe = ('echo "P=${PARAM_SCOPE_PROJECTS:-unset} F=${PARAM_SCOPE_FOLDERS:-unset} O=${PARAM_SCOPE_ORGANIZATIONS:-unset} '
+                 'X=${PARAM_SCOPE_EXCLUDE_PROJECTS:-unset} C=${PARAM_SCOPE_EXCLUDE_CLUSTERS:-unset}"')
+        stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_FOLDERS": "111", "SCOPE_ORGANIZATIONS": "222",
+                 "SCOPE_EXCLUDE_PROJECTS": "*-stray", "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text("PROJECT_ID=p\n")
@@ -7427,14 +7432,14 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                 capture_output=True, text=True, cwd=str(_REPO_ROOT),
                 env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
             )
-            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=unset F=unset O=unset X=unset C=unset", proc.stdout, proc.stderr)
             env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
             proc = subprocess.run(
                 ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
                 capture_output=True, text=True, cwd=str(_REPO_ROOT),
                 env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
             )
-            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=from-the-file F=unset O=unset X=unset C=unset", proc.stdout, proc.stderr)
         # No file: a first install seeds from the environment and records it.
         with tempfile.TemporaryDirectory() as tmp:
             script_copy = pathlib.Path(tmp) / "install.sh"
@@ -7444,7 +7449,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                 capture_output=True, text=True, cwd=tmp,
                 env=get_isolated_test_env(overrides={"HOME": tmp, **stray}),
             )
-            self.assertIn("P=stray-project X=*-stray C=s/l/c", proc.stdout, proc.stderr)
+            self.assertIn("P=stray-project F=111 O=222 X=*-stray C=s/l/c", proc.stdout, proc.stderr)
 
     def test_a_flag_that_disagrees_with_the_recorded_file_warns_and_names_the_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -7464,6 +7469,20 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             # Spelled as install.env records it (%q), so the line pastes back as is.
             self.assertIn("Set SCOPE_PROJECTS=payments-prod\\,payments-staging in", out)
             self.assertEqual(existing.read_text(), "SCOPE_PROJECTS=payments-prod\n")
+        # A folder flag gets the same warning against a file that records none.
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_FOLDERS="123456789012"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            self.assertIn("--scope-folders=123456789012 applies to this run only", out)
+            self.assertIn("Set SCOPE_FOLDERS=123456789012 in", out)
 
     def test_the_remedy_for_a_space_separated_flag_pastes_back_as_one_assignment(self):
         # The scope keys are the first list-valued values through the warning;
@@ -7508,6 +7527,8 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         # while install.env still named them; the file is where a scope is
         # emptied on purpose.
         for flag, key in (("--scope-projects", "SCOPE_PROJECTS"),
+                          ("--scope-folders", "SCOPE_FOLDERS"),
+                          ("--scope-organizations", "SCOPE_ORGANIZATIONS"),
                           ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
                           ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
             for value in ("", ",", " ", " , "):
@@ -7529,7 +7550,8 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
         )
         help_text = proc.stdout + proc.stderr
-        for flag in ("--scope-projects=IDS", "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
+        for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
+                     "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, help_text)
 
@@ -7556,6 +7578,38 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(fetch, check)
         self.assertLess(check, summary)
 
+    def test_the_container_preflight_mode_follows_the_route(self):
+        # A first install has no cluster to read a CR from, but it does bind a
+        # declared folder with this identity, so the container preflight is
+        # outside the existing-cluster gate and skipped only by --dry-run. A
+        # run that will apply is refused, a run that hands the apply to
+        # lifecycle.sh only warns, and the interactive run is checked at the
+        # (Y/n/g) prompt, where its route is known, so the g answer is the same
+        # choice as the flag and a Y still refuses before step 12.
+        gate_end = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
+        preflight = self.text.index(
+            'if [ "$PARAM_DRY_RUN" != "true" ]; then\n'
+            '    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n'
+            '      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n'
+            '    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then\n'
+            '      check_scope_container_access || exit 1\n'
+            '    fi\n'
+            '  fi\n')
+        summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
+        self.assertLess(gate_end, preflight)
+        self.assertLess(preflight, summary)
+        prompt = self.text.index('prompt_read "\\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)"')
+        yes = self.text.index('      [Yy])\n', prompt)
+        yes_check = self.text.index('check_scope_container_access || exit 1', yes)
+        g = self.text.index('      [Gg])\n', prompt)
+        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"', g)
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        self.assertLess(summary, prompt)
+        self.assertLess(yes, yes_check)
+        self.assertLess(yes_check, g)
+        self.assertLess(g, g_check)
+        self.assertLess(g_check, step12)
+
     def test_the_crds_are_applied_at_step_12_before_the_apply_on_the_one_fetched_context(self):
         # INSTALL.md names a re-run and the menu as the way to change
         # configuration; Helm never upgrades CRDs, so a field the served schema
@@ -7577,10 +7631,12 @@ class ScopeCheckWiringTest(unittest.TestCase):
         menu = self.text[self.text.index("run_menu_system()"):]
         fetch = menu.index('gcloud container clusters get-credentials "$cluster_name" --location "$REGION"')
         check = menu.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
+        preflight = menu.index('check_scope_container_access || exit 1')
         crds = menu.index('apply_crd_upgrades "$repo_dir"')
         apply = menu.index('run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-')
         self.assertLess(fetch, check)
-        self.assertLess(check, crds)
+        self.assertLess(check, preflight)
+        self.assertLess(preflight, crds)
         self.assertLess(crds, apply)
 
     def test_the_menu_refuses_a_scope_flag(self):
@@ -7596,7 +7652,16 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(refusal, run)
 
     def test_the_generate_only_handoff_says_the_check_does_not_run_there(self):
+        # The one applying route with no live-scope check: the sentence is the
+        # only guard, so it names every key the apply renders, not just the
+        # projects, and says what to do.
         self.assertIn("The live-scope check does not run here", self.text)
+        handoff = self.text[self.text.index("The live-scope check does not run here"):]
+        handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS and the two exclusions",
+                       "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, handoff)
 
     def test_the_generate_only_handoff_applies_the_crds_before_the_apply(self):
         # lifecycle.sh applies no CRDs; on an existing install a field the

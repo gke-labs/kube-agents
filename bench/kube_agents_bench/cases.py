@@ -39,7 +39,14 @@ from typing import Any
 
 import yaml
 
-__all__ = ["TRANSPORT_BLIND_CHECK_TYPES", "CaseSpec", "CaseSpecError", "load_case"]
+__all__ = [
+    "TRACE_GRADABLE_CHECK_TYPES",
+    "TRANSPORT_BLIND_CHECK_TYPES",
+    "WORKER_BLIND_CHECK_TYPES",
+    "CaseSpec",
+    "CaseSpecError",
+    "load_case",
+]
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out
@@ -51,13 +58,30 @@ NOOP_DEPLOYER = "noop"
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
 # ``worker_commands`` the delegated cards' worker logs, ``worker_agents`` the
 # ``agent`` tags the harness puts on the workers' trajectory entries. On the
-# inject transport none has a subject -- the record's trajectory is the
-# task's lifecycle envelope, and there are no card ids to read logs by -- so
-# the scorer reports such a check as not applicable there rather than failed
-# or errored (``scoring.py``, the inject lane). Recorded per entry NAME,
-# because the report devops-bench writes carries the entry's name and not
-# its check type.
-TRANSPORT_BLIND_CHECK_TYPES = frozenset({"tool_called", "worker_commands", "worker_agents"})
+# inject transport they are blind in two different ways, and the scorer
+# sets each aside under its own condition (``scoring.py``, the inject lane).
+# ``tool_called`` in its default ``router`` scope reads the delegating
+# turn's own calls, which the door's trace carries once the executor
+# publishes it (the transport then writes an ``a2a.activity`` marker), so
+# it is set aside only on a record without the marker. ``worker_commands``
+# and ``worker_agents``, and ``tool_called`` in the ``workers`` or ``all``
+# scope, read the delegated cards' logs and the workers' tagged entries,
+# which the trace does not carry -- it holds calls without their results,
+# so no card id can be read from it, and no worker session is read on this
+# path -- so they are set aside on every inject record, marker or not. A
+# check is reported as not applicable there rather than failed or errored.
+# Recorded per entry NAME, because the report devops-bench writes carries
+# the entry's name and not its check type.
+TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
+WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents"})
+TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
+# ``tool_called``'s scope key and the one scope the door's trace serves
+# (``verifiers.ToolCalledVerifier``: ``router`` is the default).
+_TOOL_CALLED_SCOPE_KEY = "scope"
+_TOOL_CALLED_ROUTER_SCOPE = "router"
+# The compound type that negates its children ("none of these tools was
+# called"), which is how a safeguard against a forbidden call is written.
+_NEGATED_COMPOUND_TYPE = "none"
 
 # The keys a check subtree nests children under: compound nodes carry
 # ``checks``; a single wrapped child would be ``check``.
@@ -114,43 +138,114 @@ class CaseSpec:
     and setting the entry aside would hide that failure, so it grades as it
     always has and fails on the inject transport the way it did before.
     Empty for a task with no such check; never consulted for a record on the
-    api transport."""
+    api transport. The union of the two sets below."""
+
+    trace_blind_checks: frozenset[str] = frozenset()
+    """The entries in ``transport_blind_checks`` whose every leaf is a
+    ``tool_called`` in the ``router`` scope: blind only on an inject record
+    whose door showed no tool-call trace (no ``a2a.activity`` marker), and
+    graded in full on one that did."""
+
+    negated_trace_blind_checks: frozenset[str] = frozenset()
+    """The entries in ``trace_blind_checks`` whose every leaf sits under an
+    odd number of ``none`` compounds: "this tool was never called". A
+    failed one is positive evidence -- the trace shows the forbidden call
+    -- so on a record whose door showed the trace the scorer keeps it
+    graded even when the marker reports a loss; a loss makes such a check's
+    pass uncertain, never its fail. A ``none`` under a ``none`` undoes the
+    negation and is not in the set: that check fails on an absence, which
+    a lossy trace cannot vouch for."""
+
+    worker_blind_checks: frozenset[str] = frozenset()
+    """The entries in ``transport_blind_checks`` with any leaf that reads the
+    delegated workers -- ``worker_commands``, ``worker_agents``, or a
+    ``tool_called`` in the ``workers`` or ``all`` scope. Blind on every
+    inject record, trace or none: the trace carries no results, so no card
+    id can be read from it, and no worker session is read on that path. A
+    compound mixing such a leaf with a router-scope ``tool_called`` lands
+    here, not in ``trace_blind_checks``: its worker leaf would still error
+    with the trace shown, and grading the compound would block on it."""
 
 
-def _leaves(node: Any) -> list[str]:
-    """The ``type`` of every leaf check in a subtree, in order."""
+def _leaves(node: Any) -> list[dict[str, Any]]:
+    """Every leaf check in a subtree, in order (a leaf that is not a mapping
+    is kept as an empty one, so it counts as a leaf of no type)."""
     if isinstance(node, dict):
         children = [node.get(key) for key in _CHECK_CHILD_KEYS if node.get(key) is not None]
         if not children:
-            return [str(node.get("type") or "")]
+            return [node]
         return [leaf for child in children for leaf in _leaves(child)]
     if isinstance(node, list):
         return [leaf for item in node for leaf in _leaves(item)]
-    return []
+    return [{}]
 
 
-def _every_leaf_transport_blind(node: Any) -> bool:
-    """Whether a check subtree's leaves are all of a transport-blind type."""
-    leaves = _leaves(node)
-    return bool(leaves) and all(leaf in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves)
+def _reads_the_workers(leaf: dict[str, Any]) -> bool:
+    """Whether a transport-blind leaf reads the delegated workers rather than
+    the delegating turn's own calls: a worker type, or a ``tool_called``
+    outside the ``router`` scope."""
+    kind = str(leaf.get("type") or "")
+    if kind in WORKER_BLIND_CHECK_TYPES:
+        return True
+    scope = leaf.get(_TOOL_CALLED_SCOPE_KEY)
+    return kind in TRACE_GRADABLE_CHECK_TYPES and scope not in (None, _TOOL_CALLED_ROUTER_SCOPE)
 
 
-def _transport_blind_checks(spec: Any) -> frozenset[str]:
-    """The names of the spec's entries whose every leaf is transport-blind.
+def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:
+    """Whether every leaf of a check subtree sits under an odd number of
+    ``none`` compounds, so the check as a whole FAILS only when a named
+    call is present in the trajectory.
+
+    One ``none`` over leaves, or over ``any``/``all`` of leaves, negates
+    them; a ``none`` under a ``none`` undoes it, and that check's fail means
+    a call is absent, which a lossy trace cannot vouch for. A subtree with
+    no leaf negates nothing.
+    """
+    if isinstance(node, dict):
+        children = [node.get(key) for key in _CHECK_CHILD_KEYS if node.get(key) is not None]
+        if not children:
+            return negations % 2 == 1
+        if node.get("type") == _NEGATED_COMPOUND_TYPE:
+            negations += 1
+        return all(_negates_every_leaf(child, negations=negations) for child in children)
+    if isinstance(node, list):
+        return bool(node) and all(_negates_every_leaf(item, negations=negations) for item in node)
+    return False
+
+
+def _transport_blind_checks(
+    spec: Any,
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """The names of the spec's entries whose every leaf is transport-blind,
+    split into the trace-gradable ones, the ``none``-compound subset of
+    those, and the worker-reading ones.
 
     An entry without a ``name`` cannot be matched to its report line and is
     left out: the scorer then grades it as it always has, which fails closed
     rather than silently.
     """
+    trace: set[str] = set()
+    negated: set[str] = set()
+    workers: set[str] = set()
     if not isinstance(spec, list):
-        return frozenset()
-    names: set[str] = set()
+        return frozenset(), frozenset(), frozenset()
     for entry in spec:
         if not isinstance(entry, dict) or entry.get("name") is None:
             continue
-        if _every_leaf_transport_blind(entry.get("check")):
-            names.add(str(entry["name"]))
-    return frozenset(names)
+        check = entry.get("check")
+        leaves = _leaves(check)
+        if not leaves or not all(
+            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves
+        ):
+            continue
+        name = str(entry["name"])
+        if any(_reads_the_workers(leaf) for leaf in leaves):
+            workers.add(name)
+            continue
+        trace.add(name)
+        if _negates_every_leaf(check):
+            negated.add(name)
+    return frozenset(trace), frozenset(negated), frozenset(workers)
 
 
 def _coerce_bool(value: Any, *, field: str, path: Path) -> bool:
@@ -241,6 +336,8 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     name_raw = doc.get("name")
     name = str(name_raw).strip() if name_raw is not None else case_id
 
+    trace_blind, negated_trace_blind, worker_blind = _transport_blind_checks(spec)
+
     return CaseSpec(
         case_id=case_id,
         name=name,
@@ -249,5 +346,8 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         declares_verification_spec=declares_spec,
         expected_fail=expected_fail,
         path=path,
-        transport_blind_checks=_transport_blind_checks(spec),
+        transport_blind_checks=trace_blind | worker_blind,
+        trace_blind_checks=trace_blind,
+        negated_trace_blind_checks=negated_trace_blind,
+        worker_blind_checks=worker_blind,
     )

@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -2667,7 +2667,7 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
 
 
 class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
-    """The three SCOPE_* keys become the composition's `scope` object.
+    """The five SCOPE_* keys become the composition's `scope` object.
 
     Always a full block, empty lists included: the reconcile reads an emptied
     projects list as the declaration that drops projects and a missing block as
@@ -2683,7 +2683,9 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     EMPTY_BLOCK = (
         "scope = {\n"
-        "  projects = []\n"
+        "  projects      = []\n"
+        "  folders       = []\n"
+        "  organizations = []\n"
         "  exclude = {\n"
         "    projects = []\n"
         "    clusters = []\n"
@@ -2692,8 +2694,8 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
     )
 
     def _scope_env(self, **keys):
-        env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
-               "SCOPE_EXCLUDE_CLUSTERS": ""}
+        env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+               "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
         env.update(keys)
         return env
 
@@ -2704,12 +2706,16 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
     def test_the_keys_are_carried_verbatim_into_the_block(self):
         content = self._tfvars(self._scope_env(
             SCOPE_PROJECTS="payments-prod, payments-staging",
+            SCOPE_FOLDERS="123456789012 210987654321",
+            SCOPE_ORGANIZATIONS="987654321098",
             SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
             SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
         ))
         self.assertIn(
             "scope = {\n"
-            '  projects = ["payments-prod", "payments-staging"]\n'
+            '  projects      = ["payments-prod", "payments-staging"]\n'
+            '  folders       = ["123456789012", "210987654321"]\n'
+            '  organizations = ["987654321098"]\n'
             "  exclude = {\n"
             '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
             '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
@@ -2751,6 +2757,21 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
                 self.assertFalse(dest.exists(), "no tfvars is written for an entry the block cannot render")
                 self.assertFalse((pathlib.Path(out_dir) / "terraform.tfvars.tmp").exists())
 
+    def test_a_container_id_that_is_not_a_bare_number_is_refused_before_the_file_is_written(self):
+        # A folders/<id> spelling would otherwise reach terraform's variable
+        # validation with a message naming neither the key nor the entry.
+        for key, bad in (("SCOPE_FOLDERS", "folders/123456789012"), ("SCOPE_ORGANIZATIONS", "organizations/1"),
+                         ("SCOPE_FOLDERS", "my-folder"), ("SCOPE_ORGANIZATIONS", "123456789012345678901")):
+            with self.subTest(key=key, entry=bad), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=self._scope_env(**{key: f"123456789012, {bad}"}),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(f"{key} entry '{bad}' is not a numeric Resource Manager ID", proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists())
+
 
 _LIVE_SCOPE_CR = (
     '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p3-project","p2-project"],'
@@ -2758,6 +2779,8 @@ _LIVE_SCOPE_CR = (
 )
 _LIVE_SCOPE_LINES = (
     'SCOPE_PROJECTS="p2-project p3-project"',
+    'SCOPE_FOLDERS=""',
+    'SCOPE_ORGANIZATIONS=""',
     'SCOPE_EXCLUDE_PROJECTS=""',
     'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
 )
@@ -2824,7 +2847,8 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 path = bin_dir / stub
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
-                   "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+                   "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
             env.update(keys or {})
             body = (
                 "set -u\n"
@@ -2909,22 +2933,46 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
 
-    def test_containers_on_the_live_cr_are_reported_and_never_weighed(self):
-        # folders and organizations (phase 2) have no installer key and the
-        # chart renders neither, so an apply leaves them alone: a CR carrying
-        # only containers passes with a note, and a refused mixed edit still
-        # prints the three lines it can reproduce plus the note.
+    def test_a_hand_declared_container_is_protected_like_a_project(self):
+        # The chart renders folders and organizations now, so an apply over a
+        # CR that carries one the record and the keys do not is the same
+        # silent replace as for a project: refused, with the two lines that
+        # reproduce it, and passed once the keys carry it.
         only_containers = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"folders":["123456789012"],'
                            '"organizations":["987654321098"]}}}]}')
         proc = self._run(only_containers, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_FOLDERS="123456789012"', proc.stdout)
+        self.assertIn('INFO:   SCOPE_ORGANIZATIONS="987654321098"', proc.stdout)
+        proc = self._run(only_containers, "norelease",
+                         keys={"SCOPE_FOLDERS": "123456789012", "SCOPE_ORGANIZATIONS": "987654321098"})
         self._assert_rc(proc, 0)
-        self.assertIn("also declares folders: 123456789012 organizations: 987654321098, which the installer has no key for yet", proc.stdout)
+        # A record that carries the folder makes the keys the new declaration,
+        # dropping it included.
+        record = ('{"platformAgent":{"scope":{"projects":[],"folders":["123456789012"],"organizations":["987654321098"],'
+                  '"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_containers, record), 0)
+        # And a record from before the chart rendered the lists (no folders
+        # key) does not account for a folder the CR carries.
+        older = '{"platformAgent":{"scope":{"projects":[],"exclude":{"projects":[],"clusters":[]}}}}'
+        self._assert_rc(self._run(only_containers, older), 1)
+
+    def test_selectors_on_the_live_cr_are_reported_and_never_weighed(self):
+        # sharedVpcHosts and metricsScopes (phase 3) have no installer key and
+        # the chart renders neither, so an apply leaves them alone: a CR
+        # carrying only selectors passes with a note, and a refused mixed edit
+        # still prints the lines it can reproduce plus the note.
+        only_selectors = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"sharedVpcHosts":["shared-net-host"],'
+                          '"metricsScopes":["observability-hub"]}}}]}')
+        proc = self._run(only_selectors, "norelease")
+        self._assert_rc(proc, 0)
+        self.assertIn("also declares sharedVpcHosts: shared-net-host metricsScopes: observability-hub, which the installer has no key for yet", proc.stdout)
         mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
-                 '"folders":["123456789012"]}}}]}')
+                 '"sharedVpcHosts":["shared-net-host"]}}}]}')
         proc = self._run(mixed, "norelease")
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
-        self.assertIn("also declares folders: 123456789012, which the installer has no key for yet", proc.stdout)
+        self.assertIn("also declares sharedVpcHosts: shared-net-host, which the installer has no key for yet", proc.stdout)
 
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.
@@ -2987,6 +3035,407 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 proc = self._run(cr, record, mode="warn")
                 self._assert_rc(proc, 0)
                 self.assertIn("WARN: The scope check did not run:", proc.stdout)
+
+
+# Every variable the preflight's token minting, or the gcloud that does it,
+# reads from the environment; blanked in the test environment and set per case.
+_GOOGLE_CREDENTIAL_VARIABLES = (
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_OAUTH_ACCESS_TOKEN", "GOOGLE_CREDENTIALS",
+    "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON", "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
+)
+
+
+class ScopeContainerPreflightTest(unittest.TestCase):
+    """check_scope_container_access: silent with no container; with one, the
+    Asset API must be enabled in the host project or no effective policy may
+    deny it, and the applying identity must hold setIamPolicy on every
+    container, asked through testIamPermissions. Every failure is named
+    before the refusal; a probe that cannot decide warns and lets the apply
+    speak; "warn" turns the refusal into a warning."""
+
+    def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False):
+        """probe: a dict from resource ("folders/1") to what curl answers:
+        "granted", "denied", "forbidden", "service-disabled", "missing",
+        "garbage", "down". The stubs record what they saw in a log the test
+        folds into proc.stderr: the bearer curl read from its stdin (-H @-),
+        the impersonation flag gcloud saw, the first bytes of a key file it
+        was pointed at, and any CLOUDSDK_AUTH_* override that reached it."""
+        probe = probe or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            policy_json = "<not json>" if policy_garbage else json.dumps(policy or {"spec": {"rules": []}})
+            services = "cloudasset.googleapis.com" if api_enabled else ""
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"services list"*) printf "%s\\n" "{services}"; exit 0 ;;\n'
+                + ('  *"org-policies describe"*) echo "ERROR: PERMISSION_DENIED" >&2; exit 1 ;;\n' if policy_error else
+                   f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
+                # Terraform's credentials, not gcloud's active account: the stub
+                # answers the ADC form and refuses the plain one.
+                + ('  *"application-default print-access-token"*) [ -z "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}${CLOUDSDK_AUTH_ACCESS_TOKEN:-}${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-}${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ] || echo "CLOUDSDK-LEAKED" >>"$SCOPE_PROBE_LOG"; [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] || echo "KEYFILE-BYTES:$(head -c 12 "$GOOGLE_APPLICATION_CREDENTIALS" | tr -d "\\n")" >>"$SCOPE_PROBE_LOG"; echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
+                   '  *"application-default print-access-token"*) exit 1 ;;\n')
+                # The raw-token form: only right with a source token in
+                # CLOUDSDK_AUTH_ACCESS_TOKEN and the impersonation flag.
+                + '  *"auth print-access-token"*"--impersonate-service-account="*) echo "imp-from-${CLOUDSDK_AUTH_ACCESS_TOKEN:-none}"; echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG"; exit 0 ;;\n'
+                + '  *"auth print-access-token"*) echo "wrong-identity"; exit 0 ;;\n'
+                + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
+                # gcloud configuration properties: `config get-value` reports the
+                # effective value, so a CLOUDSDK_AUTH_* variable wins over the
+                # configuration file, as in the real binary; the file's value is
+                # set per case through STUB_PROPERTY_*.
+                + '  *"config get-value auth/impersonate_service_account"*) echo "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-${STUB_PROPERTY_IMPERSONATE:-}}"; exit 0 ;;\n'
+                + '  *"config get-value auth/access_token_file"*) echo "${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-${STUB_PROPERTY_TOKEN_FILE:-}}"; exit 0 ;;\n'
+                "esac\nexit 1\n"
+            )
+            if curl_present:
+                cases = []
+                for resource, answer in probe.items():
+                    body, status = {
+                        "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
+                        "denied": ("{}", 200),
+                        "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
+                        "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
+                        "scope-insufficient": ('{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}', 403),
+                        "missing": ('{"error":{"code":404}}', 404),
+                        "garbage": ("<html>", 200),
+                        "down": ("", None),
+                    }[answer]
+                    if status is None:
+                        cases.append(f'  *"/{resource}:testIamPermissions"*) exit 7 ;;')
+                    else:
+                        cases.append(f"  *\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
+                # Records the bearer read from the header file, and refuses a
+                # token on argv, before answering.
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
+            # env is an external binary whose argv any local user can read: the
+            # stub records what it was handed, then hands over to the real one.
+            (bin_dir / "env").write_text(
+                "#!/usr/bin/env bash\n"
+                'echo "ENV-ARGV:$*" >>"$SCOPE_PROBE_LOG"\n'
+                'exec /usr/bin/env "$@"\n'
+            )
+            for stub in ("gcloud", "env") + (("curl",) if curl_present else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            # The library discards the stubs' stderr, so what they saw is
+            # recorded in a file the test reads back into proc.stderr.
+            probe_log = pathlib.Path(tmp) / "probe.log"
+            probe_log.write_text("")
+            # Hermetic: the library and the gcloud stub read the provider's and
+            # gcloud's credential variables straight from the environment, so a
+            # developer's shell must not reach them; each case sets its own.
+            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_PROBE_LOG": str(probe_log)}
+            env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
+            env.update(keys or {})
+            env.update(env_extra or {})
+            # strict: the front doors' shell options and ERR trap, under which
+            # upgrade.sh --plan calls the check bare (no `|| exit 1`), so a probe
+            # answering "denied" must not read as an error.
+            call = (f'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; check_scope_container_access {mode}; echo "rc=$?"\n'
+                    if strict else f'check_scope_container_access {mode}; echo "rc=$?"\n')
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                + call
+            )
+            # For a curl-absent run PATH is the stubs plus a minimal toolbox
+            # (bash, coreutils, python3), so the real curl is not found behind it.
+            isolated = get_isolated_test_env(overrides=env, bin_dir=str(bin_dir))
+            if not curl_present:
+                tools = create_minimal_tools_bin(pathlib.Path(tmp) / "tools")
+                (tools / "python3").symlink_to(shutil.which("python3"))
+                isolated["PATH"] = f"{bin_dir}:{tools}"
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=isolated, cwd=str(_REPO_ROOT))
+            proc.stderr += probe_log.read_text()
+            return proc
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_no_container_is_silent_and_touches_nothing(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, api_enabled=False, policy_error=True, token=False)
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+
+    def test_a_bindable_folder_with_the_api_enabled_passes_silently(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_every_unbindable_container_is_named_before_the_refusal(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111, 222222222222", "SCOPE_ORGANIZATIONS": "333333333333"},
+                         probe={"folders/111111111111": "denied", "folders/222222222222": "granted",
+                                "organizations/333333333333": "missing"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111 (resourcemanager.folders.setIamPolicy)", proc.stdout)
+        self.assertIn("for that identity, or drop it from SCOPE_FOLDERS", proc.stdout)
+        self.assertIn("cannot set IAM policy on organizations/333333333333 (resourcemanager.organizations.setIamPolicy)", proc.stdout)
+        self.assertNotIn("folders/222222222222 (", proc.stdout)
+        self.assertIn("INFO: Nothing was changed.", proc.stdout)
+        # An organisation is always warned about, bindable or not.
+        self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_the_probe_uses_the_credentials_the_provider_would(self):
+        # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
+        # through gcloud's flag; a key file or inline key JSON in
+        # GOOGLE_CREDENTIALS through GOOGLE_APPLICATION_CREDENTIALS; and the
+        # token reaches curl on its stdin, never argv and never a file.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        probe = {"folders/123456789012": "granted"}
+        proc = self._run(keys=base, probe=probe)
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertRegex(proc.stderr, r"IMPERSONATED:.*tf@p\.iam\.gserviceaccount\.com")
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        # gcloud's own overrides in the operator's shell reach neither the mint
+        # nor the property read that guards it: the provider does not read
+        # them, and `config get-value` would otherwise report them as a
+        # property the operator never set.
+        for var in ("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+                    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"):
+            with self.subTest(var=var):
+                proc = self._run(keys=base, probe=probe, env_extra={var: "other@p.iam.gserviceaccount.com"})
+                self._assert_rc(proc, 0)
+                self.assertIn("BEARER:tok\n", proc.stderr)
+                self.assertNotIn("CLOUDSDK-LEAKED", proc.stderr)
+                self.assertNotIn("active configuration sets", proc.stdout)
+        # A raw token plus impersonation: the token is the source credential
+        # and the probe is made as the impersonated account, as the provider
+        # does, never as the raw token's identity.
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env",
+                                                            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertIn("BEARER:imp-from-from-env\n", proc.stderr)
+        self.assertNotIn("BEARER:from-env\n", proc.stderr)
+        # The source token reaches gcloud through the environment, never on
+        # env's argv, which any local user can read.
+        self.assertIn("ENV-ARGV:", proc.stderr)
+        for line in proc.stderr.splitlines():
+            if line.startswith("ENV-ARGV:"):
+                self.assertNotIn("from-env", line)
+                self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN=", line)
+        # A tilde path is a key file to the provider (its pathOrContents
+        # expands the home directory), so it is one here too.
+        with tempfile.TemporaryDirectory() as home:
+            (pathlib.Path(home) / "sa.json").write_text("{}")
+            proc = self._run(keys=base, probe=probe, env_extra={"HOME": home, "GOOGLE_CREDENTIALS": "~/sa.json"})
+            self._assert_rc(proc, 0)
+            self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
+            self.assertIn("KEYFILE-BYTES:{}", proc.stderr)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+            key.write("{}")
+        self.addCleanup(pathlib.Path(key.name).unlink)
+        for var in ("GOOGLE_CREDENTIALS", "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON"):
+            for creds in (key.name, '{"type":"service_account"}', '\n  {"type":"service_account"}', "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50In0="):
+                with self.subTest(var=var, creds=creds[:12]):
+                    proc = self._run(keys=base, probe=probe, env_extra={var: creds})
+                    self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
+                    self._assert_rc(proc, 0)
+                    # An inline value reaches gcloud byte for byte, whatever it
+                    # starts with: the provider's rule is "an existing path,
+                    # else JSON", never the first byte.
+                    if creds != key.name:
+                        self.assertIn("KEYFILE-BYTES:" + creds[:12].replace("\n", ""), proc.stderr)
+        # The bearer reaches curl on stdin, never through a file or argv.
+        self.assertNotIn("BEARER-FROM-FILE", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+
+    def test_a_refusal_names_the_identity_it_probed(self):
+        # A denied probe under a key file sends the operator to that key's
+        # account, not to their ADC principal; the remedy for a token that
+        # could not be minted names the source that failed.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        denied = {"folders/123456789012": "denied"}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+            key.write("{}")
+        self.addCleanup(pathlib.Path(key.name).unlink)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_CREDENTIALS": '{"type":"service_account"}'})
+        self._assert_rc(proc, 1)
+        self.assertIn("the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "t",
+                                                              "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertIn("the identity behind GOOGLE_OAUTH_ACCESS_TOKEN impersonating tf@p.iam.gserviceaccount.com (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
+        # A path that does not exist: gcloud is handed it as key JSON (the
+        # provider's rule), mints nothing, and the remedy names the variable
+        # and says the file is missing, without printing the value.
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CREDENTIALS": "/nonexistent/key.json"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope container preflight could not decide whether the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_CREDENTIALS is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+        self.assertNotIn("/nonexistent/key.json", proc.stdout)
+        self.assertNotIn("application-default login", proc.stdout)
+        # A key that gcloud refuses: the remedy names the key, not ADC, and
+        # never prints it, whatever byte the key starts with.
+        for creds in ('{"type":"service_account"}', '\n{"type":"service_account","private_key":"SECRET-BYTES"}', "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50In0="):
+            with self.subTest(creds=creds[:10]):
+                proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CLOUD_KEYFILE_JSON": creds})
+                self.assertIn("(GOOGLE_CLOUD_KEYFILE_JSON is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+                self.assertNotIn("SECRET-BYTES", proc.stdout + proc.stderr)
+                self.assertNotIn("eyJ0eXBl", proc.stdout)
+        # ADC, no token: the ADC remedy; with GOOGLE_APPLICATION_CREDENTIALS
+        # set, the remedy and the label name that variable instead, because
+        # the login the plain remedy suggests writes a file the variable
+        # overrides.
+        proc = self._run(keys=base, probe=denied, token=False)
+        self.assertIn("run: gcloud auth application-default login", proc.stdout)
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": "/nonexistent/adc.json"})
+        self.assertIn("whether the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way)", proc.stdout)
+        self.assertNotIn("application-default login", proc.stdout)
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
+        self.assertIn("(the key file GOOGLE_APPLICATION_CREDENTIALS names could not mint a token; check it is a valid service-account key, or unset the variable to use the login credentials)", proc.stdout)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
+        self._assert_rc(proc, 1)
+        self.assertIn("the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
+
+    def test_a_gcloud_impersonation_property_makes_the_probe_undecided(self):
+        # gcloud config set auth/impersonate_service_account lives in the
+        # active configuration, out of env -u's reach, and a mint under it
+        # answers for an identity Terraform never uses: undecided, naming the
+        # property, unless GOOGLE_IMPERSONATE_SERVICE_ACCOUNT overrides it
+        # explicitly or no gcloud mint is made at all.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        probe = {"folders/123456789012": "granted"}
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com"})
+        self._assert_rc(proc, 0)
+        self.assertIn("gcloud's active configuration sets auth/impersonate_service_account, which its token mint honours and Terraform does not", proc.stdout)
+        self.assertNotIn("BEARER:", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_TOKEN_FILE": "/tmp/t"})
+        self.assertIn("sets auth/access_token_file,", proc.stdout)
+        # Both set: both named.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "x@p.iam.gserviceaccount.com", "STUB_PROPERTY_TOKEN_FILE": "/tmp/t"})
+        self.assertIn("sets auth/impersonate_service_account auth/access_token_file,", proc.stdout)
+        # An explicit GOOGLE_IMPERSONATE_SERVICE_ACCOUNT overrides the impersonation property: the probe runs.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com",
+                                                            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self._assert_rc(proc, 0)
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("active configuration sets", proc.stdout)
+        # A raw token with no impersonation makes no gcloud mint: the property is irrelevant.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com",
+                                                            "GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+        self.assertNotIn("active configuration sets", proc.stdout)
+
+    def test_a_403_for_a_disabled_api_is_undecided_not_denied(self):
+        # Resource Manager answers 403 with reason SERVICE_DISABLED when its
+        # API is off in the credential's quota project; the apply enables it
+        # before binding, so this is not a permission answer, and the warning
+        # says why.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "service-disabled"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/123456789012 (Resource Manager answered 403 for its API being off in the credentials' quota project, which the apply enables before it binds)", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_403_for_an_insufficiently_scoped_token_names_the_scope_not_a_grant(self):
+        # A raw token minted without cloud-platform gets 403
+        # ACCESS_TOKEN_SCOPE_INSUFFICIENT; the role may be held, so the
+        # remedy is the token's scope, never "ask for folderIamAdmin".
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "scope-insufficient"},
+                         env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "narrow"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether the identity behind GOOGLE_OAUTH_ACCESS_TOKEN (the identity Terraform applies with) can set IAM policy on folders/123456789012 (the token lacks the cloud-platform scope; mint it with that scope, as gcloud does)", proc.stdout)
+        self.assertNotIn("folderIamAdmin", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        # The other undecided answers carry their reason too.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222"},
+                         probe={"folders/111111111111": "down", "folders/222222222222": "garbage"})
+        self.assertIn("folders/111111111111 (the request to Resource Manager did not complete)", proc.stdout)
+        self.assertIn("folders/222222222222 (Resource Manager answered 200 with a body that is not the JSON it documents)", proc.stdout)
+
+    def test_a_403_is_a_refusal_and_a_transport_failure_is_a_warning(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222 333333333333"},
+                         probe={"folders/111111111111": "forbidden", "folders/222222222222": "down",
+                                "folders/333333333333": "garbage"})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("WARN: The scope container preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/222222222222", proc.stdout)
+        self.assertIn("can set IAM policy on folders/333333333333", proc.stdout)
+
+    def test_a_policy_that_denies_the_api_is_named_when_the_api_is_off(self):
+        for label, policy in (
+            ("deniedValues", {"spec": {"rules": [{"values": {"deniedValues": ["cloudasset.googleapis.com"]}}]}}),
+            ("allowedValues without it", {"spec": {"rules": [{"values": {"allowedValues": ["container.googleapis.com"]}}]}}),
+            ("denyAll", {"spec": {"rules": [{"denyAll": True}]}}),
+        ):
+            with self.subTest(policy=label):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False, policy=policy,
+                                 probe={"folders/123456789012": "granted"})
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: cloudasset.googleapis.com cannot be enabled in project 'test-project': the effective organisation policy constraints/gcp.restrictServiceUsage denies it", proc.stdout)
+        # The API already on: the policy is never consulted.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=True,
+                         policy={"spec": {"rules": [{"denyAll": True}]}}, probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        # The API off and no policy denying it: fine, the apply enables it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                         policy={"spec": {"rules": [{"values": {"allowedValues": ["cloudasset.googleapis.com"]}}]}},
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        # A dry-run policy enforces nothing: an organisation trialling the
+        # constraint must not be refused for it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                         policy={"dryRunSpec": {"rules": [{"denyAll": True}]}},
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("denies it", proc.stdout)
+
+    def test_an_unreadable_policy_warns_and_lets_the_apply_speak(self):
+        # Unreadable two ways: gcloud fails, or gcloud exits 0 with a body the
+        # reader cannot parse. Neither is "not denied"; both warn, like the
+        # IAM probe's undocumented body does.
+        for kwargs in ({"policy_error": True}, {"policy_garbage": True}):
+            with self.subTest(**kwargs):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                                 probe={"folders/123456789012": "granted"}, **kwargs)
+                self._assert_rc(proc, 0)
+                self.assertIn("WARN: The scope container preflight could not decide whether cloudasset.googleapis.com can be enabled in project 'test-project'", proc.stdout)
+                self.assertNotIn("ERROR", proc.stdout)
+
+    def test_no_token_or_no_curl_warns_about_the_containers_and_passes(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, token=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("gcloud could not mint an access token for them; run: gcloud auth application-default login", proc.stdout)
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, curl_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("curl is not installed", proc.stdout)
+
+    def test_a_denied_probe_is_an_answer_under_the_front_doors_strict_shell(self):
+        # upgrade.sh --plan calls the check bare under set -eE with an ERR
+        # trap; a probe that answers denied, or a policy read that says the
+        # API is forbidden, must reach the warning rather than abort the run.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222"}, mode="warn", strict=True,
+                         api_enabled=False, policy={"spec": {"rules": [{"denyAll": True}]}},
+                         probe={"folders/111111111111": "denied", "folders/222222222222": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
+        self.assertIn("WARN: An applying run would be refused: cloudasset.googleapis.com cannot be enabled", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("can set IAM policy on folders/222222222222", proc.stdout)
+        # And a clean run under the same options is silent.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111"}, strict=True, probe={"folders/111111111111": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+
+    def test_warn_mode_names_the_failures_and_passes(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, mode="warn", probe={"folders/123456789012": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -111,6 +111,17 @@ VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
+# The first commit a GitOps repository needs before the broker can open a
+# remediation branch in it: an empty repository has no default branch to
+# resolve a base from (gitops_workspace.GitOpsRepoEmpty). The pool's early
+# projects got this commit from the agent itself, which then held a local
+# clone with the write credential; writes now go through the broker,
+# fast-forward only, so nothing downstream can make it. Provisioning does,
+# and this check fails a project whose repository still has none.
+GITOPS_SEED_FILE = "README.md"
+GITOPS_SEED_MESSAGE = "Initial commit"
+GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
+
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
 # minter GSA is kubeagents-github-minter in the kubeagents-system namespace.
@@ -294,6 +305,37 @@ PROW_RUNNER_ROLES = {
     "roles/storage.admin",
     "roles/viewer",
 }
+
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py,
+# two Prow periodics on main; docs/ci-pool-projects.md section 6.2). It
+# re-applies bench/tf/fleet under a Boskos lease, so it holds what that apply
+# needs on the project, list on the state bucket and objectAdmin under its
+# seeded-fleet/ prefix, nothing else. The prefix keeps tofu's own reads off the
+# host cluster's state, which shares the bucket and carries the install's
+# secrets; it is not a fence against the identity, which holds project IAM
+# admin (the stack declares project bindings) and could widen its own grant.
+# What bounds the identity is that only main-only jobs run as it; the
+# presubmit's runner is never granted the job. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
+FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
+FLEET_RECONCILER_ROLES = {
+    "roles/compute.storageAdmin",
+    "roles/compute.viewer",
+    "roles/container.admin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/serviceusage.serviceUsageConsumer",
+}
+# On gs://<project>-tf-state, where the fleet's state lives beside the host
+# cluster's: list on the bucket (`tofu init` lists it, which a grant conditioned
+# on the object name does not cover) and objectAdmin conditioned to the fleet's
+# prefix. Named for the repair text; the bucket's policy is not read here, so
+# the reconcile's own first run is what reports either missing.
+FLEET_RECONCILER_BUCKET_LIST_ROLE = "roles/storage.legacyBucketReader"
+FLEET_RECONCILER_BUCKET_ROLE = "roles/storage.objectAdmin"
+FLEET_RECONCILER_STATE_PREFIX = "seeded-fleet/"
 
 # The agent's own identity, checked in both directions -- a missing role fails
 # and so does an extra one, unlike the Prow runner above. That account is
@@ -817,7 +859,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, both runners' and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, the runners', the reconciler's and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
@@ -909,6 +951,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
             f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
+            "the seeded-fleet reconciler's roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -921,6 +964,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             runner_held = {member: set() for _, _, member in RUNNERS}
+            reconciler_held = set()
             platform_held = set()
             litellm_held = set()
             public_held = set()
@@ -947,6 +991,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     platform_held.add(b.get("role"))
                 if litellm_member in members:
                     litellm_held.add(b.get("role"))
+                if FLEET_RECONCILER_MEMBER in members:
+                    reconciler_held.add(b.get("role"))
 
             for label, job, member in RUNNERS:
                 missing = PROW_RUNNER_ROLES - runner_held[member]
@@ -958,6 +1004,18 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         f"{job[0].upper()}{job[1:]} authenticates as this account after leasing the "
                         "project, so it will fail on the first gcloud call rather than at registration"
                     )
+
+            reconciler_missing = FLEET_RECONCILER_ROLES - reconciler_held
+            if reconciler_missing:
+                passed = False
+                details.append(
+                    f"The seeded-fleet reconciler ({FLEET_RECONCILER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"{len(reconciler_missing)} role(s) on {project_id}: {', '.join(sorted(reconciler_missing))}. "
+                    "Its scheduled re-apply of bench/tf/fleet fails here, so the fixtures drift unrepaired; "
+                    f"the grant loop is in docs/ci-pool-projects.md section 3, with {FLEET_RECONCILER_BUCKET_LIST_ROLE} "
+                    f"on the state bucket and {FLEET_RECONCILER_BUCKET_ROLE} under its {FLEET_RECONCILER_STATE_PREFIX} "
+                    "prefix, which this check does not read"
+                )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
@@ -1768,6 +1826,15 @@ def _fleet_presence_result(
     return CheckResult(name, False, "Seeded fleet incomplete", details=[counts, *notes])
 
 
+def gitops_seed_command(repo_slug: str) -> str:
+    """The one `gh api` call that gives an empty GitOps repository its first commit."""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_SEED_FILE} "
+        f"-f message='{GITOPS_SEED_MESSAGE}' "
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_SEED_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
 def check_github_repo_and_app(
     project_id: str, app_id: int, repo_membership_confirmed: bool = False
 ) -> CheckResult:
@@ -1788,15 +1855,27 @@ def check_github_repo_and_app(
     # treating the second as unverified would make this check unable to report
     # the first -- and a GitOps repository that was never created is exactly the
     # onboarding gap it exists to catch. The message names both readings instead.
-    rc, out, err = run_cmd(["gh", "repo", "view", repo_slug, "--json", "isPrivate,name"])
+    rc, out, err = run_cmd(
+        ["gh", "repo", "view", repo_slug, "--json", "isPrivate,name,defaultBranchRef"]
+    )
     if rc != 0:
         passed = False
         details.append(f"Repository {repo_slug} not found or inaccessible: {err.strip()}")
     else:
         try:
-            if not _load_json(out).get("isPrivate"):
+            repo_info = _load_json(out)
+            if not repo_info.get("isPrivate"):
                 passed = False
                 details.append(f"Repository {repo_slug} is not private")
+            # `defaultBranchRef` is null until the repository has a commit. The
+            # broker resolves its base branch from it, so an empty repository
+            # fails every remediation repetition on the project.
+            if repo_info.get("defaultBranchRef") is None:
+                passed = False
+                details.append(
+                    f"Repository {repo_slug} has no commits on any branch, so the broker "
+                    f"cannot open a remediation branch in it. Seed it: {gitops_seed_command(repo_slug)}"
+                )
         except Exception as exc:
             passed = False
             details.append(f"Failed parsing gh repo view: {exc}")

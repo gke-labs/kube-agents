@@ -72,9 +72,10 @@ type ScopeSpec struct {
 	// Folders lists GCP folder IDs (numeric) whose every project, at any depth,
 	// contributes its GKE clusters, resolved through Cloud Asset Inventory on each
 	// run. The agent's service account needs roles/cloudasset.viewer and the read
-	// roles on the folder, granted by hand: the install's Terraform binds the
-	// projects `projects` names and no folder yet; a folder it cannot read
-	// freezes its previous members and is reported with the reason.
+	// roles on the folder: the install's Terraform binds them from the same scope
+	// input that renders this block, and a CR edited by hand needs the same grants
+	// made by hand; a folder it cannot read freezes its previous members and is
+	// reported with the reason.
 	// +kubebuilder:validation:MaxItems=100
 	// +kubebuilder:validation:items:Pattern=`^[0-9]{1,20}$`
 	// +listType=set

@@ -64,6 +64,48 @@ def constants_block() -> str:
     return "\n".join(line for line in text(_CI_EVAL).splitlines() if line.startswith("readonly "))
 
 
+def lifted_between(start: str, stop: str, what: str) -> str:
+    """The text from the first line equal to `start` through the first line
+    equal to `stop` after it, both included."""
+    lines = text(_CI_EVAL).splitlines()
+    for index, line in enumerate(lines):
+        if line == start:
+            for end in range(index, len(lines)):
+                if lines[end] == stop:
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{what} not found in {_CI_EVAL}")
+
+
+def recorder_decision() -> str:
+    """EVAL_IS_MAIN_RUN, decided above the fan-out: the JOB_TYPE case and the
+    overrides after it, through the flag's."""
+    lines = text(_CI_EVAL).splitlines()
+    start = lines.index('case "${JOB_TYPE:-}" in')
+    for end in range(start, len(lines) - 2):
+        if (
+            lines[end] == 'if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then'
+            and lines[end + 1] == '  EVAL_IS_MAIN_RUN="false"'
+            and lines[end + 2] == "fi"
+        ):
+            return "\n".join(lines[start : end + 3])
+    raise AssertionError(f"the recorder decision not found in {_CI_EVAL}")
+
+
+def publisher_gate() -> str:
+    """publish_eval_dashboard(), as written."""
+    match = re.search(r"^publish_eval_dashboard\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"publish_eval_dashboard() not found in {_CI_EVAL}")
+    return match.group(0)
+
+
+def recorder_step_message() -> str:
+    """The record step after the fan-out: the if/elif/else that either
+    records or says why it did not."""
+    return lifted_between('if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then', "fi", "the record step")
+
+
 def constants() -> dict[str, str]:
     found = {}
     for line in text(_CI_EVAL).splitlines():
@@ -133,20 +175,29 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
                 self.assertEqual(len(calls), 1, calls)
                 self.assertIn("secret platform-agent-secrets", calls[0])
 
-    def test_the_flag_is_read_in_section_4_and_nowhere_else_in_the_eval_script(self) -> None:
-        """The header promises one site; a second reader is a second behaviour
-        under the flag that this test suite does not cover."""
+    def test_the_flag_is_read_in_section_4_the_recorder_and_the_publisher_and_nowhere_else(self) -> None:
+        """The header promises three places: section 4, the baseline recorder
+        (its decision and the log line at the record step) and the dashboard
+        publisher's gate. Another reader is another behaviour under the flag
+        that this test suite does not cover. The publisher's gate is run in
+        scripts/test_eval_dashboard_publish.py; the other three here."""
         script = text(_CI_EVAL)
         # Any spelling of an expansion (`${EVAL_MODE_NEXT...}` or bare `$EVAL_MODE_NEXT`),
-        # on a line that is not a comment; the two log lines that name the flag
-        # as text are not reads.
+        # on a line that is not a comment; the log lines that name the flag as
+        # text are not reads.
         reads = [
             m.start()
             for m in re.finditer(r"^[^#\n]*\$\{?EVAL_MODE_NEXT\b", script, re.MULTILINE)
         ]
-        self.assertEqual(len(reads), 1, "EVAL_MODE_NEXT is read at more than one site in hack/ci-eval-pr.sh")
+        self.assertEqual(len(reads), 4, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
+        publisher = script.index(publisher_gate())
+        self.assertTrue(publisher <= reads[0] < publisher + len(publisher_gate()))
         start = script.index(section())
-        self.assertTrue(start <= reads[0] < start + len(section()))
+        self.assertTrue(start <= reads[1] < start + len(section()))
+        decision = script.index(recorder_decision())
+        self.assertTrue(decision <= reads[2] < decision + len(recorder_decision()))
+        step = script.index(recorder_step_message())
+        self.assertTrue(step <= reads[3] < step + len(recorder_step_message()))
 
 
 class FlagSetIsInjectTest(unittest.TestCase):
@@ -208,6 +259,75 @@ class FlagSetIsInjectTest(unittest.TestCase):
         block = section()
         self.assertIn("export AGENT_INJECT_TOKEN", block)
         self.assertIn('export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"', block)
+
+
+class FlagSetNeverRecordsBaselineTest(unittest.TestCase):
+    """A flagged run never appends to the baseline store. The next lane's
+    periodic on main is JOB_TYPE=periodic with no PULL_NUMBER, exactly the
+    shape the recorder appends from, and VersionKey has no mode field, so its
+    samples would be today's once written. With the flag unset the decision
+    is what it was: main-branch job types record, a release candidate and
+    a pull request do not."""
+
+    def decide(self, mode_next: str | None, job_type: str, rc: str = "") -> str:
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                "unset EVAL_MODE_NEXT JOB_TYPE RC_COMMIT_SHA PULL_NUMBER",
+                "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
+                f'export JOB_TYPE="{job_type}"',
+                f'export RC_COMMIT_SHA="{rc}"',
+                recorder_decision(),
+                'echo "MAIN=${EVAL_IS_MAIN_RUN}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().removeprefix("MAIN=")
+
+    def test_the_flag_unset_records_from_main_branch_job_types_only(self) -> None:
+        for value in _FLAG_UNSET_SPELLINGS:
+            with self.subTest(EVAL_MODE_NEXT=value):
+                self.assertEqual(self.decide(value, "periodic"), "true")
+                self.assertEqual(self.decide(value, "postsubmit"), "true")
+                self.assertEqual(self.decide(value, "presubmit"), "false")
+                self.assertEqual(self.decide(value, ""), "false")
+                self.assertEqual(self.decide(value, "periodic", rc="abc1234"), "false")
+
+    def test_the_flag_set_records_from_nothing(self) -> None:
+        for job_type in ("periodic", "postsubmit", "presubmit", ""):
+            with self.subTest(JOB_TYPE=job_type):
+                self.assertEqual(self.decide("1", job_type), "false")
+
+    def test_the_record_step_says_why_a_flagged_periodic_did_not_record(self) -> None:
+        """The record step's else-chain, run with the recorder stubbed: a
+        flagged periodic logs the next-mode line and never calls bench-gate;
+        without the flag the same periodic records; a flagged presubmit keeps
+        the line PULL_NUMBER already earned it."""
+        for mode_next, job_type, pull, expect_record, expect_line in (
+            ("1", "periodic", "", False, "Next-mode run (EVAL_MODE_NEXT=1, JOB_TYPE=periodic): the baseline store is read, never written"),
+            (None, "periodic", "", True, "Recording baseline evidence from main"),
+            ("1", "presubmit", "1686", False, "Not a main-branch recorder run (JOB_TYPE=presubmit)"),
+        ):
+            with self.subTest(EVAL_MODE_NEXT=mode_next, JOB_TYPE=job_type, PULL_NUMBER=pull):
+                script = "\n".join(
+                    [
+                        "set -euo pipefail",
+                        "unset EVAL_MODE_NEXT RC_COMMIT_SHA PULL_NUMBER",
+                        "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
+                        f'export JOB_TYPE="{job_type}"',
+                        "" if not pull else f'export PULL_NUMBER="{pull}"',
+                        'BENCH_DIR="." ARTIFACT_DIR="." EVAL_RECORD_COMMIT="" EVAL_RECORDED_MANIFEST="./manifest"',
+                        "CASE_RESULTS=(./case-a.json)",
+                        'uv() { echo "UV $*"; }',
+                        recorder_decision(),
+                        recorder_step_message(),
+                    ]
+                )
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(expect_line, result.stdout)
+                self.assertEqual("UV run bench-gate record" in result.stdout, expect_record, result.stdout)
 
 
 if __name__ == "__main__":

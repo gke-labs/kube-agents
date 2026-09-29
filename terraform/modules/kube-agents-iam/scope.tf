@@ -1,12 +1,14 @@
-# Grants for the projects `spec.scope` declares beyond the host project.
+# Grants for the projects, folders and organisations `spec.scope` declares
+# beyond the host project.
 #
 # The scope is the set of GCP projects whose GKE clusters the Cluster Agent
 # reconcile enumerates (docs/designs/multi-project-scope.md §3). The reconcile
 # reads the declaration from the PlatformAgent CR; this file is the IAM half of
-# the same value, so a project named in `scope.projects` is bound before the CR
-# that declares it is written (the composition orders the release after this
-# module; ordering, not IAM propagation, which the reconcile's first tick may
-# still run ahead of). `exclude` travels in the variable because the
+# the same value, so a project named in `scope.projects`, and a folder or
+# organisation named in `scope.folders` or `scope.organizations`, is bound
+# before the CR that declares it is written (the composition orders the release
+# after this module; ordering, not IAM propagation, which the reconcile's first
+# tick may still run ahead of). `exclude` travels in the variable because the
 # composition renders the CR from the same object, but it binds nothing and
 # revokes nothing: an exclusion is applied by the reconcile after resolution, a
 # glob cannot be evaluated here, and a project named in `projects` is bound
@@ -20,6 +22,13 @@
 # container.clusters.impersonate into every other project, and a
 # quota-consuming role does not consume quota where the agent only reads.
 # Widening what the scope carries is an edit to this list, on purpose.
+#
+# A container (folder or organisation) carries the same allowlist plus
+# `roles/cloudasset.viewer`, because the reconcile resolves a container's
+# members with one Cloud Asset Inventory search scoped to it (design §4), and
+# a container-level binding is inherited by every project beneath, including
+# one created tomorrow: that inheritance is what makes onboarding under a
+# declared folder zero-touch, and it is also why an organisation is wide (§9).
 
 locals {
   # The read roles a scoped project may carry. tests/test_scope_iam.py holds
@@ -58,6 +67,31 @@ locals {
     for pair in setproduct(sort(tolist(local.scope_projects)), local.scope_roles) :
     "${pair[0]}/${pair[1]}" => { project = pair[0], role = pair[1] }
   }
+
+  # The one role a container carries beyond the allowlist: the reconcile's
+  # `asset search-all-resources --scope=<container>` needs it on the container
+  # it searches, and nowhere else. Not intersected with project_roles, because
+  # the host project never holds it (the host is listed with `clusters list`).
+  scope_container_asset_role = "roles/cloudasset.viewer"
+
+  scope_container_roles = concat(local.scope_roles, [local.scope_container_asset_role])
+
+  scope_folders       = toset(var.scope.folders)
+  scope_organizations = toset(var.scope.organizations)
+
+  scope_folder_bindings = {
+    for pair in setproduct(sort(tolist(local.scope_folders)), local.scope_container_roles) :
+    "${pair[0]}/${pair[1]}" => { folder = pair[0], role = pair[1] }
+  }
+
+  scope_organization_bindings = {
+    for pair in setproduct(sort(tolist(local.scope_organizations)), local.scope_container_roles) :
+    "${pair[0]}/${pair[1]}" => { organization = pair[0], role = pair[1] }
+  }
+
+  # What the manageability precondition in main.tf counts: any declaration
+  # that binds outside the host project.
+  scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) > 0
 }
 
 resource "google_project_iam_member" "scope_roles" {
@@ -71,4 +105,30 @@ resource "google_project_iam_member" "scope_roles" {
   project = each.value.project
   role    = each.value.role
   member  = "serviceAccount:${google_service_account.agent.email}"
+}
+
+resource "google_folder_iam_member" "scope_roles" {
+  #checkov:skip=CKV_GCP_41:The scope binds read roles only, filtered through local.scope_role_allowlist, plus roles/cloudasset.viewer
+  #checkov:skip=CKV_GCP_42:Service account is granted non-admin folder roles
+  #checkov:skip=CKV_GCP_46:Dedicated custom service account used for agent workload identity
+  #checkov:skip=CKV_GCP_49:The scope binds read roles only, filtered through local.scope_role_allowlist, plus roles/cloudasset.viewer
+  #checkov:skip=CKV_GCP_117:Standard GCP viewer roles granted for read-only cluster discovery beneath a declared folder
+  for_each = local.scope_folder_bindings
+
+  folder = "folders/${each.value.folder}"
+  role   = each.value.role
+  member = "serviceAccount:${google_service_account.agent.email}"
+}
+
+resource "google_organization_iam_member" "scope_roles" {
+  #checkov:skip=CKV_GCP_41:The scope binds read roles only, filtered through local.scope_role_allowlist, plus roles/cloudasset.viewer
+  #checkov:skip=CKV_GCP_42:Service account is granted non-admin organisation roles
+  #checkov:skip=CKV_GCP_46:Dedicated custom service account used for agent workload identity
+  #checkov:skip=CKV_GCP_49:The scope binds read roles only, filtered through local.scope_role_allowlist, plus roles/cloudasset.viewer
+  #checkov:skip=CKV_GCP_117:Standard GCP viewer roles granted for read-only cluster discovery across a declared organisation
+  for_each = local.scope_organization_bindings
+
+  org_id = each.value.organization
+  role   = each.value.role
+  member = "serviceAccount:${google_service_account.agent.email}"
 }

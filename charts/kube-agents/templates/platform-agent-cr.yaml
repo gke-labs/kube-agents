@@ -207,13 +207,24 @@ spec:
     projects, and an absent block as no declaration at all
     (docs/designs/multi-project-scope.md §7). `kindIs "map"` is the test because the
     default is null and a null user value deletes the key, both of which render no
-    block, while `{}` is a present map that `with` would skip.
+    block, while `{}` is a present map that `with` would skip. The two container lists
+    render only when the value carries the key: Helm patches the CR from the difference
+    between rendered manifests, so a release record written before the chart knew the
+    keys must re-render without them, or the first retag onto this chart would patch
+    `folders: []` over a folder declared on the CR by hand and retire its members. The
+    composition always passes both keys, so on that path they always render.
   */}}
   {{- $scope := .Values.platformAgent.scope }}
   {{- if kindIs "map" $scope }}
   {{- $scopeExclude := $scope.exclude | default dict }}
   scope:
     projects: {{ $scope.projects | default list | toJson }}
+    {{- if hasKey $scope "folders" }}
+    folders: {{ $scope.folders | default list | toJson }}
+    {{- end }}
+    {{- if hasKey $scope "organizations" }}
+    organizations: {{ $scope.organizations | default list | toJson }}
+    {{- end }}
     exclude:
       projects: {{ $scopeExclude.projects | default list | toJson }}
       clusters: {{ $scopeExclude.clusters | default list | toJson }}

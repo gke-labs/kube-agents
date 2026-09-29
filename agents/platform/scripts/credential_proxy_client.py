@@ -56,6 +56,13 @@ API_RELAY_PREFIX = "/v1/gcp/"
 # one that convention spells as `${HERMES_HOME:-/opt/data}`.
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
+# What a workspace `open` labels itself with, so the broker's log can say who
+# holds a slot when the store is full: the kanban card first, the session
+# otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
+# outside it is dropped rather than sent, because a label is a courtesy to the
+# log and must never be what fails an open.
+CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
+CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
 # A shell's context pin: which cluster the last context-less `get-credentials`
@@ -893,6 +900,22 @@ class Listing(list):
         self.truncated = truncated
 
 
+def default_caller_label() -> str:
+    """The card or session id this process runs under, or "" when it has none.
+
+    Read at call time, like `session_lease` in the skill, because the agent
+    runs each command in a fresh process and the identity lives in its
+    environment. A value the broker's grammar would refuse is dropped here:
+    the label exists so the log can name who filled the store, and it must
+    never be the reason an open fails.
+    """
+    for name in CALLER_LABEL_ENV:
+        value = os.environ.get(name, "").strip()
+        if value and CALLER_LABEL_RE.match(value):
+            return value
+    return ""
+
+
 class Workspace:
     """A git repository the broker owns and this process cannot see.
 
@@ -935,8 +958,12 @@ class Workspace:
         base: str | None = None,
         branch: str | None = None,
         depth: int | None = None,
+        caller: str | None = None,
     ) -> "Workspace":
         """`branch` names the branch this session will commit to, if known.
+
+        `caller` labels the workspace in the broker's log; left None, it is the
+        card or session id from the environment (`default_caller_label`).
 
         Naming it decides what `read` and `list` answer with: when the branch
         already exists on the remote -- a second round of review feedback -- the
@@ -953,6 +980,9 @@ class Workspace:
             payload["branch"] = branch
         if depth:
             payload["depth"] = depth
+        label = default_caller_label() if caller is None else caller
+        if label:
+            payload["caller"] = label
         return cls(endpoint, _workspace_call(endpoint, "open", payload))
 
     def read(self, path: str) -> bytes:

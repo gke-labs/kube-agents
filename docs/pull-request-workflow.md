@@ -193,6 +193,33 @@ Hindsight's images sit behind `hindsight.enabled` — unset by default, and then
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 
+**CodeQL alerts.** CodeQL runs here through GitHub's default setup, which analyses pushes to `main`
+and the other protected branches, a weekly schedule, and, intermittently, pull requests whose head
+branch lives in this repository; in the repository's history one fork pull request has been
+analysed, and no pull request of any kind since early September. Contributor branches live on
+forks, so a change that closes a code-scanning alert cannot count on CI to show it closing.
+Reproduce it locally instead: install the CLI as a `gh` extension, pin it to the version the
+alert's `tool.version` reports, and build a database over a scratch tree holding the flagged file
+at its repository path, once before the change and once after:
+
+```bash
+gh extension install github/gh-codeql
+gh codeql set-version 2.27.1 # the alert's tool.version
+gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
+gh codeql database analyze /tmp/cq/db \
+  codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
+  --download --format=sarif-latest --output /tmp/cq/out.sarif
+```
+
+An alert names a rule id, not a query. The query is the `.ql` in the pack whose `@id` matches it:
+after the first `--download`,
+`grep -rl '@id py/clear-text-logging-sensitive-data' ~/.codeql/packages/codeql/python-queries/`
+finds `Security/CWE-312/CleartextLogging.ql`, and `CleartextStorage.ql` beside it is the storage
+rule. The before run has to reproduce the alert at `main`'s line, and the SARIF's `codeFlows` names
+the source the flagged line was reached from; the after run reports none. Quote both under
+**Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
+code-scanning tab on the merged head is still the final check.
+
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
 and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
 loop while you work:

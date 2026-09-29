@@ -63,6 +63,12 @@ install without the interview.
   backend and `AgentPlugin/gkestockoutinvestigator`: Pub/Sub topic (`stockout_pubsub_topic`),
   subscription (`stockout_pubsub_subscription`), Cloud Logging project sink
   (`stockout_pubsub_sink`), and publisher IAM binding.
+- Optionally (`enable_drift_pubsub = true`) the drift detector's audit-log
+  ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
+  sink exporting GKE audit logs (`drift_pubsub_sink`), the drift-audit Pub/Sub
+  topic (`drift_pubsub_topic`) and pull subscription
+  (`drift_pubsub_subscription`), and the sink-writer and agent-GSA IAM on
+  them. See [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -194,6 +200,18 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
+The drift audit-log ingress has the same one-default-per-project shape, with
+adoption in place of a collision: with `enable_drift_pubsub` on,
+`drift_pubsub_topic`, `drift_pubsub_subscription` and `drift_pubsub_sink` each
+default to one name, and `lifecycle.sh apply` imports a resource of that name
+that exists but is not in its state, which it cannot tell from one the other
+live install owns. A second install that turns the flag on names all three
+(through the front doors, `TF_VAR_drift_pubsub_topic=...` and the other two as
+lines in `install.env`, since the generator writes none of them) or leaves the
+flag off; otherwise its apply adopts the first install's topic, subscription
+and sink into its own state, and its teardown removes them, retained messages
+included. The stockout trio (`stockout_pubsub_*`) is adopted the same way and
+carries the same requirement.
 Versioning is the recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
@@ -470,7 +488,7 @@ equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
 
-### Projects in scope (`scope`)
+### Projects, folders and organisations in scope (`scope`)
 
 `scope` is the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the
 install from this one value: the `kube-agents-iam` module binds its read allowlist (the read
@@ -482,7 +500,8 @@ drops projects (their read roles are revoked and their Cluster Agent profiles re
 reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
 `cluster_name` triple; neither changes IAM. Through the installer the value comes from
-`SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
+`SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
 forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
 declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that
@@ -496,8 +515,20 @@ as `upgrade.sh` does, or a `spec.scope` the served schema does not know is prune
 release record then carrying it, never re-sent. The identity running the apply needs
 to set IAM policy in each project named. The release's dependency on the module orders creation,
 not IAM propagation: a first install's one-shot inventory sweep may name a scoped project as
-`denied`, and the hourly reconcile creates its profiles once the grant has propagated. Folders and
-organisations are not inputs yet.
+`denied`, and the hourly reconcile creates its profiles once the grant has propagated.
+
+`scope.folders` and `scope.organizations` take numeric Resource Manager IDs. Each is bound on the
+container itself with the same allowlist plus `roles/cloudasset.viewer`, so every project beneath
+it inherits the grant and the reconcile resolves its members with one Cloud Asset Inventory search;
+a project created under a declared folder after the apply is discovered and readable with no
+change here. Declaring one adds `cloudasset.googleapis.com` to the APIs the composition enables in
+`project_id`; an install that names explicit projects alone never enables it. The identity running
+the apply needs `resourcemanager.folders.setIamPolicy` on each folder or
+`resourcemanager.organizations.setIamPolicy` on the organisation, which the installer front doors
+check before the apply and the composition run directly does not. An organisation binding reaches
+every project in the organisation; the design recommends folders until the scoped service account
+pool grants authority ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
+§9).
 
 ### Backups
 
@@ -593,6 +624,66 @@ uninstall its standalone release before setting these variables (`helm uninstall
 `helm uninstall gkestockoutinvestigator -n <namespace>`). Helm checks object ownership metadata
 (`meta.helm.sh/release-name`) and refuses to adopt existing resources owned by another release.
 
+### Drift audit-log ingress
+
+`enable_drift_pubsub = true` (default `false`) instantiates the
+[`drift-pubsub`](../../modules/drift-pubsub) module: a Log Router sink that
+exports mutating GKE audit-log calls (`drift_pubsub_sink`, default
+`platform-agent-drift-audit-sink`), the topic it publishes to
+(`drift_pubsub_topic`, default `platform-agent-drift-audit`), the pull
+subscription (`drift_pubsub_subscription`, default
+`platform-agent-drift-audit-sub`), `roles/pubsub.publisher` on the topic for
+the sink's writer identity, and `roles/pubsub.subscriber` plus
+`roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
+`pubsub.googleapis.com` to the enabled APIs. Beyond the three names, only the
+module's two required inputs are passed, so its defaults decide the 31-day
+retention and the cluster scope, which is every GKE cluster in the project; a
+caller that needs the module's other knobs instantiates it directly.
+
+Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
+`drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the
+fully-qualified path the drift detector's `--subscription` flag takes.
+
+The subscription is the input to the drift detector of
+[`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md).
+Its consumer,
+[`k8s-operator/cmd/drift-detector`](../../../k8s-operator/cmd/drift-detector/README.md),
+ships in the platform-agent images and starts inside the gateway pod when the
+`PlatformAgent` sets `spec.harness.driftDetector.enabled`. This composition
+does not set that field: the flag provisions the ingress, and enabling the
+detector is one leaf in `extra_helm_values`
+(`platformAgent = { harness = { driftDetector = { enabled = true } } }`). With
+the flag on, the composition does write the subscription's name into that
+block (`platformAgent.harness.driftDetector.subscription`), so a renamed
+`drift_pubsub_subscription` is the one the detector pulls from; the detector's
+compiled-in default is the module's default name, which is why an install that
+leaves the name alone would work without that wire and one that renames it
+would not. Turned on without the detector, the sink publishes every mutating
+call on every GKE cluster in the project (about 60k messages a day after the
+module's lease filter, per its README) into a subscription that retains them
+for 31 days and never expires: Pub/Sub storage cost and a backlog until the
+detector is enabled. The reverse, the detector enabled on an install whose
+flag is off, is what the CRD field's description warns about: the process
+retries a pull that cannot succeed for the life of the pod, and the pod stays
+Ready. `lifecycle.sh apply` adopts a topic, subscription or sink of those
+names left behind by an earlier install before applying, the way it adopts
+the stockout trio, so a re-install does not 409 on them. That adoption is by
+name and cannot tell a leftover from another install's live trio, so a second
+install in the same project that turns the flag on sets its own three names
+first ([Remote state](#remote-state)).
+
+The variable is for a hand-driven apply. The installer front doors
+(`install.sh`, `upgrade.sh`) have no `install.env` key for it and regenerate
+`terraform.tfvars` without it on every run, so on a front-door install a
+`true` written into that file lasts until the next front-door run, whose
+apply then plans the sink, topic and subscription (with up to 31 days of
+retained messages) for removal under `-auto-approve`; no guard refuses that
+the way `guard_pubsub_subscription` refuses a Chat rename. Through the front
+doors, set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`,
+the same channel `agent_ksa_name` uses: every front door sources that file
+with `set -a`, and Terraform reads `TF_VAR_*` where the generated file is
+silent.
+
 **Manual steps that no IaC can perform** — canonical walkthrough:
 [INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):
 
@@ -623,8 +714,8 @@ module "gke_cluster" {
 }
 ```
 
-(and likewise for `kube-agents-iam`, `chat-pubsub`, `github-minter`, and
-`gke-backup-plan`), and
+(and likewise for `kube-agents-iam`, `chat-pubsub`, `github-minter`,
+`gke-backup-plan`, and `drift-pubsub`), and
 would install the chart from the OCI registry rather than a local path — see
 the [chart README](../../../charts/kube-agents/README.md).
 
@@ -646,13 +737,14 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                                | Handled by                                                                                                                                   |
-| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s      | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace     | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
-| A `BackupPlan` cannot be deleted while it owns backups                   | `tf-destroy` purges the plan's backups first                                                                                                 |
-| `deletion_protection = true` cannot be overridden by a destroy alone     | `tf-destroy` applies it as `false`, then destroys                                                                                            |
-| A Pub/Sub topic or subscription that already exists makes the create 409 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
+| Asymmetry                                                                                              | Handled by                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s                                    | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                   | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
+| A `BackupPlan` cannot be deleted while it owns backups                                                 | `tf-destroy` purges the plan's backups first                                                                                                 |
+| `deletion_protection = true` cannot be overridden by a destroy alone                                   | `tf-destroy` applies it as `false`, then destroys                                                                                            |
+| A Pub/Sub topic or subscription that already exists makes the create 409                               | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
+| The stockout and drift topics, subscriptions and sinks survive a partial teardown and 409 the same way | `tf-apply` imports whichever of them exist by name when their flags are on (`adopt_kms`, alongside the KMS resources)                        |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`

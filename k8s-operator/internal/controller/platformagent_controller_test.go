@@ -4608,7 +4608,7 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile)
+	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -4698,7 +4698,7 @@ func TestReconcileNetworkPolicy_StatusReporting_Disabled(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile); err != nil {
+	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 

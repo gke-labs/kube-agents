@@ -41,3 +41,28 @@ output "scope_roles" {
   EOT
   value       = local.scope_roles
 }
+
+output "scope_folders" {
+  description = <<-EOT
+    The folders scope.folders named, each bound on the folder itself with
+    scope_container_roles, so every project beneath inherits the grant.
+  EOT
+  value       = sort(tolist(local.scope_folders))
+}
+
+output "scope_organizations" {
+  description = <<-EOT
+    The organisations scope.organizations named, each bound on the
+    organisation itself with scope_container_roles.
+  EOT
+  value       = sort(tolist(local.scope_organizations))
+}
+
+output "scope_container_roles" {
+  description = <<-EOT
+    The roles bound on every folder and organisation in scope: scope_roles
+    plus roles/cloudasset.viewer, which the reconcile's container search needs
+    on the container it searches.
+  EOT
+  value       = local.scope_container_roles
+}
