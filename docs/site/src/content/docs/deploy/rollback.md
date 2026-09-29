@@ -139,9 +139,11 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
   that is Helm's ordinary behaviour.
 - Which values those templates are rendered with depends on the script. From `0.5.0` on the
   re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the values the
-  install set on top. `0.4.0` and earlier use `--reuse-values`, which keeps every value `N`'s
-  release computed, defaults included, so a chart default `N` changed stays at `N`'s value after a
-  rollback to `0.4.0` even though the chart version reads `0.4.0`.
+  install set on top. From the first release after `0.7.0` it is the same, less any value the
+  install set that `N-1`'s values schema does not declare, which the script drops and names
+  before it applies anything. `0.4.0` and earlier use `--reuse-values`, which keeps every value
+  `N`'s release computed, defaults included, so a chart default `N` changed stays at `N`'s value
+  after a rollback to `0.4.0` even though the chart version reads `0.4.0`.
 
 ## What they leave as it is
 
@@ -170,7 +172,10 @@ which has no sandbox, and the next forward upgrade renders the Secret again.
 Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the API server prunes
 them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
 them stay in the release's recorded values: a later forward re-tag renders them again, the schema
-refusal below turns on them, and the full mode discards them.
+refusal below turns on them, and the full mode discards them. A re-tag by a script from after
+`0.7.0` drops each one `N-1`'s values schema does not declare, so after such a rollback the release
+no longer records it, and the next forward re-tag renders it from `N`'s chart default until a
+full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
@@ -270,11 +275,13 @@ checks before it renders or applies anything, so the release itself keeps its la
   does not declare fails Helm's schema check. Helm checks before it renders, so the release keeps
   its last revision, but in the operator step the CRD apply has already run: put `N`'s CRDs back
   from the `N` checkout with the same command the script uses,
-  `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. The re-tag has no
-  flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
-  full mode does, because its Helm release renders from the composition's values rather than the
-  recorded ones (the section above), at the price of a GCP-level apply and the plan read that
-  goes before it.
+  `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. Through `0.7.0` the
+  re-tag has no way to drop a reused key, so for a pair whose `N-1` is `0.7.0` or earlier the
+  Helm-only rollback does not complete. From the first release after `0.7.0` the re-tag drops each
+  recorded key the schema refuses as undeclared and prints its name, so the refusal no longer
+  happens where `N-1` is that release or later. The full mode completes either way, because its
+  Helm release renders from the composition's values rather than the recorded ones (the section
+  above), at the price of a GCP-level apply and the plan read that goes before it.
 
   Two pairs are refused this way, each on an install the newer release's composition applied (a
   fresh install of it, or a full-mode upgrade to it). `0.7.0` rolling back to `0.6.0`: `0.7.0`'s

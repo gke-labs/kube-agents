@@ -4,6 +4,7 @@ Tests pure numeric SemVer (X.Y.Z) references, 40-character commit SHAs,
 piped stdin execution, and source ref alignment in upgrade.sh.
 """
 
+import json
 import os
 import pathlib
 import re
@@ -405,9 +406,8 @@ class UpgradeRunContractTest(unittest.TestCase):
         checkout back, so a run that raises it and then refuses strands someone
         else's clone on this run's ref. Both previews exit before the mode
         dispatch, but refusals do not stop there: full still runs the scope check,
-        the minter/KMS guard and the service-account 409 check, and harness still
-        reads the
-        release's values to learn which plugin tags to move. So the gate cannot
+        the minter/KMS guard and the service-account 409 check, and operator and
+        harness still read the release's values to re-tag it. So the gate cannot
         be raised once above the `case`; each arm has to raise it on its own,
         after its last refusal and before its first write.
 
@@ -439,10 +439,10 @@ class UpgradeRunContractTest(unittest.TestCase):
             return "\n      " + literal
 
         for mode, last_refusal, first_write in (
-            ("operator", None, "apply_crd_upgrades"),
+            ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE"', "apply_crd_upgrades"),
             (
                 "harness",
-                'harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE"',
+                'retag_values "$KUBE_AGENTS_HELM_RELEASE"',
                 'helm_retag "${HARNESS_RETAG_KEYS[@]}"',
             ),
             ("full", "check_service_account_ownership || exit 1", "apply_crd_upgrades"),
@@ -691,9 +691,9 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         branch owes is to call it and to hand the whole list to helm_retag,
         which turns each key into `--set key=<tag>` (#1808).
 
-        Order, not adjacency: the arm raises UPGRADE_APPLY_STARTED between the
-        two, because the read is the last thing here that can fail without
-        having changed anything. That placement is
+        Order, not adjacency: the values read and UPGRADE_APPLY_STARTED sit
+        between the two, because the reads are the last things here that can
+        fail without having changed anything. That placement is
         UpgradeRunContractTest.test_the_apply_gate_sits_after_every_refusal_in_its_arm's
         to keep.
         """
@@ -711,6 +711,20 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
         self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
+
+    def test_the_retag_applies_the_filtered_values_over_the_chart_defaults(self):
+        """helm_retag re-applies what retag_values kept, not what the release recorded.
+
+        --reset-then-reuse-values re-applies every recorded key, one the chart
+        does not declare included, and Helm then refuses the whole upgrade on
+        the schema check (#2109). RetagValuesTest runs the filter itself.
+        """
+        text = _UPGRADE_SH.read_text()
+        start = text.index("  helm_retag() {")
+        retag = text[start : text.index("\n  }\n", start)]
+        self.assertIn("printf '%s' \"$RETAG_VALUES_JSON\" | helm upgrade", retag)
+        self.assertIn("--reset-values --values -", retag)
+        self.assertNotIn("reuse-values", retag)
 
     def test_jq_is_required_for_the_modes_that_read_with_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
@@ -965,6 +979,198 @@ class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("platformAgent.deployment.image.tag", proc.stdout)
         self.assertIn("Could not read the values of Helm release", proc.stdout)
+
+
+class RetagValuesTest(_StubHelm, unittest.TestCase):
+    """retag_values against a stub helm: the values helm_retag re-applies (#2109)."""
+
+    _SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "platformAgent": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "env": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {"name": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+            "open": {"type": "object"},
+            "plugins": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"enabled": {"type": "boolean"}},
+                },
+            },
+            "combined": {"allOf": [{"type": "object"}], "additionalProperties": False, "properties": {}},
+        },
+    }
+    _VALUES_PREFIX = "values="
+
+    def _run(self, values_json, schema_text=None, helm_exit=0):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        schema_path = pathlib.Path(tmp.name) / "values.schema.json"
+        if schema_text != "":
+            schema_path.write_text(schema_text or json.dumps(self._SCHEMA))
+        snippet = (
+            f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
+            f'echo "{self._VALUES_PREFIX}$RETAG_VALUES_JSON"'
+        )
+        return self._run_with_helm(snippet, values_json, helm_exit=helm_exit)
+
+    def _values(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = [line for line in proc.stdout.splitlines() if line.startswith(self._VALUES_PREFIX)]
+        self.assertEqual(len(lines), 1, proc.stdout)
+        return json.loads(lines[0][len(self._VALUES_PREFIX) :])
+
+    def test_a_key_the_schema_does_not_declare_is_dropped_and_named(self):
+        proc = self._run('{"platformAgent":{"name":"p","scope":{"projects":[]}},"stray":1}')
+        self.assertEqual(self._values(proc), {"platformAgent": {"name": "p"}})
+        self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
+        self.assertIn("Dropping 'stray'", proc.stdout)
+
+    def test_an_object_the_schema_leaves_open_keeps_every_key(self):
+        values = {"open": {"anything": {"nested": 1}}}
+        proc = self._run(json.dumps(values))
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("Dropping", proc.stdout)
+
+    def test_map_entries_and_list_items_are_checked_against_their_schema(self):
+        proc = self._run(
+            '{"plugins":{"a":{"enabled":true,"extra":1}},'
+            '"platformAgent":{"env":[{"name":"A"},{"name":"B","value":"v"}]}}'
+        )
+        self.assertEqual(
+            self._values(proc),
+            {"plugins": {"a": {"enabled": True}}, "platformAgent": {"env": [{"name": "A"}, {"name": "B"}]}},
+        )
+        self.assertIn("Dropping 'plugins.a.extra'", proc.stdout)
+        self.assertIn("Dropping 'platformAgent.env[1].value'", proc.stdout)
+
+    def test_a_node_using_a_keyword_the_walk_does_not_model_is_left_for_helm(self):
+        values = {"combined": {"x": 1}}
+        proc = self._run(json.dumps(values))
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("Dropping", proc.stdout)
+
+    def test_a_chart_without_a_schema_drops_nothing(self):
+        values = {"platformAgent": {"scope": {"projects": []}}}
+        proc = self._run(json.dumps(values), schema_text="")
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("Dropping", proc.stdout)
+
+    def test_a_release_that_recorded_no_values_is_an_empty_object(self):
+        """`helm get values -o json` prints null for a release installed with none."""
+        self.assertEqual(self._values(self._run("null")), {})
+
+    def test_a_dropped_value_is_never_printed(self):
+        """The recorded values carry the install's credentials."""
+        proc = self._run('{"platformAgent":{"apiKey":"s3cr3t-token"}}')
+        self.assertEqual(self._values(proc), {"platformAgent": {}})
+        self.assertNotIn("s3cr3t-token", proc.stdout + proc.stderr)
+
+    def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
+        proc = self._run("", helm_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("Could not read the values of Helm release", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_a_malformed_schema_is_an_error_not_an_unfiltered_upgrade(self):
+        proc = self._run('{"stray":1}', schema_text="{not json")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("Could not filter the values of Helm release", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class RetagValuesAgainstHelmTest(unittest.TestCase):
+    """Helm accepts the filtered values where it refuses the recorded ones (#2109).
+
+    The target chart is this repository's chart with `platformAgent.scope` taken
+    out of its schema: the shape of a rollback to 0.7.0 from an install whose
+    composition records `scope`. `helm get values` is stubbed; `helm template`,
+    which runs the same schema check as `helm upgrade`, is the real binary.
+    """
+
+    _RECORDED = {
+        "platformAgent": {
+            "harness": {"clusterName": "ci-cluster", "location": "us-central1", "projectId": "ci-project"},
+            "scope": {"projects": [], "folders": [], "organizations": []},
+        }
+    }
+    _HELM_TIMEOUT_SECONDS = 120
+    _SCHEMA_ERROR = "additional properties 'scope' not allowed"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = pathlib.Path(tmp.name)
+        self.chart = self.base / "kube-agents"
+        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", self.chart)
+        schema_path = self.chart / "values.schema.json"
+        schema = json.loads(schema_path.read_text())
+        del schema["properties"]["platformAgent"]["properties"]["scope"]
+        schema_path.write_text(json.dumps(schema))
+
+    def _template(self, values_path):
+        return subprocess.run(
+            ["helm", "template", "kube-agents", str(self.chart), "--values", str(values_path)],
+            capture_output=True,
+            text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
+        )
+
+    def test_the_recorded_values_fail_the_schema_check(self):
+        """The control: without the filter, Helm refuses on `scope`."""
+        recorded = self.base / "recorded.json"
+        recorded.write_text(json.dumps(self._RECORDED))
+        proc = self._template(recorded)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
+        self.assertIn(self._SCHEMA_ERROR, proc.stderr)
+
+    def test_the_filtered_values_render(self):
+        bin_dir = self.base / "bin"
+        bin_dir.mkdir()
+        helm = bin_dir / "helm"
+        helm.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "get" ]; then\n'
+            f"  cat <<'JSON'\n{json.dumps(self._RECORDED)}\nJSON\n"
+            "  exit 0\n"
+            "fi\n"
+            f'exec {shlex.quote(shutil.which("helm"))} "$@"\n'
+        )
+        helm.chmod(0o755)
+        filtered = self.base / "filtered.json"
+        script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+retag_values kube-agents kubeagents-system {shlex.quote(str(self.chart / "values.schema.json"))}
+printf '%s' "$RETAG_VALUES_JSON" > {shlex.quote(str(filtered))}
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(bin_dir=str(bin_dir)),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
+        rendered = self._template(filtered)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
 
 
 class UpgradeReusesTheInstallCheckoutTest(unittest.TestCase):

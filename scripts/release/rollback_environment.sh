@@ -152,8 +152,8 @@ if [ -z "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
   # Not --strict: the strict render refuses a rebuilt environment such as
   # nightly (Chat enabled with an open allowlist by design, and settings the
   # composition needs that a re-tag does not), and the operator and harness
-  # modes only re-tag the release with --reset-then-reuse-values; they apply
-  # nothing from install.env to the cluster. The deploy job's lease check
+  # modes only re-tag the release over its recorded values; they apply nothing
+  # from install.env to the cluster. The deploy job's lease check
   # renders the same file without --strict for the same reason.
   echo "==> Rendering the install configuration from the environment."
   "${SCRIPT_DIR}/render_install_env.sh" "${RENDERED_INSTALL_ENV}"
