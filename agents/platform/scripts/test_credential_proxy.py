@@ -79,6 +79,39 @@ _STALLED_CLIENT_READ_TIMEOUT_SECONDS = 5
 # under AgentAPIProxyHandler.max_request_bytes so the drain runs at all.
 _ANNOUNCED_BODY_NEVER_SENT = 1024 * 1024
 
+# Decimal places the fake clock keeps; enough for any poll interval the kill
+# uses, few enough that repeated sums stay exact.
+_FAKE_CLOCK_DECIMALS = 9
+
+
+class _FakeClock:
+    """A `time` stand-in for the kill's waits: `sleep` advances `monotonic`.
+
+    `ceiling` is fake seconds; a `sleep` that would carry the clock past it
+    raises instead, so a wait that stopped honouring its bound fails the test
+    with a line naming the cause rather than looping until the runner's own
+    timeout ends the job.
+    """
+
+    def __init__(self, ceiling):
+        self.now = 0.0
+        self.ceiling = ceiling
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        if self.now + seconds > self.ceiling:
+            raise AssertionError(
+                f"still waiting at fake t={self.now:.2f}s, past the "
+                f"{self.ceiling}s ceiling: a wait no longer honours its bound"
+            )
+        # Rounded so that the polls sum to the bound exactly: forty 0.05s
+        # sleeps in binary floating point land a hair past 2.0, and the
+        # deadline computed from there would then buy one poll more or fewer
+        # than the arithmetic says.
+        self.now = round(self.now + seconds, _FAKE_CLOCK_DECIMALS)
+
 
 class AgentAPIProxyTest(unittest.TestCase):
     def setUp(self):
@@ -3104,31 +3137,51 @@ class CommandExecutorTest(unittest.TestCase):
         # returns. A group that never reads as empty (a member in
         # uninterruptible sleep, an orphan its reaper has not collected) has
         # to run that wait out rather than hold the slot: every signal-0 probe
-        # here answers that the group is still occupied, and the command still
-        # comes back within the grace plus the bound, the second signal sent
-        # once.
+        # here answers that the group is still occupied, and the kill still
+        # returns once the grace and then the bound run out, the second signal
+        # sent once. The clock is faked and the probes counted, so the bound
+        # is pinned to its value; and a wait that stopped honouring it fails
+        # here at the clock's ceiling, not at the CI job's.
+        clock = _FakeClock(
+            ceiling=credential_proxy.KILL_GRACE_SECONDS
+            + 2 * credential_proxy.KILL_SETTLE_SECONDS
+        )
         sent = []
-        real_killpg = os.killpg
+        probes_after_kill = []
 
         def always_occupied(pgid, signum):
-            if signum == 0:
+            if signum != 0:
+                sent.append((signum, clock.now))
                 return None
-            sent.append(signum)
-            return real_killpg(pgid, signum)
+            if sent and sent[-1][0] == credential_proxy.signal.SIGKILL:
+                probes_after_kill.append(clock.now)
+            return None
 
-        executor = self.fake_kubectl(
-            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
-            body="trap '' TERM; sleep 10 & wait $!",
-        )
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 4242
+        process.poll.return_value = None
         with (
+            mock.patch.object(credential_proxy, "time", clock),
             mock.patch("credential_proxy.os.killpg", always_occupied),
             self.assertLogs("credential-proxy", level="WARNING") as logs,
         ):
-            result = executor.execute(["kubectl", "get", "pods"])
+            credential_proxy._kill_process_group(process)
 
-        self.assertTrue(result.timed_out)
         self.assertEqual(
-            [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL], sent
+            [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL],
+            [signum for signum, _ in sent],
+        )
+        killed_at = sent[-1][1]
+        self.assertGreaterEqual(killed_at, credential_proxy.KILL_GRACE_SECONDS)
+        # One probe per poll across the bound, plus the one at the deadline
+        # that finds the group still there and gives up.
+        self.assertEqual(
+            round(credential_proxy.KILL_SETTLE_SECONDS / credential_proxy.KILL_POLL_SECONDS)
+            + 1,
+            len(probes_after_kill),
+        )
+        self.assertAlmostEqual(
+            credential_proxy.KILL_SETTLE_SECONDS, clock.now - killed_at, places=6
         )
         # A bound that ran out is the one case an operator may later ask
         # about, so it leaves a line.
@@ -3136,13 +3189,6 @@ class CommandExecutorTest(unittest.TestCase):
             any("still occupied" in line and "after SIGKILL" in line for line in logs.output),
             logs.output,
         )
-        floor_ms = (
-            1000
-            + credential_proxy.KILL_GRACE_SECONDS * 1000
-            + credential_proxy.KILL_SETTLE_SECONDS * 1000
-        )
-        self.assertGreaterEqual(result.duration_ms, floor_ms - 100)
-        self.assertLess(result.duration_ms, floor_ms + 3000)
 
     def test_the_wait_after_sigkill_returns_once_the_group_is_gone(self):
         # The other half of the bound: the wait ends when the group empties,
@@ -3152,17 +3198,10 @@ class CommandExecutorTest(unittest.TestCase):
         # the whole bound -- so the clock is faked and the probes counted.
         # The group here ignores SIGTERM, and after SIGKILL it reads occupied
         # once (the members not yet scheduled to exit) and then empty.
-        class FakeClock:
-            def __init__(self):
-                self.now = 0.0
-
-            def monotonic(self):
-                return self.now
-
-            def sleep(self, seconds):
-                self.now += seconds
-
-        clock = FakeClock()
+        clock = _FakeClock(
+            ceiling=credential_proxy.KILL_GRACE_SECONDS
+            + 2 * credential_proxy.KILL_SETTLE_SECONDS
+        )
         sent = []
         probes_after_kill = []
 
