@@ -903,8 +903,8 @@ failed or was interrupted in, and `since` is carried from the previous
 `health.json`. `periodics_read` names the jobs a reading arrived for this
 tick, whether or not they are noted; the poster clears a told job only on a
 reading that shows it clean. `periodics_since` is each open note's start, kept
-across the ticks that read nothing (which write no `periodics`) and dropped for
-a job once a tick with readings writes no note for it
+for a job across the ticks with no reading for it (which write no note for it)
+and dropped once a tick with a reading for it writes no note
 (`scripts/eval_dashboard/periodics.py` owns the notes).
 
 `health-history.jsonl` is one JSON object per line, each the full

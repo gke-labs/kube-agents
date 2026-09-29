@@ -1993,9 +1993,15 @@ def adjudicate(
     before_since = (prev or {}).get("periodics_since") or {}
     prev_notes = {job: {"since": since} for job, since in before_since.items() if isinstance(since, str)}
     prev_notes.update((prev or {}).get("periodics") or {})
-    watched = periodics.assess(readings, now, prev_notes)
+    # The wall clock, as the pool note's: a job that stopped is measured
+    # against the time it is, not data.json's horizon, which a stalled
+    # archive freezes together with the jobs.
+    watched = periodics.assess(readings, pool_clock, prev_notes)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
-    periodics_since = {job: note["since"] for job, note in watched.items()} if readings else dict(before_since)
+    # Per job: a job read this tick keeps its start only while it is noted;
+    # a job with no reading this tick keeps whatever start it had.
+    periodics_since = {job: since for job, since in before_since.items() if job not in readings}
+    periodics_since.update({job: note["since"] for job, note in watched.items()})
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])

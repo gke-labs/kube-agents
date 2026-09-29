@@ -36,9 +36,6 @@ ARTIFACTS_DIR = "artifacts"
 # the one before it has finished. Three covers a run of aborted builds.
 FALLBACK_BUILDS = 3
 GSUTIL_TIMEOUT_S = 60
-# finished.json's result for a passed run; anything else is a failure or an
-# abort, and `passed` says which.
-RESULT_SUCCESS = "SUCCESS"
 VERDICT_FAILED = "FAILED"
 VERDICT_STALE = "STALE"
 # How many refused or failed projects a message names before "and N more".
@@ -48,6 +45,9 @@ DETAIL_LIMIT = 5
 RECONCILE_ARTIFACT = "fleet-reconcile.json"
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
 NOT_FOUND_MARKERS = ("NotFound", "No URLs matched", "404")
+# GitHub Actions renders a line with this prefix as a workflow warning, as the
+# sibling pool-pressure step's `echo "::warning::..."` does.
+WARNING_PREFIX = "::warning::"
 # run()'s conventions for a binary that is missing and a call that timed out,
 # and argparse's exit for a bad command line.
 MISSING_BINARY_RC = 127
@@ -144,7 +144,7 @@ def _earlier_builds(job: str, newest: str, runner) -> list[str]:
     ids = []
     for line in out.splitlines():
         name = line.strip().rstrip("/").rsplit("/", 1)[-1]
-        if name.isdigit() and int(name) < int(newest):
+        if name.isdecimal() and int(name) < int(newest):
             ids.append(int(name))
     return [str(i) for i in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
 
@@ -158,16 +158,17 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     rc, out, err = _gsutil(["cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner)
     if rc != 0:
         if not _not_found(err):
-            log(f"warning: could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
+            log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
         return None
     newest = out.strip()
-    if not newest.isdigit():
+    # isdecimal, not isdigit: the latter admits characters int() rejects.
+    if not newest.isdecimal():
         return None
     for build in [newest, *_earlier_builds(periodic.job, newest, runner)]:
         try:
             finished = _finished(periodic.job, build, runner)
         except Unreadable as exc:
-            log(f"warning: could not read {periodic.job}'s {exc}", file=sys.stderr)
+            log(f"{WARNING_PREFIX}could not read {periodic.job}'s {exc}", file=sys.stderr)
             return None
         if finished is None:
             continue

@@ -1284,6 +1284,19 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
         clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
         self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
+        # Blind to one job, not another: the unread job's start survives.
+        partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
+        self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(partial["periodics_read"], [self.SWEEP])
+
+    def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
+        # A stalled archive freezes data.json's generated_at with the jobs; the
+        # dead-man's switch has to read the time it is.
+        reading = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=9))}
+        frozen = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), periodics_readings=reading)
+        self.assertEqual(frozen["periodics"], {}, "on the data's own horizon the run is a day old")
+        live = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), wall_clock=T0, periodics_readings=reading)
+        self.assertEqual(live["periodics"][self.WEEKLY]["verdict"], "STALE")
 
 
 class PoolNote(unittest.TestCase):

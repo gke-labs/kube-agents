@@ -1781,9 +1781,9 @@ def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet 
 
 
 class WatchedPeriodics(RunHarness):
-    """A watched Prow periodic that fails or stops is said once per failing
-    build, with the projects it names and its history; its next clean run is
-    said once; no reading is neither."""
+    """A watched Prow periodic that fails or stops is said once per episode
+    and verdict, with the projects it names and its history; its next clean
+    run is said once; no reading is neither."""
 
     WEEKLY = "ci-kube-agents-fleet-reconcile-all"
 

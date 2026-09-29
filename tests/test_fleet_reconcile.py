@@ -506,7 +506,7 @@ class MainTest(unittest.TestCase):
     def test_an_unhandled_exception_still_writes_its_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = pathlib.Path(tmp) / "r.json"
-            with mock.patch.object(reconcile, "reset_stranded_or_reconcile", create=True), mock.patch.object(reconcile, "_run", side_effect=KeyError("boom")), mock.patch.object(reconcile.signal, "signal"):
+            with mock.patch.object(reconcile, "_run", side_effect=KeyError("boom")), mock.patch.object(reconcile.signal, "signal"):
                 with self.assertRaises(KeyError):
                     reconcile.main(["--project", P7, "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
             doc = json.loads(report.read_text())

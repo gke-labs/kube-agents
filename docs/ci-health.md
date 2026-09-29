@@ -364,9 +364,10 @@ Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note; one whose latest finished
 build is older than its stale window (an hour for the sweep, three for the
 hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
-verdict. The note carries the build, when it finished, `since` (kept across
-ticks through the previous `health.json`, blind ticks included), the job's
-history link, where the
+verdict, measured on the wall clock rather than data.json's horizon, as the
+pool note is. The note carries the build, when it finished, `since` (kept for
+the job across ticks through the previous `health.json`, ticks with no reading
+for that job included), the job's history link, where the
 recovery is written, and for the reconcile the projects it refused, failed or
 was interrupted in, with each one's reason, up to five. A job with no reading
 writes no note and ends none: that is the bot losing sight of the job, not the
