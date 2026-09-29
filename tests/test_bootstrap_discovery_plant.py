@@ -38,8 +38,9 @@ The rest pin step 1's refusals, step 2 stopping when it cannot list the open
 cards or the sandbox pods, or remove the INVENTORY files from one, step 4's
 handling of a board read that fails and of a sweep no worker picked up, the
 trap retrying a marker restore or a card listing that fails, the trap and the
-destroy carrying on past a failed step and naming it, and every exec into the
-agent Deployment bounding its wait for a pod. As in
+destroy carrying on past a failed step and naming it, the trap ignoring a
+second signal during its cleanup, and every exec into the agent Deployment
+bounding its wait for a pod. As in
 `test_autoops_incident_plant.py`, the provisioners are rendered the way
 Terraform renders them and run against a stub `kubectl`/`gcloud`/`sleep`. The
 reads in steps 1 and 2 also run on their own against a data directory, and
