@@ -99,6 +99,31 @@ verification_spec:
       # rescues without closing it. The composed verdict is the judge's.
       # "channel default" and bare "older than" stay out: they match the two
       # recorded wrong answers as written.
+      #
+      # Widened 2026-09-29 (#1493, #2124) from all 279 scored presubmit
+      # repetitions of 2026-09-25 to 09-29 (52 misses, every one on this
+      # check): 39 were correct answers in words the list lacked ("older
+      # than the default" 17 times; "no longer listed / not available /
+      # missing from the list" once GKE dropped the planted patch from
+      # REGULAR's valid list on 09-28; "trailing the channel's default",
+      # which the apostrophe hid from the entry above) and 13 were the agent
+      # calling the cluster current with its own 1.34-against-1.35.8 table a
+      # line below -- four more of those passed on a stray "behind". The 17
+      # spellings below rescue 28 of the 39; the forbidden_phrases list
+      # closes the verdict gap the paragraph above left to the judge, on the
+      # 13 shapes those 17 wrong answers used, and touches none of the 223
+      # correct passes. "older than the" is the qualified form the wrong
+      # answers hedge with; the two that use it are caught by the forbidden
+      # list. Priced with the verifier's own _normalize:
+      #
+      # | 279 reps        | pass      | wrong verdicts passing | correct answers failing |
+      # |-----------------|-----------|------------------------|-------------------------|
+      # | before          | 227 / 279 | 4                      | 39                      |
+      # | after           | 251 / 279 | 0                      | 11                      |
+      #
+      # The 11 still failing are 7 replies that list versions with no
+      # comparison sentence and 4 one-off wordings; neither is worth a bare
+      # phrase.
       any_of_phrases: [
           "behind",
           "lagging",
@@ -122,6 +147,55 @@ verification_spec:
           # The lag as a comparison. Qualified with "version": bare "older
           # than" matches the two wrong answers, bare "older" is in "folder".
           "older version than",
+          # 2026-09-29: the comparison as the agent writes it -- "older than
+          # the default", "an older version", "older control plane version".
+          # "older than the" keeps the article so bare "older than" stays out.
+          "older than the",
+          "older control plane version",
+          "older version",
+          # 2026-09-29: the lag as absence, in the words that appeared once
+          # 1.34.10 left REGULAR's valid list ("no longer offered" and "not a
+          # valid version" above did not cover them).
+          "no longer available",
+          "no longer among",
+          "no longer listed",
+          "not listed among",
+          "missing from the list",
+          # 2026-09-29: the question negated, and the comparison in other
+          # verbs. The apostrophe forms are separate entries because the
+          # verifier folds the typographic apostrophe to ASCII but does not
+          # drop it, so "trailing the channel default" never matched
+          # "trailing the channel's default".
+          "not up to date",
+          "below the channel",
+          "out of sync",
+          "moved ahead",
+          "trailing the channel's default",
+          "trails its",
+          "does not match the channel's default",
+          "not running the version currently recommended",
+          "not running the current version",
+        ]
+      # 2026-09-29 (#2124): the verdict, not just the description. Each entry
+      # is a sentence shape one of the 17 recorded wrong answers used to call
+      # the lagging cluster current; the "is" and "fully" prefixes are what
+      # keep "not fully up to date" and "is not current" safe, and none of
+      # the 13 appears in any of the 223 correct passes. A report that words
+      # the gap AND one of these fails, which is what expected_output asks.
+      forbidden_phrases: [
+          "is current for its release channel",
+          "is current with the",
+          "is current relative",
+          "is currently up to date",
+          "is currently up-to-date",
+          "is fully up to date",
+          "is fully up-to-date",
+          "fully current",
+          "is the correct, current version",
+          "matches the default version",
+          "matches its configured release channel",
+          "no action is required",
+          "no pending upgrade",
         ]
   - name: no-invented-cves
     role: objective
