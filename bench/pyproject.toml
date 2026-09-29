@@ -51,6 +51,7 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 # to override an upstream type, only to add one. Hence a distinct name rather
 # than a drop-in replacement.
 [project.entry-points."devops_bench.verifiers"]
+bootstrap_delivered = "kube_agents_bench.verifiers:BootstrapDeliveredVerifier"
 bootstrap_fanout = "kube_agents_bench.verifiers:BootstrapFanoutVerifier"
 bootstrap_findings = "kube_agents_bench.verifiers:BootstrapFindingsVerifier"
 bootstrap_report_read = "kube_agents_bench.verifiers:BootstrapReportReadVerifier"

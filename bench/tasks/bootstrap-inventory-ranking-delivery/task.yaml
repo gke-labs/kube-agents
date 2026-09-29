@@ -26,7 +26,8 @@
 # the board has succeeded. The first objective reads INVENTORY.items.json off
 # the sandbox and compares its findings with the raw report's findings block;
 # the second reads whether the delivery job claimed the report and moved it
-# aside on the sandbox.
+# aside on the sandbox; the third reads whether the scheduler kept the run
+# that did so, which it must for the report to be posted.
 #
 # The stack refuses an install where a person has connected, onboarding has
 # already delivered, either onboarding cron job is gone, or the delivery job
@@ -43,7 +44,7 @@
 # takes a dispatcher slot for most of the stack's wait.
 ---
 id: bootstrap-inventory-ranking-delivery
-name: Onboarding extracts the sweep's findings in the shell sandbox and reads the report from there
+name: Onboarding extracts the sweep's findings in the shell sandbox and delivers the report from there
 
 # No seeded-fleet dependency: the raw report is a fixed file the stack plants.
 fixtures: []
@@ -116,3 +117,11 @@ verification_spec:
     role: objective
     check:
       type: bootstrap_report_read
+  # Reads the delivery job's runs in the agent pod's cron/executions.db
+  # (kube_agents_bench/onboarding.py). The run that claimed the report has to
+  # complete: the scheduler discards the output of a run whose job was removed
+  # while it ran.
+  - name: report-delivered
+    role: objective
+    check:
+      type: bootstrap_delivered

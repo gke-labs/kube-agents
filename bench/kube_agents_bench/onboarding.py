@@ -20,7 +20,8 @@ files it writes land on the sandbox's data volume, which the agent pod does
 not mount. ``harness._agent_shell`` execs into the agent's Service, so it
 cannot see them. :func:`sandbox_shell` execs into the sandbox pod instead,
 named the way ``hack/ci-eval-pr.sh`` names it. The delivery job runs in the
-agent pod and writes its marker there, which :func:`agent_shell` reads.
+agent pod and writes its marker there, which :func:`agent_shell` reads, along
+with the scheduler's record of the job's runs.
 
 A reply without a sentinel is a failed read, never an empty one: both shells
 return ``""`` on any kubectl failure.
@@ -28,19 +29,23 @@ return ``""`` on any kubectl failure.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
 import subprocess
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 
 __all__ = [
     "COMPLETED_MARKER",
     "DELIVERED_FILE",
+    "DELIVERY_JOB_ID",
+    "EXECUTIONS_DB",
     "ITEMS_FILE",
     "REPORT_FILE",
     "agent_shell",
+    "read_delivery_runs",
     "read_files",
     "read_items",
     "sandbox_pod",
@@ -75,6 +80,45 @@ DELIVERED_FILE = "/opt/data/INVENTORY.delivered.md"
 FILES_READ = "__ONBOARDING_FILES_READ__"
 FILE_PRESENT = "present"
 FILE_ABSENT = "absent"
+
+# The scheduler's record of each run of the delivery job (bootstrap_delivery.py:
+# DELIVERY_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
+# the agent's own interpreter: the agent image ships no sqlite3 binary.
+DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+EXECUTIONS_DB = "/opt/data/cron/executions.db"
+AGENT_PYTHON = "/opt/hermes/.venv/bin/python3"
+RUNS_READ = "__ONBOARDING_RUNS_READ__"
+# The job ticks every minute, so this reaches back several hours from the
+# newest run: far past the claim in any case that just ran.
+MAX_RUNS = 500
+
+# Prints the marker's mtime and every run of the job whose window, claimed_at
+# to finished_at, holds it: the run that took the claim. A run still going has
+# no finished_at.
+_RUNS_SCRIPT = """
+import json, os, sqlite3, sys
+from datetime import datetime
+marker, db, job, limit, sentinel = sys.argv[1:6]
+out = {"marker": None, "runs": []}
+try:
+    out["marker"] = os.stat(marker).st_mtime
+except FileNotFoundError:
+    pass
+if out["marker"] is not None:
+    con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+    rows = con.execute(
+        "SELECT status, claimed_at, finished_at, error, delivery_outcome FROM executions"
+        " WHERE job_id = ? ORDER BY claimed_at DESC LIMIT ?", (job, int(limit))).fetchall()
+    for status, claimed, finished, error, outcome in rows:
+        if not claimed or datetime.fromisoformat(claimed).timestamp() > out["marker"]:
+            continue
+        if finished and datetime.fromisoformat(finished).timestamp() < out["marker"]:
+            continue
+        out["runs"].append({"status": status, "claimed_at": claimed, "finished_at": finished,
+                            "error": error, "delivery_outcome": outcome})
+print(sentinel)
+print(json.dumps(out))
+"""
 
 
 def sandbox_pod() -> str:
@@ -173,3 +217,28 @@ def read_files(shell: Callable[[str, float], str], paths: list[str], timeout: fl
     if set(seen) != set(paths):
         return None
     return seen
+
+
+def runs_command() -> str:
+    """The ``sh -c`` line that runs the executions read in the agent container."""
+    argv = [AGENT_PYTHON, "-c", _RUNS_SCRIPT, COMPLETED_MARKER, EXECUTIONS_DB, DELIVERY_JOB_ID, str(MAX_RUNS), RUNS_READ]
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def read_delivery_runs(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The claim marker's mtime and the delivery runs that span it, or ``None`` if the read failed.
+
+    ``{"marker": None, "runs": []}`` means there is no marker. ``shell`` is
+    :func:`agent_shell`, a parameter so the tests can fake it.
+    """
+    reply = shell(runs_command(), timeout)
+    marker = reply.rfind(RUNS_READ)
+    if marker < 0:
+        return None
+    try:
+        parsed = json.loads(reply[marker + len(RUNS_READ) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("runs"), list):
+        return None
+    return parsed

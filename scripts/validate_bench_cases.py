@@ -324,6 +324,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: whether the delivery job claimed and archived the report is
     # the whole assertion.
     "bootstrap_report_read": (),
+    # No field: whether the run that delivered the report completed is the
+    # whole assertion.
+    "bootstrap_delivered": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

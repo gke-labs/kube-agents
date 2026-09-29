@@ -200,7 +200,9 @@ extract` writes through the worker's terminal. It passes when those items carry 
 `(check, object)` pairs listed in `expected_findings`. `bootstrap_report_read` reads the
 sandbox too, and passes when onboarding's delivery job has claimed the ranked report
 (`.bootstrap_completed` on the agent pod) and renamed the sandbox's `INVENTORY.md` to
-`INVENTORY.delivered.md`, which it does after reading it.
+`INVENTORY.delivered.md`, which it does after reading it. `bootstrap_delivered` reads the
+agent pod's `cron/executions.db` instead and passes when the delivery job's run that claimed
+the report completed, which is the condition for the scheduler to post what it printed.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

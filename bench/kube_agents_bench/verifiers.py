@@ -2634,3 +2634,41 @@ class BootstrapReportReadVerifier(_OnboardingPollVerifier):
         if report:
             return "fail", f"{marker} exists but {pod} still holds INVENTORY.md: the delivery job did not archive the report it claimed", raw
         return "fail", f"{marker} exists but {pod} holds neither INVENTORY.md nor INVENTORY.delivered.md", raw
+
+
+@VERIFIERS.register("bootstrap_delivered")
+class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
+    """Checks that the scheduler kept the run that delivered the onboarding report.
+
+    ``bootstrap_delivery.py`` claims the report by writing
+    ``.bootstrap_completed`` and prints it; the scheduler posts what it prints
+    only if the run completes. A run whose job is removed while it runs is
+    recorded as failed and its output is discarded. This finds the delivery
+    job's run in the agent pod's ``cron/executions.db`` whose window holds the
+    marker's mtime, and passes when that run completed.
+
+    Where the output went is not checked: the bench stack delivers to
+    ``local``, which the scheduler records as ``suppressed``. The agent pod
+    unreadable is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_delivered"]
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_delivery_runs(onboarding.agent_shell, read_timeout)
+        if read is None:
+            return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
+        marker, job = onboarding.COMPLETED_MARKER, onboarding.DELIVERY_JOB_ID
+        if read.get("marker") is None:
+            return "fail", f"there is no {marker}: the delivery job never claimed the report", read
+        claimed = datetime.fromtimestamp(read["marker"], timezone.utc).isoformat()
+        runs = read["runs"]
+        if not runs:
+            return "fail", f"no run of {job} in {onboarding.EXECUTIONS_DB} spans the claim at {claimed}", read
+        run = runs[0]
+        status = run.get("status")
+        if status == "completed":
+            return "pass", f"the {job} run that claimed the report at {claimed} completed", read
+        if status in ("claimed", "running"):
+            return "fail", f"the {job} run that claimed the report at {claimed} is still {status}", read
+        return "fail", f"the {job} run that claimed the report at {claimed} ended {status}: {run.get('error') or 'no error recorded'}", read
