@@ -2025,7 +2025,8 @@ def _fleet_state_result(
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
         if rc != 0:
-            reason = _unread_reason(err)
+            # As in the presence half: a silent exit is the project's, not an unread.
+            reason = _unread_reason(err) if err.strip() else None
             if reason:
                 return CheckResult(
                     name,

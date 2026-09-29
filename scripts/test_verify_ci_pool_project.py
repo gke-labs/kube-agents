@@ -861,6 +861,16 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
         self.assertTrue(any("container.clusters.get" in w for w in result.warnings), result.warnings)
 
+    def test_a_silent_state_script_exit_is_a_failure_like_the_presence_halfs(self):
+        # The state half (hack/fleet-fixture-state.py) follows the presence
+        # half's rule: a non-zero exit with nothing on stderr is a kill or a
+        # trip, and the project's failure, not an unread.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok("v1.30.0"), (0, "", self._summary(self._roles())), (1, "", "")]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result)
+        self.assertIn("exited 1 without reporting", result.message)
+
     def test_script_timing_out_is_unverified_not_failed(self):
         # A fleet script that never finished says nothing about the fleet, and
         # it is the likeliest non-zero exit here: it walks every seeded cluster

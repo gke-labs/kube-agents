@@ -1942,7 +1942,13 @@ def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | No
     # A project the scan no longer lists has left the pool mapping; it is not
     # waited on, or an incident on a retired project would hold forever.
     scanned = set(scan_result.get("scanned") or [])
-    waiting = [project for project in incident.get("projects") or [] if not scanned or project in scanned]
+    named = list(incident.get("projects") or [])
+    waiting = [project for project in named if not scanned or project in scanned]
+    if named and not waiting:
+        # None of them is listed: a hand-uploaded --projects document or a
+        # mapping the row regex no longer reads. Nothing was observed about
+        # the incident, so it holds.
+        return f"the {label} scan lists none of {_project_list(named)}"
     unread = sorted(
         project
         for project in waiting

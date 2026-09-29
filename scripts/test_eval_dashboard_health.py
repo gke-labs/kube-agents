@@ -2460,6 +2460,20 @@ class PoolDrift(unittest.TestCase):
         held = self.judge(blind, prev=prev, now=later)
         self.assertEqual((held["state"], held["condition"]), ("DEGRADED", "pool_drift"))
 
+    def test_a_document_listing_none_of_the_incidents_projects_holds_it(self):
+        # A hand-uploaded --projects document, or a mapping the row regex no
+        # longer reads: nothing was observed about the incident's projects, so
+        # it holds rather than reading as a recovery nothing saw.
+        firing = pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)})
+        prev = self.judge(firing)
+        later = T0 + timedelta(hours=1)
+        others = pool_scan(at=later - timedelta(minutes=5), previous={project(i): [FINDING] for i in (1, 2, 3)})
+        for i in (1, 2, 3):
+            del others["projects"][project(i)]
+        held = self.judge(others, prev=prev, now=later)
+        self.assertEqual((held["state"], held["condition"], held["since"]), ("DEGRADED", "pool_drift", health.iso(T0)))
+        self.assertTrue(any("lists none of" in line for line in held["evidence"]), held["evidence"])
+
     def test_a_fixture_incident_recorded_before_reads_existed_still_exits_on_its_roles(self):
         # The live health.json at merge time may hold a fixture_drift incident
         # without `reads`; the exit then asks for the roles themselves.
