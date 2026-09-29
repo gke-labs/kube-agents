@@ -733,10 +733,14 @@ guard_pubsub_subscription() {
     in_state "$addr" || continue
 
     # Assigned rather than compared inline. tfvar ends in `exit 1`, which
-    # inside $( ) kills only the subshell: `[[ "$(tfvar x)" == true ]]` reads a
-    # failed console as "not enabled" and skips the guard, while an assignment
-    # fails under `set -e` and stops the apply. A guard that cannot read the
-    # configuration has to fail closed.
+    # inside $( ) kills only the subshell, so comparing the substitution
+    # directly reads a failed console as "not enabled" and skips the guard,
+    # while an assignment fails under `set -e` and stops the apply. A guard
+    # that cannot read the configuration has to fail closed. The name is not
+    # written out here as a call: hack/check-tfvar-console.sh greps this file
+    # for `$(tfvar <name>)` and evaluates every name it finds, so one in a
+    # comment is a variable the composition does not declare and reds the
+    # check.
     local enabled
     enabled=$(tfvar "$flag")
     [[ "$enabled" == "true" ]] || continue
