@@ -11,8 +11,10 @@ endpoint is needed and no run's state is read.
 
 import http.client
 import json
+import signal
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,8 +38,14 @@ MAX_CONSECUTIVE_REPEATS = 3
 HEARTBEAT_SECONDS = 30
 # Prow ends a job with a signal and a grace period before SIGKILL. Python's
 # default action skips `finally`, which is where a held project is released;
-# converting the signal to an exception is what lets the release run.
+# converting the signal to an exception is what lets the release run. The
+# signals are deferred from the acquire until the hold's `try` is entered and
+# again across the release, so one landing in those windows is acted on after
+# the project is safe, not instead of it.
 TERMINATED_EXIT_CODE = 143
+TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+# What acquire_and_hold returns when the acquire handed out nothing.
+NOT_ACQUIRED = object()
 
 REACH_ERRORS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
 
@@ -133,31 +141,84 @@ def _heartbeat(server, owner, hold_state, name, stop):
             print("  %s: heartbeat failed (%s)" % (name, exc), file=sys.stderr)
 
 
-def hold(server, owner, hold_state, name, visit, release_failures, heartbeat=False):
-    """Run visit(name) with the project held, and release it whatever happens.
+# Termination signals deferred while a hold is between its acquire and its
+# armed `finally`, or inside its release: the handler below records them and
+# the unblock raises the first as Terminated in the hold's own frame. Done
+# with Python-level handlers rather than a signal mask because the mask does
+# not stop a process-directed signal reaching another thread.
+_DEFERRED = []
+_SAVED_HANDLERS = {}
+_HOLD_DEPTH = 0
+
+
+def _defer(signum, frame):
+    _DEFERRED.append(signum)
+
+
+def _hold_signals(block):
+    global _HOLD_DEPTH
+    if block:
+        _HOLD_DEPTH += 1
+        if _HOLD_DEPTH == 1:
+            for sig in TERMINATION_SIGNALS:
+                if signal.getsignal(sig) is terminate:
+                    _SAVED_HANDLERS[sig] = signal.signal(sig, _defer)
+        return
+    _HOLD_DEPTH = max(0, _HOLD_DEPTH - 1)
+    if _HOLD_DEPTH:
+        return
+    for sig, previous in _SAVED_HANDLERS.items():
+        signal.signal(sig, previous)
+    _SAVED_HANDLERS.clear()
+    if _DEFERRED:
+        signum = _DEFERRED[0]
+        _DEFERRED.clear()
+        raise Terminated("signal %d" % signum)
+
+
+def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failures, heartbeat=False):
+    """Acquire a project with acquire_fn(), run visit(name) with it held, and
+    release it whatever happens; NOT_ACQUIRED when acquire_fn() returned None.
 
     With `heartbeat`, a thread refreshes the hold every HEARTBEAT_SECONDS for
-    as long as the visit runs. A release that fails is recorded in
+    as long as the visit runs. Termination signals are deferred from the
+    acquire until the visit starts and across the release, so none is acted
+    on between a project being acquired and its `finally` being armed, or
+    while it is being given back. A release that fails is recorded in
     `release_failures` and not raised: the project stays in `hold_state` until
     the next run's reset returns it, and an exception already unwinding (a
     termination) is not replaced by this one.
     """
-    stop = threading.Event()
-    beater = None
-    if heartbeat:
-        beater = threading.Thread(target=_heartbeat, args=(server, owner, hold_state, name, stop), daemon=True)
-        beater.start()
+    _hold_signals(True)
     try:
-        return visit(name)
-    finally:
-        stop.set()
-        if beater is not None:
-            beater.join()
+        name = acquire_fn()
+        if name is None:
+            return NOT_ACQUIRED
+        stop = threading.Event()
+        beater = None
         try:
-            release(server, owner, name)
-        except (BoskosError,) + REACH_ERRORS as exc:
-            print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
-            release_failures[name] = "release failed: %s" % exc
+            if heartbeat:
+                beater = threading.Thread(target=_heartbeat, args=(server, owner, hold_state, name, stop), daemon=True)
+                beater.start()
+            _hold_signals(False)
+            return visit(name)
+        finally:
+            _hold_signals(True)
+            stop.set()
+            if beater is not None:
+                beater.join()
+            try:
+                release(server, owner, name)
+            except (BoskosError,) + REACH_ERRORS as exc:
+                print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
+                release_failures[name] = "release failed: %s" % exc
+    finally:
+        _hold_signals(False)
+
+
+def hold(server, owner, hold_state, name, visit, release_failures, heartbeat=False):
+    """Run visit(name) with an already acquired project held; see acquire_and_hold."""
+    return acquire_and_hold(server, owner, hold_state, lambda: name, visit, release_failures, heartbeat=heartbeat)
 
 
 def walk(server, owner, hold_state, pool_size, visit, heartbeat=False):
@@ -172,9 +233,6 @@ def walk(server, owner, hold_state, pool_size, visit, heartbeat=False):
     release_failures = {}
     repeats = 0
     for _ in range(2 * pool_size + MAX_CONSECUTIVE_REPEATS):
-        name = acquire(server, owner, hold_state)
-        if name is None:
-            break
 
         def once(project):
             nonlocal repeats
@@ -187,7 +245,9 @@ def walk(server, owner, hold_state, pool_size, visit, heartbeat=False):
             visit(project)
             return True
 
-        hold(server, owner, hold_state, name, once, release_failures, heartbeat=heartbeat)
-        if repeats >= MAX_CONSECUTIVE_REPEATS:
+        outcome = acquire_and_hold(
+            server, owner, hold_state, lambda: acquire(server, owner, hold_state), once, release_failures, heartbeat=heartbeat
+        )
+        if outcome is NOT_ACQUIRED or repeats >= MAX_CONSECUTIVE_REPEATS:
             break
     return visited, release_failures

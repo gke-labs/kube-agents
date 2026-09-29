@@ -79,7 +79,7 @@ STRANDED_AFTER = "65m"
 # killed. Prow's entrypoint sends SIGINT and its own grace period, so the
 # periodic's grace_period must exceed this.
 INTERRUPT_GRACE_SECONDS = 120
-TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+TERMINATION_SIGNALS = boskos_pool.TERMINATION_SIGNALS
 
 # Where the CI health bot publishes its scan (docs/ci-health.md, "The
 # seeded-fleet scan"); `--drifted` applies the projects it lists.
@@ -334,19 +334,20 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
         if project not in known:
             outcomes[project] = (OUTCOME_FAILED, REASON_UNMAPPED)
             continue
-        if boskos_pool.acquire(server, owner, HOLD_STATE, name=project) is None:
-            outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
-            continue
         release_failures = {}
-        outcomes[project] = boskos_pool.hold(
+        outcome = boskos_pool.acquire_and_hold(
             server,
             owner,
             HOLD_STATE,
-            project,
+            lambda project=project: boskos_pool.acquire(server, owner, HOLD_STATE, name=project),
             lambda p: reconcile_project(p, runner=runner, dry_run=dry_run),
             release_failures,
             heartbeat=True,
         )
+        if outcome is boskos_pool.NOT_ACQUIRED:
+            outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
+            continue
+        outcomes[project] = outcome
         if project in release_failures:
             outcomes[project] = (OUTCOME_FAILED, release_failures[project])
     return outcomes
@@ -398,6 +399,8 @@ def main(argv=None):
         signal.signal(sig, boskos_pool.terminate)
     try:
         if args.project:
+            if not args.no_lease:
+                boskos_pool.reset_stranded(args.boskos_server, HOLD_STATE, STRANDED_AFTER, "reconcile")
             outcomes = reconcile_named(
                 args.project,
                 args.boskos_server,

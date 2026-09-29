@@ -447,6 +447,71 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(boskos.beats[0], P7)
         self.assertEqual(boskos.released, [P7], "released after the last beat")
 
+    def test_the_reconciles_own_holds_are_heartbeat(self):
+        # Through reconcile_named and reconcile_pool, not hold() alone: a
+        # dropped heartbeat=True in either would hand a mid-apply project to
+        # the reaper five minutes in.
+        def slow_tofu(argv, **_):
+            if argv[1] == "apply":
+                time.sleep(0.3)
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        for run in ("named", "pool"):
+            boskos = _Boskos(free=[P7])
+            with mock.patch.object(boskos_pool, "HEARTBEAT_SECONDS", 0.05), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+                if run == "named":
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=slow_tofu, known=KNOWN)
+                else:
+                    reconcile.reconcile_pool(BOSKOS, OWNER, 1, runner=slow_tofu, known=KNOWN)
+            self.assertGreaterEqual(len(boskos.beats), 2, run)
+            self.assertEqual(boskos.released, [P7], run)
+
+    def test_a_termination_during_the_release_still_releases_and_then_propagates(self):
+        # The signal is held back across the release: the project goes back to
+        # free first, and the termination is delivered after.
+        class _Boskos_signalling_release(_Boskos):
+            def __call__(self, request, timeout=None):
+                if "/release?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return super().__call__(request, timeout)
+
+        boskos = _Boskos_signalling_release(free=[P7])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
+                try:
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+                except boskos_pool.Terminated:
+                    pass
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        # The property under test is the order: the project is back in the
+        # pool before the termination can be acted on. Where the termination
+        # surfaces is the unit test below.
+        self.assertEqual(boskos.released, [P7], "released before the termination was delivered")
+
+    def test_a_signal_held_back_is_raised_on_the_unblock_in_that_frame(self):
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            boskos_pool._hold_signals(True)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool._defer, "deferred while held")
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.05)
+            self.assertEqual(boskos_pool._DEFERRED, [signal.SIGINT])
+            with self.assertRaises(boskos_pool.Terminated):
+                boskos_pool._hold_signals(False)
+            self.assertIs(signal.getsignal(signal.SIGINT), boskos_pool.terminate, "the handler is back")
+            self.assertEqual(boskos_pool._DEFERRED, [])
+        finally:
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._SAVED_HANDLERS.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+
     def test_the_reset_window_outlasts_one_projects_ceiling_and_its_grace(self):
         # A live apply's project must never be reset to free under it.
         minutes = int(reconcile.STRANDED_AFTER.removesuffix("m"))
