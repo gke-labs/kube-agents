@@ -237,6 +237,7 @@ class PlanInspectionTest(unittest.TestCase):
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu, timeout=5)
         self.assertEqual(outcome, reconcile.OUTCOME_FAILED)
         self.assertIn("did not finish within 5s", detail)
+        self.assertIn("tofu force-unlock", detail, "a kill at the ceiling leaves the lock; the line says so")
 
     def test_a_show_that_is_not_json_is_a_failure(self):
         tofu = _Tofu({P7: "<html>"})
@@ -454,6 +455,27 @@ class MainTest(unittest.TestCase):
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
 
+    def test_all_walks_the_free_pool_after_resetting_strands_and_applies_each(self):
+        # The weekly arm: the pool size from the mapping bounds the walk, each
+        # free project is held and applied once, and the exit is the outcomes'.
+        boskos = _Boskos(free=[P7, P8])
+        tofu = _Tofu({P7: UPDATE_ONLY, P8: UPDATE_ONLY})
+        rc, _ = self._main(["--all"], boskos, tofu)
+        self.assertEqual(rc, reconcile.EXIT_OK)
+        self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
+        self.assertEqual(boskos.acquired, [P7, P8])
+        self.assertEqual(boskos.released, [P7, P8])
+        self.assertEqual(tofu.verbs().count("apply"), 2)
+
+    def test_all_fails_on_a_hand_out_outside_the_mapping_and_releases_it(self):
+        boskos = _Boskos(free=["kube-agents-evals-99", P7])
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        rc, stderr = self._main(["--all"], boskos, tofu)
+        self.assertEqual(rc, reconcile.EXIT_FAILED)
+        self.assertIn("kube-agents-evals-99", stderr)
+        self.assertEqual(boskos.released, ["kube-agents-evals-99", P7])
+        self.assertEqual(tofu.verbs().count("apply"), 1, "the mapped project is still applied")
+
     def test_a_busy_pool_exits_zero(self):
         rc, _ = self._main(["--project", P7], _Boskos(free=[]), _Tofu({}))
         self.assertEqual(rc, reconcile.EXIT_OK)
@@ -555,6 +577,36 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(boskos.acquired, [P7])
         self.assertEqual(boskos.released, [P7], "acquired, then given back")
         self.assertEqual(tofu.calls, [], "never applied")
+
+    def test_a_termination_as_the_release_arms_its_deferral_still_releases(self):
+        # The moment between the hold's finally starting and its handlers
+        # being held: a signal there is raised out of the swap, and the
+        # release must run anyway.
+        boskos = _Boskos(free=[P7])
+        original = boskos_pool._hold_signals
+        blocks = []
+
+        def hooked(block):
+            if block:
+                blocks.append(True)
+                if len(blocks) == 2:
+                    os.kill(os.getpid(), signal.SIGINT)
+                    time.sleep(0.05)
+            return original(block)
+
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(
+                boskos_pool, "_hold_signals", hooked
+            ), mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+        finally:
+            boskos_pool._DEFERRED.clear()
+            boskos_pool._HOLD_DEPTH = 0
+            signal.signal(signal.SIGINT, previous)
+        self.assertEqual(len(blocks), 2, "the signal landed at the release's block")
+        self.assertEqual(boskos.released, [P7], "released although the signal landed before the handlers were held")
 
     def test_a_signal_held_back_is_raised_on_the_unblock_in_that_frame(self):
         previous = signal.signal(signal.SIGINT, boskos_pool.terminate)

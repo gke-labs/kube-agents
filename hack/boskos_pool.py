@@ -219,15 +219,20 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
             _hold_signals(False)
             return visit(name)
         finally:
-            _hold_signals(True)
-            stop.set()
-            if beater is not None:
-                beater.join()
+            # A termination raised out of the swap below (a signal in the
+            # moment before the handlers are held) must not skip the release:
+            # the raise itself leaves later signals held, so the release runs.
             try:
-                release(server, owner, name)
-            except (BoskosError,) + REACH_ERRORS as exc:
-                print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
-                release_failures[name] = "release failed: %s" % exc
+                _hold_signals(True)
+            finally:
+                stop.set()
+                if beater is not None:
+                    beater.join()
+                try:
+                    release(server, owner, name)
+                except (BoskosError,) + REACH_ERRORS as exc:
+                    print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
+                    release_failures[name] = "release failed: %s" % exc
     finally:
         _hold_signals(False)
 

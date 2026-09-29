@@ -105,6 +105,7 @@ REASON_UNMAPPED = "not a mapped pool project (gitops_repo_for_project in hack/ci
 # mapping row and its Boskos registration, and reads busy until registered.
 REASON_BUSY = "not free in Boskos, or not registered there yet"
 REASON_INTERRUPTED = "terminated (%s) while tofu ran; an apply cut past its grace leaves the state locked: tofu force-unlock"
+REASON_CEILING = "did not finish within %ds; tofu was interrupted, and killed if it did not stop within %ds, which leaves the state locked: tofu force-unlock"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -296,7 +297,7 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
         except ReconcileError as exc:
             return OUTCOME_FAILED, str(exc)
         except subprocess.TimeoutExpired:
-            return OUTCOME_FAILED, "did not finish within %ds; tofu was interrupted" % timeout
+            return OUTCOME_FAILED, REASON_CEILING % (timeout, INTERRUPT_GRACE_SECONDS)
         except (OSError, subprocess.SubprocessError) as exc:
             return OUTCOME_FAILED, "could not run tofu (%s: %s)" % (type(exc).__name__, exc)
 
