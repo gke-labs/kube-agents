@@ -187,7 +187,13 @@ overwhelming majority of the stream.
 
 **It is off unless you ask for it, the opposite of the watcher.** The subscription it reads does not
 exist in a stock install: the audit log sink, topic, and subscription come from the
-`drift-pubsub` Terraform module, and an install that has not applied it has nothing for the detector
+`drift-pubsub` Terraform module, which the
+[`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)
+composition instantiates only when you set `enable_drift_pubsub = true`. If you installed with
+`install.sh`, set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`: the front doors
+regenerate `terraform.tfvars` on every run, so a value written into that file by hand does not
+survive the next one. An install that has neither set that flag nor applied the module by hand has
+nothing for the detector
 to pull. Starting it anyway gives a process that retries a failing pull for the life of the pod
 without ever reporting a change, and the pod stays Ready throughout — so unset means off, and an
 install you switched on by mistake looks exactly like a fleet nobody has touched.

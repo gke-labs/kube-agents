@@ -437,8 +437,10 @@ credential proxy's entrypoint starts it, so what an install still needs is
 `spec.harness.driftDetector.enabled` set on its `PlatformAgent` and the `drift-pubsub` Terraform
 module applied. Only the first is a start gate: without it the detector ships and does not run,
 while enabling it without the module gives a detector that runs and retries a pull that cannot
-succeed. Either way no drift is detected. What the domain is waiting on is that provisioning, not
-design.
+succeed. Either way no drift is detected. The provisioning is a flag:
+`terraform/examples/full-install` instantiates the module when `enable_drift_pubsub` is set. The CR
+field is the half it leaves alone, and reaches the chart through `extra_helm_values`, which the
+installer front doors do not expose — an install.sh install sets it on the `PlatformAgent` itself.
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously

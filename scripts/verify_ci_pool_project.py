@@ -424,6 +424,37 @@ PROW_RUNNER_ROLES = {
     "roles/viewer",
 }
 
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py,
+# two Prow periodics on main; docs/ci-pool-projects.md section 6.2). It
+# re-applies bench/tf/fleet under a Boskos lease, so it holds what that apply
+# needs on the project, list on the state bucket and objectAdmin under its
+# seeded-fleet/ prefix, nothing else. The prefix keeps tofu's own reads off the
+# host cluster's state, which shares the bucket and carries the install's
+# secrets; it is not a fence against the identity, which holds project IAM
+# admin (the stack declares project bindings) and could widen its own grant.
+# What bounds the identity is that only main-only jobs run as it; the
+# presubmit's runner is never granted the job. Kept equal to the grant loop in
+# scripts/provision_ci_pool_project.sh and the repair block in
+# docs/ci-pool-projects.md by scripts/test_verify_ci_pool_project.py.
+FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
+FLEET_RECONCILER_ROLES = {
+    "roles/compute.storageAdmin",
+    "roles/compute.viewer",
+    "roles/container.admin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/serviceusage.serviceUsageConsumer",
+}
+# On gs://<project>-tf-state, where the fleet's state lives beside the host
+# cluster's: list on the bucket (`tofu init` lists it, which a grant conditioned
+# on the object name does not cover) and objectAdmin conditioned to the fleet's
+# prefix. Named for the repair text; the bucket's policy is not read here, so
+# the reconcile's own first run is what reports either missing.
+FLEET_RECONCILER_BUCKET_LIST_ROLE = "roles/storage.legacyBucketReader"
+FLEET_RECONCILER_BUCKET_ROLE = "roles/storage.objectAdmin"
+FLEET_RECONCILER_STATE_PREFIX = "seeded-fleet/"
+
 # The agent's own identity, checked in both directions -- a missing role fails
 # and so does an extra one, unlike the Prow runner above. That account is
 # infrastructure and a superset is harmless; this one is the subject under test,
@@ -1045,7 +1076,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, both runners' and the platform GSA's project roles, and the fleet reader's token-creator binding."""
+    """Verify Workload Identity, the runners', the reconciler's and the platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     findings: List[Finding] = []
@@ -1155,6 +1186,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
             f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
+            "the seeded-fleet reconciler's roles, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -1167,6 +1199,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             runner_held = {member: set() for _, _, member in RUNNERS}
+            reconciler_held = set()
             platform_held = set()
             litellm_held = set()
             bot_held = set()
@@ -1196,6 +1229,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     litellm_held.add(b.get("role"))
                 if CI_HEALTH_BOT_MEMBER in members:
                     bot_held.add(b.get("role"))
+                if FLEET_RECONCILER_MEMBER in members:
+                    reconciler_held.add(b.get("role"))
 
             for label, job, member in RUNNERS:
                 missing = PROW_RUNNER_ROLES - runner_held[member]
@@ -1214,6 +1249,18 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                             f"{label} is missing {role} on {project_id}",
                             _project_binding(project_id, member, role),
                         ))
+
+            reconciler_missing = FLEET_RECONCILER_ROLES - reconciler_held
+            if reconciler_missing:
+                passed = False
+                details.append(
+                    f"The seeded-fleet reconciler ({FLEET_RECONCILER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"{len(reconciler_missing)} role(s) on {project_id}: {', '.join(sorted(reconciler_missing))}. "
+                    "Its scheduled re-apply of bench/tf/fleet fails here, so the fixtures drift unrepaired; "
+                    f"the grant loop is in docs/ci-pool-projects.md section 3, with {FLEET_RECONCILER_BUCKET_LIST_ROLE} "
+                    f"on the state bucket and {FLEET_RECONCILER_BUCKET_ROLE} under its {FLEET_RECONCILER_STATE_PREFIX} "
+                    "prefix, which this check does not read"
+                )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
