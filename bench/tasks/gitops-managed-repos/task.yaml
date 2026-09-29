@@ -1,0 +1,27 @@
+# Which GitOps repositories the agent manages, answered from its own
+# configuration: the gitops-state ConfigMap, mounted at $GITOPS_STATE_PATH.
+# Each eval project's repository is <owner>/<project>-infra (hack/ci-deploy.sh).
+id: gitops-managed-repos
+name: List the GitOps repositories the agent manages
+prompt: >-
+  Which GitOps repositories do you manage?
+expected_output: >-
+  The repositories in managed_repos, by name.
+infrastructure:
+  deployer: noop
+validated: false
+domain: chat-and-routing
+owner: maintainers
+verification_spec:
+  - name: names-the-managed-repo
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["{{PROJECT_ID}}-infra"]
+  - name: answered-from-the-configuration
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns: ['\bgh\s+(repo\s+list|search\s+repos)\b', '\bgcloud\b']
