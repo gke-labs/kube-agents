@@ -3274,10 +3274,18 @@ class CommandExecutorTest(unittest.TestCase):
     def test_a_command_that_closes_its_pipes_and_runs_on_still_meets_the_deadline(self):
         # With both pipes closed there is nothing left to read, so the
         # deadline is enforced by the wait that follows -- at the deadline,
-        # not at the end of the drain grace a killed command gets.
+        # not at the end of the drain grace a killed command gets. The sleep
+        # replaces the shell rather than running under it so that the group
+        # holds one process, the child, which exits on SIGTERM and is reaped
+        # here: a sleep forked by the shell is reparented at the kill, and
+        # under a PID 1 that does not reap (the test process itself as PID 1
+        # of a container, say) it stays a zombie in the group, the kill runs
+        # the whole grace and then the whole wait after SIGKILL, and the span
+        # lands on the ceiling. The ceiling stays where the drain grace is
+        # what it has to tell the deadline apart from.
         executor = self.fake_kubectl(
             self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
-            body="exec >&- 2>&-; sleep 10",
+            body="exec >&- 2>&-; exec sleep 10",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
