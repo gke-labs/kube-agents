@@ -6813,12 +6813,25 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 "repeat --enable-drift-detector on every later install.sh run",
                 combined,
             )
-            # The remedy has to name upgrade.sh. It takes no --enable-drift-detector
-            # and regenerates terraform.tfvars from install.env alone, so an
-            # operator who reads "repeat the flag" and does exactly that keeps
-            # the ingress across install.sh re-runs and loses it on their first
-            # upgrade -- which is the run this warning exists to head off.
+            # The remedy has to name upgrade.sh, because it takes no
+            # --enable-drift-detector: an operator who reads "repeat the flag"
+            # and does exactly that keeps the ingress across install.sh re-runs
+            # and loses it on their first upgrade, which is the run this
+            # warning exists to head off.
             self.assertIn("upgrade.sh takes no such flag", combined)
+            # And it has to say what upgrade.sh regenerates from, correctly.
+            # "from the file alone" was wrong: write_tfvars_from_state reads
+            # ${ENABLE_DRIFT_DETECTOR:-...} out of the environment, and
+            # upgrade.sh clears only PROJECT_ID, CLUSTER_NAME and REGION before
+            # sourcing install.env over whatever it inherited, so an exported
+            # value provisions the sink, topic and subscription on that front
+            # door with no guard on it at all -- and the next upgrade from a
+            # shell without the export destroys them. Telling the operator that
+            # route does not exist is the one thing this sentence must not do.
+            # test_an_exported_value_survives_the_file_load_into_the_tfvars in
+            # tests/test_installer_common.py pins the behaviour it describes.
+            self.assertIn("whatever the calling shell still exports", combined)
+            self.assertNotIn("from the file alone", combined)
 
     def test_the_drift_detector_warning_reaches_an_exported_value(self):
         """The environment is a supported route, and it bypassed the guard.

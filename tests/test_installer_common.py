@@ -427,6 +427,45 @@ class InstallerCommonTest(unittest.TestCase):
                 self.assertNotIn("enable_drift_pubsub", content)
                 self.assertNotIn("enable_drift_detector", content)
 
+    def test_an_exported_value_survives_the_file_load_into_the_tfvars(self):
+        """install.env is not this generator's only input, and no front door makes it one.
+
+        install.sh's unrecorded-value guard tells the operator what upgrade.sh
+        will do with a key their install.env does not record, so that sentence
+        has to match this. `write_tfvars_from_state` reads
+        ${ENABLE_DRIFT_DETECTOR:-...} out of the environment;
+        `load_install_env` clears NAMESPACE and the five scope keys before
+        sourcing, and upgrade.sh clears PROJECT_ID, CLUSTER_NAME and REGION;
+        ENABLE_DRIFT_DETECTOR is on neither list. So `ENABLE_DRIFT_DETECTOR=true
+        ./upgrade.sh` over a file predating the key provisions the sink, topic
+        and subscription -- on a front door with no guard on that route at all
+        -- and the next upgrade from a shell without the export writes neither
+        key and destroys them under -auto-approve.
+
+        The scope key is the contrast, and the reason this is asserted as a
+        pair: the clearing list is what decides, both halves of it are read
+        here, and a sentence claiming either key comes from the file alone is
+        true of exactly one of them.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text("PROJECT_ID=p\n")
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            proc = self._run(
+                f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "ENABLE_DRIFT_DETECTOR": "true",
+                    "SCOPE_PROJECTS": "exported-project",
+                },
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("enable_drift_pubsub   = true", content)
+            self.assertIn("enable_drift_detector = true", content)
+            self.assertNotIn("exported-project", content)
+
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
     def test_tfvars_keeps_cert_manager_when_the_state_manages_the_release(self):

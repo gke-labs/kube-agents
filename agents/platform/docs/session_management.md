@@ -124,8 +124,9 @@ The agent images carry the detector and the credential proxy's entrypoint starts
 has an in-cluster producer — on an install that has set `spec.harness.driftDetector.enabled` and
 applied the `drift-pubsub` Terraform module. Without the field the detector does not start; without
 the module it starts and retries a pull that cannot succeed. Either way the flag exists and the
-route accepts it, and nothing produces one. `terraform/examples/full-install` does both from one
-`enable_drift_detector`, and the installer front doors from one `ENABLE_DRIFT_DETECTOR` key.
+route accepts it, and nothing produces one. `terraform/examples/full-install` takes the two as
+separate variables and refuses an apply that sets `enable_drift_detector` without
+`enable_drift_pubsub`; the installer front doors write both from one `ENABLE_DRIFT_DETECTOR` key.
 
 #### Asking whether the dispatch is there
 

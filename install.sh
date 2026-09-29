@@ -1720,7 +1720,7 @@ bootstrap_install_env_file() {
       "$drift_detector_chosen" \
       "$drift_detector_consequence" \
       true \
-      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file alone, so the file is the only remedy that survives one"
+      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file and from whatever the calling shell still exports, so the file is the only remedy that does not depend on which shell runs the upgrade"
     # The scope keys: a flag applies its declaration for this run, and the
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
