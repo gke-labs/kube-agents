@@ -876,6 +876,25 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
+    def test_a_rolling_card_blocking_after_the_lapse_holds_suspended(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "a")
+            adapter.client.fail.add("update")
+            self.assertFalse(await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "b"))
+            adapter.client.fail.clear()
+            await runtime.settle_row(adapter, _sub("t_a"), "completed")
+            await asyncio.sleep(0.2)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+            await runtime.settle_row(adapter, _sub("t_b"), "blocked")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+            await runtime.settle_row(adapter, _sub("t_b"), "completed")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+        self.assertEqual(runtime._lapsed, {})
+
     def test_rolling_cards_waiting_on_the_user_suspend_the_session(self):
         adapter = _Adapter()
         self._note(adapter, 1, "a", task="t_a")

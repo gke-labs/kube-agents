@@ -66,11 +66,10 @@ message was deleted), the thread drops to the rolling line until every card
 that rolled a note since has settled or been archived, which is what the
 thread showed before this module. A posted plan holds ``processing`` while
 those cards roll and ``suspended`` while they wait on the user; a plan refused
-on its first post holds no status. A settle
-still edits a posted plan, best effort, so an edit refused once, for a rate limit say, does not leave its
-rows showing as running. Everything here is in process,
-like the progress-line map: a gateway restart forgets the plan, and the next
-note starts a new one.
+on its first post holds no status. A settle still edits a posted plan, best
+effort, so an edit refused once, for a rate limit say, does not leave its rows
+showing as running. Everything here is in process, like the progress-line map:
+a gateway restart forgets the plan, and the next note starts a new one.
 """
 
 from __future__ import annotations
@@ -107,8 +106,8 @@ PLATFORM = "slack"
 #: status can go if one ever does, at one call a minute instead of thirty.
 SESSION_REFRESH_SECONDS = 60.0
 
-#: How long a plan with no new note or settled row holds the session open
-#: before closing it. A card whose terminal event never reaches the thread (a
+#: How long a plan with no new note or settled row stands before it is set
+#: aside, closing the session unless a card waits on the user. A card whose terminal event never reaches the thread (a
 #: dropped subscription, a lost event) leaves its row running for good; this
 #: stops that row holding Working… forever, while covering a card's silent
 #: stretches, since noteless heartbeats reach no one.
@@ -129,6 +128,9 @@ UNBLOCKED_KIND = "unblocked"
 SESSIONS_MAX = 512
 ASKS_MAX = 512
 PLANS_MAX = 256
+#: Set-aside plans kept per thread, oldest dropped first; one dropped stops
+#: settling its rows and holding ``suspended``. ``_lapsed`` itself is capped
+#: at :data:`PLANS_MAX` threads.
 LAPSED_PER_THREAD = 4
 
 _warned_missing = False
@@ -163,7 +165,7 @@ class _Plan:
         self.waiting: set[str] = set()
         #: ``time.monotonic()`` at the last note or settled row.
         self.touched = time.monotonic()
-        #: The timer that closes the session after :data:`PLAN_HOLD_SECONDS`.
+        #: The timer that sets the plan aside after :data:`PLAN_HOLD_SECONDS`.
         self.lapse: asyncio.TimerHandle | None = None
 
 
@@ -177,9 +179,9 @@ _asks: OrderedDict[tuple, str] = OrderedDict()
 _titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> _Plan``.
 _plans: OrderedDict[tuple, _Plan] = OrderedDict()
-#: ``(channel, thread) -> [_Plan]`` the lapse set aside with a card still
-#: running or waiting, newest last, kept so the card's later events still
-#: settle its row.
+#: ``(channel, thread) -> [_Plan]`` the lapse set aside with a row still
+#: running or waiting, or a card still rolling, newest last, kept so the
+#: card's later events still settle it.
 _lapsed: OrderedDict[tuple, list] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
@@ -282,7 +284,7 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
     """The session status the thread's plans hold, or ``""`` when no card runs or waits.
 
     Only the current plan runs: a card rolling after its posted plan fell back
-    counts, and nothing counts once it is untouched for
+    counts, and no card counts as running once the plan is untouched for
     :data:`PLAN_HOLD_SECONDS`. A card waiting on the user, on it or on a plan
     the lapse set aside, holds ``suspended``.
     """
@@ -306,7 +308,7 @@ def _waiting(plan: _Plan) -> bool:
 
 def _held(plan: _Plan) -> bool:
     """Whether a set-aside plan still has a card whose events can move it."""
-    return bool(plan.waiting) or any(_live(row) for row in plan.rows.values())
+    return bool(plan.rolling) or any(_live(row) for row in plan.rows.values())
 
 
 def _live(row: _Row) -> bool:
@@ -351,12 +353,12 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
 
 
 async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
-    """Send the session status the plan now holds, through the adapter's setter.
+    """Send the session status the thread's plans now hold, with this plan's team.
 
-    A row running opens the session; nothing running clears it, which
-    :func:`set_thread_status` turns into ``suspended`` while a row still waits
-    and the legacy thread status shows as cleared. Sent on every note and
-    settle: :func:`set_thread_status` skips an unchanged status against what
+    :func:`_plan_session` reads the current plan and any set aside: a card
+    running opens the session, one waiting on the user suspends it, nothing
+    clears it. Sent on every note and settle that moves a posted plan:
+    :func:`set_thread_status` skips an unchanged status against what
     Slack last accepted, so a refused one is retried and one a Planning Agent
     turn changed is restored. The legacy setter has no such check and costs a
     call per note, beside the note's own edit.
@@ -402,11 +404,12 @@ def _start_lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
 
 
 async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
-    """Set aside a plan nothing has touched for :data:`PLAN_HOLD_SECONDS`, closing its session.
+    """Set aside a plan nothing has touched for :data:`PLAN_HOLD_SECONDS`.
 
-    A row still running there lost its terminal event, or its card is quiet;
-    the thread's next note starts a new plan rather than reopening this one.
-    A posted plan with a card still running or waiting joins :data:`_lapsed`,
+    Its session closes unless a card waits on the user. A row still running
+    there lost its terminal event, or its card is quiet; the thread's next
+    note starts a new plan rather than reopening this one. A posted plan with
+    a row still running or waiting, or a card still rolling, joins :data:`_lapsed`,
     where that card's events still settle its row (:func:`settle_row`) and a
     card waiting on the user keeps the session ``suspended``.
     """
