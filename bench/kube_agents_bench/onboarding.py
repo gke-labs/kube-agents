@@ -97,21 +97,27 @@ MAX_RUNS = 500
 
 # Prints the marker's mtime and every run of the job whose window, claimed_at
 # to finished_at, holds it: the run that took the claim. A run still going has
-# no finished_at.
+# no finished_at. A sqlite failure is printed as "error" rather than raised, so
+# the verdict names it instead of reading as an unreachable pod.
 _RUNS_SCRIPT = """
 import json, os, sqlite3, sys
 from datetime import datetime
 marker, db, job, limit, sentinel = sys.argv[1:6]
-out = {"marker": None, "runs": []}
+SQLITE_BUSY_TIMEOUT = 10
+out = {"marker": None, "runs": [], "error": None}
 try:
     out["marker"] = os.stat(marker).st_mtime
 except FileNotFoundError:
     pass
+rows = []
 if out["marker"] is not None:
-    con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
-    rows = con.execute(
-        "SELECT status, claimed_at, finished_at, error, delivery_outcome FROM executions"
-        " WHERE job_id = ? ORDER BY claimed_at DESC LIMIT ?", (job, int(limit))).fetchall()
+    try:
+        con = sqlite3.connect("file:" + db + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT)
+        rows = con.execute(
+            "SELECT status, claimed_at, finished_at, error, delivery_outcome FROM executions"
+            " WHERE job_id = ? ORDER BY claimed_at DESC LIMIT ?", (job, int(limit))).fetchall()
+    except sqlite3.Error as exc:
+        out["error"] = "%s: %s" % (db, exc)
     for status, claimed, finished, error, outcome in rows:
         if not claimed or datetime.fromisoformat(claimed).timestamp() > out["marker"]:
             continue
@@ -232,7 +238,8 @@ def runs_command() -> str:
 def read_delivery_runs(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
     """The claim marker's mtime and the delivery runs that span it, or ``None`` if the read failed.
 
-    ``{"marker": None, "runs": []}`` means there is no marker. ``shell`` is
+    A ``"marker"`` of ``None`` means there is no marker. An ``"error"``
+    is the store's sqlite failure, read from a pod that answered. ``shell`` is
     :func:`agent_shell`, a parameter so the tests can fake it.
     """
     reply = shell(runs_command(), timeout)

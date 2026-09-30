@@ -35,7 +35,8 @@
 # the one onboarding sends to the user. It also refuses one whose gate has not filed its sweep,
 # and one without exactly one shell sandbox pod. The checks are one read at
 # the start, so run the case on an eval install nobody chats with: a first
-# chat during the run is sent the planted report.
+# chat after the stack arms delivery is sent the ranked report, and one before
+# it fails the arm and is sent the report only if delivery claims it first.
 #
 # Isolation class: read-only on the cluster; it plants the raw report on the
 # install under test, files one card and touches `.user_aligned`, and the

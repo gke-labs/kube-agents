@@ -2657,6 +2657,8 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
         read = onboarding.read_delivery_runs(onboarding.agent_shell, read_timeout)
         if read is None:
             return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"the agent pod's cron store could not be read: {read['error']}", read
         marker, job = onboarding.COMPLETED_MARKER, onboarding.DELIVERY_JOB_ID
         if read.get("marker") is None:
             return "fail", f"there is no {marker}: the delivery job never claimed the report", read

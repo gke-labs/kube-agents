@@ -168,14 +168,31 @@ def test_the_read_returns_only_the_run_that_spans_the_claim(store: Store) -> Non
 
 def test_no_marker_is_read_without_opening_the_store(store: Store) -> None:
     store.db.unlink()
-    assert onboarding.read_delivery_runs(onboarding.agent_shell, 10.0) == {"marker": None, "runs": []}
+    assert onboarding.read_delivery_runs(onboarding.agent_shell, 10.0) == {"marker": None, "runs": [], "error": None}
 
 
-def test_a_store_that_cannot_be_opened_is_a_failed_read(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_store_that_cannot_be_opened_is_an_error_that_names_it(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
     store.claim()
     store.db.unlink()
     monkeypatch.setattr(onboarding, "agent_shell", _lenient_shell)
-    assert onboarding.read_delivery_runs(onboarding.agent_shell, 10.0) is None
+    read = onboarding.read_delivery_runs(onboarding.agent_shell, 10.0)
+    assert read is not None
+    assert read["runs"] == []
+    assert read["error"] == f"{store.db}: unable to open database file"
+    result = _verify()
+    assert result.status == "error"
+    assert "unable to open database file" in result.reason
+    assert "kubectl exec failed" not in result.reason
+
+
+def test_a_store_without_a_selected_column_is_an_error_that_names_it(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    store.claim()
+    with sqlite3.connect(store.db) as con:
+        con.execute("ALTER TABLE executions DROP COLUMN delivery_outcome")
+    monkeypatch.setattr(onboarding, "agent_shell", _lenient_shell)
+    result = _verify()
+    assert result.status == "error"
+    assert "no such column: delivery_outcome" in result.reason
 
 
 @pytest.mark.parametrize(

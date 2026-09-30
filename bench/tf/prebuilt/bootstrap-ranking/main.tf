@@ -40,9 +40,10 @@
 # so the gate files no other.
 #
 # These checks are one read at the start, so the case is for an eval install
-# nobody chats with: a person's first chat on the install during the run is
-# sent the planted report, and a teardown after the arm removes their
-# `.user_aligned`.
+# nobody chats with: a person's first chat on the install after the arm is
+# sent the ranked report. One before it fails the arm at step 6, and that
+# person is sent the report only if a delivery tick claims it before the exit
+# trap clears it. A teardown after the arm removes their `.user_aligned`.
 #
 # Arming writes the two onboarding job records to `state_file` first. The
 # teardown, and the exit trap on a failed apply, remove `.user_aligned` and

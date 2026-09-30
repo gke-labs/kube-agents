@@ -21,8 +21,9 @@ count stopping the apply before anything changes; the order clear, plant,
 file, wait, arm; a leftover arm being torn down first; the planted bytes
 being the fixture's; the card being filed with the gate's key and assignee;
 step 5's hand-over rules; the exit trap archiving, clearing and disarming on
-a failure or a TERM or INT after step 2, and finishing when a second signal
-arrives; and the destroy carrying on past a failed step and naming it. As in `test_bootstrap_discovery_plant.py`, the provisioners are
+a failure or a TERM or INT after step 2, and finishing when a signal arrives
+during that cleanup; and the destroy carrying on past a failed step and
+naming it. As in `test_bootstrap_discovery_plant.py`, the provisioners are
 rendered the way Terraform renders them and run against a stub
 `kubectl`/`gcloud`/`sleep`. The in-pod card filing runs on its own against a
 stub `hermes`, step 5's board query against a sqlite board, and the arm and
@@ -551,6 +552,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertIn(
             "Cleanup incomplete: could not list the open cards, remove the INVENTORY files.", completed.stderr
         )
+        self._clear()
         completed, _ = self._run(RUN_STATES="0 0 0", DISARM_FAIL=1)
         self.assertIn("Cleanup incomplete: could not disarm the delivery job.", completed.stderr)
 
