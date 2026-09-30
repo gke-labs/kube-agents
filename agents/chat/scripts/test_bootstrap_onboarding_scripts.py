@@ -278,6 +278,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
 
     SANDBOX_REPORT = "/opt/data/INVENTORY.md"
     SANDBOX_DELIVERED = "/opt/data/INVENTORY.delivered.md"
+    _REAL_READ_BYTES = staticmethod(sandbox_exec.read_bytes)
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -353,6 +354,33 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.assertIn("did not answer", err)
                 self.assertFalse((self.d / COMPLETED).exists())
                 self.run_.assert_not_called()
+
+    def test_a_sandbox_report_that_cannot_be_read_is_a_failure(self):
+        # The local path exits 1 on an unreadable report; the sandbox path must
+        # not read the same state as "not written yet" and wait on it forever.
+        self.read.side_effect = self._REAL_READ_BYTES
+        for returncode, stderr in (
+            (sandbox_exec._READ_UNREADABLE, ""),
+            (sandbox_exec._READ_INCOMPLETE, "mktemp: No space left on device"),
+        ):
+            with self.subTest(returncode=returncode):
+                self.run_.return_value = subprocess.CompletedProcess(
+                    ["sh"], returncode, stdout="", stderr=stderr
+                )
+                rc, out, err = self._run()
+                self.assertEqual((rc, out), (1, ""))
+                self.assertIn("could not read INVENTORY.md", err)
+                self.assertIn(self.SANDBOX_REPORT, err)
+                self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_nothing_at_the_sandbox_path_is_a_silent_run(self):
+        self.read.side_effect = self._REAL_READ_BYTES
+        self.run_.return_value = subprocess.CompletedProcess(
+            ["sh"], sandbox_exec._READ_ABSENT, stdout="", stderr=""
+        )
+        rc, out, err = self._run()
+        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertFalse((self.d / COMPLETED).exists())
 
     def test_an_unreadable_sandbox_config_is_a_failure(self):
         sandbox_exec.sandbox_enabled.side_effect = sandbox_exec.SandboxMisconfigured("bad yaml")

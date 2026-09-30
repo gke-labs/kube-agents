@@ -103,9 +103,13 @@ TERMINAL_PRINCIPAL = "agent"
 # by writing the file differently.
 _READ_MARKER = "--- sandbox-exec read ---"
 
-# `read_bytes`' exit code for a path that is not a readable regular file, as
-# distinct from the shell failing for any other reason. Both answer None; the
-# split is what lets a caller log the difference.
+# `read_bytes`' exit code for a path with nothing at it. It is the only failed
+# read that answers None: a caller polling for a file it expects has to tell
+# "not written yet" from "written and unreadable", and wait only on the first.
+_READ_ABSENT = 5
+
+# `read_bytes`' exit code for a path that holds something other than a readable
+# regular file, as distinct from the shell failing for any other reason.
 _READ_UNREADABLE = 3
 
 # `read_bytes`' exit code for a file that was a readable regular file when it
@@ -116,6 +120,11 @@ _READ_UNREADABLE = 3
 # failed `head` hands it, and a failed read would arrive here as a successful
 # zero-byte file and be delivered as the report.
 _READ_INCOMPLETE = 4
+
+# How much of a failed read's stderr `SandboxReadFailed` carries. The login
+# shell runs first and the model owns its startup file, so the stream has no
+# natural bound.
+_READ_STDERR_CHARS = 200
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
 
@@ -194,6 +203,10 @@ class SandboxMisconfigured(RuntimeError):
     Raised rather than defaulted, because the default is the agent pod and
     running there is the thing the sandbox exists to prevent.
     """
+
+
+class SandboxReadFailed(RuntimeError):
+    """Something is at the path in the sandbox, and `read_bytes` could not read it."""
 
 
 class SandboxUnavailable(RuntimeError):
@@ -452,11 +465,10 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
                config_path: str | None = None) -> bytes | None:
     """Up to `max_bytes` bytes of `path` in the sandbox, or None.
 
-    None is "there is nothing to read here": not a regular file, not readable,
-    or output that did not survive the trip. `SandboxUnavailable` is the other
-    answer and means the sandbox was never reached, which a caller may want to
-    retry. A caller that treats both the same is welcome to; keeping them apart
-    is what lets one of them be logged as a fault.
+    None is "there is nothing at this path". `SandboxReadFailed` is "something
+    is there and did not arrive": not a regular file, not readable, a read that
+    failed partway, or output that did not survive the trip. `SandboxUnavailable`
+    means the sandbox was never reached, which a caller may want to retry.
 
     Reads at most `max_bytes`, and bounds the transfer as well as the result:
     the cap is applied by `head` on the far side, so a caller asking for 32 KiB
@@ -497,24 +509,34 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     sandbox is configured. Call it behind `sandbox_enabled()`.
     """
     quoted = shlex.quote(path)
+    # A file removed between the test and the read is absent, not a fault: the
+    # re-test after a failed `head` keeps that race from reading as one.
     script = (
+        f'if [ ! -e {quoted} ]; then exit {_READ_ABSENT}; fi; '
         f'if [ ! -f {quoted} ] || [ ! -r {quoted} ]; then '
         f'exit {_READ_UNREADABLE}; fi; '
         f'scratch=$(mktemp) || exit {_READ_INCOMPLETE}; '
         f"trap 'rm -f \"$scratch\"' EXIT; "
         f'head -c {int(max_bytes)} -- {quoted} > "$scratch" '
-        f'|| exit {_READ_INCOMPLETE}; '
+        f'|| {{ [ -e {quoted} ] || exit {_READ_ABSENT}; exit {_READ_INCOMPLETE}; }}; '
         f'printf "%s\\n" {shlex.quote(_READ_MARKER)}; '
         f'base64 -w0 < "$scratch"'
     )
     completed = run(["sh", "-c", script], principal=principal, timeout=timeout,
                     path=config_path)
-    if completed.returncode != 0:
+    if completed.returncode == _READ_ABSENT:
         return None
+    if completed.returncode == _READ_UNREADABLE:
+        raise SandboxReadFailed(f"{path} is not a readable regular file")
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()[:_READ_STDERR_CHARS]
+        raise SandboxReadFailed(
+            f"reading {path} exited {completed.returncode}: {stderr}"
+        )
     _, marker, encoded = (completed.stdout or "").partition(_READ_MARKER)
     if not marker:
-        return None
+        raise SandboxReadFailed(f"reading {path} printed no payload")
     try:
         return base64.b64decode(encoded.strip(), validate=True)
-    except (ValueError, binascii.Error):
-        return None
+    except (ValueError, binascii.Error) as exc:
+        raise SandboxReadFailed(f"{path} did not arrive intact: {exc}") from exc

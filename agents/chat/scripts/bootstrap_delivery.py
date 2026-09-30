@@ -110,8 +110,9 @@ def _read_report(data_dir: Path, in_sandbox: bool) -> bytes | None:
     """Up to ``REPORT_MAX_BYTES + 1`` bytes of the report, or None if there is none.
 
     Raises ``sandbox_exec.SandboxUnavailable`` or ``subprocess.TimeoutExpired``
-    when the sandbox did not answer, and ``OSError`` when the local file could
-    not be read.
+    when the sandbox did not answer, ``sandbox_exec.SandboxReadFailed`` when the
+    sandbox holds something at the path it could not read, and ``OSError`` when
+    the local file could not be read.
     """
     if in_sandbox:
         return sandbox_exec.read_bytes(
@@ -243,7 +244,7 @@ def main(data_dir: Path | None = None) -> int:
         # user's chat as a failure alert, once per tick the sandbox is rolling.
         sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
         return 0
-    except (OSError, sandbox_exec.SandboxMisconfigured) as e:
+    except (OSError, sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed) as e:
         sys.stderr.write(f"bootstrap_delivery: could not read INVENTORY.md: {e}\n")
         return 1
     if raw is None:

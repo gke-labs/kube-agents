@@ -1878,7 +1878,8 @@ and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as
 for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
 `agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
 because a failing `no_agent` script posts an alert to the user's chat on every tick it
-fails. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on
+fails. A report that is there and cannot be read fails the run, as it does on the agent
+pod, since no later tick would read it either. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on
 the PVC from the moment the card is filed, so the report files it also checks add
 nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
 which is wrong about the pod and right about the path the worker must write.
