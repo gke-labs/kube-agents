@@ -989,8 +989,7 @@ class SkillTextTest(unittest.TestCase):
         # Review finding: every command reaches the sandbox as a fresh
         # non-interactive `bash -c`, which does not expand aliases, so an
         # aliased `git` followed by `git log` ran the credentialed shim. The
-        # skill points at the path, or at an exported variable, which the
-        # sandbox's environment snapshot does carry.
+        # skill points at the path.
         text = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text()
         self.assertNotIn("alias git", text)
         self.assertIn("/opt/vcs/libexec/git", text)
