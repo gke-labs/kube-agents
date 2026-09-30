@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,10 +62,12 @@ GITHUB_RAW_MEDIA_TYPE = "application/vnd.github.raw+json"
 # What one read of a repository path settles. A refusal or a transient is
 # classified before `404` is matched, because run_cmd's timeout text embeds
 # the command line, and so the project id, which `\b404\b` matches in a
-# project named `...-404`.
+# project named `...-404`. Anything else gh refuses (a 409 on a repository
+# with no commits, a 422) is a failure the check reports, not an unread.
 GITHUB_PATH_PRESENT = "present"
 GITHUB_PATH_ABSENT = "absent"
 GITHUB_PATH_UNREAD = "unread"
+GITHUB_PATH_FAILED = "failed"
 # The contents API's `type` for a symlink at the last component of a path. The
 # audit's walk follows none, so a prefix that is one names nothing to it.
 GITHUB_CONTENT_TYPE_SYMLINK = "symlink"
@@ -2442,14 +2445,18 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
 def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[str, str]:
     """Read one path of the GitOps repository: (GITHUB_PATH_*, the body, or the reason it was not read).
 
-    `raw` asks for the file's bytes; without it the contents API's JSON
-    object (or list, for a directory) comes back, which is what a probe for a
-    prefix's existence needs, `type` included.
+    The one reader for every path this check touches, so the note, the
+    intent file and each prefix classify a failure the same way. `raw` asks
+    for the file's bytes; without it the contents API's JSON object (or
+    list, for a directory) comes back, which is what a probe for a prefix's
+    existence needs, `type` included. The path is percent-encoded: the
+    audit's reader admits `#` in a prefix, which an unencoded URL would drop
+    as a fragment and probe a different path than the audit checks.
     """
     cmd = ["gh", "api"]
     if raw:
         cmd += ["-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}"]
-    rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{path}"])
+    rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}"])
     if rc == 0:
         return GITHUB_PATH_PRESENT, out
     reason = _unread_reason(err or "")
@@ -2457,7 +2464,7 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
         return GITHUB_PATH_UNREAD, reason
     if _GITHUB_NOT_FOUND.search(err or ""):
         return GITHUB_PATH_ABSENT, ""
-    return GITHUB_PATH_UNREAD, (err or "").strip()
+    return GITHUB_PATH_FAILED, (err or "").strip()
 
 
 def _names_nothing_to_the_audit(contents_json: str) -> bool:
@@ -2485,30 +2492,30 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
     repo_slug = _gitops_repo_slug(project_id)
-    rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
-    if rc != 0:
-        # A refusal or a transient is classified first: run_cmd's timeout text
-        # embeds the command line, and so the project id, which `\b404\b`
-        # would match in a project named `...-404`.
-        reason = _unread_reason(err or "")
-        if reason is not None:
-            return CheckResult(
-                name,
-                True,
-                "Not checked",
-                warnings=[Unread(f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} could not be read: {reason}")],
-                read=False,
-            )
-        if _GITHUB_NOT_FOUND.search(err or ""):
-            return CheckResult(
-                name,
-                False,
-                f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
-                f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
-                f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
-                f"is seeded: {gitops_note_seed_command(repo_slug)}",
-            )
-        return CheckResult(name, False, f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what} in {repo_slug} could not be read: {reason}")], read=False)
+
+    def absent_note() -> CheckResult:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
+            f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
+            f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
+            f"is seeded: {gitops_note_seed_command(repo_slug)}",
+        )
+
+    def failed(what: str, err: str) -> CheckResult:
+        return CheckResult(name, False, f"Could not read {what} in {repo_slug}: {err}")
+
+    state, out = _gitops_path_state(repo_slug, GITOPS_INTENT_NOTE_PATH)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(GITOPS_INTENT_NOTE_PATH, out)
+    if state == GITHUB_PATH_ABSENT:
+        return absent_note()
+    if state == GITHUB_PATH_FAILED:
+        return failed(GITOPS_INTENT_NOTE_PATH, out)
     try:
         payload = _load_json(out)
         sha = str(payload.get("sha") or "")
@@ -2516,16 +2523,13 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             # Over the inline limit: the metadata carries no body. Read it the
             # way the audit does, whole, rather than parse an empty string and
             # tell the operator to overwrite a note the audit would have joined.
-            rc, raw, err = run_cmd(["gh", "api", "-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
-            if rc != 0:
-                return CheckResult(
-                    name,
-                    True,
-                    "Not checked",
-                    warnings=[Unread(f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} is over the contents API's inline limit and the raw read failed: {(err or '').strip()}")],
-                    read=False,
-                )
-            body = raw
+            state, body = _gitops_path_state(repo_slug, GITOPS_INTENT_NOTE_PATH, raw=True)
+            if state == GITHUB_PATH_UNREAD:
+                return unread(f"{GITOPS_INTENT_NOTE_PATH} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_ABSENT:
+                return absent_note()
+            if state == GITHUB_PATH_FAILED:
+                return failed(f"{GITOPS_INTENT_NOTE_PATH} (over the contents API's inline limit, read raw)", body)
         else:
             body = base64.b64decode(payload.get("content") or "").decode("utf-8")
     except Exception as exc:
@@ -2568,13 +2572,9 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     # names anything at this commit, is read from the repository below.
     state, intent_out = _gitops_path_state(repo_slug, audit.INTENT_FILE, raw=True)
     if state == GITHUB_PATH_UNREAD:
-        return CheckResult(
-            name,
-            True,
-            "Not checked",
-            warnings=[Unread(f"Not checked: {audit.INTENT_FILE} in {repo_slug} could not be read, so whether it bounds the search away from the note is unknown: {intent_out}")],
-            read=False,
-        )
+        return unread(f"{audit.INTENT_FILE} (so whether it bounds the search away from the note is unknown)", intent_out)
+    if state == GITHUB_PATH_FAILED:
+        return failed(audit.INTENT_FILE, intent_out)
     if state == GITHUB_PATH_ABSENT:
         return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
     import contextlib
@@ -2610,13 +2610,9 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     for prefix in prefixes:
         state, out = _gitops_path_state(repo_slug, prefix)
         if state == GITHUB_PATH_UNREAD:
-            return CheckResult(
-                name,
-                True,
-                "Not checked",
-                warnings=[Unread(f"Not checked: `{prefix}` from {audit.INTENT_FILE} in {repo_slug} could not be read, so whether the audit applies that bound is unknown: {out}")],
-                read=False,
-            )
+            return unread(f"`{prefix}` from {audit.INTENT_FILE} (so whether the audit applies that bound is unknown)", out)
+        if state == GITHUB_PATH_FAILED:
+            return failed(f"`{prefix}` from {audit.INTENT_FILE}", out)
         if state == GITHUB_PATH_ABSENT or _names_nothing_to_the_audit(out):
             return CheckResult(
                 name,

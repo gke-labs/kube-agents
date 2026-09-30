@@ -1523,6 +1523,45 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                     self.assertFalse(result.read)
                     self.assertIn("`provisioning`", result.warnings[0])
 
+    def test_every_read_on_the_path_classifies_a_failure_the_same_way(self):
+        # One reader: a 409 (an empty repository) or a 422 is a failure on the
+        # note, on the raw re-read, on the intent file and on a prefix alike,
+        # never an unread; a 404 on the raw re-read is the note gone.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        large = json.dumps({"sha": "abc", "path": self._NOTE_PATH, "encoding": "none", "content": "", "size": 2_000_000})
+        conflict = _fail("gh: Git Repository is empty. (HTTP 409)")
+        cases = {
+            "intent file": ([_ok(self._contents(good)), conflict], ".kube-agents/intent.yaml"),
+            "prefix": ([_ok(self._contents(good)), _ok("paths: [provisioning/]\n"), conflict], "`provisioning`"),
+            "raw re-read": ([_ok(large), conflict], "read raw"),
+        }
+        for label, (reads, what) in cases.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = reads
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertFalse(result.passed, (label, result.message))
+                self.assertEqual([], result.warnings)
+                self.assertIn("Could not read", result.message)
+                self.assertIn(what, result.message)
+                self.assertIn("HTTP 409", result.message)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), _fail("gh: Not Found (HTTP 404)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("has no knowledge/notification-relay-no-pdb.md", result.message)
+
+    def test_a_prefix_is_percent_encoded_so_the_probe_reads_the_audits_path(self):
+        # The audit's reader admits `#` in a prefix; unencoded, gh's URL parser
+        # drops it as a fragment and the probe reads `docs`, not `docs#archive`.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(good)), _ok("paths: [docs#archive]\n"), _fail("gh: Not Found (HTTP 404)")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        probe = " ".join(run.call_args_list[2].args[0])
+        self.assertIn("contents/docs%23archive", probe)
+        self.assertNotIn("docs#archive", probe)
+
     def test_an_intent_read_that_times_out_on_a_404_project_is_unverified_not_absent(self):
         # The same `\b404\b`-in-the-command-line trap as the note read, on
         # the bound's read: a timeout must not read as "no intent file".
