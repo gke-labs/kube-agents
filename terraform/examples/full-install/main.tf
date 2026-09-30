@@ -185,9 +185,24 @@ locals {
   # then fails the lookup and leaves this false, where an uncaught conversion
   # would abort the plan with a type error instead of the message the
   # precondition owes. Such a value reaches the CRD, which rejects it.
+  #
+  # `== true` inside the try for the same reason, against the one input that
+  # is neither a boolean nor a conversion failure: null. tobool(null) does not
+  # error -- it converts, and a null of type bool comes back -- so the try has
+  # nothing to catch and hands a null to `||`, whose arguments may not be
+  # null. The plan then aborts on this local, naming no variable, and it does
+  # so whichever way enable_drift_detector is set: OpenTofu evaluates both
+  # operands. That leaf is the chart's own idiom, not a typo --
+  # charts/kube-agents/values.yaml ships `driftDetector.enabled: null`,
+  # values.schema.json types it ["boolean","null"], and the chart README says
+  # null is how a knob is omitted so the CRD's default applies -- so an
+  # operator copying the block into extra_helm_values to set gitopsManagers,
+  # which this composition does not expose, writes exactly that. `null == true`
+  # is false rather than null, so the comparison turns the one value the
+  # conversion accepts and the operator did not ask for into "not requested".
   drift_detector_requested = (
     var.enable_drift_detector ||
-    try(tobool(var.extra_helm_values.platformAgent.harness.driftDetector.enabled), false)
+    try(tobool(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) == true, false)
   )
 }
 

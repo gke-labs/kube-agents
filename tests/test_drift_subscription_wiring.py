@@ -44,6 +44,7 @@ Run:
 
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -59,6 +60,7 @@ MODULE_VARIABLES = REPO_ROOT / "terraform" / "modules" / "drift-pubsub" / "varia
 DETECTOR_MAIN = REPO_ROOT / "k8s-operator" / "cmd" / "drift-detector" / "main.go"
 CHART_VALUES = REPO_ROOT / "charts" / "kube-agents" / "values.yaml"
 CHART_CR_TEMPLATE = REPO_ROOT / "charts" / "kube-agents" / "templates" / "platform-agent-cr.yaml"
+CHART_SCHEMA = REPO_ROOT / "charts" / "kube-agents" / "values.schema.json"
 
 FLAG_VARIABLE = "enable_drift_pubsub"
 DETECTOR_FLAG_VARIABLE = "enable_drift_detector"
@@ -121,10 +123,18 @@ PRECONDITION_RE = re.compile(
     r"condition\s*=\s*!local\." + REQUESTED_LOCAL + r"\s*\|\|\s*var\." + FLAG_VARIABLE + r"\s*$",
     re.M,
 )
+# The `== true` is pinned, not incidental. tobool(null) converts rather than
+# failing, so the try catches nothing and a null of type bool reaches `||`,
+# whose arguments may not be null: the plan aborts on the local itself, for
+# every apply passing the leaf as null, which is what the chart's values.yaml
+# and values.schema.json teach. `null == true` is false, so the comparison
+# is what turns that into "not requested".
 REQUESTED_LOCAL_RE = re.compile(
     REQUESTED_LOCAL + r"\s*=\s*\(\s*"
     r"var\." + DETECTOR_FLAG_VARIABLE + r"\s*\|\|\s*"
-    r"try\(tobool\(var\.extra_helm_values\." + r"\.".join(DRIFT_VALUE_PREFIX) + r"\.enabled\)\s*,\s*false\)",
+    r"try\(tobool\(var\.extra_helm_values\."
+    + r"\.".join(DRIFT_VALUE_PREFIX)
+    + r"\.enabled\)\s*==\s*true\s*,\s*false\)",
     re.S,
 )
 
@@ -200,6 +210,40 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
             self.main,
             f"local.{REQUESTED_LOCAL} reading both enable_drift_detector and the extra_helm_values leaf",
         )
+
+    def test_the_leaf_the_refusal_reads_is_one_the_chart_teaches_as_null(self):
+        """Why `local.drift_detector_requested` compares rather than converts.
+
+        `tobool` fails on "yes" and on 1, and the `try` catches both. It does
+        not fail on null: the conversion succeeds and returns a null of type
+        bool, so the `try` has nothing to catch and the null reaches `||`,
+        whose arguments may not be null. The plan aborts on the local, naming
+        no variable, for every apply that passes the leaf that way — including
+        `enable_drift_detector = true`, since OpenTofu evaluates both operands.
+
+        That input is not a typo, which is what makes it worth a test rather
+        than a comment: the chart ships the leaf as null and its schema types
+        it that way, because null is how a knob is omitted so the CRD's own
+        default applies. An operator copying the `driftDetector` block into
+        `extra_helm_values` to set `gitopsManagers`, which the composition
+        does not expose, writes exactly that. Asserted against the chart
+        rather than restated, so that a chart that stopped teaching null would
+        take the reasoning with it instead of leaving it stale here.
+
+        The `== true` itself is pinned by REQUESTED_LOCAL_RE, which
+        test_the_refusal_covers_the_values_document_a_caller_can_pass runs.
+        """
+        values = yaml.safe_load(CHART_VALUES.read_text(encoding="utf-8"))
+        node = values
+        for key in (*DRIFT_VALUE_PREFIX, "enabled"):
+            self.assertIn(key, node, f"chart values have no {'.'.join((*DRIFT_VALUE_PREFIX, 'enabled'))}")
+            node = node[key]
+        self.assertIsNone(node, "the chart no longer ships the detector leaf as null")
+        schema = json.loads(CHART_SCHEMA.read_text(encoding="utf-8"))
+        node = schema
+        for key in (*DRIFT_VALUE_PREFIX, "enabled"):
+            node = node["properties"][key]
+        self.assertIn("null", node.get("type", []), f"values.schema.json no longer admits null there: {node}")
 
     def test_chart_exposes_the_value_paths_the_composition_writes(self):
         values = yaml.safe_load(CHART_VALUES.read_text(encoding="utf-8"))
