@@ -19,9 +19,13 @@ SKILL_MD = (
 )
 
 # A variable run as the program: at the start of a line or a code span, or
-# after a shell join, as in `cd <workspace> && $G add`.
+# after a shell join, as in `cd <workspace> && $G add`, and after a shell
+# keyword or a wrapper that runs the next word as a program (`xargs $G add`).
 VARIABLE_PROGRAM_RE = re.compile(
-    r"(^|`|&&|;|\|)\s*\"?\$\{?[A-Za-z_]\w*\}?\"?\s+\S", re.MULTILINE
+    r"(^|`|&&|;|\|)\s*"
+    r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)*"
+    r"\"?\$\{?[A-Za-z_]\w*\}?\"?\s+\S",
+    re.MULTILINE,
 )
 # The path put in a variable for later use, which is the variable form's setup.
 # Capturing git's output, `SHA=$(/opt/vcs/libexec/git ...)`, is not that.

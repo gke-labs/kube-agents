@@ -20,11 +20,15 @@ from markdown_it import MarkdownIt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
 
+# A shell keyword or a wrapper that runs the next word as a program
+# (`if $G diff`, `xargs $G add`).
+PREFIX = (
+    r"(^|`|&&|;|\|)\s*"
+    r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)*"
+)
 # The patterns agentplugins/gke-stockout-investigator/tests/test_skill_commands.py
 # applies to that plugin's skill.
-VARIABLE_PROGRAM_RE = re.compile(
-    r"(^|`|&&|;|\|)\s*\"?\$\{?[A-Za-z_]\w*\}?\"?\s+\S", re.MULTILINE
-)
+VARIABLE_PROGRAM_RE = re.compile(PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?\s+\S", re.MULTILINE)
 PROGRAM_ASSIGNMENT_RE = re.compile(
     r"\b[A-Za-z_]\w*=(?!\"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*"
     r"(/opt/vcs/libexec/git|submit_suggestion\.py)\b"
@@ -33,7 +37,7 @@ PROGRAM_ASSIGNMENT_RE = re.compile(
 # for their helper scripts (`"$HERMES_HOME"/skills/.../resolver.py poll`). The
 # plugin's skill never did, so its test has no copy.
 VARIABLE_PATH_PROGRAM_RE = re.compile(
-    r"(^|`|&&|;|\|)\s*\"?\$\{?[A-Za-z_]\w*\}?\"?/\S*\s+\S", re.MULTILINE
+    PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?/\S*\s+\S", re.MULTILINE
 )
 # A caution names the refused form so a reader knows what not to write.
 REFUSED_EXAMPLE_RE = re.compile(r"whose program is a variable \(`[^`]*`\)")
@@ -75,6 +79,8 @@ class SkillInlineCommandsTest(unittest.TestCase):
             '"$S" prepare --repo <owner>/<repo>',
             '"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             'cd "$WS" && "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll',
+            "if ! $G diff --quiet; then $G commit -m x; fi",
+            "find . -name '*.yaml' | xargs $G add",
         ):
             with self.subTest(span):
                 self.assertTrue(refused(span))
@@ -86,6 +92,7 @@ class SkillInlineCommandsTest(unittest.TestCase):
             '"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py',
             'python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
+            'for f in $FILES; do echo "$f"; done',
         ):
             with self.subTest(span):
                 self.assertFalse(refused(span))
