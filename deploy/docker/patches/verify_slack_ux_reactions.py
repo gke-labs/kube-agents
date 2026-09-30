@@ -123,6 +123,15 @@ def check_adapter(root: Path) -> None:
         body = node.body
         if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
+        # The applier anchors on the docstring, so a renamed parameter leaves
+        # a guard that compiles and raises NameError on every flag-on turn.
+        params = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+        unbound = [
+            n.id for arg in body[1].body[0].value.value.args[1:]
+            for n in ast.walk(arg) if isinstance(n, ast.Name) and n.id not in params
+        ]
+        if unbound:
+            raise _fail(f"{name}() guard passes {', '.join(unbound)}, which the hook no longer takes")
         upstream = ast.Module(body=body[2:], type_ignores=[])
         if not any(
             isinstance(call, ast.Call)
