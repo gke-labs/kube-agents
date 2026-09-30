@@ -64,8 +64,9 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
 # so one drain can still take both replicas at once; that is the finding.
 # Asserted by obtainability-planted-pdb and by
 # cluster-agent-healthy-workload-no-finding, which uses this workload for the
-# opposite property: its runtime state is clean, so it is the fleet's only
-# fixture that lets a case ask whether the agent invents a fault. That case
+# opposite property: its runtime state is clean, so it is one of the two
+# fixtures (notification-relay in seeded-intent is the other) that let a
+# case ask whether the agent invents a fault. That case
 # additionally asserts the container image and the absence of a
 # rollout-restart annotation, so it is not only the replica count and the
 # missing budget that are load-bearing here now.
@@ -414,8 +415,9 @@ resource "kubernetes_network_policy_v1" "default_deny" {
 
 # Reliability SOP 3.3 background closure: inference-server runs at two or
 # more desired replicas with no PodDisruptionBudget, which is exactly the
-# planted checkout-gateway defect -- but only checkout-gateway is the
-# fixture. maxUnavailable: 1 is the SOP's own structurally-safe shape; a PDB
+# planted checkout-gateway defect -- but the fixtures are checkout-gateway
+# and (declared) notification-relay, not this. maxUnavailable: 1 is the
+# SOP's own structurally-safe shape; a PDB
 # governs evictions only, so the stockout fixture (a scheduling gap) is
 # untouched. The HPA's desired count is a load calculation and differs
 # between projects (3/2/3 across the three eval projects on 2026-08-24), so

@@ -2331,29 +2331,45 @@ def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
     `type`, `declares`, the item shape, the `cluster` rule) and the surviving
     items are compared on the audit's own join key, which folds
     `Deployment/notification-relay`, `deployment/notification-relay` and
-    `Deployment / notification-relay` to one. What passes here is what the
-    audit reads; what fails names the parser's reason as the audit logs it. A
-    fleet-wide item is required: one carrying `cluster` joins only that
-    cluster's finding, which is not the fixture's note.
+    `Deployment / notification-relay` to one. The join is the audit's too:
+    `apply_declarations` files clustered items under their cluster and the
+    rest fleet-wide, and a finding falls through to a fleet-wide entry, so a
+    note is good when ANY matching item is fleet-wide, whatever else it lists.
+    A note the parser reads nothing from is diagnosed here with the parser's
+    own `split_frontmatter`, because for the common misshapes (no frontmatter,
+    unclosed, no `type`, no `declares`) the parser is silent by design.
     """
+    import yaml
+
     audit = _load_audit_report()
     declarable = frozenset({GITOPS_INTENT_NOTE_DECLARATION["check"]})
     entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
     if not entries:
+        front_text = audit.split_frontmatter(body)
+        if front_text is None:
+            return "it has no frontmatter: the first line must be `---` and a `---` or `...` line must close it"
+        try:
+            front = yaml.safe_load(front_text)
+        except (yaml.YAMLError, ValueError, RecursionError) as exc:
+            return f"its frontmatter is not valid YAML ({type(exc).__name__})"
+        if not isinstance(front, dict) or audit.OKF_TYPE_KEY not in front:
+            return f"its frontmatter has no `{audit.OKF_TYPE_KEY}`, so it is not an OKF note"
+        if audit.DECLARES_KEY not in front:
+            return f"its frontmatter has no `{audit.DECLARES_KEY}` list"
         return (
-            "parse_declarations reads no declaration from it (no OKF frontmatter with `type` and a "
-            "`declares` list, or no item of the right shape; the WARNING lines above say which)"
+            f"every `{audit.DECLARES_KEY}` item was skipped by the audit's parser "
+            "(it logged a WARNING per item above saying why)"
         )
     wanted = audit._declaration_key(GITOPS_INTENT_NOTE_DECLARATION, with_cluster=False)
-    for entry in entries:
-        if audit._declaration_key(entry, with_cluster=False) != wanted:
-            continue
-        if audit.DECLARATION_CLUSTER_FIELD in entry:
-            return (
-                f"its declaration names cluster {entry[audit.DECLARATION_CLUSTER_FIELD]!r}, so the audit joins it "
-                "to that cluster's finding only; the fixture's note is fleet-wide (no `cluster`)"
-            )
+    matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
+    if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
         return None
+    if matching:
+        clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
+        return (
+            f"its only matching declaration(s) name cluster {', '.join(clusters)}, so the audit joins them to "
+            "that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
+        )
     return "no declares item is check no-pdb for Deployment/notification-relay in seeded-intent"
 
 

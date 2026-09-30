@@ -1532,12 +1532,27 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             # rather than ending the run in a traceback.
             "unquoted impossible date": good.replace("type: decision\n", "type: decision\nreviewed: 2026-02-30\n"),
         }
+        # The reason the message gives for the shapes the audit's parser is
+        # silent about, so the operator is not sent to look for a WARNING that
+        # was never logged.
+        reasons = {
+            "empty": "it has no frontmatter",
+            "unclosed": "it has no frontmatter",
+            "no type": "has no `type`",
+            "no declares": "has no `declares` list",
+            "other object": "no declares item is check no-pdb",
+            "strings but no structure": "not valid YAML",
+            "empty cluster": "was skipped by the audit's parser",
+            "another cluster": "name cluster seeded-b",
+            "unquoted impossible date": "not valid YAML (ValueError)",
+        }
         for label, body in rejected.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch("sys.stderr", new=io.StringIO()):
                 run.side_effect = [_ok(self._contents(body, sha="deadbeef"))]
                 result = checker.check_gitops_declaration("kube-agents-evals-3")
                 self.assertFalse(result.passed, label)
                 self.assertIn("the audit reads no declaration from it", result.message)
+                self.assertIn(reasons[label], result.message, label)
                 self.assertIn("-f sha=deadbeef", result.message)
         # And what the audit accepts, this accepts: the `...` closer and the
         # spellings the join key folds to one.
@@ -1546,6 +1561,13 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "kubectl spelling": good.replace("Deployment/notification-relay", "deployment/notification-relay"),
             "spaces round the slash": good.replace("Deployment/notification-relay", "Deployment / notification-relay"),
             "crlf": good.replace("\n", "\r\n"),
+            # The audit files clustered items under their cluster and the rest
+            # fleet-wide, and a finding falls through to the fleet-wide entry,
+            # so a clustered item ahead of the fleet-wide one is still joined.
+            "clustered item before the fleet-wide one": good.replace(
+                "declares:\n",
+                "declares:\n  - check: no-pdb\n    namespace: seeded-intent\n    object: Deployment/notification-relay\n    cluster: seeded-b\n",
+            ),
         }
         for label, body in accepted.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
