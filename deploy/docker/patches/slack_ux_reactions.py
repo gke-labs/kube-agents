@@ -110,6 +110,10 @@ UNRESOLVED_PREFIX = "slug:"
 #: one of its thread's cards resumed it.
 BLOCKED = "blocked"
 
+#: Statuses a card runs from, or waits to be picked up in. A card that paused
+#: during a turn but sits in one of these at its end was resumed within it.
+RESUMED_STATUSES = frozenset({"todo", "ready", "scheduled", "running"})
+
 
 class _Card(NamedTuple):
     """An open card as one board read saw it."""
@@ -301,7 +305,9 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
                     chat_id, thread_id, len(asks) - DEFERRED_PER_THREAD,
                 )
             _remember(_deferred, (chat_id, thread_id), asks[-DEFERRED_PER_THREAD:], DEFERRED_MAX)
-            if waiting & turn.paused:
+            # A pause the turn also saw resumed would put ⏸️ on nothing that waits.
+            paused = {card for card in waiting & turn.paused if card in after}
+            if any(after[card].status not in RESUMED_STATUSES for card in paused):
                 blocked = _presenter.settle_reaction(_presenter.SETTLE_BLOCKED)
                 await adapter._react(chat_id, ts, blocked, team_id, remove=False)
             return
