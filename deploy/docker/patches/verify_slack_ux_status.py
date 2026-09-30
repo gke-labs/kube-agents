@@ -12,7 +12,9 @@ Two things are checked:
    is the flag guard handing over to ``_kage_slack_status``, and upstream's
    body still follows it, so with the flag off the setter is upstream's. The
    message-event builder calls ``note_ask``, and the import the guard names is
-   bound at module level.
+   bound at module level. Every name the guard and the ``note_ask`` call pass
+   is bound where they run, so an upstream rename fails here rather than
+   raising ``NameError`` on every flag-on call.
 2. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it is inert; flag on, Hermes's phrase reaches Slack as
    ``processing`` once, the clear as ``closed``, the ask becomes the session
@@ -26,12 +28,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import importlib.util
 import os
 import sys
 from pathlib import Path
 
 ADAPTER = "plugins/platforms/slack/adapter.py"
+ADAPTER_CLASS = "SlackAdapter"
 RUNTIME = "gateway/slack_ux_status.py"
 FLAG_ENV = "KAGE_SLACK_UX"
 
@@ -100,34 +104,90 @@ def _is_guard(stmt: ast.stmt) -> bool:
     )
 
 
+def _method(tree: ast.Module, name: str) -> ast.AsyncFunctionDef:
+    """``name`` as defined on the adapter class, not a same-named def elsewhere in the module."""
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
+    )
+    if adapter is None:
+        raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
+    for node in adapter.body:
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+            return node
+    raise _fail(f"{ADAPTER_CLASS} has no async def {name}()")
+
+
+def _module_names(tree: ast.Module) -> set[str]:
+    """Names bound at module level, including under a top-level ``if``, ``try`` or ``with``."""
+    names = set(dir(builtins))
+    stack = list(tree.body)
+    while stack:
+        stmt = stack.pop()
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(stmt.name)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in stmt.names)
+        elif isinstance(stmt, (ast.If, ast.Try, ast.With)):
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, ast.stmt):
+                    stack.append(child)
+                elif isinstance(child, ast.excepthandler):
+                    stack.extend(child.body)
+        else:
+            names.update(n.id for n in ast.walk(stmt) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+    return names
+
+
+def _unbound(func: ast.AsyncFunctionDef, module: set[str], stmt: ast.stmt) -> list[str]:
+    """Names ``stmt``, a statement of ``func``'s body, reads that nothing binds before it runs.
+
+    Bound means a parameter, a module-level name, or a plain assignment in
+    ``func``'s body ahead of ``stmt``; one under a branch may not have run.
+    """
+    signature = func.args
+    bound = {a.arg for a in signature.posonlyargs + signature.args + signature.kwonlyargs}
+    bound.update(a.arg for a in (signature.vararg, signature.kwarg) if a is not None)
+    for earlier in func.body[: func.body.index(stmt)]:
+        if isinstance(earlier, (ast.Assign, ast.AnnAssign)):
+            targets = earlier.targets if isinstance(earlier, ast.Assign) else [earlier.target]
+            bound.update(
+                n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            )
+    return sorted({
+        n.id for n in ast.walk(stmt)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound | module
+    })
+
+
 def check_adapter(root: Path) -> None:
     path = root / ADAPTER
     if not path.is_file():
         raise _fail(f"{path} does not exist")
     tree = ast.parse(path.read_text())
-    defs = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in (SETTER, BUILDER)
-    }
-    setter = defs.get(SETTER)
-    if setter is None:
-        raise _fail(f"{ADAPTER} has no async def {SETTER}()")
+    module = _module_names(tree)
+    setter = _method(tree, SETTER)
     positional = tuple(a.arg for a in setter.args.posonlyargs + setter.args.args)
     if positional != SETTER_POSITIONAL:
         raise _fail(f"{SETTER}() is not ({', '.join(SETTER_POSITIONAL)}): {positional}")
     body = setter.body
     if len(body) < 3 or not _is_guard(body[1]):
         raise _fail(f"{SETTER}() does not open with the {FLAG_ENV} guard after its docstring")
+    unbound = _unbound(setter, module, body[1])
+    if unbound:
+        raise _fail(f"{SETTER}() guard reads {', '.join(unbound)}, which {ADAPTER} no longer binds")
     upstream = ast.Module(body=body[2:], type_ignores=[])
     if not any(
         isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == UPSTREAM_RESOLVER
         for call in ast.walk(upstream)
     ):
         raise _fail(f"{SETTER}() no longer runs upstream's body after the guard")
-    builder = defs.get(BUILDER)
-    if builder is None or not _calls(builder, GUARD_ALIAS, NOTE_TARGET):
+    builder = _method(tree, BUILDER)
+    notes = [stmt for stmt in builder.body if _calls(stmt, GUARD_ALIAS, NOTE_TARGET)]
+    if not notes:
         raise _fail(f"{BUILDER}() does not keep the ask for the session title")
+    unbound = _unbound(builder, module, notes[0])
+    if unbound:
+        raise _fail(f"{BUILDER}() passes {', '.join(unbound)} to {NOTE_TARGET}(), which it no longer binds")
     bound = any(
         isinstance(stmt, ast.ImportFrom)
         and stmt.module == IMPORT_MODULE

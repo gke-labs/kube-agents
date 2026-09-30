@@ -18,9 +18,9 @@ every 2 seconds while a turn runs, and ``""`` to clear. That method takes
 fails ``invalid_arguments``, logged at debug: Working… never shows, the clear
 never lands, and the refresh loop spends 30 Slack calls a minute on errors.
 With the flag on, the phrase becomes ``processing`` and the clear
-``closed``, and a status is sent only when it changes or
-:data:`SESSION_REFRESH_SECONDS` have passed, so a turn costs a call or two
-rather than 30 a minute. Each open and close is logged at info. The legacy
+``closed``, and a status is sent only when it changes, or when
+:data:`SESSION_REFRESH_SECONDS` have passed on ``processing``, so a turn
+costs a call or two rather than 30 a minute. Each open and close is logged at info. The legacy
 ``assistant.threads.setStatus``, used when the SDK has no Agent Sessions, takes
 free text and is left to upstream.
 
@@ -38,8 +38,9 @@ event settles an existing row (``complete``, ``error``, or ``pending`` for a
 card waiting on the user) and never creates one, so a card that finished
 without a note adds no plan above its report. Two kinds upstream never posts
 reach the plan through ``kanban_progress_lines.silent_event``:
-``unblocked`` sets a waiting row running again, and ``archived`` settles a
-running or waiting row as failed, with an ``Archived`` note. The row stays
+``unblocked`` sets a waiting row, or one that gave up, running again, and
+``archived`` settles a running or waiting row as failed, with an ``Archived``
+note. The row stays
 rather than the message going: the credential proxy refuses ``chat.delete``,
 as it refuses every destructive Slack verb. ``crashed`` and ``timed_out``
 leave the row running, since the dispatcher retries the card, and
@@ -48,7 +49,9 @@ The plan holds the thread's session status: ``processing`` while a row runs,
 ``suspended`` while rows wait on the user and none runs, and a Planning Agent
 turn ending in the thread does not close it under either. Once no row is
 running or waiting, the session is closed and the plan is forgotten here, and
-the thread's next card starts a new plan. A plan with no note or settled row
+the thread's next card starts a new plan. A plan with a card that gave up,
+which the breaker parks until it is unblocked, is set aside instead, as a
+lapsed one is below, so the unblock still finds its row. A plan with no note or settled row
 for :data:`PLAN_HOLD_SECONDS` is set aside, so a card whose terminal event
 was lost does not hold the next card's Working… or put its row on a message
 far up the thread; the next note starts a new plan. A set-aside plan holds
@@ -59,7 +62,8 @@ answered there runs on it again: it becomes the thread's plan once more, or,
 beside a newer plan, holds ``processing`` for another hold. Past
 :data:`LAPSED_PER_THREAD` a thread drops a set-aside plan that is quiet and
 has no card waiting first. A plan evicted at :data:`PLANS_MAX`, current or set
-aside, has its session sent again on the way out, since nothing else would.
+aside, has its session sent again on the way out, since nothing else would;
+the current plan evicted is the thread with the oldest note.
 Past ``slack_status.ROWS_MAX`` rows the oldest settled rows leave the plan
 first, so the cap hides a live card only when more than that many are live.
 The plan has no Stop button yet: ``/stop`` interrupts only the
@@ -326,18 +330,23 @@ def _waiting(plan: _Plan) -> bool:
 
 def _held(plan: _Plan) -> bool:
     """Whether a set-aside plan still has a card whose events can move it."""
-    return bool(plan.rolling) or any(_live(row) for row in plan.rows.values())
+    return bool(plan.rolling) or any(_open(row) for row in plan.rows.values())
 
 
 def _live(row: _Row) -> bool:
     return row.status in (_status.TASK_RUNNING, _status.TASK_PENDING)
 
 
+def _open(row: _Row) -> bool:
+    """Whether the row can still move: live, or a card that gave up, which ``unblocked`` resumes."""
+    return _live(row) or (row.status == _status.TASK_ERROR and not row.archived)
+
+
 def _prune(plan: _Plan) -> None:
     """Drop the oldest settled rows past ``ROWS_MAX``, so the renderer's cap cuts no live card."""
     extra = len(plan.rows) - _status.ROWS_MAX
     if extra > 0:
-        for card in [card for card, row in plan.rows.items() if not _live(row)][:extra]:
+        for card in [card for card, row in plan.rows.items() if not _open(row)][:extra]:
             del plan.rows[card]
 
 
@@ -513,7 +522,7 @@ def _move(row: _Row, kind: str) -> bool:
     if row.archived:
         return False  # upstream never unarchives, so a later event is a redelivery
     if kind == ARCHIVED_KIND:
-        if not _live(row):
+        if not _open(row):
             return False  # archived after it finished: its row stands
         # Archived by hand: nothing else will settle the row.
         row.lines = [*row.lines, ARCHIVED_NOTE][-_status.STEPS_MAX:]
@@ -610,6 +619,8 @@ async def _settle_current(
         _disarm(plan)
         if _plans.get(key) is plan:
             _plans.pop(key, None)
+            if plan.ts and _held(plan):
+                await _set_aside(adapter, key, plan)  # a card that gave up waits there for its unblock
     else:
         _arm(adapter, key, plan)
     return True
@@ -635,7 +646,10 @@ async def _deliver_move(
     kind = MOVE_KINDS.get(moved)
     if kind is not None:
         await settle_row(adapter, sub, kind)
-    elif row is not None and not await _render(adapter, key, plan):
+        refused = row is not None and plan.fallback  # the settle's edit was refused
+    else:
+        refused = row is not None and not await _render(adapter, key, plan)
+    if refused:
         row.lines, row.last_event_id = previous
         return False
     rolls = any(card in old.rolling for old in _lapsed.get(key, ()))
@@ -663,6 +677,8 @@ async def deliver_row(
     if plan is None:
         plan = _Plan(str(sub.get("team_id") or ""))
         await _keep(adapter, key, plan)
+    else:
+        _plans.move_to_end(key)  # eviction at PLANS_MAX takes the least active thread
     if plan.fallback:
         _roll(adapter, key, plan, card)
         if plan.ts:

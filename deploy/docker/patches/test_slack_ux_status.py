@@ -79,6 +79,8 @@ class SlackAdapter:
     async def _build_message_event(
         self, *, text, original_text, channel_id, team_id, ts, thread_ts, is_dm, msg_type):
         """Resolve names, title the DM thread, and build the ``MessageEvent``."""
+        if msg_type == MessageType.COMMAND:
+            text = original_text
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
@@ -194,6 +196,38 @@ class ApplierTest(unittest.TestCase):
 
     def test_verifier_passes_on_patched_tree(self):
         applier.apply(self.root.dir)
+        env = _flag(None)
+        self.addCleanup(env.stop)
+        verifier.main(self.root.dir)
+
+    def test_verifier_refuses_a_guard_name_upstream_renamed(self):
+        renames = (
+            ("def _session_title_method(", "def _session_rename_method("),
+            ("def _sdk_supports_agent_sessions(", "def _sdk_has_agent_sessions("),
+            ("team_id, ts, thread_ts", "team_id, message_ts, thread_ts"),
+            # Renamed, but still assigned under a branch that may not run.
+            ("self, *, text, original_text,", "self, *, body, original_text,"),
+        )
+        env = _flag(None)
+        self.addCleanup(env.stop)
+        path = self.root.dir / applier.RELATIVE
+        for old, new in renames:
+            with self.subTest(old):
+                path.write_text(UPSTREAM)
+                applier.apply(self.root.dir)
+                path.write_text(path.read_text().replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn("no longer binds", str(caught.exception))
+
+    def test_verifier_reads_the_adapter_class_only(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        path.write_text(path.read_text() + (
+            "\n\nclass OtherAdapter:\n"
+            "    async def _set_thread_status(self, thread_ts, chat_id):\n"
+            "        return None\n"
+        ))
         env = _flag(None)
         self.addCleanup(env.stop)
         verifier.main(self.root.dir)
@@ -555,6 +589,32 @@ class PlanTest(_RuntimeCase):
         tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
         self.assertEqual([t["status"] for t in tasks], ["in_progress"])
 
+    def test_a_card_that_gave_up_leaves_the_next_card_a_fresh_plan(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs", task="t_a")
+        _run(runtime.settle_row(adapter, _sub("t_a"), "gave_up"))
+        self._note(adapter, 2, "checking pods", task="t_b")
+        self.assertEqual(self._kinds(adapter).count("post"), 2)
+        self.assertEqual(list(runtime._plans[(CHANNEL, THREAD)].rows), ["t_b"])
+
+    def test_archiving_a_card_that_gave_up_lets_its_plan_go(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        _run(runtime.settle_row(adapter, _sub(), "archived"))
+        self.assertEqual((runtime._plans, runtime._lapsed), ({}, {}))
+
+    def test_a_lone_card_that_gave_up_runs_again_when_unblocked(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        self.assertEqual([t["status"] for t in tasks], ["in_progress"])
+        self.assertEqual(self._kinds(adapter).count("post"), 1)
+
     def test_a_card_that_gave_up_runs_again_when_unblocked(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
@@ -593,6 +653,14 @@ class PlanTest(_RuntimeCase):
         tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
         self.assertEqual([t["status"] for t in tasks], ["pending"])
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+
+    def test_a_move_into_review_whose_edit_is_refused_goes_to_the_rolling_message(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        adapter.client.fail.add("update")
+        self.assertFalse(self._move(adapter, 2, "review"))
+        row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
+        self.assertEqual((row.lines, row.last_event_id), (["reading logs"], 1))
 
     def test_a_move_for_a_card_rolling_on_a_set_aside_plan_goes_to_its_rolling_message(self):
         async def scenario(adapter):
@@ -690,6 +758,15 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_eviction_takes_the_least_active_thread(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLANS_MAX", 2):
+            self._note(adapter, 1, "a", task="t_a")
+            _run(runtime.deliver_row(adapter, _sub("t_b", thread="2.0"), 2, "two", "b"))
+            self._note(adapter, 3, "a again", task="t_a")
+            _run(runtime.deliver_row(adapter, _sub("t_c", thread="3.0"), 4, "three", "c"))
+        self.assertEqual(list(runtime._plans), [(CHANNEL, THREAD), (CHANNEL, "3.0")])
 
     def test_an_evicted_plan_closes_its_session(self):
         adapter = _Adapter()
