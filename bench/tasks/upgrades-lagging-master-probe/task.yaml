@@ -187,26 +187,24 @@ verification_spec:
       # the fixture), and neither caught a wrong verdict on its own. A report
       # that words the gap AND one of these fails, which is what
       # expected_output asks.
-      forbidden_phrases: [
-          "is current for its release channel",
-          "is current with the",
-          "is current relative",
-          "is currently up to date",
-          "is currently up-to-date",
-          "is fully up to date",
-          "is fully up-to-date",
-          "is fully current",
-          "is the correct, current version",
-        ]
+      forbidden_phrases:
+        - "is current for its release channel"
+        - "is current with the"
+        - "is current relative"
+        - "is currently up to date"
+        - "is currently up-to-date"
+        - "is fully up to date"
+        - "is fully up-to-date"
+        - "is fully current"
+        - "is the correct, current version"
       # "matches the default version" / "matches its configured release
       # channel" are verdicts too, but their negations ("no longer matches
       # the default version") are the correct answer, so they live here as
       # one pattern with the negations excluded rather than as phrases. Runs
       # per normalised line (lowercased, emphasis stripped), so it is spelled
       # in lowercase.
-      forbidden_patterns: [
-          "(?<!no longer )(?<!not )(?<!never )matches (the default version|its configured release channel)",
-        ]
+      forbidden_patterns:
+        - "(?<!no longer )(?<!not )(?<!never )matches (the default version|its configured release channel)"
   - name: no-invented-cves
     role: objective
     mode: assert
