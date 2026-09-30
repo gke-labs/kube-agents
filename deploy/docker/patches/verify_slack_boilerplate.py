@@ -33,7 +33,10 @@ Four things are checked:
    ``gateway/slash_commands.py``). With the flag on, ``system_text`` must
    reword every one, with no emoji, "Gateway", "gateway", "agent", "Hermes",
    ``/stop`` or exception text left; this is what catches an upstream
-   rewording. The words a drain reply or the interrupted-cron-job notice
+   rewording. The two replies built around an exception, the ``/steer``
+   failure and the provider authentication failure, must each be the upstream
+   argument of an ``error_reply`` call, so Slack gets the plain reply whatever
+   the exception holds. The words a drain reply or the interrupted-cron-job notice
    interpolates are read out of upstream too (``_status_action_gerund()`` and
    the notice's ``action`` binding), and each must be one the runtime rewords.
 4. The runtime module, loaded by path: on Slack with the flag on,
@@ -118,6 +121,13 @@ BACKGROUND_OUTPUTS = ("", "step 3/9")
 AUTH_PREFIX = "⚠️ Provider authentication failed"
 #: Stands in for the provider exception; Slack must never see it.
 AUTH_ERROR = "401 stand-in provider error"
+
+#: (file, prefix) of each reply built around an exception, and the runtime
+#: helper that must build it.
+ERROR_SITES = ((RUN_BUSY, "⚠️ Steer failed"), (RUN_TURN_RUNNER, AUTH_PREFIX))
+ERROR_HELPER = f"{ALIAS}.error_reply"
+#: Stand-ins for exceptions no bounded display-time pattern could match.
+ERROR_SHAPES = (f"{AUTH_ERROR}\nTraceback line two", AUTH_ERROR + "x" * 600)
 
 SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
 SLACK_CLASS = "SlackAdapter"
@@ -371,6 +381,26 @@ def _leading_text(node: ast.AST) -> str | None:
     return None
 
 
+def check_error_sites(root: Path) -> None:
+    """Each exception-bearing reply is built through ``error_reply``, the upstream text as its second argument."""
+    for relative, prefix in ERROR_SITES:
+        tree = _tree(root, relative)
+        if not _binds_alias(tree):
+            raise _fail(f"{relative} does not import gateway.slack_boilerplate as {ALIAS}")
+        literals = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.JoinedStr) and (_leading_text(node) or "").startswith(prefix)
+        ]
+        wrapped = {
+            id(node.args[1]) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and ast.unparse(node.func) == ERROR_HELPER and len(node.args) >= 3
+        }
+        if not literals or any(id(node) not in wrapped for node in literals):
+            raise _fail(
+                f"{relative} builds a {prefix!r} reply outside {ERROR_HELPER}(), so its exception can reach Slack"
+            )
+
+
 def check_system(root: Path) -> list[str]:
     """Check the system-reply call sites; return every such reply rendered from source."""
     replies: list[str] = []
@@ -532,6 +562,13 @@ def drive(module, notices: list[str], replies: list[str]) -> None:
                 raise _fail(f"system_text left the Slack notice {notice!r} as {out!r}")
             if not on and out is not notice:
                 raise _fail(f"system_text changed the notice {notice!r} with the flag off")
+        for error in ERROR_SHAPES:
+            upstream = f"{AUTH_PREFIX}: {error}"
+            for platform in ("slack", "chat"):
+                out = module.error_reply(platform, upstream, module.AUTH_FAILED, module.AUTH_FAILED_LOG, error)
+                expected = module.AUTH_FAILED if on and platform == "slack" else upstream
+                if out != expected:
+                    raise _fail(f"error_reply for {platform} with the flag {'on' if on else 'off'}: {out!r}")
         for reply in replies:
             out = module.system_text(reply)
             if on and (out == reply or any(word in out for word in SYSTEM_LEFTOVERS)):
@@ -546,13 +583,15 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_heartbeat(root)
     notices = check_notices(root)
     replies = check_system(root) + check_locale(root)
+    check_error_sites(root)
     runtime = _load_runtime(root)
     check_action_words(runtime, root)
     drive(runtime, notices, replies)
     print(
         "slack_boilerplate verify: Slack cron targets send the unwrapped report, the heartbeat "
         f"goes generic on Slack, {len(notices)} interrupting "
-        f"notices and {len(replies)} system replies reworded, and both back-online notices, the "
+        f"notices and {len(replies)} system replies reworded, exception text kept out of the "
+        "steer and auth failure replies where they are built, and both back-online notices, the "
         "session-database warnings and the busy-input hint kept off Slack; "
         "flag off and every other platform unchanged"
     )

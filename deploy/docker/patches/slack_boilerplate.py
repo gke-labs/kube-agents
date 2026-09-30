@@ -55,7 +55,13 @@ through ``SlackAdapter.send``, or ``SlackAdapter.edit_message`` when they
 arrive as a streamed or edited message. Both pass them through
 ``system_text``: each known one is reworded in plain voice, with no emoji, no
 "Gateway" or "agent", no console command, tool name or iteration count, and no
-exception text (that is logged instead). The background-task update is the
+exception text (that is logged instead). The two replies built around an
+exception, the ``/steer`` failure and the provider authentication failure, are
+replaced where they are built: ``error_reply`` returns the plain reply on Slack,
+so no exception of any length or shape reaches it. Their patterns in
+``SYSTEM_REWORDS`` are the fallback for text that arrives some other way, and
+match one bounded line only, so an agent reply that opens the same way is left
+alone. The background-task update is the
 exception: it keeps the command and its recent output, which is what the user
 asked to see. The ``/restart`` and ``/stop``
 replies come from Hermes' English catalog (``locales/en.yaml``); an install
@@ -190,7 +196,7 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
                 re.DOTALL),
      lambda m: (f"Still running {m['cmd']}." if m["cmd"] else "Still running.") + (m["rest"] or "")),
     (re.compile(rf"⚠️ Provider authentication failed: (?P<error>[^\n]{{1,{ERROR_TEXT_MAX}}})"),
-     lambda m: _logged("provider authentication failed", m["error"], AUTH_FAILED)),
+     lambda m: _logged(AUTH_FAILED_LOG, m["error"], AUTH_FAILED)),
     (re.compile(r"⚠️ Provider authentication failed\. Check the configured credentials; "
                 r"raw provider details are in the gateway logs\."),
      lambda m: AUTH_FAILED),
@@ -207,8 +213,10 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
      "Something went wrong on my side. Try again?"),
 )
 
-#: What Slack is told when the model provider refuses the turn's credentials.
+#: What Slack is told when the model provider refuses the turn's credentials,
+#: and what the log line says the exception it replaces was.
 AUTH_FAILED = "I can't reach the model right now (authentication failed)."
+AUTH_FAILED_LOG = "provider authentication failed"
 
 #: What Slack is told when ``/steer`` raises; the exception is logged.
 STEER_FAILED = "I couldn't add that to what I'm working on — send it again once I've answered."
@@ -276,6 +284,23 @@ def drop_notice(platform: Any) -> bool:
 def _logged(what: str, error: str, reply: str) -> str:
     logger.warning("slack_boilerplate: %s (not shown on Slack): %s", what, error)
     return reply
+
+
+def error_reply(
+    platform: Any, upstream: str, plain: str, what: str | None = None, error: Any = None,
+) -> str:
+    """An exception-bearing reply as its call site builds it: ``plain`` on Slack.
+
+    ``upstream`` is Hermes' own reply, exception text included, and comes back
+    unchanged with the flag off or for any platform other than Slack. On Slack
+    the exception never leaves the process; when ``what`` is given, ``error``
+    is logged under it first (``/steer`` logs its own and passes neither).
+    """
+    if _platform_name(platform) != PLATFORM or not enabled():
+        return upstream
+    if what is not None:
+        return _logged(what, str(error), plain)
+    return plain
 
 
 def system_text(text: Any) -> Any:

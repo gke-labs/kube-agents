@@ -261,7 +261,7 @@ class GatewayBusyMixin:
             f"mid-turn. Wait for the current response or `/stop` first."
         )
 
-    async def _busy_steer_command(self, running_agent, steer_text):
+    async def _busy_steer_command(self, event, running_agent, steer_text):
         def _queue_fallback(reply: str) -> str:
             return reply
 
@@ -272,6 +272,7 @@ class GatewayBusyMixin:
         try:
             running_agent.steer(steer_text)
         except Exception as exc:
+            logger.warning("Steer failed: %s", exc)
             return f"⚠️ Steer failed: {exc}"
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
@@ -400,8 +401,13 @@ RUN_TURN_RUNNER = '''\
 """Fixture standing in for gateway/run_turn_runner.py."""
 
 
-def _auth_failed(exc):
-    return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+class GatewayTurnRunnerMixin:
+    def _run_agent(self, ctx, runner):
+        try:
+            runner._resolve_session_agent_runtime(source=ctx.source)
+        except Exception as exc:
+            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+        return {"final_response": "ok"}
 '''
 
 RUN = '''\
@@ -570,6 +576,7 @@ class ApplierTest(unittest.TestCase):
         applier.apply(self.root.dir)
         for relative in (
             applier.DELIVERY, applier.RUN_TURN, applier.RUN_NOTIFICATIONS, applier.RUN_BUSY, applier.SLACK_ADAPTER,
+            applier.RUN_TURN_RUNNER,
         ):
             self.assertIn(applier.BUILD_MARKER, (self.root.dir / relative).read_text())
         # The interrupting notices are reworded in SlackAdapter.send; the shutdown module is untouched.
@@ -1009,6 +1016,62 @@ class SystemReplyTest(unittest.TestCase):
                 self.assertEqual(self._sent(self.adapter, text, FLAG_ON), text)
         with mock.patch.dict(os.environ, FLAG_ON):
             self.assertIsNone(runtime.system_text(None))
+
+
+class ErrorSiteTest(unittest.TestCase):
+    """The steer and auth failure replies, built by the patched call sites themselves."""
+
+    ERRORS = ("RuntimeError: queue closed\nTraceback (most recent call last):\n  sk-abc", "E" * 600)
+
+    def setUp(self):
+        self.root = _Root()
+        self.addCleanup(self.root.cleanup)
+        applier.apply(self.root.dir)
+        self.busy = self.root.load(applier.RUN_BUSY, "patched")["GatewayBusyMixin"]
+        self.turns = self.root.load(applier.RUN_TURN_RUNNER, "patched")["GatewayTurnRunnerMixin"]
+
+    def _steer(self, platform, error, env):
+        agent = SimpleNamespace(steer=mock.Mock(side_effect=RuntimeError(error)))
+        event = SimpleNamespace(source=SimpleNamespace(platform=platform))
+        with mock.patch.dict(os.environ, env):
+            return _run(self.busy()._busy_steer_command(event, agent, "check the ingress"))
+
+    def _auth(self, platform, error, env):
+        runner = SimpleNamespace(_resolve_session_agent_runtime=mock.Mock(side_effect=RuntimeError(error)))
+        ctx = SimpleNamespace(source=SimpleNamespace(platform=platform))
+        with mock.patch.dict(os.environ, env):
+            return self.turns()._run_agent(ctx, runner)["final_response"]
+
+    def test_slack_gets_the_plain_reply_whatever_the_exception(self):
+        for error in self.ERRORS:
+            with self.subTest(length=len(error)):
+                self.assertEqual(self._steer("slack", error, FLAG_ON), runtime.STEER_FAILED)
+                with self.assertLogs("gateway.slack_boilerplate", "WARNING") as logs:
+                    self.assertEqual(self._auth(SimpleNamespace(value="slack"), error, FLAG_ON), runtime.AUTH_FAILED)
+                self.assertIn(error, logs.output[0])
+
+    def test_flag_off_or_another_platform_keeps_upstream_reply(self):
+        for platform, env in (("slack", {"KAGE_SLACK_UX": ""}), ("telegram", FLAG_ON)):
+            for error in self.ERRORS:
+                with self.subTest(platform=platform, length=len(error)):
+                    self.assertEqual(self._steer(platform, error, env), f"⚠️ Steer failed: {error}")
+                    self.assertEqual(
+                        self._auth(platform, error, env), f"⚠️ Provider authentication failed: {error}")
+
+    def test_verifier_refuses_an_unwrapped_site(self):
+        for relative, anchor, patched in (
+            (applier.RUN_BUSY, applier.STEER_FAILED_ANCHOR, applier.STEER_FAILED_PATCHED),
+            (applier.RUN_TURN_RUNNER, applier.AUTH_FAILED_ANCHOR, applier.AUTH_FAILED_PATCHED),
+        ):
+            path = self.root.dir / relative
+            good = path.read_text()
+            with self.subTest(relative=relative):
+                path.write_text(good.replace(patched, anchor))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn("outside", str(caught.exception))
+            path.write_text(good)
+        verifier.main(self.root.dir)
 
 
 class BusyHintTest(unittest.TestCase):

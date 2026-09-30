@@ -743,7 +743,9 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # phrase instead), the back-online notices, session-database warnings and
 # busy-input hint (not sent), and the restart/shutdown notices, slash-command
 # replies and other system replies (reworded in SlackAdapter.send and
-# edit_message). See deploy/docker/patches/slack_boilerplate.py.
+# edit_message; the steer and auth failure replies are replaced where they
+# are built, so no exception text reaches Slack). See
+# deploy/docker/patches/slack_boilerplate.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \

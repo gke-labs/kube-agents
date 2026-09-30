@@ -2,7 +2,7 @@
 """Wire gateway/slack_boilerplate.py into the cron delivery, the heartbeat and the notices.
 
 Run by ``deploy/docker/Dockerfile`` against the Hermes tree, after
-``slack_boilerplate.py`` has been copied to ``gateway/``. Five files:
+``slack_boilerplate.py`` has been copied to ``gateway/``. Six files:
 
 ``cron/scheduler_delivery.py``: ``_deliver_result`` imports the module beside
 its own ``BasePlatformAdapter`` import, and each target's two send lanes take
@@ -22,7 +22,12 @@ way in their own loop.
 
 ``gateway/run_busy.py``: the one-time busy-input onboarding hint is neither
 appended nor marked seen when ``drop_notice`` says the busy message came from
-Slack.
+Slack, and a failed ``/steer`` replies through ``error_reply``, which keeps
+the exception (already logged there) out of a Slack reply.
+
+``gateway/run_turn_runner.py``: a provider authentication failure's
+``final_response`` is built through ``error_reply``, which logs the exception
+and gives Slack the plain reply.
 
 ``plugins/platforms/slack/adapter.py``: ``SlackAdapter.send`` passes its
 content through ``system_text`` once the DM target is resolved, the one place
@@ -162,6 +167,29 @@ BUSY_HINT_PATCHED = (
     "                    _kage_slack_boilerplate.drop_notice(event.source.platform)):\n"
 )
 
+STEER_FAILED_ANCHOR = '            return f"⚠️ Steer failed: {exc}"\n'
+STEER_FAILED_PATCHED = (
+    "            # kube-agents patch: KAGE_SLACK_UX keeps the exception (logged above)\n"
+    "            # out of a Slack reply; see gateway/slack_boilerplate.py.\n"
+    "            return _kage_slack_boilerplate.error_reply(\n"
+    '                event.source.platform, f"⚠️ Steer failed: {exc}", _kage_slack_boilerplate.STEER_FAILED)\n'
+)
+
+RUN_TURN_RUNNER = "gateway/run_turn_runner.py"
+
+AUTH_FAILED_ANCHOR = (
+    '            return {"final_response": f"⚠️ Provider authentication failed: {exc}", '
+    '"messages": [], "api_calls": 0, "tools": []}\n'
+)
+AUTH_FAILED_PATCHED = (
+    "            # kube-agents patch: KAGE_SLACK_UX logs the exception and keeps it out of\n"
+    "            # a Slack reply; see gateway/slack_boilerplate.py.\n"
+    '            return {"final_response": _kage_slack_boilerplate.error_reply(\n'
+    '                ctx.source.platform, f"⚠️ Provider authentication failed: {exc}",\n'
+    "                _kage_slack_boilerplate.AUTH_FAILED, _kage_slack_boilerplate.AUTH_FAILED_LOG, exc,\n"
+    '            ), "messages": [], "api_calls": 0, "tools": []}\n'
+)
+
 SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
 
 SLACK_SEND_ANCHOR = (
@@ -212,7 +240,13 @@ def apply(root: Path) -> None:
     run_busy = patchlib.Patch(root, RUN_BUSY, prefix=PREFIX)
     run_busy.refuse_if_patched(BUILD_MARKER)
     run_busy.substitute(BUSY_HINT_ANCHOR, BUSY_HINT_PATCHED, label="busy-input onboarding hint")
+    run_busy.substitute(STEER_FAILED_ANCHOR, STEER_FAILED_PATCHED, label="/steer failure reply")
     run_busy.append(GATEWAY_IMPORT)
+
+    run_turn_runner = patchlib.Patch(root, RUN_TURN_RUNNER, prefix=PREFIX)
+    run_turn_runner.refuse_if_patched(BUILD_MARKER)
+    run_turn_runner.substitute(AUTH_FAILED_ANCHOR, AUTH_FAILED_PATCHED, label="provider auth failure reply")
+    run_turn_runner.append(GATEWAY_IMPORT)
 
     slack_adapter = patchlib.Patch(root, SLACK_ADAPTER, prefix=PREFIX)
     slack_adapter.refuse_if_patched(BUILD_MARKER)
@@ -223,7 +257,8 @@ def apply(root: Path) -> None:
     delivery.commit("2 anchors")
     run_turn.commit("1 anchor, 1 import")
     run_notifications.commit("3 anchors, 1 import")
-    run_busy.commit("1 anchor, 1 import")
+    run_busy.commit("2 anchors, 1 import")
+    run_turn_runner.commit("1 anchor, 1 import")
     slack_adapter.commit("2 anchors, 1 import")
 
 
