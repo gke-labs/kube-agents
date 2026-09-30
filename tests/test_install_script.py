@@ -7127,6 +7127,13 @@ class DomainScopedFlagsTest(unittest.TestCase):
         test that the sourcing stays sourcing, and it fails on the day someone
         replaces it with a parser that is right about the table and wrong about
         the next line anyone writes.
+
+        The yardstick is load_install_env itself rather than a `source` this
+        test writes, because a reader can match a `source` and still miss what
+        the install reads back. Both live readers source inside a function, and
+        `declare -x K=v` there is a local that is gone when the function
+        returns — so a top-level yardstick and a top-level reader agree on
+        `true` for a line the install never sees.
         """
         keys = [key for key, _ in self.QUOTING_SPELLINGS]
         # dict.fromkeys: AQ and AR are two keys off one line, and writing that
@@ -7140,7 +7147,12 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     f'for k in {" ".join(keys)}; do',
                     f'  printf "READER\\t%s\\t[%s]\\n" "$k" "$(recorded_install_env_value \'{env_file}\' "$k")"',
                     "done",
-                    f"set -a; source '{env_file}'; set +a",
+                    # load_install_env, not a top-level `source`. The scope is
+                    # part of the answer: `declare -x AK=true` is a global at
+                    # the top level of a script and a local inside a function,
+                    # so a top-level yardstick agrees with a top-level reader
+                    # about a key that neither live reader ever leaves behind.
+                    f"load_install_env '{env_file}'",
                     f'for k in {" ".join(keys)}; do',
                     # ${!k-}, not ${!k}: install.sh runs under set -u, and P
                     # through S, X, Y and AC are spellings that leave the key
@@ -7166,6 +7178,54 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     seen["READER"].get(key),
                     f"recorded_install_env_value disagrees with sourcing the file for {key}",
                 )
+        # Pinned separately, because agreement alone does not catch the way
+        # this went wrong: move the reader back to a top-level `source` and a
+        # top-level yardstick moves with it, both reporting `true` for a line
+        # whose value dies with the function that read it. `declare -x` is the
+        # one row in the table where the scope decides the answer.
+        self.assertEqual(
+            "[]",
+            seen["BASH"]["AK"],
+            "a `declare -x` line assigns a function-local, so neither live "
+            f"reader keeps it: {proc.stdout}",
+        )
+
+    def test_reading_many_keys_evaluates_the_file_once(self):
+        """install.env is shell, so an evaluation can cost a network call.
+
+        `GEMINI_API_KEY=$(gcloud secrets versions access ...)` is a documented
+        shape, and the interview guard asks about twenty-two keys. A reader
+        that sources per key ran that command twenty-two times per interactive
+        re-run, with the exit swallowed and the value silently empty on any
+        one of them that failed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "counting.env"
+            marks = pathlib.Path(tmp) / "marks"
+            env_file.write_text(f'printf x >> "{marks}"\nA=1\nB=2\nC=3\n')
+            keys = "A B C"
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        f"read_recorded_install_env_values '{env_file}' {keys}",
+                        f"for k in {keys}; do",
+                        f"  printf '%s\\n' "
+                        f'"$(recorded_install_env_value \'{env_file}\' "$k")"',
+                        f'  install_env_records_key \'{env_file}\' "$k" '
+                        '|| printf "unrecorded %s\\n" "$k"',
+                        "done",
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertNotIn("unrecorded", proc.stdout)
+            self.assertEqual(
+                "x",
+                marks.read_text(),
+                "three values and three presence tests, one evaluation of the "
+                f"file: {proc.stdout}",
+            )
 
     def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
         """Both axes at once: the destroying is now, and nothing is destroyed.
@@ -7374,7 +7434,18 @@ class DomainScopedFlagsTest(unittest.TestCase):
                      "resolve_shared_defaults\n"
                      'printf "%s" "$PARAM_ENABLE_DRIFT_DETECTOR"'],
                     capture_output=True, text=True, cwd=str(_REPO_ROOT),
-                    env=_env_without_ambient_drift_keys(),
+                    # KUBE_AGENTS_INSTALL_ENV, as the outer _parse pins it:
+                    # without it INSTALL_ENV_FILE falls to the install.env
+                    # beside install.sh, and bootstrap_install_env sources that
+                    # with `set -a` before PARAM_ENABLE_DRIFT_DETECTOR is
+                    # seeded. A developer who has run ./install.sh from this
+                    # checkout has one, and it now names this key, so the
+                    # assertion below would fail on the developer's file rather
+                    # than on resolve_shared_defaults. Scrubbing the
+                    # environment covers the other route in, not this one.
+                    env=_env_without_ambient_drift_keys(
+                        {"KUBE_AGENTS_INSTALL_ENV": str(destination)}
+                    ),
                 ).stdout,
                 "resolve_shared_defaults must leave this one empty",
             )
@@ -7400,6 +7471,41 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
                     combined = proc.stdout + proc.stderr
                     self.assertNotIn("ENABLE_DRIFT_DETECTOR", combined)
+
+    def test_a_spelling_only_bash_sees_still_counts_as_recorded(self):
+        """One reader decides both "does the file record it" and "as what".
+
+        These three lines all assign the key, and none of them match the
+        `^[[:space:]]*(export[[:space:]]+)?KEY=` pattern the guard used to test
+        presence with. While the value came from sourcing and presence came
+        from that pattern, a file recording exactly the flagged value earned
+        `records no ENABLE_DRIFT_DETECTOR` on every flagless run, followed by
+        the destroyed-ingress consequence for a reversal the next run cannot
+        perform — it re-reads the same line.
+
+        `declare -x` is deliberately not in the list: it assigns a local inside
+        the function both live readers source from, so the file really does not
+        record it, and the reader agreeing with the pattern there is correct
+        rather than lucky.
+        """
+        for line in (
+            "export TF_VAR_enable_drift_pubsub=true ENABLE_DRIFT_DETECTOR=true",
+            "readonly ENABLE_DRIFT_DETECTOR=true",
+            "  ENABLE_DRIFT_DETECTOR=true",
+        ):
+            with self.subTest(line=line):
+                with tempfile.TemporaryDirectory() as tmp:
+                    destination = pathlib.Path(tmp) / "existing.env"
+                    destination.write_text(line + "\n")
+                    proc = self._parse(
+                        "--enable-drift-detector=true",
+                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                    self.assertNotIn(
+                        "records no ENABLE_DRIFT_DETECTOR",
+                        proc.stdout + proc.stderr,
+                    )
 
     def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
         """Nothing is overridden, so there is nothing to lose by omitting it.
@@ -8252,10 +8358,15 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
              'resolve_shared_defaults\n'
              'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n' + script],
             capture_output=True, text=True,
-            env=get_isolated_test_env(overrides={
+            # The drift keys scrubbed for the same reason DomainScopedFlagsTest
+            # scrubs them: this class drives bootstrap_install_env_file over a
+            # file recording only scope keys, and the silence-asserting cases
+            # here would see the new drift branch warn about a flag the shell
+            # supplied. No case in this class passes either key through `env=`.
+            env=_env_without_ambient_drift_keys({
                 "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
                 **(env or {}),
-            }),
+            }, env),
             cwd=str(_REPO_ROOT),
         )
 

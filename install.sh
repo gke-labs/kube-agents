@@ -68,6 +68,14 @@ readonly NETWORK_POLICY_ENFORCEMENT_ANNOTATION="kubeagents.x-k8s.io/network-poli
 readonly NP_ENFORCEMENT_ENFORCED="enforced"
 readonly NP_ENFORCEMENT_ENABLED_BY_INSTALL="enabled-by-install"
 readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
+# Where read_recorded_install_env_values parks what one evaluation of
+# install.env found, mangled onto the key. A key the file can assign is a shell
+# name, so the mangled slot is one too.
+readonly RECORDED_VALUE_PREFIX="_RECORDED_INSTALL_ENV_VALUE_"
+readonly RECORDED_SET_PREFIX="_RECORDED_INSTALL_ENV_SET_"
+# The file those slots hold answers for, and the keys parked so far.
+RECORDED_INSTALL_ENV_FILE=""
+RECORDED_INSTALL_ENV_KEYS=""
 # The report field's key, and the value in the report until a run has decided.
 readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
@@ -1343,48 +1351,125 @@ write_secret_env_var() {
 # the one the interview asked for, never the probed TFVARS_CLUSTER_MODE, which
 # write_tfvars_from_state re-derives on every run.
 
-# The value install.env records for one key, empty when it records none.
+# What install.env records for a set of keys, and whether it records them at
+# all, from one evaluation of the file.
 #
 # Asks bash rather than parsing the file, because bash is the other reader and
-# the only one whose answer matters: load_install_env sources install.env into
-# the environment every guard here compares against. A reader that parses the
-# line instead has to reimplement the grammar bash applies to it -- assignment
+# the only one whose answer matters: bootstrap_install_env sources install.env
+# at startup and load_install_env again on every front door, into the
+# environment every guard here compares against. A reader that parses the line
+# instead has to reimplement the grammar bash applies to it -- assignment
 # prefixes and command words, redirections, `&>`, comments, quoting, backslash
 # escapes, parameter and command substitution, a reassignment later on the same
-# line -- and stay right about all of it. Sourcing is correct for every
-# spelling by construction, and it is what actually happens.
+# line -- and stay right about all of it.
 #
-# `unset "$key"` first, so a value coming back means the *file* assigned it.
+# Sourced inside a function, because that is where both live readers source it,
+# and the scope changes the answer. `declare -x K=true` is a global at the top
+# level of a script and a local inside a function, so a top-level reader hands
+# back `true` for a line whose value dies with bootstrap_install_env's return
+# and never reaches write_tfvars_from_state. Matching the scope is what makes
+# "what the file records" mean "what the install will read back".
+#
+# Set-ness travels with the value, so no caller needs a presence test of its
+# own. A `grep -E "^[[:space:]]*(export[[:space:]]+)?${key}="` beside this is
+# the second parser the function exists to remove, and the two disagree on
+# every spelling the pattern does not know -- `declare -x K=v`, `readonly K=v`,
+# the second assignment on one `export` -- which is how a file recording
+# exactly the flagged value earns "records no K".
+#
+# One evaluation for all of them, because the file is shell and a line may run
+# a command: `GEMINI_API_KEY=$(gcloud secrets versions access ...)` is a
+# network round-trip per evaluation, and the interview guard alone asks about
+# twenty-two keys. Answers stay cached until the file argument changes. A
+# caller reading through a command substitution primes the cache in a subshell
+# that then exits, so the callers that read several keys prime here first, in
+# their own shell, and their reads land warm.
+#
+# `unset` each key first, so a value coming back means the *file* assigned it.
 # Without that the caller's own exported ENABLE_DRIFT_DETECTOR would read back
 # as a recorded line, which is the one distinction the drift guard exists to
 # make. The rest of the environment is inherited on purpose: a file recording
 # `K=$OTHER` assigns whatever the real sourcing will assign, so the reader has
 # to see the same shell the install runs in.
 #
-# Executing the file is not a new exposure. bootstrap_install_env sources it in
-# the real shell at startup, and load_install_env again on every front door; a
-# throwaway subshell that reads one key back is strictly less than either.
+# Executing the file is not a new exposure. The real shell sources it at
+# startup and every front door sources it again; a throwaway subshell that
+# reads keys back is strictly less than either.
 #
-# `set -a` matches load_install_env, `>/dev/null 2>&1` keeps a chatty file out
-# of the caller's output, and `${!key-}` distinguishes nothing from empty --
-# both of which this returns as empty, as the callers expect.
+# `%q` so a value carrying a newline still arrives as one line the caller can
+# eval, and `>/dev/null 2>&1` keeps a chatty file out of the caller's output.
+read_recorded_install_env_values() {
+  local file="${1:-}"
+  shift || true
+  [ -n "$file" ] && [ -f "$file" ] && [ "$#" -gt 0 ] || return 0
+
+  if [ "$RECORDED_INSTALL_ENV_FILE" != "$file" ]; then
+    local stale
+    for stale in $RECORDED_INSTALL_ENV_KEYS; do
+      unset "${RECORDED_VALUE_PREFIX}${stale}" "${RECORDED_SET_PREFIX}${stale}"
+    done
+    RECORDED_INSTALL_ENV_KEYS=""
+    RECORDED_INSTALL_ENV_FILE="$file"
+  fi
+
+  local key slot
+  local pending=()
+  for key in "$@"; do
+    slot="${RECORDED_SET_PREFIX}${key}"
+    [ -n "${!slot-}" ] || pending+=("$key")
+  done
+  [ "${#pending[@]}" -gt 0 ] || return 0
+
+  eval "$(bash -c '
+    file="$1"
+    value_prefix="$2"
+    set_prefix="$3"
+    shift 3
+    for key in "$@"; do unset "$key"; done
+    source_as_the_install_does() {
+      set -a
+      # shellcheck disable=SC1090
+      . "$1" >/dev/null 2>&1 || true
+      set +a
+    }
+    source_as_the_install_does "$file"
+    for key in "$@"; do
+      if [ -n "${!key+x}" ]; then
+        printf "%s%s=1\n" "$set_prefix" "$key"
+        printf "%s%s=%q\n" "$value_prefix" "$key" "${!key}"
+      else
+        printf "%s%s=0\n" "$set_prefix" "$key"
+        printf "%s%s=\n" "$value_prefix" "$key"
+      fi
+    done
+  ' _ "$file" "$RECORDED_VALUE_PREFIX" "$RECORDED_SET_PREFIX" "${pending[@]}" 2>/dev/null || true)"
+  RECORDED_INSTALL_ENV_KEYS="${RECORDED_INSTALL_ENV_KEYS}${RECORDED_INSTALL_ENV_KEYS:+ }${pending[*]}"
+}
+
+# The value install.env records for one key, empty when it records none.
 #
 # Always returns 0. A `return 1` for "no such key" would be the natural
 # signature and is the wrong one here: this is called from a command
 # substitution, `set -E` propagates the ERR trap into that subshell, and the
 # trap fires on the non-zero return before the caller's `||` is ever consulted
-# -- printing an abort banner per absent key. Callers test presence separately.
+# -- printing an abort banner per absent key. install_env_records_key is the
+# presence test, and it is safe because `if` suppresses the trap.
 recorded_install_env_value() {
   local file="${1:-}" key="${2:-}"
   [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 0
-  bash -c '
-    unset "$2"
-    set -a
-    # shellcheck disable=SC1090
-    . "$1" >/dev/null 2>&1 || true
-    set +a
-    printf "%s" "${!2-}"
-  ' _ "$file" "$key" 2>/dev/null || true
+  read_recorded_install_env_values "$file" "$key"
+  local slot="${RECORDED_VALUE_PREFIX}${key}"
+  printf "%s" "${!slot-}"
+}
+
+# Whether install.env assigns the key at all, told apart from assigning it
+# empty, by the same evaluation that reads the value.
+install_env_records_key() {
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 1
+  read_recorded_install_env_values "$file" "$key"
+  local slot="${RECORDED_SET_PREFIX}${key}"
+  [ "${!slot-0}" = "1" ]
 }
 
 # Say so when an interactive answer changed something the file still records
@@ -1437,12 +1522,16 @@ warn_unrecorded_interview_answers() {
   #      and having the next run derive multiuser_memory from the unchanged file
   #      and tear the Hindsight API and its Postgres back down.
   local key recorded current drifted=""
-  for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
-    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
+  local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
+    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
+    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+  # One evaluation of the file for the whole list, in this shell, so the reads
+  # below land on the cache instead of re-running whatever the file's lines run.
+  read_recorded_install_env_values "$file" "${interview_keys[@]}"
+  for key in "${interview_keys[@]}"; do
+    install_env_records_key "$file" "$key" || continue
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
       MEMORY) current="${PARAM_MEMORY:-}" ;;
@@ -1551,7 +1640,7 @@ note_stale_network_policy_acceptance() {
 warn_flag_beats_unrecorded_file_value() {
   local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}"
   [ -n "$value" ] || return 0
-  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
+  if install_env_records_key "$file" "$key"; then
     local recorded
     recorded="$(recorded_install_env_value "$file" "$key")"
     if [ "$compare_as_bool" = "true" ]; then
@@ -1630,6 +1719,9 @@ bootstrap_install_env_file() {
     # on, and each of these is read by someone about to be surprised.
     local drift_detector_chosen="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
     local drift_detector_recorded drift_detector_consequence drift_detector_turning_off=""
+    # Both drift keys in one evaluation of the file, in this shell, so the two
+    # reads below and the guard's own presence test share it.
+    read_recorded_install_env_values "$destination" ENABLE_DRIFT_DETECTOR TF_VAR_enable_drift_pubsub
     drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
     # What a later run that passes no flag reads the key back from. The file
     # when it records one; otherwise, with the file silent, this shell's own
