@@ -33,14 +33,15 @@
 # onboarding has already delivered, either onboarding cron job is gone, or the
 # delivery job is paused or bound to a chat: the ranked report this produces is
 # the one onboarding sends to the user. It also refuses one whose gate has not filed its sweep,
-# and one without exactly one shell sandbox pod.
+# and one without exactly one shell sandbox pod. The checks are one read at
+# the start, so run the case on an eval install nobody chats with: a first
+# chat during the run is sent the planted report.
 #
 # Isolation class: read-only on the cluster; it plants the raw report on the
-# install under test, writes `.bootstrap_greeted`, files one card and touches
-# `.user_aligned`, and the destroy archives the onboarding cards, removes the
-# INVENTORY files from both pods, removes `.user_aligned` and
-# `.bootstrap_completed`, puts back whichever onboarding cron job the delivery
-# removed, and removes the `.bootstrap_greeted` it wrote. Eligible
+# install under test, files one card and touches `.user_aligned`, and the
+# destroy archives the onboarding cards, removes the INVENTORY files from both
+# pods, removes `.user_aligned` and `.bootstrap_completed`, and puts back
+# whichever onboarding cron job the delivery removed. Eligible
 # tier: nightly -- one card's worker runs the whole prioritization SOP, which
 # takes a dispatcher slot for most of the stack's wait.
 ---

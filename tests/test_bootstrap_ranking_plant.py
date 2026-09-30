@@ -21,8 +21,8 @@ count stopping the apply before anything changes; the order clear, plant,
 file, wait, arm; a leftover arm being torn down first; the planted bytes
 being the fixture's; the card being filed with the gate's key and assignee;
 step 5's hand-over rules; the exit trap archiving, clearing and disarming on
-a failure after step 2; and the destroy carrying on past a failed step and
-naming it. As in `test_bootstrap_discovery_plant.py`, the provisioners are
+a failure or a TERM or INT after step 2, and finishing when a second signal
+arrives; and the destroy carrying on past a failed step and naming it. As in `test_bootstrap_discovery_plant.py`, the provisioners are
 rendered the way Terraform renders them and run against a stub
 `kubectl`/`gcloud`/`sleep`. The in-pod card filing runs on its own against a
 stub `hermes`, step 5's board query against a sqlite board, and the arm and
@@ -74,8 +74,6 @@ _IN_POD = {
     "local.scan_job": "bootstrap-inventory-scan",
     "local.delivery_job": "bootstrap-inventory-delivery",
     "local.state_file": "/opt/data/.bench-onboarding-jobs.json",
-    "local.greeted": "/opt/data/.bootstrap_greeted",
-    "local.hold_token": "held by bench/tf/prebuilt/bootstrap-ranking",
     "local.settle_wait": "120",
     "local.settle_poll": "2",
 }
@@ -102,9 +100,7 @@ _INTERPOLATIONS = {
     "local.scan_job": _IN_POD["local.scan_job"],
     "local.delivery_job": _IN_POD["local.delivery_job"],
     "local.state_file": _IN_POD["local.state_file"],
-    "local.greeted": _IN_POD["local.greeted"],
-    "local.hold_token": _IN_POD["local.hold_token"],
-    "base64encode(local.hold_py)": base64.b64encode(_in_pod("hold_py", _IN_POD).encode()).decode(),
+    "local.greeted": "/opt/data/.bootstrap_greeted",
     "base64encode(local.arm_py)": base64.b64encode(_in_pod("arm_py", _IN_POD).encode()).decode(),
     "base64encode(local.disarm_py)": base64.b64encode(_in_pod("disarm_py", _IN_POD).encode()).decode(),
     "var.project_id": "kube-agents-evals",
@@ -138,7 +134,7 @@ _DESTROY_INTERPOLATIONS = {
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
 # keeps scenario state as files under $STATE.
 _KUBECTL_STUB = r'''#!/usr/bin/env python3
-import os, pathlib, sys
+import os, pathlib, signal, sys
 
 argv = sys.argv[1:]
 state = pathlib.Path(os.environ["STATE"])
@@ -183,10 +179,6 @@ elif "os.replace(tmp, state)" in stdin:
     record("arm")
     if os.environ.get("ARM_FAIL") == "1":
         unreachable()
-elif "os.link(" in stdin:
-    record("hold")
-    if os.environ.get("HOLD_FAIL") == "1":
-        sys.exit("/opt/data/.bootstrap_greeted exists: a person has been greeted")
 elif ".user_aligned" in stdin:
     record("state")
     states = os.environ.get("STEP_1_STATE", "clear").split(";")
@@ -194,12 +186,13 @@ elif ".user_aligned" in stdin:
 elif '"kanban", "create"' in stdin:
     record("create")
     (state / "create_argv").write_text("\n".join(cmd))
-    if os.environ.get("CREATE_FAIL") == "1":
-        unreachable()
     card = os.environ.get("CARD_ID", "t_card")
     if card:
         with open(state / "created", "a") as fh:
             fh.write(card + "\n")
+    # A create whose exec failed after the board filed the card.
+    if os.environ.get("CREATE_FAIL") == "1":
+        unreachable()
     print(card)
 elif "task_runs" in stdin:
     record("run_state")
@@ -224,7 +217,9 @@ elif "base64 -d" in script:
         unreachable()
 elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
     record("clear " + target)
-    if os.environ.get("INVENTORY_RM_FAIL") == target:
+    if os.environ.get("INVENTORY_RM_FAIL") == target and bump("rm_" + target.replace("/", "_")) + 1 >= int(
+        os.environ.get("INVENTORY_RM_FAIL_FROM", "1")
+    ):
         unreachable()
 elif "archive" in cmd:
     record("archive")
@@ -232,12 +227,22 @@ elif "archive" in cmd:
         unreachable()
     with open(state / "archived", "a") as fh:
         fh.write(cmd[-1] + "\n")
+    if cmd[-1] == os.environ.get("SIGNAL_ON_ARCHIVE_OF"):
+        os.kill(os.getppid(), getattr(signal, "SIG" + os.environ["SIGNAL"]))
 else:
     record()
 '''
 
 _GCLOUD_STUB = '#!/bin/bash\necho "gcloud $*" >> "$CALLS"\n'
-_SLEEP_STUB = '#!/bin/bash\necho "sleep $*" >> "$CALLS"\n'
+# SIGNAL_ON_SLEEP signals the plant from its first sleep, step 5's poll on a
+# happy-path run.
+_SLEEP_STUB = r'''#!/bin/bash
+echo "sleep $*" >> "$CALLS"
+if [ -n "${SIGNAL:-}" ] && [ -n "${SIGNAL_ON_SLEEP:-}" ] && [ ! -e "$STATE/signalled" ]; then
+  touch "$STATE/signalled"
+  kill -"$SIGNAL" "$PPID"
+fi
+'''
 
 
 def _render(block: int, interpolations: dict) -> str:
@@ -310,7 +315,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         return [i for i, call in enumerate(calls) if call.endswith(needle)]
 
     def _changes(self, calls):
-        return [c for c in calls if re.search(r"\[(archive|clear |hold|plant |create|arm|disarm)", c)]
+        return [c for c in calls if re.search(r"\[(archive|clear |plant |create|arm|disarm)", c)]
 
     def test_bash_syntax_is_valid(self):
         for script in (self._script, self._destroy_script):
@@ -323,21 +328,17 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         archive = self._indices(calls, "archive t_old [archive]")
         clear = self._indices(calls, "[clear pod/platform-agent-shell-0]")
         clear_agent = self._indices(calls, "[clear deployment/platform-agent-gateway]")
-        hold = self._indices(calls, "[hold]")
         plant = self._indices(calls, "[plant pod/platform-agent-shell-0]")
         create = self._indices(calls, "[create]")
         runs = self._indices(calls, "[run_state]")
         arm = self._indices(calls, "[arm]")
         self.assertEqual(
-            [len(archive), len(clear), len(clear_agent), len(hold), len(plant), len(create), len(arm)],
-            [1, 1, 1, 1, 1, 1, 1],
-            calls,
+            [len(archive), len(clear), len(clear_agent), len(plant), len(create), len(arm)], [1, 1, 1, 1, 1, 1], calls
         )
         self.assertEqual(len(runs), 3)
         self.assertLess(archive[0], clear[0])
-        self.assertLess(clear[0], hold[0])
-        self.assertLess(clear_agent[0], hold[0])
-        self.assertLess(hold[0], plant[0])
+        self.assertLess(clear[0], plant[0])
+        self.assertLess(clear_agent[0], plant[0])
         self.assertLess(plant[0], create[0])
         self.assertLess(create[0], runs[0])
         self.assertLess(runs[-1], arm[0])
@@ -392,7 +393,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
     def test_a_leftover_arm_is_torn_down_before_the_checks(self):
         completed, calls = self._run(STEP_1_STATE="armed;clear")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("An earlier run left its teardown unfinished", completed.stderr)
+        self.assertIn("An earlier run left delivery armed", completed.stderr)
         states = self._indices(calls, "[state]")
         disarm = self._indices(calls, "[disarm]")
         clear = self._indices(calls, "[clear pod/platform-agent-shell-0]")
@@ -481,6 +482,9 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Plant failed", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[open_cards]")), 3)
+        archived = self._indices(calls, "archive t_card [archive]")
+        self.assertEqual(len(archived), 1, calls)
+        self.assertLess(self._indices(calls, "[create]")[0], archived[0])
 
     def test_a_failed_plant_fails_and_the_trap_cleans_up(self):
         completed, calls = self._run(PLANT_FAIL=1)
@@ -490,14 +494,6 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         clear_agent = self._indices(calls, "[clear deployment/platform-agent-gateway]")
         self.assertEqual(len(clear_agent), 2)
         self.assertLess(clear_agent[-1], self._indices(calls, "[disarm]")[0])
-
-    def test_a_failed_hold_stops_before_the_plant_and_the_trap_disarms(self):
-        completed, calls = self._run(HOLD_FAIL=1)
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("a person has been greeted", completed.stderr)
-        self.assertIn("Plant failed", completed.stderr)
-        self.assertEqual(self._indices(calls, "[plant pod/platform-agent-shell-0]"), [])
-        self.assertLess(self._indices(calls, "[hold]")[0], self._indices(calls, "[disarm]")[0])
 
     def test_a_failed_arm_fails_and_the_trap_disarms(self):
         completed, calls = self._run(ARM_FAIL=1)
@@ -543,15 +539,54 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertNotIn("Cleanup incomplete", completed.stderr)
 
     def test_the_trap_names_what_it_could_not_clean(self):
+        # Step 2's removal succeeds, so the failure is step 5's.
         completed, _ = self._run(
-            RUN_STATES="0 0 0", FAILED_LISTINGS="3 4 5", INVENTORY_RM_FAIL="pod/platform-agent-shell-0"
+            RUN_STATES="0 0 0",
+            FAILED_LISTINGS="3 4 5",
+            INVENTORY_RM_FAIL="pod/platform-agent-shell-0",
+            INVENTORY_RM_FAIL_FROM=2,
         )
         self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("no worker picked up card t_card", completed.stderr)
         self.assertIn(
             "Cleanup incomplete: could not list the open cards, remove the INVENTORY files.", completed.stderr
         )
         completed, _ = self._run(RUN_STATES="0 0 0", DISARM_FAIL=1)
         self.assertIn("Cleanup incomplete: could not disarm the delivery job.", completed.stderr)
+
+    def test_a_signal_during_step_5_still_cleans_up(self):
+        # A Prow deadline arrives as SIGTERM, and bash skips the EXIT trap
+        # when an untrapped signal ends it.
+        for name in ("TERM", "INT"):
+            with self.subTest(signal=name):
+                self._clear()
+                completed, calls = self._run(RUN_STATES="0 0 0", SIGNAL=name, SIGNAL_ON_SLEEP=1)
+                self.assertEqual(completed.returncode, 143, completed.stderr)
+                self.assertIn("Plant failed (exit 143)", completed.stderr)
+                self.assertEqual(len(self._indices(calls, "[run_state]")), 1)
+                archived = self._indices(calls, "archive t_card [archive]")
+                self.assertEqual(len(archived), 1, calls)
+                clear = self._indices(calls, "[clear pod/platform-agent-shell-0]")
+                self.assertEqual(len(clear), 2)
+                disarm = self._indices(calls, "[disarm]")
+                self.assertEqual(len(disarm), 1)
+                self.assertLess(archived[0], clear[-1])
+                self.assertLess(clear[-1], disarm[0])
+
+    def test_a_signal_during_the_trap_does_not_cut_its_cleanup_short(self):
+        for name in ("TERM", "INT"):
+            with self.subTest(signal=name):
+                self._clear()
+                completed, calls = self._run(RUN_STATES="0 0 0", SIGNAL=name, SIGNAL_ON_ARCHIVE_OF="t_card")
+                self.assertNotEqual(completed.returncode, 0)
+                archived = self._indices(calls, "archive t_card [archive]")
+                self.assertEqual(len(archived), 1, calls)
+                clear = self._indices(calls, "[clear pod/platform-agent-shell-0]")
+                disarm = self._indices(calls, "[disarm]")
+                self.assertEqual([len(clear), len(disarm)], [2, 1], calls)
+                self.assertLess(archived[0], clear[-1])
+                self.assertLess(clear[-1], disarm[0])
+                self.assertNotIn("Cleanup incomplete", completed.stderr)
 
     def test_every_exec_into_the_agent_bounds_its_wait_for_a_pod(self):
         completed, calls = self._run(OPEN_CARDS="", RUN_STATES="0 0 0")
@@ -688,11 +723,9 @@ class ArmDisarmTest(unittest.TestCase):
             **_IN_POD,
             "local.home": str(self._home),
             "local.state_file": str(self._home / ".bench-onboarding-jobs.json"),
-            "local.greeted": str(self._home / ".bootstrap_greeted"),
             "local.settle_wait": "1",
             "local.settle_poll": "0.1",
         }
-        self._hold = _in_pod("hold_py", values)
         self._arm = _in_pod("arm_py", values)
         self._disarm = _in_pod("disarm_py", values)
         self._greeted = self._home / ".bootstrap_greeted"
@@ -753,51 +786,11 @@ class ArmDisarmTest(unittest.TestCase):
                 out = self._py(read_state)
                 self.assertEqual((out.returncode, out.stdout.strip()), (0, answer), out.stderr)
 
-    def test_step_1_reads_the_token_as_a_leftover_and_a_plugin_marker_as_greeted(self):
+    def test_step_1_reads_a_greeted_marker_as_greeted(self):
         (self._home / ".bootstrap_scan_filed").touch()
-        read_state = self._read_state()
-        for content, answer in (("held by bench/tf/prebuilt/bootstrap-ranking", "armed"), ("", "greeted")):
-            with self.subTest(content=content):
-                self._greeted.write_text(content)
-                out = self._py(read_state)
-                self.assertEqual((out.returncode, out.stdout.strip()), (0, answer), out.stderr)
-
-    def test_hold_writes_the_token_and_disarm_removes_it_with_or_without_an_arm(self):
-        for armed in (False, True):
-            with self.subTest(armed=armed):
-                out = self._py(self._hold)
-                self.assertEqual(out.returncode, 0, out.stderr)
-                self.assertEqual(self._greeted.read_text(), "held by bench/tf/prebuilt/bootstrap-ranking")
-                if armed:
-                    self.assertEqual(self._py(self._arm).returncode, 0)
-                out = self._py(self._disarm)
-                self.assertEqual(out.returncode, 0, out.stderr)
-                self.assertIn("released", out.stdout)
-                self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
-
-    def test_hold_refuses_a_marker_it_did_not_write_and_disarm_leaves_it(self):
-        self._greeted.write_text("")
-        out = self._py(self._hold)
-        self.assertNotEqual(out.returncode, 0)
-        self.assertIn("a person has been greeted", out.stderr)
-        self.assertEqual(self._greeted.read_text(), "")
-        self.assertEqual(self._py(self._disarm).returncode, 0)
-        self.assertEqual(sorted(p.name for p in self._home.iterdir()), [".bootstrap_greeted", "cron"])
-
-    def test_hold_refuses_a_person_who_connected_after_step_1(self):
-        for connect in ("aligned", "bound"):
-            with self.subTest(connect=connect):
-                if connect == "aligned":
-                    (self._home / ".user_aligned").touch()
-                else:
-                    self._jobs([_SCAN, {**_DELIVERY, "deliver": "origin"}])
-                out = self._py(self._hold)
-                self.assertNotEqual(out.returncode, 0)
-                self.assertIn("a person connected after step 1's read", out.stderr)
-                self.assertEqual(self._py(self._disarm).returncode, 0)
-                self.assertFalse(self._greeted.exists())
-                (self._home / ".user_aligned").unlink(missing_ok=True)
-                self._jobs([_SCAN, _DELIVERY])
+        self._greeted.touch()
+        out = self._py(self._read_state())
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "greeted"), out.stderr)
 
     def test_arm_records_the_jobs_then_touches_the_marker_once(self):
         out = self._py(self._arm)
