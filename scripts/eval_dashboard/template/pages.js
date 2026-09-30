@@ -846,10 +846,13 @@ function runsListHtml(inWindow, inc, title) {
     // cases all passed, "all gate cases passed".
     if (run.cls === "deadline-kill") note = `<span class="chip inf">killed at the deadline${measured(run) ? `, ${plural((run.cases || []).length, "case")} recorded first` : ""}</span>`;
     else if (run.setup_death) note = '<span class="chip inf">died in setup</span>';
-    else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
-    // The suite's own verdict (classify.py): nothing was graded for the lost
-    // cases, so neither "all gate cases passed" nor a failure chip is true.
+    // The suite's own verdict (classify.py), cases recorded or not: nothing
+    // was graded for the lost cases, so neither "all gate cases passed" nor
+    // a failure chip is true, and a record with the field and no parsed
+    // tasks is still that verdict on the run page it links to, not "no
+    // cases recorded".
     else if (run.verdict === "not_evaluated") note = `<span class="chip inf">not evaluated · ${esc(plural((run.not_evaluated || []).length, "case"))} lost</span>`;
+    else if (!measured(run)) note = `<span class="chip inf">${run.result === "ABORTED" ? "aborted" : "no cases recorded"}</span>`;
     // A run whose every recorded case went ungraded (a storm, or every
     // worker at the delegation ceiling) passed nothing; the chips say why.
     else if (!failed.length) note = (run.cases || []).some((c) => c.outcome !== "infra") ? '<span class="chip ok">all gate cases passed</span>' : '<span class="chip inf">nothing graded</span>';

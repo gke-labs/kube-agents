@@ -1197,6 +1197,25 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('class="runrow v-not_evaluated"', index)
         self.assertIn("not evaluated · 1 case lost", index)
 
+    def test_brief_row_of_a_not_evaluated_run_with_no_tasks_says_so(self):
+        # classify_run keeps the suite's verdict for a record with the field
+        # and no parsed tasks (test_eval_dashboard_classify.py), and the run
+        # page headlines it "Not evaluated"; the Brief's row used to reach the
+        # unmeasured branch first and read "no cases recorded" under a
+        # v-not_evaluated border. The three surfaces agree.
+        data = copy.deepcopy(self.data)
+        for run in data["runs"]:
+            if str(run.get("build_id")) == NOT_EVALUATED_BUILD:
+                run["tasks"] = []
+        out = render_to(pathlib.Path(self.tmp.name) / "noteval-notasks", data, health=health_doc())
+        index = dom_text(out / "index.html")
+        row = re.search(r'<a class="runrow v-not_evaluated"[^>]*>.*?</a>', index, re.S)
+        self.assertIsNotNone(row, index[:400])
+        self.assertIn("not evaluated · 1 case lost", row.group(0))
+        self.assertNotIn("no cases recorded", row.group(0))
+        app = dom_text(out / "run.html", query=f"build={NOT_EVALUATED_BUILD}")
+        self.assertIn("Not evaluated: 1 gate case lost every repetition to infrastructure.", app)
+
     def test_pr_view_unknown_build(self):
         app = dom_text(self.run_page, query="build=1")
         self.assertIn(f"No run with that id in the last {render.RUN_VIEW_DAYS} days.", app)
