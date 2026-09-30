@@ -2,9 +2,10 @@
 
 The worker_commands verifier runs ``re.search`` on each one-line command
 summary, so these pin the task file's two patterns against summaries in that
-shape: the variable forms the skills used to teach, and commands a passing
-worker writes that only look like them: literal paths, quoted messages, test
-expressions and another tool's `exec` subcommand.
+shape: a variable run as a program, in the forms the skills used to teach and
+the other shapes the patterns name, and commands a passing worker writes that
+only look like one: literal paths, quoted messages, joined lines, a loop's
+word list, test expressions and other tools' subcommands.
 """
 
 from __future__ import annotations
@@ -76,6 +77,7 @@ def test_a_command_that_runs_no_variable_is_not_flagged():
         'if /opt/vcs/libexec/git diff --quiet; then echo "then ${SHA} done"; fi',
         'if [ ! -d "$WS" -o -f "$WS" ]; then echo x; fi',
         '[ ! "$N" -gt 0 ]',
+        '[ ! "$FORCE" -a -f "$LOCK" ]',
         'test ! -e "$P" -a -d "$D"',
         '[[ -n "$A" && ! "$N" -gt 0 ]]',
         "if [[ $A == x || ! $B -ge 3 ]]; then :; fi",

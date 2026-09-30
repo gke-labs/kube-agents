@@ -78,7 +78,7 @@ class SkillCommandsTest(unittest.TestCase):
             with self.subTest(command):
                 self.assertTrue(any(pattern.search(command) for pattern in PATTERNS))
 
-    def test_a_literal_program_is_not_caught(self):
+    def test_a_command_that_runs_no_variable_is_not_caught(self):
         for command in (
             "./skills/submit-suggestion/scripts/submit_suggestion.py prepare \\",
             'V="$HERMES_HOME"/skills/version-control/scripts/vcs.py',
@@ -93,7 +93,9 @@ class SkillCommandsTest(unittest.TestCase):
             '[[ -n "$A" && ! "$N" -gt 0 ]]',
             '[[ -n "$A" && "$B" == x ]]',
             '[[ -n "$A" || "$B" != x ]]',
+            '[[ -n "$A" && "$B" = x ]]',
             '[[ -n "$A" && ! "$B" ]]',
+            '[[ -n "$A" && ! -f "$X" ]]',
             'test -n "$A" && ! -d "$WS" -o "$X" y',
         ):
             with self.subTest(command):

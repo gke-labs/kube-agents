@@ -8,7 +8,8 @@ The image build's deploy/docker/check_skill_commands.py runs the fenced shell
 blocks through that scanner but not inline code, most of which is JSON, report
 templates or fragments the scanner cannot rate. This reads the inline code of
 the same three skill trees for the variable forms the skills used to teach: a
-variable as the program, or a script run by a path that starts with one.
+variable as the program, a script run by a path that starts with one, or the
+path of git or `submit_suggestion.py` put in a variable.
 """
 
 import re
@@ -92,7 +93,7 @@ class SkillInlineCommandsTest(unittest.TestCase):
         ]
         self.assertEqual([], found)
 
-    def test_the_forms_the_skills_taught_are_caught(self):
+    def test_a_variable_program_is_caught(self):
         for span in (
             "$G add <path>",
             '$G add config/manifest.yaml && $G commit -m "feat: x"',
@@ -117,7 +118,7 @@ class SkillInlineCommandsTest(unittest.TestCase):
             with self.subTest(span):
                 self.assertTrue(refused(span))
 
-    def test_a_path_or_a_captured_output_is_not_caught(self):
+    def test_a_command_that_runs_no_variable_is_not_caught(self):
         for span in (
             "/opt/vcs/libexec/git add <path>",
             "$HERMES_HOME/skills",

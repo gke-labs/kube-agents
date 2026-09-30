@@ -34,9 +34,10 @@ holds, as a terminal command that long would be; the report prints Tirith's
 finding titles so that reads as "split the block". Unlabelled blocks and inline
 code are not read: in the skills they hold tool calls, report templates and
 program output as often as commands. ``tests/test_skill_inline_commands.py``
-checks inline code for the variable program, or the script path starting with
-a variable, that the skills used to teach. The Dockerfile names the agent
-image's three trees; a plugin's skills ship in its own image and are not read.
+checks inline code for the forms the skills used to teach: a variable as the
+program, a script path starting with a variable, and a program's path put in
+a variable. The Dockerfile names the agent image's three trees; a plugin's
+skills ship in its own image and are not read.
 A tree with no shell block fails the check, and so do two trees where one path
 is, or holds, the other: an empty copy, or a path repeated from another tree in
 the Dockerfile, would otherwise pass a tree with nothing read.

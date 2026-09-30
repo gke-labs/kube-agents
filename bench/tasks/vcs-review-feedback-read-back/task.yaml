@@ -176,7 +176,7 @@ verification_spec:
       # starts with `time`. It may not start there with a wrapper, since
       # `exec` and `env` are also other tools' subcommands
       # (`kubectl exec "$POD" -n ns`), or with a `!`, which there is more
-      # often a test's negation, `[ ! "$N" -gt 0 ]`.
+      # often a test's negation, `[ ! "$FORCE" -a -f "$LOCK" ]`.
       # What follows it is a listed git subcommand, `submit_suggestion.py`'s
       # `prepare` or `submit`, or a flag (`$G -C dir`): any word would also
       # match a variable inside a quoted message, `"done; ${SHA} pushed"`.
