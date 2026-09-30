@@ -660,6 +660,34 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(boskos.released, [P7], "acquired, then given back")
         self.assertEqual(tofu.calls, [], "never applied")
 
+    def test_a_second_termination_during_the_release_after_one_in_the_acquire_still_releases(self):
+        # The first signal lands during the acquire and is raised by the
+        # unblock; the release that follows must still run under held signals,
+        # so a second signal during it is deferred rather than skipping it.
+        seen = []
+
+        class _Boskos_two_signals(_Boskos):
+            def __call__(self, request, timeout=None):
+                if "/release?" in request.full_url:
+                    seen.append(signal.getsignal(signal.SIGINT))
+                    os.kill(os.getpid(), signal.SIGINT)
+                out = super().__call__(request, timeout)
+                if "/acquirebystate?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return out
+
+        boskos = _Boskos_two_signals(free=[P7])
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(boskos_pool, "pause", lambda s: None):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertEqual(boskos.released, [P7], "the release ran despite the second signal")
+        self.assertEqual(seen, [boskos_pool._defer], "the release ran under held signals")
+        self.assertEqual(boskos_pool._HOLD_DEPTH, 0)
+
     def test_a_termination_as_the_release_arms_its_deferral_still_releases(self):
         # The moment between the hold's finally starting and its handlers
         # being held: a signal there is raised out of the swap, and the

@@ -278,8 +278,11 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
                 thread = threading.Thread(target=_heartbeat, args=(server, owner, hold_state, name, stop), daemon=True)
                 thread.start()
                 beater = thread
-            _hold_signals(False)
+            # Marked before the unblock: the unblock gives the hold up (it
+            # decrements) before it can raise a deferred termination, and the
+            # release after that raise must still run under held signals.
             unblocked = True
+            _hold_signals(False)
             return visit(name)
         finally:
             # A termination raised out of the swap below (a signal in the

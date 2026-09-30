@@ -713,7 +713,7 @@ def main(argv=None):
         code, error = _run(args, run)
         return code
     except Terminated as exc:
-        error = "terminated (%s); held projects were released" % exc
+        error = "terminated (%s); held projects were released unless named above" % exc
         print("ERROR: %s" % error, file=sys.stderr)
         code = TERMINATED_EXIT_CODE
         return code

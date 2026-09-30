@@ -587,7 +587,7 @@ def _run(args, outcomes, error):
         # in included; the summary says how far the run got.
         report(outcomes)
         interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
-        message = "terminated (%s) after %d project(s)%s; held projects were released" % (
+        message = "terminated (%s) after %d project(s)%s; held projects were released unless named above" % (
             exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
         )
         error.append(message)
