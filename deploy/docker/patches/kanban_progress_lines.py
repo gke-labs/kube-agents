@@ -366,9 +366,9 @@ async def deliver(
     last line rather than the whole trail. And a failure the creator's wake will
     explain is held rather than posted, returning ``None`` like the replay path;
     the notifier's wake step drops it once the wake is admitted for the kind, and
-    posts it if the wake raises or never covers the kind, so the thread gets the
-    failure at least once. A line that cannot be held is posted. See section 6
-    of ``gateway/kanban_notifier.py``.
+    posts it if the wake raises or never covers the kind, so a failed wake does
+    not leave the failure untold. A line that cannot be held is posted. Section 6
+    of ``gateway/kanban_notifier.py`` has the retry and the gap it leaves.
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
