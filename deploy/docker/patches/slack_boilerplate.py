@@ -47,6 +47,17 @@ restarted successfully.`` to the chat that asked for the restart and ``♻️
 Gateway online — Hermes is back and ready.`` to the home channel, are not sent
 to Slack at all: ``drop_notice`` gates both call sites. Text this module does
 not recognise, a later upstream rewording included, passes through unchanged.
+
+**The rest of the gateway's system replies.** Busy acks, drain and restart
+refusals, the force-stop reply, the background-task update and the provider
+authentication failure reach Slack through ``SlackAdapter.send``, which passes
+them through ``system_text``: each known one is reworded in plain voice, with
+no emoji, no "Gateway" or "agent", no tool name or iteration count, and no
+exception text (that one is logged instead). Two go entirely: the one-time
+busy-input hint about Hermes' queue/interrupt setting is not appended on Slack
+(so it is not marked seen either, and another platform still gets it), and
+the session-database warnings with their ``hermes doctor`` commands are not
+broadcast to a Slack home channel; the gateway already logs the failure.
 """
 
 from __future__ import annotations
@@ -102,6 +113,42 @@ CRON_INTERRUPTED_REWORD = (
     "so there's no result from this run."
 )
 CRON_INTERRUPTED_WHY = {"restarting": "restarting", "shutting down": "going offline"}
+
+#: ``_status_action_gerund()``'s values, as the drain replies say them on Slack.
+DRAIN_WHO = {"restarting": "I'm restarting", "shutting down": "I'm going offline for a moment"}
+
+#: The gateway's other system replies, each matched whole, and what Slack is
+#: sent instead. A callable gets the match; a string is sent as it stands.
+SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
+    (re.compile(r"⏳ Queued for the next turn(?: \([^\n]*\))?\. I'll respond once the current task finishes\."),
+     "Got it — I'll pick this up when I finish the current one."),
+    (re.compile(r"⚡ Interrupting current task(?: \([^\n]*\))?\. I'll respond to your message shortly\."),
+     "Stopping what I was doing to look at this."),
+    (re.compile(r"⏳ Gateway (?P<action>restarting|shutting down) — queued for the next turn after it comes back\."),
+     lambda m: f"{DRAIN_WHO[m['action']]} — I'll pick this up when I'm back."),
+    (re.compile(r"⏳ Gateway is (?P<action>restarting|shutting down) and is not accepting "
+                r"(?:another turn|new work) right now\."),
+     lambda m: f"{DRAIN_WHO[m['action']]} — send that again in a minute."),
+    (re.compile(r"⏳ This agent is draining for a maintenance action and isn't accepting new turns right now\. "
+                r"It'll be back in a moment — please resend shortly\."),
+     "I'm finishing some maintenance — try again in a minute."),
+    (re.compile(r"⏳ Another turn is still running on this session\. To protect the transcript, this message "
+                r"was not processed\. Wait for the active turn to finish, then resend it\."),
+     "Still working on your last message — send this again once I've answered."),
+    (re.compile(r"⚡ Force-stopped\. The agent was still starting — session unlocked\."),
+     "Stopped."),
+    (re.compile(r"⏳ Background task still running(?: — (?P<cmd>`[^\n]*`))?(?P<rest>\n\nRecent output:\n.*)?",
+                re.DOTALL),
+     lambda m: (f"Still running {m['cmd']}." if m["cmd"] else "Still running.") + (m["rest"] or "")),
+    (re.compile(r"⚠️ Provider authentication failed: (?P<error>.*)", re.DOTALL),
+     lambda m: _logged_auth_failure(m["error"])),
+    (re.compile(r"⚠️ Provider authentication failed\. Check the configured credentials; "
+                r"raw provider details are in the gateway logs\."),
+     lambda m: AUTH_FAILED),
+)
+
+#: What Slack is told when the model provider refuses the turn's credentials.
+AUTH_FAILED = "I can't reach the model right now (authentication failed)."
 
 _warned_missing = False
 
@@ -167,6 +214,26 @@ def long_running_mode(source: Any, mode: str, metadata: Any = None) -> str:
 def drop_notice(platform: Any) -> bool:
     """Whether a back-online notice to ``platform`` is skipped: Slack, with the flag on."""
     return _platform_name(platform) == PLATFORM and enabled()
+
+
+def _logged_auth_failure(error: str) -> str:
+    logger.warning("slack_boilerplate: provider authentication failed (not shown on Slack): %s", error)
+    return AUTH_FAILED
+
+
+def system_text(text: Any) -> Any:
+    """A gateway system reply as the Slack adapter sends it: reworded when known.
+
+    Called from ``SlackAdapter.send`` only, so the platform is always Slack.
+    Flag off, or for any text not matched whole, the input object comes back.
+    """
+    if not isinstance(text, str) or not enabled():
+        return text
+    for pattern, reword in SYSTEM_REWORDS:
+        match = pattern.fullmatch(text)
+        if match:
+            return reword(match) if callable(reword) else reword
+    return text
 
 
 def notice_text(platform: Any, text: str) -> str:

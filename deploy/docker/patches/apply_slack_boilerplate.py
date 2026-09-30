@@ -2,7 +2,7 @@
 """Wire gateway/slack_boilerplate.py into the cron delivery, the heartbeat and the notices.
 
 Run by ``deploy/docker/Dockerfile`` against the Hermes tree, after
-``slack_boilerplate.py`` has been copied to ``gateway/``. Four files:
+``slack_boilerplate.py`` has been copied to ``gateway/``. Six files:
 
 ``cron/scheduler_delivery.py``: ``_deliver_result`` imports the module beside
 its own ``BasePlatformAdapter`` import, and each target's two send lanes take
@@ -20,8 +20,19 @@ shutdown notice and the interrupted-cron-job notice, sends ``notice_text(...)``.
 ``gateway/run_notifications.py``: the post-restart notice returns before its
 send when ``drop_notice`` says so (the ``finally`` still unlinks the marker),
 and the home-channel startup loop skips the channel before calling
-``_send_home_channel_message``. The helper itself is untouched, since the
-session-database warnings share it.
+``_send_home_channel_message``. The helper itself is untouched; the
+session-database warnings, which share it, skip a Slack home channel the same
+way in their own loop.
+
+``gateway/run_busy.py``: the one-time busy-input onboarding hint is neither
+appended nor marked seen when ``drop_notice`` says the busy message came from
+Slack.
+
+``plugins/platforms/slack/adapter.py``: ``SlackAdapter.send`` passes its
+content through ``system_text`` once the DM target is resolved, the one place
+every busy ack, drain refusal, background-task update and provider
+authentication failure passes on the way to Slack. Runs after
+``apply_slack_ux_reactions.py``, which leaves ``send`` alone.
 
 With the flag off every helper returns its input unchanged, so the calls are
 upstream's. What the flag changes, and why, is in the module docstring of
@@ -137,6 +148,47 @@ STARTUP_PATCHED = (
     "                continue\n"
 ) + STARTUP_ANCHOR
 
+SESSION_DB_ANCHOR = (
+    "        for platform, _platform_cfg, home, transport in self._home_channel_transports():\n"
+    "            await self._send_home_channel_message(\n"
+    '                platform, home, transport, message, "state.db warning notification failed for %s:%s: %s",\n'
+)
+SESSION_DB_PATCHED = (
+    "        for platform, _platform_cfg, home, transport in self._home_channel_transports():\n"
+    "            # kube-agents patch: KAGE_SLACK_UX keeps this warning off Slack (it is\n"
+    "            # logged above); see gateway/slack_boilerplate.py.\n"
+    "            if _kage_slack_boilerplate.drop_notice(platform):\n"
+    '                logger.info("state.db warning to %s not sent: KAGE_SLACK_UX", platform.value)\n'
+    "                continue\n"
+    "            await self._send_home_channel_message(\n"
+    '                platform, home, transport, message, "state.db warning notification failed for %s:%s: %s",\n'
+)
+
+RUN_BUSY = "gateway/run_busy.py"
+
+BUSY_HINT_ANCHOR = "            if not is_seen(_load_gateway_config(), BUSY_INPUT_FLAG):\n"
+BUSY_HINT_PATCHED = (
+    "            # kube-agents patch: KAGE_SLACK_UX leaves the hint off Slack; see\n"
+    "            # gateway/slack_boilerplate.py.\n"
+    "            if not is_seen(_load_gateway_config(), BUSY_INPUT_FLAG) and not (\n"
+    "                    _kage_slack_boilerplate.drop_notice(event.source.platform)):\n"
+)
+
+SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
+
+SLACK_SEND_ANCHOR = (
+    '        """Send a message to a Slack channel or DM."""\n'
+    '        blocked = self._outbound_blocked(chat_id, "outbound generic send to")\n'
+    "        if blocked:\n"
+    "            return blocked\n"
+    "        chat_id = await self._dm_target(chat_id, metadata)\n"
+)
+SLACK_SEND_PATCHED = SLACK_SEND_ANCHOR + (
+    "        # kube-agents patch: KAGE_SLACK_UX rewords the gateway's system replies;\n"
+    "        # see gateway/slack_boilerplate.py. Off, this is content.\n"
+    "        content = _kage_slack_boilerplate.system_text(content)\n"
+)
+
 
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
@@ -159,12 +211,25 @@ def apply(root: Path) -> None:
     run_notifications.refuse_if_patched(BUILD_MARKER)
     run_notifications.substitute(RESTARTED_ANCHOR, RESTARTED_PATCHED, label="post-restart notice")
     run_notifications.substitute(STARTUP_ANCHOR, STARTUP_PATCHED, label="home-channel startup loop")
+    run_notifications.substitute(SESSION_DB_ANCHOR, SESSION_DB_PATCHED, label="state.db warning loop")
     run_notifications.append(GATEWAY_IMPORT)
+
+    run_busy = patchlib.Patch(root, RUN_BUSY, prefix=PREFIX)
+    run_busy.refuse_if_patched(BUILD_MARKER)
+    run_busy.substitute(BUSY_HINT_ANCHOR, BUSY_HINT_PATCHED, label="busy-input onboarding hint")
+    run_busy.append(GATEWAY_IMPORT)
+
+    slack_adapter = patchlib.Patch(root, SLACK_ADAPTER, prefix=PREFIX)
+    slack_adapter.refuse_if_patched(BUILD_MARKER)
+    slack_adapter.substitute(SLACK_SEND_ANCHOR, SLACK_SEND_PATCHED, label="SlackAdapter.send")
+    slack_adapter.append(GATEWAY_IMPORT)
 
     delivery.commit("2 anchors")
     run_turn.commit("1 anchor, 1 import")
     run_shutdown.commit("1 anchor, 1 import")
-    run_notifications.commit("2 anchors, 1 import")
+    run_notifications.commit("3 anchors, 1 import")
+    run_busy.commit("1 anchor, 1 import")
+    slack_adapter.commit("1 anchor, 1 import")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Run by ``deploy/docker/Dockerfile`` against the patched ``/opt/hermes`` tree,
 after ``apply_slack_boilerplate.py``, with ``slack_presenter.py`` staged beside
 this script.
 
-Three things are checked:
+Four things are checked:
 
 1. The call sites. Both cron send lanes take ``target_text``, bound from
    ``cron_delivery_text`` over the unwrapped ``content`` and the wrapped
@@ -15,13 +15,22 @@ Three things are checked:
    send goes through ``notice_text``. The post-restart send and the
    home-channel startup send each sit behind a ``drop_notice`` guard that
    returns or continues first, and ``_send_home_channel_message``, which the
-   session-database warnings share, carries no guard.
+   session-database warnings share, carries no guard; their own loop does. The
+   busy-input onboarding hint is gated on ``drop_notice``, and
+   ``SlackAdapter.send`` passes its content through ``system_text`` once the
+   DM target is resolved.
 2. The notices themselves. Each interrupting notice is read out of the patched
    source, rendered, and handed to the runtime: on Slack with the flag on it
    must come back reworded. ``notice_text`` passes text it does not recognise
    through unchanged, so an upstream rewording would otherwise put Hermes'
    wording back on Slack with nothing failing.
-3. The runtime module, loaded by path: on Slack with the flag on,
+3. The other system replies, rendered from the patched source the same way:
+   the busy acks, the drain and restart refusals, the force-stop reply, the
+   background-task update and both provider authentication failures. With the
+   flag on, ``system_text`` must reword every one, with no emoji, "Gateway",
+   "agent" or exception text left; ``system_text`` passes unrecognised text
+   through, so this is what catches an upstream rewording.
+4. The runtime module, loaded by path: on Slack with the flag on,
    ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
    off, and for any platform other than Slack, every helper returns its input
    and ``drop_notice`` is false.
@@ -63,6 +72,43 @@ HOME_CHANNEL_FN = "_send_home_channel_message"
 STARTUP_FN = "_send_home_channel_startup_notifications"
 STATUS_METADATA = "turn_ctx._status_thread_metadata"
 THREAD_METADATA = {"thread_id": "1700000000.000100"}
+
+SESSION_DB_FN = "_send_session_db_warning_notifications"
+
+RUN_BUSY = "gateway/run_busy.py"
+BUSY_ACK_FN = "_compose_busy_ack_message"
+BUSY_HINT = "busy_input_hint_gateway"
+BUSY_HEADS = ("⏳ Queued for the next turn", "⚡ Interrupting current task")
+BUSY_DETAILS = ("", " (3 min elapsed, running: terminal)")
+DRAIN_FN = "_send_busy_drain_notice"
+
+RUN_INBOUND = "gateway/run_inbound.py"
+RUN_TURN_RUNNER = "gateway/run_turn_runner.py"
+RUN = "gateway/run.py"
+BACKGROUND_FN = "_format_process_running_message"
+BACKGROUND_CMDS = ("make build", "")
+BACKGROUND_OUTPUTS = ("", "step 3/9")
+AUTH_PREFIX = "⚠️ Provider authentication failed"
+#: Stands in for the provider exception; Slack must never see it.
+AUTH_ERROR = "401 stand-in provider error"
+
+SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
+SLACK_CLASS = "SlackAdapter"
+
+#: (file, literal prefix, how many literals or f-strings carry it) for the
+#: replies read straight out of a module; ``self._status_action_gerund()`` is
+#: rendered for each of CRON_ACTIONS.
+SYSTEM_LITERALS = (
+    (RUN_BUSY, "⏳ Gateway", 2),
+    (RUN_INBOUND, "⏳ Gateway", 3),
+    (RUN_INBOUND, "⏳ This agent is draining", 1),
+    (RUN_INBOUND, "⏳ Another turn is still running", 1),
+    (RUN_INBOUND, "⚡ Force-stopped", 1),
+    (RUN_TURN_RUNNER, AUTH_PREFIX, 1),
+    (RUN, AUTH_PREFIX, 1),
+)
+#: Left on a reworded reply, any of these means the rewording missed.
+SYSTEM_LEFTOVERS = ("⏳", "⚡", "⚠️", "Gateway", "agent", AUTH_ERROR)
 
 #: Stands in for the names the interrupted-cron-job notice interpolates.
 CRON_JOB_NAME = "inventory"
@@ -234,6 +280,95 @@ def check_notices(root: Path) -> list[str]:
     return notices
 
 
+def _render(node: ast.expr, relative: str, env: dict) -> str:
+    return eval(compile(ast.Expression(body=node), relative, "eval"), {}, env)
+
+
+def _leading_text(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr) and node.values and isinstance(node.values[0], ast.Constant):
+        return node.values[0].value
+    return None
+
+
+def check_system(root: Path) -> list[str]:
+    """Check the system-reply call sites; return every such reply rendered from source."""
+    replies: list[str] = []
+    for relative, prefix, expected in SYSTEM_LITERALS:
+        tree = _tree(root, relative)
+        pieces = {id(part) for node in ast.walk(tree) if isinstance(node, ast.JoinedStr) for part in node.values}
+        nodes = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant | ast.JoinedStr) and id(node) not in pieces
+            and (_leading_text(node) or "").startswith(prefix)
+        ]
+        if len(nodes) != expected:
+            raise _fail(f"{relative} has {len(nodes)} replies starting {prefix!r}, expected {expected}")
+        for node, action in itertools.product(nodes, CRON_ACTIONS):
+            self = SimpleNamespace(_status_action_gerund=lambda action=action: action)
+            replies.append(_render(node, relative, {"self": self, "exc": AUTH_ERROR}))
+
+    tree = _tree(root, RUN_BUSY)
+    if not _binds_alias(tree):
+        raise _fail(f"{RUN_BUSY} does not import gateway.slack_boilerplate as {ALIAS}")
+    compose = _function(tree, BUSY_ACK_FN, RUN_BUSY)
+    heads = {
+        node.value.elts[0].value: node.value.elts[1].value for node in ast.walk(compose)
+        if isinstance(node, ast.Assign) and _names(node.targets) == ["(head, tail)"]
+        and isinstance(node.value, ast.Tuple) and all(isinstance(e, ast.Constant) for e in node.value.elts)
+    }
+    for head in BUSY_HEADS:
+        if head not in heads:
+            raise _fail(f"{BUSY_ACK_FN}() no longer builds the {head!r} ack")
+        replies.extend(f"{head}{detail}{heads[head]}" for detail in BUSY_DETAILS)
+    if not any(
+        isinstance(node, ast.If) and BUSY_HINT in ast.unparse(node)
+        and "is_seen(" in ast.unparse(node.test)
+        and f"{ALIAS}.drop_notice(event.source.platform)" in ast.unparse(node.test)
+        for node in ast.walk(compose)
+    ):
+        raise _fail(f"{BUSY_ACK_FN}() appends the busy-input hint without checking drop_notice")
+
+    tree = _tree(root, RUN_NOTIFICATIONS)
+    background = _function(tree, BACKGROUND_FN, RUN_NOTIFICATIONS)
+    header = _strings(background, "header")
+    ret = [node.value for node in ast.walk(background) if isinstance(node, ast.Return)]
+    if len(header) != 1 or len(ret) != 1:
+        raise _fail(f"{BACKGROUND_FN}() no longer builds one header and returns once")
+    for cmd, output in itertools.product(BACKGROUND_CMDS, BACKGROUND_OUTPUTS):
+        env = {"header": _render(header[0], RUN_NOTIFICATIONS, {"short_cmd": cmd}), "new_output": output}
+        replies.append(_render(ret[0], RUN_NOTIFICATIONS, env))
+    warnings = _function(tree, SESSION_DB_FN, RUN_NOTIFICATIONS)
+    warning_sends = [
+        node.lineno for node in ast.walk(warnings)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == f"self.{HOME_CHANNEL_FN}"
+    ]
+    if len(warning_sends) != 1:
+        raise _fail(f"{SESSION_DB_FN}() calls {HOME_CHANNEL_FN}() {len(warning_sends)} times, expected 1")
+    if _guard_line(warnings, ast.Continue) > warning_sends[0]:
+        raise _fail(f"{SESSION_DB_FN}() checks drop_notice after the warning is sent")
+
+    tree = _tree(root, SLACK_ADAPTER)
+    if not _binds_alias(tree):
+        raise _fail(f"{SLACK_ADAPTER} does not import gateway.slack_boilerplate as {ALIAS}")
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == SLACK_CLASS]
+    sends = [
+        node for cls in classes for node in cls.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "send"
+    ]
+    if len(sends) != 1:
+        raise _fail(f"{SLACK_ADAPTER} has {len(sends)} {SLACK_CLASS}.send methods, expected 1")
+    if not any(
+        isinstance(first, ast.Assign) and _names(first.targets) == ["chat_id"] and "_dm_target" in ast.unparse(first)
+        and isinstance(second, ast.Assign) and _names(second.targets) == ["content"]
+        and _is_helper(second.value, "system_text") and _names(second.value.args) == ["content"]
+        for first, second in itertools.pairwise(sends[0].body)
+    ):
+        raise _fail(f"{SLACK_CLASS}.send does not pass content through system_text after _dm_target")
+    return replies
+
+
 def _load_runtime(root: Path):
     path = root / RUNTIME
     if not path.is_file():
@@ -246,7 +381,7 @@ def _load_runtime(root: Path):
     return module
 
 
-def drive(module, notices: list[str]) -> None:
+def drive(module, notices: list[str], replies: list[str]) -> None:
     def extract_media(text):
         return [], text
 
@@ -283,6 +418,12 @@ def drive(module, notices: list[str]) -> None:
                     raise _fail(f"notice_text left the Slack notice {notice!r} as {out!r}")
                 if not reworded and out != notice:
                     raise _fail(f"notice_text changed {notice!r} for {platform} with the flag {'on' if on else 'off'}")
+        for reply in replies:
+            out = module.system_text(reply)
+            if on and (out == reply or any(word in out for word in SYSTEM_LEFTOVERS)):
+                raise _fail(f"system_text left the Slack reply {reply!r} as {out!r}")
+            if not on and out is not reply:
+                raise _fail(f"system_text changed {reply!r} with the flag off")
     os.environ.pop(FLAG_ENV, None)
 
 
@@ -290,11 +431,13 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_delivery(root)
     check_heartbeat(root)
     notices = check_notices(root)
-    drive(_load_runtime(root), notices)
+    replies = check_system(root)
+    drive(_load_runtime(root), notices, replies)
     print(
         "slack_boilerplate verify: Slack cron targets send the unwrapped report, the heartbeat "
         f"drops under the status line and goes generic elsewhere on Slack, {len(notices)} interrupting "
-        "notices reworded and both back-online notices skipped on Slack; "
+        f"notices and {len(replies)} system replies reworded, and both back-online notices, the "
+        "session-database warnings and the busy-input hint kept off Slack; "
         "flag off and every other platform unchanged"
     )
 

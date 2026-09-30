@@ -3,12 +3,13 @@
 Run: python3 -m pytest deploy/docker/patches/test_slack_boilerplate.py
 
 The fixtures carry upstream's call sites verbatim (v2026.9.14) inside trimmed
-stand-ins for the four files: the cron wrapper and the per-target send lanes,
-the heartbeat's mode read, the notice send, the lifecycle notices and the
-home-channel startup loop. The
-tests apply the patch, exec the patched and unpatched fixtures, and compare
-what each sends: with the flag off, or for any platform but Slack, the two
-must be identical.
+stand-ins for the patched files: the cron wrapper and the per-target send
+lanes, the heartbeat's mode read, the notice send, the lifecycle notices, the
+home-channel startup and session-database loops, the busy acks with their
+onboarding hint, the Slack adapter's send, and the system replies the verifier
+reads out of source. The tests apply the patch, exec the patched and unpatched
+fixtures, and compare what each sends: with the flag off, or for any platform
+but Slack, the two must be identical.
 """
 
 import asyncio
@@ -201,6 +202,194 @@ class GatewayNotificationsMixin:
             ):
                 delivered.add(target)
         return delivered
+
+    async def _send_session_db_warning_notifications(self) -> None:
+        error = self._session_db_init_error
+        if not error:
+            return
+        message = (
+            f"⚠️ Session database unavailable — messages may not be persisted. "
+            f"{error}\\nRun `hermes doctor` for diagnostics."
+        )
+        logger.warning("Broadcasting state.db failure warning to home channels: %s", error)
+        for platform, _platform_cfg, home, transport in self._home_channel_transports():
+            await self._send_home_channel_message(
+                platform, home, transport, message, "state.db warning notification failed for %s:%s: %s",
+            )
+
+    def _format_process_running_message(self, session) -> str:
+        new_output = self._redacted_output_tail(session, 500)
+        short_cmd = getattr(session, "command", "") or ""
+        header = "⏳ Background task still running" + (f" — `{short_cmd}`" if short_cmd else "")
+        return f"{header}\\n\\nRecent output:\\n```\\n{new_output.strip()}\\n```" if new_output.strip() else header
+'''
+
+RUN_BUSY = '''\
+"""Fixture standing in for gateway/run_busy.py."""
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+_hermes_home = Path("/tmp/hermes-fixture")
+
+
+def _load_gateway_config():
+    return {}
+
+
+class GatewayBusyMixin:
+    _BUSY_DEMOTED_TAIL = ". Your message is queued."
+
+    async def _send_busy_drain_notice(self, event, session_key: str, effective_mode: str) -> None:
+        """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
+        adapter = self._adapter_for_source(event.source)
+        if not adapter:
+            return
+        if self._queue_during_drain_enabled(effective_mode):
+            self._queue_or_replace_pending_event(session_key, event)
+            message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+        else:
+            message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+        await self._send_busy_reply(event, adapter, message)
+
+    def _compose_busy_ack_message(self, event, status_parts, *, is_queue_mode):
+        is_steer_mode = is_redirect_mode = demoted_for_subagents = demoted_for_compression = False
+        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+        if is_steer_mode:
+            head, tail = "⏩ Steered into current run", ". Your message arrives after the next tool call."
+        elif is_redirect_mode:
+            head, tail = "↪ Redirected current run", ". I'll adjust using your correction."
+        elif is_queue_mode and demoted_for_subagents:
+            # Explain the demotion: the follow-up didn't kill the subagent; /stop is the escape hatch.
+            head, tail = "⏳ Subagent working", self._BUSY_DEMOTED_TAIL
+        elif is_queue_mode and demoted_for_compression:
+            head, tail = "⏳ Compressing context", self._BUSY_DEMOTED_TAIL
+        elif is_queue_mode:
+            head, tail = "⏳ Queued for the next turn", ". I'll respond once the current task finishes."
+        else:
+            head, tail = "⚡ Interrupting current task", ". I'll respond to your message shortly."
+        message = f"{head}{status_detail}{tail}"
+
+        # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).
+        try:
+            from agent.onboarding import (BUSY_INPUT_FLAG, busy_input_hint_gateway, is_seen, mark_seen)
+            if not is_seen(_load_gateway_config(), BUSY_INPUT_FLAG):
+                _hint_mode = (
+                    "steer" if is_steer_mode
+                    else "queue" if is_queue_mode
+                    else "redirect" if is_redirect_mode
+                    else "interrupt"
+                )
+                message = f"{message}\\n\\n{busy_input_hint_gateway(_hint_mode)}"
+                mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+        except Exception as _onb_err:
+            logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
+        return message
+'''
+
+ONBOARDING = '''\
+"""Fixture standing in for agent/onboarding.py."""
+BUSY_INPUT_FLAG = "busy_input"
+SEEN = []
+
+
+def is_seen(config, flag):
+    return flag in SEEN
+
+
+def mark_seen(path, flag):
+    SEEN.append(flag)
+
+
+def busy_input_hint_gateway(mode):
+    return f"Tip: set display.busy_input_mode (now {mode}) in config.yaml."
+'''
+
+RUN_INBOUND = '''\
+"""Fixture standing in for the replies in gateway/run_inbound.py."""
+
+
+class EphemeralReply(str):
+    pass
+
+
+class GatewayInboundMixin:
+    def _force_stopped(self):
+        return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
+
+    def _drain_busy(self, queue_during_drain):
+        return (
+            f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+            if queue_during_drain
+            else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+        )
+
+    def _drain_command(self, command):
+        return True, f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.", command
+
+    def _external_drain(self):
+        return (
+            "⏳ This agent is draining for a maintenance action and isn't "
+            "accepting new turns right now. It'll be back in a moment — "
+            "please resend shortly."
+        )
+
+    def _transcript_busy(self):
+        return (
+            "⏳ Another turn is still running on this session. To "
+            "protect the transcript, this message was not processed. "
+            "Wait for the active turn to finish, then resend it."
+        )
+'''
+
+RUN_TURN_RUNNER = '''\
+"""Fixture standing in for gateway/run_turn_runner.py."""
+
+
+def _auth_failed(exc):
+    return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+'''
+
+RUN = '''\
+"""Fixture standing in for gateway/run.py."""
+
+
+def _non_conversational_metadata(metadata, platform=None):
+    return metadata
+
+
+_PROVIDER_ERROR_REPLIES = (
+    (None, "⚠️ Provider authentication failed. Check the configured credentials; "
+           "raw provider details are in the gateway logs."),
+)
+'''
+
+SLACK_ADAPTER = '''\
+"""Fixture standing in for plugins/platforms/slack/adapter.py."""
+from typing import Any, Dict, Optional
+
+
+class SlackAdapter:
+    def __init__(self):
+        self.sent = []
+
+    def _outbound_blocked(self, chat_id, what):
+        return None
+
+    async def _dm_target(self, chat_id, metadata):
+        return chat_id
+
+    async def send(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None):
+        """Send a message to a Slack channel or DM."""
+        blocked = self._outbound_blocked(chat_id, "outbound generic send to")
+        if blocked:
+            return blocked
+        chat_id = await self._dm_target(chat_id, metadata)
+        thread_ts = None
+        self.sent.append(content)
+        return thread_ts
 '''
 
 FIXTURES = {
@@ -208,9 +397,15 @@ FIXTURES = {
     applier.RUN_TURN: RUN_TURN,
     applier.RUN_SHUTDOWN: RUN_SHUTDOWN,
     applier.RUN_NOTIFICATIONS: RUN_NOTIFICATIONS,
+    applier.RUN_BUSY: RUN_BUSY,
+    applier.SLACK_ADAPTER: SLACK_ADAPTER,
+    verifier.RUN_INBOUND: RUN_INBOUND,
+    verifier.RUN_TURN_RUNNER: RUN_TURN_RUNNER,
+    verifier.RUN: RUN,
     "gateway/platforms/base.py": PLATFORMS_BASE,
-    "gateway/run.py": "def _non_conversational_metadata(metadata, platform=None):\n    return metadata\n",
+    "agent/onboarding.py": ONBOARDING,
 }
+PACKAGES = ("gateway", "gateway/platforms", "agent", "plugins", "plugins/platforms", "plugins/platforms/slack")
 
 REPORT = "Your fleet: 3 clusters, all healthy."
 FLAG_ON = {"KAGE_SLACK_UX": "1"}
@@ -229,7 +424,8 @@ class _Root:
             path = self.dir / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        for package in ("gateway", "gateway/platforms"):
+        for package in PACKAGES:
+            (self.dir / package).mkdir(parents=True, exist_ok=True)
             (self.dir / package / "__init__.py").write_text("")
         shutil.copy(HERE / "slack_boilerplate.py", self.dir / "gateway" / "slack_boilerplate.py")
         # On the path for the root's lifetime: the delivery fixture imports
@@ -239,7 +435,7 @@ class _Root:
 
     @staticmethod
     def _forget_gateway():
-        for module in [m for m in sys.modules if m == "gateway" or m.startswith("gateway.")]:
+        for module in [m for m in sys.modules if m.partition(".")[0] in ("gateway", "agent")]:
             sys.modules.pop(module)
 
     def load(self, relative, name):
@@ -287,7 +483,10 @@ class ApplierTest(unittest.TestCase):
 
     def test_applies_once(self):
         applier.apply(self.root.dir)
-        for relative in (applier.DELIVERY, applier.RUN_TURN, applier.RUN_SHUTDOWN, applier.RUN_NOTIFICATIONS):
+        for relative in (
+            applier.DELIVERY, applier.RUN_TURN, applier.RUN_SHUTDOWN, applier.RUN_NOTIFICATIONS,
+            applier.RUN_BUSY, applier.SLACK_ADAPTER,
+        ):
             self.assertIn(applier.BUILD_MARKER, (self.root.dir / relative).read_text())
         with self.assertRaises(SystemExit):
             applier.apply(self.root.dir)
@@ -337,6 +536,31 @@ class ApplierTest(unittest.TestCase):
                     verifier.main(self.root.dir)
                 self.assertIn("drop_notice(platform) guards", str(caught.exception))
         path.write_text(patched)
+        verifier.main(self.root.dir)
+
+    def test_verifier_refuses_a_reworded_upstream_system_reply(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / verifier.RUN_INBOUND
+        path.write_text(path.read_text().replace("please resend shortly", "please retry"))
+        with self.assertRaises(SystemExit) as caught:
+            verifier.main(self.root.dir)
+        self.assertIn("please retry", str(caught.exception))
+
+    def test_verifier_refuses_a_system_reply_or_hint_reaching_slack_unfiltered(self):
+        applier.apply(self.root.dir)
+        for relative, old, new, expected in (
+            (applier.SLACK_ADAPTER, applier.SLACK_SEND_PATCHED, applier.SLACK_SEND_ANCHOR, "system_text"),
+            (applier.RUN_BUSY, applier.BUSY_HINT_PATCHED, applier.BUSY_HINT_ANCHOR, "busy-input hint"),
+            (applier.RUN_NOTIFICATIONS, applier.SESSION_DB_PATCHED, applier.SESSION_DB_ANCHOR, "_send_session_db"),
+        ):
+            with self.subTest(relative=relative):
+                path = self.root.dir / relative
+                patched = path.read_text()
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn(expected, str(caught.exception))
+                path.write_text(patched)
         verifier.main(self.root.dir)
 
     def test_verifier_refuses_a_dropped_wrapper(self):
@@ -538,6 +762,133 @@ class NoticeTest(unittest.TestCase):
         with mock.patch.dict(os.environ, FLAG_ON):
             self.assertEqual(runtime.notice_text("slack", "⚠️ Something new"), "⚠️ Something new")
             self.assertEqual(runtime.notice_text("slack", None), None)
+
+
+class SystemReplyTest(unittest.TestCase):
+    """The busy acks, drain refusals and other system replies, through SlackAdapter.send."""
+
+    def setUp(self):
+        self.root = _Root()
+        self.addCleanup(self.root.cleanup)
+        self.upstream_adapter = self.root.load(applier.SLACK_ADAPTER, "upstream")["SlackAdapter"]
+        applier.apply(self.root.dir)
+        self.adapter = self.root.load(applier.SLACK_ADAPTER, "patched")["SlackAdapter"]
+        self.replies = verifier.check_system(self.root.dir)
+
+    def _sent(self, cls, content, env):
+        adapter = cls()
+        with mock.patch.dict(os.environ, env):
+            _run(adapter.send("C1", content))
+        return adapter.sent[0]
+
+    def test_flag_off_is_upstream(self):
+        for reply in self.replies:
+            with self.subTest(reply=reply):
+                self.assertEqual(
+                    self._sent(self.adapter, reply, {"KAGE_SLACK_UX": ""}),
+                    self._sent(self.upstream_adapter, reply, {"KAGE_SLACK_UX": ""}),
+                )
+
+    def test_flag_on_rewords_every_reply(self):
+        with self.assertLogs("gateway.slack_boilerplate", "WARNING"):
+            sent = {self._sent(self.adapter, reply, FLAG_ON) for reply in self.replies}
+        self.assertEqual(
+            sent,
+            {
+                "Got it — I'll pick this up when I finish the current one.",
+                "Stopping what I was doing to look at this.",
+                "I'm restarting — I'll pick this up when I'm back.",
+                "I'm going offline for a moment — I'll pick this up when I'm back.",
+                "I'm restarting — send that again in a minute.",
+                "I'm going offline for a moment — send that again in a minute.",
+                "I'm finishing some maintenance — try again in a minute.",
+                "Still working on your last message — send this again once I've answered.",
+                "Stopped.",
+                "Still running `make build`.",
+                "Still running `make build`.\n\nRecent output:\n```\nstep 3/9\n```",
+                "Still running.",
+                "Still running.\n\nRecent output:\n```\nstep 3/9\n```",
+                "I can't reach the model right now (authentication failed).",
+            },
+        )
+
+    def test_auth_failure_is_logged_not_sent(self):
+        with self.assertLogs("gateway.slack_boilerplate", "WARNING") as logs:
+            sent = self._sent(self.adapter, "⚠️ Provider authentication failed: 401 key sk-abc", FLAG_ON)
+        self.assertEqual(sent, runtime.AUTH_FAILED)
+        self.assertIn("401 key sk-abc", logs.output[0])
+
+    def test_model_text_and_unknown_replies_pass_through(self):
+        for text in (REPORT, "⏩ Steered into current run. Your message arrives after the next tool call.",
+                     "Stopped. The agent was still starting — session unlocked."):
+            with self.subTest(text=text):
+                self.assertEqual(self._sent(self.adapter, text, FLAG_ON), text)
+        with mock.patch.dict(os.environ, FLAG_ON):
+            self.assertIsNone(runtime.system_text(None))
+
+
+class BusyHintTest(unittest.TestCase):
+    def setUp(self):
+        self.root = _Root()
+        self.addCleanup(self.root.cleanup)
+        self.upstream = self.root.load(applier.RUN_BUSY, "upstream")["GatewayBusyMixin"]
+        applier.apply(self.root.dir)
+        self.patched = self.root.load(applier.RUN_BUSY, "patched")["GatewayBusyMixin"]
+
+    def _ack(self, cls, platform, env):
+        """The busy ack's text, and whether the hint was marked seen."""
+        from agent import onboarding
+        onboarding.SEEN.clear()
+        event = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value=platform)))
+        with mock.patch.dict(os.environ, env):
+            message = cls._compose_busy_ack_message(cls, event, ["3 min elapsed"], is_queue_mode=True)
+        return message, list(onboarding.SEEN)
+
+    def test_flag_off_and_other_platforms_are_upstream(self):
+        for platform, env in (("slack", {"KAGE_SLACK_UX": ""}), ("telegram", FLAG_ON)):
+            with self.subTest(platform=platform):
+                upstream = self._ack(self.upstream, platform, env)
+                self.assertEqual(self._ack(self.patched, platform, env), upstream)
+                self.assertIn("Tip:", upstream[0])
+
+    def test_flag_on_slack_drops_the_hint_and_leaves_it_unseen(self):
+        self.assertEqual(
+            self._ack(self.patched, "slack", FLAG_ON),
+            ("⏳ Queued for the next turn (3 min elapsed). I'll respond once the current task finishes.", []),
+        )
+
+
+class SessionDbWarningTest(unittest.TestCase):
+    def setUp(self):
+        self.root = _Root()
+        self.addCleanup(self.root.cleanup)
+        self.upstream = self.root.load(applier.RUN_NOTIFICATIONS, "upstream")["GatewayNotificationsMixin"]
+        applier.apply(self.root.dir)
+        self.patched = self.root.load(applier.RUN_NOTIFICATIONS, "patched")["GatewayNotificationsMixin"]
+
+    def _warn(self, cls, platforms, env):
+        transport = _Transport()
+        owner = SimpleNamespace(
+            _session_db_init_error="database is locked",
+            _home_channel_transports=lambda: [
+                (SimpleNamespace(value=p), None, SimpleNamespace(chat_id=f"C-{p}"), transport) for p in platforms
+            ],
+            _send_home_channel_message=lambda *a: cls._send_home_channel_message(None, *a),
+        )
+        with mock.patch.dict(os.environ, env):
+            _run(cls._send_session_db_warning_notifications(owner))
+        return transport.sent
+
+    def test_flag_off_is_upstream(self):
+        env = {"KAGE_SLACK_UX": ""}
+        sent = self._warn(self.patched, ["slack", "telegram"], env)
+        self.assertEqual(sent, self._warn(self.upstream, ["slack", "telegram"], env))
+        self.assertEqual(len(sent), 2)
+
+    def test_flag_on_skips_slack_and_still_warns_elsewhere(self):
+        sent = self._warn(self.patched, ["slack", "telegram"], FLAG_ON)
+        self.assertEqual(sent, self._warn(self.upstream, ["telegram"], FLAG_ON))
+        self.assertEqual([p for p, _ in sent], ["telegram"])
 
 
 class RuntimeTest(unittest.TestCase):
