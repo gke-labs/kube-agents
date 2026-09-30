@@ -335,6 +335,8 @@ class RuntimeTest(unittest.TestCase):
             [[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]]
         )
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
+        # The notification text no longer offers the choices the blocks dropped.
+        self.assertEqual(update["text"], "✓ <@U1>: Leave it")
         self.assertEqual(echo, {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
         self.assertEqual(
             turn,

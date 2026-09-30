@@ -26,8 +26,11 @@ text is untouched, only laid out.
 
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would
-show options the stored row does not have; a thread that already has a row
-gets the reply upstream posts. A report with no "What's wrong" sentence, an
+show options the stored row does not have and erase the first from Slack; a
+thread that already has a row gets the reply upstream posts. That row is a
+best-effort write after the send, so this process also remembers the alerts
+it edited and never edits one twice; only a failed write followed by a
+gateway restart leaves a thread open to a second edit. A report with no "What's wrong" sentence, an
 option named but not parsed, a fold ``block_kit`` cannot render, or any failure
 to edit, also falls back to that reply.
 """
@@ -39,6 +42,7 @@ import logging
 import os
 import re
 import sqlite3
+from collections import OrderedDict
 from contextlib import closing
 from importlib import util as importlib_util
 from pathlib import Path
@@ -92,11 +96,18 @@ PROPOSED_FIX_LINE = re.compile(r"^\s*[-*]\s+[*_]*Proposed fix\s*" + TITLE)
 LINKS_MARKER = "🔗"
 #: Any option the section names, parsed or not.
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
-RECOMMENDED = re.compile(r"Recommended:?[*_\s]*Option ([A-Z])\b")
+#: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
+#: word, so ``Not Recommended: Option A`` is not one.
+RECOMMENDED = re.compile(r"^[^\w\n]*Recommended:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: A code fence line; nothing between two is a heading, a bullet or markup.
 FENCE = re.compile(r"^\s*(```|~~~)")
+#: How many edited alerts this process remembers.
+EDITED_MAX = 512
+
+#: ``(chat_id, thread_id)`` of the alerts this process has edited, oldest first.
+_edited: OrderedDict[tuple[str, str], None] = OrderedDict()
 
 
 def enabled() -> bool:
@@ -104,9 +115,9 @@ def enabled() -> bool:
     return _presenter is not None and _presenter.enabled()
 
 
-def _sections(report: str) -> dict[str, str]:
-    """``{heading: body}`` for each markdown heading in ``report``."""
-    out: dict[str, str] = {}
+def _sections(report: str) -> list[tuple[str, str]]:
+    """``(heading, body)`` for each markdown heading in ``report``, in order."""
+    out: list[tuple[str, str]] = []
     heading, body = None, []
     fenced = False
     for line in report.split("\n"):
@@ -115,17 +126,17 @@ def _sections(report: str) -> dict[str, str]:
         match = None if fenced else HEADING.match(line)
         if match:
             if heading is not None:
-                out[heading] = "\n".join(body).strip()
+                out.append((heading, "\n".join(body).strip()))
             heading, body = match.group(1).strip(), []
         elif heading is not None:
             body.append(line)
     if heading is not None:
-        out[heading] = "\n".join(body).strip()
+        out.append((heading, "\n".join(body).strip()))
     return out
 
 
-def _section(sections: dict[str, str], name: re.Pattern) -> str:
-    return next((body for heading, body in sections.items() if name.search(heading)), "")
+def _section(sections: list[tuple[str, str]], name: re.Pattern) -> str:
+    return next((body for heading, body in sections if name.search(heading)), "")
 
 
 def _unfenced(text: str) -> list[str]:
@@ -145,6 +156,9 @@ def parse_triage(report: str) -> dict | None:
     ``choices`` are ``(label, recommended)`` pairs in the report's order.
     """
     sections = _sections(report)
+    if sum(bool(WHAT_TO_DO.search(heading)) for heading, _body in sections) > 1:
+        # Buttons from one section under a fold showing both would misstate the report.
+        return None
     # A fenced block may quote the option shape; only prose lines count.
     lines = _unfenced(_section(sections, WHAT_TO_DO))
     what_to_do = "\n".join(lines)
@@ -283,7 +297,11 @@ class _AlertEditor:
         return getattr(self._adapter, name)
 
     async def send(self, chat_id: Any, content: Any, metadata: Any = None, **kwargs: Any) -> Any:
-        if str(chat_id) == self._chat_id:
+        key = (self._chat_id, self._thread_id)
+        if str(chat_id) == self._chat_id and key not in _edited:
+            _edited[key] = None
+            while len(_edited) > EDITED_MAX:
+                _edited.popitem(last=False)
             try:
                 await self._adapter._get_client(self._chat_id).chat_update(
                     channel=self._chat_id,
@@ -294,6 +312,7 @@ class _AlertEditor:
                 logger.info("slack_ux_incident: edited alert %s into its triage", self._thread_id)
                 return SimpleNamespace(success=True, message_id=self._thread_id, error=None)
             except Exception as exc:  # noqa: BLE001 — the threaded reply still delivers it
+                _edited.pop(key, None)
                 logger.warning(
                     "slack_ux_incident: could not edit alert %s, replying under it: %s", self._thread_id, exc
                 )
@@ -330,7 +349,7 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         if not (chat_id and thread_id):
             return adapter
         triage = parse_triage(report)
-        if triage is None or not is_open_alert(chat_id, thread_id):
+        if triage is None or (chat_id, thread_id) in _edited or not is_open_alert(chat_id, thread_id):
             return adapter
         fold_blocks = render_fold(report, getattr(adapter, "format_message", None))
         if not fold_blocks:

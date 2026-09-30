@@ -129,6 +129,7 @@ BLOCK_KIT = SimpleNamespace(render_blocks=_render_blocks, sanitize_blocks=lambda
 
 class RuntimeTest(unittest.TestCase):
     def setUp(self):
+        runtime._edited.clear()
         self.block_kit = mock.patch.object(runtime, "_load_block_kit", return_value=BLOCK_KIT)
         self.block_kit.start()
         self.addCleanup(self.block_kit.stop)
@@ -255,6 +256,30 @@ class RuntimeTest(unittest.TestCase):
         )
         kept = [e["text"]["text"] for b in answered if b["type"] == "actions" for e in b["elements"]]
         self.assertEqual(kept, ["GKE Workloads ↗", "Cloud Logs ↗"])
+
+    def test_an_alert_is_edited_once_even_when_no_row_is_stored(self):
+        adapter = _Adapter()
+        self.deliver(adapter)
+        # No incidents row was written, as when POST /v1/incidents fails.
+        self.assertIs(self.wrap(adapter), adapter)
+
+    def test_a_failed_edit_leaves_the_alert_open(self):
+        self.deliver(_Adapter(fail_update=True))
+        adapter = _Adapter()
+        self.deliver(adapter)
+        self.assertEqual([e[0] for e in adapter.log], ["chat_update"])
+
+    def test_not_recommended_is_not_the_recommendation(self):
+        report = REPORT.replace(
+            "- ✅ **Recommended: Option B**",
+            "- ❌ **Not Recommended: Option A** — it hides the cause.\n- ✅ **Recommended: Option B**",
+        )
+        triage = runtime.parse_triage(report)
+        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+
+    def test_two_what_to_do_sections_keep_the_reply(self):
+        second = "\n## What to do (cluster B)\n\n- **Option C (Drain the node):** moves the pods.\n"
+        self.assertIsNone(runtime.parse_triage(REPORT + second))
 
     def test_a_failed_edit_falls_back_to_the_reply(self):
         adapter = _Adapter(fail_update=True)

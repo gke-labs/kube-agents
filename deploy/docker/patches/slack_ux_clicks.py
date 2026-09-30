@@ -198,7 +198,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     note = ANSWERED.format(user=user_id, label=shown)
     try:
         await client.chat_update(
-            channel=channel_id, ts=msg_ts, text=message.get("text") or note,
+            channel=channel_id, ts=msg_ts, text=note,
             blocks=answered_blocks(message.get("blocks"), _answered_by, note),
         )
     except Exception as exc:  # noqa: BLE001 — the click still answers
