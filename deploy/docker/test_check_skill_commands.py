@@ -280,29 +280,46 @@ class TriageTest(unittest.TestCase):
         self.assertEqual([], new)
         self.assertEqual([("a/SKILL.md", "gone")], stale)
 
+    def run_main(self, known, skill_verdict):
+        """Run ``main`` over one skill block the fake scanner rates ``skill_verdict``."""
+        probes = {check.PROBE_REFUSED: verdict("block"), check.PROBE_ALLOWED: verdict("allow")}
+        scanner = types.ModuleType("tools.tirith_security")
+        scanner.check_command_security = lambda text: probes.get(text, skill_verdict)
+        modules = {"tools": types.ModuleType("tools"), "tools.tirith_security": scanner}
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            # Not the allowed probe's command, which ``probes`` would answer.
+            skill.write_text("```bash\npwd\n```\n")
+            with mock.patch.dict(sys.modules, modules), \
+                    mock.patch.dict(check.os.environ), \
+                    mock.patch.object(check, "KNOWN_FINDINGS", known), \
+                    mock.patch("sys.stdout", new=io.StringIO()) as out, \
+                    mock.patch("sys.stderr", new=io.StringIO()) as err:
+                code = check.main([f"agents/platform/skills={tmp}", "--tirith-bin", "tirith"])
+        return code, out.getvalue(), err.getvalue()
+
     def test_main_judges_staleness_against_the_trees_it_was_given(self):
         known = {
             (f"{tree}/demo/SKILL.md", "gone"): (frozenset({"r"}), "reason")
             for tree in ("agents/platform/skills", "agents/cluster/skills")
         }
-        scanner = types.ModuleType("tools.tirith_security")
-        scanner.check_command_security = lambda text: verdict(
-            "block" if text == check.PROBE_REFUSED else "allow"
-        )
-        modules = {"tools": types.ModuleType("tools"), "tools.tirith_security": scanner}
-        with tempfile.TemporaryDirectory() as tmp:
-            skill = Path(tmp) / "demo" / "SKILL.md"
-            skill.parent.mkdir()
-            skill.write_text("```bash\nls\n```\n")
-            with mock.patch.dict(sys.modules, modules), \
-                    mock.patch.dict(check.os.environ), \
-                    mock.patch.object(check, "KNOWN_FINDINGS", known), \
-                    mock.patch("sys.stderr", new=io.StringIO()) as err:
-                self.assertEqual(
-                    1, check.main([f"agents/platform/skills={tmp}", "--tirith-bin", "tirith"])
-                )
-        self.assertIn("('agents/platform/skills/demo/SKILL.md', 'gone')", err.getvalue())
-        self.assertNotIn("agents/cluster/skills", err.getvalue())
+        code, _, err = self.run_main(known, verdict("allow"))
+        self.assertEqual(1, code)
+        self.assertIn("('agents/platform/skills/demo/SKILL.md', 'gone')", err)
+        self.assertNotIn("agents/cluster/skills", err)
+
+    def test_main_fails_on_a_refused_block_and_reports_it(self):
+        code, out, err = self.run_main({}, verdict("block", "r"))
+        self.assertEqual(1, code)
+        self.assertIn("agents/platform/skills/demo/SKILL.md:2: Tirith rates this block block [r]", err)
+        self.assertEqual("", out)
+
+    def test_main_passes_when_every_block_is_allowed(self):
+        code, out, err = self.run_main({}, verdict("allow"))
+        self.assertEqual(0, code)
+        self.assertIn("1 skill shell blocks pass Tirith", out)
+        self.assertEqual("", err)
 
 
 class KnownFindingsTest(unittest.TestCase):
