@@ -26,9 +26,9 @@ Four things are checked:
    wording back on Slack with nothing failing.
 3. The other system replies, rendered from the patched source the same way:
    the busy acks, the drain and restart refusals, the force-stop reply, the
-   background-task update and both provider authentication failures. With the
+   background-task update and every provider error reply. With the
    flag on, ``system_text`` must reword every one, with no emoji, "Gateway",
-   "agent" or exception text left; ``system_text`` passes unrecognised text
+   "gateway", "agent", ``/stop`` or exception text left; ``system_text`` passes unrecognised text
    through, so this is what catches an upstream rewording.
 4. The runtime module, loaded by path: on Slack with the flag on,
    ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
@@ -78,7 +78,12 @@ SESSION_DB_FN = "_send_session_db_warning_notifications"
 RUN_BUSY = "gateway/run_busy.py"
 BUSY_ACK_FN = "_compose_busy_ack_message"
 BUSY_HINT = "busy_input_hint_gateway"
-BUSY_HEADS = ("⏳ Queued for the next turn", "⚡ Interrupting current task")
+BUSY_HEADS = (
+    "⏳ Queued for the next turn", "⚡ Interrupting current task", "⏩ Steered into current run",
+    "↪ Redirected current run", "⏳ Subagent working", "⏳ Compressing context",
+)
+#: The shared tail of the subagent and compression acks, a class attribute.
+BUSY_DEMOTED_TAIL = "_BUSY_DEMOTED_TAIL"
 BUSY_DETAILS = ("", " (3 min elapsed, running: terminal)")
 DRAIN_FN = "_send_busy_drain_notice"
 
@@ -106,9 +111,13 @@ SYSTEM_LITERALS = (
     (RUN_INBOUND, "⚡ Force-stopped", 1),
     (RUN_TURN_RUNNER, AUTH_PREFIX, 1),
     (RUN, AUTH_PREFIX, 1),
+    (RUN, "⚠️ The model provider rejected", 1),
+    (RUN, "⏱️ The model provider is rate-limiting", 1),
+    (RUN, "⚠️ The model server is not responding", 1),
+    (RUN, "⚠️ The model provider failed after retries", 1),
 )
 #: Left on a reworded reply, any of these means the rewording missed.
-SYSTEM_LEFTOVERS = ("⏳", "⚡", "⚠️", "Gateway", "agent", AUTH_ERROR)
+SYSTEM_LEFTOVERS = ("⏳", "⚡", "⚠️", "⏱️", "⏩", "↪", "/stop", "Gateway", "agent", "gateway", AUTH_ERROR)
 
 #: Stands in for the names the interrupted-cron-job notice interpolates.
 CRON_JOB_NAME = "inventory"
@@ -313,14 +322,25 @@ def check_system(root: Path) -> list[str]:
     if not _binds_alias(tree):
         raise _fail(f"{RUN_BUSY} does not import gateway.slack_boilerplate as {ALIAS}")
     compose = _function(tree, BUSY_ACK_FN, RUN_BUSY)
+    demoted = [
+        ast.literal_eval(node.value) for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and _names(node.targets) == [BUSY_DEMOTED_TAIL]
+    ]
+    if len(demoted) != 1:
+        raise _fail(f"{RUN_BUSY} defines {BUSY_DEMOTED_TAIL} {len(demoted)} times, expected 1")
+    tails = {f"self.{BUSY_DEMOTED_TAIL}": demoted[0]}
     heads = {
-        node.value.elts[0].value: node.value.elts[1].value for node in ast.walk(compose)
+        node.value.elts[0].value: (
+            node.value.elts[1].value if isinstance(node.value.elts[1], ast.Constant)
+            else tails.get(ast.unparse(node.value.elts[1]))
+        )
+        for node in ast.walk(compose)
         if isinstance(node, ast.Assign) and _names(node.targets) == ["(head, tail)"]
-        and isinstance(node.value, ast.Tuple) and all(isinstance(e, ast.Constant) for e in node.value.elts)
+        and isinstance(node.value, ast.Tuple) and isinstance(node.value.elts[0], ast.Constant)
     }
     for head in BUSY_HEADS:
-        if head not in heads:
-            raise _fail(f"{BUSY_ACK_FN}() no longer builds the {head!r} ack")
+        if heads.get(head) is None:
+            raise _fail(f"{BUSY_ACK_FN}() no longer builds the {head!r} ack from literals")
         replies.extend(f"{head}{detail}{heads[head]}" for detail in BUSY_DETAILS)
     if not any(
         isinstance(node, ast.If) and BUSY_HINT in ast.unparse(node)

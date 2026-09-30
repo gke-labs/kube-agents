@@ -50,7 +50,7 @@ not recognise, a later upstream rewording included, passes through unchanged.
 
 **The rest of the gateway's system replies.** Busy acks, drain and restart
 refusals, the force-stop reply, the background-task update and the provider
-authentication failure reach Slack through ``SlackAdapter.send``, which passes
+error replies reach Slack through ``SlackAdapter.send``, which passes
 them through ``system_text``: each known one is reworded in plain voice, with
 no emoji, no "Gateway" or "agent", no tool name or iteration count, and no
 exception text (that one is logged instead). Two go entirely: the one-time
@@ -124,6 +124,15 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
      "Got it — I'll pick this up when I finish the current one."),
     (re.compile(r"⚡ Interrupting current task(?: \([^\n]*\))?\. I'll respond to your message shortly\."),
      "Stopping what I was doing to look at this."),
+    (re.compile(r"⏩ Steered into current run(?: \([^\n]*\))?\. Your message arrives after the next tool call\."),
+     "Got it — I'll fold this into what I'm working on now."),
+    (re.compile(r"↪ Redirected current run(?: \([^\n]*\))?\. I'll adjust using your correction\."),
+     "Got it — changing course with your correction."),
+    # Both queue the message behind work that cannot be interrupted; the
+    # subagent and compression detail is internals, so Slack hears neither.
+    (re.compile(r"⏳ (?:Subagent working|Compressing context)(?: \([^\n]*\))? — your message is queued for "
+                r"when it finishes \(use /stop to cancel everything\)\."),
+     "Got it — I'll pick this up when the current work finishes."),
     (re.compile(r"⏳ Gateway (?P<action>restarting|shutting down) — queued for the next turn after it comes back\."),
      lambda m: f"{DRAIN_WHO[m['action']]} — I'll pick this up when I'm back."),
     (re.compile(r"⏳ Gateway is (?P<action>restarting|shutting down) and is not accepting "
@@ -145,6 +154,17 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
     (re.compile(r"⚠️ Provider authentication failed\. Check the configured credentials; "
                 r"raw provider details are in the gateway logs\."),
      lambda m: AUTH_FAILED),
+    (re.compile(r"⚠️ The model provider rejected the request\. I kept the raw provider error out of chat; "
+                r"check gateway logs for details or try rephrasing\."),
+     "I can't help with that one."),
+    (re.compile(r"⏱️ The model provider is rate-limiting requests\. Please wait a moment and try again\."),
+     "I'm being rate-limited. Give me a minute and try again."),
+    (re.compile(r"⚠️ The model server is not responding — it looks like the configured model endpoint is not "
+                r"running or is unreachable\."),
+     "I can't reach the model right now. Try again in a minute."),
+    (re.compile(r"⚠️ The model provider failed after retries\. I kept raw provider details out of chat; "
+                r"check gateway logs for diagnostics\."),
+     "Something went wrong on my side. Try again?"),
 )
 
 #: What Slack is told when the model provider refuses the turn's credentials.

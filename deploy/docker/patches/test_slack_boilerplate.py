@@ -238,7 +238,9 @@ def _load_gateway_config():
 
 
 class GatewayBusyMixin:
-    _BUSY_DEMOTED_TAIL = ". Your message is queued."
+    _BUSY_DEMOTED_TAIL = (
+        " — your message is queued for when it finishes (use /stop to cancel everything)."
+    )
 
     async def _send_busy_drain_notice(self, event, session_key: str, effective_mode: str) -> None:
         """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
@@ -361,7 +363,18 @@ def _non_conversational_metadata(metadata, platform=None):
 _PROVIDER_ERROR_REPLIES = (
     (None, "⚠️ Provider authentication failed. Check the configured credentials; "
            "raw provider details are in the gateway logs."),
+    (None, "⚠️ The model provider rejected the request. I kept the raw provider "
+           "error out of chat; check gateway logs for details or try rephrasing."),
+    (None, "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."),
+    (None, "⚠️ The model server is not responding — it looks like the configured "
+           "model endpoint is not running or is unreachable."),
 )
+
+
+def _gateway_provider_error_reply(text):
+    return (
+        "⚠️ The model provider failed after retries. I kept raw provider details "
+        "out of chat; check gateway logs for diagnostics.")
 '''
 
 SLACK_ADAPTER = '''\
@@ -540,11 +553,19 @@ class ApplierTest(unittest.TestCase):
 
     def test_verifier_refuses_a_reworded_upstream_system_reply(self):
         applier.apply(self.root.dir)
-        path = self.root.dir / verifier.RUN_INBOUND
-        path.write_text(path.read_text().replace("please resend shortly", "please retry"))
-        with self.assertRaises(SystemExit) as caught:
-            verifier.main(self.root.dir)
-        self.assertIn("please retry", str(caught.exception))
+        for relative, old, new in (
+            (verifier.RUN_INBOUND, "please resend shortly", "please retry"),
+            (verifier.RUN, "Please wait a moment", "Please hold on"),
+            (applier.RUN_BUSY, "after the next tool call", "at the next tool call"),
+        ):
+            with self.subTest(relative=relative):
+                path = self.root.dir / relative
+                patched = path.read_text()
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn(new, str(caught.exception))
+                path.write_text(patched)
 
     def test_verifier_refuses_a_system_reply_or_hint_reaching_slack_unfiltered(self):
         applier.apply(self.root.dir)
@@ -797,6 +818,9 @@ class SystemReplyTest(unittest.TestCase):
             {
                 "Got it — I'll pick this up when I finish the current one.",
                 "Stopping what I was doing to look at this.",
+                "Got it — I'll fold this into what I'm working on now.",
+                "Got it — changing course with your correction.",
+                "Got it — I'll pick this up when the current work finishes.",
                 "I'm restarting — I'll pick this up when I'm back.",
                 "I'm going offline for a moment — I'll pick this up when I'm back.",
                 "I'm restarting — send that again in a minute.",
@@ -809,6 +833,10 @@ class SystemReplyTest(unittest.TestCase):
                 "Still running.",
                 "Still running.\n\nRecent output:\n```\nstep 3/9\n```",
                 "I can't reach the model right now (authentication failed).",
+                "I can't help with that one.",
+                "I'm being rate-limited. Give me a minute and try again.",
+                "I can't reach the model right now. Try again in a minute.",
+                "Something went wrong on my side. Try again?",
             },
         )
 
@@ -819,7 +847,7 @@ class SystemReplyTest(unittest.TestCase):
         self.assertIn("401 key sk-abc", logs.output[0])
 
     def test_model_text_and_unknown_replies_pass_through(self):
-        for text in (REPORT, "⏩ Steered into current run. Your message arrives after the next tool call.",
+        for text in (REPORT, "⏩ Steered into current run. Your message arrives sooner.",
                      "Stopped. The agent was still starting — session unlocked."):
             with self.subTest(text=text):
                 self.assertEqual(self._sent(self.adapter, text, FLAG_ON), text)
