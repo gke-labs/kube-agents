@@ -2374,6 +2374,8 @@ def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
             return f"its frontmatter has no `{audit.DECLARES_KEY}` list"
         if isinstance(declares, list) and not declares:
             return f"its `{audit.DECLARES_KEY}` list is empty"
+        if not isinstance(declares, list):
+            return f"its `{audit.DECLARES_KEY}` is not a list (the audit's parser logs one WARNING and reads nothing)"
         return (
             f"every `{audit.DECLARES_KEY}` item was skipped by the audit's parser "
             "(it logged a WARNING per item above saying why)"

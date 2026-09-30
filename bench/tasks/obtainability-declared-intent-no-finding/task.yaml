@@ -1,4 +1,4 @@
-# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-30,
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-29,
 # out of the validator's FIXTURE_NOT_READY allowlist the same day (#1409).
 # The health signal this case grades is a REPOSITORY DECLARATION rather than
 # workload health: the obtainability SOP's declared-intent step (§4a, #1341)
@@ -31,7 +31,7 @@
 # Planted defect required: notification-relay (role declared-no-pdb-workload)
 # plus the repository declaration above.
 # Isolation class: read-only.
-# Eligible tier: presubmit once admitted; nightly since 2026-09-30.
+# Eligible tier: presubmit once admitted; nightly since 2026-09-29.
 id: obtainability-declared-intent-no-finding
 name: Reliability inspection of a declared two-replica workload reports no missing PDB
 prompt: >-

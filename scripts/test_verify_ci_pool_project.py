@@ -1535,6 +1535,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             # nothing without a WARNING, so the diagnosis must not promise one.
             "null declares": good[: good.index("declares:")] + "declares:\n---\n" + good[good.index("---\n\n`notification") + 4 :],
             "empty declares": good[: good.index("declares:")] + "declares: []\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            "declares is a mapping": good[: good.index("declares:")] + "declares:\n  check: no-pdb\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            "declares is a scalar": good[: good.index("declares:")] + "declares: yes\n---\n" + good[good.index("---\n\n`notification") + 4 :],
         }
         # The reason the message gives for the shapes the audit's parser is
         # silent about, so the operator is not sent to look for a WARNING that
@@ -1551,6 +1553,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "unquoted impossible date": "not valid YAML (ValueError)",
             "null declares": "has no `declares` list",
             "empty declares": "`declares` list is empty",
+            "declares is a mapping": "is not a list",
+            "declares is a scalar": "is not a list",
         }
         for label, body in rejected.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch("sys.stderr", new=io.StringIO()):
@@ -1594,6 +1598,31 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 self.assertIsInstance(result.warnings[0], checker.Unread)
                 self.assertIn(type(exc).__name__, result.warnings[0])
                 self.assertFalse(result.read)
+
+    def test_the_printed_repair_command_puts_the_note_provisioning_seeds(self):
+        # The command is meant to be pasted: run it through bash with `gh`
+        # stubbed to echo its argv, and check the decoded content is the note
+        # plus the trailing newline the script's printf adds, and that the
+        # audit's parser joins it. An apostrophe added to the note text later
+        # breaks the paste while every substring assertion stays green; this
+        # is what catches it.
+        import subprocess as sp
+        import tempfile
+        command = checker.gitops_note_seed_command("gke-agentic/kube-agents-evals-3-infra", sha="deadbeef")
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = pathlib.Path(tmp) / "gh"
+            gh.write_text("#!/bin/bash\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n")
+            gh.chmod(0o755)
+            proc = sp.run(["bash", "-c", command], capture_output=True, env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        argv = proc.stdout.decode().split("\0")[:-1]
+        self.assertEqual(["api", "-X", "PUT", "repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md"], argv[:4])
+        fields = dict(argv[i + 1].split("=", 1) for i in range(len(argv)) if argv[i] == "-f")
+        self.assertEqual(checker.GITOPS_INTENT_NOTE_MESSAGE, fields["message"])
+        self.assertEqual("deadbeef", fields["sha"])
+        body = base64.b64decode(fields["content"]).decode()
+        self.assertEqual(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", body)
+        self.assertIsNone(checker._note_declaration_problem(body, "gke-agentic/kube-agents-evals-3-infra"))
 
     def test_the_declarable_set_is_the_audits(self):
         # The check asks the audit which slugs a note may justify; the fixture's

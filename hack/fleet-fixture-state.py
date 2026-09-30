@@ -23,7 +23,7 @@ took all of its CPU, `payments-api` and `checkout-gateway` sat Pending on all
 every pull request for a day (#1278). This script is the other half (#1544): for
 each role the runner published it reads the `state` assertions the catalog
 (bench/tf/fleet/fixtures.json) declares -- the crashloop has recorded an
-OOMKilled termination, the healthy workload is Ready, the idle pool's node is
+OOMKilled termination, the two healthy workloads are Ready, the idle pool's node is
 Ready and tainted, slot b's control plane is still one minor behind its
 channel -- and reports the roles whose fixture is there but not in the shape
 the cases depend on.
