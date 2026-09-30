@@ -100,7 +100,7 @@ During the drain and reschedule:
 
 1. [A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction):
    a surge upgrade waits an hour for the pod and a blue-green one leaves it on the old pool for up
-   to seven days, then GKE deletes it anyway.
+   to about a week, then GKE deletes it anyway.
    `k8s, GKE`
 2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods): on a
    pool configured to allow unavailability, or an autoscaled blue-green pool that cannot grow,
@@ -151,9 +151,10 @@ On the new node image:
 
 The list groups failures by moment. The diagram draws the paths an upgrade takes through them,
 rather than one box per entry, with one fact the list cannot show: which failures hold GKE's drain,
-and for how long. A refused eviction holds a surge drain for up to an hour per node, and on
-blue-green leaves the pod on the old pool until that pool is deleted, up to seven days later; either
-way GKE then removes the pod, and three entries reach that: a budget with no allowance left (1), and
+and for how long. A refused eviction holds a surge drain for up to an hour per node; a standard
+blue-green upgrade leaves the pod on the old pool until that pool is deleted, up to seven days
+later; an autoscaled blue-green upgrade waits up to seven days and then drains under the same
+one-hour limit. Every path then removes the pod, and three entries reach that: a budget with no allowance left (1), and
 the two cases where replacements never become Ready, because there was nowhere to schedule them (2,
 on a pool that allows unavailability or an autoscaled green pool that cannot grow) or a fail-closed
 webhook rejected them (7); a budget counts those replacements unavailable, and once its allowance is
@@ -172,7 +173,7 @@ flowchart TD
     Defaults -- yes --> Adm["Rejections at admission,<br/>evictions nobody asked for"]
     Defaults -- no --> Pool[Node pool upgrade:<br/>drain each node, rebuild it]
     Pool --> PDB{Does the budget<br/>allow the eviction?}
-    PDB -- no --> Stall["Surge: drain held up to an hour per node;<br/>blue-green: pod left on the old pool<br/>until it is deleted, up to seven days;<br/>then force-delete: an outage"]
+    PDB -- no --> Stall["Surge: drain held up to an hour per node;<br/>standard blue-green: pod left on the old pool<br/>until it is deleted, up to seven days;<br/>autoscaled blue-green: a wait of up to seven days,<br/>then the one-hour drain;<br/>then force-delete: an outage"]
     PDB -- yes --> Room{Is there somewhere<br/>to reschedule?}
     Room -- "no: fail-closed webhook" --> Deadlock["Webhook deadlock: blocks the drain itself<br/>when it matches evictions or kube-system,<br/>else via a budget with no allowance left"]
     Room -- "no: maxUnavailable set or green pool<br/>cannot grow, no headroom" --> Pending["Pods Pending until a node frees up<br/>(stalls the drain, for the same window,<br/>once a budget's allowance is used up)"]
@@ -226,7 +227,8 @@ nodes it can empty, then drains the rest, respecting the budget for up to one ho
 - Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`, and the obtainability audit reports it as `blocking-pdb`.
 - GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
 - Why it is on the list: how long each strategy keeps the pod (an hour per node on surge; the
-  soak or the wait, up to seven days, on blue-green) and the removal that ends it are in GKE's
+  soak, at most seven days in total, on standard blue-green; the wait of up to seven days and then
+  an hour's drain on autoscaled blue-green) and the removal that ends it are in GKE's
   [node upgrade strategies](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies).
   The seeded fleet plants no drain-blocking budget.
 
@@ -236,7 +238,7 @@ This entry needs a pool whose upgrade settings let a node go away before its rep
 `maxUnavailable` above 0, which GKE sets only on request, or an autoscaled blue-green upgrade,
 whose green pool starts with no nodes. On GKE's default surge settings,
 `maxSurge` 1 and `maxUnavailable` 0, the replacement node is created first, and if it cannot be
-(quota, a stockout) the upgrade stops there with the old node still serving. On a pool that allows
+(quota, a stockout) the upgrade waits there with the old node still serving. On a pool that allows
 unavailability, draining a node only works if the pods it carries can start somewhere else. With no
 headroom, an autoscaler at its ceiling or exhausted accelerator quota, they wait for the node that
 was just taken away, and a single-replica application has a guaranteed outage. On autoscaled
@@ -250,7 +252,7 @@ strategy's limitations.
 - Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits, and Compute Engine for accelerator quota; the Kubernetes API for the sum of requests against allocatable.
 - After: Pending pods with `Insufficient cpu` or `Insufficient nvidia.com/gpu`, autoscaler events
   citing quota.
-- Mitigate before: leave the pool on GKE's default surge settings, or return it to them: `maxSurge` at least 1 and `maxUnavailable` 0, with one node of headroom, an autoscaler ceiling and accelerator quota that allow the extra node; for accelerator pools surge is the strategy that fits a small quota, since `maxSurge` 1 needs one extra node's quota while blue-green needs a whole second pool's.
+- Mitigate before: leave the pool on GKE's default surge settings, or return it to them: `maxSurge` at least 1 and `maxUnavailable` 0, with one node of headroom, an autoscaler ceiling and accelerator quota that allow the extra node; for accelerator pools surge is the strategy that fits a small quota, since `maxSurge` 1 needs one extra node's quota while standard blue-green needs a whole second pool's.
 - Mitigate after: add a node or raise the ceiling and the Pending pods schedule.
 - Read today: the stockout-prevention audit flags regional GPU, TPU and CPU quota near exhaustion and pools near `autoscaling.maxNodeCount`; `maxSurge` and headroom against allocatable are unread.
 - GKE recommender: partial: `CLUSTER_UNDERPROVISIONED` from the [utilisation insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/optimize-cluster-utilization); nothing reads `maxSurge` or quota. The Network Analyzer's separate `google.networkanalyzer.container.ipAddressInsight` covers pod IP exhaustion.
