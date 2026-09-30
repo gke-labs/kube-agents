@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import importlib.util
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -147,21 +149,34 @@ def _method_args(tree: ast.Module, member: ast.AST) -> ast.arguments | None:
     return nested[returned[0]].args if len(returned) == 1 and returned[0] in nested else None
 
 
+def _signature(args: ast.arguments) -> inspect.Signature:
+    """The signature ``args`` declares, with annotations dropped and every default ``None``."""
+    bare = copy.deepcopy(args)
+    for arg in [*bare.posonlyargs, *bare.args, *bare.kwonlyargs, bare.vararg, bare.kwarg]:
+        if arg is not None:
+            arg.annotation = None
+    bare.defaults = [ast.Constant(None) for _ in bare.defaults]
+    bare.kw_defaults = [None if d is None else ast.Constant(None) for d in bare.kw_defaults]
+    scope: dict = {}
+    exec(f"def member({ast.unparse(bare)}): pass", scope)  # noqa: S102 — a signature, no body
+    return inspect.signature(scope["member"])
+
+
 def _accepts(args: ast.arguments, positional: int, keywords: tuple[str, ...]) -> bool:
-    """Whether a method with ``args`` accepts ``self`` plus the given call."""
-    params = [a.arg for a in [*args.posonlyargs, *args.args]][1:]
-    posonly = {a.arg for a in args.posonlyargs}
-    required = params[: len(params) - len(args.defaults)]
-    if any(p not in keywords or p in posonly for p in required[positional:]):
+    """Whether a method with ``args`` binds ``self`` plus the given call as Python would.
+
+    A keyword that binds only into ``**kwargs`` (a positional-only parameter of that name)
+    counts as refused: the call runs, but the parameter it meant to set does not get it.
+    """
+    signature = _signature(args)
+    try:
+        bound = signature.bind(None, *[None] * positional, **dict.fromkeys(keywords))
+    except TypeError:
         return False
-    if positional > len(params) and args.vararg is None:
-        return False
-    named = (set(params[positional:]) - posonly) | {a.arg for a in args.kwonlyargs}
-    # A keyword naming a parameter already bound positionally is "multiple values", ``**kwargs`` or not.
-    if set(keywords) & set(params[:positional]) or (args.kwarg is None and not set(keywords) <= named):
-        return False
-    required_kw = {a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is None}
-    return required_kw <= set(keywords)
+    extra = next(
+        (bound.arguments.get(p.name, {}) for p in signature.parameters.values() if p.kind is p.VAR_KEYWORD), {}
+    )
+    return not set(keywords) & set(extra)
 
 
 def check_members(tree: ast.Module) -> None:

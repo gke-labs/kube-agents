@@ -220,6 +220,11 @@ class ApplierTest(unittest.TestCase):
         self.assertFalse(verifier._accepts(posonly, 1, ("team_id",)))
         swapped = ast.parse("def _get_client(self, team_id, chat_id=None, **kwargs): pass").body[0].args
         self.assertFalse(verifier._accepts(swapped, 1, ("team_id",)))
+        swallowed = ast.parse("def _get_client(self, chat_id, team_id=None, /, **kwargs): pass").body[0].args
+        self.assertFalse(verifier._accepts(swallowed, 1, ("team_id",)))
+        annotated = ast.parse("def _get_client(self, chat_id: str, team_id: Opt[str] = UNSET): pass").body[0].args
+        self.assertTrue(verifier._accepts(annotated, 1, ("team_id",)))
+        self.assertTrue(verifier._accepts(annotated, 1, ()))
 
 
 class FlagOffIdentityTest(unittest.TestCase):
