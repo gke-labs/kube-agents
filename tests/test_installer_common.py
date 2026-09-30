@@ -456,9 +456,15 @@ class InstallerCommonTest(unittest.TestCase):
         key and destroys them under -auto-approve.
 
         The scope key is the contrast, and the reason this is asserted as a
-        pair: the clearing list is what decides, both halves of it are read
-        here, and a sentence claiming either key comes from the file alone is
-        true of exactly one of them.
+        pair: the clearing list is what decides, and a sentence claiming either
+        key comes from the file alone is true of exactly one of them.
+
+        Only load_install_env's half of that list is read here -- the body
+        sources installer_common.sh and never runs upgrade.sh. The other half
+        is pinned by test_upgrade_script.py's
+        test_the_upgrade_clearing_list_is_the_three_coordinates, which is the
+        one that fails if ENABLE_DRIFT_DETECTOR is ever added to it and the
+        guard's sentence goes stale.
         """
         with tempfile.TemporaryDirectory() as tmp:
             install_env = pathlib.Path(tmp) / "install.env"

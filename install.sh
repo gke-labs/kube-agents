@@ -1407,58 +1407,126 @@ unquote_shell_value() {
 # escaped, or not whitespace -- which drops the trailing run bash drops too.
 #
 # A comment is not the only thing that can follow the value, and the rest of
-# what can is why the scan does not simply stop at the first unquoted blank.
-# What comes after the blank decides whether bash assigns anything at all:
+# what can is why the value word alone is not the answer. Bash's simple
+# command is `(assignment | redirection)* [word ...]`, and it assigns to the
+# environment of the caller only when no word follows -- so what comes after
+# the blank decides whether bash assigns anything at all:
 #
 #   K=true; export K     assignment, then a second command   -> true
 #   K=true && true       same, through a list operator       -> true
 #   K=true > /dev/null   assignment with a redirection       -> true
 #   K=true 2>&1          the fd digits belong to the redirect-> true
+#   K=true &>/dev/null   and `&>` is one operator, not two   -> true
+#   K=true V=2           a second assignment is not a word   -> true
+#   export K=true V=2    `export` takes both as arguments    -> true
+#   export K=true :      and a plain word is an argument too -> true
 #   K= true              `true` is the command, K= its prefix-> unset
 #   K=a b                same shape, `a` never lands         -> unset
 #   K=true | cat         prefix of a pipeline element        -> unset
 #   K=true &             prefix of a background job          -> unset
+#   K=true 2>/dev/null | cat   a redirection does not end it -> unset
 #
-# The last four are the ones worth the code. Returning the tail for them --
+# The last five are the ones worth the code. Returning the tail for them --
 # `true`, or `a`, or `true | cat` -- tells a guard the file records a value
 # the shell that sources it will not have, and the guard then announces a
 # reversal of something that was never set. An empty answer is what
 # recorded_install_env_value returns for a key the file does not mention at
 # all, which is exactly what those spellings amount to.
 #
+# Hence two phases rather than one. The first reads the value word, stopping
+# at the unquoted blank or metacharacter that ends it. The second walks the
+# rest a word at a time and answers one question -- assignment, redirection,
+# terminator, comment, or a command word -- because no single character
+# decides it. A redirection in particular does not end the scan: `2>/dev/null`
+# leaves the value standing, and the `| cat` after it still takes it away.
+#
+# One spelling has no single right answer: `K=true &>>/dev/null` sets K under
+# bash 4 and later, where `&>>` is one operator, and leaves it unset under the
+# bash 3.2 macOS ships, which reads `&` and then `>>` and backgrounds the
+# assignment. The scan takes the former, which is what CI and every Linux
+# install run use. That is the only place it picks a version, and the parity
+# table leaves the row out rather than asserting whichever bash runs the test.
+#
+# The second argument is why that list has an `export` row. The grep in
+# recorded_install_env_value admits the prefix, and it changes the grammar
+# rather than decorating it: after `export`, every word is an argument to the
+# builtin, so `export K=true :` exports K and then fails to export `:`, where
+# the bare `K=true :` runs `:` with K in its environment alone. The word test
+# below is the only difference, and a pipeline or a background job still take
+# the value away in both -- the assignment lands in a subshell either way.
+#
 # `dropped` carries that verdict out of the loop, since awk's exit would skip
 # the print and leave the distinction to a side effect.
 bash_assigned_value() {
-  printf '%s' "${1:-}" | awk '
+  printf '%s' "${1:-}" | awk -v exported="${2:-}" '
+    # Advance past unquoted whitespace.
+    function skipblank(p,   c) {
+      while (p <= n) { c = substr($0, p, 1); if (c != " " && c != "\t") break; p++ }
+      return p
+    }
+    # Advance past one word, carrying the same quote state as phase one.
+    function skipword(p,   c, s, d) {
+      s = 0; d = 0
+      while (p <= n) {
+        c = substr($0, p, 1)
+        if (!s && c == "\\" && p < n) { p += 2; continue }
+        if (!d && c == "\x27") { s = !s; p++; continue }
+        if (!s && c == "\"") { d = !d; p++; continue }
+        if (!s && !d && (c == " " || c == "\t" || c == ";" || c == "&" || c == "|" || c == "<" || c == ">")) break
+        p++
+      }
+      return p
+    }
+    # p is the < or > of a redirection operator, past any fd digits or &.
+    # Consume the operator and the target word it applies to.
+    function skipredir(p,   c) {
+      c = substr($0, p, 1); p++
+      if (substr($0, p, 1) == c) p++     # >> or <<
+      if (substr($0, p, 1) == "&") p++   # >& or <&
+      return skipword(skipblank(p))
+    }
     {
-      out = ""; keep = 0; sq = 0; dq = 0; dropped = 0; n = length($0)
-      for (i = 1; i <= n; i++) {
+      n = length($0)
+      # Phase one: the value word.
+      out = ""; keep = 0; sq = 0; dq = 0; dropped = 0; i = 1
+      while (i <= n) {
         c = substr($0, i, 1)
-        if (!sq && c == "\\" && i < n) { out = out c substr($0, i + 1, 1); i++; keep = length(out); continue }
-        if (!dq && c == "\x27") { sq = !sq; out = out c; keep = length(out); continue }
-        if (!sq && c == "\"") { dq = !dq; out = out c; keep = length(out); continue }
-        if (!sq && !dq) {
-          # A comment, and only one starting a word: the value stands.
-          if (c == "#" && keep < length(out)) break
-          # A terminator or a redirection: the value stands.
-          if (c == ";" || c == ">" || c == "<") break
-          # && and || end the assignment; a single & or | makes it a prefix.
-          if (c == "&" || c == "|") {
-            if (substr($0, i + 1, 1) == c) break
-            dropped = 1; break
-          }
-          # First character of a word after unquoted whitespace. Digits then
-          # > or < are a redirection and the value stands; anything else is
-          # the command this assignment is only a prefix of.
-          if (keep < length(out) && c != " " && c != "\t") {
-            j = i
-            while (j <= n && substr($0, j, 1) ~ /[0-9]/) j++
-            if (j <= n && (substr($0, j, 1) == ">" || substr($0, j, 1) == "<")) break
-            dropped = 1; break
-          }
+        if (!sq && c == "\\" && i < n) { out = out c substr($0, i + 1, 1); i += 2; keep = length(out); continue }
+        if (!dq && c == "\x27") { sq = !sq; out = out c; i++; keep = length(out); continue }
+        if (!sq && c == "\"") { dq = !dq; out = out c; i++; keep = length(out); continue }
+        if (!sq && !dq && (c == " " || c == "\t" || c == ";" || c == "&" || c == "|" || c == "<" || c == ">")) break
+        out = out c; i++; keep = length(out)
+      }
+      # Phase two: what follows decides whether bash assigns it.
+      while (i <= n) {
+        i = skipblank(i)
+        if (i > n) break
+        c = substr($0, i, 1)
+        # A comment or a terminator: the value stands.
+        if (c == "#" || c == ";") break
+        if (c == "&") {
+          if (substr($0, i + 1, 1) == "&") break              # && ends the command
+          if (substr($0, i + 1, 1) == ">") { i = skipredir(i + 1); continue }
+          dropped = 1; break                                  # a background job
         }
-        out = out c
-        if (sq || dq || c != " " && c != "\t") keep = length(out)
+        if (c == "|") {
+          if (substr($0, i + 1, 1) == "|") break              # || ends the command
+          dropped = 1; break                                  # a pipeline element
+        }
+        if (c == ">" || c == "<") { i = skipredir(i); continue }
+        # Digits then > or < are a redirection, not a word.
+        j = i
+        while (j <= n && substr($0, j, 1) ~ /[0-9]/) j++
+        if (j > i && j <= n && (substr($0, j, 1) == ">" || substr($0, j, 1) == "<")) { i = skipredir(j); continue }
+        # A second assignment is not a word either: it joins this one. Under
+        # `export` nothing here is a command word at all.
+        if (exported != "") { i = skipword(i); continue }
+        if (c ~ /[A-Za-z_]/) {
+          j = i
+          while (j <= n && substr($0, j, 1) ~ /[A-Za-z0-9_]/) j++
+          if (j <= n && substr($0, j, 1) == "=") { i = skipword(j); continue }
+        }
+        dropped = 1; break                                    # a command word
       }
       if (!dropped) printf "%s", substr(out, 1, keep)
     }
@@ -1466,7 +1534,7 @@ bash_assigned_value() {
 }
 
 recorded_install_env_value() {
-  local file="${1:-}" key="${2:-}" line=""
+  local file="${1:-}" key="${2:-}" line="" exported=""
   [ -n "$file" ] && [ -f "$file" ] || return 0
   # install.env.example tells the operator `export K=V` is harmless, and every
   # other reader of the file honours that: save_env_var, live_test_lease.py and
@@ -1474,11 +1542,15 @@ recorded_install_env_value() {
   # reader in step -- missing the prefix skips the key silently, and in the
   # direction of no warning at all.
   # The `${line#*=}` below strips through the first `=`, so the longer prefix
-  # needs nothing further.
+  # needs nothing further -- but bash_assigned_value has to be told it was
+  # there, because it decides what a word after the value means.
   line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
   [ -n "$line" ] || return 0
+  case "${line#"${line%%[![:space:]]*}"}" in
+    export[[:space:]]*) exported="export" ;;
+  esac
   line="${line#*=}"
-  unquote_shell_value "$(bash_assigned_value "$line")"
+  unquote_shell_value "$(bash_assigned_value "$line" "$exported")"
 }
 
 # Say so when an interactive answer changed something the file still records

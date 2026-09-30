@@ -7043,6 +7043,16 @@ class DomainScopedFlagsTest(unittest.TestCase):
     # stays unset -- which the reader has to spell as the empty string it
     # returns for a key the file never mentions, or a guard announces the
     # reversal of a value nobody has.
+    #
+    # T onwards are the combinations no single character settles. A second
+    # assignment is not a command word (T), `export` makes even a plain word
+    # an argument rather than a command (U, W), a redirection leaves the value
+    # standing but does not end the command, so a pipeline or a background job
+    # after one still takes it away (X, Y) -- and `&>` and `>&` are single
+    # operators that must not be read as the `&` that backgrounds (Z, AB).
+    # `&>>` is the one spelling left out on purpose: bash 4 and later read it
+    # as one operator and bash 3.2 as two, so the row would assert whichever
+    # bash runs the test. bash_assigned_value's comment says which it takes.
     QUOTING_SPELLINGS = [
         "A=true # comment",
         "B=#hash",
@@ -7063,6 +7073,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "Q=true true",
         "R=true | cat",
         "S=true &",
+        "T=true SECOND_ASSIGNMENT=2",
+        "export U=true ANOTHER_ASSIGNMENT=2",
+        "export W=true ANOTHER_ASSIGNMENT",
+        "X=true 2>/dev/null | cat",
+        "Y=true >/dev/null &",
+        "Z=true &>/dev/null",
+        "AB=true >&2",
+        "AC=true THIRD_ASSIGNMENT=2 true",
+        "AD=a>/dev/null",
     ]
 
     def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
@@ -7075,7 +7094,12 @@ class DomainScopedFlagsTest(unittest.TestCase):
         spelling nobody thought of: the two readers cannot disagree without
         this failing.
         """
-        keys = [line.split("=", 1)[0] for line in self.QUOTING_SPELLINGS]
+        # removeprefix because the reader's grep admits `export K=V` and two
+        # rows spell it that way; without it the key here would be `export U`.
+        keys = [
+            line.split("=", 1)[0].removeprefix("export ")
+            for line in self.QUOTING_SPELLINGS
+        ]
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "spellings.env"
             env_file.write_text("\n".join(self.QUOTING_SPELLINGS) + "\n")
@@ -7087,8 +7111,8 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     f"set -a; source '{env_file}'; set +a",
                     f'for k in {" ".join(keys)}; do',
                     # ${!k-}, not ${!k}: install.sh runs under set -u, and P
-                    # through S are spellings that leave the key unset, which
-                    # is the whole point of them. Empty is also what the
+                    # through S, X, Y and AC are spellings that leave the key
+                    # unset, which is the point of them. Empty is also what the
                     # reader returns for a key the file never mentions, so the
                     # comparison below is between the same two answers.
                     '  printf "BASH\\t%s\\t[%s]\\n" "$k" "${!k-}"',
