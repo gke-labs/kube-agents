@@ -30,6 +30,7 @@ from kanban_progress_lines import (
     progress_note,
     render,
     rolling_line,
+    slack_line,
     sub_key,
     tracked_messages,
 )
@@ -840,6 +841,118 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn(STOPPED if kind == "gave_up" else FINISHED, with_flag_module.edits[-1][1])
             self.assertIn(f"{BULLET}Checking seeded-a.", with_flag_module.edits[-1][1])
+
+
+BOARD = "default"
+SLACK_HEAD = f"{HEADER}Kanban {SLACK_SUB['task_id']}"
+FAILURE_LINES = {
+    "gave_up": f"✖ {SLACK_HEAD} gave up after repeated spawn failures",
+    "crashed": f"✖ {SLACK_HEAD} worker crashed (pid gone); dispatcher will retry",
+    "blocked": f"⏸ {SLACK_HEAD} blocked: needs the prod-a kubeconfig",
+    "timed_out": f"⏱ {SLACK_HEAD} timed out (max_runtime=600s); will retry",
+}
+
+
+class SlackHeadsTest(unittest.IsolatedAsyncioTestCase):
+    """KAGE_SLACK_UX on a Slack card: no line carries the board tag or ``Kanban <id>``.
+
+    The ``@assignee`` stays: it is how the thread names the specialist.
+    """
+
+    setUp = SlackQuietTerminalTest.setUp
+
+    async def _run(self, adapter, sub, kind, message, header=HEADER):
+        watcher = self.watcher = SimpleNamespace()
+        await deliver(watcher, adapter, sub, "heartbeat", _beat(1, "Checking seeded-a."), "", None, header, board=BOARD)
+        await deliver(watcher, adapter, sub, "heartbeat", _beat(2, "Reading pod state."), "", None, header, board=BOARD)
+        return await deliver(watcher, adapter, sub, kind, _terminal(3, kind), message, None, header, board=BOARD)
+
+    async def test_progress_lines_keep_only_the_agent(self):
+        adapter = _Adapter()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up.")
+        self.assertEqual(adapter.sent[0][1], f"{IN_PROGRESS} @platform Checking seeded-a.")
+        self.assertEqual(adapter.edits[0][1], f"{IN_PROGRESS} @platform\n{BULLET}Checking seeded-a.\n{BULLET}Reading pod state.")
+        self.assertEqual(adapter.edits[-1][1], f"{FINISHED} @platform Reading pod state.")
+
+    async def test_the_no_summary_done_head_keeps_only_the_agent(self):
+        adapter = _Adapter()
+        head = kanban_notifier.COMPLETION_HEAD.format(head=SLACK_HEAD, title="check seeded-a")
+        await self._run(adapter, SLACK_SUB, "completed", head)
+        self.assertEqual(adapter.sent[-1][1], "✔ @platform done — check seeded-a")
+
+    async def test_a_held_failure_line_keeps_only_the_agent(self):
+        for kind, line in FAILURE_LINES.items():
+            with self.subTest(kind=kind):
+                adapter = _Adapter()
+                await self._run(adapter, SLACK_SUB, kind, line)
+                held = getattr(self.watcher, kanban_notifier.HELD_ATTR)[sub_key(SLACK_SUB)]
+                told = held[3][2]
+                self.assertEqual(told, line.replace(SLACK_HEAD, "@platform"))
+                await kanban_notifier.tell_unexplained(self.watcher, adapter, SLACK_SUB, set())
+                self.assertEqual(adapter.sent[-1][1], told)
+
+    async def test_a_posted_failure_line_keeps_only_the_agent(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        await self._run(adapter, sub, "blocked", FAILURE_LINES["blocked"])
+        self.assertEqual(adapter.sent[-1][1], "⏸ @platform blocked: needs the prod-a kubeconfig")
+
+    async def test_a_card_with_no_assignee_loses_the_head(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        line = f"✖ [{BOARD}] Kanban {SLACK_SUB['task_id']} gave up after repeated spawn failures"
+        await self._run(adapter, sub, "gave_up", line, header=f"[{BOARD}] ")
+        self.assertEqual(adapter.sent[0][1], f"{IN_PROGRESS} Checking seeded-a.")
+        self.assertEqual(adapter.sent[-1][1], "✖ gave up after repeated spawn failures")
+
+    async def test_no_line_carries_the_board_or_the_card(self):
+        for kind, line in FAILURE_LINES.items():
+            adapter = _Adapter()
+            await self._run(adapter, dict(SLACK_SUB, delivery_mode="notify"), kind, line)
+            for content in [c for _chat, c, _id in adapter.sent] + [c for _id, c in adapter.edits]:
+                self.assertNotIn(f"[{BOARD}]", content)
+                self.assertNotIn(SLACK_SUB["task_id"], content)
+                self.assertIn("@platform", content)
+
+    async def test_flag_off_keeps_upstreams_heads_byte_for_byte(self):
+        self.flag = False
+        for kind, line in (("completed", f"✔ {SLACK_HEAD} done — check seeded-a"), *FAILURE_LINES.items()):
+            with self.subTest(kind=kind):
+                with_flag_module, without = _Adapter(), _Adapter()
+                await self._run(with_flag_module, SLACK_SUB, kind, line)
+                with mock.patch.dict(sys.modules, {"gateway": None, "gateway.slack_ux_reactions": None}):
+                    await self._run(without, SLACK_SUB, kind, line)
+                self.assertEqual(
+                    (with_flag_module.sent, with_flag_module.edits), (without.sent, without.edits),
+                )
+                self.assertEqual(with_flag_module.sent[0][1], f"{IN_PROGRESS} {HEADER}Checking seeded-a.")
+                self.assertEqual(with_flag_module.sent[-1][1], line)
+
+    async def test_other_platforms_keep_upstreams_heads_with_the_flag_on(self):
+        adapter = _Adapter()
+        line = f"✖ {HEADER}Kanban {SUB['task_id']} gave up"
+        await self._run(adapter, SUB, "gave_up", line)
+        self.assertEqual(adapter.sent[0][1], f"{IN_PROGRESS} {HEADER}Checking seeded-a.")
+        self.assertEqual(adapter.sent[-1][1], line)
+
+
+class SlackLineTest(unittest.TestCase):
+    def test_changes_requested_names_the_agent(self):
+        line = f"🛑 [{BOARD}] Kanban t_1 review requested changes/BLOCK: fix it — reviewer @qa"
+        self.assertEqual(
+            slack_line(line, HEADER, BOARD, "t_1"),
+            "🛑 @platform review requested changes/BLOCK: fix it — reviewer @qa",
+        )
+
+    def test_only_the_head_is_trimmed(self):
+        line = f"✔ {HEADER}Kanban t_1 done — t\nSee Kanban t_1 in the board."
+        self.assertEqual(slack_line(line, HEADER, BOARD, "t_1"), "✔ @platform done — t\nSee Kanban t_1 in the board.")
+
+    def test_no_board(self):
+        self.assertEqual(slack_line("✖ @platform Kanban t_1 gave up", "@platform ", None, "t_1"), "✖ @platform gave up")
+
+    def test_a_line_without_the_head_is_unchanged(self):
+        self.assertEqual(slack_line("Both pods are up.", HEADER, BOARD, "t_1"), "Both pods are up.")
 
 
 class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
