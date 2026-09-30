@@ -7036,6 +7036,13 @@ class DomainScopedFlagsTest(unittest.TestCase):
     # The comment cases are the finding; the rest are what a fix for it must
     # not break -- a '#' mid-word, inside either quote, or backslash-escaped,
     # which is how %q writes SLACK_HOME_CHANNEL="#gke-alerts".
+    #
+    # L through S are the other half: a word after the value, where what the
+    # word is decides whether bash assigns anything at all. L to O leave the
+    # assignment standing, P to S make it a one-command prefix and the key
+    # stays unset -- which the reader has to spell as the empty string it
+    # returns for a key the file never mentions, or a guard announces the
+    # reversal of a value nobody has.
     QUOTING_SPELLINGS = [
         "A=true # comment",
         "B=#hash",
@@ -7048,6 +7055,14 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "I=trailing\\ space\\ ",
         "J='a' # after a quote",
         "K=  ",
+        "L=true; export L",
+        "M=true && true",
+        "N=true > /dev/null",
+        "O=true 2>/dev/null",
+        "P= true",
+        "Q=true true",
+        "R=true | cat",
+        "S=true &",
     ]
 
     def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
@@ -7071,7 +7086,12 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     "done",
                     f"set -a; source '{env_file}'; set +a",
                     f'for k in {" ".join(keys)}; do',
-                    '  printf "BASH\\t%s\\t[%s]\\n" "$k" "${!k}"',
+                    # ${!k-}, not ${!k}: install.sh runs under set -u, and P
+                    # through S are spellings that leave the key unset, which
+                    # is the whole point of them. Empty is also what the
+                    # reader returns for a key the file never mentions, so the
+                    # comparison below is between the same two answers.
+                    '  printf "BASH\\t%s\\t[%s]\\n" "$k" "${!k-}"',
                     "done",
                 ]
             )
@@ -7175,12 +7195,20 @@ class DomainScopedFlagsTest(unittest.TestCase):
         topic and subscription again -- empty, billing, and nothing said. The
         recorded value alone cannot see it, so the test above (which withholds
         the value when the file never asked) must not swallow this one.
+
+        The snippet re-exports ENABLE_DRIFT_DETECTOR from the chosen value
+        before calling the guard because main() does, a hundred lines before
+        it reaches bootstrap_install_env_file. Without that line the test
+        passes on a guard that reads the live environment, and production --
+        where the export has already landed -- stays silent on the one
+        population this branch exists for.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
             destination.write_text("PROJECT_ID=p\n")
             proc = self._parse(
                 "--enable-drift-detector=false",
+                'export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"\n'
                 f'bootstrap_install_env_file "{destination}" v1.2.3',
                 env={"ENABLE_DRIFT_DETECTOR": "true"},
             )

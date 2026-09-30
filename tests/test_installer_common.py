@@ -218,6 +218,13 @@ class InstallerCommonTest(unittest.TestCase):
                     # a developer's exported memory mode must not steer a test.
                     "MEMORY": "",
                     "MEMORY_PROVIDER": "",
+                    # Same reasoning, and the same ${VAR:-} read in
+                    # write_tfvars_from_state. get_isolated_test_env filters
+                    # the CI names and nothing else, so without this a shell
+                    # exporting ENABLE_DRIFT_DETECTOR=true reaches every case
+                    # that does not set it -- including the arm below that
+                    # asserts the drift keys are omitted when nobody asks.
+                    "ENABLE_DRIFT_DETECTOR": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -419,6 +426,12 @@ class InstallerCommonTest(unittest.TestCase):
         = false` here would therefore override an install already running the
         audit-log ingress that way, and the next upgrade would destroy its
         sink, topic and subscription under -auto-approve.
+
+        The None arm is the key absent from what the case passes in. It only
+        means "unset" because _run blanks ENABLE_DRIFT_DETECTOR in the
+        isolated environment it builds; get_isolated_test_env copies the rest
+        of os.environ through, so without that blank this arm would assert
+        against whatever the developer's shell happened to export.
         """
         for value in ("false", "False", "no", "0", "off", "", None):
             with self.subTest(value=value):

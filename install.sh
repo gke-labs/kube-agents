@@ -413,6 +413,17 @@ PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
 # provision the ingress with no warning that the next upgrade.sh destroys it.
 # main() therefore exports this one conditionally, as it does the backup plan.
 PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
+# The same value again, under a name nothing downstream writes. That
+# conditional export in main() overwrites ENABLE_DRIFT_DETECTOR with the
+# chosen value, and it runs before bootstrap_install_env_file, so by the time
+# the warning below asks "does this shell ask for the detector", the answer it
+# would read back is this run's own flag. `--enable-drift-detector=false` in a
+# shell exporting true would then look like nobody had asked for it, the
+# warning would stay silent, and the next run from that shell -- seeding
+# PARAM from the export again -- would provision the ingress the operator
+# thought they had just declined. This line is the last moment the shell's
+# answer and the run's answer are distinguishable.
+SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
@@ -1394,20 +1405,62 @@ unquote_shell_value() {
 # than a sed: it carries the same quote and backslash state unquote_shell_value
 # reads afterwards, and `keep` marks the last character that is quoted,
 # escaped, or not whitespace -- which drops the trailing run bash drops too.
-strip_unquoted_comment() {
+#
+# A comment is not the only thing that can follow the value, and the rest of
+# what can is why the scan does not simply stop at the first unquoted blank.
+# What comes after the blank decides whether bash assigns anything at all:
+#
+#   K=true; export K     assignment, then a second command   -> true
+#   K=true && true       same, through a list operator       -> true
+#   K=true > /dev/null   assignment with a redirection       -> true
+#   K=true 2>&1          the fd digits belong to the redirect-> true
+#   K= true              `true` is the command, K= its prefix-> unset
+#   K=a b                same shape, `a` never lands         -> unset
+#   K=true | cat         prefix of a pipeline element        -> unset
+#   K=true &             prefix of a background job          -> unset
+#
+# The last four are the ones worth the code. Returning the tail for them --
+# `true`, or `a`, or `true | cat` -- tells a guard the file records a value
+# the shell that sources it will not have, and the guard then announces a
+# reversal of something that was never set. An empty answer is what
+# recorded_install_env_value returns for a key the file does not mention at
+# all, which is exactly what those spellings amount to.
+#
+# `dropped` carries that verdict out of the loop, since awk's exit would skip
+# the print and leave the distinction to a side effect.
+bash_assigned_value() {
   printf '%s' "${1:-}" | awk '
     {
-      out = ""; keep = 0; sq = 0; dq = 0; n = length($0)
+      out = ""; keep = 0; sq = 0; dq = 0; dropped = 0; n = length($0)
       for (i = 1; i <= n; i++) {
         c = substr($0, i, 1)
         if (!sq && c == "\\" && i < n) { out = out c substr($0, i + 1, 1); i++; keep = length(out); continue }
         if (!dq && c == "\x27") { sq = !sq; out = out c; keep = length(out); continue }
         if (!sq && c == "\"") { dq = !dq; out = out c; keep = length(out); continue }
-        if (!sq && !dq && c == "#" && keep < length(out)) break
+        if (!sq && !dq) {
+          # A comment, and only one starting a word: the value stands.
+          if (c == "#" && keep < length(out)) break
+          # A terminator or a redirection: the value stands.
+          if (c == ";" || c == ">" || c == "<") break
+          # && and || end the assignment; a single & or | makes it a prefix.
+          if (c == "&" || c == "|") {
+            if (substr($0, i + 1, 1) == c) break
+            dropped = 1; break
+          }
+          # First character of a word after unquoted whitespace. Digits then
+          # > or < are a redirection and the value stands; anything else is
+          # the command this assignment is only a prefix of.
+          if (keep < length(out) && c != " " && c != "\t") {
+            j = i
+            while (j <= n && substr($0, j, 1) ~ /[0-9]/) j++
+            if (j <= n && (substr($0, j, 1) == ">" || substr($0, j, 1) == "<")) break
+            dropped = 1; break
+          }
+        }
         out = out c
         if (sq || dq || c != " " && c != "\t") keep = length(out)
       }
-      printf "%s", substr(out, 1, keep)
+      if (!dropped) printf "%s", substr(out, 1, keep)
     }
   '
 }
@@ -1425,7 +1478,7 @@ recorded_install_env_value() {
   line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
   [ -n "$line" ] || return 0
   line="${line#*=}"
-  unquote_shell_value "$(strip_unquoted_comment "$line")"
+  unquote_shell_value "$(bash_assigned_value "$line")"
 }
 
 # Say so when an interactive answer changed something the file still records
@@ -1677,12 +1730,15 @@ bootstrap_install_env_file() {
     # export -- PARAM_ENABLE_DRIFT_DETECTOR is seeded from the environment
     # before parse_args overwrites it, so that export is what the next run
     # from this shell chooses and what an upgrade.sh from it regenerates on.
+    # SHELL_ENABLE_DRIFT_DETECTOR rather than ENABLE_DRIFT_DETECTOR because
+    # main() has already overwritten the latter with this run's choice; the
+    # comment beside the capture has the consequence of reading the wrong one.
     local drift_detector_restorer="${destination}"
-    if [ -z "$drift_detector_recorded" ] && is_truthy "${ENABLE_DRIFT_DETECTOR:-false}"; then
-      drift_detector_restorer="the ENABLE_DRIFT_DETECTOR=${ENABLE_DRIFT_DETECTOR} this shell exports"
+    if [ -z "$drift_detector_recorded" ] && is_truthy "${SHELL_ENABLE_DRIFT_DETECTOR:-false}"; then
+      drift_detector_restorer="the ENABLE_DRIFT_DETECTOR=${SHELL_ENABLE_DRIFT_DETECTOR} this shell exports"
     fi
     if [ -n "$drift_detector_chosen" ] && ! is_truthy "$drift_detector_chosen"; then
-      if is_truthy "${drift_detector_recorded:-false}" || is_truthy "${ENABLE_DRIFT_DETECTOR:-false}"; then
+      if is_truthy "${drift_detector_recorded:-false}" || is_truthy "${SHELL_ENABLE_DRIFT_DETECTOR:-false}"; then
         # Off over something that asks for it on: the file, or -- with the file
         # silent -- the shell. The second is a reversal too, and the one this
         # guard exists to catch: the =false applies to this run, and the next
