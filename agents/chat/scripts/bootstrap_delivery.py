@@ -28,8 +28,9 @@ message). A report it cannot read, or one over ``REPORT_MAX_BYTES``, fails the
 run instead (exit 1), which the scheduler posts as an alert. An unreachable
 sandbox stays silent and is retried on the next tick until it has not answered
 for ``SANDBOX_UNANSWERED_ALERT_SECONDS``, then fails the run once and again every
-``UNANSWERED_REALERT_SECONDS`` while it stays unanswered. The first run ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two
-onboarding cron jobs; ``_retire_jobs`` says why the delivering run cannot.
+``UNANSWERED_REALERT_SECONDS`` while it stays unanswered. The first run
+``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
+cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
 The claim is what makes "exactly once" true rather than merely likely.
 ``.bootstrap_completed`` is created with ``O_CREAT | O_EXCL`` *before* anything

@@ -398,6 +398,21 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         later = T0 + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS + bootstrap_delivery.UNANSWERED_STREAK_GAP_SECONDS
         self.assertEqual(self._ticks(later, later + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS), {0})
 
+    def test_reads_closer_than_the_gap_keep_the_streak(self):
+        limit = bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
+        step = bootstrap_delivery.UNANSWERED_STREAK_GAP_SECONDS - 60
+        reads = range(T0, T0 + limit + step, step)
+        self.assertEqual([self._read_at(t)[0] for t in reads], [0] * (len(reads) - 1) + [1])
+
+    def test_a_streak_started_after_a_gap_alerts_without_waiting_out_the_realert_interval(self):
+        # The earlier alert was about a streak the sandbox may since have ended.
+        limit = T0 + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
+        self._ticks(T0, limit)
+        self.assertEqual(self._read_at(limit)[0], 1)
+        later = limit + bootstrap_delivery.UNANSWERED_STREAK_GAP_SECONDS
+        self.assertEqual(self._ticks(later, later + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS), {0})
+        self.assertEqual(self._read_at(later + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS)[0], 1)
+
     def test_a_read_the_sandbox_answers_restarts_the_limit(self):
         limit = bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
         for answered in (

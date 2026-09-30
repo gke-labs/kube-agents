@@ -47,11 +47,11 @@
 # arm removes their `.user_aligned`.
 #
 # Arming writes the two onboarding job records to `state_file` first. The
-# teardown, and the exit trap on a failed apply, remove `.user_aligned` and
-# `.bootstrap_completed` and put back either job the delivery removed, from
-# those records; `state_file` existing is what says this stack armed it. An
-# apply that finds `state_file` left by an earlier run finishes that teardown
-# before its own checks.
+# teardown, and the exit trap on a failed apply, remove `.user_aligned`,
+# `.bootstrap_completed` and `.bootstrap_sandbox_unanswered` and put back either
+# job the delivery removed, from those records; `state_file` existing is what
+# says this stack armed it. An apply that finds `state_file` left by an earlier
+# run finishes that teardown before its own checks.
 
 terraform {
   required_version = ">= 1.5.0"
