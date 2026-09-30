@@ -1995,6 +1995,13 @@ RUN set -eu; \
 
 USER 10000:10000
 
+# Slack presentation (reactions by kind, settle reaction), off by
+# default. An install turns it on through the PlatformAgent's
+# spec.deployment.env (the chart's platformAgent.deployment.env), which the
+# container's environment takes over this default. Read by
+# agents/platform/scripts/slack_presenter.py.
+ENV KAGE_SLACK_UX=0
+
 # The build this image came from, for the `User-Agent` that remote MCP calls
 # carry. Hermes resolves `${KUBE_AGENTS_VERSION}` in an `mcp_servers` entry's
 # `args` from the agent process environment, so the value has to be on the
@@ -2012,13 +2019,6 @@ USER 10000:10000
 # names the exact image.
 ARG KUBE_AGENTS_VERSION
 ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
-
-# Slack presentation (reactions by kind, settle reaction), off by
-# default. An install turns it on through the PlatformAgent's
-# spec.deployment.env (the chart's platformAgent.deployment.env), which the
-# container's environment takes over this default. Read by
-# agents/platform/scripts/slack_presenter.py.
-ENV KAGE_SLACK_UX=0
 
 # --- CREDENTIAL PROXY TOOLING ---
 # Everything the sidecar needs that is not agent source: the credential-aware

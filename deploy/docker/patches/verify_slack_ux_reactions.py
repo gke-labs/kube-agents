@@ -263,6 +263,7 @@ def _load_runtime(root: Path):
         raise _fail(f"{path} does not exist")
     spec = importlib.util.spec_from_file_location("slack_ux_reactions_verify", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     if module._presenter is None:
         raise _fail("slack_presenter did not import beside the runtime module")
@@ -277,7 +278,7 @@ async def _drive(module) -> None:
         raise _fail(f"enabled() is true with {FLAG_ENV} unset")
 
     os.environ[FLAG_ENV] = "1"
-    boards: list[frozenset] = []
+    boards: list[dict] = []
 
     async def open_cards(chat_id, thread_id):
         return boards.pop(0)
@@ -286,7 +287,7 @@ async def _drive(module) -> None:
 
     # A direct answer: arrival by kind, then the settle at once.
     adapter = _StubAdapter()
-    boards[:] = [frozenset(), frozenset()]
+    boards[:] = [{}, {}]
     await module.on_processing_start(adapter, _event("fix it"))
     await module.on_processing_complete(adapter, _event("fix it"), success)
     expected = [
@@ -298,9 +299,11 @@ async def _drive(module) -> None:
 
     # A delegated answer: nothing at completion; the notifier's terminal event settles it.
     adapter = _StubAdapter()
-    boards[:] = [frozenset(), frozenset({(module.DEFAULT_BOARD, CARD)})]
+    boards[:] = [{}, {(module.DEFAULT_BOARD, CARD): "running"}]
     await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
     await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
+    if adapter.calls != [(CHANNEL, ASK_TS, "eyes", TEAM, False)]:
+        raise _fail(f"delegated answer settled before the notifier: {adapter.calls!r}")
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": CARD}
     await module.settle_delegated(adapter, sub, "completed")
     expected = [

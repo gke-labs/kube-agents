@@ -29,8 +29,9 @@ With the flag on:
   cancelled turn adds nothing.
 * A turn that put new cards on the board, subscribed to this thread, defers
   its settle to those cards, and only those: a card already open when the ask
-  arrived is not its to wait on. A turn that failed after opening them still
-  settles ❌ when they finish, whatever they did. The kanban notifier calls
+  arrived is not its to wait on, unless the turn resumed it from ``blocked``
+  (answering its question, or retrying it after it gave up). A turn that failed
+  after opening them still settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
   or ❌ if any gave up. A fan-out settles once, when all of it has. Cards are
@@ -76,10 +77,11 @@ PLATFORM = "slack"
 #: the notifier names none.
 DEFAULT_BOARD = "default"
 
-#: Cards subscribed to one Slack thread that have not reached a final status.
-#: ``blocked`` counts as open: it waits on the user and will run on.
+#: Cards subscribed to one Slack thread that have not reached a final status,
+#: with that status. ``blocked`` counts as open: it waits on the user and will
+#: run on.
 OPEN_CARDS_SQL = (
-    "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+    "SELECT s.task_id, t.status FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"
 )
@@ -103,12 +105,14 @@ DEFERRED_PER_THREAD = 32
 #: The notifier's dedup key for a board whose database path does not resolve.
 UNRESOLVED_PREFIX = "slug:"
 
+#: A card waiting on the user, or parked after giving up. A turn that moves one
+#: of its thread's cards out of this status resumed it.
+BLOCKED = "blocked"
+
 
 class _Ask:
     """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``.
 
-    A plain class, not a dataclass: the build-time verify loads this module by
-    path without registering it in ``sys.modules``, which ``@dataclass`` needs.
     """
 
     __slots__ = ("cards", "failed", "team_id", "ts")
@@ -120,7 +124,7 @@ class _Ask:
         self.failed = failed
 
 
-_started: OrderedDict[Any, frozenset | None] = OrderedDict()
+_started: OrderedDict[Any, dict | None] = OrderedDict()
 _deferred: OrderedDict[tuple, list[_Ask]] = OrderedDict()
 #: Cards the notifier has reported finished, as ``(board, id)``, and whether each
 #: failed. A card can finish between the turn's board read and the moment its
@@ -159,8 +163,8 @@ def _live_boards(kb: Any) -> list[dict]:
         return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
 
 
-def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
-    """``(board, id)`` of every open card subscribed to this thread, on every live board.
+def _query_open_cards(chat_id: str, thread_id: str) -> dict:
+    """Every open card subscribed to this thread, on every live board, as ``{(board, id): status}``.
 
     Boards are walked as the notifier walks them: one read per database, under
     the slug the notifier stamps on that database's deliveries. So a card read
@@ -171,7 +175,7 @@ def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect
 
-    cards: set[tuple[str, str]] = set()
+    cards: dict[tuple[str, str], str] = {}
     seen: set[str] = set()
     for meta in _live_boards(kb):
         slug = meta.get("slug") or kb.DEFAULT_BOARD
@@ -194,12 +198,12 @@ def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
         except Exception as exc:  # noqa: BLE001 — one bad board does not blank the others
             logger.debug("slack_ux_reactions: kanban board %s unreadable: %s", slug, exc)
             continue
-        cards.update((slug, row[0]) for row in rows)
-    return frozenset(cards)
+        cards.update(((slug, row[0]), row[1]) for row in rows)
+    return cards
 
 
-async def open_cards(chat_id: str, thread_id: str) -> frozenset | None:
-    """``(board, id)`` of the open cards subscribed to this thread, or None when a board cannot be read."""
+async def open_cards(chat_id: str, thread_id: str) -> dict | None:
+    """The thread's open cards as ``{(board, id): status}``, or None when the boards cannot be read."""
     try:
         return await asyncio.to_thread(_query_open_cards, chat_id, thread_id)
     except Exception as exc:  # noqa: BLE001 — a cosmetic read never fails a turn
@@ -210,6 +214,14 @@ async def open_cards(chat_id: str, thread_id: str) -> frozenset | None:
 def _where(event: Any) -> tuple[str | None, str]:
     source = getattr(event, "source", None)
     return getattr(source, "chat_id", None), str(getattr(source, "thread_id", "") or "")
+
+
+def _own_cards(before: dict, after: dict) -> set:
+    """The cards this turn is waiting on: opened during it, or resumed from ``blocked``."""
+    return {
+        card for card, status in after.items()
+        if card not in before or (before[card] == BLOCKED and status != BLOCKED)
+    }
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
@@ -225,7 +237,13 @@ async def on_processing_start(adapter: Any, event: Any) -> None:
     await adapter._react(chat_id, ts, emoji, team_id, remove=False)
     # After the reaction, so the read never delays it; the model has not
     # created a card yet, since the turn has not reached its first tool call.
-    _remember(_started, marker, await open_cards(chat_id, thread_id), STARTED_MAX)
+    before = await open_cards(chat_id, thread_id)
+    # A card open now has not finished since it last did: a gave-up card sits
+    # at blocked. Forget that finish, so a retry this turn waits on the card
+    # again; a finish reported during the turn is recorded afresh.
+    for card in before or ():
+        _finished.pop(card, None)
+    _remember(_started, marker, before, STARTED_MAX)
 
 
 async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None:
@@ -241,8 +259,8 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
     if not chat_id or settle is None:
         return
     after = await open_cards(chat_id, thread_id)
-    if before is not None and after is not None and after - before:
-        new = after - before
+    new = _own_cards(before, after) if before is not None and after is not None else set()
+    if new:
         waiting = set(new) - set(_finished)
         # The turn's own failure carries into the deferred settle: cards that
         # later complete do not undo an ask whose turn raised.

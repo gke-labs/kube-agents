@@ -300,9 +300,11 @@ async def deliver(
 
     Terminal events are unchanged from the caller's point of view — a new
     message, with the artifact upload and failure accounting that follow it
-    untouched. The only thing added on that path is settling the rolling
-    message first, and that is best-effort: a failed cosmetic edit must not
-    reach the notifier's ``except``, where it would rewind the cursor and count
+    untouched. Two things are added on that path, both best-effort: settling
+    the rolling message first, and, once the terminal message has posted,
+    the ``KAGE_SLACK_UX`` settle reaction on the ask
+    (``slack_ux_reactions.settle_delegated``). Neither may reach the notifier's
+    ``except``, where a failed cosmetic call would rewind the cursor and count
     against the subscription's send-failure budget.
     """
     chat_id = sub["chat_id"]
