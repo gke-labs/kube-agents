@@ -57,6 +57,7 @@ from kanban_notifier import (
     NOTE_SIGNATURE,
     RESULT_LIMIT,
     SEPARATOR,
+    TELL_ATTEMPTS,
     UNDELIVERED_OUTCOME_KINDS,
     UNSTRUCTURED_MIN_CHARS,
     _warned_config,
@@ -1659,25 +1660,55 @@ class ExplainedByWakeTest(unittest.TestCase):
 
 
 class _SendLog:
-    """An adapter whose ``send`` records each call, raising or failing on request."""
+    """An adapter whose ``send`` records each call, raising or failing on request.
 
-    def __init__(self, outcome=None):
+    ``outcome`` answers every call; ``outcomes``, when given, answers the calls
+    in order and then falls back to ``outcome``.
+    """
+
+    def __init__(self, outcome=None, outcomes=()):
         self.sent = []
         self.outcome = outcome
+        self.outcomes = list(outcomes)
 
     async def send(self, chat_id, message, metadata=None):
         self.sent.append((chat_id, message, metadata))
-        if isinstance(self.outcome, BaseException):
-            raise self.outcome
-        return self.outcome
+        outcome = self.outcomes.pop(0) if self.outcomes else self.outcome
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class _Scope:
+    """An owner scope that records whether a send ran inside it."""
+
+    def __init__(self, adapter):
+        self.adapter, self.entered, self.sends_inside = adapter, 0, 0
+
+    def __call__(self):
+        scope = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                scope.entered += 1
+                scope.before = len(scope.adapter.sent)
+
+            async def __aexit__(self, *exc):
+                scope.sends_inside += len(scope.adapter.sent) - scope.before
+                return False
+
+        return _Ctx()
 
 
 class HeldFailureLinesTest(unittest.TestCase):
     def setUp(self):
         self.runner = types.SimpleNamespace()
+        patcher = mock.patch("kanban_notifier.TELL_RETRY_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def tell(self, adapter, woken, sub=None):
-        asyncio.run(tell_unexplained(self.runner, adapter, sub or _sub(), woken))
+    def tell(self, adapter, woken, sub=None, scope=None):
+        asyncio.run(tell_unexplained(self.runner, adapter, sub or _sub(), woken, scope))
 
     def test_a_line_the_wake_covered_is_dropped(self):
         hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", {"thread_id": "1.2"})
@@ -1721,11 +1752,27 @@ class HeldFailureLinesTest(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 self.runner = types.SimpleNamespace()
                 hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
+                failing = _SendLog(outcome)
                 with self.assertLogs("gateway.run", level="WARNING"):
-                    self.tell(_SendLog(outcome), set())
+                    self.tell(failing, set())
+                self.assertEqual(len(failing.sent), TELL_ATTEMPTS)
                 adapter = _SendLog()
                 self.tell(adapter, set())
                 self.assertEqual(len(adapter.sent), 1)
+
+    def test_a_post_that_fails_once_is_retried_in_place(self):
+        hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
+        adapter = _SendLog(outcomes=[RuntimeError("slack 503")])
+        self.tell(adapter, set())
+        self.assertEqual([m for _, m, _ in adapter.sent], ["✖ gave up", "✖ gave up"])
+        self.assertEqual(getattr(self.runner, HELD_ATTR), {})
+
+    def test_the_post_runs_in_the_owner_scope(self):
+        hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
+        adapter = _SendLog()
+        scope = _Scope(adapter)
+        self.tell(adapter, set(), scope=scope)
+        self.assertEqual((scope.entered, scope.sends_inside), (1, 1))
 
     def test_nothing_held_sends_nothing_and_never_raises(self):
         adapter = _SendLog(RuntimeError("never called"))
@@ -1742,6 +1789,14 @@ class HeldFailureLinesTest(unittest.TestCase):
         held = getattr(self.runner, HELD_ATTR)
         self.assertEqual(len(held), HELD_MAX)
         self.assertNotIn(("t_0", "slack", "C1", "1.2"), held)
+
+    def test_an_evicted_line_is_logged_by_card(self):
+        for i in range(HELD_MAX):
+            hold_explained(self.runner, dict(_sub(), task_id=f"t_{i}"), "gave_up", 1, "✖", None)
+        with self.assertLogs("gateway.run", level="WARNING") as logs:
+            hold_explained(self.runner, dict(_sub(), task_id="t_new"), "crashed", 1, "✖", None)
+        self.assertIn("gave_up", logs.output[0])
+        self.assertIn("t_0", logs.output[0])
 
 
 # =============================================================================
@@ -2252,10 +2307,14 @@ class _Delivery:
             async def unsub(self):
                 pass
 
+            def _owner_scope(self):
+                record.scopes += 1
+                return contextlib.nullcontext()
+
         self.cls = Notification
         self.runner, self.adapter, self.sub, self.events = runner, adapter, sub, events
         self.wake_outcomes = list(wake_outcomes)
-        self.wakes = self.failures = self.rewinds = self.advanced = 0
+        self.wakes = self.failures = self.rewinds = self.advanced = self.scopes = 0
 
     def tick(self):
         """One notifier tick: a fresh object per delivery, as upstream builds it."""

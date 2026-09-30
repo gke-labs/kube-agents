@@ -1063,10 +1063,10 @@ for _platform in ("slack", "google_chat"):
 # through ``kanban_progress_lines``, the real wake gate and failure accounting
 # -- with only the transport faked: the adapter, the wake itself, the cursor
 # ops, and ``gateway.slack_ux_reactions``, which is installed later in the build
-# and so is stood in here with the flag on. What it proves is the P1 this
-# section was written for: with the flag on, a Slack failure the wake was
-# expected to explain posts nothing when the wake lands, and posts its line
-# exactly once when the wake raises, however many retries follow.
+# and so is stood in here with the flag on. What it proves is that a held
+# failure line is not lost to a failed wake: with the flag on, a Slack failure
+# the wake was expected to explain posts nothing when the wake lands, and posts
+# its line exactly once when the wake raises, however many retries follow.
 print("held failure lines:")
 import asyncio  # noqa: E402
 import types  # noqa: E402
