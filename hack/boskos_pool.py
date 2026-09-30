@@ -28,10 +28,26 @@ FREE_STATE = "free"
 TIMEOUT_SECONDS = 30
 # Boskos answers /acquire with 404 when no resource is in the requested state.
 NO_RESOURCE_CODE = 404
-# Boskos picks any free resource, so after a release the same project can come
-# straight back. Stop after this many consecutive repeats: the pool has been
-# walked, and anything unvisited is busy.
+# Boskos hands out the free project untouched the longest (its list is sorted
+# by LastUpdate), and a release stamps the project, so a walk gets every free
+# project before it sees one again: a repeat means the pool has been walked and
+# anything unvisited is busy. Three in a row is margin; each is a hold of
+# MIN_HOLD_SECONDS and nothing more.
 MAX_CONSECUTIVE_REPEATS = 3
+# Boskos answers a release by reading the project back through a cache that
+# its own lease write reaches a moment later. A release within milliseconds of
+# the lease can read the pre-lease copy -- no owner -- and be refused "owner
+# mismatch ... currently owned by" nobody, while the lease stands until the
+# reaper's expiry. So every hold lasts at least this long before its release,
+# and a release refused that way is tried once more after the same pause.
+MIN_HOLD_SECONDS = 1.0
+OWNER_MISMATCH_CODE = 401
+# How much of an error body a message keeps: Boskos's names the current owner,
+# GitHub's the limit or permission that refused.
+ERROR_BODY_CHARS = 300
+# The clock and the pause, as module attributes so a test can stand in for both.
+clock = time.monotonic
+pause = time.sleep
 # A hold longer than seconds keeps its LastUpdate fresh with /update, as the
 # presubmit does (hack/boskos_heartbeat.sh, same cadence): the pool's reaper
 # reclaims a lease whose LastUpdate is stale for about five minutes.
@@ -71,11 +87,35 @@ def terminate(signum, frame):
     raise Terminated("signal %d" % signum)
 
 
+def error_body(exc):
+    """The first ERROR_BODY_CHARS of an HTTPError's body, read once and kept on it."""
+    kept = getattr(exc, "body", None)
+    if kept is None:
+        try:
+            kept = exc.read().decode("utf-8", "replace")[:ERROR_BODY_CHARS].strip()
+        except (OSError, ValueError, AttributeError):
+            kept = ""
+        exc.body = kept
+    return kept
+
+
+def describe(exc):
+    """An exception for a log line: an HTTPError with its status and body, else str()."""
+    if isinstance(exc, urllib.error.HTTPError):
+        body = error_body(exc)
+        return "HTTP %d %s%s" % (exc.code, exc.reason, ": " + body if body else "")
+    return str(exc)
+
+
 def _call(server, action, params):
     query = urllib.parse.urlencode(params)
     request = urllib.request.Request("%s/%s?%s" % (server.rstrip("/"), action, query), method="POST")
-    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-        raw = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        error_body(exc)
+        raise
     if not raw:
         return None
     try:
@@ -113,6 +153,22 @@ def acquire(server, owner, hold_state, name=None):
 
 def release(server, owner, name):
     _call(server, "release", {"name": name, "dest": FREE_STATE, "owner": owner})
+
+
+def release_settled(server, owner, name, held_since):
+    """Release after the hold has lasted MIN_HOLD_SECONDS; on an owner-mismatch
+    refusal, the cache lag above, pause once more and release again."""
+    remaining = MIN_HOLD_SECONDS - (clock() - held_since)
+    if remaining > 0:
+        pause(remaining)
+    try:
+        release(server, owner, name)
+    except urllib.error.HTTPError as exc:
+        if exc.code != OWNER_MISMATCH_CODE:
+            raise
+        print("  %s: release refused (%s); releasing again after %.0fs" % (name, describe(exc), MIN_HOLD_SECONDS), file=sys.stderr)
+        pause(MIN_HOLD_SECONDS)
+        release(server, owner, name)
 
 
 def update(server, owner, hold_state, name):
@@ -210,6 +266,7 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
         name = acquire_fn()
         if name is None:
             return NOT_ACQUIRED
+        held_since = clock()
         stop = threading.Event()
         beater = None
         try:
@@ -229,10 +286,10 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
                 if beater is not None:
                     beater.join()
                 try:
-                    release(server, owner, name)
+                    release_settled(server, owner, name, held_since)
                 except (BoskosError,) + REACH_ERRORS as exc:
-                    print("  %s: release failed (%s); the next run's reset returns it" % (name, exc), file=sys.stderr)
-                    release_failures[name] = "release failed: %s" % exc
+                    print("  %s: release failed (%s); the next run's reset returns it" % (name, describe(exc)), file=sys.stderr)
+                    release_failures[name] = "release failed: %s" % describe(exc)
     finally:
         _hold_signals(False)
 

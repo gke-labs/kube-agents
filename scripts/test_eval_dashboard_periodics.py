@@ -72,7 +72,7 @@ def archive(job, builds):
         if finished is not None:
             objects[f"{root}/{build}/{periodics.FINISHED}"] = json.dumps(finished)
         if artifact is not None:
-            objects[f"{root}/{build}/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = json.dumps(artifact)
+            objects[f"{root}/{build}/{periodics.ARTIFACTS_DIR}/{periodics.WATCHED_BY_JOB[job].artifact}"] = json.dumps(artifact)
     return objects
 
 
@@ -108,7 +108,7 @@ class FetchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=gsutil)
         self.assertEqual(readings[SWEEP.job]["build"], "8")
-        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat"], "pointer and finished.json only, no ls")
+        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat", "cat"], "pointer, finished.json and the report; no ls")
 
     def test_an_aborted_newest_build_is_walked_past_not_reported_as_failed(self):
         # Prow's sidecar writes finished.json with result ABORTED when it
@@ -291,12 +291,11 @@ class AssessTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertIn("not a JSON object", warnings[0])
         self.assertEqual(periodics.reconcile_detail(readings[WEEKLY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
-        # A passed build's artifact is not read: nothing would name its projects.
+        # A passed build's report is read too: the recovery message says what the run did.
         passed = FakeGsutil(archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=passed)
-        self.assertIsNone(readings[WEEKLY.job]["artifact"])
-        self.assertFalse([c for c in passed.calls if c[3].endswith(periodics.RECONCILE_ARTIFACT)])
+        self.assertEqual(readings[WEEKLY.job]["artifact"], report)
         # A run that wrote no artifact is a reading without one.
         absent = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
@@ -338,6 +337,47 @@ class WorkflowWiring(unittest.TestCase):
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--periodics-dir work/periodics", adjudicate["run"])
         self.assertLess(names.index(fetch["name"]), names.index("Adjudicate"))
+
+    def test_the_sweeps_report_gives_the_detail_and_the_summary(self):
+        report = {"projects": 11, "closed": 0, "failed": 11, "left_for_next_run": 0, "ended_early": "GitHub refused PATCH twice (HTTP 403 Forbidden: secondary rate limit)",
+                  "outcomes": {"kube-agents-evals-%d" % n: {"error": "HTTP 403 Forbidden: secondary rate limit"} for n in range(2, 13)}}
+        lines = periodics.sweep_detail(report)
+        self.assertEqual(lines[0], "kube-agents-evals-10: HTTP 403 Forbidden: secondary rate limit")
+        self.assertEqual(lines[periodics.DETAIL_LIMIT], "and 6 more")
+        self.assertEqual(lines[-1], "run ended early: GitHub refused PATCH twice (HTTP 403 Forbidden: secondary rate limit)")
+        self.assertEqual(periodics.run_summary(SWEEP, report, passed=False), "failed in 11 of 11 project(s)")
+        drained = {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 30, "ended_early": None, "outcomes": {}}
+        self.assertEqual(periodics.run_summary(SWEEP, drained, passed=True), "closed 241 pull request(s) across 12 project(s), 30 write(s) left for the next run")
+        self.assertEqual(periodics.sweep_detail(drained), ["30 write(s) left for the next run (the run's write budget)"])
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=True), "nothing to do")
+        self.assertIsNone(periodics.run_summary(WEEKLY, None, passed=True))
+
+    def test_a_failed_sweep_note_carries_its_report_and_a_passed_one_its_summary(self):
+        report = {"projects": 3, "closed": 1, "failed": 2, "left_for_next_run": 0, "ended_early": None, "outcomes": {"kube-agents-evals-2": {"error": "HTTP 403 Forbidden: x"}, "kube-agents-evals-3": {"closed": 1}, "kube-agents-evals-4": {"error": "HTTP 502 Bad Gateway"}}}
+        failed = {"job": SWEEP.job, "build": "100", "finished_at": (NOW - timedelta(minutes=5)).isoformat(timespec="seconds"), "passed": False, "result": "FAILURE", "artifact": report}
+        notes = periodics.assess({SWEEP.job: failed}, NOW, None)
+        note = notes[SWEEP.job]
+        self.assertEqual(note["summary"], "failed in 2 of 3 project(s)")
+        self.assertEqual(note["detail"], ["kube-agents-evals-2: HTTP 403 Forbidden: x", "kube-agents-evals-4: HTTP 502 Bad Gateway"])
+        self.assertEqual((note["place"], note["absence"]), ("Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up"))
+        self.assertTrue(note["runbook"].endswith("#55-the-pull-request-sweep"))
+        passed = {"job": SWEEP.job, "build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "result": "SUCCESS", "artifact": {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 0, "outcomes": {}}}
+        runs = periodics.runs({SWEEP.job: passed})
+        self.assertEqual(runs[SWEEP.job], {"build": "100", "finished_at": NOW.isoformat(timespec="seconds"), "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"})
+
+    def test_every_watched_job_has_its_words_and_a_runbook_section_that_exists(self):
+        headings = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ci-pool-projects.md").read_text().splitlines()
+        slugs = set()
+        for line in headings:
+            if line.startswith("#"):
+                text = line.lstrip("#").strip().lower()
+                slugs.add("".join(ch for ch in text.replace(" ", "-") if ch.isalnum() or ch == "-"))
+        for periodic in periodics.WATCHED:
+            for field in ("place", "absence", "presence", "does", "effect", "runbook"):
+                self.assertTrue(getattr(periodic, field), f"{periodic.job} has no {field}")
+            self.assertTrue(periodic.runbook.startswith(periodics.RUNBOOK_ROOT + "docs/ci-pool-projects.md#"), periodic.runbook)
+            self.assertIn(periodic.runbook.split("#", 1)[1], slugs, f"{periodic.job}'s runbook anchor names no heading")
 
     def test_the_watched_jobs_are_the_three_periodics(self):
         # The names are the Prow job names in oss-test-infra, which nothing here

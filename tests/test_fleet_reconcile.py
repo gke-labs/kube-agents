@@ -91,6 +91,18 @@ class _Tofu:
         return [call[1] for call in self.calls]
 
 
+def setUpModule():
+    # boskos_pool holds every lease a second before releasing it (its cache
+    # lag); the reconcile's holds last minutes, so nothing here depends on it.
+    global _real_pool_pause
+    _real_pool_pause = boskos_pool.pause
+    boskos_pool.pause = lambda seconds: None
+
+
+def tearDownModule():
+    boskos_pool.pause = _real_pool_pause
+
+
 class _Boskos:
     """A stand-in for the Boskos server: `free` in order for /acquire, by name for /acquirebystate."""
 

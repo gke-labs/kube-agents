@@ -1267,6 +1267,10 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual(result["periodics"], {})
         self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
         self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
+        # What each read job's latest build did, for the recovery message.
+        self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
+        self.assertIsNone(result["periodics_runs"][self.SWEEP]["summary"], "no report, no summary")
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
         stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})

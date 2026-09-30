@@ -374,8 +374,9 @@ latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
-running), keeps the reconcile's `fleet-reconcile.json` when a failed build wrote
-one, and hands the readings to `health.py --periodics-dir`.
+running), keeps the job's report when the build wrote one (the reconcile's
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`), and hands the readings
+to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note; one whose latest finished
@@ -384,21 +385,32 @@ hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
-for that job included), the job's history link, where the
-recovery is written, and for the reconcile the projects it refused, failed or
-was interrupted in, with each one's reason, up to five. A job with no reading
-writes no note and ends none: that is the bot losing sight of the job, not the
-job recovering.
+for that job included), the job's history link, the runbook link, the words the
+message is built from (where the job acts, what stops happening when it fails
+and resumes when it recovers, what it does and how often, what a failure costs),
+a one-line summary of what the run did from its report, and the report's detail
+lines, up to five: for the reconcile the projects it refused, failed or was
+interrupted in with each one's reason; for the sweep the projects whose sweep
+failed with GitHub's answer, what the run left for the next one under its write
+budget, and why it ended early if it did. `periodics_runs` carries every read
+job's latest build and its summary, which is what the recovery message says. A
+job with no reading writes no note and ends none: that is the bot losing sight
+of the job, not the job recovering.
 
 The poster sends one message per episode and verdict: a job's first failing
 build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
-was told about passes again, on a reading only. The digest carries one line per
-open note.
-Nothing here files an issue: the recovery is a person's, and the failed
-message says where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
+was told about passes again, on a reading only. Each message is four lines: a
+headline naming where and what stopped happening ("Eval GitOps repos: leftover
+pull requests from eval runs are not being cleaned up"); the job, what it does
+and how often, which run and how it failed, with the report's detail lines under
+it; the effect and the scope ("CI eval infrastructure only"); the runbook link
+and the build link. The recovery names the run and what it did ("closed 241 pull
+request(s) across 12 project(s)"). The digest carries one line per open note.
+Nothing here files an issue: the recovery is a person's, and every message links
+the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
 ## The comment on a red pull request
 

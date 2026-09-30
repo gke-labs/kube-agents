@@ -20,7 +20,8 @@ periodics' readings (`--periodics-dir`, scripts/eval_dashboard/periodics.py)
 -- health.json out (abridged; SCHEMA.md has every key)::
 
     {state, since, cause, failing_cases, evidence, advice, slow, pool,
-     fixture_state, pool_state, periodics, periodics_read, periodics_since,
+     fixture_state, pool_state, periodics, periodics_read, periodics_runs,
+     periodics_since,
      metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
@@ -2264,6 +2265,7 @@ def adjudicate(
         "pool": pool,
         "periodics": watched,
         "periodics_read": sorted(readings),
+        "periodics_runs": periodics.runs(readings),
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,

@@ -55,6 +55,17 @@ DETAIL_LIMIT = 5
 # The reconcile's artifact (hack/fleet_reconcile.py --report) and the outcomes
 # in it worth naming.
 RECONCILE_ARTIFACT = "fleet-reconcile.json"
+# The sweep's report (hack/ci_sweep_agent_pulls.py write_report).
+SWEEP_ARTIFACT = "pull-sweep.json"
+SWEEP_KEY_CLOSED = "closed"
+SWEEP_KEY_PROJECTS = "projects"
+SWEEP_KEY_FAILED = "failed"
+SWEEP_KEY_LEFT = "left_for_next_run"
+SWEEP_KEY_ENDED_EARLY = "ended_early"
+# Where the runbook sections live, as a link a reader can click.
+RUNBOOK_ROOT = "https://github.com/gke-labs/kube-agents/blob/main/"
+# The scope line every message carries: none of this reaches a user cluster.
+SCOPE_LINE = "CI eval infrastructure only."
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
 # settled on for the Prow archive; the same wording here. Never a bare 404,
@@ -90,6 +101,15 @@ KEY_DRY_RUN = "dry_run"
 KEY_DETAIL = "detail"
 KEY_HISTORY_URL = "history_url"
 KEY_DOC = "doc"
+KEY_PLACE = "place"
+KEY_ABSENCE = "absence"
+KEY_PRESENCE = "presence"
+KEY_DOES = "does"
+KEY_EFFECT = "effect"
+KEY_RUNBOOK = "runbook"
+KEY_SUMMARY = "summary"
+# The reconcile's summary counts (hack/fleet_reconcile.py write_report).
+RECONCILE_KEY_SUMMARY = "summary"
 # The reconcile's report (hack/fleet_reconcile.py write_report).
 REPORT_KEY_OUTCOMES = "outcomes"
 REPORT_KEY_OUTCOME = "outcome"
@@ -99,6 +119,11 @@ REPORT_KEY_ERROR = "error"
 
 @dataclasses.dataclass(frozen=True)
 class Periodic:
+    """One watched job, and the words its messages are built from: where it
+    acts (`place`), what stops happening when it fails (`absence`) and starts
+    again when it recovers (`presence`), what it does and how often (`does`),
+    what a failure costs (`effect`), and where the runbook section is."""
+
     job: str
     label: str
     # A finished build older than this is a job that stopped running. It is a
@@ -107,14 +132,42 @@ class Periodic:
     # TestGrid stale-results settings were; the weekly's is a week and a day.
     stale_after: timedelta
     artifact: str | None
-    # Where the recovery is written up.
+    # Where the recovery is written up, as a path a reader can find and as a link.
     doc: str
+    place: str
+    absence: str
+    presence: str
+    does: str
+    effect: str
+    runbook: str
 
 
+SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals-<n>-infra` repos"
+SWEEP_EFFECT = "pull requests pile up in those repos, and eval cases that open one can link an old one and fail."
+RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (
-    Periodic("ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), None, "docs/ci-pool-projects.md, section 5.5"),
-    Periodic("ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT, "docs/ci-pool-projects.md, section 6.2"),
-    Periodic("ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly)", timedelta(hours=192), RECONCILE_ARTIFACT, "docs/ci-pool-projects.md, section 6.2"),
+    Periodic(
+        "ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), SWEEP_ARTIFACT,
+        "docs/ci-pool-projects.md, section 5.5",
+        "Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up",
+        "leftover pull requests from eval runs are being cleaned up again",
+        f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-pull-request-sweep",
+    ),
+    Periodic(
+        "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT,
+        "docs/ci-pool-projects.md, section 6.2",
+        "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
+        "runs hourly and re-applies the seeded-fleet stack in the pool projects the scan reports drifted", RECONCILE_EFFECT,
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+    ),
+    Periodic(
+        "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly)", timedelta(hours=192), RECONCILE_ARTIFACT,
+        "docs/ci-pool-projects.md, section 6.2",
+        "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
+        "runs weekly and re-applies the seeded-fleet stack in every free pool project", RECONCILE_EFFECT,
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+    ),
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
 
@@ -229,14 +282,14 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             KEY_RESULT: str(finished.get(KEY_RESULT) or ""),
         }
         reading[KEY_ARTIFACT] = None
-        if periodic.artifact and not reading[KEY_PASSED]:
-            # Read for a failed build only: the note is what names the projects,
-            # and a passed build gets none. Absent is a run that wrote none. Present but not a JSON object is
-            # a report cut short, which no later tick can read either, so the
-            # failure is posted with that said rather than never. Any other
-            # failure is unreadable and the tick is blind on this job, as for
-            # finished.json: a note is posted once, and one written without its
-            # projects would stay so.
+        if periodic.artifact:
+            # A failed build's report names the projects; a passed build's says
+            # what the run did, which the recovery message carries. Absent is a
+            # run that wrote none. Present but not a JSON object is a report cut
+            # short, which no later tick can read either, so it is said rather
+            # than never. Any other failure is unreadable and the tick is blind
+            # on this job, as for finished.json: a note is posted once, and one
+            # written without its projects would stay so.
             out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             if out is not None:
                 try:
@@ -244,7 +297,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                 except ValueError:
                     loaded = None
                 if not isinstance(loaded, dict):
-                    log(f"{WARNING_PREFIX}{periodic.job}'s {build}/{periodic.artifact} is not a JSON object; a failed build's note says so", file=sys.stderr)
+                    log(f"{WARNING_PREFIX}{periodic.job}'s {build}/{periodic.artifact} is not a JSON object; the note says so", file=sys.stderr)
                     loaded = {REPORT_KEY_ERROR: REPORT_UNREADABLE}
                 reading[KEY_ARTIFACT] = loaded
             elif not _not_found(err):
@@ -307,6 +360,81 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     return lines
 
 
+def sweep_detail(artifact: dict | None) -> list[str]:
+    """What the sweep's report says went wrong: one line per failed project,
+    then what the run left for the next one, then the run's own error."""
+    if not isinstance(artifact, dict):
+        return []
+    lines = []
+    outcomes = artifact.get(REPORT_KEY_OUTCOMES)
+    if isinstance(outcomes, dict):
+        for project in sorted(outcomes):
+            entry = outcomes[project]
+            if isinstance(entry, dict) and entry.get(REPORT_KEY_ERROR):
+                lines.append(f"{project}: {entry[REPORT_KEY_ERROR]}")
+    if len(lines) > DETAIL_LIMIT:
+        lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
+    left = artifact.get(SWEEP_KEY_LEFT)
+    if isinstance(left, int) and left > 0:
+        lines.append(f"{left} write(s) left for the next run (the run's write budget)")
+    if artifact.get(SWEEP_KEY_ENDED_EARLY):
+        lines.append(f"run ended early: {artifact[SWEEP_KEY_ENDED_EARLY]}")
+    elif artifact.get(REPORT_KEY_ERROR):
+        lines.append(f"run: {artifact[REPORT_KEY_ERROR]}")
+    return lines
+
+
+def detail_lines(periodic: Periodic, artifact: dict | None) -> list[str]:
+    if periodic.artifact == SWEEP_ARTIFACT:
+        return sweep_detail(artifact)
+    return reconcile_detail(artifact)
+
+
+def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str | None:
+    """One clause on what the run did, from its report; None without one."""
+    if not isinstance(artifact, dict):
+        return None
+    if artifact.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE:
+        return REPORT_UNREADABLE
+    if periodic.artifact == SWEEP_ARTIFACT:
+        projects = artifact.get(SWEEP_KEY_PROJECTS)
+        failed = artifact.get(SWEEP_KEY_FAILED)
+        closed = artifact.get(SWEEP_KEY_CLOSED)
+        if not isinstance(projects, int):
+            return None
+        if passed or not failed:
+            text = f"closed {closed or 0} pull request(s) across {projects} project(s)"
+        else:
+            text = f"failed in {failed} of {projects} project(s)"
+        left = artifact.get(SWEEP_KEY_LEFT)
+        if isinstance(left, int) and left > 0:
+            text += f", {left} write(s) left for the next run"
+        return text
+    summary = artifact.get(RECONCILE_KEY_SUMMARY)
+    if not isinstance(summary, dict):
+        return None
+    parts = [f"{count} {outcome}" for outcome, count in summary.items() if isinstance(count, int) and count > 0]
+    return ", ".join(parts) if parts else "nothing to do"
+
+
+def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
+    """What each read job's latest finished build did, for the recovery message:
+    `{job: {build, finished_at, passed, summary}}`."""
+    out = {}
+    for periodic in watched:
+        reading = readings.get(periodic.job)
+        if not isinstance(reading, dict):
+            continue
+        artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
+        out[periodic.job] = {
+            KEY_BUILD: reading.get(KEY_BUILD),
+            KEY_FINISHED_AT: reading.get(KEY_FINISHED_AT),
+            KEY_PASSED: bool(reading.get(KEY_PASSED)),
+            KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))),
+        }
+    return out
+
+
 def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED) -> dict[str, dict]:
     """The notes this tick: one per watched job whose latest finished build
     failed, or is older than the job's stale window. `prev_notes` carries each
@@ -335,9 +463,16 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_RESULT: reading.get(KEY_RESULT),
             KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR),
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
-            KEY_DETAIL: reconcile_detail(artifact) if verdict == VERDICT_FAILED else [],
+            KEY_DETAIL: detail_lines(periodic, artifact) if verdict == VERDICT_FAILED else [],
+            KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))) if verdict == VERDICT_FAILED else None,
             KEY_HISTORY_URL: history_url(periodic.job),
             KEY_DOC: periodic.doc,
+            KEY_PLACE: periodic.place,
+            KEY_ABSENCE: periodic.absence,
+            KEY_PRESENCE: periodic.presence,
+            KEY_DOES: periodic.does,
+            KEY_EFFECT: periodic.effect,
+            KEY_RUNBOOK: periodic.runbook,
         }
     return notes
 

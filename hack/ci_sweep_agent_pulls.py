@@ -26,6 +26,13 @@ so a project a run holds is never touched, and a run arriving mid-sweep waits
 those seconds at its own acquire. No listing endpoint is needed and no run's
 state is read.
 
+The writes are paced to GitHub's published burst limits for an App -- a second
+between writes, 500 writes an hour -- with a budget of writes per run past which
+the rest waits for the next run, logged and reported; a write GitHub refuses is
+retried once after the Retry-After it asks for, and refused again the run ends
+rather than visiting every project during the cooldown. Every run writes a
+report beside the job's artifacts (write_report), which the CI health bot reads.
+
 Three conditions, all required, matching is_agent_pull_request in
 agents/platform/scripts/forge.py: authored by the agent's bot, head branch
 carrying the agent's prefix, and that branch in the repository itself rather
@@ -60,6 +67,34 @@ API_ROOT = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 USER_AGENT = "kube-agents-pull-sweep"
 REQUEST_TIMEOUT_SECONDS = 30
+# GitHub's secondary limits for one App: at least a second between writes, and
+# no more than 500 content-generating requests an hour, answered otherwise with
+# a 403 for every call for some minutes. A close and its branch delete are two
+# writes; six runs an hour at this budget stay under 500, and a backlog drains
+# across runs instead of in one burst. What a run leaves is logged and reported.
+WRITE_PAUSE_SECONDS = 1.0
+WRITE_BUDGET_PER_RUN = 80
+RATE_LIMITED_CODE = 403
+RETRY_AFTER_HEADER = "Retry-After"
+# Without the header, or with one past this, a refused write waits this long
+# once; refused again, the run ends rather than visiting every project during
+# the cooldown.
+RETRY_AFTER_DEFAULT_SECONDS = 60
+RETRY_AFTER_MAX_SECONDS = 120
+# The run's report, written last like the reconcile's (hack/fleet_reconcile.py),
+# under Prow's artifacts when it sets ARTIFACTS: what the CI health bot names.
+REPORT_FILE = "pull-sweep.json"
+REPORT_SCHEMA_VERSION = 1
+ARTIFACTS_ENV = "ARTIFACTS"
+ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+EXIT_NAME_OK = "ok"
+EXIT_NAME_FAILED = "failed"
+EXIT_NAME_TERMINATED = "terminated"
+EXIT_NAME_ERROR = "error"
+MODE_POOL = "pool"
+MODE_PROJECT = "project"
+# The pause between writes, a module attribute so a test can stand in for it.
+pause = time.sleep
 
 # Must equal AGENT_BRANCH_PREFIX in agents/platform/scripts/forge.py, which is
 # what names the branches these pull requests come from. A test pins the two.
@@ -140,6 +175,31 @@ _terminate = boskos_pool.terminate
 CI_DEPLOY_SCRIPT = pathlib.Path(__file__).resolve().parent / "ci-deploy.sh"
 MAPPING_FUNCTION = "gitops_repo_for_project"
 MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;;\s*$')
+
+
+class RateLimited(Exception):
+    """GitHub refused a write twice under its burst limit: the run ends here."""
+
+
+class WriteBudget:
+    """The run's remaining writes. A close or a delete takes one; when none is
+    left the rest waits for the next run, counted in `left`."""
+
+    def __init__(self, writes=None):
+        self.budget = WRITE_BUDGET_PER_RUN if writes is None else writes
+        self.remaining = self.budget
+        self.left = 0
+        self.exhausted_at = None
+
+    def take(self, repo):
+        if self.remaining <= 0:
+            if self.exhausted_at is None:
+                self.exhausted_at = repo
+                print("  write budget for this run (%d) used up at %s; the rest waits for the next run" % (self.budget, repo), file=sys.stderr)
+            self.left += 1
+            return False
+        self.remaining -= 1
+        return True
 
 
 class SweepError(Exception):
@@ -226,8 +286,12 @@ def api(method, path, authorization, body=None):
         data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(API_ROOT + path, method=method, headers=headers, data=data)
-    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-        raw = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        boskos_pool.error_body(exc)
+        raise
     if not raw:
         return None
     try:
@@ -331,10 +395,42 @@ def _field(payload, key, what, repo):
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException, SweepError)
 
 
+def _retry_after(exc):
+    """Seconds GitHub asked for, bounded; the default when it named none."""
+    raw = (getattr(exc, "headers", None) or {}).get(RETRY_AFTER_HEADER)
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return RETRY_AFTER_DEFAULT_SECONDS
+    return max(0, min(seconds, RETRY_AFTER_MAX_SECONDS))
+
+
+def write(method, path, authorization, body=None):
+    """One GitHub write, paced. A 403 is GitHub's burst limit (or a permission,
+    which reads the same): wait what it asks once and try again; refused again,
+    the run ends here rather than visiting every project during the cooldown."""
+    try:
+        result = api(method, path, authorization, body)
+    except urllib.error.HTTPError as exc:
+        if exc.code != RATE_LIMITED_CODE:
+            raise
+        wait = _retry_after(exc)
+        print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
+        pause(wait)
+        try:
+            result = api(method, path, authorization, body)
+        except urllib.error.HTTPError as again:
+            if again.code != RATE_LIMITED_CODE:
+                raise
+            raise RateLimited("GitHub refused %s %s twice (%s)" % (method, path, boskos_pool.describe(again)))
+    pause(WRITE_PAUSE_SECONDS)
+    return result
+
+
 def delete_branch(repo, ref, authorization):
     """Delete `ref` (a branch name) from the repository. Already gone is fine."""
     try:
-        api("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, urllib.parse.quote(ref, safe="/")), authorization)
+        write("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, urllib.parse.quote(ref, safe="/")), authorization)
     except urllib.error.HTTPError as exc:
         if exc.code not in REF_GONE_CODES:
             raise
@@ -349,20 +445,25 @@ def agent_branches(repo, authorization):
     return [name[len("refs/heads/"):] for name in names if name.startswith("refs/heads/" + AGENT_BRANCH_PREFIX)]
 
 
-def close_agent_pulls(repo, authorization, bot_login, dry_run=False):
+def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None):
     """Close every open pull request `bot_login` owns, and delete its branch --
     and any branch under the agent's prefix an earlier run left behind.
 
     Returns (closed, deleted, unclosed, undeleted): the counts, the numbers
-    that would not close, and the branches that would not delete.
+    that would not close, and the branches that would not delete. With a
+    `budget`, each write takes one from it and a write it cannot pay for is
+    left for the next run; a RateLimited from a write ends the sweep of this
+    repository and is the caller's to end the run on.
     """
     closed = 0
     deleted = 0
     unclosed = []
     undeleted = []
+    budget = budget or WriteBudget()
     pulls = open_pulls(repo, authorization)
     still_open = set()
     gone = set()
+    deferred = set()
     for pull in pulls:
         if not is_agent_pull_request(pull, repo, bot_login):
             still_open.add(str((pull.get("head") or {}).get("ref") or ""))
@@ -374,31 +475,39 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False):
             closed += 1
             gone.add(ref)
             continue
+        if not budget.take(repo):
+            still_open.add(ref)
+            continue
         # Each close stands alone. One that fails is reported and the sweep
         # carries on: giving up here would leave every later pull request open,
         # which is the thing being fixed. HTTPException covers a response cut
         # short mid-read, which urllib does not raise as OSError.
         try:
-            api(
+            write(
                 "PATCH",
                 "/repos/%s/pulls/%s" % (repo, number),
                 authorization,
                 {"state": "closed"},
             )
         except CALL_FAULTS as exc:
-            print("  #%s did not close (%s)" % (number, exc), file=sys.stderr)
+            print("  #%s did not close (%s)" % (number, boskos_pool.describe(exc)), file=sys.stderr)
             unclosed.append(number)
             still_open.add(ref)
             continue
         closed += 1
         # The branch only after the close: a branch deleted first would leave
-        # the pull request open on a head that no longer exists.
+        # the pull request open on a head that no longer exists. A branch the
+        # budget cannot pay for is a closed pull request's, which the next
+        # run's branch pass below deletes.
+        if not budget.take(repo):
+            deferred.add(ref)
+            continue
         try:
             delete_branch(repo, ref, authorization)
             deleted += 1
             gone.add(ref)
         except CALL_FAULTS as exc:
-            print("  #%s closed but %s was not deleted (%s)" % (number, ref, exc), file=sys.stderr)
+            print("  #%s closed but %s was not deleted (%s)" % (number, ref, boskos_pool.describe(exc)), file=sys.stderr)
             undeleted.append(ref)
     # Branches an earlier run left behind -- a delete that failed, a job killed
     # between a close and its delete -- belong to closed pull requests, which
@@ -408,25 +517,27 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False):
     # itself only the agent pushes under its prefix; the prefix-alone caveat
     # is about forks, which this listing never reaches.
     for ref in agent_branches(repo, authorization):
-        if ref in gone or ref in still_open or ref in undeleted:
+        if ref in gone or ref in still_open or ref in undeleted or ref in deferred:
             continue
         print("  branch %s (no open pull request)" % ref)
         if dry_run:
             deleted += 1
             continue
+        if not budget.take(repo):
+            continue
         try:
             delete_branch(repo, ref, authorization)
             deleted += 1
         except CALL_FAULTS as exc:
-            print("  %s was not deleted (%s)" % (ref, exc), file=sys.stderr)
+            print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
             undeleted.append(ref)
     return closed, deleted, unclosed, undeleted
 
 
-def sweep_repo(project, repo, app_id, dry_run=False, runner=subprocess.run):
+def sweep_repo(project, repo, app_id, dry_run=False, runner=subprocess.run, budget=None):
     """Close the agent's leftovers in one project's repository; returns the count."""
     token, bot_login = scoped_token(app_id, project, repo, runner)
-    closed, deleted, unclosed, undeleted = close_agent_pulls(repo, "token " + token, bot_login, dry_run=dry_run)
+    closed, deleted, unclosed, undeleted = close_agent_pulls(repo, "token " + token, bot_login, dry_run=dry_run, budget=budget)
     verb = "would close" if dry_run else "closed"
     print(
         "%s %d pull request(s) by %s and %s %d branch(es) in %s"
@@ -466,17 +577,21 @@ def boskos_reset_stranded(server):
     return boskos_pool.reset_stranded(server, BOSKOS_SWEEP_STATE, BOSKOS_STRANDED_AFTER, "sweep")
 
 
-def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.run):
+def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.run, report=None):
     """Sweep every project Boskos will hand out as free, once each.
 
     Returns (closed_by_project, failures_by_project, unmapped). A project is
     released in every path, including a fault mid-sweep; holding one would take
-    it out of the pool until a human noticed.
+    it out of the pool until a human noticed. `report`, a dict, receives what
+    the run left for the next one (`left`) and why it ended early, if it did
+    (`ended_early`).
     """
     boskos_reset_stranded(server)
     closed = {}
     failures = {}
     unmapped = []
+    budget = WriteBudget()
+    ended_early = []
 
     def visit(name):
         repo = mapping.get(name)
@@ -484,9 +599,18 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             print("skipping %s: maps to no GitOps repository" % name)
             unmapped.append(name)
             return
+        if ended_early:
+            # GitHub's cooldown covers every repository; the project is held
+            # and released so the walk still ends, and nothing is asked of it.
+            print("skipping %s: %s" % (name, ended_early[0]))
+            return
         print("sweeping %s (%s)" % (name, repo))
         try:
-            closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner)
+            closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner, budget=budget)
+        except RateLimited as exc:
+            print("  %s: %s" % (name, exc), file=sys.stderr)
+            failures[name] = str(exc)
+            ended_early.append(str(exc))
         except (
             SweepError,
             urllib.error.HTTPError,
@@ -494,15 +618,18 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             http.client.HTTPException,
             subprocess.SubprocessError,
         ) as exc:
-            print("  %s: %s" % (name, exc), file=sys.stderr)
-            failures[name] = str(exc)
+            print("  %s: %s" % (name, boskos_pool.describe(exc)), file=sys.stderr)
+            failures[name] = boskos_pool.describe(exc)
 
     _, release_failures = boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit)
     failures.update(release_failures)
     print(
-        "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped"
-        % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped))
+        "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped, %d write(s) left for the next run"
+        % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped), budget.left)
     )
+    if report is not None:
+        report["left"] = budget.left
+        report["ended_early"] = ended_early[0] if ended_early else None
     return closed, failures, unmapped
 
 
@@ -537,44 +664,106 @@ def main(argv=None):
         default=os.environ.get("BOSKOS_OWNER") or DEFAULT_BOSKOS_OWNER,
         help="owner name the acquisitions are recorded under",
     )
+    parser.add_argument(
+        "--report",
+        default=default_report_path(),
+        help="where to write the run's %s (default: $%s/%s when Prow sets it, else nowhere)" % (REPORT_FILE, ARTIFACTS_ENV, REPORT_FILE),
+    )
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, _terminate)
+    started = time.time()
+    run = {"closed": {}, "failures": {}, "unmapped": [], "left": 0, "ended_early": None}
+    code = None
+    error = None
+    try:
+        code, error = _run(args, run)
+        return code
+    except Terminated as exc:
+        error = "terminated (%s); held projects were released" % exc
+        print("ERROR: %s" % error, file=sys.stderr)
+        code = TERMINATED_EXIT_CODE
+        return code
+    except BaseException as exc:
+        error = "%s: %s" % (type(exc).__name__, exc)
+        raise
+    finally:
+        if args.report:
+            write_report(args.report, args, run, code, error, started)
+
+
+def _run(args, run):
+    """The sweep itself; (exit code, error line or None)."""
     try:
         mapping = pool_repos(args.ci_deploy_script)
         if args.project:
             repo = args.repo or mapping.get(args.project)
             if not repo:
                 raise SweepError("%s maps to no GitOps repository" % args.project)
-            sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
-            return 0
-        _, failures, _ = sweep_pool(
+            run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
+            return 0, None
+        closed, failures, unmapped = sweep_pool(
             args.boskos_server,
             args.boskos_owner,
             args.app_id,
             mapping,
             dry_run=args.dry_run,
             runner=subprocess.run,
+            report=run,
         )
+        run["closed"], run["failures"], run["unmapped"] = closed, failures, unmapped
         if failures:
-            print(
-                "ERROR: %d project(s) not fully swept: %s"
-                % (len(failures), ", ".join(sorted(failures))),
-                file=sys.stderr,
-            )
-            return 1
-        return 0
-    except Terminated as exc:
-        print("ERROR: terminated (%s); held projects were released" % exc, file=sys.stderr)
-        return TERMINATED_EXIT_CODE
+            error = "%d project(s) not fully swept: %s" % (len(failures), ", ".join(sorted(failures)))
+            print("ERROR: %s" % error, file=sys.stderr)
+            return 1, error
+        return 0, None
     except (SweepError, boskos_pool.BoskosError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
-        return 1
+        return 1, str(exc)
     except urllib.error.HTTPError as exc:
-        print("ERROR: HTTP %d (%s) from %s" % (exc.code, exc.reason, exc.url), file=sys.stderr)
-        return 1
+        error = "HTTP %d (%s) from %s: %s" % (exc.code, exc.reason, exc.url, boskos_pool.error_body(exc))
+        print("ERROR: %s" % error, file=sys.stderr)
+        return 1, error
     except (OSError, http.client.HTTPException, subprocess.SubprocessError) as exc:
-        print("ERROR: could not reach a service (%s: %s)" % (type(exc).__name__, exc), file=sys.stderr)
-        return 1
+        error = "could not reach a service (%s: %s)" % (type(exc).__name__, exc)
+        print("ERROR: %s" % error, file=sys.stderr)
+        return 1, error
+
+
+def default_report_path():
+    artifacts = os.environ.get(ARTIFACTS_ENV)
+    return str(pathlib.Path(artifacts) / REPORT_FILE) if artifacts else None
+
+
+def write_report(path, args, run, code, error, started):
+    """The run as one JSON document, written last: what the CI health bot names."""
+    names = {0: EXIT_NAME_OK, 1: EXIT_NAME_FAILED, TERMINATED_EXIT_CODE: EXIT_NAME_TERMINATED}
+    outcomes = {}
+    for project, count in sorted(run["closed"].items()):
+        outcomes[project] = {"closed": count}
+    for project, text in sorted(run["failures"].items()):
+        outcomes[project] = {"error": text}
+    document = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "mode": MODE_PROJECT if args.project else MODE_POOL,
+        "dry_run": bool(args.dry_run),
+        "started_at": time.strftime(ISO_UTC_FORMAT, time.gmtime(started)),
+        "finished_at": time.strftime(ISO_UTC_FORMAT, time.gmtime(time.time())),
+        "exit": names.get(code, EXIT_NAME_ERROR),
+        "exit_code": code,
+        "error": error,
+        "ended_early": run.get("ended_early"),
+        "projects": len(outcomes),
+        "closed": sum(run["closed"].values()),
+        "failed": len(run["failures"]),
+        "unmapped": list(run["unmapped"]),
+        "left_for_next_run": run.get("left", 0),
+        "outcomes": outcomes,
+    }
+    try:
+        pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(path).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print("WARNING: could not write the report to %s (%s)" % (path, exc), file=sys.stderr)
 
 
 if __name__ == "__main__":
