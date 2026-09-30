@@ -123,10 +123,17 @@ class ScanHarness(unittest.TestCase):
 class TheChecksItAsksFor(unittest.TestCase):
     def test_the_default_set_is_the_verifiers_read_only_set(self):
         self.assertEqual(pool_state.DEFAULT_CHECKS, tuple(verifier.POOL_STATE_CHECKS))
-        for excluded in (verifier.CHECK_SEEDED_FLEET, verifier.CHECK_CODEBASE_MAPPING, verifier.CHECK_TOKEN_MINTER, *verifier.GITHUB_CHECKS):
+        for excluded in (verifier.CHECK_SEEDED_FLEET, verifier.CHECK_CODEBASE_MAPPING, verifier.CHECK_TOKEN_MINTER, verifier.CHECK_LEDGER_READ_CREDENTIAL, *verifier.GITHUB_CHECKS):
             self.assertNotIn(excluded, pool_state.DEFAULT_CHECKS)
         self.assertIn(verifier.CHECK_TOKEN_MINTER_KMS, pool_state.DEFAULT_CHECKS)
+        # The one GitHub read in the set: a metadata call the job makes with
+        # whatever GH_TOKEN it carries, not checked when it carries none.
+        self.assertIn(verifier.CHECK_GITOPS_DEFAULT_BRANCH, pool_state.DEFAULT_CHECKS)
         self.assertTrue(set(pool_state.DEFAULT_CHECKS) <= set(verifier.CHECK_IDS))
+
+    def test_the_docs_name_the_scans_check_list(self):
+        text = (REPO / "docs" / "ci-health.md").read_text()
+        self.assertIn("--checks " + ",".join(verifier.POOL_STATE_CHECKS) + " --report", text)
 
 
 class OneProject(ScanHarness):
@@ -156,6 +163,28 @@ class OneProject(ScanHarness):
         self.assertEqual(pool_state.repair_for(doc, PROJECT, FINDING), REPAIR)
         self.assertEqual(doc["summary"]["findings"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 1)
+
+    def test_a_default_branch_finding_carries_the_repository_and_the_patch(self):
+        observed = "Repository gke-agentic/kube-agents-evals-2-infra's default branch is platform-agent/fix-payments-api-oom, not main: submit_suggestion.py prepare starts every remediation workspace from it, so a fix already on that branch is a no-op and the case fails on a leftover proposal"
+        repair = "gh api -X PATCH repos/gke-agentic/kube-agents-evals-2-infra -f default_branch=main"
+        doc = self.scan({PROJECT: report(gitops_default_branch=drifted(finding="gitops/default-branch", observed=observed, repair=repair))})
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(entry["checks"]["gitops_default_branch"]["state"], "drifted")
+        self.assertEqual(entry["findings"], {"gitops/default-branch": {"check": "gitops_default_branch", "detail": [observed], "repair": repair}})
+        self.assertEqual(pool_state.repair_for(doc, PROJECT, "gitops/default-branch"), repair)
+        self.assertEqual(pool_state.check_of(doc, PROJECT, "gitops/default-branch"), "gitops_default_branch")
+        self.assertEqual(pool_state.drift_map(doc), {PROJECT: ["gitops/default-branch"]})
+
+    def test_a_default_branch_the_job_has_no_credential_for_is_not_checked_not_drift(self):
+        reason = "Could not read gke-agentic/kube-agents-evals-2-infra's default branch (the read needs a GitHub credential in GH_TOKEN that the repository is visible to): gh auth login"
+        doc = self.scan({PROJECT: report(gitops_default_branch=unchecked(reason))})
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(entry["checks"]["gitops_default_branch"]["state"], "not_checked")
+        self.assertIn(reason, entry["checks"]["gitops_default_branch"]["detail"])
+        self.assertEqual(entry["findings"], {})
+        self.assertEqual(pool_state.drift_map(doc), {})
+        self.assertEqual(entry["summary"]["not_checked"], 1)
+        self.assertEqual(doc["summary"]["checked"], 1, "the GCP checks still make the project a checked one")
 
     def test_the_stub_exits_the_way_the_verifier_does(self):
         # The fixtures' exit codes sit on the check records; the stub must
@@ -508,6 +537,12 @@ class Workflow(unittest.TestCase):
         self.assertIn("Fetch the previous pool-state scan", names)
         env = self.doc["env"]
         self.assertTrue(int(env["POOL_STATE_TIMEOUT_S"]) > int(env["POOL_STATE_PROJECT_TIMEOUT_S"]) > 0)
+
+    def test_the_pool_scan_step_carries_the_gitops_read_credential_and_no_write(self):
+        steps = self.jobs["fixture-state-scan"]["steps"]
+        scan = next(step for step in steps if "pool_state.py" in step.get("run", ""))
+        self.assertEqual(scan["env"][verifier.GITOPS_READ_TOKEN_ENV], "${{ secrets.GITOPS_METADATA_READ_TOKEN }}")
+        self.assertEqual(self.jobs["fixture-state-scan"]["permissions"], {"contents": "read", "id-token": "write"}, "the job still holds no GitHub write")
 
     def test_each_scans_ceiling_covers_every_wave_of_the_mapped_pool(self):
         # A pool-wide API stall puts every project at the per-project ceiling;

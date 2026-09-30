@@ -63,6 +63,11 @@ CHECK_WARM_CACHE = "warm_cache"
 CHECK_GKE_AND_STATE = "gke_and_state"
 CHECK_SEEDED_FLEET = "seeded_fleet_fixtures"
 CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
+# The GitOps repository's default branch alone: one metadata read, apart from
+# the repo-and-App check because that one needs an org member's `gh` and this
+# one any credential the repository is visible to, which is what lets the
+# hourly pool-state scan run it (docs/ci-health.md, "The pool-state scan").
+CHECK_GITOPS_DEFAULT_BRANCH = "gitops_default_branch"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
@@ -80,6 +85,7 @@ CHECK_IDS = (
     CHECK_GKE_AND_STATE,
     CHECK_SEEDED_FLEET,
     CHECK_GITHUB_REPO_AND_APP,
+    CHECK_GITOPS_DEFAULT_BRANCH,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
@@ -100,6 +106,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GKE_AND_STATE: "GKE Clusters & Terraform State",
     CHECK_SEEDED_FLEET: "Seeded Fleet Fixtures",
     CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
+    CHECK_GITOPS_DEFAULT_BRANCH: "GitOps Repo Default Branch",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
@@ -109,16 +116,24 @@ CHECK_DISPLAY_NAMES = {
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
 GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
+# The default-branch read is `gh` too, and is left out of GITHUB_CHECKS on
+# purpose: the pool-state scan selects it, and a toolchain blocker would turn
+# a job without a GitHub credential into "not checked" on all of the scan's
+# checks. The check files its own unread instead, and the GCP checks still run.
 # The checks that read GCP, and so need a gcloud credential before they run:
 # every check but the mapping, which reads the checkout and the remote ref,
-# and the GitHub check, whose reads are all `gh`.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING} - GITHUB_CHECKS
+# and the two GitHub reads, which are all `gh`.
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
-# two GitHub checks (each needs a credential the health bot must not hold),
-# not the mapping (that is about the checkout, not the project), and not the
-# warm-cache check, whose read is in another project the bot holds nothing on.
-POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_TOKEN_MINTER_KMS)
+# two GitHub checks that need a credential the health bot must not hold (an
+# org member's `gh` for the repo-and-App read, the ledger App's key for the
+# ledger read), not the mapping (that is about the checkout, not the project),
+# and not the warm-cache check, whose read is in another project the bot holds
+# nothing on. The GitOps default-branch read is in: one metadata call the job
+# makes with whatever GitHub credential it carries (GITOPS_READ_TOKEN_ENV), and
+# records as not checked when it carries none.
+POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_TOKEN_MINTER_KMS)
 # --report's document (docs/ci-health.md, "The pool-state scan").
 REPORT_SCHEMA_VERSION = 1
 REPORT_STATUS_PASS = "pass"
@@ -320,6 +335,23 @@ PROW_BUILD_CLUSTER_PROJECT = "kube-agents-prow"
 # repository's issues needs `issues: read`. The installation's repository list
 # needs only `metadata: read`, so it would have passed the evals-6 case.
 GITHUB_ISSUES_URL = "https://api.github.com/repos/{repo}/issues?per_page=1&state=all"
+
+# The branch every GitOps repository must default to. submit_suggestion.py
+# prepare starts each remediation workspace from the repository's default
+# branch, so a default moved onto an agent branch that already carries the fix
+# makes every rca write a no-op ("nothing to commit", a leftover proposal
+# quoted back) and the case reads 0/3 whatever the agent does. That is what
+# the pilot-only gitops_switch_default_branch mode of
+# bench/tf/prebuilt/gitops-fix-cycle left behind on four pool repositories
+# between 2026-08-28 and 2026-09-30, unseen, when its restore never ran. One
+# `gh api` read of the repository per project; a PATCH of the same field is
+# the repair. The repositories are private, so the read needs a credential
+# they are visible to, carried in GITOPS_READ_TOKEN_ENV (gh's own variable).
+GITOPS_DEFAULT_BRANCH = "main"
+GITOPS_REPO_API_PATH = "repos/{repo}"
+GITOPS_READ_TOKEN_ENV = "GH_TOKEN"
+FINDING_GITOPS_DEFAULT_BRANCH = "gitops/default-branch"
+REPAIR_GITOPS_DEFAULT_BRANCH = "gh api -X PATCH repos/{repo} -f default_branch={branch}"
 
 # GitHub rejects an App JWT whose `exp` is more than ten minutes ahead. Building
 # the payload, shelling out to gcloud, and the round trip all elapse between
@@ -2402,6 +2434,48 @@ def check_github_repo_and_app(
     )
 
 
+def check_gitops_default_branch(project_id: str) -> CheckResult:
+    """The GitOps repository defaults to GITOPS_DEFAULT_BRANCH.
+
+    One metadata read. A read that did not happen -- no `gh`, no credential
+    (`gh` exits 4 and says so), a token the repository is invisible to (404,
+    which GitHub also answers for a repository that does not exist; the
+    repo-and-App check is the one that decides absence) -- is not checked,
+    with the reason, so the hourly scan says what it could not see instead of
+    reporting drift on every private repository its token cannot open.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DEFAULT_BRANCH]
+    repo_slug = f"gke-agentic/{project_id}-infra"
+    rc, out, err = run_cmd(["gh", "api", GITOPS_REPO_API_PATH.format(repo=repo_slug), "--jq", ".default_branch"])
+    observed = out.strip()
+    if rc != 0 or not observed:
+        reason = _unread_reason(err) or (err.strip().splitlines() or [NO_OUTPUT_REASON])[-1].strip()[:200]
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(
+                f"Could not read {repo_slug}'s default branch (the read needs a GitHub credential in "
+                f"{GITOPS_READ_TOKEN_ENV} that the repository is visible to): {reason}"
+            )],
+            read=False,
+        )
+    if observed == GITOPS_DEFAULT_BRANCH:
+        return CheckResult(name, True, f"{repo_slug} defaults to {GITOPS_DEFAULT_BRANCH}")
+    details: List[str] = []
+    findings: List[Finding] = []
+    _drift(
+        details,
+        findings,
+        FINDING_GITOPS_DEFAULT_BRANCH,
+        f"Repository {repo_slug}'s default branch is {observed}, not {GITOPS_DEFAULT_BRANCH}: "
+        "submit_suggestion.py prepare starts every remediation workspace from it, so a fix "
+        "already on that branch is a no-op and the case fails on a leftover proposal",
+        REPAIR_GITOPS_DEFAULT_BRANCH.format(repo=repo_slug, branch=GITOPS_DEFAULT_BRANCH),
+    )
+    return CheckResult(name, False, f"{repo_slug} does not default to {GITOPS_DEFAULT_BRANCH}", details=details, findings=findings)
+
+
 def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
     """The ledger App's PEM, read out of the build cluster. Returns (pem, reason).
 
@@ -3250,6 +3324,7 @@ def run_checks(
     run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
     run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))
     run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
+    run(CHECK_GITOPS_DEFAULT_BRANCH, lambda: check_gitops_default_branch(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))

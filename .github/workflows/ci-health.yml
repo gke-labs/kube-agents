@@ -766,6 +766,14 @@ jobs:
       # exits non-zero here.
       - name: Scan every pool project's shape
         if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
+        env:
+          # The verifier's gitops_default_branch check reads each private
+          # *-infra repository's metadata with `gh`; the workflow token sees
+          # none of them, so the read needs a credential of its own, with
+          # metadata read on gke-agentic's *-infra repositories and nothing
+          # else. Until the secret exists this is empty, the check records
+          # "not checked" naming the need, and the GCP checks run regardless.
+          GH_TOKEN: ${{ secrets.GITOPS_METADATA_READ_TOKEN }}
         run: |
           timeout "$POOL_STATE_TIMEOUT_S" python3 scripts/eval_dashboard/pool_state.py \
             --out work/pool-state.json \

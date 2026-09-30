@@ -19,13 +19,16 @@ Per project, in a temporary directory of its own:
 
 The checks are the verifier's POOL_STATE_CHECKS: the project and its APIs,
 IAM, Artifact Registry, the clusters and state bucket, and the KMS half of
-the token minter. Every read runs as the bot itself
-(eval-dashboard-publisher@kube-agents-prow), which needs the project-level
-read roles bench/tf/fleet grants it (`pool_state_readers`); a project without
-them scans as "not checked" with gcloud's own words. Not run here: the fleet
-fixtures (fixture_state.py already does), the two GitHub checks (each needs a
-credential the bot must not hold), the mapping (about the checkout, not the
-project).
+the token minter, and the GitOps repository's default branch. Every GCP
+read runs as the bot itself (eval-dashboard-publisher@kube-agents-prow),
+which needs the project-level read roles bench/tf/fleet grants it
+(`pool_state_readers`); a project without them scans as "not checked" with
+gcloud's own words. The default-branch read is one `gh api` call per private
+repository with whatever GitHub credential the job puts in GH_TOKEN, and is
+"not checked" with that reason while it carries none. Not run here: the fleet
+fixtures (fixture_state.py already does), the two GitHub checks that need a
+credential the bot must not hold (an org member's `gh`, the ledger App's key),
+the mapping (about the checkout, not the project).
 
 The project list is `gitops_repo_for_project()` in hack/ci-deploy.sh, read
 the way fixture_state.py reads it. Nothing here fails the bot's run: a
