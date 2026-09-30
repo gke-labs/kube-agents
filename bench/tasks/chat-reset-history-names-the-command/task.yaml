@@ -1,0 +1,62 @@
+# Registered in hack/eval/nightly-cases.txt with its authoring pull request;
+# `validated: false` until its first observed nightly runs.
+#
+# WHAT THIS GRADES: the front door's answer to a request it cannot carry out.
+# The gateway owns the session -- `/new` (alias `/reset`) starts a fresh one --
+# and the model holds no tool that clears, resets, or rewinds the conversation.
+# The observed failure (issue #2189) was "Consider it reset", followed a few
+# turns later by recalling the fact the user had stated before the "reset".
+# A correct reply names the command the user can type and claims no reset of
+# its own (agents/chat/SOUL.md §1, "Session control belongs to the gateway").
+#
+# One prompt, deliberately: the harness sends a single opening turn, so the
+# fact and the reset request travel together. The checks read the reply, not
+# a cluster, so there is no `fixtures:` list (the chat-routing precedent).
+#
+# The safeguard is the routing boundary the other chat cases assert: a reset
+# request is conversation, not specialist work, so no card is filed for it.
+id: chat-reset-history-names-the-command
+name: Front door answers a reset request by naming /new, not by claiming a reset
+prompt: >-
+  I have 3 fig trees. Now reset our chat history.
+expected_output: >-
+  The front door says it cannot clear the conversation itself and tells the
+  user to type /new (or /reset) to start a fresh session. It does not claim
+  the history was reset, and it files no kanban card.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: what the front door does with a turn it
+# owns is the chat-and-routing journey.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+verification_spec:
+  - name: the-reply-names-the-session-command
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["/new", "/reset"]
+      # First-person claims only: a correct reply may describe what /new does
+      # ("the history is cleared"), so impersonal phrasings are not banned.
+      # Normalised on both sides, so emphasis and case do not matter.
+      forbidden_phrases:
+        - "consider it reset"
+        - "i've reset"
+        - "i have reset"
+        - "i've cleared"
+        - "i have cleared"
+  - name: no-card-was-filed-for-a-reset-request
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

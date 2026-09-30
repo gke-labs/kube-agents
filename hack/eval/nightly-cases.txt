@@ -450,6 +450,11 @@
 # A simple case that can run on kind.
 ./tasks/chat-routing-own-cluster-namespaces/task.yaml
 
+# The front door's answer to "reset our chat history": it names /new (alias
+# /reset) and claims no reset of its own (#2189). `validated: false` until its
+# first observed nightly runs.
+./tasks/chat-reset-history-names-the-command/task.yaml
+
 # The two obtainability-journey probes: CUJ1's Day-0 design discipline and
 # CUJ3's Day-2 window planning, graded on the report and the worker
 # commands through the eval harness (their live siblings under bench/cuj/

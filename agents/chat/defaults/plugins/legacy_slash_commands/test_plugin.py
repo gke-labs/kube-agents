@@ -22,6 +22,7 @@ FAKE_MAP = {
     "help": "/help",
     "model": "/model",
     "compact": "/compress",
+    "undo": "/undo",
 }
 
 
@@ -67,6 +68,21 @@ class RewriteLegacyHermesCommandTest(unittest.TestCase):
         self.assertIsNone(plugin.rewrite_legacy_hermes_command("/help"))
 
 
+class DisableUndoCommandTest(unittest.TestCase):
+    def test_undo_loses_its_slash(self):
+        self.assertEqual(plugin.disable_undo_command("/undo"), "undo")
+        self.assertEqual(plugin.disable_undo_command("/undo 2"), "undo 2")
+        self.assertEqual(plugin.disable_undo_command("/UNDO"), "undo")
+
+    def test_bot_mention_forms_are_covered(self):
+        self.assertEqual(plugin.disable_undo_command("/undo@kage"), "undo")
+        self.assertEqual(plugin.disable_undo_command("<@U0BKNNDJERG> /undo"), "undo")
+
+    def test_other_text_is_left_alone(self):
+        for text in ("/undone", "undo", "please /undo that", "/help", "", None):
+            self.assertIsNone(plugin.disable_undo_command(text))
+
+
 class PreGatewayDispatchHookTest(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.object(plugin, "_subcommand_map", return_value=dict(FAKE_MAP))
@@ -79,6 +95,14 @@ class PreGatewayDispatchHookTest(unittest.TestCase):
             plugin.handle_pre_gateway_dispatch(event=event, gateway=None, session_store=None),
             {"action": "rewrite", "text": "/sethome"},
         )
+
+    def test_hook_disables_undo_typed_directly_or_through_hermes(self):
+        for text in ("/undo", "/hermes undo"):
+            event = SimpleNamespace(text=text)
+            self.assertEqual(
+                plugin.handle_pre_gateway_dispatch(event=event, gateway=None, session_store=None),
+                {"action": "rewrite", "text": "undo"},
+            )
 
     def test_hook_is_a_no_op_for_ordinary_messages(self):
         event = SimpleNamespace(text="what clusters do I have?")
