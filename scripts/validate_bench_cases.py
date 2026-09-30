@@ -330,7 +330,8 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 # seam, which greets any turn whose message contains the case's phrase. A
 # phrase outside the case's own prompt is a request nothing answers, and a
 # short one matches other cases' turns. The floor matches the stack's
-# variables.tf validation.
+# variables.tf validation. A phrase inside another case's prompt greets that
+# case's turn too, since the nightly runs every case against one install.
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
@@ -813,6 +814,42 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     return problems
 
 
+def greet_phrase_collisions(cases: dict[str, pathlib.Path]) -> dict[str, list[str]]:
+    """Cases on the greet stack whose phrase is inside another case's prompt.
+
+    The plugin takes the first request, in file-name order, whose phrase is in
+    the turn's message, so the other case's turn can be greeted with this
+    case's variant. Unreadable files are skipped; validate_case reports them.
+    """
+    phrases: dict[str, str] = {}
+    prompts: dict[str, str] = {}
+    for name, path in cases.items():
+        try:
+            spec = _load_yaml(path)
+        except CaseError:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        if isinstance(spec.get("prompt"), str):
+            prompts[name] = spec["prompt"]
+        infrastructure = spec.get("infrastructure")
+        if isinstance(infrastructure, dict) and infrastructure.get("stack") == GREET_EVAL_STACK:
+            variables = infrastructure.get("variables")
+            phrase = variables.get("phrase") if isinstance(variables, dict) else None
+            if isinstance(phrase, str) and len(phrase.strip()) >= GREET_EVAL_PHRASE_MIN_LENGTH:
+                phrases[name] = phrase.strip()
+    out: dict[str, list[str]] = {}
+    for name, phrase in phrases.items():
+        for other, prompt in prompts.items():
+            if other != name and phrase in prompt:
+                out.setdefault(name, []).append(
+                    f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                    f"that is also inside {other}'s 'prompt:', so {other}'s turn "
+                    "can be greeted by this case's request"
+                )
+    return out
+
+
 def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
     """Validate specific task.yaml paths, keyed by their directory name.
 
@@ -851,12 +888,15 @@ def validate_all() -> dict[str, list[str]]:
             ]
         }
     results: dict[str, list[str]] = {}
-    for name, path in bench_cases().items():
+    cases = bench_cases()
+    for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
             results[name] = validate_case(name, path, registered=registered)
         except CaseError as exc:
             results[name] = [str(exc)]
+    for name, problems in greet_phrase_collisions(cases).items():
+        results[name].extend(problems)
     # The retired parking state: a case path inside a roster-file comment. It
     # is a finding against the case when the case exists, and against the
     # roster files when it does not (a comment can name anything).

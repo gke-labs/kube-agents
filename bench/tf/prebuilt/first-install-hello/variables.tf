@@ -72,7 +72,8 @@ variable "phrase" {
 
   # The plugin matches by substring on every turn, so a short phrase (" ", "hi")
   # would greet any concurrent case's turn. scripts/validate_bench_cases.py
-  # checks the same floor and that the phrase is in the case's own prompt.
+  # checks the same floor, and that the phrase is in the case's own prompt and
+  # in no other case's.
   validation {
     condition     = length(trimspace(var.phrase)) >= 12
     error_message = "phrase must be at least 12 characters after trimming."

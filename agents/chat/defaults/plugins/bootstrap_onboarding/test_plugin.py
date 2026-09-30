@@ -307,7 +307,7 @@ class PreLlmCallTest(unittest.TestCase):
                 self.assertIn("written_at", logs.output[0])
 
     def test_eval_marker_without_a_readable_written_at_is_ignored(self):
-        for suffix, written_at in (("-none", None), ("-text", "now"), ("-bool", True)):
+        for suffix, written_at in (("-none", None), ("-text", "now"), ("-bool", True), ("-nan", float("nan"))):
             request = {"variant": "in_progress", "phrase": "just installed you"}
             if written_at is not None:
                 request["written_at"] = written_at

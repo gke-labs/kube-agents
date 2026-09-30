@@ -572,6 +572,23 @@ class TestTheRulesReject(unittest.TestCase):
         spec = self._greet_eval("I've just installed you", prompt="hi! I've just installed you")
         self.assertEqual(self._validate(**spec), [])
 
+    def test_a_greet_eval_phrase_inside_another_cases_prompt_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {}
+            for name, spec in (
+                ("greeted", self._greet_eval("just installed you")),
+                ("other", {"prompt": "priya here, just installed you, now check my pods"}),
+                ("unrelated", {"prompt": "why is my pod pending?"}),
+            ):
+                path = pathlib.Path(tmp) / name / "task.yaml"
+                path.parent.mkdir()
+                path.write_text(yaml.safe_dump(spec))
+                cases[name] = path
+            found = validator.greet_phrase_collisions(cases)
+        self.assertEqual(list(found), ["greeted"])
+        self.assertEqual(len(found["greeted"]), 1)
+        self.assertIn("inside other's 'prompt:'", found["greeted"][0])
+
     # -- the case-level keys --
 
     def test_the_task_id_alias_is_rejected(self):

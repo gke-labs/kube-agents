@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -157,6 +158,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
         if (
             isinstance(written_at, bool)
             or not isinstance(written_at, (int, float))
+            or not math.isfinite(written_at)
             or abs(time.time() - written_at) > EVAL_REQUEST_MAX_AGE_SECONDS
         ):
             logger.warning(
