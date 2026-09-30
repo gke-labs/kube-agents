@@ -4,9 +4,12 @@
 The pull sweep and the two seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
-then `finished.json`, then, for a failed build, the artifact the job wrote) and turns a failed or overdue run into
+then `finished.json`, then the report the job wrote, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
-link and, for the reconcile, the projects it refused or could not finish.
+link and the report's detail: for the reconcile the projects it refused or
+could not finish, for the sweep the projects whose sweep failed and what the run
+left for the next one. A passed build's report becomes the one-line summary the
+recovery message carries (`periodics_runs`).
 
     fetch --out-dir DIR      one <job>.json per watched periodic that has a
                              finished build; a job that has never run writes
@@ -142,7 +145,7 @@ class Periodic:
     runbook: str
 
 
-SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals-<n>-infra` repos"
+SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
 SWEEP_EFFECT = "pull requests pile up in those repos, and eval cases that open one can link an old one and fail."
 RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (

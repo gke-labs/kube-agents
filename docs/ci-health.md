@@ -368,8 +368,8 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
 reconcile, hourly against the drifted projects and weekly against every free
 one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
-per job with its label, its stale window and the artifact it writes, so adding
-the next periodic is one line. The 15-minute tick's `Fetch the watched periodics'
+per job with its label, its stale window, the report it writes, and the words
+its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
 identities cannot write the Prow archive),
@@ -402,15 +402,16 @@ build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
-was told about passes again, on a reading only. Each message is four lines: a
-headline naming where and what stopped happening ("Eval GitOps repos: leftover
-pull requests from eval runs are not being cleaned up"); the job, what it does
-and how often, which run and how it failed, with the report's detail lines under
-it; the effect and the scope ("CI eval infrastructure only"); the runbook link
-and the build link. The recovery names the run and what it did ("closed 241 pull
-request(s) across 12 project(s)"). The digest carries one line per open note.
-Nothing here files an issue: the recovery is a person's, and every message links
-the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
+was told about passes again, on a reading only. The failed and stopped
+messages are four lines, the failed one with the report's detail lines under its
+second: a headline naming where and what stopped happening ("Eval GitOps repos:
+leftover pull requests from eval runs are not being cleaned up"); the job, what
+it does and how often, which run and how it failed; the effect and the scope
+("CI eval infrastructure only"); the runbook link and the build link. The
+recovery is one line naming the run and what it did ("closed 241 pull request(s)
+across 12 project(s)"). The digest carries one line per open note. Nothing here
+files an issue: the recovery is a person's, and the failed and stopped messages
+link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
 ## The comment on a red pull request
 
@@ -777,7 +778,8 @@ record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
 `evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
-`periodics`, `periodics_read`, `periodics_since`, `metrics`, `dashboard_url`,
+`pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_since`,
+`metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line
 was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled

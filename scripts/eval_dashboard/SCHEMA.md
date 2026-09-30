@@ -912,13 +912,15 @@ whose latest finished build failed (`verdict: FAILED`) or is older than the
 job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], summary, history_url, doc,
 place, absence, presence, does, effect, runbook}`. `detail` (on `FAILED` only)
-is the report's lines, up to five (then `and N more`): for the reconcile the
+is the report's lines, the projects capped at five (then `and N more`) and the
+run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, then the run's own `error`
 line; for the sweep the projects whose sweep failed with GitHub's answer, then
 the writes left for the next run under its budget, then why the run ended early
 or its `error` line; either says when the report was not a JSON object.
-`summary` is one clause on what the run did ("failed in 11 of 11 project(s)",
-"3 applied, 9 unchanged"); `since` is carried from the previous `health.json`;
+`summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
+of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
+previous `health.json`;
 `place`, `absence`, `presence`, `does`, `effect` and `runbook` are the words and
 the link the message is built from, from `WATCHED`. The reconcile's report,
 `fleet-reconcile.json` from `hack/fleet_reconcile.py --report`, is
