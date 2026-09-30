@@ -68,6 +68,9 @@ GITHUB_PATH_PRESENT = "present"
 GITHUB_PATH_ABSENT = "absent"
 GITHUB_PATH_UNREAD = "unread"
 GITHUB_PATH_FAILED = "failed"
+# The body came back but is not UTF-8. run_cmd decodes strictly, so this is
+# caught in the reader rather than ending the verifier in a traceback.
+GITHUB_PATH_UNDECODABLE = "undecodable"
 # The contents API's `type` for a symlink at the last component of a path. The
 # audit's walk follows none, so a prefix that is one names nothing to it.
 GITHUB_CONTENT_TYPE_SYMLINK = "symlink"
@@ -794,7 +797,7 @@ _UNREAD_PATTERNS = (
     # refused connection, a socket timeout or a TLS handshake that never
     # completed. None of these is a resource's name.
     re.compile(
-        r"error connecting to api\.github\.com|check your internet connection|githubstatus\.com|dial tcp .*(?:connection refused|i/o timeout)|net/http: TLS handshake timeout",
+        r"error connecting to api\.github\.com|check your internet connection|githubstatus\.com|dial tcp \S*: (?:connect: )?(?:connection refused|i/o timeout|network is unreachable|no route to host)|dial tcp .*(?:connection refused|i/o timeout)|net/http: TLS handshake timeout|unexpected EOF",
         re.I,
     ),
 )
@@ -2390,6 +2393,12 @@ def _load_audit_report():
     spec.loader.exec_module(module)
     for name in _AUDIT_REPORT_SYMBOLS:
         getattr(module, name)
+    # `read_intent_paths` imports this lazily too, from the sys.path entry the
+    # audit script adds for its own checkout; a checkout without it is the
+    # same machine fault as no PyYAML, proven here rather than blamed on a
+    # repository's intent file.
+    import workspace_paths  # noqa: F401
+
     return module
 
 
@@ -2456,7 +2465,10 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
     cmd = ["gh", "api"]
     if raw:
         cmd += ["-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}"]
-    rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}"])
+    try:
+        rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{urllib.parse.quote(path, safe='/')}"])
+    except UnicodeDecodeError as exc:
+        return GITHUB_PATH_UNDECODABLE, f"not UTF-8: {exc}"
     if rc == 0:
         return GITHUB_PATH_PRESENT, out
     reason = _unread_reason(err or "")
@@ -2514,7 +2526,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         return unread(GITOPS_INTENT_NOTE_PATH, out)
     if state == GITHUB_PATH_ABSENT:
         return absent_note()
-    if state == GITHUB_PATH_FAILED:
+    if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
         return failed(GITOPS_INTENT_NOTE_PATH, out)
     try:
         payload = _load_json(out)
@@ -2528,7 +2540,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
                 return unread(f"{GITOPS_INTENT_NOTE_PATH} (over the contents API's inline limit, read raw)", body)
             if state == GITHUB_PATH_ABSENT:
                 return absent_note()
-            if state == GITHUB_PATH_FAILED:
+            if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
                 return failed(f"{GITOPS_INTENT_NOTE_PATH} (over the contents API's inline limit, read raw)", body)
         else:
             body = base64.b64decode(payload.get("content") or "").decode("utf-8")
@@ -2575,6 +2587,15 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         return unread(f"{audit.INTENT_FILE} (so whether it bounds the search away from the note is unknown)", intent_out)
     if state == GITHUB_PATH_FAILED:
         return failed(audit.INTENT_FILE, intent_out)
+    if state == GITHUB_PATH_UNDECODABLE:
+        # The audit's reader catches the same UnicodeDecodeError and searches
+        # the whole tree, note included; so does this verdict.
+        return CheckResult(
+            name,
+            True,
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration; its {audit.INTENT_FILE} is not UTF-8, "
+            f"which the audit reads as no bound, so it searches the whole tree, note included",
+        )
     if state == GITHUB_PATH_ABSENT:
         return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
     import contextlib
@@ -2611,7 +2632,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         state, out = _gitops_path_state(repo_slug, prefix)
         if state == GITHUB_PATH_UNREAD:
             return unread(f"`{prefix}` from {audit.INTENT_FILE} (so whether the audit applies that bound is unknown)", out)
-        if state == GITHUB_PATH_FAILED:
+        if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
             return failed(f"`{prefix}` from {audit.INTENT_FILE}", out)
         if state == GITHUB_PATH_ABSENT or _names_nothing_to_the_audit(out):
             return CheckResult(

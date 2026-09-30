@@ -1562,6 +1562,32 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIn("contents/docs%23archive", probe)
         self.assertNotIn("docs#archive", probe)
 
+    def test_an_intent_file_that_is_not_utf8_is_no_bound_as_the_audit_reads_it(self):
+        # run_cmd decodes strictly; a Latin-1 byte in the intent file raised out
+        # of the verifier. The audit's reader catches it and searches the whole
+        # tree, so the verdict is a pass that says so.
+        undecodable = UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid start byte")
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), undecodable]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        self.assertIn("not UTF-8", result.message)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [undecodable]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("Could not read", result.message)
+
+    def test_no_workspace_paths_leaves_the_check_unverified_like_no_pyyaml(self):
+        # read_intent_paths imports workspace_paths lazily; a checkout without
+        # it is a machine fault the loader proves, not a repository's fault.
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.dict(sys.modules, {"workspace_paths": None}):
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("workspace_paths", result.warnings[0])
+
     def test_an_intent_read_that_times_out_on_a_404_project_is_unverified_not_absent(self):
         # The same `\b404\b`-in-the-command-line trap as the note read, on
         # the bound's read: a timeout must not read as "no intent file".
@@ -1650,11 +1676,17 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: connection refused',
             'Get "https://api.github.com/...": dial tcp 140.82.112.5:443: i/o timeout',
             "net/http: TLS handshake timeout",
+            # The other dial failures gh prints raw, one of them on a `-404-`
+            # project whose id sits in the URL the error embeds.
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: network is unreachable',
+            "dial tcp 140.82.112.5:443: connect: no route to host",
+            'Get "https://api.github.com/...": unexpected EOF',
         )
         for err in errs:
             with self.subTest(err[:40]), mock.patch.object(checker, "run_cmd") as run:
                 run.side_effect = [_fail(err)]
-                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                result = checker.check_gitops_declaration("kube-agents-evals-404" if "-404-" in err else "kube-agents-evals-3")
+                self.assertNotIn("-X PUT", result.message)
                 self.assertTrue(result.passed, err)
                 self.assertEqual("Not checked", result.message)
                 self.assertIsInstance(result.warnings[0], checker.Unread)
