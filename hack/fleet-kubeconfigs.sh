@@ -53,8 +53,8 @@
 # whole fail/error distinction rests on being able to say an object that is
 # gone AT CHECK TIME went missing DURING the run. Confirming it here is what
 # makes that true, and confirming it PER OBJECT rather than per namespace is
-# what makes it true for the roles that have no namespace: four of the nine
-# are cluster-scoped, so a namespace-only gate waved them through and let a
+# what makes it true for the roles that have no namespace: the cluster-scoped
+# ones, which a namespace-only gate waved through and so let a
 # check on a live-but-empty cluster blame an agent that touched nothing. A
 # fixture that was never planted leaves the role unresolvable, which is an
 # error about the environment, not a failure blamed on the agent.

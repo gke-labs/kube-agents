@@ -90,7 +90,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Ten fixtures: nine across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
+Every fixture but the project-scoped `orphan-disks` sits on one of the three cluster slots. Every in-cluster fixture is on slot `a`, across the
 six seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
 `seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
@@ -130,7 +130,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the ten roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -150,7 +150,7 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Seven of the ten are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+Assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
 `declared-no-pdb-workload`, `crashloop-workload`, `hpa-saturated`, `version-laggard` and
 `deprecated-api-caller`,
 covering security, reliability, cluster debugging, remediation, capacity, upgrades and API

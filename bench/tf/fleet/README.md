@@ -203,7 +203,7 @@ The chain, end to end:
    the objects. Confirming presence here, before the agent runs, is what entitles the
    verifier to read an object that is gone at check time as a fixture the run destroyed
    rather than one that was never planted. It probes the **objects** and not merely the
-   namespace because four of the nine roles are cluster-scoped and have no namespace:
+   namespace because the cluster-scoped roles (`rbac-overgrant`, `idle-nodepool`, `version-laggard`, `drift-outlier`) have no namespace:
    a namespace-only gate published them unconditionally, and `compliance-rbac-overgrant`
    then reported a catastrophic `fail` against an agent that had touched nothing.
    Adding a fixture therefore means adding both its role and its probes; every subject

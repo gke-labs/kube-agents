@@ -4,8 +4,8 @@
 # presubmit runs the blocking roster only (#1023) and this case was never
 # admitted (491/679 graded presubmit repetitions 2026-09-15 to 09-22), so
 # it earns its roster seat on the nightly record now.
-# Grades what nothing active grades: fleet-wide DISCOVERY. Every active
-# reliability task names checkout-gateway in its prompt; this one does not —
+# Grades what nothing active grades: fleet-wide DISCOVERY. Every located
+# PDB case names checkout-gateway in its prompt; this one does not —
 # the agent has to sweep the seeded namespaces across the clusters it
 # manages and find the exposed workload itself. The prompt states that an
 # exposed workload exists (the same information the located prompts leak by

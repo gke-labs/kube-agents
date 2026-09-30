@@ -1580,6 +1580,27 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 run.side_effect = [_ok(self._contents(body))]
                 self.assertTrue(checker.check_gitops_declaration("kube-agents-evals-3").passed, label)
 
+    def test_a_parser_that_cannot_run_leaves_the_check_unverified(self):
+        # No PyYAML, or the audit script missing from the tree: a fact about
+        # the machine, not the note, so the check is unread rather than failed
+        # and the run exits 2 instead of ending in a traceback.
+        for label, exc in (("no PyYAML", ModuleNotFoundError("No module named 'yaml'")), ("no audit script", FileNotFoundError("audit_report.py"))):
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_load_audit_report", side_effect=exc):
+                run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertTrue(result.passed, label)
+                self.assertEqual("Not checked", result.message)
+                self.assertEqual(1, len(result.warnings))
+                self.assertIsInstance(result.warnings[0], checker.Unread)
+                self.assertIn(type(exc).__name__, result.warnings[0])
+                self.assertFalse(result.read)
+
+    def test_the_declarable_set_is_the_audits(self):
+        # The check asks the audit which slugs a note may justify; the fixture's
+        # check has to be one of them, or the note it seeds declares nothing.
+        audit = checker._load_audit_report()
+        self.assertIn(checker.GITOPS_INTENT_NOTE_DECLARATION["check"], audit.audit_declarable_checks(checker.GITOPS_INTENT_NOTE_AUDIT))
+
     def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
         # One note, defined twice: the script seeds it, the verifier reads it
         # back and prints it as the repair. They drift apart unless pinned.

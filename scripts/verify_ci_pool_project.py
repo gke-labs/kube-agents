@@ -123,11 +123,13 @@ CHECK_DISPLAY_NAMES = {
 GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
 # The checks that read GCP, and so need a gcloud credential before they run:
 # every check but the mapping, which reads the checkout and the remote ref,
-# and the GitHub check, whose reads are all `gh`.
+# and the GitHub checks in GITHUB_CHECKS, whose reads are all `gh`.
 GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING} - GITHUB_CHECKS
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
-# two GitHub checks (each needs a credential the health bot must not hold),
+# GitHub-reading checks -- github_repo_and_app, gitops_declaration,
+# ledger_read_credential -- (each needs a credential the health bot must not
+# hold),
 # not the mapping (that is about the checkout, not the project), and not the
 # warm-cache check, whose read is in another project the bot holds nothing on.
 POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_TOKEN_MINTER_KMS)
@@ -307,6 +309,9 @@ obtainability audit lists this posture under Declared intent rather than as a fi
 # must find in the note's `declares` list. A file that has the path but not
 # this declares nothing, and the case fails on that project with a
 # presence-only check green -- which is why presence alone is not the check.
+# The stream whose declared-intent step reads the note; its `declarable` set is
+# the policy the check defers to.
+GITOPS_INTENT_NOTE_AUDIT = "obtainability-audit"
 GITOPS_INTENT_NOTE_DECLARATION = {
     "check": "no-pdb",
     "namespace": "seeded-intent",
@@ -756,8 +761,9 @@ _UNREAD_PATTERNS = (
 )
 
 # gh prints `gh: Not Found (HTTP 404)` both for a resource that is absent and
-# for one the token's scopes do not reach. Only call sites that know a 404
-# cannot mean "absent" may use this; see check_github_repo_and_app.
+# for one the token's scopes do not reach. A call site may use this only when
+# it either knows a 404 cannot mean "absent" (check_github_repo_and_app) or
+# names both readings in what it reports (check_gitops_declaration).
 _GITHUB_NOT_FOUND = re.compile(r"\b404\b|\bnot found\b", re.I)
 
 # hack/fleet-kubeconfigs.sh reports a cluster it could not reach and a fleet
@@ -2018,7 +2024,7 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         return CheckResult(name, False, f"{_FLEET_CATALOG} declares no fixture roles")
 
     # kubectl is absent from check_toolchain() because every other check here is
-    # gcloud or gh. Without it every probe fails, all nine roles report as
+    # gcloud or gh. Without it every probe fails, every role reports as
     # unplanted, and the run states a confident and wrong verdict about a fleet
     # it never looked at.
     rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
@@ -2348,7 +2354,10 @@ def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
     import yaml
 
     audit = _load_audit_report()
-    declarable = frozenset({GITOPS_INTENT_NOTE_DECLARATION["check"]})
+    # The audit's own policy for which slugs a note may justify, not a local
+    # copy of it: if no-pdb ever leaves the obtainability stream's declarable
+    # set, this check rejects the note the day the audit does.
+    declarable = audit.audit_declarable_checks(GITOPS_INTENT_NOTE_AUDIT)
     entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
     if not entries:
         front_text = audit.split_frontmatter(body)
@@ -2406,7 +2415,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
                 name,
                 False,
                 f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
-                f"(gh answers 404 to both; the repository check above says which). If the repository is "
+                f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
                 f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
                 f"is seeded: {gitops_note_seed_command(repo_slug)}",
             )
