@@ -555,6 +555,18 @@ class PlanTest(_RuntimeCase):
         tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
         self.assertEqual([t["status"] for t in tasks], ["in_progress"])
 
+    def test_a_card_that_gave_up_runs_again_when_unblocked(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        self._note(adapter, 2, "b", task="t_b")
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        _run(runtime.settle_row(adapter, _sub("t_b"), "blocked"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        self.assertEqual([t["status"] for t in tasks], ["in_progress", "pending"])
+
     def _move(self, adapter, event_id, moved, task="t_a"):
         return _run(runtime.deliver_row(adapter, _sub(task), event_id, "check payments", f"→ {moved}", moved))
 
@@ -710,6 +722,17 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_a"), "archived"))
         self.assertEqual(len(adapter.calls), calls)
         self.assertEqual(list(runtime._plans[(CHANNEL, THREAD)].rows), ["t_a", "t_b"])
+
+    def test_a_redelivered_batch_leaves_an_archived_row_archived(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        self._note(adapter, 2, "b", task="t_b")
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        for _ in range(3):
+            for kind in ("unblocked", "blocked", "archived"):
+                _run(runtime.settle_row(adapter, _sub(), kind))
+        row = runtime._plans[(CHANNEL, THREAD)].rows["t_a"]
+        self.assertEqual((row.lines, row.status), (["reading logs", "Archived"], "error"))
 
     def test_an_unblocked_replay_leaves_a_running_row(self):
         adapter = _Adapter()

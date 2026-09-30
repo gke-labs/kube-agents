@@ -126,6 +126,11 @@ check(
     "an unclaimed kind never reaches the formatter",
 )
 check(
+    "the silent kinds are claimed",
+    {"archived", "unblocked"} <= set(notifier.TERMINAL_KINDS),
+    "an unclaimed archived or unblocked never reaches the _send_pings hook",
+)
+check(
     "heartbeat never wakes the creator",
     "heartbeat" not in notifier._WAKE_KINDS,
     "a progress note that costs a full LLM turn is the most expensive thing on the board",

@@ -606,10 +606,12 @@ async def deliver(
 
     payload = getattr(ev, "payload", None)
     line = rolling_line(kind, payload) or message
+    moved = _moved_to(kind, payload)
     plan = _slack_plan(quiet)
-    if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line, _moved_to(kind, payload)):
-        if entry and entry["message_id"] and entry["lines"]:
-            # The plan took over a card that rolled while it stood fallen back.
+    if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line, moved):
+        if moved is None and entry and entry["message_id"] and entry["lines"]:
+            # The plan took over a card that rolled while it stood fallen back. A
+            # move it took may have been dropped, so only a note hands over.
             try:
                 await adapter.edit_message(
                     chat_id, entry["message_id"], render(header, entry["lines"][-1:], MOVED_TO_PLAN),

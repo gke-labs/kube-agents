@@ -64,12 +64,12 @@ TASK_STATUSES = frozenset({TASK_PENDING, TASK_RUNNING, TASK_COMPLETE, TASK_ERROR
 
 #: Kanban notifier kinds, by the row status each leaves. A kind not listed
 #: leaves the row as it was: ``crashed`` and ``timed_out``, which the
-#: dispatcher retries, and ``archived``, which the runtime settles itself
-#: (``gateway/slack_ux_status.py``). ``block_loop_detected`` waits on the
-#: user, as ``slack_presenter.SETTLE_BY_KANBAN_KIND`` reads it.
+#: dispatcher retries, and ``archived`` and ``status`` (a dashboard move),
+#: which the runtime handles itself (``gateway/slack_ux_status.py``).
+#: ``block_loop_detected`` waits on the user, as
+#: ``slack_presenter.SETTLE_BY_KANBAN_KIND`` reads it.
 TASK_STATUS_BY_KIND = {
     "heartbeat": TASK_RUNNING,
-    "status": TASK_RUNNING,
     "completed": TASK_COMPLETE,
     "blocked": TASK_PENDING,
     "unblocked": TASK_RUNNING,

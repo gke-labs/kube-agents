@@ -39,6 +39,7 @@ class TaskStatusTest(unittest.TestCase):
         self.assertEqual(s.task_status("unblocked"), "in_progress")
         self.assertEqual(s.task_status("gave_up"), "error")
         self.assertIsNone(s.task_status("archived"))
+        self.assertIsNone(s.task_status("status"))
 
     def test_retried_kinds_leave_the_row_and_a_block_loop_waits(self):
         # As slack_presenter reads them: the dispatcher retries a crash or a timeout.

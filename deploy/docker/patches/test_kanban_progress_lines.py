@@ -1101,6 +1101,19 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Checking seeded-a.", adapter.edits[0][1])
         self.assertEqual(tracked_messages(watcher), {})
 
+    async def test_a_move_the_plan_takes_leaves_a_rolling_message_rolling(self):
+        adapter, watcher = _Adapter(), SimpleNamespace()
+        self.takes = False
+        await deliver(
+            watcher, adapter, SLACK_SUB, "heartbeat", _beat(1, "Checking seeded-a."),
+            f"{IN_PROGRESS} {HEADER}Checking seeded-a.", None, HEADER, title="check seeded-a",
+        )
+        self.takes = True
+        move = SimpleNamespace(id=2, kind="status", payload={"status": "ready"})
+        await deliver(watcher, adapter, SLACK_SUB, "status", move, "🔄", None, HEADER)
+        self.assertEqual(adapter.edits, [])
+        self.assertNotEqual(tracked_messages(watcher), {})
+
     async def test_a_status_move_reaches_the_plan_as_a_move(self):
         move = SimpleNamespace(id=1, kind="status", payload={"status": " ready "})
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "status", move, "🔄", None, HEADER)

@@ -102,9 +102,6 @@ FLAG_ENV = "KAGE_SLACK_UX"
 #: exactly when that module cannot be imported.
 FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
-#: The platform name kanban subscriptions carry for Slack.
-PLATFORM = "slack"
-
 #: How long an unchanged ``processing`` stands before it is sent again. Slack
 #: documents no expiry for an agent session's status; this bounds how stale a
 #: status can go if one ever does, at one call a minute instead of thirty.
@@ -126,7 +123,8 @@ PLAN_STATUS_LABEL = "plan"
 ARCHIVED_KIND = "archived"
 ARCHIVED_NOTE = "Archived"
 
-#: The notifier kind for a card the user unblocked: its waiting row runs again.
+#: The notifier kind for a card the user unblocked: its waiting row runs
+#: again, as does one that gave up, which the breaker parks until unblocked.
 UNBLOCKED_KIND = "unblocked"
 
 #: A dashboard move (a ``status`` event) to one of these columns settles the
@@ -154,7 +152,7 @@ _warned_missing = False
 class _Row:
     """One card's row. A plain class, for the reason ``slack_ux_reactions._Ask`` is."""
 
-    __slots__ = ("last_event_id", "lines", "status", "task_id", "title")
+    __slots__ = ("archived", "last_event_id", "lines", "status", "task_id", "title")
 
     def __init__(self, task_id: str, title: str) -> None:
         self.task_id = task_id
@@ -162,6 +160,7 @@ class _Row:
         self.lines: list[str] = []
         self.status = ""
         self.last_event_id = 0
+        self.archived = False
 
 
 class _Plan:
@@ -511,15 +510,19 @@ def _settled(plan: _Plan) -> bool:
 
 def _move(row: _Row, kind: str) -> bool:
     """Apply a terminal or silent event to the card's row; False when it moves nothing."""
+    if row.archived:
+        return False  # upstream never unarchives, so a later event is a redelivery
     if kind == ARCHIVED_KIND:
         if not _live(row):
             return False  # archived after it finished: its row stands
         # Archived by hand: nothing else will settle the row.
         row.lines = [*row.lines, ARCHIVED_NOTE][-_status.STEPS_MAX:]
         row.status = _status.TASK_ERROR
+        row.archived = True
         return True
     status = _status.task_status(kind)
-    if status is None or (kind == UNBLOCKED_KIND and row.status != _status.TASK_PENDING):
+    resumable = (_status.TASK_PENDING, _status.TASK_ERROR)
+    if status is None or (kind == UNBLOCKED_KIND and row.status not in resumable):
         return False  # nothing to move, or an unblocked replay
     row.status = status
     return True
