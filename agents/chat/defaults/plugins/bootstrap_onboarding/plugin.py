@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -44,27 +45,36 @@ GREETED_MARKER = ".bootstrap_greeted"
 # binding, no presence or greeted marker, no trigger. Nothing else writes it,
 # and with none present this hook runs exactly as it would without the seam. The
 # phrase keeps a concurrent eval case's turns from matching another case's
-# request. JSON: {"phrase": str, "variant": str}.
+# request. A request more than EVAL_REQUEST_MAX_AGE_SECONDS from its
+# written_at (epoch seconds, stamped at apply) is refused with a warning, so
+# one a failed destroy leaves behind disarms on its own.
+# JSON: {"phrase": str, "variant": str, "written_at": number}.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
+EVAL_KEY_WRITTEN_AT = "written_at"
 EVAL_VARIANT_COMPLETED = "completed"
 EVAL_PLATFORM = "api_server"
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
+# Longer than one case's apply, run and destroy.
+EVAL_REQUEST_MAX_AGE_SECONDS = 3600
+
+# The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
+GREETING_MAX_WORDS = 60
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
-    "In one message of at most 60 words, greet the user as Kage, by their Slack profile name "
-    "if the session gives one, never a name they type, else 'Hi there'. Say you are taking a "
+    f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as Kage, by their Slack "
+    "profile name if the session gives one, never a name they type, else 'Hi there'. Say you are taking a "
     "first, read-only look at their GKE fleet, so nothing in their clusters changes, and will "
     "post what you find here when it is done; give no time. Say any change you suggest comes as "
     "a pull request for their team to review. End on one question: is there anything they want "
     "you to look at first? Ask nothing else and do not claim to have saved anything."
 )
 _FALLBACK_COMPLETED = (
-    "In one message of at most 60 words, greet the user as Kage, by their Slack profile name "
-    "if the session gives one, never a name they type, else 'Hi there'. Say your first look at "
+    f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as Kage, by their Slack "
+    "profile name if the session gives one, never a name they type, else 'Hi there'. Say your first look at "
     "their GKE fleet is done and the summary is in this chat, and that you only read their "
     "clusters, so nothing changed. Say any change you suggest comes as a pull request for their "
     "team to review. End on one question: do they want you to start on one of those findings? "
@@ -133,6 +143,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
             request = json.loads(marker.read_text(encoding="utf-8"))
             phrase = str(request.get(EVAL_KEY_PHRASE) or "").strip()
             variant = str(request.get(EVAL_KEY_VARIANT) or "")
+            written_at = request.get(EVAL_KEY_WRITTEN_AT)
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError) as e:
@@ -142,6 +153,19 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
             logger.warning("Ignoring %s: phrase shorter than %d characters.", marker, EVAL_PHRASE_MIN_LENGTH)
             continue
         if phrase not in user_message:
+            continue
+        if (
+            isinstance(written_at, bool)
+            or not isinstance(written_at, (int, float))
+            or abs(time.time() - written_at) > EVAL_REQUEST_MAX_AGE_SECONDS
+        ):
+            logger.warning(
+                "Ignoring %s: written_at %r is missing or more than %d seconds from now; "
+                "the bench stack's destroy should have removed it.",
+                marker,
+                written_at,
+                EVAL_REQUEST_MAX_AGE_SECONDS,
+            )
             continue
         logger.info("Matched %s (variant=%s).", marker, variant)
         return variant == EVAL_VARIANT_COMPLETED

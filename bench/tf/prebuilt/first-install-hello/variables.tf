@@ -74,7 +74,7 @@ variable "phrase" {
   # would greet any concurrent case's turn. scripts/validate_bench_cases.py
   # checks the same floor and that the phrase is in the case's own prompt.
   validation {
-    condition     = length(trimspace(var.phrase)) >= 12 && !can(regex("'", var.phrase))
-    error_message = "phrase must be at least 12 characters after trimming and contain no single quote (it is passed through a shell)."
+    condition     = length(trimspace(var.phrase)) >= 12
+    error_message = "phrase must be at least 12 characters after trimming."
   }
 }

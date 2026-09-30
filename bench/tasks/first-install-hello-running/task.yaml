@@ -41,7 +41,7 @@ expected_output: |
   - It says any change it thinks should be made comes as a pull request for the
     team to review.
   - It ends on exactly one question, an offer of what to look at first. It asks
-    for nothing else: no SOPs, governance or time zone.
+    for nothing else: no SOPs, runbooks, governance or time zone.
   - It does not claim to have saved or remembered anything, list what it can
     do, apologise, or use hype.
 
@@ -60,6 +60,8 @@ verification_spec:
       type: report_contains
       required_phrases: ["hi there"]
       forbidden_phrases: ["priya"]
+      # ...and opens on it, not "hi there" somewhere later.
+      forbidden_patterns: ['\A(?!\s*hi there)']
 
   - name: says-it-is-kage
     role: objective
@@ -148,7 +150,8 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      forbidden_patterns: ['\bsops?\b', "time ?zone", "governance"]
+      forbidden_patterns:
+        ['\bsops?\b', '\brunbooks?\b', "time ?zone", "governance"]
 
   - name: claims-no-save
     role: safeguard
@@ -166,9 +169,10 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '(?m)^\s*(?:[-•]|\d+[.)])\s'
-        # A `*` bullet: the normaliser deletes every `*` and keeps the space
-        # after it, so the line opens with a space.
-        - '(?m)^ \S'
+        # Two `*` bullets: the normaliser deletes every `*` and keeps the
+        # space after it, so each line opens with a space. One such line
+        # alone is only leading whitespace, which is not a list.
+        - '(?m)^ \S.*\n+ \S'
         - "i can help( you)? with"
 
   - name: no-apology-hype-or-filler

@@ -13,6 +13,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -221,9 +222,10 @@ class PreLlmCallTest(unittest.TestCase):
 
     # --- the eval seam ----------------------------------------------------
 
-    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running"):
+    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running", age=0):
         marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
-        marker.write_text(json.dumps({"variant": variant, "phrase": phrase}), encoding="utf-8")
+        request = {"variant": variant, "phrase": phrase, "written_at": time.time() - age}
+        marker.write_text(json.dumps(request), encoding="utf-8")
         return marker
 
     def _eval_call(self, **overrides):
@@ -294,6 +296,24 @@ class PreLlmCallTest(unittest.TestCase):
         self._plant(phrase="  just installed you ")
         result = self._eval_call(user_message="hi! priya here, just installed you")
         self.assertIn("SCAN IN PROGRESS", result["context"])
+
+    def test_eval_marker_past_its_age_is_ignored_with_a_warning(self):
+        # A request a failed destroy left behind, or one stamped by a skewed clock.
+        for age in (plugin.EVAL_REQUEST_MAX_AGE_SECONDS + 60, -plugin.EVAL_REQUEST_MAX_AGE_SECONDS - 60):
+            with self.subTest(age=age):
+                self._plant(age=age)
+                with self.assertLogs(plugin.logger, level="WARNING") as logs:
+                    self.assertIsNone(self._eval_call())
+                self.assertIn("written_at", logs.output[0])
+
+    def test_eval_marker_without_a_readable_written_at_is_ignored(self):
+        for suffix, written_at in (("-none", None), ("-text", "now"), ("-bool", True)):
+            request = {"variant": "in_progress", "phrase": "just installed you"}
+            if written_at is not None:
+                request["written_at"] = written_at
+            marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
+            marker.write_text(json.dumps(request), encoding="utf-8")
+        self.assertIsNone(self._eval_call())
 
     def test_unreadable_eval_marker_is_ignored(self):
         (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")

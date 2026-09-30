@@ -31,8 +31,11 @@
 # concurrently against one install: a shared file would be overwritten by the
 # other variant's apply, and a phrase-less one taken by any case's first turn.
 #
-# Destroy removes the file; until then it stays armed for its phrase. Nothing
-# else is planted, so nothing else is torn down.
+# Destroy removes the file and reads back, failing when it is still there;
+# until then it stays armed for its phrase. The request also carries the time
+# it was written, and the plugin refuses one older than an hour, so a file a
+# failed destroy leaves behind disarms on its own. Nothing else is planted, so
+# nothing else is torn down.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -63,7 +66,11 @@ resource "null_resource" "greet_request" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+    environment = {
+      GREET_REQUEST = local.request
+      MARKER_NAME   = local.marker_name
+    }
+    command = <<-EOT
       set -euo pipefail
 
       kubeconfig_dir="$(mktemp -d)"
@@ -87,15 +94,20 @@ resource "null_resource" "greet_request" {
       pod="deployment/${var.agent_deployment}"
       exec_in_pod=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
 
+      # Stamped here rather than in local.request, which is a trigger: a time
+      # there would re-create the resource on every plan. jsonencode ends the
+      # object on its closing brace, which the key goes in front of.
+      request="$${GREET_REQUEST%?},\"written_at\":$(date -u +%s)}"
+
       # The home is read inside the pod the way the entrypoint derives HERMES_HOME
       # (PLATFORM_AGENT_HOME from the operator, then the plugin's own default), so
       # the file lands where the chat profile's hook looks for it.
-      printf '%s' '${local.request}' | "$${exec_in_pod[@]}" sh -c \
+      printf '%s' "$request" | "$${exec_in_pod[@]}" sh -c \
         'home="$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}"; cat > "$home/$1.tmp" && mv "$home/$1.tmp" "$home/$1"' \
-        sh "${local.marker_name}"
+        sh "$MARKER_NAME"
 
-      written="$("$${exec_in_pod[@]}" sh -c 'cat "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1"' sh "${local.marker_name}" </dev/null)"
-      if [ "$written" != '${local.request}' ]; then
+      written="$("$${exec_in_pod[@]}" sh -c 'cat "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1"' sh "$MARKER_NAME" </dev/null)"
+      if [ "$written" != "$request" ]; then
         echo "ERROR: ${local.marker_name} in ${var.agent_container} does not hold the request this stack wrote, so the greeting would not fire. Found: $written" >&2
         exit 1
       fi
@@ -103,11 +115,15 @@ resource "null_resource" "greet_request" {
     EOT
   }
 
+  # No on_failure = continue: a destroy that cannot confirm the file is gone
+  # fails the run, rather than leaving a request Terraform records as removed.
   provisioner "local-exec" {
     when        = destroy
-    on_failure  = continue
     interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
+    environment = {
+      MARKER_NAME = self.triggers.marker_name
+    }
+    command = <<-EOT
       set -euo pipefail
       kubeconfig_dir="$(mktemp -d)"
       trap 'rm -rf "$kubeconfig_dir"' EXIT
@@ -122,9 +138,18 @@ resource "null_resource" "greet_request" {
       gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
         --location "${self.triggers.host_location}" --project "$project" --quiet
 
-      kubectl exec "deployment/${self.triggers.deployment}" -n "${self.triggers.namespace}" \
-        -c "${self.triggers.container}" -- \
-        sh -c 'rm -f "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1"' sh "${self.triggers.marker_name}"
+      exec_in_pod=(kubectl exec "deployment/${self.triggers.deployment}" -n "${self.triggers.namespace}" -c "${self.triggers.container}" --)
+
+      "$${exec_in_pod[@]}" sh -c 'rm -f "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1"' sh "$MARKER_NAME" </dev/null
+
+      # A separate read, so a remove that silently did nothing is caught. An
+      # exec that fails outright fails the destroy through set -e.
+      remaining="$("$${exec_in_pod[@]}" sh -c 'if [ -e "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1" ]; then echo present; else echo absent; fi' sh "$MARKER_NAME" </dev/null)"
+      if [ "$remaining" != absent ]; then
+        echo "ERROR: $MARKER_NAME is still in ${self.triggers.container} after destroy (read back: $remaining). Every API-server turn carrying its phrase gets the canned greeting until it is removed or an hour after it was written." >&2
+        exit 1
+      fi
+      echo "Removed $MARKER_NAME."
     EOT
   }
 }
