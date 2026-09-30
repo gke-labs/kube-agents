@@ -37,8 +37,9 @@ problems directly, and treat a Recommender insight as a bonus.
 ## The table
 
 `results.py` generates everything between the markers, and [`results.csv`](results.csv) beside it, from the
-verdicts it holds and from `recommender.json`. It writes nothing and exits 1 if a quote does not appear word
-for word in its evidence file. Run prettier on `README.md` after it, at the version
+verdicts it holds and from `recommender.json`. It writes nothing and exits 1 if `recommender.json` or an
+evidence file is missing, if a quote does not appear word for word in its evidence file, or if this file does
+not have exactly one pair of markers. Run prettier on `README.md` after it, at the version
 `.github/workflows/prettier.yml` pins: the repository's prettier check aligns the table, and `results.py`
 writes it unaligned. GitHub shows `results.csv` as a searchable table with one row per scenario and the full quote (tabs shown as
 spaces). The proof column below shows at most 150 characters of each quote, with tabs shown as single spaces
@@ -115,8 +116,9 @@ catalogue predicts nothing breaks yet, and nothing did.
 ## What each verdict rests on
 
 Every line below survived the adversarial pass. Times are UTC on 2026-09-29. Only the evidence file each table
-row quotes is checked in, under `evidence/`, with the project ID and project number replaced by placeholders.
-The other files named below were recorded in the same runs and are not in the repository.
+row quotes, and scenario 11's probe log, are checked in, under `evidence/`, with the project ID, the project
+number and public IP addresses replaced by placeholders. The other files named below were recorded in the same
+runs and are not in the repository.
 
 1. The budget refused GKE's own drain: the audit log shows `container-engine-robot` getting HTTP 429 on
    eviction. GKE then force-killed the pod at 15:00:16, 61 minutes after the pool upgrade began at 13:59:14. The
@@ -151,7 +153,8 @@ The other files named below were recorded in the same runs and are not in the re
     planted, and kubectl's skew warning was not captured.
 11. A probe read and wrote every two to four seconds, from 10 seconds before the zonal control-plane upgrade to
     30 seconds after it: 228 samples, about 211 inside the operation, all up; every sample is in
-    `11b/zonal-probe.txt`. The summary's `samples=229` also counts that file's header line. The read-only run
+    `11b/zonal-probe.txt`. The checked-in summary's `samples=229` counted that file's header line too; it was
+    recorded before the count was fixed. The read-only run
     on `upg-11` saw 225 up. No gap was measurable.
 12. A pod selected a label set by hand with `kubectl`. The rebuilt node did not carry it, and the pod stayed
     Pending after GKE reported DONE. GKE form: the run tested a label the node pool does not declare, which
@@ -258,7 +261,7 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code
 and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. The
 availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly. A re-run adds new files
-beside the checked-in ones; commit only a file a table row or the catalogue quotes, after replacing the project
+beside the checked-in ones; commit only a file the table or the notes above cite, after replacing the project
 ID and number and any public IP address.
 Redirect the console to `logs/<track>.log` if you want it; `logs/` is gitignored.
 
@@ -279,8 +282,9 @@ The Recommender side has two parts:
   already broken and moved on shows it nothing to warn about.
 - **The read.** `check-recommender.sh` reads every `google.container.DiagnosisInsight` insight and every
   `google.container.DiagnosisRecommender` recommendation in each zone. It saves the raw JSON under
-  `evidence/recommender/<stamp>/`, and writes `recommender.json`, which maps each insight to the cluster in its
-  resource path.
+  `evidence/recommender/<stamp>/`, and writes `recommender.json`, which maps each insight and recommendation to
+  the cluster in its resource path (for a recommendation, its `targetResources` or its operations). It prints any
+  record that names no cluster rather than dropping it, and replaces the project ID and number in what it writes.
 
 A scenario counts as **caught** when an insight subtype that GKE documents for that hazard was published on a
 cluster carrying the hazard. An unrelated insight on the same cluster does not count. Both catches so far came

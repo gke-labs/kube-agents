@@ -1,5 +1,5 @@
 # Per-cluster kubeconfigs, the locally built crane, console logs and the raw Recommender responses (which carry
-# the project number) stay local. Only the evidence files the results table or the catalogue quotes are checked in, scrubbed.
+# the project number) stay local. Only the evidence files the README's table or notes cite are checked in, scrubbed.
 .kubeconfigs/
 .bin/
 logs/
