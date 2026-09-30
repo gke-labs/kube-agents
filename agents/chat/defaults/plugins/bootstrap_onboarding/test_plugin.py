@@ -218,7 +218,7 @@ class PreLlmCallTest(unittest.TestCase):
 
     # --- the eval seam ----------------------------------------------------
 
-    def _plant(self, variant="in_progress", phrase="priya here", suffix="-running"):
+    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running"):
         marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
         marker.write_text(json.dumps({"variant": variant, "phrase": phrase}), encoding="utf-8")
         return marker
@@ -243,7 +243,7 @@ class PreLlmCallTest(unittest.TestCase):
 
     def test_eval_marker_touches_no_onboarding_state(self):
         self._plant()
-        self._eval_call(platform="google_chat")
+        self.assertIsNotNone(self._eval_call())
         self.update_job.assert_not_called()
         self.trigger_job.assert_not_called()
         self.assertFalse((self.data_dir / ".user_aligned").exists())
@@ -275,6 +275,17 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNone(self._eval_call(platform="cron"))
         self.assertIsNone(self._eval_call(session_id="cron_abc"))
         self.assertTrue(marker.exists())
+
+    def test_eval_marker_is_not_consulted_on_a_chat_platform(self):
+        (self.data_dir / plugin.GREETED_MARKER).touch()
+        self._plant()
+        self.assertIsNone(self._eval_call(platform="google_chat"))
+        self.assertIsNone(self._eval_call(platform="slack"))
+
+    def test_eval_marker_with_a_short_phrase_is_ignored(self):
+        for suffix, phrase in (("-blank", " "), ("-hi", "hi"), ("-padded", "   priya   ")):
+            self._plant(phrase=phrase, suffix=suffix)
+        self.assertIsNone(self._eval_call())
 
     def test_unreadable_eval_marker_is_ignored(self):
         (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")

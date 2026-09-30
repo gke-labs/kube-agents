@@ -32,11 +32,12 @@ GREETED_MARKER = ".bootstrap_greeted"
 
 # The eval seam: requests written only by the first-install-hello bench stack
 # (bench/tf/prebuilt/first-install-hello) as files whose names start with this
-# prefix, one per case, each asking for the greeting on every non-cron turn whose
-# message contains its phrase, on any platform, until the stack's destroy step
-# removes the file. It exists because the bench reaches the gateway over the API
-# server, which the platform allowlist above excludes, and because a real
-# install greets once. It is not used up on first match: the harness re-sends the
+# prefix, one per case, each asking for the greeting on every API-server turn
+# whose message contains its phrase, until the stack's destroy step removes the
+# file. It exists because the bench reaches the gateway over the API server,
+# which the platform allowlist above excludes, and because a real install greets
+# once. A chat platform's turns never consult it, and a phrase shorter than the
+# floor is ignored, so a stray request cannot greet every turn. It is not used up on first match: the harness re-sends the
 # opening turn in the same conversation after a dropped connection, and that
 # retry is no longer a first turn, so a used-up request would grade the retry's
 # ordinary reply as the model's. It touches no onboarding state: no delivery
@@ -48,6 +49,9 @@ EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
 EVAL_VARIANT_COMPLETED = "completed"
+EVAL_PLATFORM = "api_server"
+# The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
+EVAL_PHRASE_MIN_LENGTH = 12
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
@@ -132,7 +136,10 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
         except (OSError, ValueError, AttributeError) as e:
             logger.warning("Ignoring unreadable %s: %s", marker, e)
             continue
-        if not phrase or phrase not in user_message:
+        if len(phrase.strip()) < EVAL_PHRASE_MIN_LENGTH:
+            logger.warning("Ignoring %s: phrase shorter than %d characters.", marker, EVAL_PHRASE_MIN_LENGTH)
+            continue
+        if phrase not in user_message:
             continue
         logger.info("Matched %s (variant=%s).", marker, variant)
         return variant == EVAL_VARIANT_COMPLETED
@@ -179,9 +186,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # Ahead of the first-turn check: a retried opening turn is no longer a
     # first turn and must still greet (see EVAL_GREET_MARKER).
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
-    eval_completed = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
-    if eval_completed is not None:
-        return _greeting(data_dir, eval_completed)
+    if platform_name == EVAL_PLATFORM:
+        eval_completed = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
+        if eval_completed is not None:
+            return _greeting(data_dir, eval_completed)
 
     if not kwargs.get("is_first_turn", False):
         return None
