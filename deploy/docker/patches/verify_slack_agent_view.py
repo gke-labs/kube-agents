@@ -41,7 +41,7 @@ ADAPTER_MODULE = "plugins.platforms.slack.adapter"
 
 REQUIRED_SCOPES = ("reactions:write", "users:read", "files:write")
 FLAG_ON = "true"
-APP_NAME = "Kage"
+APP_NAME = "kube-agents"
 AGENT_DESCRIPTION = f"Chat with {APP_NAME} in Slack Messages."
 STOP_EVENT = "agent_session_stopped"
 

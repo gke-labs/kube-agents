@@ -168,7 +168,7 @@ class FlagOffTest(unittest.TestCase):
         before = load(original, MANIFEST)
         after = load(patched, MANIFEST)
         for value in (None, "", "0", "false", "off"):
-            for flags in ({}, {"agent_view": True}, {"no_assistant": True}, {"agent_view": True, "name": "Kage"}):
+            for flags in ({}, {"agent_view": True}, {"no_assistant": True}, {"agent_view": True, "name": "kube-agents"}):
                 with self.subTest(flag=value, args=flags), flag(value):
                     self.assertEqual(manifest(after, **flags), manifest(before, **flags))
 
@@ -196,7 +196,7 @@ class FlagOnTest(unittest.TestCase):
         # manifest without --agent-view is upstream's.
         upstream = load(build(), MANIFEST)
         for value in ("1", "true", "TRUE", " yes ", "on"):
-            for flags in ({}, {"no_assistant": True}, {"name": "Kage"}):
+            for flags in ({}, {"no_assistant": True}, {"name": "kube-agents"}):
                 with self.subTest(flag=value, args=flags), flag(value):
                     got = manifest(load(self.root, MANIFEST), **flags)
                     self.assertEqual(got, manifest(upstream, **flags))
@@ -204,8 +204,8 @@ class FlagOnTest(unittest.TestCase):
 
     def test_agent_view_is_named_and_offers_no_stop(self):
         with flag("true"):
-            got = manifest(load(self.root, MANIFEST), agent_view=True, name="Kage")
-        self.assertEqual(got["features"]["agent_view"]["agent_description"], "Chat with Kage in Slack Messages.")
+            got = manifest(load(self.root, MANIFEST), agent_view=True, name="kube-agents")
+        self.assertEqual(got["features"]["agent_view"]["agent_description"], "Chat with kube-agents in Slack Messages.")
         events = got["settings"]["event_subscriptions"]["bot_events"]
         # Nothing handles a Stop press yet, so Slack must not offer one.
         self.assertNotIn(STOP_EVENT, events)
