@@ -728,12 +728,25 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # Rides this COPY and RUN for the same budget reason as the block above.
 # See the module docstring in
 # deploy/docker/patches/apply_slack_reactions_scope.py.
+#
+# Slack: with KAGE_SLACK_UX on, react to each ask by its kind (eyes, hammer and
+# wrench, clipboard, rotating light) and add a settle reaction beside it when
+# the work ends, never removing one -- the credential proxy refuses reactions.remove,
+# so upstream's eyes-for-a-tick swap leaves both. The two hooks gain a guard
+# that hands over to gateway/slack_ux_reactions.py; with the flag off they run
+# upstream's body untouched. slack_presenter.py is staged here only so the
+# verifier can import it; the image ships it under /opt/defaults/scripts. Also
+# rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
      deploy/docker/patches/apply_slack_reactions_scope.py \
      deploy/docker/patches/verify_slack_reactions_scope.py \
+     deploy/docker/patches/apply_slack_ux_reactions.py \
+     deploy/docker/patches/verify_slack_ux_reactions.py \
+     deploy/docker/patches/slack_ux_reactions.py \
+     agents/platform/scripts/slack_presenter.py \
      deploy/docker/patches/patchlib.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
@@ -745,10 +758,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
     grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_reactions.py /opt/hermes && \
+    grep -qF "_kage_slack_ux.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -1977,6 +1994,13 @@ RUN set -eu; \
     done
 
 USER 10000:10000
+
+# Slack presentation (reactions by kind, settle reaction), off by
+# default. An install turns it on through the PlatformAgent's
+# spec.deployment.env (the chart's platformAgent.deployment.env), which the
+# container's environment takes over this default. Read by
+# agents/platform/scripts/slack_presenter.py.
+ENV KAGE_SLACK_UX=0
 
 # The build this image came from, for the `User-Agent` that remote MCP calls
 # carry. Hermes resolves `${KUBE_AGENTS_VERSION}` in an `mcp_servers` entry's
