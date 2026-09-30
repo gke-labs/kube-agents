@@ -157,6 +157,10 @@ class HeadlineFromIssueTest(unittest.TestCase):
         for line in (
             "Security & RBAC posture audit: 0 findings, coverage incomplete (2 gaps)",
             "Security & RBAC posture audit: no findings; 1 carried finding unaccounted",
+            "Security & RBAC posture audit: zero findings across 3 of 5 clusters",
+            # The SOPs leave the wording of a held or partial clean line to the model.
+            "Upgrade & patch readiness: clean this run; 2 carried (up-1, up-2) held, ledger stays open",
+            "Cost audit: clean across 3 of 5 clusters (2 coverage gaps)",
         ):
             with self.subTest(line=line):
                 self.assertIsNone(sar.headline_from_issue(ISSUE, REF, f"{line} — {LEDGER}"))
@@ -192,6 +196,31 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertNotIn("evil.example", row)
         self.assertNotIn("<", row)
         self.assertIn("seeded-a docs and seeded-b !channel", row)
+
+    def test_the_audit_name_cannot_post_a_link_or_a_mention(self):
+        title = "[audit] Security & RBAC Posture Audit <!channel> [see](https://evil.example/x) — 7 findings (2 critical)"
+        head = sar.headline_from_issue(dict(ISSUE, title=title), REF).splitlines()[0]
+        self.assertNotIn("evil.example", head)
+        self.assertNotIn("<", head)
+        self.assertEqual(head, "**Security & RBAC Posture Audit !channel see: 7 findings, 2 critical.**")
+
+    def test_a_hash_line_in_fenced_evidence_ends_no_section(self):
+        # fleet-audit's trim_command marks a long evidence command with a column-0 "# " line.
+        command = "```bash\nkubectl get clusterrolebindings\n# … (command truncated by audit_report.py)\n"
+        for close in ("```\n", ""):  # balanced, and a fence the model left open
+            with self.subTest(balanced=bool(close)):
+                body = (
+                    "### Critical (2)\n\n"
+                    + finding("seeded-b: first critical", "a")
+                    + command
+                    + close
+                    + finding("seeded-c: second critical", "b")
+                    + "\n### Major (1)\n\n"
+                    + finding("seeded-a: a major", "x")
+                )
+                rows = sar.headline_from_issue(dict(ISSUE, body=body), REF).splitlines()[1:3]
+                self.assertTrue(rows[0].endswith("seeded-b: first critical"), rows)
+                self.assertTrue(rows[1].endswith("seeded-c: second critical"), rows)
 
     def test_zero_in_the_title_with_findings_in_the_body_is_not_clean(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)")

@@ -3445,6 +3445,22 @@ class TestSlackAuditHeadline(unittest.TestCase):
             )],
         )
 
+    def test_flag_on_the_truncation_notice_is_not_the_reports_line(self):
+        # An over-cap report whose composed message is only the link: the notice
+        # leads the channel message once, and is neither the line nor a reason to fold.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        composed = f"Ledger: {self.LEDGER}"
+        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 3):
+            response, calls = self._post(composed=composed)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 1)
+        posted = calls[0].args[1]
+        self.assertTrue(posted.startswith("[truncated]"), posted[:40])
+        self.assertEqual(posted.count("[truncated]"), 1)
+        headline = posted.split("\n\n", 1)[1].splitlines()
+        self.assertTrue(headline[0].startswith("**Security & RBAC Posture audit: 7 findings"), headline)
+        self.assertTrue(headline[1].startswith(":red_circle:"), headline)
+
     def test_flag_on_a_ledger_that_does_not_parse_falls_back(self):
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue={"title": "something else", "body": ""})

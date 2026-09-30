@@ -10,7 +10,7 @@ rewriting the title, so a closed issue's counts are the last run's, not this
 one's; a zero-finding run that could not read the whole fleet, or did not
 account for a carried finding, leaves the ledger open over the same old title,
 so a finding total in the report's line that disagrees with the title also
-falls back. The relay's send path
+falls back, as does a line that calls the run clean or held without a total. The relay's send path
 (``hermes send``) takes text and no blocks, and the Slack adapter converts
 standard markdown to mrkdwn on the way out, so the output here is markdown:
 ``**bold**``, ``[label](url)`` and emoji shortcodes.
@@ -20,12 +20,14 @@ findings come from the issue itself, whose title is fleet-audit's
 ``issue_title`` (``[audit] <name> — <n> findings (<c> critical)``) and whose
 body has one ``### <Severity> (<n>)`` section per severity, most severe first,
 each finding a ``#### <title> <!-- finding:<id> -->`` heading; the collector's
-held rows under ``## Held by the collector`` are not this run's findings.
+held rows under ``## Held by the collector`` are not this run's findings, and
+a ``#`` line inside a finding's fenced evidence ends no section.
 Nothing in the report's own text can set the counts or pick the link, beyond
 its last URL; its line can only withhold them. The relayed line itself goes
 under the headline, since it alone carries the run's coverage, resolved count
 and remediation pull requests. Finding titles are model-written and editable
-on the forge, so a row keeps a link's text and drops its target.
+on the forge, as is the issue title, so a row and the audit name keep a
+link's text and drop its target.
 """
 
 from __future__ import annotations
@@ -69,10 +71,18 @@ SEVERITY_SECTION = re.compile(r"^###[ \t]+(?P<severity>Critical|Major|Minor)[ \t
 ANY_SECTION = re.compile(r"^(?:#{1,3}[ \t]|<!--[ \t]*audit-held:begin)", re.MULTILINE)
 #: fleet-audit's ``FINDING_MARKER_RE``.
 FINDING_HEADING = re.compile(r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.MULTILINE)
+#: A code fence line, opening or closing: a finding's evidence command sits in one.
+FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+#: Harness-written lines that end a fence the model left open, so one unbalanced
+#: fence cannot swallow every finding after it.
+FENCE_BREAK = re.compile(r"^(?:####[ \t].*<!--[ \t]*finding:|###[ \t]|<!--[ \t]*audit-held:begin)")
 NEW_COUNT = re.compile(r"\b(?P<count>\d+)\s+new\b", re.IGNORECASE)
 #: A run total in the report's line ("0 findings", "no findings"); "3 new
 #: findings" is a new count, not a total, and does not match.
-FINDINGS_TOTAL = re.compile(r"\b(?P<count>\d+|no)\s+findings?\b", re.IGNORECASE)
+FINDINGS_TOTAL = re.compile(r"\b(?P<count>\d+|no|zero)\s+findings?\b", re.IGNORECASE)
+#: A report line calling the run clean or held: a zero-finding run that leaves
+#: the ledger open over the last run's title, whatever words it uses for it.
+ZERO_FINDING_RUN = re.compile(r"\b(?:clean|held)\b", re.IGNORECASE)
 #: The line that carries a composed report's counts, when its last line is only the link.
 COUNTS_DIGIT = re.compile(r"\d")
 TRAILING_AUDIT = re.compile(r"\s+Audit$")
@@ -160,7 +170,7 @@ def _findings_total(line: str) -> int | None:
     if not match:
         return None
     count = match.group("count")
-    return 0 if count.lower() == "no" else int(count)
+    return int(count) if count.isdigit() else 0
 
 
 def _new_phrase(line: str) -> str:
@@ -187,10 +197,28 @@ def _row_text(title: str) -> str:
     return SLACK_LINK.sub(lambda m: m.group(2) or m.group(1), text)
 
 
+def _without_fences(body: str) -> str:
+    """The body with every fenced block's lines dropped, fences included."""
+    kept, fence = [], ""
+    for line in body.split("\n"):
+        if fence and FENCE_BREAK.match(line):
+            fence = ""
+        opener = FENCE.match(line)
+        if fence:
+            if opener and opener.group(1)[0] == fence[0] and len(opener.group(1)) >= len(fence):
+                fence = ""
+            continue
+        if opener:
+            fence = opener.group(1)
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _severity_findings(body: str) -> list[tuple[str, str]]:
     """``(severity, title)`` for every finding under a severity section, in body order."""
     # fleet-audit's own reader does the same: a body edited in the browser is CRLF.
-    body = body.replace("\r\n", "\n")
+    body = _without_fences(body.replace("\r\n", "\n"))
     found = []
     for section in SEVERITY_SECTION.finditer(body):
         start = section.end()
@@ -208,8 +236,9 @@ def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | 
     and that line's "<n> new" count joins it. A closed issue, one without the
     ledger label, and a zero-finding title do not parse: a clean run closes the
     ledger over its old title, and the fallback posts the report's own line.
-    Nor does one whose title disagrees with the line's own finding total, which
-    is a zero-finding partial or held run leaving the old ledger open.
+    Nor does one whose title disagrees with the line's own finding total, or
+    one whose line calls the run clean or held without a total: both are a
+    zero-finding partial or held run leaving the old ledger open.
     """
     if str(issue.get("state") or "").lower() != LEDGER_STATE:
         return None
@@ -218,7 +247,7 @@ def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | 
     title = LEDGER_TITLE.match(str(issue.get("title") or "").strip())
     if not title:
         return None
-    name = TRAILING_AUDIT.sub(AUDIT_SUFFIX, title.group("name").strip())
+    name = TRAILING_AUDIT.sub(AUDIT_SUFFIX, _row_text(title.group("name")).strip())
     count, critical = int(title.group("count")), int(title.group("critical"))
     line = _ledger_line(report)
     if (_new_count(line) or 0) > count:
@@ -226,6 +255,8 @@ def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | 
     total = _findings_total(line)
     if total is not None and total != count:
         return None  # the ledger was not rewritten this run
+    if total is None and ZERO_FINDING_RUN.search(line):
+        return None  # a clean or held run said so in other words
     if count == 0:
         return None
     findings = _severity_findings(str(issue.get("body") or ""))

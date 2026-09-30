@@ -2656,6 +2656,9 @@ def relay_cron_report(
         else ""
     )
 
+    # The headline and the fold decision read the composed message without the
+    # notice, which is not the report's line and is not more to say.
+    composed = message
     if truncation_notice:
         # After the turn, never before it. Appended to the report it would be
         # model input, and the instructions tell the Chat Agent to add "nothing
@@ -2688,13 +2691,13 @@ def relay_cron_report(
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
         try:
-            headline = _slack_audit_headline(platform, message, unrelayed, leg_chat_id, profile, job_id)
+            headline = _slack_audit_headline(platform, composed, unrelayed, leg_chat_id, profile, job_id)
         except Exception as exc:
             logger.warning(f"Relay for {profile}/{job_id}: audit headline skipped: {exc!r}")
             headline = None
         leg_message = truncation_notice + headline if headline else message
         new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
-        if new_thread_id and headline and slack_audit_report.needs_fold(message, headline):
+        if new_thread_id and headline and slack_audit_report.needs_fold(composed, headline):
             _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id)
         if new_thread_id:
             threads[platform] = new_thread_id

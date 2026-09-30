@@ -75,14 +75,17 @@ headline in place of the composed message (`slack_audit_report.py`, called from
 include `fleet-audit`, and the message ends with a link to an issue in a managed
 repository. The headline reads the finding and critical counts and the top two
 findings from that issue if it is open and labelled `agent:audit`; held rows are
-not findings, and a finding title keeps a link's text but not its target. Below
+not findings, a `#` line inside a finding's fenced evidence ends no section, and
+a finding title or the audit name keeps a link's text but not its target. Below
 them go the relayed line, which alone carries coverage, resolved counts and
 remediation pull requests, and the ledger link; its "<n> new" count joins the
 headline. When the issue cannot be read, is closed (a clean run closes it without
 rewriting its title), does not parse, or has a title whose count disagrees with
-the finding total the relayed line states (a zero-finding partial or held run
-leaves the ledger open over its old title), the leg posts the relayed line in
-bold with the link. The full report is also posted into the
+the finding total the relayed line states, or a relayed line that calls the run
+clean or held with no total (a zero-finding partial or held run leaves the
+ledger open over its old title), the leg posts the relayed line in bold with
+the link. A truncation notice leads the leg's message but is never read as the
+relayed line. The full report is also posted into the
 headline's thread when it is longer than one line or the headline lost part of
 its line (a link target, a clipped tail), and the incident row stores the full
 report either way, so a reply in the thread is answered with the whole report.
