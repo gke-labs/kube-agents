@@ -204,6 +204,37 @@ locals {
     var.enable_drift_detector ||
     try(tobool(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) == true, false)
   )
+
+  # The same leaf, read a second time, for what the local above cannot say:
+  # extra_helm_values does not only ask for the detector, it can also
+  # countermand enable_drift_detector. The block above renders `enabled: true`
+  # into the computed document and extra_helm_values is the second one, so the
+  # provider's later-document-wins merge hands whatever the leaf holds
+  # straight to the CR. A null deletes the field -- Helm's coalesce drops a
+  # nil user key and the chart's compactFields drops what is then missing --
+  # and the CRD's default false applies; a false arrives as false. Either way
+  # enable_drift_detector is true in the tfvars, the sink, topic and
+  # subscription are provisioned and billing, the CR does not start the
+  # detector, and nothing says so. That is the state the two preconditions
+  # below already refuse, reached by a third door, and the only one of the
+  # three where the operator did ask for the detector.
+  #
+  # `!= true` rather than a test for null, because false countermands exactly
+  # as null does and arrives by the same paste. A leaf the type cannot hold
+  # ("yes", "true") is refused here too, which is a better message than the
+  # one values.schema.json gives for it further in and arrives before the
+  # apply starts. Comparing across types is safe -- a string is not equal to a
+  # bool, so it lands on `!= true` rather than raising.
+  #
+  # can() as well as try(), to tell a leaf that is present and null from one
+  # that is absent. Absent is the ordinary case and must not be refused:
+  # nothing overrides the computed document and `enabled: true` reaches the
+  # CR.
+  extra_helm_values_countermands_detector = (
+    var.enable_drift_detector &&
+    can(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) &&
+    try(var.extra_helm_values.platformAgent.harness.driftDetector.enabled, null) != true
+  )
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -927,6 +958,23 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.drift_detector_requested || !can(regex("^[0-9]+$", var.project_id))
       error_message = "the drift detector requires project_id to be the project ID, not the project number: it matches it against each audit record's project_id, which is always the ID, so the operator refuses to start it and the ingress bills for a stream nothing reads."
+    }
+
+    # The third route to that same ingress-without-a-consumer, and the one the
+    # other two cannot see: here the flag is set, the ingress is asked for by
+    # the same variable that asks for the detector, and the CR is what
+    # disagrees. local.extra_helm_values_countermands_detector above has the
+    # merge that does it and why false is refused alongside null.
+    #
+    # Refused rather than stripped from the document. Silently dropping the
+    # leaf would give this operator what they almost certainly meant, and it
+    # would also make extra_helm_values the one values document this
+    # composition edits before passing on -- so the next operator to set a
+    # leaf it disagrees with would have no way to tell whether it arrived.
+    # Saying which line to delete costs one apply and keeps that contract.
+    precondition {
+      condition     = !local.extra_helm_values_countermands_detector
+      error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
     }
   }
 }

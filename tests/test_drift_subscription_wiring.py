@@ -137,6 +137,28 @@ REQUESTED_LOCAL_RE = re.compile(
     + r"\.enabled\)\s*==\s*true\s*,\s*false\)",
     re.S,
 )
+# The other direction through the same leaf: extra_helm_values countermanding
+# the flag rather than standing in for it. Both halves are pinned because
+# either alone is wrong. Without can() an absent leaf reads as null and every
+# ordinary install is refused; with `== null` in place of `!= true` a false
+# leaf passes, and false silences the detector exactly as null does.
+COUNTERMAND_LOCAL = "extra_helm_values_countermands_detector"
+LEAF_PATH = r"var\.extra_helm_values\." + r"\.".join(DRIFT_VALUE_PREFIX) + r"\.enabled"
+COUNTERMAND_LOCAL_RE = re.compile(
+    COUNTERMAND_LOCAL + r"\s*=\s*\(\s*"
+    r"var\." + DETECTOR_FLAG_VARIABLE + r"\s*&&\s*"
+    r"can\(" + LEAF_PATH + r"\)\s*&&\s*"
+    r"try\(" + LEAF_PATH + r",\s*null\)\s*!=\s*true",
+    re.S,
+)
+COUNTERMAND_PRECONDITION_RE = re.compile(
+    r"condition\s*=\s*!local\." + COUNTERMAND_LOCAL + r"\s*$",
+    re.M,
+)
+# The document extra_helm_values contributes, and the fact the countermand
+# rests on: it is passed later in the same list than the computed one, and
+# Helm's merge gives the later document the key.
+EXTRA_VALUES_DOCUMENT = "yamlencode(var.extra_helm_values)"
 
 
 def variable_block(text: str, name: str) -> str:
@@ -244,6 +266,50 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
         for key in (*DRIFT_VALUE_PREFIX, "enabled"):
             node = node["properties"][key]
         self.assertIn("null", node.get("type", []), f"values.schema.json no longer admits null there: {node}")
+
+    def test_the_composition_refuses_a_leaf_that_countermands_the_flag(self):
+        """The same leaf read the other way round.
+
+        `local.drift_detector_requested` covers `extra_helm_values` asking for
+        the detector without the flag. This covers the flag asking for it and
+        `extra_helm_values` taking it away: the leaf lands in the second
+        values document, Helm gives the later document the key, and a null
+        deletes the field (the CRD default `false` then applies) while a
+        `false` arrives as `false`. The tfvars say `enable_drift_detector =
+        true`, the sink, topic and subscription are provisioned and bill, and
+        the CR never starts a consumer — the state the other two
+        preconditions exist to refuse, reached where neither of them looks.
+        """
+        single(
+            COUNTERMAND_LOCAL_RE,
+            self.main,
+            f"local.{COUNTERMAND_LOCAL} reading the extra_helm_values leaf against the flag",
+        )
+        single(
+            COUNTERMAND_PRECONDITION_RE,
+            self.main,
+            f"precondition refusing local.{COUNTERMAND_LOCAL}",
+        )
+
+    def test_extra_helm_values_is_the_later_document(self):
+        """Why the countermand happens at all.
+
+        Helm merges successive values documents with the later one winning the
+        key, so the refusal above is only needed while `extra_helm_values` is
+        passed after the document this composition computes. Reordering them
+        would make the flag win and the precondition pointless — a change that
+        should have to come past this test rather than leave a refusal nobody
+        can trigger.
+        """
+        computed = self.main.find("driftDetector = {")
+        self.assertNotEqual(computed, -1, "the computed document no longer writes a driftDetector block")
+        passed = self.main.find(EXTRA_VALUES_DOCUMENT)
+        self.assertNotEqual(passed, -1, f"the composition no longer passes {EXTRA_VALUES_DOCUMENT}")
+        self.assertLess(
+            computed,
+            passed,
+            f"{EXTRA_VALUES_DOCUMENT} is no longer the later document, so the leaf no longer wins the key",
+        )
 
     def test_chart_exposes_the_value_paths_the_composition_writes(self):
         values = yaml.safe_load(CHART_VALUES.read_text(encoding="utf-8"))
