@@ -5,7 +5,8 @@ upgrade_readiness.py — the rules behind `fleet_upgrade_report.py --readiness`.
 Pure functions over data the report script has already read: the PodDisruptionBudgets
 and workloads of one cluster, its `maintenancePolicy`, and its node-pool versions. Nothing
 here runs a command or touches a clock; the caller passes the instant to evaluate at. The
-three rules are the ones the governance SOPs define in prose:
+first three rules are the ones the governance SOPs define in prose; the fourth has no SOP
+check yet and is stated here:
 
 - a drain-blocking PDB, `obtainability_audit_sop.md` §3.4: `maxUnavailable` 0 or `0%`, or
   `minAvailable` at or above the matched workloads' replica total (an integer, or a
@@ -14,7 +15,10 @@ three rules are the ones the governance SOPs define in prose:
   `security_patch_orchestrator_sop.md` §3.8, and the maintenance window's state at the
   instant, §3.7;
 - node-pool version skew against the target control plane, §3.2: more than two minors, or
-  a different major, blocks the control-plane upgrade until the pool moves.
+  a different major, blocks the control-plane upgrade until the pool moves;
+- a fail-closed admission webhook whose backing Service has no ready endpoints: every
+  request its rules match fails now, and the node drains an upgrade performs stall when
+  the replacement pods match, the same hold as a drain-blocking PDB.
 """
 
 import re
@@ -123,6 +127,19 @@ SKEW_NOT_APPLICABLE = "n/a"
 SKEW_AUTOPILOT_REASON = "Autopilot: Google owns the node pools"
 SKEW_NO_TARGET_REASON = "no target to measure against"
 SKEW_MAJOR_DIFFERS = "major version differs from the target"
+
+# Fail-closed webhooks. admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail,
+# so an absent field grades as Fail. Only a webhook whose backend is a Service in the
+# cluster is graded: a URL backend is outside the drain's reach, so it is counted in the
+# note rather than graded either way. An EndpointSlice endpoint with no `ready` condition
+# counts as ready, as the EndpointSlice API says a consumer must assume.
+WEBHOOK_CONFIG_KINDS = ("ValidatingWebhookConfiguration", "MutatingWebhookConfiguration")
+ENDPOINTSLICE_KIND = "EndpointSlice"
+SERVICE_NAME_LABEL = "kubernetes.io/service-name"
+FAILURE_POLICY_FAIL = "Fail"
+WEBHOOK_NAME_FORMAT = "{config}/{webhook}"
+WEBHOOK_SERVICE_FORMAT = "{namespace}/{name}"
+WEBHOOK_FINDING_FORMAT = "{webhook} ({config_kind}): failurePolicy Fail and Service {service} has no ready endpoints"
 
 
 # ---------------------------------------------------------------------------- PDBs
@@ -578,14 +595,94 @@ def evaluate_skew(target, pools: list[dict], autopilot: bool) -> dict:
     }
 
 
+# ---------------------------------------------------------------------- webhooks
+
+
+def split_webhook_items(items: list) -> tuple[list[dict], list[dict]]:
+    """(webhook configurations, EndpointSlices) from the same mixed `items` list."""
+    configs, slices = [], []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        if kind in WEBHOOK_CONFIG_KINDS:
+            configs.append(item)
+        elif kind == ENDPOINTSLICE_KIND:
+            slices.append(item)
+    return configs, slices
+
+
+def _ready_endpoints(slices: list[dict], namespace: str, name: str) -> int:
+    """Ready endpoints across the Service's EndpointSlices; `ready` absent counts as ready."""
+    count = 0
+    for slice_ in slices:
+        meta = slice_.get("metadata") or {}
+        if meta.get("namespace") != namespace:
+            continue
+        if (meta.get("labels") or {}).get(SERVICE_NAME_LABEL) != name:
+            continue
+        for endpoint in slice_.get("endpoints") or []:
+            if not isinstance(endpoint, dict):
+                continue
+            if (endpoint.get("conditions") or {}).get("ready") is not False:
+                count += 1
+    return count
+
+
+def grade_webhooks(configs: list[dict], slices: list[dict]) -> dict:
+    """Which fail-closed webhooks have no ready backend, and what was counted instead.
+
+    A webhook blocks when its `failurePolicy` is Fail (or absent, the v1 default) and its
+    `clientConfig.service` resolves to zero ready endpoints: its matching requests fail
+    already, and a drain stalls once the budget over a matching workload runs out of
+    allowance. Fail-open webhooks are counted (`fail_open`); fail-closed webhooks with a
+    URL backend are counted (`url_backends`) and never graded, because nothing read here
+    says whether the URL answers.
+    """
+    result = {"blocking": [], "evaluated": 0, "fail_open": 0, "url_backends": 0}
+    for config in configs:
+        config_kind = config.get("kind")
+        config_name = (config.get("metadata") or {}).get("name", "")
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", FAILURE_POLICY_FAIL) != FAILURE_POLICY_FAIL:
+                result["fail_open"] += 1
+                continue
+            service = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service, dict):
+                result["url_backends"] += 1
+                continue
+            result["evaluated"] += 1
+            namespace, name = service.get("namespace", ""), service.get("name", "")
+            ready = _ready_endpoints(slices, namespace, name)
+            if ready:
+                continue
+            result["blocking"].append(
+                {
+                    "webhook": WEBHOOK_NAME_FORMAT.format(config=config_name, webhook=hook.get("name", "")),
+                    "config_kind": config_kind,
+                    "config": config_name,
+                    "name": hook.get("name", ""),
+                    "service": WEBHOOK_SERVICE_FORMAT.format(namespace=namespace, name=name),
+                    "ready_endpoints": ready,
+                }
+            )
+    return result
+
+
+def describe_webhook_finding(finding: dict) -> str:
+    return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], service=finding["service"])
+
+
 # ------------------------------------------------------------------------- verdict
 
 
-def readiness_status(pdbs: dict | None, maintenance: dict, skew: dict, target_known: bool) -> str:
+def readiness_status(pdbs: dict | None, webhooks: dict | None, maintenance: dict, skew: dict, target_known: bool) -> str:
     """`blocked` beats `unknown` beats `ready`: a definite blocker is reported whatever else
     could not be evaluated, and a member is `ready` only when every rule was evaluated."""
-    if (pdbs and pdbs["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"]:
+    if (pdbs and pdbs["blocking"]) or (webhooks and webhooks["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"]:
         return READINESS_BLOCKED
-    if pdbs is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
+    if pdbs is None or webhooks is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
         return READINESS_UNKNOWN
     return READINESS_READY

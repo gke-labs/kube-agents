@@ -792,6 +792,14 @@ def k8s_pdb(namespace, name, spec, expected):
     return {"kind": "PodDisruptionBudget", "metadata": {"namespace": namespace, "name": name}, "spec": spec, "status": {"expectedPods": expected, "disruptionsAllowed": 0}}
 
 
+def k8s_webhook(kind, config, webhook, policy, service):
+    return {"kind": kind, "metadata": {"name": config}, "webhooks": [{"name": webhook, "failurePolicy": policy, "clientConfig": {"service": {"namespace": service[0], "name": service[1]}}}]}
+
+
+def k8s_endpointslice(namespace, service, ready):
+    return {"kind": "EndpointSlice", "metadata": {"namespace": namespace, "name": f"{service}-x", "labels": {"kubernetes.io/service-name": service}}, "endpoints": [{"conditions": {"ready": ready}}]}
+
+
 class ReadinessTest(unittest.TestCase):
     TARGET = "1.35.1-gke.1000"
     AT = "2026-09-14T15:00:00Z"
@@ -830,6 +838,14 @@ class ReadinessTest(unittest.TestCase):
                 k8s_pdb("readiness-1411", "orphan", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "gone"}}}, 0),
             ],
         }
+        self.objects["seeded-b"] = self.objects.get("seeded-b", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", "gate.seeded.example.com", "Fail", ("seeded-upgrade", "absent-hook")),
+        ]
+        self.objects["seeded-a"] = self.objects.get("seeded-a", []) + [
+            k8s_webhook("ValidatingWebhookConfiguration", "healthy-gate", "ok.example.com", "Fail", ("kube-system", "live-hook")),
+            k8s_endpointslice("kube-system", "live-hook", ready=True),
+            k8s_webhook("MutatingWebhookConfiguration", "advisor", "advise.example.com", "Ignore", ("kube-system", "live-hook")),
+        ]
 
     def _args(self, *extra):
         return ["--state-dir", self.state_dir, "--project", "p1", "--target-version", self.TARGET, *extra]
@@ -875,12 +891,17 @@ class ReadinessTest(unittest.TestCase):
         b = by_name["seeded-b"]
         self.assertEqual(b["status"], "blocked")
         self.assertEqual(b["pdbs"]["blocking"], [])
+        self.assertEqual([f["webhook"] for f in b["webhooks"]["blocking"]], ["seeded-fail-closed-gate/gate.seeded.example.com"])
+        self.assertEqual(b["webhooks"]["blocking"][0]["service"], "seeded-upgrade/absent-hook")
         self.assertEqual(b["maintenance"]["blocking_exclusions"], ["hold-the-minor-lag"])
         self.assertEqual(b["maintenance"]["window"]["state"], "closed")
         self.assertEqual(b["maintenance"]["window"]["next_opening"], "2026-09-15T03:00Z")
 
         a = by_name["seeded-a"]
         self.assertEqual(a["status"], "ready")
+        self.assertEqual(a["webhooks"]["blocking"], [])
+        self.assertEqual(a["webhooks"]["evaluated"], 1)
+        self.assertEqual(a["webhooks"]["fail_open"], 1)
         self.assertEqual(a["skew"]["pools"][0]["verdict"], "ok")
         self.assertEqual(data["readiness"]["summary"], {"blocked": 2, "ready": 1, "unknown": 0})
         self.assertEqual(data["readiness"]["evaluated_at"], "2026-09-14T15:00:00Z")
@@ -892,6 +913,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("no exclusion in effect; no maintenance window", host_row)
         self.assertIn("n/a (Autopilot", host_row)
         b_row = next(l for l in lines if l.startswith("| p1 | seeded-b |") and "| blocked |" in l)
+        self.assertIn("seeded-fail-closed-gate/gate.seeded.example.com (ValidatingWebhookConfiguration): failurePolicy Fail and Service seeded-upgrade/absent-hook has no ready endpoints", b_row)
         self.assertIn("exclusion hold-the-minor-lag (NO_MINOR_UPGRADES) blocks auto-upgrade to 1.35.1-gke.1000 until 2026-12-11T14:35Z", b_row)
         self.assertIn("window daily at 03:00Z for 4h: closed, next opening 2026-09-15T03:00Z", b_row)
         self.assertIn("Readiness at 2026-09-14T15:00:00Z: 2 blocked, 1 ready, 0 unknown", text)
@@ -914,7 +936,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(all(k and k.startswith(self.kubeconfig_dir + os.sep) for k in fake.kubeconfigs))
         self.assertTrue(os.path.isdir(self.kubeconfig_dir))
         kubectl = [c for c in fake.calls if c[:1] == ["kubectl"]]
-        self.assertEqual(kubectl, [["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]] * 3)
+        self.assertEqual(kubectl, [["kubectl", "get", report.KUBECTL_RESOURCES, "-A", "-o", "json"]] * 3)
         self.assertEqual(data["readiness"]["kubeconfig_dir"], self.kubeconfig_dir)
         self.assertEqual({m["cluster"]: m["readiness"]["kubeconfig"] for m in data["members"]}["seeded-b"], expected)
 
@@ -938,7 +960,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(by_name["robot-host"]["status"], "blocked")
         self.assertEqual(by_name["seeded-b"]["status"], "blocked")
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
-        self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
+        self.assertIn(f"- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get {report.KUBECTL_RESOURCES} -A -o json failed (1)", text)
         self.assertIn("| read failed |", text)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)

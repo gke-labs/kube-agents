@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks with no ready backend, maintenance exclusions and windows, and node-pool version skew. Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -13,8 +13,9 @@ fleet is from a release-channel default, or whether the repositories are ready f
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
-that blocks every node drain, a maintenance exclusion or window, or node pools too far below the
-target (see "Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
+that blocks every node drain, a fail-closed admission webhook whose Service has no ready
+endpoints, a maintenance exclusion or window, or node pools too far below the target (see
+"Check upgrade readiness"). For upgrade plans, runbooks and checklists, use the
 `gke-upgrades` skill; it links back here when the question is one these two scripts answer.
 
 "Version skew" here is the gap between a member's versions and the target. It is not
@@ -137,9 +138,9 @@ members missing this run.
 `--readiness` adds a second table after the version table, one row per member, graded against
 the same target as the member's version row, and a `readiness` object per member in the JSON
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
-count per verdict). Without the flag nothing changes. Three rules, each derived from a governance
-SOP check and named beside it; the maintenance rule departs from its SOP where the two differ,
-and says so below:
+count per verdict). Without the flag nothing changes. Four rules; the first three each derive
+from a governance SOP check named beside it, the webhook rule has no SOP check yet, and the
+maintenance rule departs from its SOP where the two differ, and says so below:
 
 - **Drain-blocking PDBs** (`obtainability_audit_sop.md` §3.4). For each member the script runs
   `gcloud container clusters get-credentials` into a kubeconfig of its own under
@@ -162,6 +163,18 @@ and says so below:
   does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
   silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
   them.
+- **Fail-closed webhooks**, read in the same `kubectl get` (its resource list also names the
+  webhook configurations and EndpointSlices). A webhook blocks when its `failurePolicy` is
+  `Fail` — or absent, which `admissionregistration.k8s.io/v1` defaults to `Fail` — and its
+  `clientConfig.service` resolves to zero ready endpoints across the Service's EndpointSlices
+  (an endpoint without a `ready` condition counts as ready, as the API requires). Such a
+  webhook is a current outage for whatever its rules match, and it stalls the node drains an
+  upgrade performs the moment a matching workload's budget runs out of allowance, so it grades
+  `blocked` like a drain-blocking PDB. The cell names the configuration, the webhook and the
+  Service; each JSON finding carries `ready_endpoints`. Counted in the note rather than graded:
+  a fail-closed webhook whose backend is a URL, because nothing read here says whether the URL
+  answers, and it sits outside the drain's reach. Fail-open webhooks are counted in the JSON
+  (`fail_open`) and never block.
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an
   RFC 3339 instant, by default now. An exclusion in effect blocks when its scope covers the upgrade
   the target needs: `NO_UPGRADES` (the default when the record carries no scope) always;

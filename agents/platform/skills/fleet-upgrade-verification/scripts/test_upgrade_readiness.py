@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for upgrade_readiness.py: the PDB, maintenance and skew rules on canned objects."""
+"""Unit tests for upgrade_readiness.py: the PDB, webhook, maintenance and skew rules on canned objects."""
 
 import os
 import sys
@@ -379,19 +379,98 @@ class SkewTest(unittest.TestCase):
 class VerdictTest(unittest.TestCase):
     CLEAR = {"blocking_exclusions": [], "undecided_exclusions": []}
     NO_SKEW = {"blocking": [], "unknown": []}
+    NO_WEBHOOKS = {"blocking": []}
 
     def test_ready_needs_every_rule_evaluated(self):
         pdbs = {"blocking": []}
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, self.NO_SKEW, True), "ready")
-        self.assertEqual(r.readiness_status(None, self.CLEAR, self.NO_SKEW, True), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, self.NO_SKEW, False), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, {"blocking_exclusions": [], "undecided_exclusions": ["x"]}, self.NO_SKEW, True), "unknown")
-        self.assertEqual(r.readiness_status(pdbs, self.CLEAR, {"blocking": [], "unknown": ["p"]}, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, True), "ready")
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, None, self.CLEAR, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, False), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, {"blocking_exclusions": [], "undecided_exclusions": ["x"]}, self.NO_SKEW, True), "unknown")
+        self.assertEqual(r.readiness_status(pdbs, self.NO_WEBHOOKS, self.CLEAR, {"blocking": [], "unknown": ["p"]}, True), "unknown")
 
     def test_blocked_beats_unknown(self):
-        self.assertEqual(r.readiness_status({"blocking": [{"pdb": "a/b"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
-        self.assertEqual(r.readiness_status(None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
-        self.assertEqual(r.readiness_status(None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
+        self.assertEqual(r.readiness_status({"blocking": [{"pdb": "a/b"}]}, self.NO_WEBHOOKS, self.CLEAR, self.NO_SKEW, False), "blocked")
+        self.assertEqual(r.readiness_status(None, None, {"blocking_exclusions": ["x"], "undecided_exclusions": []}, self.NO_SKEW, True), "blocked")
+        self.assertEqual(r.readiness_status(None, None, self.CLEAR, {"blocking": ["p"], "unknown": []}, True), "blocked")
+        self.assertEqual(r.readiness_status({"blocking": []}, {"blocking": [{"webhook": "g/h"}]}, self.CLEAR, self.NO_SKEW, False), "blocked")
+
+
+def webhook_config(kind, name, hooks):
+    return {"kind": kind, "metadata": {"name": name}, "webhooks": hooks}
+
+
+def hook(name, policy=None, service=("scen", "absent-hook"), url=None):
+    record = {"name": name, "clientConfig": {}}
+    if policy is not None:
+        record["failurePolicy"] = policy
+    if url is not None:
+        record["clientConfig"]["url"] = url
+    elif service is not None:
+        record["clientConfig"]["service"] = {"namespace": service[0], "name": service[1]}
+    return record
+
+
+def endpoint_slice(namespace, service, ready_flags):
+    return {
+        "kind": "EndpointSlice",
+        "metadata": {"namespace": namespace, "name": f"{service}-abc", "labels": {"kubernetes.io/service-name": service}},
+        "endpoints": [{"conditions": {} if flag is None else {"ready": flag}} for flag in ready_flags],
+    }
+
+
+class WebhookTest(unittest.TestCase):
+    def test_fail_closed_with_no_endpoints_blocks(self):
+        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("gate.scen.example.com", policy="Fail")])]
+        graded = r.grade_webhooks(configs, [])
+        self.assertEqual(len(graded["blocking"]), 1)
+        finding = graded["blocking"][0]
+        self.assertEqual(finding["webhook"], "gate/gate.scen.example.com")
+        self.assertEqual(finding["service"], "scen/absent-hook")
+        self.assertEqual(finding["ready_endpoints"], 0)
+        self.assertIn("no ready endpoints", r.describe_webhook_finding(finding))
+        self.assertEqual(graded["evaluated"], 1)
+
+    def test_absent_failure_policy_is_fail_the_v1_default(self):
+        configs = [webhook_config("MutatingWebhookConfiguration", "defaulter", [hook("d.example.com")])]
+        self.assertEqual(len(r.grade_webhooks(configs, [])["blocking"]), 1)
+
+    def test_ready_backend_does_not_block_and_absent_ready_counts_as_ready(self):
+        slices = [endpoint_slice("scen", "absent-hook", [None])]
+        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("g.example.com", policy="Fail")])]
+        graded = r.grade_webhooks(configs, slices)
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual(graded["evaluated"], 1)
+
+    def test_every_endpoint_not_ready_blocks(self):
+        slices = [endpoint_slice("scen", "absent-hook", [False, False])]
+        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("g.example.com", policy="Fail")])]
+        self.assertEqual(len(r.grade_webhooks(configs, slices)["blocking"]), 1)
+
+    def test_fail_open_is_counted_not_graded(self):
+        configs = [webhook_config("ValidatingWebhookConfiguration", "advisor", [hook("a.example.com", policy="Ignore")])]
+        graded = r.grade_webhooks(configs, [])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual(graded["fail_open"], 1)
+        self.assertEqual(graded["evaluated"], 0)
+
+    def test_url_backend_is_counted_not_graded(self):
+        configs = [webhook_config("ValidatingWebhookConfiguration", "external", [hook("e.example.com", policy="Fail", service=None, url="https://hook.example.com/validate")])]
+        graded = r.grade_webhooks(configs, [])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual(graded["url_backends"], 1)
+
+    def test_slices_of_another_service_or_namespace_do_not_count(self):
+        slices = [endpoint_slice("scen", "other-svc", [None]), endpoint_slice("prod", "absent-hook", [None])]
+        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("g.example.com", policy="Fail")])]
+        self.assertEqual(len(r.grade_webhooks(configs, slices)["blocking"]), 1)
+
+    def test_split_webhook_items(self):
+        items = [webhook_config("ValidatingWebhookConfiguration", "v", []), webhook_config("MutatingWebhookConfiguration", "m", []), endpoint_slice("scen", "s", [True]), {"kind": "PodDisruptionBudget"}, "junk"]
+        configs, slices = r.split_webhook_items(items)
+        self.assertEqual([c["metadata"]["name"] for c in configs], ["v", "m"])
+        self.assertEqual(len(slices), 1)
 
 
 if __name__ == "__main__":
