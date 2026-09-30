@@ -7,6 +7,7 @@
 # restarts the pod on the old node after the image is gone, the control that shows the cache hides it.
 CHANNEL=REGULAR; START=1.34; POOL_FLAGS="--num-nodes 1 --machine-type e2-standard-2"; CREATE_FLAGS="--cluster-ipv4-cidr=/19"
 REPO=us-central1-docker.pkg.dev/$PROJECT/upg-scenarios
+IMAGE=$REPO/$CLUSTER/pause:3.9   # one image path per cluster: two runs in one project can neither retire nor restore each other's image
 SOURCE_IMAGE=registry.k8s.io/pause:3.9
 PULL_ROLE=roles/artifactregistry.reader; ROLLOUT_TIMEOUT=420s
 CRANE_VERSION=v0.22.1
@@ -23,7 +24,7 @@ cached_images(){ K get nodes -l role=work -o jsonpath='{range .items[*]}{.metada
 pod_phase(){ K -n scen get pods -l app=retired-image -o jsonpath='{.items[*].status.phase}'; }
 push_image(){ local dc rc; dc=$(mktemp -d)
   gcloud auth print-access-token | DOCKER_CONFIG=$dc "$CRANE" auth login us-central1-docker.pkg.dev -u oauth2accesstoken --password-stdin >/dev/null &&
-    DOCKER_CONFIG=$dc "$CRANE" copy "$SOURCE_IMAGE" "$REPO/pause:3.9" && DOCKER_CONFIG=$dc "$CRANE" digest "$REPO/pause:3.9"; rc=$?; rm -rf "$dc"; return $rc; }
+    DOCKER_CONFIG=$dc "$CRANE" copy "$SOURCE_IMAGE" "$IMAGE" && DOCKER_CONFIG=$dc "$CRANE" digest "$IMAGE"; rc=$?; rm -rf "$dc"; return $rc; }
 plant(){ G artifacts repositories describe upg-scenarios --location us-central1 >/dev/null 2>&1 || G artifacts repositories create upg-scenarios --repository-format=docker --location=us-central1 --quiet; ev registry push push_image; ev registry grant-pull grant_pull; K -n scen apply -f - <<Y
 apiVersion: apps/v1
 kind: Deployment
@@ -35,14 +36,16 @@ spec:
     metadata: {labels: {app: retired-image}}
     spec:
       nodeSelector: {role: work}
-      containers: [{name: web, image: $REPO/pause:3.9, imagePullPolicy: IfNotPresent, resources: {requests: {cpu: 10m, memory: 16Mi}}}]
+      containers: [{name: web, image: $IMAGE, imagePullPolicy: IfNotPresent, resources: {requests: {cpu: 10m, memory: 16Mi}}}]
 Y
   K -n scen delete pod -l app=retired-image --ignore-not-found >/dev/null; K -n scen rollout status deploy/retired-image --timeout=$ROLLOUT_TIMEOUT
   [ "$(pod_phase)" = Running ] || { ev registry plant-failed K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; note registry "precondition not met: the image never ran on the old node; stopping before the retirement"; exit 1; }; }
-before(){ ev registry cached cached_images; ev registry before K -n scen get pods -l app=retired-image -o wide; ev registry delete-image G artifacts docker images delete $REPO/pause:3.9 --delete-tags --quiet || { note final "precondition not met: the image was not retired; stopping before the upgrade"; exit 1; }; sleep 30; ev registry gone G artifacts docker images list $REPO --include-tags
-  tags=$(G artifacts docker images list $REPO --include-tags --format='value(tags)') || { note final "precondition not met: the repository could not be listed after the delete; stopping before the upgrade"; exit 1; }
+before(){ ev registry cached cached_images; ev registry before K -n scen get pods -l app=retired-image -o wide; ev registry delete-image G artifacts docker images delete "$IMAGE" --delete-tags --quiet || { note final "precondition not met: the image was not retired; stopping before the upgrade"; exit 1; }; sleep 30; ev registry gone G artifacts docker images list "${IMAGE%:*}" --include-tags
+  tags=$(G artifacts docker images list "${IMAGE%:*}" --include-tags --format='value(tags)') || { note final "precondition not met: the repository could not be listed after the delete; stopping before the upgrade"; exit 1; }
   ! grep -qw 3.9 <<<"$tags" || { note final "precondition not met: tag 3.9 is still listed after the delete; stopping before the upgrade"; exit 1; }; ev registry still-running K -n scen get pods -l app=retired-image -o wide
   note registry "control: restart the pod on the old node, which still holds the image in its cache"; K -n scen delete pod -l app=retired-image --wait=true >/dev/null
-  K -n scen rollout status deploy/retired-image --timeout=120s; ev registry restarted-from-cache K -n scen get pods -l app=retired-image -o wide; }
+  K -n scen rollout status deploy/retired-image --timeout=120s; ev registry restarted-from-cache K -n scen get pods -l app=retired-image -o wide
+  # The control gives the verdict its meaning: a pod already failing on the old node would make the after-state's ImagePullBackOff say nothing about the rebuild.
+  [ "$(pod_phase)" = Running ] || { ev registry control-failed K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; note final "precondition not met: the restarted pod did not run from the old node's cache; stopping before the upgrade"; exit 1; }; }
 break_it(){ V=$(newest_patch REGULAR 1.35); [ "$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)')" = "$V" ] || upgrade_master "$V"; upgrade_pool work-pool "$V" registry:scen:app=retired-image; }
 after(){ ev registry after K -n scen get pods -l app=retired-image -o wide; ev registry pull-events K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; }
