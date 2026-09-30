@@ -125,9 +125,12 @@ def check_adapter(root: Path) -> None:
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
         # The applier anchors on the docstring, so a renamed parameter leaves
         # a guard that compiles and raises NameError on every flag-on turn.
-        params = {a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs}
+        signature = node.args
+        params = {a.arg for a in signature.posonlyargs + signature.args + signature.kwonlyargs}
+        params.update(a.arg for a in (signature.vararg, signature.kwarg) if a is not None)
+        guard = body[1].body[0].value.value
         unbound = [
-            n.id for arg in body[1].body[0].value.value.args[1:]
+            n.id for arg in [*guard.args[1:], *(k.value for k in guard.keywords)]
             for n in ast.walk(arg) if isinstance(n, ast.Name) and n.id not in params
         ]
         if unbound:
