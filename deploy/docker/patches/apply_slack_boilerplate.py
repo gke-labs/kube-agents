@@ -30,8 +30,10 @@ Slack.
 
 ``plugins/platforms/slack/adapter.py``: ``SlackAdapter.send`` passes its
 content through ``system_text`` once the DM target is resolved, the one place
-every busy ack, drain refusal, background-task update and provider
-authentication failure passes on the way to Slack. Runs after
+every busy ack, drain refusal, background-task update and provider error
+reply passes on the way to Slack, and ``SlackAdapter.edit_message`` does the
+same once its outbound check passes, for a reply that arrives as a streamed or
+edited message. Runs after
 ``apply_slack_ux_reactions.py``, which leaves ``send`` alone.
 
 With the flag off every helper returns its input unchanged, so the calls are
@@ -189,6 +191,18 @@ SLACK_SEND_PATCHED = SLACK_SEND_ANCHOR + (
     "        content = _kage_slack_boilerplate.system_text(content)\n"
 )
 
+SLACK_EDIT_ANCHOR = (
+    '        """Edit a previously sent Slack message."""\n'
+    '        blocked = self._outbound_blocked(chat_id, "message edit in")\n'
+    "        if blocked:\n"
+    "            return blocked\n"
+)
+SLACK_EDIT_PATCHED = SLACK_EDIT_ANCHOR + (
+    "        # kube-agents patch: KAGE_SLACK_UX rewords the gateway's system replies\n"
+    "        # on the streaming/edit path too; see gateway/slack_boilerplate.py.\n"
+    "        content = _kage_slack_boilerplate.system_text(content)\n"
+)
+
 
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
@@ -222,6 +236,7 @@ def apply(root: Path) -> None:
     slack_adapter = patchlib.Patch(root, SLACK_ADAPTER, prefix=PREFIX)
     slack_adapter.refuse_if_patched(BUILD_MARKER)
     slack_adapter.substitute(SLACK_SEND_ANCHOR, SLACK_SEND_PATCHED, label="SlackAdapter.send")
+    slack_adapter.substitute(SLACK_EDIT_ANCHOR, SLACK_EDIT_PATCHED, label="SlackAdapter.edit_message")
     slack_adapter.append(GATEWAY_IMPORT)
 
     delivery.commit("2 anchors")
@@ -229,7 +244,7 @@ def apply(root: Path) -> None:
     run_shutdown.commit("1 anchor, 1 import")
     run_notifications.commit("3 anchors, 1 import")
     run_busy.commit("1 anchor, 1 import")
-    slack_adapter.commit("1 anchor, 1 import")
+    slack_adapter.commit("2 anchors, 1 import")
 
 
 if __name__ == "__main__":

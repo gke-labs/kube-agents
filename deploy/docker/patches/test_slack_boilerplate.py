@@ -403,6 +403,19 @@ class SlackAdapter:
         thread_ts = None
         self.sent.append(content)
         return thread_ts
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None):
+        """Edit a previously sent Slack message."""
+        blocked = self._outbound_blocked(chat_id, "message edit in")
+        if blocked:
+            return blocked
+        try:
+            formatted = content
+            self.sent.append(formatted)
+        except Exception:
+            return None
 '''
 
 FIXTURES = {
@@ -570,7 +583,8 @@ class ApplierTest(unittest.TestCase):
     def test_verifier_refuses_a_system_reply_or_hint_reaching_slack_unfiltered(self):
         applier.apply(self.root.dir)
         for relative, old, new, expected in (
-            (applier.SLACK_ADAPTER, applier.SLACK_SEND_PATCHED, applier.SLACK_SEND_ANCHOR, "system_text"),
+            (applier.SLACK_ADAPTER, applier.SLACK_SEND_PATCHED, applier.SLACK_SEND_ANCHOR, "send does not"),
+            (applier.SLACK_ADAPTER, applier.SLACK_EDIT_PATCHED, applier.SLACK_EDIT_ANCHOR, "edit_message does not"),
             (applier.RUN_BUSY, applier.BUSY_HINT_PATCHED, applier.BUSY_HINT_ANCHOR, "busy-input hint"),
             (applier.RUN_NOTIFICATIONS, applier.SESSION_DB_PATCHED, applier.SESSION_DB_ANCHOR, "_send_session_db"),
         ):
@@ -801,6 +815,23 @@ class SystemReplyTest(unittest.TestCase):
         with mock.patch.dict(os.environ, env):
             _run(adapter.send("C1", content))
         return adapter.sent[0]
+
+    def _edited(self, cls, content, env):
+        adapter = cls()
+        with mock.patch.dict(os.environ, env):
+            _run(adapter.edit_message("C1", "1700000000.000100", content, finalize=True))
+        return adapter.sent[0]
+
+    def test_edit_path_matches_send(self):
+        with self.assertLogs("gateway.slack_boilerplate", "WARNING"):
+            for reply in self.replies:
+                with self.subTest(reply=reply):
+                    self.assertEqual(self._edited(self.adapter, reply, FLAG_ON), self._sent(self.adapter, reply, FLAG_ON))
+                    self.assertEqual(
+                        self._edited(self.adapter, reply, {"KAGE_SLACK_UX": ""}),
+                        self._edited(self.upstream_adapter, reply, {"KAGE_SLACK_UX": ""}),
+                    )
+        self.assertEqual(self._edited(self.adapter, REPORT, FLAG_ON), REPORT)
 
     def test_flag_off_is_upstream(self):
         for reply in self.replies:

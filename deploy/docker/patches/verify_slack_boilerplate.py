@@ -17,8 +17,8 @@ Four things are checked:
    returns or continues first, and ``_send_home_channel_message``, which the
    session-database warnings share, carries no guard; their own loop does. The
    busy-input onboarding hint is gated on ``drop_notice``, and
-   ``SlackAdapter.send`` passes its content through ``system_text`` once the
-   DM target is resolved.
+   ``SlackAdapter.send`` and ``SlackAdapter.edit_message`` pass their content
+   through ``system_text``, after the DM target and the outbound check.
 2. The notices themselves. Each interrupting notice is read out of the patched
    source, rendered, and handed to the runtime: on Slack with the flag on it
    must come back reworded. ``notice_text`` passes text it does not recognise
@@ -99,6 +99,8 @@ AUTH_ERROR = "401 stand-in provider error"
 
 SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
 SLACK_CLASS = "SlackAdapter"
+#: Each hooked method, and what the statement just before the hook contains.
+SLACK_METHODS = {"send": "self._dm_target(", "edit_message": "return blocked"}
 
 #: (file, literal prefix, how many literals or f-strings carry it) for the
 #: replies read straight out of a module; ``self._status_action_gerund()`` is
@@ -373,19 +375,20 @@ def check_system(root: Path) -> list[str]:
     if not _binds_alias(tree):
         raise _fail(f"{SLACK_ADAPTER} does not import gateway.slack_boilerplate as {ALIAS}")
     classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == SLACK_CLASS]
-    sends = [
-        node for cls in classes for node in cls.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "send"
-    ]
-    if len(sends) != 1:
-        raise _fail(f"{SLACK_ADAPTER} has {len(sends)} {SLACK_CLASS}.send methods, expected 1")
-    if not any(
-        isinstance(first, ast.Assign) and _names(first.targets) == ["chat_id"] and "_dm_target" in ast.unparse(first)
-        and isinstance(second, ast.Assign) and _names(second.targets) == ["content"]
-        and _is_helper(second.value, "system_text") and _names(second.value.args) == ["content"]
-        for first, second in itertools.pairwise(sends[0].body)
-    ):
-        raise _fail(f"{SLACK_CLASS}.send does not pass content through system_text after _dm_target")
+    for method, before in SLACK_METHODS.items():
+        defs = [
+            node for cls in classes for node in cls.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == method
+        ]
+        if len(defs) != 1:
+            raise _fail(f"{SLACK_ADAPTER} has {len(defs)} {SLACK_CLASS}.{method} methods, expected 1")
+        if not any(
+            before in ast.unparse(first)
+            and isinstance(second, ast.Assign) and _names(second.targets) == ["content"]
+            and _is_helper(second.value, "system_text") and _names(second.value.args) == ["content"]
+            for first, second in itertools.pairwise(defs[0].body)
+        ):
+            raise _fail(f"{SLACK_CLASS}.{method} does not pass content through system_text after {before}")
     return replies
 
 
