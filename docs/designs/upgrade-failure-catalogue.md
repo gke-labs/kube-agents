@@ -1,5 +1,8 @@
 # Upgrade failure catalogue: what a GKE minor upgrade breaks, and the signal for each
 
+**Status:** requirements. The checks this list feeds are specified, and credited where built, in
+[`upgrade-readiness-checks.md`](upgrade-readiness-checks.md).
+
 A GKE minor upgrade does two things to a running application. It replaces the API server with a
 newer one that may refuse requests the old one accepted, and it drains and rebuilds every node, so
 every pod is killed and rescheduled once. Nearly every upgrade outage is one of those two events
@@ -32,9 +35,9 @@ While the computers are being rebuilt:
    it and then stops it anyway; the blue-green kind leaves it running on the old computer until
    the old computers are removed, up to a week later, and then stops it. Either way the
    application goes down.
-2. Only if the computers were told they may go away before a replacement exists, which is not
-   how GKE is set up unless someone asks for it: then there is no free computer to move a piece
-   to, and it waits, offline, until its old computer is back.
+2. Only if someone changed how GKE rebuilds, so that a computer may go away before its
+   replacement exists or the replacements are only added on demand: then there may be no free
+   computer to move a piece to, and it waits, offline, until one appears.
 3. All copies of a piece live on the same computer or in the same building, so one rebuild takes
    them all down at once.
 4. A piece kept data on the computer's own disk, and the rebuild wipes that disk.
@@ -91,7 +94,7 @@ charts a GitOps repository declares, `image` is what a container image contains 
 CUDA build or entrypoint), `notes` is the target version's release notes, node image notes and
 vendor support matrices, and `node` is a read-only look inside a node or container. None of the
 entries needs application source code. Each entry links to its own section, which names the
-evidence; an entry with no public incident and no planted fixture says so there.
+evidence; an entry with no public incident and no seeded-fleet fixture says so there.
 
 During the drain and reschedule:
 
@@ -100,7 +103,8 @@ During the drain and reschedule:
    to seven days, then GKE deletes it anyway.
    `k8s, GKE`
 2. [No spare capacity for the displaced pods](#2-no-spare-capacity-for-the-displaced-pods): on a
-   pool configured to allow unavailability, pods sit Pending until the old node returns. `GKE, k8s`
+   pool configured to allow unavailability, or an autoscaled blue-green pool that cannot grow,
+   pods sit Pending until a node frees up. `GKE, k8s`
 3. [Every replica in one zone or on one node](#3-every-replica-in-one-zone-or-on-one-node): a
    redundant-looking application loses all replicas at once. `k8s`
 4. [Data on the node is gone](#4-data-on-the-node-is-gone): Local SSD and `emptyDir` do not
@@ -125,7 +129,7 @@ Once the control plane moves:
 
 On the new node image:
 
-12. [A node label or taint is removed](#12-a-node-label-or-taint-is-removed): pods selecting on
+12. [A node label is removed](#12-a-node-label-is-removed): pods selecting on
     it never schedule. `k8s, notes`
 13. [The container runtime changes](#13-the-container-runtime-changes): agents and images built
     for the old containerd stop working. `k8s, GKE`
@@ -145,19 +149,19 @@ On the new node image:
 
 ## Where each failure lands in the upgrade
 
-The list groups failures by moment. The diagram puts them in order, with one fact the list cannot
-show: which failures hold GKE's drain, and for how long. A refused eviction holds a surge drain
-for up to an hour per node, and on blue-green leaves the pod on the old pool until that pool is
-deleted, up to seven days later; either way GKE then removes the pod, and three entries reach that: a budget with no allowance
-left (1), and the two cases where replacements never become Ready, because there was nowhere to
-schedule them (2, on a pool configured to allow unavailability) or a fail-closed webhook rejected
-them (7); a budget counts those replacements
-unavailable, and once its allowance is used up it refuses the next eviction. A webhook that matches
-the eviction call itself, or `kube-system`, blocks the drain with no budget involved. A maintenance
-window that closes mid-roll (5) pauses the operation between nodes, and the diagram leaves that
-case out. Every other failure lets the upgrade finish, and the break lands afterwards on an
-upgraded cluster, which is why the post-upgrade signals are worth reading even when the operation
-reports success.
+The list groups failures by moment. The diagram draws the paths an upgrade takes through them,
+rather than one box per entry, with one fact the list cannot show: which failures hold GKE's drain,
+and for how long. A refused eviction holds a surge drain for up to an hour per node, and on
+blue-green leaves the pod on the old pool until that pool is deleted, up to seven days later; either
+way GKE then removes the pod, and three entries reach that: a budget with no allowance left (1), and
+the two cases where replacements never become Ready, because there was nowhere to schedule them (2,
+on a pool that allows unavailability or an autoscaled green pool that cannot grow) or a fail-closed
+webhook rejected them (7); a budget counts those replacements unavailable, and once its allowance is
+used up it refuses the next eviction. A webhook that matches the eviction call itself, or
+`kube-system`, blocks the drain with no budget involved. A maintenance window that closes mid-roll
+(5) pauses the operation between nodes, and the diagram leaves that case out. Every other failure
+lets the upgrade finish, and the break lands afterwards on an upgraded cluster, which is why the
+post-upgrade signals are worth reading even when the operation reports success.
 
 ```mermaid
 flowchart TD
@@ -171,7 +175,7 @@ flowchart TD
     PDB -- no --> Stall["Surge: drain held up to an hour per node;<br/>blue-green: pod left on the old pool<br/>until it is deleted, up to seven days;<br/>then force-delete: an outage"]
     PDB -- yes --> Room{Is there somewhere<br/>to reschedule?}
     Room -- "no: fail-closed webhook" --> Deadlock["Webhook deadlock: blocks the drain itself<br/>when it matches evictions or kube-system,<br/>else via a budget with no allowance left"]
-    Room -- "no: maxUnavailable set, no headroom" --> Pending["Pods Pending until the old node returns<br/>(stalls the drain, for the same window,<br/>once a budget's allowance is used up)"]
+    Room -- "no: maxUnavailable set or green pool<br/>cannot grow, no headroom" --> Pending["Pods Pending until a node frees up<br/>(stalls the drain, for the same window,<br/>once a budget's allowance is used up)"]
     Room -- yes --> Image[The new node image boots]
     Image -- "CNI, kube-proxy or<br/>kernel regression" --> Net[Node NotReady or<br/>Service routing broken]
     Image -- "runtime, cgroup, label,<br/>driver or registry change" --> Crash["CrashLoop, OOMKilled,<br/>group OOM kill, unschedulable,<br/>ImagePullBackOff"]
@@ -191,7 +195,8 @@ mitigation is general to every after-signal on a node pool: the standard blue-gr
 strategy keeps the old nodes until a soak passes and can be rolled back until the blue pool's
 deletion begins; an autoscaled blue-green upgrade skips the soak and cannot be rolled back. The
 [Scope table](upgrade-readiness-checks.md#scope) in the readiness requirements is the record of
-which audit or skill reads what; the "read today" lines here are the delta against it.
+which audit or skill reads what; the "read today" lines here say which of those readers covers
+each entry.
 
 ### 1. A PodDisruptionBudget forbids the eviction
 
@@ -211,13 +216,14 @@ nodes it can empty, then drains the rest, respecting the budget for up to one ho
   behind a budget whose `minAvailable` demands its only pod.
 - Where to look: the Kubernetes API: each budget's `spec` and `status`, and the owner's `.spec.replicas` behind it.
 - After: on a surge upgrade, and in an autoscaled blue-green upgrade's final drain, the node sits
-  `SchedulingDisabled` with the pod still on it, `Cannot evict pod` events, the `UPGRADE_NODES`
-  operation running far longer than one node should take, then the pod deleted. On a standard
+  `SchedulingDisabled` with the pod still on it, the audit log's `pods/eviction` calls from GKE's
+  service agent answered 429, the `UPGRADE_NODES` operation running far longer than one node
+  should take, then the pod deleted. On a standard
   blue-green upgrade the pod stays Running on a cordoned blue node through the soak and goes when
   the blue pool is deleted.
-- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window, or choose a blue-green upgrade and set its soak or wait (up to seven days) long enough to fix the budget or move the workload before GKE deletes the pod; the longer window postpones the outage and does not avoid it. The autoscaled variant is in Preview, needs a control plane on 1.34.0-gke.2201000 or later with cluster autoscaling enabled, and a cancelled one cannot be rolled back.
+- Mitigate before: give the budget room: `maxUnavailable` at least 1 or `minAvailable` below the replica count, and a second replica so the budget can be honoured; for a true singleton, accept the outage inside a maintenance window, or choose a blue-green upgrade and set its soak or wait (up to seven days) long enough to fix the budget or move the workload before GKE deletes the pod; the longer window postpones the outage and does not avoid it. The autoscaled variant is in Preview, needs a control plane on 1.34.0-gke.2201000 or later with cluster autoscaling enabled, starts its green pool empty so it needs the quota to grow (entry 2), and a cancelled one cannot be rolled back.
 - Mitigate after: on surge or an autoscaled drain, fix the budget and the stalled drain resumes at once; on a standard blue-green upgrade, fix the budget and evict the pod yourself before the soak ends so it starts on the green pool, or roll the upgrade back; never delete the budget without replacing it, since that trades a stall for an unprotected workload.
-- Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`.
+- Read today: the readiness mode of `fleet-upgrade-verification` grades it `blocked`, and the obtainability audit reports it as `blocking-pdb`.
 - GKE recommender: `PDB_UNPERMISSIVE` flags a budget that allows zero evictions; `DEPLOYMENT_MISSING_PDB` and `PDB_UNPROTECTED_STATEFULSET` flag the opposite gap. All from the [disruption-readiness insights](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-disruption-readiness), reassessed daily.
 - Why it is on the list: how long each strategy keeps the pod (an hour per node on surge; the
   soak or the wait, up to seven days, on blue-green) and the removal that ends it are in GKE's
@@ -226,17 +232,21 @@ nodes it can empty, then drains the rest, respecting the budget for up to one ho
 
 ### 2. No spare capacity for the displaced pods
 
-This entry needs a pool whose upgrade settings let a node go away before its replacement exists:
-`maxUnavailable` above 0, which GKE sets only on request. On GKE's default surge settings,
+This entry needs a pool whose upgrade settings let a node go away before its replacement exists,
+`maxUnavailable` above 0, which GKE sets only on request, or an autoscaled blue-green upgrade,
+whose green pool starts with no nodes. On GKE's default surge settings,
 `maxSurge` 1 and `maxUnavailable` 0, the replacement node is created first, and if it cannot be
 (quota, a stockout) the upgrade stops there with the old node still serving. On a pool that allows
 unavailability, draining a node only works if the pods it carries can start somewhere else. With no
 headroom, an autoscaler at its ceiling or exhausted accelerator quota, they wait for the node that
-was just taken away, and a single-replica application has a guaranteed outage.
+was just taken away, and a single-replica application has a guaranteed outage. On autoscaled
+blue-green the green pool grows only as far as the cluster autoscaler can add nodes, so quota,
+the autoscaler's limits or a stockout leave the displaced pods Pending, which GKE lists among that
+strategy's limitations.
 
 - Before: a pool whose `upgradeSettings` set `maxUnavailable` above 0 (with or without
-  `maxSurge` 0), and then requests already close to allocatable minus one node, the autoscaler at
-  its maximum, or accelerator quota exhausted.
+  `maxSurge` 0) or that uses the autoscaled blue-green strategy, and then requests already close to
+  allocatable minus one node, the autoscaler at its maximum, or accelerator quota exhausted.
 - Where to look: the GKE API for the pool's `upgradeSettings`, autoscaler limits, and Compute Engine for accelerator quota; the Kubernetes API for the sum of requests against allocatable.
 - After: Pending pods with `Insufficient cpu` or `Insufficient nvidia.com/gpu`, autoscaler events
   citing quota.
@@ -369,7 +379,7 @@ without anyone changing it.
 - Mitigate before: read the target minor's notes, run Pod Security Admission in `warn` and `audit` before `enforce`, and rehearse on a staging cluster already at the target version.
 - Mitigate after: the audit log names the rejecting rule; relabel the namespace or adjust the pod.
 - Read today: nothing.
-- GKE recommender: only where the default change is also a removal, such as `DEPRECATION_K8S_1_25_PODSECURITYPOLICY`.
+- GKE recommender: only where GKE files the default change as a removal, such as `DEPRECATION_K8S_1_25_PODSECURITYPOLICY`, or `EXEC_PROBE_TIMEOUT` for exec probes that overrun their timeout, which GKE enforces from 1.35.
 - Why it is on the list: the PodSecurityPolicy removal in 1.25; the `gitRepo` volume the kubelet
   refuses from [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/).
 
@@ -416,7 +426,10 @@ that talks to the API without retrying fails for those minutes.
 
 - Before: the cluster is zonal. Whether its clients retry is not readable from the cluster, so the check reports the exposure and the operator answers the rest.
 - Where to look: the GKE API for the cluster's location type.
-- After: API 5xx for a few minutes, GitOps out of sync.
+- After: API errors or timeouts while the replica is replaced, GitOps out of sync. The
+  reproduction linked above polled a zonal cluster's API every two to four seconds through its
+  control-plane upgrade and saw no failed read or write, so the gap can be shorter than a poll
+  interval.
 - Mitigate before: a regional cluster for anything automation depends on, and retries with backoff in the clients that cannot tolerate a few minutes of 5xx.
 - Mitigate after: wait for the control plane; GitOps resyncs on its own.
 - Read today: nothing.
@@ -425,7 +438,7 @@ that talks to the API without retrying fails for those minutes.
   [cluster availability types](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)
   document the behaviour; no public incident verified and no fixture.
 
-### 12. A node label or taint is removed
+### 12. A node label is removed
 
 A pod whose `nodeSelector` names a label the new kubelet or node image no longer sets can never
 schedule again.
@@ -458,7 +471,7 @@ tolerated, which is the runtime change a node pool upgrade can carry.
 - Mitigate after: the same changes, under pressure; a completed node pool can be downgraded in place while GKE still offers the previous version.
 - Read today: the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant; CRI clients, image schemas and containerd configuration are unread.
 - GKE recommender: `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, the two transitions GKE has flagged on real clusters; `DEPRECATION_K8S_1_24_DOCKERSHIM` is the historical one.
-- Why it is on the list: containerd 1.x is supported through Kubernetes 1.35 and 2.x follows it, and GKE's two containerd insights exist because both breaks happened on real clusters.
+- Why it is on the list: GKE's Linux nodes move to containerd 2.0 at 1.33 and Windows Server nodes at 1.35 ([containerd 2 migration](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/migrate-containerd-2)), and GKE's two containerd insights exist because both breaks happened on real clusters. The reproduction linked above saw a patch upgrade inside 1.31 move a node from containerd 1.7.34 to 2.0.10 and break a `v1alpha2` client, so the before-signal is the containerd version the target node image ships, not the minor.
 
 ### 14. cgroup v2 under a runtime that cannot read it
 
@@ -522,7 +535,7 @@ specific flow is handled.
 - Read today: the fleet-consistency drift audit reads each cluster's `datapathProvider` and its
   network-policy settings across the cohort, so a member whose dataplane differs from its peers
   is reported; how a policy behaves, and the DNS provider, are unread.
-- GKE recommender: none. The Network Analyzer's separate connectivity insight covers control-plane and node reachability, not policy behaviour.
+- GKE recommender: `NETWORK_POLICIES_UNRECONCILED` flags NetworkPolicy objects that exist but are not enforced, which are the ones that start blocking traffic when a dataplane change turns enforcement on; nothing covers DNS or how a specific flow is handled. The Network Analyzer's separate connectivity insight covers control-plane and node reachability.
 - Why it is on the list: no public incident verified; the per-version known-issue notes are the
   signal.
 
@@ -548,16 +561,22 @@ CNI's own control components are hit, cluster-wide within minutes.
 ### 18. GPU driver mismatch
 
 The node image ships a GPU driver; the containers ship a CUDA version. When the new image's driver
-is older than what the CUDA build requires, the device cannot be opened.
+is older than what the CUDA build requires, the device cannot be opened. It also fails the other
+way: an image that carries NVIDIA's CUDA forward-compatibility libraries, to run a newer CUDA on an
+older driver, stops working once the node's driver is newer than those libraries.
 
-- Before: the driver version the target node image ships against the CUDA version the images need.
+- Before: the driver version the target node image ships against the CUDA version the images need, and whether the images put forward-compatibility libraries on the library path.
 - Where to look: the GPU how-to page's table of driver versions per GKE version, for the target version, since the GKE API only records `DEFAULT` or `LATEST`; the images for the CUDA version they need.
-- After: pods Pending on `nvidia.com/gpu`, or crashing in `nvidia-smi`.
+- After: pods Pending on `nvidia.com/gpu`, crashing in `nvidia-smi`, or failing with
+  `Error 803: system has unsupported display driver / cuda driver combination` when
+  forward-compatibility libraries are older than the new driver.
 - Mitigate before: match the driver to the images before the upgrade: the GPU how-to page's table gives the driver per GKE version, and NVIDIA's minimum-driver matrix per CUDA major gives the floor the images accept; upgrade a canary GPU pool first.
 - Mitigate after: recreate the pool with the driver version the images need.
 - Read today: nothing.
 - GKE recommender: none.
-- Why it is on the list: frequent on accelerator pools; no public incident verified.
+- Why it is on the list: frequent on accelerator pools; no public incident verified. The
+  reproduction linked above saw the second direction: the 1.34 node image moved the driver from
+  R535 to R580 and both pods carrying forward-compatibility libraries failed with `Error 803`.
 
 ### 19. In-tree volumes lose their CSI path
 
@@ -571,7 +590,8 @@ is the same.
   `gcePersistentDiskCsiDriverConfig` add-on is disabled; StorageClasses naming a provisioner that
   no longer exists.
 - Where to look: the GKE API for the `gcePersistentDiskCsiDriverConfig` add-on; the Kubernetes API for PersistentVolume specs and StorageClass provisioners.
-- After: attach errors, pods stuck `ContainerCreating`.
+- After: attach errors, pods stuck `ContainerCreating`, or, as the reproduction linked above saw,
+  a replacement pod `Pending` with `didn't match PersistentVolume's node affinity`.
 - Mitigate before: enable the PD CSI driver add-on and move StorageClasses to `pd.csi.storage.gke.io`.
 - Mitigate after: enable the add-on; the volumes attach.
 - Read today: nothing.
@@ -603,15 +623,15 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 ## The order to add checks
 
 The order is by how often each failure appears in the public record and how cheap its signal is to
-read. GKE's recommender comes first, because one call per location returns the deprecation
-insights (6) together with the budget (1), webhook (7), skew (10), runtime (13) and window (5)
-insights; the readiness requirements'
+read. GKE's recommender comes first, because one call per location returns the deprecation insights
+(6) together with the budget (1), webhook (7), skew (10), runtime (13) and network-policy (16)
+insights and the maintenance-window recommendation (5); the readiness requirements'
 [deprecation-insights section](upgrade-readiness-checks.md#gke-deprecation-insights) says what else
-the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (7) and the unread half of capacity headroom (2), surge settings and headroom
-against allocatable, come next, because both turn a routine drain into an outage and both are a few
-list calls. Replica placement (3) is already read. The node-image entries (12 to 20) follow, which
-need the target version to be known before they mean anything. Post-upgrade detection is one mechanism for every
+the pause the deprecation family puts on automatic upgrades explains. Fail-closed webhooks (7) and
+the unread half of capacity headroom (2), surge settings and headroom against allocatable, come
+next, because both turn a routine drain into an outage and both are a few list calls. Replica
+placement (3) is already read. The node-image entries (12 to 20) follow, which need the target
+version to be known before they mean anything. Post-upgrade detection is one mechanism for every
 entry: watch the operation, then compare Pending and crash-looping pod counts and a live service
-probe against the same measurements taken before the upgrade started, as the
-readiness requirements' [rollout section](upgrade-readiness-checks.md#rollout-and-verification)
-specifies.
+probe against the same measurements taken before the upgrade started, as the readiness requirements'
+[rollout section](upgrade-readiness-checks.md#rollout-and-verification) specifies.
