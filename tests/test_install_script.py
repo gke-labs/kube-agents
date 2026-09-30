@@ -7263,7 +7263,19 @@ class DomainScopedFlagsTest(unittest.TestCase):
             env_file = pathlib.Path(tmp) / "counting.env"
             marks = pathlib.Path(tmp) / "marks"
             env_file.write_text(f'printf x >> "{marks}"\nA=1\nB=2\nC=3\n')
-            keys = "A B C"
+            # D is the key that makes this test reach the live callers' shape.
+            # Asking for exactly the keys the file defines leaves every one of
+            # them answered, and a reader that evaluates the file a second
+            # time for the unanswered ones would short-circuit before doing
+            # it -- so the assertion below would hold for a reader that does
+            # evaluate twice. Both real callers ask about a key the file will
+            # often not have: bootstrap_install_env_file asks for
+            # TF_VAR_enable_drift_pubsub alongside ENABLE_DRIFT_DETECTOR, and
+            # install.sh writes no TF_VAR_ key at all;
+            # warn_unrecorded_interview_answers asks for
+            # PLATFORM_AGENT_CUSTOM_ROLES, which install.sh writes only when
+            # PLATFORM_AGENT_PERMISSION_SET is `custom`.
+            keys = "A B C D"
             proc = self._parse(
                 "",
                 "\n".join(
@@ -7279,12 +7291,17 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            self.assertNotIn("unrecorded", proc.stdout)
+            self.assertEqual(
+                ["unrecorded D"],
+                [l for l in proc.stdout.splitlines() if l.startswith("unrecorded")],
+                f"only D is absent from the file: {proc.stdout}",
+            )
             self.assertEqual(
                 "x",
                 marks.read_text(),
-                "three values and three presence tests, one evaluation of the "
-                f"file: {proc.stdout}",
+                "four values and four presence tests, one of them for a key "
+                "the file does not assign, and one evaluation of the file: "
+                f"{proc.stdout}",
             )
 
     def test_a_second_file_is_not_answered_from_the_first_ones_cache(self):
