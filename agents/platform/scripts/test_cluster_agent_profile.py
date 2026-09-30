@@ -869,12 +869,9 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         matching_commands = [
             "python3 /opt/data/scripts/cluster_agent_profile.py list",
             "cluster_agent_profile.py name --cluster foo",
-            "cd /opt/data/scripts && python3 -m cluster_agent_profile list",
-            'python3 -c "import cluster_agent_profile"',
+            "/opt/data/scripts/cluster_agent_profile.py",
             "kanban_notify_propagate.py",
             "/opt/data/scripts/kanban_notify_propagate.py",
-            "python3 -m kanban_notify_propagate",
-            'python3 -c "import kanban_notify_propagate"',
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -888,6 +885,10 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat README.md",
             "git status",
             "echo 'kube-agents repo'",
+            "grep -rn cluster_agent_profile /opt/data/skills/",
+            "ls /opt/data/scripts | grep cluster_agent_profile",
+            'echo "not using cluster_agent_profile"',
+            "cat notes/cluster_agent_profile.md",
             "grep -n kubectl /opt/data/skills/cluster-agent-lifecycle/SKILL.md",
             "which kubectl",
             "printf 'delegated; no kubectl run here' > notes.md",

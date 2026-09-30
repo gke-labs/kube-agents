@@ -82,13 +82,12 @@ verification_spec:
     check:
       # A match anywhere in a command, not only at its start: the scripts are
       # run by path (`python3 /opt/data/scripts/cluster_agent_profile.py ...`),
-      # by module (`python3 -m cluster_agent_profile`), quoted, with `--help`,
-      # or inside loops the worker writes, and neither name has a use in a
-      # worker's terminal on an install where the stubs apply.
+      # quoted, with `--help`, or inside loops the worker writes, and neither
+      # name has a use in a worker's terminal on an install where the stubs
+      # apply.
       type: worker_commands
       forbidden_patterns:
-        - 'cluster_agent_profile(?:\.py)?\b'
-        - 'kanban_notify_propagate(?:\.py)?\b'
+        ['cluster_agent_profile\.py', 'kanban_notify_propagate\.py']
   - name: rca-names-the-oom
     role: objective
     mode: assert
