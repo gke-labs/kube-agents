@@ -30,16 +30,20 @@ DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
 # means one time".
 GREETED_MARKER = ".bootstrap_greeted"
 
-# The eval seam: one-shot requests, written only by the first-install-hello
-# bench stack (bench/tf/prebuilt/first-install-hello) as files whose names start
-# with this prefix, one per case, each asking for the greeting on the next first
-# turn whose message contains its phrase, on any platform. It exists because
-# the bench reaches the gateway over the API server, which the platform
-# allowlist above excludes, and because a real install greets once. It touches
-# no onboarding state: no delivery binding, no presence or greeted marker, no
-# trigger. Nothing else writes it, and with none present this hook runs exactly
-# as it would without the seam. The phrase keeps a concurrent eval case's first
-# turn from consuming another case's request. JSON: {"phrase": str, "variant": str}.
+# The eval seam: requests written only by the first-install-hello bench stack
+# (bench/tf/prebuilt/first-install-hello) as files whose names start with this
+# prefix, one per case, each asking for the greeting on every non-cron turn whose
+# message contains its phrase, on any platform, until the stack's destroy step
+# removes the file. It exists because the bench reaches the gateway over the API
+# server, which the platform allowlist above excludes, and because a real
+# install greets once. It is not used up on first match: the harness re-sends the
+# opening turn in the same conversation after a dropped connection, and that
+# retry is no longer a first turn, so a used-up request would grade the retry's
+# ordinary reply as the model's. It touches no onboarding state: no delivery
+# binding, no presence or greeted marker, no trigger. Nothing else writes it,
+# and with none present this hook runs exactly as it would without the seam. The
+# phrase keeps a concurrent eval case's turns from matching another case's
+# request. JSON: {"phrase": str, "variant": str}.
 EVAL_GREET_MARKER = ".bootstrap_greet_eval"
 EVAL_KEY_PHRASE = "phrase"
 EVAL_KEY_VARIANT = "variant"
@@ -111,12 +115,12 @@ def _bind_delivery_to_origin(**kwargs: Any) -> bool:
         return False
 
 
-def _consume_eval_marker(data_dir: Path, user_message: str) -> Optional[bool]:
-    """Take the eval seam's one-shot request, if this turn is the one it names.
+def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
+    """The eval seam's request whose phrase is in this turn's message, if any.
 
     Returns None when no request names this turn, else whether the greeting
-    should be the completed variant. The unlink is the claim: of two turns
-    racing on one request, only the one whose unlink succeeds greets.
+    should be the completed variant. The file is left for the stack's destroy
+    step, so a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
@@ -130,14 +134,7 @@ def _consume_eval_marker(data_dir: Path, user_message: str) -> Optional[bool]:
             continue
         if not phrase or phrase not in user_message:
             continue
-        try:
-            marker.unlink()
-        except FileNotFoundError:
-            return None
-        except OSError as e:
-            logger.warning("Could not consume %s: %s", marker, e)
-            return None
-        logger.info("Consumed %s (variant=%s).", marker, variant)
+        logger.info("Matched %s (variant=%s).", marker, variant)
         return variant == EVAL_VARIANT_COMPLETED
     return None
 
@@ -172,9 +169,6 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     the delivery, and a second chat must not re-point the job at itself and
     then promise a report the first chat is going to receive.
     """
-    if not kwargs.get("is_first_turn", False):
-        return None
-
     # Background cron runs also start with is_first_turn=True; never treat them
     # as an interactive onboarding turn.
     platform_name = str(kwargs.get("platform", "")).lower()
@@ -182,10 +176,15 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if platform_name == "cron" or session_id.startswith("cron_"):
         return None
 
+    # Ahead of the first-turn check: a retried opening turn is no longer a
+    # first turn and must still greet (see EVAL_GREET_MARKER).
     data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
-    eval_completed = _consume_eval_marker(data_dir, str(kwargs.get("user_message") or ""))
+    eval_completed = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
     if eval_completed is not None:
         return _greeting(data_dir, eval_completed)
+
+    if not kwargs.get("is_first_turn", False):
+        return None
 
     # Request/response and local surfaces have no durable adapter destination.
     # Binding delivery to an ephemeral run id makes the report disappear after

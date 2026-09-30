@@ -255,20 +255,23 @@ class PreLlmCallTest(unittest.TestCase):
         self._plant()
         self.assertIsNotNone(self._eval_call())
 
-    def test_eval_marker_is_consumed_once(self):
+    def test_eval_marker_survives_a_retried_opening_turn(self):
+        # The harness re-sends the opening turn in the same conversation after
+        # a dropped connection; by then the first attempt is in the history.
         marker = self._plant()
         self.assertIsNotNone(self._eval_call())
-        self.assertFalse(marker.exists())
-        self.assertIsNone(self._eval_call())
+        result = self._eval_call(is_first_turn=False)
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertTrue(marker.exists())
 
     def test_eval_marker_waits_for_its_phrase(self):
         marker = self._plant()
         self.assertIsNone(self._eval_call(user_message="list my clusters"))
         self.assertTrue(marker.exists())
 
-    def test_eval_marker_is_not_consumed_by_a_later_turn_or_cron(self):
+    def test_eval_marker_is_not_taken_by_another_turn_or_cron(self):
         marker = self._plant()
-        self.assertIsNone(self._eval_call(is_first_turn=False))
+        self.assertIsNone(self._eval_call(is_first_turn=False, user_message="what is its status?"))
         self.assertIsNone(self._eval_call(platform="cron"))
         self.assertIsNone(self._eval_call(session_id="cron_abc"))
         self.assertTrue(marker.exists())
@@ -283,11 +286,10 @@ class PreLlmCallTest(unittest.TestCase):
         done = self._plant(variant="completed", phrase="just set you up", suffix="-done")
         result = self._eval_call(user_message="hey, priya here, just set you up")
         self.assertIn("SCAN COMPLETED", result["context"])
-        self.assertTrue(running.exists())
-        self.assertFalse(done.exists())
         result = self._eval_call(user_message="hi! priya here, just installed you")
         self.assertIn("SCAN IN PROGRESS", result["context"])
-        self.assertFalse(running.exists())
+        self.assertTrue(running.exists())
+        self.assertTrue(done.exists())
 
     def test_only_bench_and_this_plugin_name_the_eval_marker(self):
         repo = Path(__file__).resolve().parents[5]

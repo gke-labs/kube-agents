@@ -19,19 +19,20 @@
 # a chat platform with durable delivery (the bootstrap_onboarding plugin in
 # agents/chat/defaults/plugins/). The bench reaches the agent over the API
 # server, which that plugin excludes, on an install that greeted long ago. So
-# this stack writes the plugin's eval seam instead: a one-shot request file,
-# named by the EVAL_GREET_MARKER prefix plus this case's suffix, in the chat
-# profile's home inside the agent pod. The plugin injects the greeting for the
-# request's variant on the first turn whose message contains its phrase, and
-# unlinks the file. It binds no delivery and touches no onboarding marker, so
-# the install's real onboarding state is the same before and after the case.
+# this stack writes the plugin's eval seam instead: a request file, named by
+# the EVAL_GREET_MARKER prefix plus this case's suffix, in the chat profile's
+# home inside the agent pod. The plugin injects the greeting for the request's
+# variant on every turn whose message contains its phrase, so a transport retry
+# of the opening turn greets too. It binds no delivery and touches no onboarding
+# marker, so the install's real onboarding state is the same before and after
+# the case.
 #
 # One file per case, each with its own phrase, because the nightly runs cases
 # concurrently against one install: a shared file would be overwritten by the
 # other variant's apply, and a phrase-less one taken by any case's first turn.
 #
-# Destroy removes the file, in case the turn that should have taken it never
-# arrived. Nothing else is planted, so nothing else is torn down.
+# Destroy removes the file; until then it stays armed for its phrase. Nothing
+# else is planted, so nothing else is torn down.
 
 terraform {
   required_version = ">= 1.5.0"
