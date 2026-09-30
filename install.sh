@@ -1380,7 +1380,7 @@ write_secret_env_var() {
 # One evaluation for all of them, because the file is shell and a line may run
 # a command: a key whose value is a command substitution fetching a secret is
 # a network round-trip per evaluation, and the interview guard alone asks
-# about twenty-two keys. Answers stay cached until the file changes. A
+# about twenty-three keys. Answers stay cached until the file changes. A
 # caller reading through a command substitution primes the cache in a subshell
 # that then exits, so the callers that read several keys prime here first, in
 # their own shell, and their reads land warm.
@@ -1391,6 +1391,15 @@ write_secret_env_var() {
 # make. The rest of the environment is inherited on purpose: a file recording
 # `K=$OTHER` assigns whatever the real sourcing will assign, so the reader has
 # to see the same shell the install runs in.
+#
+# A subshell of this shell, then, and not a `bash -c` child, which inherits
+# only what is exported. install.defaults.env is sourced without `set -a`
+# (see the block above `main`), so every `DEFAULT_*` is one of this shell's
+# unexported variables and a child process cannot see any of them. A file
+# spelled `ENABLE_GVISOR=$DEFAULT_ENABLE_GVISOR` -- admitted, because the file
+# is shell -- then assigns `true` on the live path and empty in a child, and
+# the interview guard reports drift on every interactive run against a file
+# that agrees with the install.
 #
 # Executing the file is not a new exposure. The real shell sources it at
 # startup and every front door sources it again; a throwaway subshell that
@@ -1420,29 +1429,36 @@ read_recorded_install_env_values() {
   done
   [ "${#pending[@]}" -gt 0 ] || return 0
 
-  eval "$(bash -c '
-    file="$1"
-    value_prefix="$2"
-    set_prefix="$3"
-    shift 3
-    for key in "$@"; do unset "$key"; done
-    source_as_the_install_does() {
-      set -a
-      # shellcheck disable=SC1090
-      . "$1" >/dev/null 2>&1 || true
-      set +a
-    }
-    source_as_the_install_does "$file"
-    for key in "$@"; do
-      if [ -n "${!key+x}" ]; then
-        printf "%s%s=1\n" "$set_prefix" "$key"
-        printf "%s%s=%q\n" "$value_prefix" "$key" "${!key}"
-      else
-        printf "%s%s=0\n" "$set_prefix" "$key"
-        printf "%s%s=\n" "$value_prefix" "$key"
-      fi
-    done
-  ' _ "$file" "$RECORDED_VALUE_PREFIX" "$RECORDED_SET_PREFIX" "${pending[@]}" 2>/dev/null || true)"
+  eval "$(
+    {
+      # set -E propagates this script's ERR trap into the subshell, where a
+      # line of the file that exits non-zero would print an abort banner.
+      trap - ERR
+      # The keys as positional parameters, so the loop below survives a file
+      # that assigns to `key` or `pending` -- both of which are this
+      # function's locals and therefore visible here, unlike in a child.
+      set -- "${pending[@]}"
+      # `|| true`: unsetting a name the script made readonly fails, and the
+      # remaining keys still have answers owed to them.
+      for key in "$@"; do unset "$key" 2>/dev/null || true; done
+      source_as_the_install_does() {
+        set -a
+        # shellcheck disable=SC1090
+        . "$1" >/dev/null 2>&1 || true
+        set +a
+      }
+      source_as_the_install_does "$file"
+      for key in "$@"; do
+        if [ -n "${!key+x}" ]; then
+          printf "%s%s=1\n" "$RECORDED_SET_PREFIX" "$key"
+          printf "%s%s=%q\n" "$RECORDED_VALUE_PREFIX" "$key" "${!key}"
+        else
+          printf "%s%s=0\n" "$RECORDED_SET_PREFIX" "$key"
+          printf "%s%s=\n" "$RECORDED_VALUE_PREFIX" "$key"
+        fi
+      done
+    } 2>/dev/null || true
+  )"
   RECORDED_INSTALL_ENV_KEYS="${RECORDED_INSTALL_ENV_KEYS}${RECORDED_INSTALL_ENV_KEYS:+ }${pending[*]}"
 }
 

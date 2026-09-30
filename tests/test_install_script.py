@@ -6485,6 +6485,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
         installer_common.sh is sourced too, in the order main() does it:
         source_provisioning_helpers runs at step 2, so every function reached
         below has is_truthy and the DEFAULT_* set by the time it runs.
+
+        stdin is /dev/null for the reason _run_installer_bash gives, applied
+        ahead of the need: the reader executes install.env, so a line of it
+        that reads standard input would block a developer running this module
+        from a shell while CI, whose fd 0 is already closed, stayed green. No
+        QUOTING_SPELLINGS row does -- the two ending in `cat` are pipelines,
+        where `cat` reads the pipe and gets EOF when the assignment exits --
+        but a row that did would hang forty evaluations deep with nothing on
+        screen.
         """
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
@@ -6500,6 +6509,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 ["bash", "-c", script],
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 env=_env_without_ambient_drift_keys(overrides, env),
                 cwd=str(_REPO_ROOT),
             )
@@ -7071,6 +7081,11 @@ class DomainScopedFlagsTest(unittest.TestCase):
     # a reassignment further down, `declare` and `readonly`, a continued line,
     # and two keys off one `export`.
     #
+    # AS is the one only *this* shell can answer. install.defaults.env is
+    # sourced without `set -a`, so DEFAULT_* are unexported, and a reader that
+    # evaluates the file in a `bash -c` child reads AS empty where both live
+    # readers read `true`.
+    #
     # `&>>` is left out. bash 4 reads it as one operator and bash 3.2 -- which
     # is what macOS ships -- as `&>` followed by a stray `>`, a syntax error
     # that aborts the source at that line and takes every row after it with it.
@@ -7117,6 +7132,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         ("AN", "AN=~"),
         ("AQ", "export AQ=true AR=2"),
         ("AR", "export AQ=true AR=2"),
+        ("AS", "AS=$DEFAULT_ENABLE_GVISOR"),
     ]
 
     def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
@@ -7191,15 +7207,27 @@ class DomainScopedFlagsTest(unittest.TestCase):
             "a `declare -x` line assigns a function-local, so neither live "
             f"reader keeps it: {proc.stdout}",
         )
+        # AS is the row that fails if the reader ever evaluates the file in a
+        # child process again, and it only carries that weight while the
+        # yardstick is non-empty: DEFAULT_ENABLE_GVISOR has to be a variable
+        # this shell holds and does not export. Asserted rather than assumed,
+        # because a default that moved would leave the row agreeing on empty
+        # and testing nothing.
+        self.assertNotEqual(
+            "[]",
+            seen["BASH"]["AS"],
+            "AS tests nothing unless install.defaults.env still sets "
+            f"DEFAULT_ENABLE_GVISOR: {proc.stdout}",
+        )
 
     def test_reading_many_keys_evaluates_the_file_once(self):
         """install.env is shell, so an evaluation can cost a network call.
 
-        `GEMINI_API_KEY=$(gcloud secrets versions access ...)` is a documented
-        shape, and the interview guard asks about twenty-two keys. A reader
-        that sources per key ran that command twenty-two times per interactive
-        re-run, with the exit swallowed and the value silently empty on any
-        one of them that failed.
+        A value that is a command substitution fetching a secret is a
+        documented shape, and the interview guard asks about twenty-three
+        keys. A reader that sources per key ran that command twenty-three
+        times per interactive re-run, with the exit swallowed and the value
+        silently empty on any one of them that failed.
         """
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "counting.env"
@@ -7227,6 +7255,46 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 marks.read_text(),
                 "three values and three presence tests, one evaluation of the "
                 f"file: {proc.stdout}",
+            )
+
+    def test_a_second_file_is_not_answered_from_the_first_ones_cache(self):
+        """The cache is keyed on the file, and nothing else would notice.
+
+        No caller in install.sh reads two files in one run today: the drift
+        branch and the interview guard are both handed the same path. That is
+        what makes this worth pinning rather than dropping -- a cache whose
+        invalidation is never exercised is a cache that answers the wrong
+        file's value on the day a third caller arrives, and the failure is a
+        guard quietly comparing against a file the operator did not name.
+
+        Each read is primed in this shell first, because that is the shape
+        that can go wrong: a bare `$(recorded_install_env_value ...)` primes
+        inside a subshell that then exits, so it would re-evaluate the right
+        file every time and pass with the invalidation deleted.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            first = pathlib.Path(tmp) / "first.env"
+            second = pathlib.Path(tmp) / "second.env"
+            first.write_text("A=from-first\n")
+            second.write_text("A=from-second\n")
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        line
+                        for path in (first, second, first)
+                        for line in (
+                            f"read_recorded_install_env_values '{path}' A",
+                            f"printf '%s\\n' \"$(recorded_install_env_value '{path}' A)\"",
+                        )
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                ["from-first", "from-second", "from-first"],
+                proc.stdout.split(),
+                f"the cache outlived the file it was keyed on: {proc.stdout}",
             )
 
     def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
