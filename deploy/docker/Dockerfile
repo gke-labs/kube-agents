@@ -488,8 +488,9 @@ RUN cd /opt/hermes && \
 # three edits to the same few lines of what is now
 # gateway/kanban_watchers_notifier.py. Three appliers meant four anchors into
 # one function and four ways for an upstream edit to break the build; this is
-# three -- the handoff, the wake set, and the incident row, which shared the
-# wake anchor until upstream split the per-event send loop from the wake step.
+# five -- the handoff, the wake set, the incident row (which shared the wake
+# anchor until upstream split the per-event send loop from the wake step), the
+# completion message, and the wake step's outcome.
 #   * Clip: upstream hard-slices the handoff at 200/160 characters and discards
 #     every line after the first, which delivered a severed GitHub link -- a
 #     ledger URL cut to ".../is" -- on 2026-08-03. Both slices are swapped for a
@@ -519,6 +520,12 @@ RUN cd /opt/hermes && \
 #     instead, riding the next user message's api_content sidecar: no model
 #     turn, ~70 tokens, no new config key -- it fires only where
 #     kanban.wake_on_events suppressed a wake.
+#   * Quiet (KAGE_SLACK_UX, Slack only; flag off is upstream's text): the
+#     completion message drops its `done` head line, and a failure line the
+#     creator's wake will explain is held rather than posted. The wake step
+#     drops it once the wake is admitted for its kind, and posts it if the wake
+#     raises or never asked for the kind, so a failed wake cannot leave the
+#     failure untold.
 #
 # The wake edit is now three greps rather than one because v2026.8.13 gave the
 # subscription its own `delivery_mode`, so the patched line is a parenthesized
@@ -572,6 +579,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -qF 'wake_configured=self.wake_agent,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_kanban_store_incident(ev, self.task, self.sub, posted=self.send_passive)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'return _kanban_completion_text(n.head, n.title, handoff, n.platform_str)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_kanban_tell_unexplained(self.runner, self.adapter, self.sub, set())' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
 sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \

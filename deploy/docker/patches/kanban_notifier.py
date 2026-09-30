@@ -10,7 +10,7 @@ model turn waking the agent that created the card. Three separate patches used
 to rewrite that path — a clip, a result delivery, and a wake filter — each with
 its own applier anchored into the same function, each its own way for a
 base-image bump to break the build for a reason that has nothing to do with the
-other two. They are merged here: three anchors, one applier, one verifier.
+other two. They are merged here: one applier, one verifier.
 
 The concerns, in the order the notifier reaches them:
 
@@ -35,6 +35,11 @@ The concerns, in the order the notifier reaches them:
    reply of ``apply Option A`` reaches an agent that can see what Option A was
    — or, where the report proposed a single unlettered fix, so that a bare
    ``apply`` reaches one that can see which fix it authorises.
+6. **Quiet** it on Slack with ``KAGE_SLACK_UX`` on: :func:`completion_text`
+   drops the head line above the report, and :func:`explained_by_wake` tells
+   ``kanban_progress_lines`` when a failure line can wait for the wake to
+   explain it. :func:`hold_explained` keeps that line, and
+   :func:`tell_unexplained` posts it after all if the wake does not happen.
 
 Step 3 is only defensible because steps 1 and 2 happened, which is the clearest
 argument for keeping them together: ``kanban.wake_on_events`` may drop
@@ -1412,3 +1417,167 @@ def store_incident_report(
             exc_info=True,
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# 6. Quieter delivery on Slack, behind KAGE_SLACK_UX
+# ---------------------------------------------------------------------------
+#
+# Two lines a Slack thread reads as noise once the answer is in it. The
+# completion message opens with ``✔ <head> done — <title>``, a status line
+# above the report that repeats the card's title and says nothing the report
+# does not. And a failure is told twice: the notifier posts ``✖ … gave up``,
+# then the wake has the creator explain the same failure in its own words.
+#
+# Both are presentation and both are gated on the flag *and* on the Slack
+# platform, so Google Chat and a flag-off Slack get exactly upstream's text.
+#
+# The failure line is held, not dropped. The ping is sent before the wake is
+# attempted, so skipping it outright would leave the thread silent whenever the
+# wake then raised: upstream counts the skipped ping as delivered and retries
+# only the wake, until it drops the subscription. So the line waits on the
+# watcher (:func:`hold_explained`), and the notifier's wake step settles it
+# (:func:`tell_unexplained`): a wake that was admitted for the kind drops it;
+# a wake that raised, or a wake set that turned out not to hold the kind, posts
+# it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry. Three
+# trade-offs, accepted:
+#
+# * A wake that raised and later succeeds on a retry tells the failure twice,
+#   once as the line and once in the creator's words. Twice is the safe side.
+# * The hold is in-process, like the progress-line map. A restart between the
+#   ping and the wake loses it, and the failure goes untold.
+# * A push wake is admission, not narration (``gateway/wake.py``). The line is
+#   dropped once the wake is queued, so a queued turn lost to a restart or an
+#   interrupt before it speaks still leaves the failure untold.
+# The flag is read through ``gateway.slack_ux_reactions.enabled()``, imported
+# when a delivery runs: that module is copied into the image after this one,
+# and an image without it reads as flag off.
+
+SLACK_PLATFORM = "slack"
+
+#: Upstream's completion head line, byte for byte. Kept whole when there is no
+#: handoff at all, since then it is the only thing the message would say.
+COMPLETION_HEAD = "✔ {head} done — {title}"
+
+#: The failure kinds the creator's wake narrates. Only these: ``completed`` is
+#: the report itself, and the review-flow kinds carry no explanation to give.
+EXPLAINED_KINDS: Tuple[str, ...] = ("blocked", "crashed", "timed_out", "gave_up")
+
+#: Upstream's ``wake_agent`` modes, and the default it applies when a
+#: subscription carries none.
+WAKING_MODES: Tuple[str, ...] = ("notify+wake", "wake")
+DEFAULT_DELIVERY_MODE = "notify"
+
+#: Where held failure lines wait, on the watcher like the progress-line map,
+#: and how many subscriptions' worth it keeps before evicting the oldest.
+HELD_ATTR = "_kage_explained_pings"
+HELD_MAX = 256
+
+
+def slack_ux_on(platform: object) -> bool:
+    """Whether ``KAGE_SLACK_UX`` is on and ``platform`` is Slack."""
+    if str(platform or "").strip().lower() != SLACK_PLATFORM:
+        return False
+    try:
+        from gateway import slack_ux_reactions
+    except ImportError:
+        return False
+    try:
+        return bool(slack_ux_reactions.enabled())
+    except Exception:
+        logger.debug("kanban notifier: reading KAGE_SLACK_UX failed", exc_info=True)
+        return False
+
+
+def completion_text(head: str, title: str, handoff: str, platform: object = None) -> str:
+    """Return the completion message: upstream's, or on Slack the handoff alone.
+
+    Flag off, or any platform but Slack, this is upstream's f-string exactly.
+    On Slack it drops the head line and leads with the worker's summary and
+    report; a card that completed with neither keeps the head line, since an
+    empty message is worse than a terse one.
+    """
+    upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
+    if not slack_ux_on(platform):
+        return upstream
+    return str(handoff or "").strip() or upstream
+
+
+def explained_by_wake(
+    sub: dict, kind: str, load_config: Optional[Callable[[], object]] = None,
+) -> bool:
+    """Whether the creator's wake will narrate this failure, so the ping can go.
+
+    True only on Slack with the flag on, for a failure kind, on a subscription
+    that asked to be woken, when ``kanban.wake_on_events`` wakes for the kind.
+    Those are the conditions under which ``wake_kinds_for`` on a push adapter
+    puts the kind in the wake set, so the one message the thread gets is the
+    creator's explanation. Anything short of all four keeps upstream's line.
+    """
+    if kind not in EXPLAINED_KINDS or not slack_ux_on(sub.get("platform")):
+        return False
+    if (sub.get("delivery_mode") or DEFAULT_DELIVERY_MODE) not in WAKING_MODES:
+        return False
+    return kind in resolve_wake_kinds(load_config)
+
+
+def _held_key(sub: dict) -> tuple:
+    """The subscription's identity, as upstream's ``_KanbanNotification.sub_key``."""
+    return (sub["task_id"], sub["platform"], sub["chat_id"], sub.get("thread_id") or "")
+
+
+def hold_explained(
+    runner: object, sub: dict, kind: str, event_id: int, message: str, metadata: Optional[dict],
+) -> None:
+    """Keep a failure line :func:`explained_by_wake` skipped, until the wake settles it.
+
+    Keyed by event id within the subscription, so an at-least-once replay of the
+    same event replaces its entry rather than queueing it twice.
+    """
+    held = getattr(runner, HELD_ATTR, None)
+    if held is None:
+        held = {}
+        setattr(runner, HELD_ATTR, held)
+    held.setdefault(_held_key(sub), {})[int(event_id)] = (
+        kind, sub["chat_id"], message, dict(metadata or {}),
+    )
+    while len(held) > HELD_MAX:
+        held.pop(next(iter(held)), None)
+
+
+async def tell_unexplained(runner: object, adapter: object, sub: dict, woken: object) -> None:
+    """Post every held line for ``sub`` whose kind is not in ``woken``; drop the rest.
+
+    Called by the notifier's wake step with the kinds the wake was admitted for,
+    or an empty set when there was no wake or it raised. Never raises: it runs
+    inside that step's ``try``. A line whose send fails is held again for the
+    next attempt.
+    """
+    try:
+        held = getattr(runner, HELD_ATTR, None)
+        if not held:
+            return
+        key = _held_key(sub)
+        pending = held.pop(key, None) or {}
+        woken = set(woken or ())
+    except Exception:
+        logger.warning("kanban notifier: reading held failure lines failed", exc_info=True)
+        return
+    for event_id in sorted(pending):
+        kind, chat_id, message, metadata = pending[event_id]
+        if kind in woken:
+            continue
+        try:
+            result = await adapter.send(chat_id, message, metadata=metadata)
+            if getattr(result, "success", True) is False:
+                raise RuntimeError(getattr(result, "error", None) or "send() reported failure")
+            logger.info(
+                "kanban notifier: posted the %s line for %s, which no wake explained",
+                kind, sub.get("task_id"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: posting the %s line for %s failed: %s; holding it for the retry",
+                kind, sub.get("task_id"), exc,
+            )
+            held.setdefault(key, {})[event_id] = pending[event_id]

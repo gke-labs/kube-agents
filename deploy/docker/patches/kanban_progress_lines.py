@@ -48,7 +48,10 @@ normally; every note after it re-renders the accumulated trail into that same
 message via ``adapter.edit_message`` (Google Chat ``messages.patch``), which
 updates the thread without re-notifying. When the card reaches a terminal state
 the rolling message is settled — the ``⏳`` becomes ``✓`` or ``⏹`` — and the
-result posts as a message of its own, which is the one that should ping.
+result posts as a message of its own, which is the one that should ping. With
+``KAGE_SLACK_UX`` on, a Slack card settles to its last line only, and a failure
+the creator's wake will explain is held for the wake step rather than posted;
+see :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -111,7 +114,9 @@ def progress_note(payload: object, limit: int = DEFAULT_NOTE_LIMIT) -> str:
 
 #: Event kinds that update the card's rolling message instead of posting one of
 #: their own. Everything else the notifier reaches the send site with is
-#: terminal: it settles the rolling message and then posts separately.
+#: terminal: it settles the rolling message and then posts separately (or,
+#: for a failure the wake will explain under ``KAGE_SLACK_UX``, holds the post
+#: for the wake step).
 #:
 #: ``status`` was listed for correctness before any code path wrote the kind;
 #: since v2026.9.14 the dashboard's drag-drop path (``_set_status_direct`` in
@@ -127,7 +132,8 @@ ROLLING_KINDS = ("heartbeat", "status")
 #:
 #: Two settled markers rather than one, because the rolling message must not
 #: imply success for a card that crashed. Which outcome it *was* is carried by
-#: the terminal message posted directly beneath it.
+#: the terminal message posted directly beneath it, or by the creator's
+#: explanation where ``KAGE_SLACK_UX`` held that message for the wake.
 IN_PROGRESS = "⏳"
 FINISHED = "✓"
 STOPPED = "⏹"
@@ -280,6 +286,54 @@ async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[s
         )
 
 
+def _slack_quiet(sub: dict) -> Any:
+    """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this Slack card, else None.
+
+    Imported when a delivery runs: ``gateway/kanban_notifier.py`` is copied into
+    the image after this module, and this one's build-time check runs before it
+    exists. Anything that goes wrong here reads as flag off.
+    """
+    try:
+        from gateway import kanban_notifier
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        except ImportError:
+            return None
+    try:
+        return kanban_notifier if kanban_notifier.slack_ux_on(sub.get("platform")) else None
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: reading KAGE_SLACK_UX failed: %s", exc)
+        return None
+
+
+def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
+    if quiet is None:
+        return False
+    try:
+        return bool(quiet.explained_by_wake(sub, kind))
+    except Exception as exc:  # noqa: BLE001 — fail towards posting the line
+        logger.debug(
+            "kanban progress: explained_by_wake for %s failed: %s", sub.get("task_id"), exc,
+        )
+        return False
+
+
+def _hold(
+    quiet: Any, watcher: Any, sub: dict, kind: str, event_id: int,
+    message: str, metadata: Optional[dict],
+) -> bool:
+    try:
+        quiet.hold_explained(watcher, sub, kind, event_id, message, metadata)
+        return True
+    except Exception as exc:  # noqa: BLE001 — fail towards posting the line
+        logger.debug(
+            "kanban progress: holding the %s line for %s failed: %s",
+            kind, sub.get("task_id"), exc,
+        )
+        return False
+
+
 async def deliver(
     watcher: Any,
     adapter: Any,
@@ -306,6 +360,15 @@ async def deliver(
     (``slack_ux_reactions.settle_delegated``). Neither may reach the notifier's
     ``except``, where a failed cosmetic call would rewind the cursor and count
     against the subscription's send-failure budget.
+
+    That is the flag-off behaviour. With ``KAGE_SLACK_UX`` on and a Slack card,
+    the terminal path is quieter in two ways. The rolling message settles to its
+    last line rather than the whole trail. And a failure the creator's wake will
+    explain is held rather than posted, returning ``None`` like the replay path;
+    the notifier's wake step drops it once the wake is admitted for the kind, and
+    posts it if the wake raises or never covers the kind, so the thread gets the
+    failure at least once. A line that cannot be held is posted. See section 6
+    of ``gateway/kanban_notifier.py``.
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
@@ -314,12 +377,14 @@ async def deliver(
     event_id = int(getattr(ev, "id", 0) or 0)
 
     if kind not in ROLLING_KINDS:
+        quiet = _slack_quiet(sub)
         if entry and entry["message_id"] and entry["lines"]:
+            settled = entry["lines"][-1:] if quiet else entry["lines"]
             try:
                 await adapter.edit_message(
                     chat_id,
                     entry["message_id"],
-                    render(header, entry["lines"], settled_marker(kind)),
+                    render(header, settled, settled_marker(kind)),
                 )
             except Exception as exc:
                 logger.debug(
@@ -327,6 +392,11 @@ async def deliver(
                     "for %s: %s", sub.get("task_id"), exc,
                 )
         tracked.pop(key, None)
+        if _explained_by_wake(quiet, sub, kind) and _hold(
+            quiet, watcher, sub, kind, event_id, message, metadata,
+        ):
+            await _settle_reaction(adapter, sub, kind, board)
+            return None
         result = await adapter.send(chat_id, message, metadata=metadata)
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
