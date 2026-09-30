@@ -197,13 +197,35 @@
 # return (session_kv_server.py) — with object_uid set to the record's
 # insertId. So after the settle any row whose object_uid is one of THIS run's
 # eleven churn insertIds, notified or not, proves Classify forwarded churn,
-# whatever the bucket held, and the stack fails the run on it. That reds a broken filter on every repetition
+# whatever the bucket held. That reds a broken filter on every repetition
 # rather than on the ones the remainder happens to favour. It is also the
 # second reason the churn insertIds have to be minted per apply (below):
 # against a fixed id the row cannot be attributed to this run. The
 # ALERT_DAILY_LIMIT_DRIFT raise BLOCKER 2 already owes is still wanted, to
 # keep the suppressed-record failure mode out of the way — it is not what
 # makes the ordering argument hold.
+#
+# HOW THE STACK'S OWN OBSERVATIONS REACH THE VERDICT
+#
+# Not by exiting non-zero. A tofu apply that fails under a deployer that is
+# not noop is classified as an infrastructure failure rather than a task
+# failure — bench/kube_agents_bench/scoring.py, _provision_death, reached
+# from classify_rep on `has_infra` — and an infrastructure repetition is
+# excluded from the verdict instead of counted against the case. Three of
+# three lands the case on Rung.INFRA, which the gate reports as
+# RESOURCE_PREPARATION_FAILED: "NOT EVALUATED — rerun when the environment is
+# healthy". The churn-row check above would then be the one observation of
+# the regression that nothing else can make, thrown away by the one
+# classification that reads it as the environment's fault. The same holds for
+# the insertId poll's three-way diagnosis below.
+#
+# So the stack applies cleanly whatever it observes, and records what it
+# observed where the verification_spec can grade it: a ConfigMap on the host
+# cluster, written last, specified under PLANTED STATE REQUIRED and asserted
+# by the fixture-observed-no-forwarded-churn safeguard. That keeps the two
+# jobs apart. Terraform failing means the fixture could not be built, which
+# is the environment's fault and is excluded correctly; a built fixture that
+# watched the pipeline forward churn is the case's finding, and it reds.
 #
 # Arrival position, not publish position. The subscription carries no ordering
 # key — terraform/modules/drift-pubsub/main.tf says so where it explains why
@@ -319,9 +341,26 @@
 #   shutdown lines print unattributed_principals=[...] by name (subscriber.go),
 #   so the fixture principal appearing there is the classifier and not the
 #   ingress, and neither it nor a --log-dropped automation line means the
-#   record never arrived at all. A stack that reports none of the three fails
-#   the run without saying what to fix -- and reports the third as the first,
-#   sending the next reader to the Pub/Sub wiring for a Classify regression.
+#   record never arrived at all. A stack that reports none of the three reds
+#   without saying what to fix -- and reports the third as the first, sending
+#   the next reader to the Pub/Sub wiring for a Classify regression. The
+#   three go in the verdict ConfigMap's `detail`, for the same reason the
+#   churn row does: a timed-out poll that killed the apply would be read as
+#   the environment's fault and excluded.
+# - The verdict ConfigMap itself: eval-drift-fixture-verdict in
+#   eval-drift-platform, created by the stack whatever it observes, with
+#   `verdict` set to the string "ok" when the settle found no ledger row
+#   carrying one of this run's eleven churn insertIds AND the insertId poll
+#   found the human card, and to a short token otherwise --
+#   churn-forwarded, card-quota-refused, card-classifier-dropped,
+#   card-never-arrived -- with `detail` carrying the human-readable form,
+#   including the fixture's twelve insertIds so a failing run can be traced
+#   without the apply log. Written last, after the settle, so a "ok" means
+#   both observations were actually made. The safeguard below asserts the
+#   string, not the absence of an object: a ConfigMap that exists only on
+#   failure reads as a pass when the stack never got far enough to write
+#   one, and the whole point of routing this through the cluster is that the
+#   grading should not be able to mistake "not observed" for "fine".
 # - Pacing, and the return condition with it, are sized to the front-door turn
 #   rather than to delivery. A card is not filed when a record arrives:
 #   _inject_drift claims the quota synchronously and then hands the record to
@@ -547,6 +586,44 @@ verification_spec:
       # own regexes.
       required_phrases: ["What to do"]
       any_of_phrases: ["Option A", "To authorize:"]
+
+  # The quota-independent half of triage-omits-the-controller-churn, read off
+  # the fixture's own observation rather than off the agent's report. The
+  # header's "HOW THE STACK'S OWN OBSERVATIONS REACH THE VERDICT" has the
+  # argument; what it comes to is that the stack watches the intercepted_events
+  # ledger for a row carrying one of this run's churn insertIds, and that is
+  # the only observation that reds a broken filter on every repetition rather
+  # than on the ones the alert bucket's remainder happens to favour. The stack
+  # cannot red the run by failing its own apply -- scoring.py classifies that
+  # as infrastructure and excludes the repetition -- so it writes what it saw
+  # and this grades it.
+  #
+  # A safeguard rather than an objective because it has to red a repetition
+  # whose objectives all passed. That is exactly the false green the header
+  # describes: the human record's card is filed first, the agent reads it, the
+  # phrase objectives pass, and the churn cards land after the board was read.
+  # Severity catastrophic for the same reason -- the finding is that the
+  # pipeline forwarded churn, whatever the report said about it.
+  #
+  # `eq "ok"` rather than the absence of a ConfigMap: absence is also what a
+  # stack that never reached the settle leaves behind, and grading must not
+  # read "not observed" as "nothing to report". The failure tokens and the
+  # `detail` key beside this one are under PLANTED STATE REQUIRED.
+  #
+  # Reads the ambient kubeconfig, with the same dependence on deployer: tofu
+  # that the safeguard below spells out: under the noop deployer this case
+  # carries while it waits, the context is whatever the previous task left.
+  - name: fixture-observed-no-forwarded-churn
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: configmap
+      resource_name: eval-drift-fixture-verdict
+      namespace: eval-drift-platform
+      path: data.verdict
+      op: eq
+      value: ok
 
   # The domain's claim is that triage never writes to the cluster, and the
   # drift template states it outright: nothing is written to the live cluster
