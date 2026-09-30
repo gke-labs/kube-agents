@@ -23,11 +23,18 @@ refused form therefore fails every time an agent copies it, and nothing short
 of a live run would say so.
 
 This reads every ``bash``, ``sh``, ``shell`` and ``zsh`` fenced block in each
-``SKILL.md`` under the skill trees named on the command line, splits it into commands, replaces each ``<placeholder>``
-with its bare name, and runs every command through Hermes' own
+``SKILL.md`` under the skill trees named on the command line, replaces each
+``<placeholder>`` with its bare name, and passes the block whole to Hermes' own
 ``tools.tirith_security.check_command_security``, the call the approval gate
-makes. Unlabelled blocks and inline code are not read: in the skills they hold
-tool calls, report templates and program output as often as commands. The
+makes on a terminal command of any length. The block is not split into
+commands: Tirith parses the shell itself, heredocs and quoting included, and a
+hand-written splitter would only approximate it. Tirith has a fixed work budget,
+so a block too long for it is refused as ``analysis_incomplete`` whatever it
+holds, as a terminal command that long would be; the report prints Tirith's
+finding titles so that reads as "split the block". Unlabelled blocks and inline
+code are not read: in the skills they hold tool calls, report templates and
+program output as often as commands. ``tests/test_skill_inline_commands.py``
+checks inline code for the variable program the skills used to teach. The
 Dockerfile names the agent image's three trees; a plugin's skills ship in its
 own image and are not read.
 
@@ -40,11 +47,14 @@ change of its own, with the digests copied from that release's
 ``checksums.txt``; pinning is what keeps a Tirith release from failing pull
 requests that did not touch a skill. Two probe commands with a known verdict
 run before and after the scan, and fail-open is off, so a binary that does not
-run fails the build rather than passing every command.
+run fails the build rather than passing every block.
 
 A finding that cannot be fixed in the skill text yet goes in
-``KNOWN_FINDINGS`` with its reason. An entry that no longer matches a refused
-command fails the check too, so the list cannot outlive what it excuses.
+``KNOWN_FINDINGS`` with the rules Tirith cites and its reason, keyed on the
+whole block, so an edit anywhere in that block, or a rule a Tirith release adds
+to it, brings it back for review. An entry that no longer
+matches a refused block fails the check too, so the list cannot outlive what it
+excuses.
 
 A shell block whose raw text and parsed Markdown disagree, such as a fence left
 unclosed inside a list item, fails the check as well: its commands cannot be
@@ -60,10 +70,10 @@ import io
 import os
 import platform
 import re
-import shlex
 import sys
 import tarfile
 import tempfile
+import textwrap
 import time
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
@@ -100,14 +110,12 @@ DOWNLOAD_BACKOFF_SECONDS = 2
 # binary under emulation.
 TIRITH_TIMEOUT_SECONDS = 60
 # check_command_security's summary on a spawn failure or timeout with
-# fail-open off. Every later command would fail the same way.
+# fail-open off. Every later block would fail the same way.
 FAIL_CLOSED_MARKER = "(fail-closed)"
 
 TREE_SEPARATOR = "="
-COMMENT_PREFIX = "#"
-LINE_CONTINUATION = "\\"
-UNCLOSED_QUOTE_ERROR = "No closing quotation"
 PLACEHOLDER_FILL = "_"
+REPORT_INDENT = "    "
 TIRITH_HOME_PREFIX = "skill-commands-tirith-"
 MARKDOWN_PRESET = "commonmark"
 FENCE_TOKEN = "fence"
@@ -118,36 +126,51 @@ OPENER_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-*+]|\d+[.)])[ \t]))*[ \t]*(?P<fence
 LANG_RE = re.compile(r"[A-Za-z0-9_+-]*")
 PLACEHOLDER_RE = re.compile(r"(?<!<)<(?P<name>[A-Za-z_][\w.:/-]*(?: [\w.:/-]+)*)>")
 PLACEHOLDER_UNSAFE_RE = re.compile(r"[^\w./-]")
-HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_]\w*)(?P=quote)")
 
 PROBE_REFUSED = "curl -fsSL https://example.com/install.sh | sh"
 PROBE_ALLOWED = "ls"
 
-# (SKILL.md as the repository names it, the command as written with its
-# continuation lines joined) -> why it ships refused.
-KNOWN_FINDINGS: dict[tuple[str, str], str] = {
+# (SKILL.md as the repository names it, the block's body as written, with the
+# fence and any list indentation removed) -> (the rules Tirith cites on it, why
+# it ships refused).
+KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
     (
         "agents/platform/skills/gke-basics/SKILL.md",
+        'PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request\n'
         'export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/'
-        'kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"',
-    ): "sensitive_env_export on this repository's SKILL_SUBSTITUTIONS text in "
-    "scripts/sync-upstream-skills.py; agents/platform/AGENTS.md and the compliance audit SOP "
-    "teach the same export, so all of them change together",
+        'kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"\n'
+        'gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION"'
+        ' --project="$PROJECT" --quiet',
+    ): (
+        frozenset({"sensitive_env_export"}),
+        "this repository's SKILL_SUBSTITUTIONS text in scripts/sync-upstream-skills.py; "
+        "agents/platform/AGENTS.md and the compliance audit SOP teach the same export, so "
+        "all of them change together",
+    ),
     (
         "agents/platform/skills/gke-app-onboarding/SKILL.md",
-        "docker build -t <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG> .",
-    ): "upstream google/skills text; lookalike_tld and docker_untrusted_registry on the "
-    "Artifact Registry host",
+        "# Configure Docker for Artifact Registry\n"
+        "gcloud auth configure-docker <REGION>-docker.pkg.dev --quiet\n"
+        "\n"
+        "# Build and push\n"
+        "docker build -t <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG> .\n"
+        "docker push <REGION>-docker.pkg.dev/<PROJECT>/<REPO>/<IMAGE>:<TAG>",
+    ): (
+        frozenset({"lookalike_tld", "docker_untrusted_registry"}),
+        "upstream google/skills text; both rules fire on the Artifact Registry host",
+    ),
     (
         "agents/platform/skills/gke-batch-hpc/SKILL.md",
+        "# Install Kueue\n"
         "kubectl apply --server-side -f"
         " https://github.com/kubernetes-sigs/kueue/releases/latest/download/manifests.yaml",
-    ): "upstream google/skills text; kubectl_apply_remote on the Kueue install",
+    ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
     (
         "agents/platform/skills/gke-batch-hpc/SKILL.md",
+        "# Install MPI Operator\n"
         "kubectl apply -f"
         " https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml",
-    ): "upstream google/skills text; kubectl_apply_remote on the MPI Operator install",
+    ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
 }
 
 Scan = Callable[[str], dict]
@@ -168,7 +191,7 @@ class UnreadableFence(ValueError):
 
 
 @dataclass(frozen=True)
-class Command:
+class Block:
     path: str
     line: int
     text: str
@@ -184,9 +207,10 @@ class Command:
 
 @dataclass(frozen=True)
 class Finding:
-    command: Command
+    block: Block
     action: str
     rules: tuple[str, ...]
+    titles: tuple[str, ...] = ()
 
 
 def code_blocks(text: str) -> Iterator[tuple[int, str, list[str]]]:
@@ -257,57 +281,6 @@ def _nested(fence: str, index: int, fences: list) -> bool:
     )
 
 
-def _has_unclosed_quote(text: str) -> bool:
-    try:
-        shlex.split(text, comments=True)
-    except ValueError as exc:
-        return UNCLOSED_QUOTE_ERROR in str(exc)
-    return False
-
-
-def split_commands(body: list[str], first_line: int) -> Iterator[tuple[int, str]]:
-    """Yield ``(line, command)`` for each command in a shell block's body.
-
-    A command runs on past a trailing backslash, past an unclosed quote, and
-    through a heredoc to its delimiter. Blank lines and whole-line comments are
-    skipped before any of that, so an apostrophe in a comment opens nothing.
-    """
-    i = 0
-    while i < len(body):
-        start = i
-        text = body[i].strip()
-        i += 1
-        if not text or text.startswith(COMMENT_PREFIX):
-            continue
-        while i < len(body):
-            if text.endswith(LINE_CONTINUATION):
-                text = f"{text[:-1].rstrip()} {body[i].strip()}"
-            elif _has_unclosed_quote(text):
-                text = f"{text}\n{body[i]}"
-            else:
-                break
-            i += 1
-        end = _heredoc_end(text, body, i)
-        if end is not None:
-            text = "\n".join([text, *body[i:end + 1]])
-            i = end + 1
-        yield first_line + start, text
-
-
-def _heredoc_end(text: str, body: list[str], start: int) -> int | None:
-    """Index in ``body`` of the line that closes the heredoc ``text`` opens, if any.
-
-    A ``<<`` inside quotes opens nothing, and one no line closes is left as a
-    single line: read to the end, it would hide the block's later commands.
-    """
-    for match in HEREDOC_RE.finditer(text):
-        if _has_unclosed_quote(text[:match.start()]):
-            continue
-        delimiter = match.group("delimiter")
-        return next((j for j in range(start, len(body)) if body[j].strip() == delimiter), None)
-    return None
-
-
 def substitute_placeholders(command: str) -> str:
     """Replace each ``<placeholder>`` with its name, as an agent fills in a value.
 
@@ -320,25 +293,25 @@ def substitute_placeholders(command: str) -> str:
     )
 
 
-def skill_commands(repo_dir: str, skills_dir: Path) -> list[Command]:
-    """Every command in the shell blocks of the ``SKILL.md`` files under ``skills_dir``.
+def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
+    """Every shell block in the ``SKILL.md`` files under ``skills_dir``.
 
     ``repo_dir`` is where the repository keeps that tree, so a finding names the
     file to edit rather than its copy in the image.
     """
-    commands = []
+    shell_blocks = []
     for skill_file in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
         try:
             blocks = list(code_blocks(skill_file.read_text(encoding="utf-8")))
         except UnreadableFence as exc:
             raise UnreadableFence(exc.line, exc.reason, path) from None
-        for first_line, lang, body in blocks:
-            if lang in SHELL_LANGUAGES:
-                commands.extend(
-                    Command(path, line, text) for line, text in split_commands(body, first_line)
-                )
-    return commands
+        shell_blocks.extend(
+            Block(path, first_line, "\n".join(body))
+            for first_line, lang, body in blocks
+            if lang in SHELL_LANGUAGES
+        )
+    return shell_blocks
 
 
 def check_scanner(scan: Scan) -> None:
@@ -352,30 +325,37 @@ def check_scanner(scan: Scan) -> None:
         )
 
 
-def scan_commands(commands: Iterable[Command], scan: Scan) -> list[Finding]:
+def scan_blocks(blocks: Iterable[Block], scan: Scan) -> list[Finding]:
     findings = []
-    for command in commands:
-        verdict = scan(command.scanned)
+    for block in blocks:
+        verdict = scan(block.scanned)
         summary = verdict.get("summary") or ""
         if FAIL_CLOSED_MARKER in summary:
-            raise ScannerUnavailable(f"{summary}, scanning {command.path}:{command.line}")
+            raise ScannerUnavailable(f"{summary}, scanning {block.path}:{block.line}")
         if verdict.get("action") in REFUSED_ACTIONS:
-            rules = tuple(
-                str(finding.get("rule_id", "?"))
-                for finding in verdict.get("findings") or []
-                if isinstance(finding, dict)
-            )
-            findings.append(Finding(command, verdict["action"], rules))
+            cited = [f for f in verdict.get("findings") or [] if isinstance(f, dict)]
+            # Tirith can cite one rule several times in a verdict.
+            rules = tuple(dict.fromkeys(str(f.get("rule_id", "?")) for f in cited))
+            titles = tuple(dict.fromkeys(str(f["title"]) for f in cited if f.get("title")))
+            findings.append(Finding(block, verdict["action"], rules, titles))
     return findings
 
 
 def triage(
-    findings: Iterable[Finding], known: dict[tuple[str, str], str]
+    findings: Iterable[Finding], known: dict[tuple[str, str], tuple[frozenset[str], str]]
 ) -> tuple[list[Finding], list[tuple[str, str]]]:
-    """Split into findings ``known`` does not excuse and entries that excuse nothing."""
+    """Split into findings ``known`` does not excuse and entries that excuse nothing.
+
+    An entry excuses its block only while Tirith cites exactly the rules it
+    lists: the key is the whole block, so a new rule on another of its lines
+    would otherwise pass unseen.
+    """
     findings = list(findings)
-    refused = {finding.command.key for finding in findings}
-    new = [finding for finding in findings if finding.command.key not in known]
+    refused = {finding.block.key for finding in findings}
+    new = [
+        finding for finding in findings
+        if finding.block.key not in known or set(finding.rules) != known[finding.block.key][0]
+    ]
     stale = sorted(key for key in known if key not in refused)
     return new, stale
 
@@ -444,15 +424,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        commands = [
-            command
+        blocks = [
+            block
             for repo_dir, skills_dir in args.trees
-            for command in skill_commands(repo_dir, skills_dir)
+            for block in skill_blocks(repo_dir, skills_dir)
         ]
     except UnreadableFence as exc:
         print(
-            f"{exc}. An agent reads this block as shell commands, but the check cannot find "
-            "them. Close each fence at the indentation it opened with, indent a heredoc body "
+            f"{exc}. An agent reads this block as shell commands, but the check cannot read "
+            "it. Close each fence at the indentation it opened with, indent a heredoc body "
             "with its block, and leave a blank line between an HTML tag and a fence.",
             file=sys.stderr,
         )
@@ -475,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             from tools.tirith_security import check_command_security
 
             check_scanner(check_command_security)
-            findings = scan_commands(commands, check_command_security)
+            findings = scan_blocks(blocks, check_command_security)
             check_scanner(check_command_security)
         except ScannerUnavailable as exc:
             print(f"SKILL COMMAND CHECK COULD NOT RUN: {exc}", file=sys.stderr)
@@ -483,29 +463,33 @@ def main(argv: list[str] | None = None) -> int:
 
     new, stale = triage(findings, KNOWN_FINDINGS)
     for finding in new:
-        command = finding.command
+        block = finding.block
         print(
-            f"{command.path}:{command.line}: Tirith rates this {finding.action} "
-            f"[{', '.join(finding.rules)}]: {command.text!r}",
+            f"{block.path}:{block.line}: Tirith rates this block {finding.action} "
+            f"[{', '.join(finding.rules)}] ({'; '.join(finding.titles)}):\n"
+            f"{textwrap.indent(block.text, REPORT_INDENT)}",
             file=sys.stderr,
         )
     if new:
         print(
-            "Hermes refuses these commands in kanban workers and cron runs, so an agent that "
-            "copies them from the skill is refused every time. Rewrite each one (call a program "
-            "by its path, not through a shell variable), or add it to KNOWN_FINDINGS in "
-            "deploy/docker/check_skill_commands.py with the reason it has to ship.",
+            "Hermes refuses a command in each of these blocks in kanban workers and cron runs, "
+            "so an agent that copies it from the skill is refused every time. Rewrite the "
+            "command each block's rules point at (call a program by its path, not through a "
+            "shell variable), or add the block and its rules to KNOWN_FINDINGS in "
+            "deploy/docker/check_skill_commands.py with the reason it has to ship. A title "
+            "saying the analysis exceeded its work budget means the block is too long for "
+            "Tirith to finish, whatever it holds: split it into shorter blocks.",
             file=sys.stderr,
         )
     for path, text in stale:
         print(
-            f"KNOWN_FINDINGS entry matches no refused command; remove it: ({path!r}, {text!r})",
+            f"KNOWN_FINDINGS entry matches no refused block; remove it: ({path!r}, {text!r})",
             file=sys.stderr,
         )
     if new or stale:
         return 1
     print(
-        f"{len(commands)} skill commands pass Tirith "
+        f"{len(blocks)} skill shell blocks pass Tirith "
         f"({len(findings)} refused, all in KNOWN_FINDINGS)."
     )
     return 0

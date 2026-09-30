@@ -1702,7 +1702,7 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # left. See the
 # module docstring for what a failure here means.
 #
-# check_skill_commands.py rides along the same way. It runs every shell command
+# check_skill_commands.py rides along the same way. It runs every shell block
 # the image's three skill trees teach through Hermes' Tirith scan, which is why
 # the Cluster Agent template is copied above this block rather than below it.
 # It downloads the Tirith release it pins; see its module docstring.

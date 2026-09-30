@@ -67,7 +67,8 @@ mcp>=2.2.0
 python-dotenv
 pyyaml
 
-# deploy/docker/check_skill_commands.py parses SKILL.md with markdown-it-py.
+# deploy/docker/check_skill_commands.py and tests/test_skill_inline_commands.py
+# parse SKILL.md with markdown-it-py.
 # The image build runs it under /opt/hermes/.venv, which gets the package from
 # hermes-agent through rich; nothing above pulls it in.
 markdown-it-py

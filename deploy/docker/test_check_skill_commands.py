@@ -29,10 +29,6 @@ sys.modules[_spec.name] = check
 _spec.loader.exec_module(check)
 
 
-def commands(body, first_line=1):
-    return list(check.split_commands(body.splitlines(), first_line))
-
-
 def verdict(action, *rules, summary=""):
     return {"action": action, "findings": [{"rule_id": r} for r in rules], "summary": summary}
 
@@ -115,37 +111,6 @@ class CodeBlocksTest(unittest.TestCase):
         )
 
 
-class SplitCommandsTest(unittest.TestCase):
-    def test_one_command_per_line_with_its_line_number(self):
-        self.assertEqual([(10, "ls"), (12, "pwd")], commands("ls\n\npwd", 10))
-
-    def test_comments_are_skipped(self):
-        self.assertEqual([(2, "ls")], commands("# list it\nls"))
-
-    def test_an_apostrophe_in_a_comment_opens_no_quote(self):
-        self.assertEqual([(2, "ls"), (3, "pwd")], commands("# don't\nls\npwd"))
-
-    def test_a_trailing_backslash_joins_with_one_space(self):
-        self.assertEqual([(1, "foo --a --b")], commands("foo \\\n  --a \\\n  --b"))
-
-    def test_an_unclosed_quote_runs_on_with_its_newline(self):
-        self.assertEqual([(1, "echo 'a\nb'"), (3, "ls")], commands("echo 'a\nb'\nls"))
-
-    def test_a_heredoc_runs_to_its_delimiter(self):
-        body = "cat <<'EOF' > f\nit's here\nEOF\nls"
-        self.assertEqual([(1, "cat <<'EOF' > f\nit's here\nEOF"), (4, "ls")], commands(body))
-
-    def test_a_here_string_is_not_a_heredoc(self):
-        self.assertEqual([(1, "cmd <<< word"), (2, "$G add f")], commands("cmd <<< word\n$G add f"))
-
-    def test_a_quoted_heredoc_marker_is_not_a_heredoc(self):
-        body = "grep -F '<<EOF' notes\nls\nEOF"
-        self.assertEqual([(1, "grep -F '<<EOF' notes"), (2, "ls"), (3, "EOF")], commands(body))
-
-    def test_a_heredoc_no_line_closes_is_one_line(self):
-        self.assertEqual([(1, "cat <<EOF"), (2, "ls"), (3, "pwd")], commands("cat <<EOF\nls\npwd"))
-
-
 class SubstitutePlaceholdersTest(unittest.TestCase):
     def test_a_placeholder_becomes_its_name(self):
         self.assertEqual("gh --repo owner/repo", check.substitute_placeholders("gh --repo <owner>/<repo>"))
@@ -161,7 +126,7 @@ class SubstitutePlaceholdersTest(unittest.TestCase):
             self.assertEqual(text, check.substitute_placeholders(text))
 
 
-class SkillCommandsTest(unittest.TestCase):
+class SkillBlocksTest(unittest.TestCase):
     def test_only_shell_blocks_and_findings_name_the_repository_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             skill = Path(tmp) / "demo" / "SKILL.md"
@@ -170,14 +135,23 @@ class SkillCommandsTest(unittest.TestCase):
                 "```bash\nls\n```\n```yaml\nkey: value\n```\n```\ntool_call()\n```\n```zsh\npwd\n```\n"
             )
             (Path(tmp) / "demo" / "README.md").write_text("```bash\nrm -rf /\n```\n")
-            got = check.skill_commands("agents/platform/skills", Path(tmp))
+            got = check.skill_blocks("agents/platform/skills", Path(tmp))
         self.assertEqual(
             [
-                check.Command("agents/platform/skills/demo/SKILL.md", 2, "ls"),
-                check.Command("agents/platform/skills/demo/SKILL.md", 11, "pwd"),
+                check.Block("agents/platform/skills/demo/SKILL.md", 2, "ls"),
+                check.Block("agents/platform/skills/demo/SKILL.md", 11, "pwd"),
             ],
             got,
         )
+
+    def test_a_block_is_scanned_whole(self):
+        body = "# apply it\nfoo \\\n  --bar\ncat > cm.yaml <<'END-OF-FILE'\ndescription: don't\nEND-OF-FILE\n$G add cm.yaml"
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text(f"```bash\n{body}\n```\n")
+            got = check.skill_blocks("agents/platform/skills", Path(tmp))
+        self.assertEqual([check.Block("agents/platform/skills/demo/SKILL.md", 2, body)], got)
 
     def test_an_unreadable_fence_names_the_repository_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,20 +159,20 @@ class SkillCommandsTest(unittest.TestCase):
             skill.parent.mkdir()
             skill.write_text("intro\n```bash\nls\n")
             with self.assertRaises(check.UnreadableFence) as caught:
-                check.skill_commands("agents/platform/skills", Path(tmp))
+                check.skill_blocks("agents/platform/skills", Path(tmp))
         self.assertEqual("agents/platform/skills/demo/SKILL.md", caught.exception.path)
         self.assertEqual(2, caught.exception.line)
 
 
 class ScanTest(unittest.TestCase):
-    ALLOW = check.Command("s/SKILL.md", 1, "ls <dir>")
-    WARN = check.Command("s/SKILL.md", 2, "export KUBECONFIG=x")
-    BLOCK = check.Command("s/SKILL.md", 3, "$G add f")
+    ALLOW = check.Block("s/SKILL.md", 1, "ls <dir>\ncd <dir>")
+    WARN = check.Block("s/SKILL.md", 4, "export KUBECONFIG=x")
+    BLOCK = check.Block("s/SKILL.md", 7, "$G add f")
 
     def test_block_and_warn_are_findings_and_allow_is_not(self):
-        verdicts = {"ls dir": verdict("allow"), "export KUBECONFIG=x": verdict("warn", "sensitive_env_export"),
-                    "$G add f": verdict("block", "analysis_incomplete")}
-        findings = check.scan_commands([self.ALLOW, self.WARN, self.BLOCK], verdicts.__getitem__)
+        verdicts = {"ls dir\ncd dir": verdict("allow"), "export KUBECONFIG=x": verdict("warn", "sensitive_env_export"),
+                    "$G add f": verdict("block", "analysis_incomplete", "analysis_incomplete")}
+        findings = check.scan_blocks([self.ALLOW, self.WARN, self.BLOCK], verdicts.__getitem__)
         self.assertEqual(
             [
                 check.Finding(self.WARN, "warn", ("sensitive_env_export",)),
@@ -207,15 +181,26 @@ class ScanTest(unittest.TestCase):
             findings,
         )
 
+    def test_a_finding_carries_each_title_once(self):
+        budget = "Command analysis exceeded its work budget"
+        cited = {"action": "block", "summary": "", "findings": [
+            {"rule_id": "analysis_incomplete", "title": budget},
+            {"rule_id": "analysis_incomplete", "title": budget},
+            {"rule_id": "analysis_incomplete"},
+        ]}
+        [finding] = check.scan_blocks([self.BLOCK], lambda text: cited)
+        self.assertEqual(("analysis_incomplete",), finding.rules)
+        self.assertEqual((budget,), finding.titles)
+
     def test_the_scanner_sees_placeholders_filled(self):
         seen = []
-        check.scan_commands([self.ALLOW], lambda text: seen.append(text) or verdict("allow"))
-        self.assertEqual(["ls dir"], seen)
+        check.scan_blocks([self.ALLOW], lambda text: seen.append(text) or verdict("allow"))
+        self.assertEqual(["ls dir\ncd dir"], seen)
 
     def test_a_fail_closed_verdict_stops_the_scan(self):
         failed = verdict("block", summary="tirith spawn failed (fail-closed)")
         with self.assertRaises(check.ScannerUnavailable):
-            check.scan_commands([self.ALLOW], lambda text: failed)
+            check.scan_blocks([self.ALLOW], lambda text: failed)
 
     def test_the_probes_need_a_block_and_an_allow(self):
         working = {check.PROBE_REFUSED: verdict("block"), check.PROBE_ALLOWED: verdict("allow")}
@@ -227,26 +212,34 @@ class ScanTest(unittest.TestCase):
 
 class TriageTest(unittest.TestCase):
     def test_known_findings_pass_and_unmatched_entries_are_stale(self):
-        known_cmd = check.Command("a/SKILL.md", 1, "known")
-        new_cmd = check.Command("a/SKILL.md", 2, "new")
-        findings = [check.Finding(known_cmd, "warn", ()), check.Finding(new_cmd, "block", ())]
-        known = {known_cmd.key: "reason", ("a/SKILL.md", "gone"): "reason"}
+        known_block = check.Block("a/SKILL.md", 1, "known")
+        new_block = check.Block("a/SKILL.md", 4, "known\nnew")
+        findings = [check.Finding(known_block, "warn", ("r",)), check.Finding(new_block, "block", ("r",))]
+        known = {known_block.key: (frozenset({"r"}), "reason"), ("a/SKILL.md", "gone"): (frozenset({"r"}), "reason")}
         new, stale = check.triage(findings, known)
         self.assertEqual([findings[1]], new)
         self.assertEqual([("a/SKILL.md", "gone")], stale)
 
+    def test_a_known_block_citing_another_rule_is_new(self):
+        block = check.Block("a/SKILL.md", 1, "known")
+        finding = check.Finding(block, "block", ("r", "added"))
+        new, stale = check.triage([finding], {block.key: (frozenset({"r"}), "reason")})
+        self.assertEqual([finding], new)
+        self.assertEqual([], stale)
+
 
 class KnownFindingsTest(unittest.TestCase):
-    def test_every_entry_names_a_command_the_repository_ships(self):
+    def test_every_entry_names_a_block_the_repository_ships(self):
         for path, text in check.KNOWN_FINDINGS:
             skill = REPO_ROOT / path
             tree = skill.parents[1]
             repo_dir = tree.relative_to(REPO_ROOT).as_posix()
-            shipped = {c.text for c in check.skill_commands(repo_dir, tree) if c.path == path}
+            shipped = {b.text for b in check.skill_blocks(repo_dir, tree) if b.path == path}
             self.assertIn(text, shipped, path)
 
-    def test_every_entry_has_a_reason(self):
-        for key, reason in check.KNOWN_FINDINGS.items():
+    def test_every_entry_has_rules_and_a_reason(self):
+        for key, (rules, reason) in check.KNOWN_FINDINGS.items():
+            self.assertTrue(rules, key)
             self.assertTrue(reason.strip(), key)
 
 

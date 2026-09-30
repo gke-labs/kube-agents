@@ -3,8 +3,8 @@
 
 The platform image build runs the shell blocks of every synced SKILL.md through
 deploy/docker/check_skill_commands.py, so a sync that brings in a command Tirith
-refuses, or rewrites one listed in its KNOWN_FINDINGS, fails that build until the
-list is updated. So does a shell block whose Markdown does not parse as one; that
+refuses, or changes any line of a block listed in its KNOWN_FINDINGS, comments
+included, fails that build until the list is updated. So does a shell block whose Markdown does not parse as one; that
 fix goes in SKILL_SUBSTITUTIONS below.
 """
 
