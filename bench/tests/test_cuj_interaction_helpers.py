@@ -108,6 +108,11 @@ def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
         "checking why the rollout failed.",
         "reviewing the failed rollout in prod-a.",
         "checking the seeded fleet.",
+        "reviewing failed rollouts in prod-a.",
+        "looking for orphaned disks.",
+        "checking evicted pods on node-3.",
+        "auditing unused node pools.",
+        "checking pinned versions across the fleet.",
     ):
         assert substantive_output({"output": ack}) == "", ack
         assert substantive_output({"output": f"{ack}\n\n{REPORT}"}) == REPORT, ack
@@ -137,6 +142,19 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "looking very good.",
         "autoscaling kicked in at 14:02.",
         "looking at the events, nothing stands out.",
+        "restarting the pod took 3 minutes.",
+        "scaling up brought it back.",
+        "restarting won't help.",
+        "restarting won\u2019t help.",
+        "checking the logs gave nothing.",
+        "rolling back will fix it.",
+        "staging cluster has 3 nodes.",
+        "warning events on checkout-gateway.",
+        "running normally.",
+        "running smoothly.",
+        "Running 3 replicas in prod-a.",
+        "provisioning failed again.",
+        "scaling completed successfully.",
     ):
         assert substantive_output({"output": report}) == report, report
 

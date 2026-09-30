@@ -26,23 +26,31 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #: The template fixes the lowercase and the period but not the verb, the
 #: length of the target, or whether it is a link, and a model drifts on all of
 #: them, so ``_is_progress_ack`` matches the shape rather than the words: one
-#: line opening with an ``-ing`` verb in either case, then a target of up to
-#: ``_ACK_MAX_TARGET_WORDS`` words, with or without a closing period or
-#: ellipsis. What keeps an answer from matching is what an answer carries and
-#: a target does not:
+#: line opening with a hand-off verb from ``_ACK_VERBS`` in either case, then
+#: a target of up to ``_ACK_MAX_TARGET_WORDS`` words, with or without a
+#: closing period or ellipsis. A line opening with any other word is an
+#: answer ("staging cluster has 3 nodes.", "running normally."). Past the
+#: verb, what keeps an answer from matching is what an answer carries and a
+#: target does not:
 #:
-#: - before any clause opener, a verdict ("looking very good."), a finding
-#:   verb ("checking the events shows the pod was evicted.") or a past tense
-#:   that no determiner turns into an adjective ("restarting the pod cleared
-#:   it.", while "reviewing the failed rollout." is a hand-off); after a
-#:   clause opener all three are part of the target ("checking why the
-#:   rollout failed.");
+#: - before any clause opener, a verdict ("looking very good."), a finite
+#:   verb from ``_ACK_FINDING_VERBS`` ("restarting the pod took 3 minutes.")
+#:   or a past tense ("restarting the pod cleared it."); after a clause
+#:   opener all three are part of the target ("checking why the rollout
+#:   failed.");
+#: - an ``-ed`` word is read as an adjective in the target, not a past tense,
+#:   after a determiner or preposition ("reviewing the failed rollout.",
+#:   "looking for orphaned disks.") or straight after the verb when a noun
+#:   follows it ("reviewing failed rollouts in prod-a.", while "provisioning
+#:   failed again." is an answer);
 #: - a label and a value, bold or not: "Running pods: 12.";
 #: - a clause after a comma, opening with a subject or a number or carrying a
 #:   past tense: "looking at the events, nothing stands out." (a
-#:   comma-separated list of targets is still a hand-off);
-#: - an opening that is a noun or adjective, not a verb: "nothing is
-#:   restarting.", "Missing quota in us-central1."
+#:   comma-separated list of targets is still a hand-off).
+#:
+#: It is a heuristic over free text: an answer that opens with a hand-off
+#: verb and carries none of these (an unlisted irregular verb, say) is still
+#: read as a hand-off.
 #:
 #: ``_DELEGATION_ACK`` is the receipt that template replaced, still sent by an
 #: install on an older image:
@@ -70,13 +78,20 @@ _DELEGATION_ACK = re.compile(
 #: The most words a hand-off's target runs to after its verb. "scaling
 #: checkout-gateway down to two replicas in prod-a." is seven.
 _ACK_MAX_TARGET_WORDS = 12
-_ACK_VERB = re.compile(r"[^\W\d_]{2,}ing", re.IGNORECASE)
-#: Words ending in "ing" that open an answer rather than a hand-off.
-_ACK_NOT_VERBS = frozenset(
+#: Verbs a hand-off opens with. A closed list rather than any "-ing" word:
+#: "staging", "warning" and "running" open answers as often as hand-offs.
+_ACK_VERBS = frozenset(
     {
-        "nothing", "everything", "something", "anything", "during", "missing",
-        "pending", "existing", "remaining", "following", "outstanding",
-        "interesting", "matching",
+        "checking", "looking", "reviewing", "auditing", "investigating",
+        "inspecting", "examining", "verifying", "diagnosing", "tracing",
+        "querying", "searching", "comparing", "analyzing", "analysing",
+        "provisioning", "scaling", "creating", "deploying", "upgrading",
+        "updating", "patching", "applying", "installing", "removing",
+        "deleting", "migrating", "resizing", "restarting", "draining",
+        "cordoning", "rolling", "drafting", "planning", "designing", "pulling",
+        "fetching", "gathering", "reading", "testing", "validating",
+        "confirming", "evaluating", "measuring", "profiling", "estimating",
+        "sizing", "digging", "triaging",
     }
 )
 _ACK_VERDICTS = frozenset(
@@ -85,12 +100,18 @@ _ACK_VERDICTS = frozenset(
         "worse", "normal", "clean",
     }
 )
+#: Finite verbs and auxiliaries an answer's clause carries and a target does
+#: not.
 _ACK_FINDING_VERBS = frozenset(
     {
         "is", "isn't", "was", "wasn't", "are", "aren't", "were", "weren't", "shows",
         "showed", "shown", "found", "finds", "reveals", "revealed", "confirms",
         "confirmed", "indicates", "indicated", "returned", "returns", "says",
-        "said", "looks", "seems", "appears",
+        "said", "looks", "seems", "appears", "has", "hasn't", "have", "haven't",
+        "had", "will", "won't", "can", "can't", "cannot", "could", "couldn't",
+        "should", "would", "did", "didn't", "does", "doesn't", "gave", "gives",
+        "got", "gets", "took", "takes", "brought", "brings", "went", "came",
+        "made", "helps",
     }
 )
 _ACK_CLAUSE_OPENERS = frozenset(
@@ -100,10 +121,21 @@ _ACK_CLAUSE_OPENERS = frozenset(
     }
 )
 #: Words that make a following "-ed" word an adjective in the target.
-_ACK_DETERMINERS = frozenset(
+_ACK_ADJECTIVE_CUES = frozenset(
     {
         "the", "a", "an", "this", "that", "these", "those", "my", "your", "its",
-        "their", "our", "each", "every", "all", "any", "some", "no",
+        "their", "our", "each", "every", "all", "any", "some", "no", "for", "of",
+        "on", "in", "across", "with", "without", "from", "into", "over", "under",
+        "about", "around", "between", "among", "per", "to", "at", "by",
+    }
+)
+#: Words that follow a finite past tense but not an adjective, so an "-ed"
+#: word straight after the verb and before one of these is a past tense.
+_ACK_AFTER_FINITE = frozenset(
+    {
+        "on", "in", "at", "for", "with", "after", "because", "due", "to", "from",
+        "again", "twice", "overnight", "earlier", "today", "yesterday",
+        "successfully", "cleanly", "back", "up", "down", "out", "and", "but",
     }
 )
 #: Words that open a clause after a comma, where a list would name a target.
@@ -116,6 +148,7 @@ _ACK_CLAUSE_SUBJECTS = frozenset(
 _ACK_CLOSING = re.compile(r"(?:\.{1,3}|…)\Z")
 _ACK_WORD_WRAPPING = "*_`[]()\"'"
 _ACK_PAST_TENSE = "ed"
+_ACK_CURLY_APOSTROPHE = "\u2019"
 
 
 @dataclass(frozen=True)
@@ -245,6 +278,15 @@ def tool_operations(
     ]
 
 
+def _is_adjective(bare: list[str], index: int) -> bool:
+    """Whether the "-ed" word at ``index`` modifies a noun in the target."""
+
+    if bare[index - 1] in _ACK_ADJECTIVE_CUES:
+        return True
+    following = bare[index + 1] if index + 1 < len(bare) else ""
+    return index == 1 and bool(following) and following not in _ACK_AFTER_FINITE
+
+
 def _is_progress_ack(sentence: str) -> bool:
     """Whether ``sentence`` is the one-line hand-off, per the comment on
     ``_DELEGATION_ACK``."""
@@ -256,17 +298,23 @@ def _is_progress_ack(sentence: str) -> bool:
     words = body.split()
     if not 2 <= len(words) <= _ACK_MAX_TARGET_WORDS + 1:
         return False
-    bare = [word.strip(_ACK_WORD_WRAPPING).rstrip(",").casefold() for word in words]
-    if not _ACK_VERB.fullmatch(bare[0]) or bare[0] in _ACK_NOT_VERBS:
+    bare = [
+        word.replace(_ACK_CURLY_APOSTROPHE, "'")
+        .strip(_ACK_WORD_WRAPPING)
+        .rstrip(",")
+        .casefold()
+        for word in words
+    ]
+    if bare[0] not in _ACK_VERBS:
         return False
     if any(";" in word or word.endswith(":") for word in bare):
         return False
-    for previous, word in zip(bare, bare[1:]):
+    for index, word in enumerate(bare[1:], start=1):
         if word in _ACK_CLAUSE_OPENERS:
             break
         if word in _ACK_VERDICTS or word in _ACK_FINDING_VERBS:
             return False
-        if word.endswith(_ACK_PAST_TENSE) and previous not in _ACK_DETERMINERS:
+        if word.endswith(_ACK_PAST_TENSE) and not _is_adjective(bare, index):
             return False
     if "," in body:
         after = [
