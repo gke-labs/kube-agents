@@ -1582,7 +1582,11 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         for label, body in accepted.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
                 run.side_effect = [_ok(self._contents(body))]
-                self.assertTrue(checker.check_gitops_declaration("kube-agents-evals-3").passed, label)
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertTrue(result.passed, label)
+                # Not the unverified branch: a parser exception on this shape
+                # would also pass, with a warning.
+                self.assertEqual([], result.warnings, label)
 
     def test_a_parser_that_cannot_run_leaves_the_check_unverified(self):
         # No PyYAML, or the audit script missing from the tree: a fact about

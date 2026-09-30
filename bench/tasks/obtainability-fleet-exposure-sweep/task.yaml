@@ -4,9 +4,9 @@
 # presubmit runs the blocking roster only (#1023) and this case was never
 # admitted (491/679 graded presubmit repetitions 2026-09-15 to 09-22), so
 # it earns its roster seat on the nightly record now.
-# Grades what nothing active grades: fleet-wide DISCOVERY. Every case that
-# grades checkout-gateway's missing budget names it in its prompt; this one
-# does not —
+# Grades what nothing active grades: fleet-wide DISCOVERY. The located cases
+# that grade checkout-gateway's missing budget name it in their prompts, and
+# obtainability-planted-pdb runs the whole SOP; this one names nothing —
 # the agent has to sweep the seeded namespaces across the clusters it
 # manages and find the exposed workload itself. The prompt states that an
 # exposed workload exists (the same information the located prompts leak by
@@ -49,8 +49,8 @@ name: Reliability sweep discovers the unbudgeted workload without being told its
 # replicated workloads, and its declared-intent step (§4a) removes a posture
 # the linked repository declares on purpose, which together make
 # checkout-gateway the unique answer to the question as asked. A cluster
-# read alone shows two candidates; the prompt says so and tells the agent to
-# consult the repositories, as the SOP does.
+# read alone shows two candidates, so the prompt tells the agent to consult
+# the repositories for declared intent, as the SOP does.
 prompt: >-
   Somewhere in the fleet's seeded namespaces there is a replicated,
   multi-replica workload that nothing protects from voluntary disruption —

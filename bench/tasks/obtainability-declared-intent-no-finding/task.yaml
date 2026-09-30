@@ -15,8 +15,8 @@
 #   1. The fixture. notification-relay in seeded-intent (role
 #      declared-no-pdb-workload, bench/tf/fleet/fixtures.json): two replicas,
 #      no budget. A workload of its own because checkout-gateway's missing
-#      budget is the defect five active cases grade, and a declaration for
-#      it would silence all five.
+#      budget is the defect the other PDB cases grade, and a declaration for
+#      it would silence every one of them.
 #   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
 #      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
 #      frontmatter carries {check: no-pdb, namespace: seeded-intent, object:

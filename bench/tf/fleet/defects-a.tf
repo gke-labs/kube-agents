@@ -129,7 +129,7 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
 
 # Declared posture (reliability): two replicas, no PodDisruptionBudget, in a
 # namespace of its own. The same shape as checkout-gateway above, planted so
-# that a repository declaration can cover it without touching the five cases
+# that a repository declaration can cover it without touching the cases
 # that grade checkout-gateway's missing budget: the obtainability SOP's
 # declared-intent step (4a) lists a declared posture under the ledger's
 # Declared intent section instead of as a finding, and

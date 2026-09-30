@@ -941,7 +941,7 @@ def _mapping_row_present(text: str, project_id: str) -> bool:
     body = _mapping_function_body(text)
     if body is None:
         return False
-    expected_repo = f"gke-agentic/{project_id}-infra"
+    expected_repo = _gitops_repo_slug(project_id)
     pattern = (
         rf"^[ \t]*{re.escape(project_id)}\)\s*echo\s+"
         rf"([\"']){re.escape(expected_repo)}\1|"
@@ -1066,7 +1066,7 @@ def check_codebase_mapping(project_id: str) -> CheckResult:
     if _mapping_function_body(text) is None:
         return CheckResult("Codebase GitOps Mapping", False, "Could not find gitops_repo_for_project() in hack/ci-deploy.sh")
 
-    expected_repo = f"gke-agentic/{project_id}-infra"
+    expected_repo = _gitops_repo_slug(project_id)
     if not _mapping_row_present(text, project_id):
         return CheckResult(
             "Codebase GitOps Mapping",
@@ -2323,6 +2323,11 @@ def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
     )
 
 
+def _gitops_repo_slug(project_id: str) -> str:
+    """The GitOps repository a pool project owns, `gke-agentic/<project>-infra`, as hack/ci-deploy.sh maps it."""
+    return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
+
+
 def _load_audit_report():
     """The fleet-audit script as a module, for its `parse_declarations` and join key."""
     import importlib.util
@@ -2390,7 +2395,10 @@ def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
             f"its only matching declaration(s) name cluster {', '.join(clusters)}, so the audit joins them to "
             "that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
         )
-    return "no declares item is check no-pdb for Deployment/notification-relay in seeded-intent"
+    return (
+        f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
+        f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']}"
+    )
 
 
 def check_gitops_declaration(project_id: str) -> CheckResult:
@@ -2402,12 +2410,13 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     and held to the audit parser's rules, not just the path. A 404 names both
     of its readings, because gh answers it for a private repository this token
     cannot see as well as for a file that is not there; any other non-zero
-    exit goes through `_record_unreadable`, as every read in this script does,
-    so a refusal or a transient leaves the check unverified and anything else
+    exit goes through `_record_unreadable`, as the reads that classify their
+    failures do (the repository check above deliberately does not, and says
+    why), so a refusal or a transient leaves the check unverified and anything else
     (a 409 on a repository with no commits, a 422) fails it.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
-    repo_slug = f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
+    repo_slug = _gitops_repo_slug(project_id)
     details: List[str] = []
     warnings: List[str] = []
     rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
@@ -2469,7 +2478,7 @@ def check_github_repo_and_app(
     warnings: List[str] = []
     passed = True
     attested = False
-    repo_slug = f"gke-agentic/{project_id}-infra"
+    repo_slug = _gitops_repo_slug(project_id)
 
     # Deliberately not routed through _record_unreadable. GitHub answers 404 for
     # a repository that does not exist and 404 for one the token cannot see, so
@@ -2793,7 +2802,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     pass.
     """
     name = "Ledger Read Credential"
-    repo_slug = f"gke-agentic/{project_id}-infra"
+    repo_slug = _gitops_repo_slug(project_id)
 
     pem, reason = _read_ledger_app_key()
     if pem is None:

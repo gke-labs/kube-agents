@@ -4228,6 +4228,11 @@ def search_tree(
 def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
     """The tuple a declaration and a finding are joined on: the finding id's segments.
 
+    Also called by scripts/verify_ci_pool_project.py (`_note_declaration_problem`),
+    which loads this module by path to read a pool repository's declared-intent
+    note exactly as the audit would; renaming this or `parse_declarations`
+    turns that check into "Not checked" pool-wide until it follows.
+
     Each field goes through `_id_segment`, the reduction `derive_finding_id`
     applies, because the ledger's identity is the standard the join has to
     meet: it lowers, trims and squeezes every run outside `[a-z0-9]` to one
