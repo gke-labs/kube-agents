@@ -36,6 +36,7 @@ class TaskStatusTest(unittest.TestCase):
         self.assertEqual(s.task_status("heartbeat"), "in_progress")
         self.assertEqual(s.task_status("completed"), "complete")
         self.assertEqual(s.task_status("blocked"), "pending")
+        self.assertEqual(s.task_status("unblocked"), "in_progress")
         self.assertEqual(s.task_status("gave_up"), "error")
         self.assertIsNone(s.task_status("archived"))
 

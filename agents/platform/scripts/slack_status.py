@@ -38,8 +38,10 @@ SESSION_CLOSED = "closed"
 SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLOSED})
 
 #: ``agents.sessions.rename`` limits, and what each refused character becomes.
+#: A slash becomes the division slash (U+2215), which reads the same, so
+#: ``kube-system/coredns`` stays one name rather than two alternatives.
 TITLE_MAX = 80
-TITLE_REPLACEMENTS = ((":", ","), ("·", ","), ("/", " or "))
+TITLE_REPLACEMENTS = ((":", ","), ("·", ","), ("/", "\u2215"))
 ELLIPSIS = "…"
 
 #: Slack markup in an ask: a user or channel mention, and a link with or
@@ -61,12 +63,14 @@ TASK_ERROR = "error"
 TASK_STATUSES = frozenset({TASK_PENDING, TASK_RUNNING, TASK_COMPLETE, TASK_ERROR})
 
 #: Kanban notifier kinds, by the row status each leaves. A kind not listed
-#: (``archived``, ``unblocked``) leaves the row as it was.
+#: leaves the row as it was; ``archived`` is one, and the runtime drops an
+#: archived card's row instead (``gateway/slack_ux_status.py``).
 TASK_STATUS_BY_KIND = {
     "heartbeat": TASK_RUNNING,
     "status": TASK_RUNNING,
     "completed": TASK_COMPLETE,
     "blocked": TASK_PENDING,
+    "unblocked": TASK_RUNNING,
     "review_requested": TASK_PENDING,
     "changes_requested": TASK_PENDING,
     "crashed": TASK_ERROR,

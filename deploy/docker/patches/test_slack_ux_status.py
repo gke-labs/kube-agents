@@ -525,8 +525,50 @@ class PlanTest(_RuntimeCase):
     def test_a_kind_that_moves_nothing_leaves_the_row(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
-        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        _run(runtime.settle_row(adapter, _sub(), "commented"))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
+
+    def test_an_unblocked_card_runs_again(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        self.assertEqual([t["status"] for t in tasks], ["in_progress"])
+
+    def test_an_archived_card_leaves_the_plan(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs", task="t_a")
+        self._note(adapter, 1, "reading metrics", task="t_b")
+        _run(runtime.settle_row(adapter, _sub("t_a"), "archived"))
+        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        self.assertEqual([t["task_id"] for t in tasks], ["t_b"])
+        _run(runtime.settle_row(adapter, _sub("t_b"), "completed"))
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_archiving_the_last_running_card_closes_the_session(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        updates = len([n for n, _v in adapter.calls if n == "update"])
+        _run(runtime.settle_row(adapter, _sub(), "archived"))
+        # The last rendering stays; there is no empty plan to show.
+        self.assertEqual(len([n for n, _v in adapter.calls if n == "update"]), updates)
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_the_plan_and_the_turn_share_the_session_entry(self):
+        # The subscription carries no team; the Planning Agent's turn does.
+        adapter = _Adapter()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+        # A woken turn starts within the minute; Working… must come back.
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
 
     def test_a_planning_turn_ending_leaves_working_while_rows_run(self):
         # The Planning Agent's turn ends with a clear while its cards still run.

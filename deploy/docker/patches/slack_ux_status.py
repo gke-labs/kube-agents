@@ -34,7 +34,8 @@ notes into one message per card. With the flag on, a Slack thread instead gets
 one message holding a plan with a row per card, edited in place with
 ``chat.update`` as notes arrive. A heartbeat creates a card's row; a terminal
 event settles an existing row (``complete``, ``error``, or ``pending`` for a
-card waiting on the user) and never creates one, so a card that finished
+card waiting on the user; ``unblocked`` sets it running again; ``archived``
+removes it) and never creates one, so a card that finished
 without a note adds no plan above its report. The plan holds the thread's
 session status: ``processing`` while a row runs, ``suspended`` while rows wait
 on the user and none runs, and a Planning Agent turn ending in the thread does
@@ -84,13 +85,17 @@ PLATFORM = "slack"
 SESSION_REFRESH_SECONDS = 60.0
 
 #: How long a plan with no new note or settled row keeps a Planning Agent
-#: turn's clear from closing the session. A card archived mid-run leaves its
-#: row running for good; this stops that row holding Working… forever, while
+#: turn's clear from closing the session. A card whose terminal event never
+#: reaches the thread (a restart, a dropped subscription) leaves its row
+#: running for good; this stops that row holding Working… forever, while
 #: covering a card's silent stretches, since noteless heartbeats reach no one.
 PLAN_HOLD_SECONDS = 1800.0
 
 #: ``fail_label`` for the adapter's status setter when the plan sets it.
 PLAN_STATUS_LABEL = "plan"
+
+#: The notifier kind for a card archived by hand: its row leaves the plan.
+ARCHIVED_KIND = "archived"
 
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
@@ -127,7 +132,9 @@ class _Plan:
         self.touched = time.monotonic()
 
 
-#: ``(team, channel, thread) -> (status sent, when)``.
+#: ``(channel, thread) -> (status sent, when)``. No team: a kanban
+#: subscription carries none, so the plan's sends and the Planning Agent's
+#: turn must share one entry or each skips a change the other made.
 _sessions: OrderedDict[tuple, tuple] = OrderedDict()
 #: ``(channel, thread) -> the ask's words``, waiting for the session to open.
 _asks: OrderedDict[tuple, str] = OrderedDict()
@@ -192,7 +199,7 @@ async def set_thread_status(
     if wanted == _status.SESSION_CLOSED:
         # A Planning Agent turn ends with a clear; the thread's plan outlives it.
         wanted = _plan_session(str(chat_id), str(thread_ts)) or wanted
-    key = (str(team_id or ""), str(chat_id), str(thread_ts))
+    key = (str(chat_id), str(thread_ts))
     sent = _sessions.get(key)
     now = time.monotonic()
     if sent and sent[0] == wanted and (
@@ -346,13 +353,18 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
     """Settle the card's row after a terminal event, if the thread's plan has one."""
     key = _thread(sub)
     plan = _plans.get(key)
-    row = plan.rows.get(str(sub.get("task_id") or "")) if plan else None
+    card = str(sub.get("task_id") or "")
+    row = plan.rows.get(card) if plan else None
     status = _status.task_status(kind)
-    if row is None or status is None:
+    if row is None or (status is None and kind != ARCHIVED_KIND):
         return
-    row.status = status
+    if status is None:
+        # Archived by hand: nothing will settle the row, so it leaves the plan.
+        del plan.rows[card]
+    else:
+        row.status = status
     plan.touched = time.monotonic()
-    if plan.ts and not plan.fallback:
+    if plan.ts and not plan.fallback and plan.rows:
         await _render(adapter, key, plan)
     # A plan that fell back is still forgotten once its rows settle, so the
     # thread's next card tries a plan again.
