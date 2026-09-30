@@ -69,6 +69,19 @@ the investigation already happened and the turn only presents. The three pieces
 that make an alert answerable — a thread, a session bound to it, and the report
 stored against that thread — are reused unchanged.
 
+With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
+headline in place of the composed message (`slack_audit_report.py`, called from
+`relay_cron_report`). The headline reads the finding and critical counts and the
+top two findings from the report's ledger issue, if that issue is open, labelled
+`agent:audit`, and in a managed repository. Below them go the relayed line, which
+alone carries coverage, resolved counts and remediation pull requests, and the
+ledger link. When the issue cannot be read, is closed (a clean run closes it
+without rewriting its title) or does not parse, the leg posts the relayed line in
+bold with the link. A report longer than one line is also posted in full into the
+headline's thread, and the incident row stores the full report either way, so a
+reply in the thread is answered with the whole report. Google Chat, and every
+report with the flag off, gets the composed message unchanged.
+
 ## Why the Chat Agent composes but does not send
 
 The Chat Agent cannot post to a chat platform out of band. Its toolset is

@@ -3349,6 +3349,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
     ISSUE = {
         "title": "[audit] Security & RBAC Posture Audit — 7 findings (2 critical)",
         "body": "### Critical (2)\n\n#### cluster-admin bound to default <!-- finding:rbac-1 -->\n",
+        "state": "open",
+        "labels": ["agent:audit"],
     }
 
     def setUp(self):
@@ -3424,6 +3426,8 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit: 7 findings, 2 critical.**"))
         self.assertIn(f"[Ledger issue #231 ↗]({self.LEDGER})", calls[0].args[1])
+        # The relayed line stays in the channel: coverage and resolved counts are only there.
+        self.assertEqual(calls[0].args[1].splitlines()[1], self.ONE_LINE.rsplit(" — ", 1)[0])
         self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.ONE_LINE)])
 
     def test_flag_on_an_unreadable_ledger_falls_back_to_the_line_and_its_link(self):
@@ -3445,6 +3449,13 @@ class TestSlackAuditHeadline(unittest.TestCase):
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, issue={"title": "something else", "body": ""})
         self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
+
+    def test_flag_on_a_closed_ledger_falls_back_to_the_line(self):
+        # A clean run closes the ledger without rewriting its title.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.ONE_LINE, issue=dict(self.ISSUE, state="closed"))
+        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
+        self.assertNotIn("7 findings", calls[0].args[1])
 
     def test_flag_on_an_unmanaged_repository_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"

@@ -88,9 +88,9 @@ The harness doesn't only reply to messages. A cluster event posted to the in-pod
 
 An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. With both integrations enabled the alert goes to Google Chat, falling through to Slack if that send is not accepted. A scheduled report has no such constraint and is posted to every enabled platform — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
 
-A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
+A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
-With `KAGE_SLACK_UX` on, that line reaches Slack as a headline read from the ledger issue: the finding and critical counts, the two most severe findings, and a link to the issue. A clean run is one line saying so, with the link. If the issue cannot be read, the report's own line is posted in bold with the link instead. A report longer than one line is also posted in full as a reply in the headline's thread, and a reply there is answered with the full report in context.
+With `KAGE_SLACK_UX` on, Slack gets a headline built from the open ledger issue: the finding and critical counts, the two most severe findings, the report's own line, and a link to the issue. A clean run closes its ledger, so it is posted like an issue that cannot be read: the report's own line in bold with the link. A report longer than one line is also posted in full as a reply in the headline's thread, and a reply there is answered with the full report in context.
 
 ## First-run onboarding
 

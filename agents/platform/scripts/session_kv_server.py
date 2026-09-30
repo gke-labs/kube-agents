@@ -2426,7 +2426,8 @@ def _slack_audit_headline(
     addressed without one, the job runs the fleet-audit skill, and the message
     ends with an issue URL in a managed repository, which is where fleet-audit
     keeps its ledger. The headline is built from that issue; when it cannot be
-    read, it is the report's own line in bold with the ledger link.
+    read, is closed or does not parse, it is the report's own line in bold with
+    the ledger link.
     """
     if platform != "slack" or unrelayed or not slack_presenter.enabled():
         return None

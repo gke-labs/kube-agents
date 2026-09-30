@@ -34,7 +34,13 @@ BODY = (
     + "\n### Skipped\n\n"
     + finding("not a finding", "skip-1")
 )
-ISSUE = {"title": "[audit] Security & RBAC Posture Audit — 7 findings (2 critical)", "body": BODY}
+ISSUE = {
+    "title": "[audit] Security & RBAC Posture Audit — 7 findings (2 critical)",
+    "body": BODY,
+    "state": "open",
+    "labels": ["agent:audit", "severity:critical"],
+}
+LINE = "Security & RBAC posture audit: 2 new, 1 resolved across 3 clusters"
 
 
 class LedgerRefTest(unittest.TestCase):
@@ -79,6 +85,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertEqual(
             sar.headline_from_issue(ISSUE, REF, REPORT),
             "**Security & RBAC Posture audit: 7 findings, 2 critical.** 2 are new since the last run.\n"
+            f"{LINE}\n"
             ":red_circle: **critical**  seeded-b, seeded-c: `cluster-admin` bound to the default service account\n"
             ":red_circle: **critical**  seeded-c: a ClusterRole grants `*` on secrets\n"
             f"[Ledger issue #231 ↗]({LEDGER}): all 7 findings",
@@ -88,7 +95,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
         body = BODY.replace("### Critical (2)", "### Nothing").replace(
             "### Minor (4)", "### Minor (4)\n\n" + finding("minor one", "m-0")
         )
-        rows = sar.headline_from_issue(dict(ISSUE, body=body), REF).splitlines()[1:3]
+        rows = sar.headline_from_issue(dict(ISSUE, body=body), REF, REPORT).splitlines()[2:4]
         self.assertEqual(rows[0], ":large_yellow_circle: **major**  seeded-a: Workload Identity is off on one node pool")
         self.assertTrue(rows[1].startswith(":white_circle: **minor**  minor one"))
 
@@ -100,19 +107,37 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertIn(" 1 is new since the last run.", sar.headline_from_issue(ISSUE, REF, "1 new — x"))
 
     def test_singular_title(self):
-        issue = {"title": "[audit] Cost Audit — 1 finding (0 critical)", "body": "### Major (1)\n\n" + finding("idle", "c")}
+        issue = dict(ISSUE, title="[audit] Cost Audit — 1 finding (0 critical)", body="### Major (1)\n\n" + finding("idle", "c"))
         self.assertEqual(sar.headline_from_issue(issue, REF).splitlines()[0], "**Cost audit: 1 finding, 0 critical.**")
 
-    def test_clean_run_is_one_line_with_the_ledger_link(self):
-        issue = {"title": "[audit] Security & RBAC Posture Audit — 0 findings (0 critical)", "body": "All clear."}
-        self.assertEqual(
-            sar.headline_from_issue(issue, REF),
-            f"**Security & RBAC Posture audit: clean.** [Ledger issue #231 ↗]({LEDGER})",
-        )
+    def test_a_closed_ledger_does_not_parse(self):
+        # A clean run closes the ledger over its old title: 7 findings is the last run's count.
+        self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state="closed"), REF, REPORT))
+        self.assertIsNone(sar.headline_from_issue(dict(ISSUE, state=""), REF, REPORT))
 
-    def test_repro_e_a_stale_clean_ledger_is_not_named(self):
-        issue = {"title": "[audit] Security & RBAC Posture Audit — 0 findings (0 critical)", "body": "All clear."}
+    def test_an_issue_without_the_ledger_label_does_not_parse(self):
+        self.assertIsNone(sar.headline_from_issue(dict(ISSUE, labels=["bug"]), REF, REPORT))
+        self.assertIsNone(sar.headline_from_issue(dict(ISSUE, labels=None), REF, REPORT))
+
+    def test_the_state_is_read_in_any_case(self):
+        self.assertIsNotNone(sar.headline_from_issue(dict(ISSUE, state="OPEN"), REF, REPORT))
+
+    def test_a_zero_finding_title_does_not_parse(self):
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)", body="All clear.")
         self.assertIsNone(sar.headline_from_issue(issue, REF, REPORT))
+
+    def test_the_relayed_line_keeps_coverage_resolved_and_prs(self):
+        line = (
+            "AI Workload Security Audit: 1 critical, 3 major, 2 minor across 2 of 7 clusters "
+            "(2 new, 1 resolved, 1 remediation PR opened)"
+        )
+        lines = sar.headline_from_issue(ISSUE, REF, f"Here's the audit.\n{line} — {LEDGER}").splitlines()
+        self.assertEqual(lines[1], line)
+        self.assertNotIn(LEDGER, lines[1])
+
+    def test_a_report_that_is_only_the_link_adds_no_line(self):
+        lines = sar.headline_from_issue(ISSUE, REF, f"Ledger: {LEDGER}").splitlines()
+        self.assertTrue(lines[1].startswith(":red_circle:"))
 
     def test_more_new_findings_than_the_ledger_lists_does_not_parse(self):
         self.assertIsNone(sar.headline_from_issue(ISSUE, REF, "8 new — x"))
@@ -122,7 +147,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertIsNone(sar.headline_from_issue(issue, REF))
 
     def test_coverage_incomplete_title_does_not_parse(self):
-        issue = {"title": "[audit] Cost Audit — coverage incomplete (2 gaps, 0 findings)", "body": ""}
+        issue = dict(ISSUE, title="[audit] Cost Audit — coverage incomplete (2 gaps, 0 findings)", body="")
         self.assertIsNone(sar.headline_from_issue(issue, REF))
 
     def test_title_must_be_whole(self):
@@ -176,6 +201,10 @@ class HeadlineFallbackTest(unittest.TestCase):
     def test_an_orienting_sentence_above_the_ledger_line_is_not_the_headline(self):
         report = f"Here's this morning's security audit.\n{REPORT}"
         self.assertEqual(sar.headline_fallback(report, REF), sar.headline_fallback(REPORT, REF))
+
+    def test_a_long_line_keeps_its_coverage(self):
+        line = "Workload Reliability Audit: " + "2 critical, 6 major, 11 minor, " * 5 + "across 4 of 9 clusters"
+        self.assertIn("across 4 of 9 clusters", sar.headline_fallback(f"{line} — {LEDGER}", REF))
 
     def test_a_bare_ledger_line_has_no_headline(self):
         self.assertIsNone(sar.headline_fallback(f"Ledger: {LEDGER}", REF))
