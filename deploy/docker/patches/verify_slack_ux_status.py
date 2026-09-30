@@ -52,7 +52,6 @@ PLAN_TS = "1700000000.000200"
 PHRASE = "is thinking..."
 ASK = "why is <#C1|payments> slow: check /metrics"
 TITLE = "why is #payments slow, check or metrics"
-STOP_BLOCK_ID = "kage_stop"
 
 
 def _fail(detail: str) -> SystemExit:
@@ -201,7 +200,7 @@ async def _drive(module) -> None:
     if adapter.calls != expected:
         raise _fail(f"the session got {adapter.calls!r}, expected {expected!r}")
 
-    # The plan: a note posts it with Stop, the next edits it, completion settles it.
+    # The plan: a note posts it, the next edits it, completion settles it.
     adapter = _StubAdapter(module)
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": CARD}
     if not await module.deliver_row(adapter, sub, 1, "check payments", "reading logs"):
@@ -212,7 +211,7 @@ async def _drive(module) -> None:
     if kinds != ["post", "setStatus", "update", "update", "setStatus"]:
         raise _fail(f"the plan made calls {kinds!r}")
     posted, settled = adapter.calls[0][1], adapter.calls[3][1]
-    if posted[0].get("type") != "plan" or posted[-1].get("block_id") != STOP_BLOCK_ID:
+    if len(posted) != 1 or posted[0].get("type") != "plan":
         raise _fail(f"the plan posted {posted!r}")
     if len(settled) != 1 or settled[0]["tasks"][0]["status"] != "complete":
         raise _fail(f"the settled plan was {settled!r}")

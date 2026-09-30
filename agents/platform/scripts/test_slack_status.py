@@ -79,15 +79,11 @@ class TaskCardTest(unittest.TestCase):
 
 
 class PlanTest(unittest.TestCase):
-    def test_stop_rides_while_a_row_runs(self):
-        blocks = s.plan_blocks(None, [_row()])
-        self.assertEqual([b["type"] for b in blocks], ["plan", "actions"])
-        self.assertEqual(blocks[1], s.stop_block())
-        self.assertEqual(blocks[1]["elements"][0]["action_id"], "kage_stop")
-
-    def test_no_stop_when_nothing_runs_or_stop_is_off(self):
-        self.assertEqual(len(s.plan_blocks(None, [_row(status=s.TASK_PENDING)])), 1)
-        self.assertEqual(len(s.plan_blocks(None, [_row()], stop=False)), 1)
+    def test_the_plan_is_one_block_with_no_stop(self):
+        # Stop is deferred: /stop would end the turn and leave the cards running.
+        for status in (s.TASK_RUNNING, s.TASK_PENDING):
+            blocks = s.plan_blocks(None, [_row(status=status)])
+            self.assertEqual([b["type"] for b in blocks], ["plan"])
 
     def test_title(self):
         self.assertEqual(s.plan_title("is it up?", [_row(), _row("t_b")]), "is it up?")

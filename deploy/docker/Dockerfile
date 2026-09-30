@@ -748,10 +748,10 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
 #
 # Slack: with KAGE_SLACK_UX on, send agents.sessions.setStatus the enum it
-# accepts (processing/closed) instead of Hermes's free-text phrase, which it
-# refuses on every call; title a channel thread's session after its ask; and
-# show a thread's delegated cards as one plan message with a row per card and a
-# Stop button, edited in place. The status setter and the message-event builder
+# accepts (processing/suspended/closed) instead of Hermes's free-text phrase,
+# which it refuses on every call; title a channel thread's session after its
+# first ask; and show a thread's delegated cards as one plan message with a row
+# per card, edited in place. The status setter and the message-event builder
 # gain a guard handing over to gateway/slack_ux_status.py; kanban_progress_lines
 # calls it for a Slack card. slack_status.py is staged for the verifier as
 # slack_presenter.py is. Also rides this COPY and RUN. See

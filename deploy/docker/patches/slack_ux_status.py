@@ -25,9 +25,9 @@ rather than 30 a minute. Each open and close is logged at info. The legacy
 free text and is left to upstream.
 
 **The session title.** Upstream titles only DM threads. With the flag on, a
-channel ask's words become its thread's session title, set once, right after
+channel thread's first ask becomes its session title, set once, right after
 the first ``processing``: ``agents.sessions.rename`` refuses a thread with no
-session yet.
+session yet. A follow-up ask in the thread keeps the title.
 
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
 notes into one message per card. With the flag on, a Slack thread instead gets
@@ -35,16 +35,13 @@ one message holding a plan with a row per card, edited in place with
 ``chat.update`` as notes arrive. A heartbeat creates a card's row; a terminal
 event settles an existing row (``complete``, ``error``, or ``pending`` for a
 card waiting on the user) and never creates one, so a card that finished
-without a note adds no plan above its report. While a row runs, the plan
-carries the ``kage_stop`` button and the thread's session is set to
-``processing``. Once no row is running or waiting, the session is closed
-and the plan is forgotten here, and the thread's next card starts a new plan.
-
-**Stop.** ``gateway/slack_ux_clicks.py`` answers a Stop click as the clicker
-typing ``/stop`` and removes the button from the message; a plan edit after
-that must not put it back, so a plan whose Stop was answered is rendered
-without it. Stop acts on the thread, not on the viewer, so once clicked it is
-gone for everyone.
+without a note adds no plan above its report. The plan holds the thread's
+session status: ``processing`` while a row runs, ``suspended`` while rows wait
+on the user and none runs, and a Planning Agent turn ending in the thread does
+not close it under either. Once no row is running or waiting, the session is
+closed and the plan is forgotten here, and the thread's next card starts a new
+plan. The plan has no Stop button yet: ``/stop`` interrupts only the Planning
+Agent's turn, and the cards would run on.
 
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
 message was deleted), the thread drops to the rolling line until the plan's
@@ -86,12 +83,14 @@ PLATFORM = "slack"
 #: status can go if one ever does, at one call a minute instead of thirty.
 SESSION_REFRESH_SECONDS = 60.0
 
+#: How long a plan with no new note or settled row keeps a Planning Agent
+#: turn's clear from closing the session. A card archived mid-run leaves its
+#: row running for good; this stops that row holding Working… forever, while
+#: covering a card's silent stretches, since noteless heartbeats reach no one.
+PLAN_HOLD_SECONDS = 1800.0
+
 #: ``fail_label`` for the adapter's status setter when the plan sets it.
 PLAN_STATUS_LABEL = "plan"
-
-#: ``slack_ux_clicks``'s record of an answered Stop, keyed
-#: ``(channel, message ts, STOP_KIND)``.
-CLICKS_STOP_KIND = "kage stop"
 
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
@@ -115,13 +114,17 @@ class _Row:
 
 
 class _Plan:
-    __slots__ = ("fallback", "rows", "team_id", "ts")
+    __slots__ = ("fallback", "rows", "session", "team_id", "touched", "ts")
 
     def __init__(self, team_id: str) -> None:
         self.ts = ""
         self.team_id = team_id
         self.rows: OrderedDict[str, _Row] = OrderedDict()
         self.fallback = False
+        #: The session status this plan last asked for, ``""`` before the first.
+        self.session = ""
+        #: ``time.monotonic()`` at the last note or settled row.
+        self.touched = time.monotonic()
 
 
 #: ``(team, channel, thread) -> (status sent, when)``.
@@ -159,11 +162,14 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
 
 
 def note_ask(chat_id: str, thread_ts: str | None, text: Any) -> None:
-    """Keep a channel ask's words to title its thread's session once it opens."""
+    """Keep a channel thread's first ask to title its session once it opens."""
     if not (chat_id and thread_ts and enabled()):
         return
+    key = (str(chat_id), str(thread_ts))
+    if key in _titles or key in _asks:
+        return
     if str(text or "").strip():
-        _remember(_asks, (str(chat_id), str(thread_ts)), str(text), ASKS_MAX)
+        _remember(_asks, key, str(text), ASKS_MAX)
 
 
 async def set_thread_status(
@@ -183,6 +189,9 @@ async def set_thread_status(
     caller only hands over when the SDK has Agent Sessions.
     """
     wanted = _status.session_status(status)
+    if wanted == _status.SESSION_CLOSED:
+        # A Planning Agent turn ends with a clear; the thread's plan outlives it.
+        wanted = _plan_session(str(chat_id), str(thread_ts)) or wanted
     key = (str(team_id or ""), str(chat_id), str(thread_ts))
     sent = _sessions.get(key)
     now = time.monotonic()
@@ -220,14 +229,19 @@ def _thread(sub: dict) -> tuple:
     return str(sub.get("chat_id") or ""), str(sub.get("thread_id") or "")
 
 
-def _stop_answered(chat_id: str, ts: str) -> bool:
-    """Whether ``slack_ux_clicks`` has answered a Stop click on this message."""
-    try:
-        from gateway import slack_ux_clicks
-    except ImportError:
-        return False
-    answered = getattr(slack_ux_clicks, "_answered", None) or {}
-    return (chat_id, ts, CLICKS_STOP_KIND) in answered
+def _plan_session(chat_id: str, thread_ts: str) -> str:
+    """The session status the thread's plan holds, or ``""`` when no row runs or waits.
+
+    A plan untouched for :data:`PLAN_HOLD_SECONDS` holds nothing.
+    """
+    plan = _plans.get((chat_id, thread_ts))
+    if plan is None or time.monotonic() - plan.touched > PLAN_HOLD_SECONDS:
+        return ""
+    if _status.running(plan.rows.values()):
+        return _status.SESSION_PROCESSING
+    if any(row.status == _status.TASK_PENDING for row in plan.rows.values()):
+        return _status.SESSION_SUSPENDED
+    return ""
 
 
 async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
@@ -235,8 +249,7 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
     chat_id, thread_ts = key
     title = _titles.get(key)
     rows = list(plan.rows.values())
-    stop = not (plan.ts and _stop_answered(chat_id, plan.ts))
-    blocks = _status.plan_blocks(title, rows, stop=stop)
+    blocks = _status.plan_blocks(title, rows)
     text = _status.plan_text(title, rows)
     try:
         client = adapter._get_client(chat_id, team_id=plan.team_id or None)
@@ -259,19 +272,30 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
     return True
 
 
-async def _session(adapter: Any, chat_id: str, team_id: str, thread_ts: str, opening: bool) -> None:
-    """Open the thread's session when its plan is posted, or clear it once the plan settles."""
+async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """Send the session status the plan now holds, when it differs from the last it sent.
+
+    A row running opens the session; nothing running clears it, which
+    :func:`set_thread_status` turns into ``suspended`` while a row still waits
+    and the legacy thread status shows as cleared.
+    """
+    chat_id, thread_ts = key
+    wanted = _plan_session(chat_id, thread_ts) if _plans.get(key) is plan else ""
+    wanted = wanted or _status.SESSION_CLOSED
+    if wanted == plan.session:
+        return
     setter = getattr(adapter, "_set_thread_status", None)
     if setter is None:
         return
+    plan.session = wanted
     phrase = ""
-    if opening:
+    if wanted == _status.SESSION_PROCESSING:
         # Hermes's own phrase: the Agent Sessions path maps it to ``processing``,
         # and the legacy thread status, which takes free text, shows it as is.
         default_text = getattr(adapter, "_default_status_text", None)
         phrase = default_text(None) if callable(default_text) else _status.SESSION_PROCESSING
     try:
-        await setter(chat_id, team_id, thread_ts, phrase, PLAN_STATUS_LABEL)
+        await setter(chat_id, plan.team_id, thread_ts, phrase, PLAN_STATUS_LABEL)
     except Exception as exc:  # noqa: BLE001 — cosmetic
         logger.debug("slack_ux_status: setting the plan's session status failed: %s", exc)
 
@@ -306,7 +330,6 @@ async def deliver_row(
         row = plan.rows[card] = _Row(card, title)
     if event_id and event_id <= row.last_event_id:
         return True  # an at-least-once replay already on the row
-    opening = not plan.ts
     previous = (list(row.lines), row.status, row.last_event_id)
     row.lines = [*row.lines, line][-_status.STEPS_MAX:]
     row.status = _status.TASK_RUNNING
@@ -314,8 +337,8 @@ async def deliver_row(
     if not await _render(adapter, key, plan):
         row.lines, row.status, row.last_event_id = previous
         return False
-    if opening:
-        await _session(adapter, key[0], plan.team_id, key[1], opening=True)
+    plan.touched = time.monotonic()
+    await _session(adapter, key, plan)
     return True
 
 
@@ -328,11 +351,12 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
     if row is None or status is None:
         return
     row.status = status
+    plan.touched = time.monotonic()
     if plan.ts and not plan.fallback:
         await _render(adapter, key, plan)
     # A plan that fell back is still forgotten once its rows settle, so the
     # thread's next card tries a plan again.
     if _settled(plan) and _plans.get(key) is plan:
         _plans.pop(key, None)
-        if plan.ts:
-            await _session(adapter, key[0], plan.team_id, key[1], opening=False)
+    if plan.ts:
+        await _session(adapter, key, plan)

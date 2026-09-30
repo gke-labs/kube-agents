@@ -357,6 +357,22 @@ class SessionTest(_RuntimeCase):
         )
         self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is #payments slow, see dash")
 
+    def test_a_follow_up_ask_keeps_the_title(self):
+        adapter = _Adapter()
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        self._status(adapter, PHRASE)
+        self._status(adapter, "")
+        runtime.note_ask(CHANNEL, THREAD, "and checkout?")
+        self._status(adapter, PHRASE)
+        self.assertEqual([v for n, v in adapter.calls if n == "rename"], ["why is payments slow?"])
+
+    def test_a_second_ask_before_the_session_opens_keeps_the_first(self):
+        adapter = _Adapter()
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        runtime.note_ask(CHANNEL, THREAD, "never mind")
+        self._status(adapter, PHRASE)
+        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is payments slow?")
+
     def test_no_ask_no_rename(self):
         adapter = _Adapter()
         self._status(adapter, PHRASE)
@@ -409,7 +425,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(blocks[0]["type"], "plan")
         self.assertEqual(blocks[0]["title"], "check payments")
         self.assertEqual(blocks[0]["tasks"][0]["status"], "in_progress")
-        self.assertEqual(blocks[1]["block_id"], slack_status.STOP_BLOCK_ID)
+        self.assertEqual(len(blocks), 1, "the plan carries no Stop")
         self.assertEqual(adapter.calls[1], ("setStatus", "processing"))
 
     def test_later_notes_edit_the_plan(self):
@@ -480,7 +496,7 @@ class PlanTest(_RuntimeCase):
         self.assertFalse(_run(runtime.deliver_row(_Adapter(), _sub(thread=""), 1, "t", "x")))
         self.assertFalse(_run(runtime.deliver_row(SimpleNamespace(), _sub(), 1, "t", "x")))
 
-    def test_settling_the_last_row_drops_stop_closes_and_forgets(self):
+    def test_settling_the_last_row_closes_and_forgets(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
         _run(runtime.settle_row(adapter, _sub(), "completed"))
@@ -497,9 +513,8 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 2, "b", task="t_b")
         _run(runtime.settle_row(adapter, _sub("t_a"), "gave_up"))
         _run(runtime.settle_row(adapter, _sub("t_b"), "blocked"))
-        tasks = adapter.calls[-1][1][0]["tasks"]
+        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
         self.assertEqual([t["status"] for t in tasks], ["error", "pending"])
-        self.assertEqual(len(adapter.calls[-1][1]), 1, "Stop shown with nothing running")
         self.assertIn((CHANNEL, THREAD), runtime._plans)
 
     def test_a_terminal_event_never_creates_a_row(self):
@@ -513,23 +528,54 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
 
-    def test_an_answered_stop_is_not_put_back(self):
+    def test_a_planning_turn_ending_leaves_working_while_rows_run(self):
+        # The Planning Agent's turn ends with a clear while its cards still run.
         adapter = _Adapter()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
         self._note(adapter, 1, "reading logs")
-        clicks = SimpleNamespace(_answered={(CHANNEL, PLAN_TS, runtime.CLICKS_STOP_KIND): True})
-        with mock.patch.dict(
-            sys.modules, {"gateway": SimpleNamespace(slack_ux_clicks=clicks), "gateway.slack_ux_clicks": clicks},
-        ):
-            self._note(adapter, 2, "reading metrics")
-        blocks = adapter.calls[-1][1]
-        self.assertEqual([b["type"] for b in blocks], ["plan"])
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self._note(adapter, 2, "reading metrics")
+        self.assertNotIn(("setStatus", "closed"), adapter.calls)
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
-    def test_without_the_clicks_module_stop_stays(self):
+    def test_a_stale_plan_stops_holding_the_session(self):
+        # A card archived mid-run never settles its row.
+        adapter = _Adapter()
+        with mock.patch.object(runtime.time, "monotonic", return_value=1000.0):
+            self._note(adapter, 1, "reading logs")
+        later = 1000.0 + runtime.PLAN_HOLD_SECONDS + 1
+        with mock.patch.object(runtime.time, "monotonic", return_value=later):
+            _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_a_turn_ending_without_a_plan_still_closes(self):
+        adapter = _Adapter()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_rows_waiting_on_the_user_suspend_the_session(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
-        with mock.patch.dict(sys.modules, {"gateway": None, "gateway.slack_ux_clicks": None}):
-            self._note(adapter, 2, "reading metrics")
-        self.assertEqual(adapter.calls[-1][1][-1]["block_id"], slack_status.STOP_BLOCK_ID)
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+        # A turn asking the user ends with a clear; the session stays suspended.
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+        # The card runs again once answered, then finishes.
+        self._note(adapter, 2, "resuming")
+        self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_a_running_row_keeps_working_beside_a_waiting_one(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "a", task="t_a")
+        self._note(adapter, 2, "b", task="t_b")
+        _run(runtime.settle_row(adapter, _sub("t_b"), "blocked"))
+        self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing"])
 
 
 class EnabledTest(unittest.TestCase):

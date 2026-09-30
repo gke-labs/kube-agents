@@ -11,10 +11,9 @@ The plan (:func:`plan_blocks`): one message per thread holding a Block Kit
 ``details`` are the card's progress notes as steps, the last one open while
 the card runs. Slack's task statuses are ``pending``, ``in_progress``,
 ``complete`` and ``error`` and nothing else, so a card waiting on the user is
-``pending``. While any row runs, the plan carries the ``kage_stop`` button;
-Slack's own Stop needs an ``agent_session_stopped`` subscription the app
-manifest does not have yet. :func:`plan_text` is the same plan as plain text,
-for the message's ``text`` field.
+``pending``. The plan carries no Stop button yet: ``/stop`` interrupts only
+the Planning Agent's turn and would leave the cards running. :func:`plan_text`
+is the same plan as plain text, for the message's ``text`` field.
 
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
@@ -98,12 +97,6 @@ STEP_TEXT_MAX = 300
 
 #: The plan's title when the caller gave none and more than one card reports.
 CARDS_TITLE = "{count} cards"
-
-#: The Stop button, as RENDER.md fixes it.
-STOP_ACTION_ID = "kage_stop"
-STOP_BLOCK_ID = "kage_stop"
-STOP_LABEL = "■ Stop"
-STOP_VALUE = "stop"
 
 
 def session_status(text: Any) -> str:
@@ -205,40 +198,21 @@ def running(rows: Iterable[Any]) -> bool:
     return any(row.status == TASK_RUNNING for row in rows)
 
 
-def stop_block() -> dict:
-    """The actions block holding the Stop button."""
-    return {
-        "type": "actions",
-        "block_id": STOP_BLOCK_ID,
-        "elements": [
-            {
-                "type": "button",
-                "action_id": STOP_ACTION_ID,
-                "text": {"type": "plain_text", "text": STOP_LABEL},
-                "value": STOP_VALUE,
-            }
-        ],
-    }
-
-
-def plan_blocks(title: str | None, rows: Sequence[Any], stop: bool = True) -> list[dict]:
-    """The status message's blocks: the plan, then Stop while a row runs and ``stop`` allows.
+def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
+    """The status message's blocks: one ``plan``.
 
     ``rows`` are objects with ``task_id``, ``title``, ``lines`` and ``status``,
     in the order the cards first reported; past :data:`ROWS_MAX` the oldest
     are dropped.
     """
     rows = list(rows)[-ROWS_MAX:]
-    blocks: list[dict] = [
+    return [
         {
             "type": "plan",
             "title": plan_title(title, rows),
             "tasks": [task_card(r.task_id, r.title, r.lines, r.status) for r in rows],
         }
     ]
-    if stop and running(rows):
-        blocks.append(stop_block())
-    return blocks
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:
