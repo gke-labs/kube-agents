@@ -25,7 +25,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "provision_ci_pool_project.sh"
 _SECTION_START = "# ─── GitOps Repo & App Installation Check"
 _SECTION_END_RE = re.compile(r"^# ─── (?!GitOps Repo)", re.MULTILINE)
-_CONSTANT_RE = re.compile(r"^readonly GITOPS_(?:SEED|INTENT_NOTE)_\w+=.*$", re.MULTILINE)
+_CONSTANT_RE = re.compile(r"^readonly GITOPS_(?:SEED|INTENT_NOTE|NOTE_ABSENT)_\w+=.*$", re.MULTILINE)
 # The note constant spans lines (a single-quoted heredoc-style value), so the
 # constants are lifted as the span from the first to the closing quote line.
 _CONSTANTS_SPAN_RE = re.compile(
@@ -82,7 +82,7 @@ def _section() -> str:
     assert start != -1, f"{_SECTION_START!r} not found in {_SCRIPT}"
     end = _SECTION_END_RE.search(text, start + len(_SECTION_START))
     assert end, "no section marker follows the GitOps repository block"
-    assert len(_CONSTANT_RE.findall(text)) == 6, "expected the six GITOPS_SEED_* / GITOPS_INTENT_NOTE_* constants"
+    assert len(_CONSTANT_RE.findall(text)) == 7, "expected the seven GITOPS_SEED_* / GITOPS_NOTE_ABSENT_* / GITOPS_INTENT_NOTE_* constants"
     span = _CONSTANTS_SPAN_RE.search(text)
     assert span, "the GITOPS_* constants are not one contiguous block"
     return span.group(0) + "\n" + text[start : end.start()]

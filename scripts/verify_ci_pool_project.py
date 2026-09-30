@@ -37,6 +37,12 @@ _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
 # The audit's own note parser, loaded when the declared-intent check runs so
 # the check reads a note exactly as the audit will, rather than a copy of it.
 _AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
+# The name the audit module is registered under when loaded by path; unregistered
+# in sys.modules, so it cannot shadow or be shadowed by an installed package.
+_AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
+# The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
+GITOPS_REPO_ORG = "gke-agentic"
+GITOPS_REPO_SUFFIX = "-infra"
 # The runner refuses to write kubeconfigs on the caller's own credential unless
 # told to. The fleet check tells it: an operator, even a project owner, holds no
 # token-creator on the reader (roles/owner does not carry
@@ -2315,7 +2321,7 @@ def _load_audit_report():
     """The fleet-audit script as a module, for its `parse_declarations` and join key."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("kube_agents_audit_report", _AUDIT_REPORT)
+    spec = importlib.util.spec_from_file_location(_AUDIT_REPORT_MODULE_NAME, _AUDIT_REPORT)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {_AUDIT_REPORT}")
     module = importlib.util.module_from_spec(spec)
@@ -2354,8 +2360,11 @@ def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
             return f"its frontmatter is not valid YAML ({type(exc).__name__})"
         if not isinstance(front, dict) or audit.OKF_TYPE_KEY not in front:
             return f"its frontmatter has no `{audit.OKF_TYPE_KEY}`, so it is not an OKF note"
-        if audit.DECLARES_KEY not in front:
+        declares = front.get(audit.DECLARES_KEY)
+        if declares is None:
             return f"its frontmatter has no `{audit.DECLARES_KEY}` list"
+        if isinstance(declares, list) and not declares:
+            return f"its `{audit.DECLARES_KEY}` list is empty"
         return (
             f"every `{audit.DECLARES_KEY}` item was skipped by the audit's parser "
             "(it logged a WARNING per item above saying why)"
@@ -2387,7 +2396,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     (a 409 on a repository with no commits, a 422) fails it.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
-    repo_slug = f"gke-agentic/{project_id}-infra"
+    repo_slug = f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
     details: List[str] = []
     warnings: List[str] = []
     rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
@@ -2970,9 +2979,11 @@ def _chart_pinned_key_version() -> Tuple[Optional[str], str]:
 
     Returns (version, detail); version is None when it cannot be read, and
     detail then says why. Parsed with a regex rather than a YAML library
-    because this script is deliberately dependency-free -- it is the first
-    thing an operator runs on a fresh machine, and a missing import here
-    would read as an unprovisioned project.
+    because this script is dependency-free everywhere a missing import would
+    read as an unprovisioned project -- it is the first thing an operator runs
+    on a fresh machine. The one exception is the declared-intent note check,
+    which loads the audit's parser and PyYAML lazily and reports "Not checked"
+    when it cannot, never a failure.
     """
     if not _CHART_VALUES.exists():
         return None, f"missing {_CHART_VALUES}"

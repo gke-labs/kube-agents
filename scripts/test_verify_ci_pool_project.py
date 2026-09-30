@@ -1531,6 +1531,10 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             # parser catches it and reads nothing, and so must this check
             # rather than ending the run in a traceback.
             "unquoted impossible date": good.replace("type: decision\n", "type: decision\nreviewed: 2026-02-30\n"),
+            # Silent in the parser too: a null and an empty list both return
+            # nothing without a WARNING, so the diagnosis must not promise one.
+            "null declares": good[: good.index("declares:")] + "declares:\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            "empty declares": good[: good.index("declares:")] + "declares: []\n---\n" + good[good.index("---\n\n`notification") + 4 :],
         }
         # The reason the message gives for the shapes the audit's parser is
         # silent about, so the operator is not sent to look for a WARNING that
@@ -1545,6 +1549,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "empty cluster": "was skipped by the audit's parser",
             "another cluster": "name cluster seeded-b",
             "unquoted impossible date": "not valid YAML (ValueError)",
+            "null declares": "has no `declares` list",
+            "empty declares": "`declares` list is empty",
         }
         for label, body in rejected.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch("sys.stderr", new=io.StringIO()):

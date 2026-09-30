@@ -53,6 +53,9 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # reads: the fleet's declared-no-pdb-workload role runs without a budget on
 # purpose, and the case grades that the agent finds this file and says so.
 # The harness reads the frontmatter, not the prose.
+# What `gh api` prints on stderr for a path that is not there; any other failure
+# of the existence read stops the seed rather than writing blind.
+readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
 readonly GITOPS_INTENT_NOTE_MESSAGE="Declare notification-relay's missing PodDisruptionBudget as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
@@ -431,7 +434,7 @@ fi
 # hand is left as it is.
 if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
   :
-elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "HTTP 404"; then
+elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
   echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
   gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
     -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \

@@ -23,7 +23,8 @@ the token minter. Every read runs as the bot itself
 (eval-dashboard-publisher@kube-agents-prow), which needs the project-level
 read roles bench/tf/fleet grants it (`pool_state_readers`); a project without
 them scans as "not checked" with gcloud's own words. Not run here: the fleet
-fixtures (fixture_state.py already does), the two GitHub checks (each needs a
+fixtures (fixture_state.py already does), the GitHub-reading checks
+(github_repo_and_app, gitops_declaration, ledger_read_credential; each needs a
 credential the bot must not hold), the mapping (about the checkout, not the
 project).
 
