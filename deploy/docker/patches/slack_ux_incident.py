@@ -13,7 +13,9 @@ and the triage card's report arrives as a reply under it, so the channel
 keeps showing the alert while the diagnosis sits in the thread. With the flag
 on, the report replaces the alert in place instead: the alert message is
 edited into the report's "What's wrong" sentence, one button per option, the
-report's own links as link buttons, and the whole report in a collapsed fold.
+report's own links as link buttons, and the whole report in a collapsed fold,
+rendered by the Slack plugin's own ``block_kit.render_blocks`` so it reads as
+the threaded reply would.
 
 A button's text is ``apply Option B: <title>`` (``apply: <title>`` for the
 single-fix shape), so a click, which ``slack_ux_clicks`` sends as the
@@ -25,8 +27,9 @@ text is untouched, only laid out.
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would
 show options the stored row does not have; a thread that already has a row
-gets the reply upstream posts. Anything that does not parse into at least one
-option, or any failure to edit, also falls back to that reply.
+gets the reply upstream posts. A report with no "What's wrong" sentence, an
+option named but not parsed, a fold ``block_kit`` cannot render, or any failure
+to edit, also falls back to that reply.
 """
 
 from __future__ import annotations
@@ -37,6 +40,8 @@ import os
 import re
 import sqlite3
 from contextlib import closing
+from importlib import util as importlib_util
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -46,6 +51,10 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+
+#: The Slack plugin's markdown renderer, beside this module's ``gateway/``
+#: directory. It imports only ``re`` and ``typing``, so it loads by path.
+BLOCK_KIT = Path(__file__).resolve().parents[1] / "plugins" / "platforms" / "slack" / "block_kit.py"
 
 SLACK = "slack"
 COMPLETED = "completed"
@@ -67,12 +76,11 @@ SINGLE_LABEL = "apply: {title}"
 LINK_LABEL = "{label} ↗"
 PRIMARY = "primary"
 #: A report longer than this keeps the threaded reply; triage reports are a
-#: few hundred words, and Slack's limit on a rich_text block is not published.
+#: few hundred words, and Slack's limit on a container's content is not published.
 FOLD_TEXT_MAX = 12000
-BULLET = "• "
 
 HEADING = re.compile(r"^ {0,3}#{1,6} +(.+?)[ #]*$")
-WHATS_WRONG = re.compile(r"what['’]s wrong", re.IGNORECASE)
+WHATS_WRONG = re.compile(r"what(?:['’]s| is) wrong", re.IGNORECASE)
 WHAT_TO_DO = re.compile(r"what to do", re.IGNORECASE)
 #: A parenthesised title, one level of nested parentheses allowed: ``(Scale to 4 (from 2))``.
 TITLE = r"\(((?:[^()\n]|\([^()\n]*\))+)\)"
@@ -86,10 +94,8 @@ LINKS_MARKER = "🔗"
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 RECOMMENDED = re.compile(r"Recommended:?[*_\s]*Option ([A-Z])\b")
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
-LIST_ITEM = re.compile(r"^\s*[-*+]\s+")
 #: A code fence line; nothing between two is a heading, a bullet or markup.
 FENCE = re.compile(r"^\s*(```|~~~)")
-INLINE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__|`([^`\n]+)`|\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 
 
 def enabled() -> bool:
@@ -148,7 +154,7 @@ def parse_triage(report: str) -> dict | None:
             choices.append((SINGLE_LABEL.format(title=_presenter._plain(single.group(1))), True))
     if not choices:
         return None
-    headline, _body = _presenter.split_answer(_section(sections, WHATS_WRONG) or report)
+    headline, _body = _presenter.split_answer(_section(sections, WHATS_WRONG))
     if not headline:
         return None
     return {
@@ -166,59 +172,27 @@ def _text(text: str, **style: bool) -> dict:
     return element
 
 
-def _inline(line: str) -> list[dict]:
-    """Rich-text elements for one markdown line: bold, code and links kept."""
-    elements: list[dict] = []
-    at = 0
-    for match in INLINE.finditer(line):
-        if match.start() > at:
-            elements.append(_text(line[at : match.start()]))
-        bold, bold_alt, code, link_text, url = match.groups()
-        if code is not None:
-            elements.append(_text(code, code=True))
-        elif url is not None:
-            elements.append({"type": "link", "url": url, "text": link_text})
-        else:
-            elements.append(_text(bold or bold_alt, bold=True))
-        at = match.end()
-    if at < len(line):
-        elements.append(_text(line[at:]))
-    return elements
+_block_kit = None
 
 
-def rich_report(report: str) -> dict:
-    """``report`` as one rich_text block: headings bold, bullets as "• ", lines split by newlines."""
-    elements: list[dict] = []
-    blank = False
-    fenced = False
-    for raw in report.strip().split("\n"):
-        line = raw.rstrip()
-        if FENCE.match(line):
-            fenced = not fenced
-            continue
-        if not line.strip():
-            blank = bool(elements)
-            continue
-        if elements:
-            elements.append(_text("\n\n" if blank else "\n"))
-        blank = False
-        if fenced:
-            elements.append(_text(line, code=True))
-            continue
-        heading = HEADING.match(line)
-        if heading:
-            elements.append(_text(heading.group(1).strip(), bold=True))
-            continue
-        item = LIST_ITEM.match(line)
-        if item:
-            elements.append(_text(BULLET))
-            line = line[item.end() :]
-        elements.extend(_inline(line))
-    return {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": elements}]}
+def _load_block_kit() -> Any:
+    global _block_kit
+    if _block_kit is None:
+        spec = importlib_util.spec_from_file_location("slack_ux_incident_block_kit", BLOCK_KIT)
+        module = importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _block_kit = module
+    return _block_kit
 
 
-def blocks_triage(triage: dict, report: str) -> list[dict]:
-    """Headline, option and link buttons, and the report folded, as Block Kit."""
+def render_fold(report: str, mrkdwn_fn: Any = None) -> list[dict] | None:
+    """``report`` as the blocks the adapter's own send would render, or None if it cannot."""
+    block_kit = _load_block_kit()
+    return block_kit.sanitize_blocks(block_kit.render_blocks(report, mrkdwn_fn=mrkdwn_fn))
+
+
+def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
+    """Headline, option and link buttons, and ``fold_blocks`` folded, as Block Kit."""
     buttons = []
     for i, (label, recommended) in enumerate(triage["choices"]):
         button = _presenter._button(label, f"{ACTION_PREFIX}.{_presenter.CHOICE_ACTION}.{i}", value=label)
@@ -238,7 +212,7 @@ def blocks_triage(triage: dict, report: str) -> list[dict]:
         "title": {"type": "plain_text", "text": triage["fold_title"]},
         "is_collapsible": True,
         "default_collapsed": True,
-        "child_blocks": [rich_report(report)],
+        "child_blocks": fold_blocks,
     }
     return [headline, *_presenter._actions(buttons), fold]
 
@@ -285,12 +259,12 @@ def is_open_alert(chat_id: str, thread_id: str, db_path: str | None = None) -> b
 class _AlertEditor:
     """The notifier's adapter, with ``send`` editing the alert instead of replying under it."""
 
-    def __init__(self, adapter: Any, chat_id: str, thread_id: str, triage: dict, report: str):
+    def __init__(self, adapter: Any, chat_id: str, thread_id: str, triage: dict, fold_blocks: list[dict]):
         self._adapter = adapter
         self._chat_id = chat_id
         self._thread_id = thread_id
         self._triage = triage
-        self._report = report
+        self._fold_blocks = fold_blocks
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._adapter, name)
@@ -302,7 +276,7 @@ class _AlertEditor:
                     channel=self._chat_id,
                     ts=self._thread_id,
                     text=fallback_text(self._triage),
-                    blocks=blocks_triage(self._triage, self._report),
+                    blocks=blocks_triage(self._triage, self._fold_blocks),
                 )
                 logger.info("slack_ux_incident: edited alert %s into its triage", self._thread_id)
                 return SimpleNamespace(success=True, message_id=self._thread_id, error=None)
@@ -345,7 +319,10 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         triage = parse_triage(report)
         if triage is None or not is_open_alert(chat_id, thread_id):
             return adapter
-        return _AlertEditor(adapter, chat_id, thread_id, triage, report)
+        fold_blocks = render_fold(report, getattr(adapter, "format_message", None))
+        if not fold_blocks:
+            return adapter
+        return _AlertEditor(adapter, chat_id, thread_id, triage, fold_blocks)
     except Exception as exc:  # noqa: BLE001 — never fail a delivery on presentation
         logger.warning("slack_ux_incident: not editing the alert: %s", exc)
         return adapter

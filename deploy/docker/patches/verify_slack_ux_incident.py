@@ -163,6 +163,9 @@ async def _drive(module, db_path: str) -> None:
             raise _fail(f"the alert edit was {update!r}")
         if buttons[1].get("style") != "primary" or "style" in buttons[0]:
             raise _fail("the recommended option is not the primary button")
+        fold = update["blocks"][-1]
+        if fold.get("type") != "container" or not fold.get("child_blocks"):
+            raise _fail("the report was not folded through the Slack plugin's block_kit")
     finally:
         os.environ.pop(FLAG_ENV, None)
         os.environ.pop(DB_PATH_ENV, None)

@@ -118,8 +118,20 @@ def _texts(block):
     return "".join(e.get("text", "") for s in block["elements"] for e in s["elements"])
 
 
+def _render_blocks(markdown, mrkdwn_fn=None):
+    """Stands in for block_kit.render_blocks: one section per paragraph."""
+    fmt = mrkdwn_fn or (lambda s: s)
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": fmt(p)}} for p in markdown.split("\n\n") if p]
+
+
+BLOCK_KIT = SimpleNamespace(render_blocks=_render_blocks, sanitize_blocks=lambda blocks: blocks)
+
+
 class RuntimeTest(unittest.TestCase):
     def setUp(self):
+        self.block_kit = mock.patch.object(runtime, "_load_block_kit", return_value=BLOCK_KIT)
+        self.block_kit.start()
+        self.addCleanup(self.block_kit.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.db = os.path.join(self.tmp.name, "session_kv.db")
         with closing(sqlite3.connect(self.db)) as conn:
@@ -218,18 +230,18 @@ class RuntimeTest(unittest.TestCase):
         self.assertIs(fold["default_collapsed"], True)
         self.assertIn("apply Option A", update["text"])
 
-    def test_the_fold_carries_every_word_of_the_report(self):
+    def test_the_fold_is_the_plugins_rendering_of_the_whole_report(self):
         adapter = _Adapter()
+        adapter.format_message = lambda s: "fmt:" + s
         self.deliver(adapter)
         fold = adapter.log[0][1]["blocks"][-1]
-        shown = _texts(fold["child_blocks"][0])
-        for line in REPORT.strip().split("\n"):
-            plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
-            plain = re.sub(r"^#+ |^- ", "", plain).replace("**", "").replace("`", "")
-            self.assertIn(plain, shown.replace("• ", ""))
-        styles = [e.get("style") for s in fold["child_blocks"][0]["elements"] for e in s["elements"]]
-        self.assertIn({"code": True}, styles)
-        self.assertIn({"bold": True}, styles)
+        self.assertEqual(fold["child_blocks"], _render_blocks(REPORT.strip(), adapter.format_message))
+
+    def test_a_fold_the_plugin_cannot_render_keeps_the_reply(self):
+        adapter = _Adapter()
+        empty = SimpleNamespace(render_blocks=lambda md, mrkdwn_fn=None: None, sanitize_blocks=lambda b: b)
+        with mock.patch.object(runtime, "_load_block_kit", return_value=empty):
+            self.assertIs(self.wrap(adapter), adapter)
 
     def test_a_click_sends_apply_option_as_the_clicker(self):
         adapter = _Adapter()
@@ -293,13 +305,15 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([c for c, _ in triage["choices"]],
                          ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret"])
         self.assertEqual(len(triage["links"]), 2)
-        section = runtime.rich_report(fenced)["elements"][0]["elements"]
-        self.assertIn(runtime._text("# in seeded-debug", code=True), section)
-        self.assertNotIn("```", "".join(e.get("text", "") for e in section))
 
     def test_a_decorated_heading_still_gives_the_headline(self):
-        triage = runtime.parse_triage(REPORT.replace("## What's wrong", "## 🚨 What's wrong?"))
-        self.assertTrue(triage["headline"].startswith("payments-api in seeded-debug keeps crashing"))
+        for heading in ("## 🚨 What's wrong?", "## What is wrong"):
+            triage = runtime.parse_triage(REPORT.replace("## What's wrong", heading))
+            self.assertTrue(triage["headline"].startswith("payments-api in seeded-debug keeps crashing"))
+
+    def test_no_whats_wrong_sentence_keeps_the_reply(self):
+        self.assertIsNone(runtime.parse_triage(REPORT.replace("## What's wrong", "## Summary")))
+        self.assertIsNone(runtime.parse_triage(REPORT.replace("## What's wrong\n\n", "## What's wrong\n\n### Symptom\n\n")))
 
     def test_an_option_that_does_not_parse_keeps_the_reply(self):
         uneven = REPORT.replace("- **Option B (Restore the secret):**", "- **Option B** (Restore the secret):")
@@ -310,7 +324,7 @@ class RuntimeTest(unittest.TestCase):
     def test_button_text_fits_slack(self):
         long_title = "x" * 120
         triage = runtime.parse_triage(REPORT.replace("Restore the secret", long_title))
-        blocks = runtime.blocks_triage(triage, REPORT)
+        blocks = runtime.blocks_triage(triage, [])
         for button in blocks[1]["elements"]:
             self.assertLessEqual(len(button["text"]["text"]), presenter.BUTTON_TEXT_MAX)
 
