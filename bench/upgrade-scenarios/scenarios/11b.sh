@@ -6,10 +6,11 @@
 # control plane that serves reads from a cache but refuses changes is still an outage for a deploy.
 CHANNEL=REGULAR; START=1.34; CREATE_FLAGS="--cluster-ipv4-cidr=/19"
 PROBE_TIMEOUT=3s
-probe_loop(){ local stop=$1 f="$EVID/zonal-probe.txt" i=0; echo "# $(ts) probe start (read=/version, write=create+delete ConfigMap, timeout $PROBE_TIMEOUT)" >>"$f"   # append: a re-run adds a block, it does not replace the checked-in one
+probe_loop(){ local stop=$1 f="$EVID/zonal-probe.txt" i=0 run; run=$(date -u +%H%M%S)-$$   # names unique to this run: a ConfigMap a timed-out delete left behind must not read as a refused write next time
+  echo "# $(ts) probe start (read=/version, write=create+delete ConfigMap, timeout $PROBE_TIMEOUT)" >>"$f"   # append: a re-run adds a block, it does not replace the checked-in one
   until [ -e "$stop" ] || ! kill -0 $$ 2>/dev/null; do i=$((i+1))   # $$ is run.sh: an interrupted run leaves no prober
     if K --request-timeout=$PROBE_TIMEOUT get --raw /version >/dev/null 2>&1; then r=up; else r=DOWN; fi
-    if K --request-timeout=$PROBE_TIMEOUT -n scen create configmap "probe-$i" --from-literal=t="$(ts)" >/dev/null 2>&1; then w=up; K --request-timeout=$PROBE_TIMEOUT -n scen delete configmap "probe-$i" --wait=false >/dev/null 2>&1; else w=DOWN; fi
+    if K --request-timeout=$PROBE_TIMEOUT -n scen create configmap "probe-$run-$i" --from-literal=t="$(ts)" >/dev/null 2>&1; then w=up; K --request-timeout=$PROBE_TIMEOUT -n scen delete configmap "probe-$run-$i" --wait=false >/dev/null 2>&1; else w=DOWN; fi
     echo "$(ts) read=$r write=$w" >>"$f"; sleep 1; done; echo "# $(ts) probe end" >>"$f"; }
 plant(){ pause_deploy bystander 1 "      nodeSelector: {}"; }
 before(){ ev zonal before K get --raw /version; ev zonal endpoint G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(endpoint,location,locations)'; }

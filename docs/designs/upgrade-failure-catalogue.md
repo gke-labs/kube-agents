@@ -385,8 +385,9 @@ without anyone changing it.
 - Mitigate after: the audit log names the rejecting rule; relabel the namespace or adjust the pod.
 - Read today: nothing.
 - GKE recommender: only where GKE files the default change as a removal, such as `DEPRECATION_K8S_1_25_PODSECURITYPOLICY`, or `EXEC_PROBE_TIMEOUT` for exec probes that overrun their timeout, which GKE enforces from 1.35.
-- Why it is on the list: the PodSecurityPolicy removal in 1.25; the `gitRepo` volume the kubelet
-  refuses from [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/).
+- Why it is on the list: the PodSecurityPolicy removal in 1.25; the `gitRepo` volume, which the kubelet refuses by
+  default from 1.33 (the reproduction's 1.33 node failed the mount) and
+  [1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/) disables for good.
 
 ### 9. A feature is deprecated but still served
 

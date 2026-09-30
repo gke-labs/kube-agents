@@ -1,1 +1,3 @@
 ## 2026-09-30T19:27:02Z [final/note] precondition not met: no version to move to (NO-PATCH-OFFERED-REGULAR-1.31: the minor is no longer offered on the channel, or the version read failed); stopping
+## 2026-09-30T19:47:51Z [final/note] could not tell whether pool nope exists (ERROR: (gcloud.container.node-pools.describe) ResponseError: code=429, message=Quota exceeded.); stopping
+## 2026-09-30T19:47:51Z [final/note] could not read the cluster's maintenance exclusions; stopping

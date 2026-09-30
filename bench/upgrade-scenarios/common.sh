@@ -76,9 +76,18 @@ upgrade_pool(){ local pool=$1 v=$2 stop="$KCFG_DIR/$CLUSTER.$TRACK.pool-done"; s
 HOLD_DAYS=2
 hold_exclusion(){ has_exclusion hold-recommender && return; retry_busy hold ev hold exclusion G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-recommender --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet ||
   { note final "precondition not met: the maintenance exclusion was not added, so GKE may upgrade the cluster before the Recommender reads it"; exit 1; }; }
-pool_exists(){ G container node-pools describe "$1" --cluster "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1; }
-# has_exclusion <name>: the cluster already carries a maintenance exclusion of that name, which GKE refuses to add twice.
-has_exclusion(){ G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(maintenancePolicy.window.maintenanceExclusions)' | grep -Eq "(^|;)$1="; }
+# pool_exists <pool> / has_exclusion <name>: both key off the describe's exit status. A describe that fails for any reason
+# other than "not found" stops the run: read as "absent", it would lead to a create GKE refuses as a duplicate, and the
+# run would stop on that refusal with a note blaming the wrong thing.
+pool_exists(){ local out; out=$(G container node-pools describe "$1" --cluster "$CLUSTER" --zone "$ZONE" 2>&1) && return 0
+  grep -Eq "code=404|[Nn]ot found|NOT_FOUND" <<<"$out" && return 1; note final "could not tell whether pool $1 exists ($(tail -1 <<<"$out")); stopping"; exit 1; }
+has_exclusion(){ local x; x=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(maintenancePolicy.window.maintenanceExclusions)') ||
+    { note final "could not read the cluster's maintenance exclusions; stopping"; exit 1; }; grep -Eq "(^|;)$1=" <<<"$x"; }
+# attempt_refusal <track> <ev command...>: a cluster change the scenario expects GKE to refuse (10, 10b, 14c ask for a
+# version GKE will not allow). It waits out other operations first and, if the refusal was "incompatible operation"
+# rather than the one the experiment is about, stops the run: that refusal would otherwise be filed as the result.
+attempt_refusal(){ local sc=$1; shift; wait_ops; "$@" && return 0
+  tail -4 "$EVID/$sc.txt" | grep -q "incompatible operation" && { note final "refused because another operation was running, not for the reason under test; stopping"; exit 1; }; return 1; }
 # run_plant <fn>: run a planting function and set PLANT_FAILED=1 if any command in it fails. The function still runs to
 # its end. Bash does not fire the ERR trap inside a function called on the left of || or &&, so call run_plant on a
 # line of its own and test PLANT_FAILED after it.

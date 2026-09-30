@@ -35,7 +35,7 @@ before(){ sleep 60; jvm_state before; }
 break_it(){ local V; V=$(newest_patch REGULAR 1.35)
   upgrade_master "$V"
   note cgroup "attempt the node upgrade of the cgroup v1 pool to $V"
-  ev cgroup pool-upgrade G container clusters upgrade "$CLUSTER" --node-pool "$V1_POOL" --cluster-version "$V" --zone "$ZONE" --quiet
+  attempt_refusal cgroup ev cgroup pool-upgrade G container clusters upgrade "$CLUSTER" --node-pool "$V1_POOL" --cluster-version "$V" --zone "$ZONE" --quiet
   wait_ops; ev cgroup after-upgrade-attempt G container node-pools describe "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --format='value(version,config.effectiveCgroupMode)'
   # Key off the describe's exit status, not its text: a failed describe prints nothing, which would read as "not V1".
   local mode; mode=$(G container node-pools describe "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --format='value(config.effectiveCgroupMode)') ||

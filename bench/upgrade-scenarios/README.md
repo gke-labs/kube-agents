@@ -261,7 +261,8 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
    upgrades only a node pool (a patch inside 1.31), 14c upgrades the control plane, asks for the pool upgrade
    and runs the migration GKE demands, and the holds upgrade nothing. A cluster change that fails stops the run;
    one GKE refuses because another operation is running is retried up to five times first. The refusals 10, 10b
-   and 14c ask for on purpose are the experiment, and are recorded instead.
+   and 14c ask for on purpose are the experiment, and are recorded instead, after any other operation has ended; a
+   refusal because one was still running stops the run rather than standing in for the result.
 4. Records the after-state.
 
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code

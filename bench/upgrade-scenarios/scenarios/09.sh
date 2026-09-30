@@ -48,4 +48,4 @@ Y
 K -n scen delete job first --ignore-not-found >/dev/null; K -n scen create job --from=cronjob/ep-writer first >/dev/null; sleep 40; }
 before(){ ev deprecated-served before K -n scen logs job/first; sleep 30; ev deprecated-served audit G logging read "resource.type=k8s_cluster AND resource.labels.cluster_name=$CLUSTER AND protoPayload.authenticationInfo.principalEmail=\"system:serviceaccount:scen:ep-writer\"" --freshness 1h --limit 2 --format='value(timestamp,protoPayload.methodName,labels."k8s.io/deprecated",labels."k8s.io/removed-release")'; }
 break_it(){ V=$(newest_patch REGULAR 1.35); upgrade_master "$V"; }
-after(){ K -n scen create job --from=cronjob/ep-writer after >/dev/null; sleep 40; ev deprecated-served after K -n scen logs job/after; }
+after(){ K -n scen delete job after --ignore-not-found >/dev/null; K -n scen create job --from=cronjob/ep-writer after >/dev/null || { note final "the after-upgrade writer job was not created; stopping"; exit 1; }; sleep 40; ev deprecated-served after K -n scen logs job/after; }
