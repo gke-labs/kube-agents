@@ -14,8 +14,8 @@
 #
 # Same shape as cluster-agent-healthy-workload-no-finding, which owns the
 # reasoning this file does not repeat: why the fixture is no-pdb-workload
-# (its defect is declarative, so at runtime it is one of the fleet's two
-# healthy workloads, notification-relay in seeded-intent being the other),
+# (its defect is declarative, so at runtime it is one of the fleet's
+# healthy workloads, as notification-relay in seeded-intent is),
 # why the symptom stays off the network (default_deny covers the
 # namespace and pause serves no HTTP), why the missing PodDisruptionBudget
 # is a legitimate mention and not a wrong answer, why the four safeguards

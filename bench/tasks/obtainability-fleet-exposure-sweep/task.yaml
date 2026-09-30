@@ -87,6 +87,10 @@ owner: maintainers
 # docs/designs/bench-fleet-catalog.md.
 fixtures:
   - no-pdb-workload
+  # The second unbudgeted workload and its declaration are what make the
+  # question above have one answer; an owner retiring seeded-intent or the
+  # note has to know this case changes shape too.
+  - declared-no-pdb-workload
 
 verification_spec:
   - name: the-sweep-names-the-workload-it-was-not-told

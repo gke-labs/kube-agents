@@ -91,7 +91,7 @@ whose own rule is that the project is registered last.
 ## The roles
 
 Every fixture but the project-scoped `orphan-disks` sits on one of the three cluster slots. Every in-cluster fixture is on slot `a`, across the
-six seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
+seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
 `seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
 outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift

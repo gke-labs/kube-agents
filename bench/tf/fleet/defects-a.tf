@@ -64,9 +64,9 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
 # so one drain can still take both replicas at once; that is the finding.
 # Asserted by obtainability-planted-pdb and by
 # cluster-agent-healthy-workload-no-finding, which uses this workload for the
-# opposite property: its runtime state is clean, so it is one of the two
-# fixtures (notification-relay in seeded-intent is the other) that let a
-# case ask whether the agent invents a fault. That case
+# opposite property: its runtime state is clean, so it is one of the
+# fixtures (with notification-relay in seeded-intent) that let a case ask
+# whether the agent invents a fault. That case
 # additionally asserts the container image and the absence of a
 # rollout-restart annotation, so it is not only the replica count and the
 # missing budget that are load-bearing here now.

@@ -37,7 +37,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The six seeded workload namespaces and the two defect node pools
+    carries: The seeded namespaces and the two defect node pools
   - slot: b
     suffix: b
     carries: The held-back control plane, and no workloads

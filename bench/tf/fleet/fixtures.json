@@ -42,7 +42,7 @@
           "path": "status.readyReplicas",
           "op": "eq",
           "value": 2,
-          "why": "one of the fleet's two healthy workloads (notification-relay in seeded-intent is the other): cluster-agent-healthy-workload-no-finding asks whether the agent invents a fault, which means something only while both replicas are Running and Ready. On 2026-09-07 they sat Pending and the case could not be read either way"
+          "why": "a healthy workload, as notification-relay in seeded-intent is: cluster-agent-healthy-workload-no-finding asks whether the agent invents a fault, which means something only while both replicas are Running and Ready. On 2026-09-07 they sat Pending and the case could not be read either way"
         },
         {
           "subject": "poddisruptionbudget?",

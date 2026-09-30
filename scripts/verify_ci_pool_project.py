@@ -2438,7 +2438,7 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             warnings=warnings,
         ):
             return CheckResult(name, True, "Not checked", warnings=warnings, read=False)
-        return CheckResult(name, False, details[0], details=details)
+        return CheckResult(name, False, details[0])
     try:
         payload = _load_json(out)
         body = base64.b64decode(payload.get("content") or "").decode("utf-8")

@@ -4230,8 +4230,10 @@ def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
 
     Also called by scripts/verify_ci_pool_project.py (`_note_declaration_problem`),
     which loads this module by path to read a pool repository's declared-intent
-    note exactly as the audit would; renaming this or `parse_declarations`
-    turns that check into "Not checked" pool-wide until it follows.
+    note exactly as the audit would. It also reaches `parse_declarations`,
+    `audit_declarable_checks`, `split_frontmatter`, `OKF_TYPE_KEY`, `DECLARES_KEY`
+    and `DECLARATION_CLUSTER_FIELD`; renaming any of them turns that check into
+    "Not checked" on every operator run until the verifier follows.
 
     Each field goes through `_id_segment`, the reduction `derive_finding_id`
     applies, because the ledger's identity is the standard the join has to
