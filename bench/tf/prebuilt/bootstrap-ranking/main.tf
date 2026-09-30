@@ -64,6 +64,7 @@ locals {
   # Every file the prioritization stage and delivery write, on either pod.
   inventory = join(" ", [for name in [
     "INVENTORY.raw.md",
+    "INVENTORY.raw.md.tmp",
     "INVENTORY.md",
     "INVENTORY.md.tmp",
     "INVENTORY.items.json",
@@ -123,9 +124,21 @@ locals {
     deliver = jobs[ids[1]].get("deliver")
     if deliver != "local":
         sys.exit("%s delivers to %r, not local" % (ids[1], deliver))
-    fd = os.open("${local.state_file}", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump({"jobs": [jobs[i] for i in ids]}, fh)
+    state = "${local.state_file}"
+    if os.path.exists(state):
+        sys.exit("%s exists: delivery is already armed" % state)
+    # Written aside and renamed: every reader takes the state file as proof of
+    # an arm, and the disarm cannot parse a half-written one.
+    tmp = state + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"jobs": [jobs[i] for i in ids]}, fh)
+        os.replace(tmp, state)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     open("${local.home}/.user_aligned", "x").close()
     print("armed")
   EOP

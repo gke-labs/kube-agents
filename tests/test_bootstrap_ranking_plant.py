@@ -173,7 +173,7 @@ if "_jobs_lock" in stdin:
     record("disarm")
     if os.environ.get("DISARM_FAIL") == "1":
         unreachable()
-elif "O_EXCL" in stdin:
+elif "os.replace(tmp, state)" in stdin:
     record("arm")
     if os.environ.get("ARM_FAIL") == "1":
         unreachable()
@@ -411,6 +411,13 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertIn("Plant failed", completed.stderr)
 
     def test_the_card_is_filed_with_the_gates_key_and_assignee(self):
+        gate = (_REPO_ROOT / "agents" / "chat" / "scripts" / "bootstrap_scan_gate.py").read_text()
+        module = _MODULE.read_text()
+        for gate_name, local in (("PRIORITIZE_IDEMPOTENCY_KEY", "card_key"), ("SCAN_ASSIGNEE", "card_assignee")):
+            with self.subTest(local=local):
+                want = re.search(rf'^{gate_name} = "([^"]+)"', gate, re.M).group(1)
+                self.assertEqual(re.search(rf'^\s*{local}\s*=\s*"([^"]+)"', module, re.M).group(1), want)
+                self.assertEqual(_INTERPOLATIONS[f"local.{local}"], want)
         completed, _ = self._run()
         self.assertEqual(completed.returncode, 0, completed.stderr)
         argv = (self._state / "create_argv").read_text().split("\n")
@@ -689,6 +696,22 @@ class ArmDisarmTest(unittest.TestCase):
         self.assertEqual(state.stat().st_mode & 0o777, 0o600)
         self.assertTrue((self._home / ".user_aligned").exists())
         self.assertNotEqual(self._py(self._arm).returncode, 0)
+
+    def test_a_failed_write_leaves_no_state_file_to_wedge_the_next_run(self):
+        # Every reader takes the state file as proof of an arm and hands it to
+        # the disarm, which cannot parse a half-written one.
+        full_disk = (
+            "import json\n"
+            "def dump(obj, fh):\n"
+            "    fh.write('{\"jo')\n"
+            "    raise OSError(28, 'No space left on device')\n"
+            "json.dump = dump\n"
+        )
+        out = self._py(full_disk + self._arm)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
+        self.assertIn("was not armed", self._py(self._disarm).stdout)
+        self.assertEqual(self._py(self._arm).returncode, 0)
 
     def test_disarm_puts_back_the_removed_jobs_and_clears_the_markers(self):
         self.assertEqual(self._py(self._arm).returncode, 0)
