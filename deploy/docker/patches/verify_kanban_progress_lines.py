@@ -156,6 +156,11 @@ check(
     "without it the rolling message loses the board slug and the @-mention",
 )
 check(
+    "the helper is given the card's title",
+    "title=self.title," in NOTIFIER_SOURCE,
+    "without it a KAGE_SLACK_UX plan row shows the card id instead of its title",
+)
+check(
     "the map is hung off the runner, not the per-delivery notification",
     "self.runner, adapter, sub, ev.kind, ev, msg, metadata," in NOTIFIER_SOURCE,
     "_KanbanNotification is rebuilt for every delivery; a map on it forgets "

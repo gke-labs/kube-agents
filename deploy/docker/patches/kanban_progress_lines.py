@@ -307,6 +307,40 @@ def _slack_quiet(sub: dict) -> Any:
         return None
 
 
+def _slack_plan(quiet: Any) -> Any:
+    """``slack_ux_status`` when ``quiet`` says ``KAGE_SLACK_UX`` is on for this Slack card.
+
+    Imported when a delivery runs, for the reason :func:`_slack_quiet` imports
+    its module then; an image without it reads as flag off.
+    """
+    if quiet is None:
+        return None
+    try:
+        from gateway import slack_ux_status
+    except ImportError:
+        return None
+    try:
+        return slack_ux_status if slack_ux_status.enabled() else None
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: reading slack_ux_status failed: %s", exc)
+        return None
+
+
+async def _plan_row(plan: Any, adapter: Any, sub: dict, event_id: int, title: str, line: str) -> bool:
+    try:
+        return bool(await plan.deliver_row(adapter, sub, event_id, title, line))
+    except Exception as exc:  # noqa: BLE001 — fall back to the progress line
+        logger.debug("kanban progress: the plan row for %s failed: %s", sub.get("task_id"), exc)
+        return False
+
+
+async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str) -> None:
+    try:
+        await plan.settle_row(adapter, sub, kind)
+    except Exception as exc:  # noqa: BLE001 — cosmetic, like the rolling settle
+        logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
+
+
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
     if quiet is None:
         return False
@@ -344,6 +378,7 @@ async def deliver(
     metadata: Optional[dict],
     header: str,
     board: Optional[str] = None,
+    title: str = "",
 ) -> Any:
     """Deliver one notifier event, rolling progress into a single message.
 
@@ -368,7 +403,10 @@ async def deliver(
     the notifier's wake step drops it once the wake is admitted for the kind, and
     posts it if the wake raises or never covers the kind, so the thread gets the
     failure at least once. A line that cannot be held is posted. See section 6
-    of ``gateway/kanban_notifier.py``.
+    of ``gateway/kanban_notifier.py``. And the card's progress goes on its row
+    in the thread's plan rather than in a rolling message of its own, with the
+    rolling message as the fallback when the plan cannot be posted; ``title``
+    is the card's, for the row. See ``gateway/slack_ux_status.py``.
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
@@ -378,6 +416,9 @@ async def deliver(
 
     if kind not in ROLLING_KINDS:
         quiet = _slack_quiet(sub)
+        plan = _slack_plan(quiet)
+        if plan is not None:
+            await _settle_plan_row(plan, adapter, sub, kind)
         if entry and entry["message_id"] and entry["lines"]:
             settled = entry["lines"][-1:] if quiet else entry["lines"]
             try:
@@ -407,6 +448,9 @@ async def deliver(
         return result
 
     line = rolling_line(kind, getattr(ev, "payload", None)) or message
+    plan = _slack_plan(_slack_quiet(sub))
+    if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line):
+        return None
     if entry and event_id and event_id <= entry["last_event_id"]:
         # An at-least-once replay of something this process already appended.
         # Reported as delivered so the cursor still advances past it.

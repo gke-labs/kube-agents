@@ -163,10 +163,12 @@ SEND_PATCHED = (
     "        # off the runner: this object is rebuilt for every delivery.\n"
     "        # See gateway/kanban_progress_lines.py. The board slug tells a\n"
     "        # KAGE_SLACK_UX settle reaction which board the card is on\n"
-    "        # (gateway/slack_ux_reactions.py).\n"
+    "        # (gateway/slack_ux_reactions.py), and the title names the\n"
+    "        # card's row in a KAGE_SLACK_UX plan (gateway/slack_ux_status.py).\n"
     "        _send_res = await _progress_deliver(\n"
     "            self.runner, adapter, sub, ev.kind, ev, msg, metadata,\n"
     "            header=self.progress_header, board=self.board_slug,\n"
+    "            title=self.title,\n"
     "        )\n"
 )
 

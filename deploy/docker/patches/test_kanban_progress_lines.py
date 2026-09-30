@@ -842,5 +842,99 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"{BULLET}Checking seeded-a.", with_flag_module.edits[-1][1])
 
 
+class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
+    """KAGE_SLACK_UX on a Slack card: notes go on the thread's plan, not a rolling message.
+
+    ``gateway.slack_ux_status`` is faked: the real one is covered by
+    ``test_slack_ux_status.py``; this pins where deliver() calls it and what
+    it falls back to.
+    """
+
+    def setUp(self):
+        self.rows = []
+        self.settled = []
+        self.flag = True
+        self.plan = True
+        self.takes = True
+        test = self
+
+        async def deliver_row(adapter, sub, event_id, title, line):
+            test.rows.append((sub["task_id"], event_id, title, line))
+            if isinstance(test.takes, Exception):
+                raise test.takes
+            return test.takes
+
+        async def settle_row(adapter, sub, kind):
+            test.settled.append((sub["task_id"], kind))
+
+        async def settle_delegated(adapter, sub, kind, board=None):
+            return None
+
+        reactions = SimpleNamespace(enabled=lambda: test.flag, settle_delegated=settle_delegated)
+        status = SimpleNamespace(enabled=lambda: test.flag and test.plan, deliver_row=deliver_row, settle_row=settle_row)
+        patcher = mock.patch.dict(
+            sys.modules,
+            {
+                "gateway": SimpleNamespace(slack_ux_reactions=reactions, slack_ux_status=status),
+                "gateway.slack_ux_reactions": reactions,
+                "gateway.slack_ux_status": status,
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _run(self, adapter, sub=SLACK_SUB):
+        watcher = SimpleNamespace()
+        for event_id, note in ((1, "Checking seeded-a."), (2, "Reading pod state.")):
+            await deliver(
+                watcher, adapter, sub, "heartbeat", _beat(event_id, note),
+                f"{IN_PROGRESS} {HEADER}{note}", None, HEADER, title="check seeded-a",
+            )
+        return await deliver(
+            watcher, adapter, sub, "completed", _terminal(3), "Both pods are up.", None, HEADER,
+            title="check seeded-a",
+        )
+
+    async def test_notes_go_on_the_plan_and_the_report_is_posted(self):
+        adapter = _Adapter()
+        await self._run(adapter)
+        self.assertEqual(
+            self.rows,
+            [("t_e0c1", 1, "check seeded-a", "Checking seeded-a."), ("t_e0c1", 2, "check seeded-a", "Reading pod state.")],
+        )
+        self.assertEqual(self.settled, [("t_e0c1", "completed")])
+        self.assertEqual([content for _chat, content, _id in adapter.sent], ["Both pods are up."])
+        self.assertEqual(adapter.edits, [])
+
+    async def test_a_plan_that_refuses_falls_back_to_the_rolling_line(self):
+        # The fallback is the flag-on rolling line: the trail settles to its last line.
+        for takes in (False, RuntimeError("boom")):
+            with self.subTest(takes=takes):
+                self.takes = takes
+                refused, without_plan = _Adapter(), _Adapter()
+                await self._run(refused)
+                self.plan = False
+                await self._run(without_plan)
+                self.plan = True
+                self.assertEqual((refused.sent, refused.edits), (without_plan.sent, without_plan.edits))
+                self.assertEqual(refused.edits[-1][1], f"{FINISHED} [default] @platform Reading pod state.")
+
+    async def test_other_platforms_never_reach_the_plan(self):
+        await self._run(_Adapter(), SUB)
+        self.assertEqual((self.rows, self.settled), ([], []))
+
+    async def test_flag_off_posts_exactly_what_it_did_before(self):
+        self.flag = False
+        with_module, without = _Adapter(), _Adapter()
+        await self._run(with_module)
+        with mock.patch.dict(
+            sys.modules,
+            {"gateway": None, "gateway.slack_ux_reactions": None, "gateway.slack_ux_status": None},
+        ):
+            await self._run(without)
+        self.assertEqual((with_module.sent, with_module.edits), (without.sent, without.edits))
+        self.assertEqual((self.rows, self.settled), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()
