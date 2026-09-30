@@ -4,8 +4,10 @@ compiled into the operator to its images.json entry (#1557).
 The operator falls back to a compiled constant whenever an image env var is
 unset; the ones that are inventory entries are the fluent-bit sidecar, and the
 NATS and nats-box images a `spec.mode: next` install renders. The last two
-reach no chart render, so this check is the only one that sees them. (The
-first-party next defaults are not inventory entries and are not checked.) CI only ever runs the script on a tree
+reach no chart render, so this check is the only one that sees them. The
+first-party next defaults (gateway, worker, callout) are release images with
+no fixed tag, so `check_compiled_repository` holds their repository constants
+to the inventory instead; its call sites are pinned below. CI only ever runs the script on a tree
 where the check passes, so its fail path -- and the normalisation that lets a
 constant keep Docker Hub's short spelling against a fully-qualified inventory
 reference -- would otherwise execute nowhere. The function is lifted from the
@@ -41,6 +43,24 @@ _CALL_SITES = (
     "check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage",
     "check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage",
     "check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage",
+    "check_compiled_repository a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AGatewayRepository",
+    "check_compiled_repository a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AWorkerRepository",
+    "check_compiled_repository a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go defaultA2ACalloutRepository",
+    "check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository",
+)
+
+# The repository check's own cases: the exact repository passes; a tag on the
+# constant, a different registry and a missing constant fail.
+_REPO_FUNCTIONS = ("fail", "check_compiled_repository")
+_REPO_NAME = "a2a-gateway"
+_REPO = "ghcr.io/gke-labs/kube-agents/a2a-gateway"
+_REPO_CONSTANT = "defaultA2AGatewayRepository"
+_REPO_CASES = (
+    (f'\t{_REPO_CONSTANT} = "{_REPO}"\n', True, ""),
+    (f'\ta2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"\n\t{_REPO_CONSTANT}   = "{_REPO}" // the published repository\n', True, ""),
+    (f'\t{_REPO_CONSTANT} = "{_REPO}:latest"\n', False, f"is '{_REPO}:latest'"),
+    (f'\t{_REPO_CONSTANT} = "registry.example/mirror/a2a-gateway"\n', False, "is 'registry.example/mirror/a2a-gateway'"),
+    (f'\treturn {_REPO_CONSTANT}\n', False, "<unset>"),
 )
 
 # The inventory the stubs answer from, and the constant every case reads.
@@ -90,6 +110,37 @@ def _run_check(go_source: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
         )
+
+
+def _run_repository_check(go_source: str) -> subprocess.CompletedProcess:
+    text = _SCRIPT.read_text()
+    functions = "".join(lift_function(name, text, _SCRIPT) for name in _REPO_FUNCTIONS)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / _GO_FILE).write_text(f"package controller\n\nconst (\n{go_source})\n")
+        script = (
+            "set -u\nstatus=0\nINVENTORY=images.json\n"
+            f"repo_of() {{ echo {_REPO}; }}\n"
+            + functions
+            + f"check_compiled_repository {_REPO_NAME} {_GO_FILE} {_REPO_CONSTANT}\nexit $status\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
+        )
+
+
+class CheckCompiledRepositoryTest(unittest.TestCase):
+    def test_constant_against_inventory_repository(self):
+        for go_source, expect_pass, fragment in _REPO_CASES:
+            with self.subTest(go_source=go_source):
+                result = _run_repository_check(go_source)
+                if expect_pass:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                else:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(fragment, result.stderr)
+                    self.assertIn(f"has repository '{_REPO}'", result.stderr)
 
 
 class CheckOperatorPinTest(unittest.TestCase):

@@ -106,9 +106,10 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout and worker images from
-#     a2a/Dockerfile.* (the operator's defaults for them name a private dev
-#     registry, #1557, which a leased project cannot pull from) and the Hermes
-#     bridge sidecar image, FROM the platform-agent image of the same build;
+#     a2a/Dockerfile.* (the pull request's own builds, the same way the four
+#     images above are; the operator would otherwise derive released images
+#     from the agent image it resolves) and the Hermes bridge sidecar image, FROM the
+#     platform-agent image of the same build;
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides, and
 #     arms the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
@@ -237,7 +238,7 @@ readonly A2A_GATEWAY_IMAGE_NAME="a2a-gateway"
 readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 # The bridge image goes to the CR as the sidecar's image, not to the operator:
-# no env var, and no images.json entry (hack/check-image-inventory.sh).
+# the operator renders no bridge, so its images.json entry has no override.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
@@ -303,13 +304,15 @@ A2A_OPERATOR_ENV_ARGS=()
 # without being named here. Both plugin images default to enabled=false and are
 # not rendered on either path.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
-  # The release pipeline publishes no A2A images, so there is nothing for
-  # step 5c to point the operator at on this path; refuse the pair here
-  # rather than at the first ImagePullBackOff forty minutes in.
+  # The release pipeline publishes the A2A images beside the others, and the
+  # operator derives the three it renders from the agent image, but this path
+  # still builds no bridge sidecar image and step 6b declares none from
+  # GHCR, so a candidate run under next would come up with nobody consuming
+  # platform tasks; refuse the pair here rather than forty minutes in.
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     echo "ERROR: EVAL_MODE_NEXT=1 is set together with RC_COMMIT_SHA. The mode-next flip needs" >&2
-    echo "       the pull-request build path, which builds the A2A images the operator has to" >&2
-    echo "       be pointed at; a published release candidate carries none." >&2
+    echo "       the pull-request build path, which builds the Hermes bridge sidecar image that" >&2
+    echo "       step 6b declares on the CR; this path does not yet resolve it from the release." >&2
     exit 1
   fi
 
@@ -741,8 +744,8 @@ else
   # one above. Empty otherwise, so the command below is byte-for-byte what it
   # was. The three references go to the operator through operator.extraEnv
   # in step 5: the operator reads its A2A image overrides from its own
-  # environment and otherwise renders defaults from a private dev registry
-  # (#1557), which is what a leased project's nodes fail to pull. The same
+  # environment and otherwise derives the released images from the agent
+  # image it resolves, which is not this pull request's build. The same
   # value list arms the gateway's inject door, which the operator likewise
   # reads from its own environment and never from the CR (a2aInjectBackendEnvVar
   # says why): without it there is no Service for the eval's transport to

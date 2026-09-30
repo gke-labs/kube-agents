@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -175,18 +176,19 @@ const (
 	// its creation in reconcileA2A) and a CR that reads Provisioning for it.
 	a2aCalloutCPULimit    = "500m"
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
-	// The stage 1 dev registry. A dev toggle's default may name a dev
-	// registry; graduation moves this to the release pipeline alongside the
-	// other first-party images.
-	//
-	// The first-party A2A images — this one, the worker below and the auth
-	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) — are not in
-	// images.json, deliberately: this repo builds them and publishes them
-	// only from that dev registry, off the release pipeline the inventory's
-	// first-party entries are copied from. That exemption is graduation debt
-	// alongside the registry move (#1557) — a mirrored or air-gapped install
-	// that flips next must override each of them via the env vars until then.
-	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
+	// The first-party next-stack images the operator renders — this one, the
+	// worker below and the auth callout (platformagent_a2a_callout.go) — are
+	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
+	// beside the other first-party images, images.json carries them (as
+	// a2a-gateway, a2a-worker and a2a-authcallout), and
+	// hack/check-image-inventory.sh holds these repository constants to the
+	// inventory. They resolve through a2aReleaseImage: the env override, else
+	// this repository's name under the registry and tag of OPERATOR_IMAGE,
+	// else of the agent image the operator resolves for itself, else the
+	// published default at the fallback tag. So a chart install at X.Y.Z
+	// pulls these at X.Y.Z, and an install that mirrored the operator has
+	// mirrored these too.
+	defaultA2AGatewayRepository = "ghcr.io/gke-labs/kube-agents/a2a-gateway"
 
 	// The session-pod image, on the same terms as the gateway above. The
 	// gateway binary carries this same default of its own (gateway/config.go),
@@ -299,7 +301,7 @@ const (
 	// on `…events` before it, and refusing those folds every recent task
 	// non-terminal. A flip that needed a new image would not get made.
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
-	defaultA2AWorkerImage       = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
+	defaultA2AWorkerRepository  = "ghcr.io/gke-labs/kube-agents/a2a-worker"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
@@ -672,17 +674,37 @@ func a2aProvisionImage() string {
 }
 
 func a2aGatewayImage() string {
-	if override := os.Getenv(a2aGatewayImageEnvVar); override != "" {
-		return override
-	}
-	return defaultA2AGatewayImage
+	return a2aReleaseImage(a2aGatewayImageEnvVar, defaultA2AGatewayRepository)
 }
 
 func a2aWorkerImage() string {
-	if override := os.Getenv(a2aWorkerImageEnvVar); override != "" {
+	return a2aReleaseImage(a2aWorkerImageEnvVar, defaultA2AWorkerRepository)
+}
+
+// a2aReleaseImage resolves one of the first-party next-stack images: the env
+// override if set; else the repository's name swapped into OPERATOR_IMAGE,
+// the rung resolveShellSandboxImage uses and for the same reason - the
+// gateway, the callout and the worker consume what the operator renders (the
+// identity map, the env, the spawn spec), so their version contract is with
+// the operator, and OPERATOR_IMAGE is set once per install by whoever
+// installed it (the chart, or main.go's discovery from the pod spec); else
+// the same swap on the agent image the operator resolves for itself
+// (defaultPlatformAgentImage: PLATFORM_AGENT_IMAGE, which the chart pins to
+// the release or the mirror, else the published default at the fallback
+// tag). One workflow builds all of these from one commit, so either tag names
+// the matching build of each, and a mirror that carries the operator or the
+// agent image carries these under the same prefix. Never a CR's
+// spec.deployment.image: a custom agent image is that agent's choice, and the
+// bus components are not. The three env vars stay the override for an
+// install that pins one apart.
+func a2aReleaseImage(envVar, repository string) string {
+	if override := os.Getenv(envVar); override != "" {
 		return override
 	}
-	return defaultA2AWorkerImage
+	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" {
+		return deriveImageFromOperator(opImg, path.Base(repository))
+	}
+	return deriveImageFromOperator(defaultPlatformAgentImage(), path.Base(repository))
 }
 
 // a2aStrictEventsWriter renders "false" for anything but an explicit "true",

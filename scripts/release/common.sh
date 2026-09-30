@@ -64,6 +64,10 @@ export REQUIRED_RELEASE_IMAGES=(
   "replay-proxy"
   "pubsub-platform"
   "gke-stockout-investigator"
+  "a2a-gateway"
+  "a2a-worker"
+  "a2a-authcallout"
+  "hermes-bridge"
 )
 
 # Declarative registry of release bundle directories, root files, and Helm charts

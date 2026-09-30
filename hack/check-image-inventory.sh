@@ -151,15 +151,12 @@ check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
 check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
-# The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) is deliberately NOT
-# an inventory entry, and only its builder base is checked. This script guards
-# the images an install pulls; the bridge is an eval-only image that
-# deploy/docker/cloudbuild-ci.yaml builds under EVAL_MODE_NEXT=1 for the
-# presubmit's install and nothing else pulls (a2a/docs/hermes-bridge.md,
-# provenance; the A2A owner's condition on #1661). Its runtime base is the
-# platform-agent image of the same build, passed as a build arg with no
-# default, so there is no runtime pin here to compare against either. It
-# joins the inventory at stage-2 graduation, if it graduates.
+# The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge) has only its
+# builder base to compare: its runtime base is the platform-agent image of the
+# same build, passed as a build arg with no default, so there is no runtime
+# pin in the Dockerfile. The image itself is a first-party inventory entry
+# (hermes-bridge), published by the release workflow beside the three A2A
+# images.
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
@@ -243,9 +240,11 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
-#    The first-party next defaults (gateway, worker, callout) fit the same
-#    description and are deliberately not here: they are not inventory
-#    entries, so there is nothing to hold them to until the stack graduates.
+#    The first-party next defaults (gateway, worker, callout) are release
+#    images with no fixed tag in the inventory, so the operator compiles in
+#    the repository alone and takes registry and tag from the agent image it
+#    resolves; the second check below holds each repository constant to the
+#    inventory exactly.
 # ---------------------------------------------------------------------------
 check_operator_pin() {
   local name=$1 gofile=$2 constant=$3
@@ -259,6 +258,24 @@ check_operator_pin() {
 check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage
 check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
 check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
+
+# A compiled repository for a release image: the constant must be the
+# inventory's repository, character for character, since the tag is not the
+# constant's to know. The gateway binary keeps its own copy of the worker
+# repository for a run outside the operator, held on the same terms.
+check_compiled_repository() {
+  local name=$1 gofile=$2 constant=$3
+  local want got
+  want="$(repo_of "$name")"
+  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  [ "$got" = "$want" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has repository '$want' for '$name'."
+}
+
+check_compiled_repository a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AGatewayRepository
+check_compiled_repository a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AWorkerRepository
+check_compiled_repository a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go defaultA2ACalloutRepository
+check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
 # 3. The chart. Rendering it is the only way to see what it actually pulls:

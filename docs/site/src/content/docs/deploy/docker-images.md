@@ -11,23 +11,27 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker and the auth callout.
-The last three are deliberately absent: this repo builds them, and today publishes them only from
-a dev registry, off the release pipeline, so until the stack graduates their pins live as defaults
-on the operator's `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` env vars, and a
-mirrored or air-gapped install that flips `next` has to override each of them. That graduation
-decision is still open. NATS and nats-box are ordinary third-party pins and are in the table below
-as `nats` and `nats-box`, so `make mirror-images` copies them. The chart does not set their env
-vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the
-copies by hand.
+The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout and
+the Hermes bridge sidecar, and each is in the tables below. The first-party ones (`a2a-gateway`,
+`a2a-worker`, `a2a-authcallout`, `hermes-bridge`) are built and tagged with the rest of the
+release. The operator derives the three it renders from its own image (`OPERATOR_IMAGE`, which
+the chart sets beside `PLATFORM_AGENT_IMAGE`), else from the agent image it resolves for itself:
+the same registry and tag, so an install at a release pulls them at that release and a mirrored
+install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
+them;
+`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` on the operator override one at a
+time. The bridge is
+built from the `platform-agent` image of the same commit and is declared on the `PlatformAgent`
+as a sidecar rather than rendered by the operator, so it has no operator override: the sidecar's
+image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
+table as `nats` and `nats-box`, so `make mirror-images` copies them; the chart does not set their
+env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at
+the copies by hand.
 
-The exemption covers those published images, not the bases they are built from. `golang`, `node`
-and `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
+The bases those images are built from are inventory entries too. `golang`, `node` and
+`distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
 `a2a/Dockerfile.gateway`, `a2a/Dockerfile.worker` and `a2a/Dockerfile.hermes-bridge` alongside
-every other builder, because an override of `A2A_WORKER_IMAGE` names an image someone still has
-to build, and a build in a mirrored environment has to resolve its bases like any other. The
-bridge image itself is built only for the evaluation pipeline, from the platform-agent image of
-the same build, and is not in the inventory.
+every other builder, so a build in a mirrored environment can resolve them like any other.
 
 Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
 `ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
@@ -51,6 +55,10 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
 | `gke-stockout-investigator` | `ghcr.io/gke-labs/kube-agents/gke-stockout-investigator` | release tag | — | The gke-stockout-investigator AgentPlugin. |
+| `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way. |
+| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. |
+| `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install. |
+| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | — | The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's. |
 
 ### Pulled by an install, built elsewhere
 
@@ -91,7 +99,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — every image except `k8s-operator` — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
+Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — not `k8s-operator`, and not the four A2A `next`-stack images, which are published to GHCR alone — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
 
 ### `platform-agent`
 
@@ -253,7 +261,9 @@ when a prefix is in effect:
 
 `CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives the broker image from the agent image
 by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
-on its own. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
+`a2a-authcallout`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
+no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.
 

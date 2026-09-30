@@ -37,6 +37,7 @@ what makes them worth their own tests rather than a line in review:
 import fnmatch
 import importlib.util
 import pathlib
+import re
 import subprocess
 import sys
 import unittest
@@ -780,6 +781,36 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
                 for line in tag_lines:
                     if ":latest" in line:
                         self.assertIn("github.ref == 'refs/heads/main'", line)
+
+    _RELEASE_COMMON = _REPO_ROOT / "scripts" / "release" / "common.sh"
+    _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([a-z0-9-]+):\$\{\{ github\.sha \}\}")
+    _OPERATOR_SHA_TAG_RE = re.compile(r"ghcr\.io/[^/\s]+/([a-z0-9-]+):\$\{\{ github\.sha \}\}")
+    _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([a-z0-9-]+)@\$")
+
+    def test_the_workflow_builds_and_signs_exactly_the_required_release_images(self):
+        """The three lists this workflow and the release ladder share are kept by
+        hand: the build steps, the cosign loop and REQUIRED_RELEASE_IMAGES. An
+        image in the list but not the workflow makes check_commit_images_exist
+        refuse every commit; one in the workflow but not the sign loop ships
+        unsigned. So the names the steps tag with :<sha> must equal the array,
+        and each must be signed once."""
+        common = self._RELEASE_COMMON.read_text()
+        block = re.search(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", common, re.S)
+        self.assertIsNotNone(block, "REQUIRED_RELEASE_IMAGES not found in common.sh")
+        required = set(re.findall(r'"([a-z0-9-]+)"', block.group(1)))
+        built = set()
+        signed = []
+        for job in self.jobs.values():
+            for step in job.get("steps") or []:
+                if str(step.get("uses", "")).startswith("docker/build-push-action@"):
+                    tags = str(step["with"]["tags"])
+                    built.update(self._SHA_TAG_RE.findall(tags))
+                    built.update(self._OPERATOR_SHA_TAG_RE.findall(tags))
+                if "cosign sign" in str(step.get("run", "")):
+                    signed.extend(self._COSIGN_RE.findall(str(step["run"])))
+        self.assertEqual(built, required, "workflow build steps and REQUIRED_RELEASE_IMAGES disagree")
+        self.assertEqual(sorted(signed), sorted(required), "cosign loop and REQUIRED_RELEASE_IMAGES disagree")
+        self.assertEqual(len(signed), len(set(signed)), "an image is signed twice")
 
 
 class ReleaseBotTokenWiringTest(unittest.TestCase):

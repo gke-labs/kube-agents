@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -95,8 +94,10 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 const a2aIdentityMapSchema = "2"
 
 const (
-	defaultA2ACalloutImage = "us-east4-docker.pkg.dev/bnaylor-kagents-dev/kube-agents/a2a-authcallout:dev"
-	a2aCalloutImageEnvVar  = "A2A_CALLOUT_IMAGE"
+	// Release surface, resolved by a2aReleaseImage like the gateway and the
+	// worker (the comment on defaultA2AGatewayRepository says how).
+	defaultA2ACalloutRepository = "ghcr.io/gke-labs/kube-agents/a2a-authcallout"
+	a2aCalloutImageEnvVar       = "A2A_CALLOUT_IMAGE"
 
 	// a2aBusTokenAudience is the audience every bus token is bound to.
 	//
@@ -122,10 +123,7 @@ const (
 )
 
 func a2aCalloutImage() string {
-	if override := os.Getenv(a2aCalloutImageEnvVar); override != "" {
-		return override
-	}
-	return defaultA2ACalloutImage
+	return a2aReleaseImage(a2aCalloutImageEnvVar, defaultA2ACalloutRepository)
 }
 
 // a2aBusTokenVolumeSource is the projected token every callout-authenticated

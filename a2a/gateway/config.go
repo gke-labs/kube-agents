@@ -38,6 +38,16 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 // the inject: prefix and a colon is not a legal ConfigMap key.
 const defaultInjectPrincipalMapPath = "/etc/a2a/inject-principal-map/principals"
 
+// The session-pod image when A2A_WORKER_IMAGE is unset, which is only a
+// gateway run outside the operator: the operator renders that env from its
+// own resolution (a2aWorkerImage in platformagent_a2a_manifests.go), and
+// hack/check-image-inventory.sh holds this repository to images.json's
+// a2a-worker entry.
+const (
+	defaultWorkerRepository = "ghcr.io/gke-labs/kube-agents/a2a-worker"
+	defaultWorkerTag        = "latest"
+)
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -323,7 +333,7 @@ func FromEnv() (*Config, error) {
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
-		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
