@@ -128,7 +128,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Store:
     s = Store(tmp_path)
     monkeypatch.setattr(onboarding, "COMPLETED_MARKER", str(s.marker))
     monkeypatch.setattr(onboarding, "EXECUTIONS_DB", str(s.db))
-    monkeypatch.setattr(onboarding, "AGENT_PYTHON", sys.executable)
+    monkeypatch.setattr(onboarding, "HERMES_PYTHON", sys.executable)
     monkeypatch.setattr(onboarding, "agent_shell", _local_shell)
     return s
 
@@ -203,8 +203,21 @@ def test_a_reply_without_the_sentinel_or_the_json_is_a_failed_read(reply: str) -
     assert onboarding.read_delivery_runs(lambda s, t: reply, 5.0) is None
 
 
-def test_the_read_runs_the_agents_interpreter() -> None:
-    assert onboarding.runs_command().startswith(onboarding.AGENT_PYTHON + " -c ")
+def test_the_read_runs_the_agents_interpreter_and_falls_back_as_the_other_reads_do() -> None:
+    cmd = onboarding.runs_command()
+    assert cmd.startswith(f"PY={onboarding.HERMES_PYTHON}; ")
+    assert f"|| PY={onboarding.FALLBACK_PYTHON}; " in cmd
+
+
+def test_the_read_falls_back_when_the_agents_interpreter_is_missing(
+    store: Store, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(onboarding, "HERMES_PYTHON", str(tmp_path / "no-such-python"))
+    monkeypatch.setattr(onboarding, "FALLBACK_PYTHON", sys.executable)
+    store.claim()
+    read = onboarding.read_delivery_runs(onboarding.agent_shell, 10.0)
+    assert read is not None
+    assert read["marker"] == pytest.approx(CLAIM.timestamp())
 
 
 # --- the objective --------------------------------------------------------

@@ -37,6 +37,8 @@ import subprocess
 from collections.abc import Callable
 from typing import Any, Literal
 
+from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
+
 __all__ = [
     "COMPLETED_MARKER",
     "DELIVERED_FILE",
@@ -66,7 +68,7 @@ DEFAULT_AGENT_NAMESPACE = "kubeagents-system"
 DEFAULT_AGENT_CONTAINER = "platform-agent"
 
 # agents/platform/scripts/inventory_findings.py: DEFAULT_ITEMS_PATH.
-ITEMS_FILE = "/opt/data/INVENTORY.items.json"
+ITEMS_FILE = f"{DATA_ROOT}/INVENTORY.items.json"
 ITEMS_PRESENT = "__INVENTORY_ITEMS_PRESENT__"
 ITEMS_ABSENT = "__INVENTORY_ITEMS_ABSENT__"
 # Far above what a first scan extracts. A file past it fails the check rather
@@ -77,9 +79,9 @@ ItemsState = Literal["present", "absent", "error"]
 
 # agents/chat/scripts/bootstrap_delivery.py: the marker it writes on the agent
 # pod when it claims the report, and the sandbox names it reads and archives.
-COMPLETED_MARKER = "/opt/data/.bootstrap_completed"
-REPORT_FILE = "/opt/data/INVENTORY.md"
-DELIVERED_FILE = "/opt/data/INVENTORY.delivered.md"
+COMPLETED_MARKER = f"{DATA_ROOT}/.bootstrap_completed"
+REPORT_FILE = f"{DATA_ROOT}/INVENTORY.md"
+DELIVERED_FILE = f"{DATA_ROOT}/INVENTORY.delivered.md"
 FILES_READ = "__ONBOARDING_FILES_READ__"
 FILE_PRESENT = "present"
 FILE_ABSENT = "absent"
@@ -88,8 +90,7 @@ FILE_ABSENT = "absent"
 # DELIVERY_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
 # the agent's own interpreter: the agent image ships no sqlite3 binary.
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
-EXECUTIONS_DB = "/opt/data/cron/executions.db"
-AGENT_PYTHON = "/opt/hermes/.venv/bin/python3"
+EXECUTIONS_DB = f"{DATA_ROOT}/cron/executions.db"
 RUNS_READ = "__ONBOARDING_RUNS_READ__"
 # The job ticks every minute, so this reaches back several hours from the
 # newest run: far past the claim in any case that just ran.
@@ -231,8 +232,11 @@ def read_files(shell: Callable[[str, float], str], paths: list[str], timeout: fl
 
 def runs_command() -> str:
     """The ``sh -c`` line that runs the executions read in the agent container."""
-    argv = [AGENT_PYTHON, "-c", _RUNS_SCRIPT, COMPLETED_MARKER, EXECUTIONS_DB, DELIVERY_JOB_ID, str(MAX_RUNS), RUNS_READ]
-    return " ".join(shlex.quote(a) for a in argv)
+    args = " ".join(shlex.quote(a) for a in [COMPLETED_MARKER, EXECUTIONS_DB, DELIVERY_JOB_ID, str(MAX_RUNS), RUNS_READ])
+    return (
+        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(_RUNS_SCRIPT)} {args}'
+    )
 
 
 def read_delivery_runs(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:

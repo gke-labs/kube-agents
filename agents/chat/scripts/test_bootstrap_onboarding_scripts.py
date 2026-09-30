@@ -53,6 +53,7 @@ DELIVERED = "INVENTORY.delivered.md"
 ALIGNED = ".user_aligned"
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
+UNANSWERED = ".bootstrap_sandbox_unanswered"
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -353,7 +354,52 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.assertEqual((rc, out), (0, ""))
                 self.assertIn("did not answer", err)
                 self.assertFalse((self.d / COMPLETED).exists())
+                self.assertTrue((self.d / UNANSWERED).exists())
                 self.run_.assert_not_called()
+
+    def test_a_sandbox_gone_past_the_limit_fails_the_run(self):
+        # A rejected key or a config with no ssh_host raises the same
+        # SandboxUnavailable as a rolling pod, and never clears on its own.
+        self.read.side_effect = sandbox_exec.SandboxUnavailable("Permission denied (publickey)")
+        marker = self.d / UNANSWERED
+        marker.touch()
+        since = time.time() - bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS - 1
+        os.utime(marker, (since, since))
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("has not answered for", err)
+        self.assertIn("Permission denied (publickey)", err)
+        self.assertFalse((self.d / COMPLETED).exists())
+        # The first unanswered read's time is kept, not moved on.
+        self.assertAlmostEqual(marker.stat().st_mtime, since, delta=1)
+
+    def test_a_sandbox_inside_the_limit_stays_silent(self):
+        self.read.side_effect = sandbox_exec.SandboxUnavailable("Connection refused")
+        marker = self.d / UNANSWERED
+        marker.touch()
+        since = time.time() - bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS + 60
+        os.utime(marker, (since, since))
+        rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, ""))
+
+    def test_a_read_the_sandbox_answers_restarts_the_limit(self):
+        since = time.time() - bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS - 1
+        for answered in (
+            {"return_value": None},
+            {"side_effect": sandbox_exec.SandboxReadFailed("/opt/data/INVENTORY.md is not a readable regular file")},
+        ):
+            with self.subTest(answered=answered):
+                marker = self.d / UNANSWERED
+                marker.touch()
+                os.utime(marker, (since, since))
+                self.read.reset_mock(return_value=True, side_effect=True)
+                self.read.configure_mock(**answered)
+                self._run()
+                self.assertFalse(marker.exists())
+                self.read.configure_mock(side_effect=sandbox_exec.SandboxUnavailable("Connection refused"))
+                rc, out, _ = self._run()
+                self.assertEqual((rc, out), (0, ""))
+                marker.unlink()
 
     def test_a_sandbox_report_that_cannot_be_read_is_a_failure(self):
         # The local path exits 1 on an unreadable report; the sandbox path must
