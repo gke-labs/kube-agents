@@ -2260,8 +2260,8 @@ class _WakeNotAccepted(Exception):
 
 
 class _Ev:
-    def __init__(self, id, kind):
-        self.id, self.kind, self.payload = id, kind, None
+    def __init__(self, id, kind, payload=None):
+        self.id, self.kind, self.payload = id, kind, payload
 
 
 class _Delivery:
@@ -2418,21 +2418,29 @@ class DeliverEndToEndTest(unittest.TestCase):
         self.assertIn("dropping the held gave_up line", "\n".join(logs.output))
         self.assertFalse(getattr(delivery.runner, HELD_ATTR, None))
 
-    def test_flag_on_a_later_comment_leaves_the_line_for_a_raising_wake(self):
-        # As above, but the card's next event is a comment, not a completion:
-        # the failure is still news, and the raised wake must tell it.
+    def test_flag_on_a_review_handoff_also_drops_the_held_line(self):
+        delivery, _ = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        delivery.events.append(_Ev(8, "review_requested"))
+        delivery.wake_outcomes.append(RuntimeError("profile gone"))
+        with self.assertLogs("gateway.run", level="WARNING"):
+            delivery.tick()
+        self.assertNotIn("✖ card gave_up", [m for _, m, _ in delivery.adapter.sent])
+
+    def test_flag_on_a_later_move_leaves_the_line_for_a_raising_wake(self):
+        # As above, but the card's next event moves it back to running, not
+        # to done: the failure is still news, and the raised wake must tell it.
         delivery, sent = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
-        delivery.events.append(_Ev(8, "commented"))
+        delivery.events.append(_Ev(8, "status", {"status": "running"}))
         delivery.wake_outcomes.append(RuntimeError("profile gone"))
         delivery.tick()
         self.assertEqual([m for _, m, _ in delivery.adapter.sent].count("✖ card gave_up"), 1)
         self.assertFalse(getattr(delivery.runner, HELD_ATTR, None))
 
     def test_flag_on_a_raising_wake_tells_a_failure_followed_in_its_batch(self):
-        # One batch, a crash then a comment, and the wake raises.
+        # One batch, a crash then a move back to running, and the wake raises.
         _, sent = self.run_ticks(
             patch_tree(UPSTREAM_NOTIFIER), True, [RuntimeError("profile gone")],
-            events=[_Ev(7, "crashed"), _Ev(8, "commented")],
+            events=[_Ev(7, "crashed"), _Ev(8, "status", {"status": "running"})],
         )
         self.assertIn("✖ card crashed", sent)
 

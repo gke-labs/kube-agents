@@ -217,6 +217,10 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # text cap all degrade to one-message-per-note, which is exactly what shipped
 # before and so looks like nothing is wrong. verify_kanban_progress_lines.py
 # therefore drives the patched runtime rather than grepping it.
+# With KAGE_SLACK_UX on, a Slack card's message settles to its last line, a
+# failure the wake will explain is held, and a recovery drops a held line; for
+# those it imports gateway/kanban_notifier.py at delivery time, a file copied in
+# further down, so an image without it reads as flag off.
 # The _WAKE_KINDS grep below pins upstream's module-level tuple as upstream
 # text, and nothing more: apply_kanban_notifier.py further down this stage
 # wraps the line that reads the tuple, not the tuple itself, so it is still in
