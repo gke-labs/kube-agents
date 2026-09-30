@@ -45,10 +45,9 @@ ADAPTER = "plugins/platforms/slack/adapter.py"
 RUNTIME = "gateway/slack_ux_reactions.py"
 FLAG_ENV = "KAGE_SLACK_UX"
 
-HOOKS = {
-    "on_processing_start": "on_processing_start",
-    "on_processing_complete": "on_processing_complete",
-}
+#: The adapter hooks the patch guards; each guard calls the runtime's function
+#: of the same name.
+HOOKS = ("on_processing_start", "on_processing_complete")
 GUARD_ALIAS = "_kage_slack_ux"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_reactions"
@@ -121,12 +120,12 @@ def check_adapter(root: Path) -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.AsyncFunctionDef) and node.name in HOOKS
     }
-    for name, target in HOOKS.items():
+    for name in HOOKS:
         node = hooks.get(name)
         if node is None:
             raise _fail(f"{ADAPTER} has no async def {name}()")
         body = node.body
-        if len(body) < 3 or not _is_guard(body[1], target):
+        if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
         upstream = ast.Module(body=body[2:], type_ignores=[])
         if not any(

@@ -111,18 +111,21 @@ BLOCKED = "blocked"
 
 class _Turn:
     """A turn in flight: its thread, the thread's open cards when it started,
-    and the cards that finished while it ran, each with whether it failed.
+    the cards that finished while it ran, each with whether it failed, and the
+    cards that paused while it ran.
 
-    Only finishes seen during the turn count, so nothing a card did before this
-    turn, or after an earlier one, decides this ask.
+    Only events seen during the turn count, so nothing a card did before this
+    turn, or after an earlier one, decides this ask. A pause is kept because
+    its ask is not deferred yet, so nothing else would put ⏸️ on it.
     """
 
-    __slots__ = ("before", "finished", "key")
+    __slots__ = ("before", "finished", "key", "paused")
 
     def __init__(self, key: tuple, before: dict | None) -> None:
         self.key = key
         self.before = before
         self.finished: dict[tuple[str, str], bool] = {}
+        self.paused: set[tuple[str, str]] = set()
 
 
 class _Ask:
@@ -279,6 +282,9 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
                     chat_id, thread_id, len(asks) - DEFERRED_PER_THREAD,
                 )
             _remember(_deferred, (chat_id, thread_id), asks[-DEFERRED_PER_THREAD:], DEFERRED_MAX)
+            if waiting & turn.paused:
+                blocked = _presenter.settle_reaction(_presenter.SETTLE_BLOCKED)
+                await adapter._react(chat_id, ts, blocked, team_id, remove=False)
             return
         if failed:
             settle = _presenter.SETTLE_FAILED
@@ -302,10 +308,13 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     card = (board or DEFAULT_BOARD, sub["task_id"])
     key = (sub.get("chat_id"), str(sub.get("thread_id") or ""))
     provisional = settle in _presenter.PROVISIONAL_SETTLES
-    if not provisional:
-        for turn in _started.values():
-            if turn.key == key:
-                turn.finished[card] = settle == _presenter.SETTLE_FAILED
+    for turn in _started.values():
+        if turn.key != key:
+            continue
+        if provisional:
+            turn.paused.add(card)
+        else:
+            turn.finished[card] = settle == _presenter.SETTLE_FAILED
     asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
     if not asks or not hasattr(adapter, "_react"):
         return
