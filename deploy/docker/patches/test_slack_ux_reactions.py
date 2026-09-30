@@ -110,9 +110,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _cards(*ids, board="default", status="running"):
-    """A board read: open cards as ``{(board, id): status}``."""
-    return {(board, task): status for task in ids}
+def _cards(*ids, board="default", status="running", resumes=0):
+    """A board read: open cards as ``{(board, id): _Card}``."""
+    return {(board, task): runtime._Card(status, resumes) for task in ids}
 
 
 class _Root:
@@ -434,12 +434,33 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(log[-1], ("111.002", "white_check_mark"))
 
     def test_a_resumed_card_that_gives_up_within_the_turn_fails_it(self):
-        # Blocked at the start, run and parked at blocked again before the end.
+        # Blocked at the start, unblocked, and parked at blocked again before the end.
         adapter = _Stub()
-        blocked = _cards("t_a", status="blocked")
-        self._turn_racing("try again", blocked, blocked, [("t_a", "gave_up")], adapter)
+        before, after = _cards("t_a", status="blocked", resumes=7), _cards("t_a", status="blocked", resumes=9)
+        self._turn_racing("try again", before, after, [("t_a", "gave_up")], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("x", False)])
         self.assertFalse(runtime._deferred)
+
+    def test_a_give_up_from_before_the_turn_reported_during_it_is_not_the_turns(self):
+        # The card was parked before the ask arrived; the notifier's report lags.
+        adapter = _Stub()
+        blocked = _cards("t_a", status="blocked", resumes=7)
+        self._turn_racing("why?", blocked, blocked, [("t_a", "gave_up")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+
+    def test_a_resumed_card_that_blocks_again_within_the_turn_pauses_the_ask(self):
+        adapter = _Stub()
+        before, after = _cards("t_a", status="blocked"), _cards("t_a", status="blocked", resumes=3)
+        self._turn_racing("yes, go ahead", before, after, [("t_a", "blocked")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("double_vertical_bar", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
+        self.assertEqual(adapter.calls[-1], ("x", False))
+
+    def test_a_blocked_card_that_completes_within_the_turn_is_its(self):
+        # Completed from blocked means resumed first; the card is closed at the end.
+        adapter = _Stub()
+        self._turn_racing("yes, go ahead", _cards("t_a", status="blocked"), {}, [("t_a", "completed")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
 
     def test_a_card_that_blocks_before_the_turn_ends_pauses_the_ask(self):
         adapter = _Stub()
@@ -535,13 +556,15 @@ class OpenCardsQueryTest(unittest.TestCase):
         conn.executescript(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);"
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
+            "INSERT INTO task_events VALUES (1,'b','unblocked'),(2,'b','blocked'),(3,'b','unblocked'),(4,'a','blocked');"
             "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready');"
             "INSERT INTO kanban_notify_subs VALUES"
             " ('a','slack','C1','111.000'),('b','slack','C1','111.000'),('c','slack','C1','111.000'),"
             " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000');"
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
-        self.assertEqual(sorted(rows), [("a", "running"), ("b", "blocked")])
+        self.assertEqual(sorted(rows), [("a", "running", 0), ("b", "blocked", 3)])
 
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
@@ -583,11 +606,11 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(default).touch()
         Path(b2).touch()
         paths = {"default": default, "alias": default, "b2": b2}
-        rows = {default: [("t_a", "running")], b2: [("t_b", "running"), ("t_c", "blocked")]}
+        rows = {default: [("t_a", "running", 0)], b2: [("t_b", "running", 0), ("t_c", "blocked", 5)]}
         reads = []
         with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, reads)):
             found = runtime._query_open_cards("C1", "111.000")
-        self.assertEqual(found, {("default", "t_a"): "running", ("b2", "t_b"): "running", ("b2", "t_c"): "blocked"})
+        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", resumes=5)})
         self.assertEqual([path for path, _ in reads], [default, b2])
         self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
 
@@ -596,9 +619,9 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(good).touch()
         reads = []
         paths = {"default": good, "b3": absent}
-        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running")]}, reads)):
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", 0)]}, reads)):
             found = runtime._query_open_cards("C1", "111.000")
-        self.assertEqual(found, {("default", "t_a"): "running"})
+        self.assertEqual(found, _cards("t_a"))
         # b3 has no database: never connected to, so never created.
         self.assertEqual([path for path, _ in reads], [good])
 
@@ -608,7 +631,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         good, bad = self._databases("good.db", "bad.db")
         Path(good).touch()
         Path(bad).touch()
-        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running")]}, [], broken={"b2"})
+        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", 0)]}, [], broken={"b2"})
         with mock.patch.dict(sys.modules, hermes):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
         hermes["hermes_cli.kanban_db"].list_boards = mock.Mock(side_effect=RuntimeError("locked"))

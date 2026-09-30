@@ -56,7 +56,7 @@ import logging
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +80,12 @@ PLATFORM = "slack"
 DEFAULT_BOARD = "default"
 
 #: Cards subscribed to one Slack thread that have not reached a final status,
-#: with that status. ``blocked`` counts as open: it waits on the user and will
-#: run on.
+#: with that status and the id of the card's latest ``unblocked`` event (0 for
+#: none). ``blocked`` counts as open: it waits on the user and will run on.
 OPEN_CARDS_SQL = (
-    "SELECT s.task_id, t.status FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+    "SELECT s.task_id, t.status, "
+    "(SELECT COALESCE(MAX(e.id), 0) FROM task_events e WHERE e.task_id = s.task_id AND e.kind = 'unblocked') "
+    "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"
 )
@@ -104,9 +106,18 @@ DEFERRED_PER_THREAD = 32
 #: The notifier's dedup key for a board whose database path does not resolve.
 UNRESOLVED_PREFIX = "slug:"
 
-#: A card waiting on the user, or parked after giving up. A turn that moves one
-#: of its thread's cards out of this status resumed it.
+#: A card waiting on the user, or parked after giving up. A turn that unblocks
+#: one of its thread's cards resumed it.
 BLOCKED = "blocked"
+
+
+class _Card(NamedTuple):
+    """An open card as one board read saw it."""
+
+    status: str
+    #: The id of its latest ``unblocked`` event: a higher one at the end of a
+    #: turn than at the start means the card was resumed during the turn.
+    resumes: int = 0
 
 
 class _Turn:
@@ -129,7 +140,7 @@ class _Turn:
 
 
 class _Ask:
-    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``."""
+    """A Slack ask whose settle waits on the cards its turn opened or resumed, as ``(board, id)``."""
 
     __slots__ = ("cards", "failed", "team_id", "ts")
 
@@ -167,7 +178,7 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
 
 
 def _query_open_cards(chat_id: str, thread_id: str) -> dict:
-    """Every open card subscribed to this thread, on every live board, as ``{(board, id): status}``.
+    """Every open card subscribed to this thread, on every live board, as ``{(board, id): _Card}``.
 
     Boards are walked as the notifier walks them: one read per database, under
     the slug the notifier stamps on that database's deliveries. So a card read
@@ -201,12 +212,12 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
             rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
         finally:
             conn.close()
-        cards.update(((slug, row[0]), row[1]) for row in rows)
+        cards.update(((slug, row[0]), _Card(row[1], row[2])) for row in rows)
     return cards
 
 
 async def open_cards(chat_id: str, thread_id: str) -> dict | None:
-    """The thread's open cards as ``{(board, id): status}``, or None when the boards cannot be read."""
+    """The thread's open cards as ``{(board, id): _Card}``, or None when the boards cannot be read."""
     try:
         return await asyncio.to_thread(_query_open_cards, chat_id, thread_id)
     except Exception as exc:  # noqa: BLE001 — a cosmetic read never fails a turn
@@ -222,16 +233,23 @@ def _where(event: Any) -> tuple[str | None, str]:
 def _own_cards(before: dict, after: dict, finished: dict) -> set:
     """The cards this turn answers for: opened during it, or resumed from ``blocked``.
 
-    A card open at the end counts if it was not open at the start, or has left
-    ``blocked`` since. A card that finished during the turn counts if it was
-    not open at the start, or was blocked then: a blocked card only runs, and
-    so only finishes, once something resumes it.
+    A card open at the end, or finished during the turn, counts if it was not
+    open at the start. One blocked at the start counts if it was unblocked
+    since: its unblock cursor moved, or it is no longer blocked, or it finished
+    and is closed, which a blocked card only does once resumed. A card still
+    blocked with no new unblock is not the turn's, even if a ``gave_up`` it
+    reached before the turn started is only reported during it.
     """
-    opened = {
-        card for card, status in after.items()
-        if card not in before or (before[card] == BLOCKED and status != BLOCKED)
-    }
-    return opened | {card for card in finished if before.get(card, BLOCKED) == BLOCKED}
+    opened = {card for card in (*after, *finished) if card not in before}
+    for card, was in before.items():
+        if was.status != BLOCKED:
+            continue
+        now = after.get(card)
+        if now is None and card in finished or now is not None and (
+            now.resumes > was.resumes or now.status != BLOCKED
+        ):
+            opened.add(card)
+    return opened
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
@@ -247,7 +265,8 @@ async def on_processing_start(adapter: Any, event: Any) -> None:
     await adapter._react(chat_id, ts, emoji, team_id, remove=False)
     # After the reaction, so the read never delays it; the model has not
     # created a card yet, since the turn has not reached its first tool call.
-    # Finishes are recorded from here on, after the read, so none can predate it.
+    # Events are recorded from here on. One can lag the change it reports, so
+    # _own_cards decides from the board what the turn did, not from arrival.
     _remember(_started, marker, _Turn((chat_id, thread_id), await open_cards(chat_id, thread_id)), STARTED_MAX)
 
 

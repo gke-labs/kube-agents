@@ -210,7 +210,10 @@ def check_board_read(module, root: Path) -> None:
         kb.create_board(SECOND_BOARD)
         expected = set()
 
-        def card(board: str, title: str, thread: str = THREAD, platform: str = "slack", done: bool = False) -> None:
+        def card(
+            board: str, title: str, thread: str = THREAD, platform: str = "slack", done: bool = False,
+            resumed: bool = False,
+        ) -> tuple[str, str]:
             conn = kc.connect(board=board)
             try:
                 task = kb.create_task(conn, title=title, assignee="platform")
@@ -219,19 +222,30 @@ def check_board_read(module, root: Path) -> None:
                     kb.complete_task(conn, task, result="verified")
                 elif thread == THREAD and platform == "slack":
                     expected.add((board, task))
+                if resumed:
+                    for step in (kb.block_task, kb.unblock_task):
+                        if not step(conn, task):
+                            raise _fail(f"hermes_cli.kanban_db.{step.__name__} refused a fresh card")
             finally:
                 conn.close()
+            return board, task
 
-        card(kb.DEFAULT_BOARD, "open on default")
+        fresh = card(kb.DEFAULT_BOARD, "open on default")
+        resumed = card(kb.DEFAULT_BOARD, "blocked and unblocked", resumed=True)
         card(SECOND_BOARD, "open on the second board")
         card(kb.DEFAULT_BOARD, "finished", done=True)
         card(kb.DEFAULT_BOARD, "another thread", thread=OTHER_THREAD)
         card(SECOND_BOARD, "another platform", platform=OTHER_PLATFORM)
         # The query itself, not open_cards(), so a drift raises here instead
         # of being logged at debug and read as "no cards".
-        found = set(module._query_open_cards(CHANNEL, THREAD))
+        read = module._query_open_cards(CHANNEL, THREAD)
+        found = set(read)
         if found != expected:
             raise _fail(f"the kanban read found {sorted(found)!r}, expected {sorted(expected)!r}")
+        # A resume is read from the card's unblock events, since its status
+        # can be blocked again by the end of the turn that resumed it.
+        if read[fresh].resumes or not read[resumed].resumes:
+            raise _fail(f"the kanban read does not see an unblock: {read[fresh]!r}, {read[resumed]!r}")
     finally:
         for name, value in saved.items():
             if value is None:
