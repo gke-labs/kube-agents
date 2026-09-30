@@ -7344,6 +7344,75 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 f"the cache outlived the file it was keyed on: {proc.stdout}",
             )
 
+    def test_a_line_that_expands_its_own_key_still_records(self):
+        """The unset and `set -u` are each right and together wrong.
+
+        The reader unsets every requested key before sourcing, so that what it
+        reports is what the file assigns rather than what the caller's
+        environment already held. install.sh runs under `set -u`, which the
+        subshell inherits. A file line that expands a key before assigning it
+        -- `K="$K,extra"`, the documented way to append to a list -- is then
+        the one place in the install where that key is unbound: the live
+        readers do not unset, so the same line is answered by whatever the
+        operator exported and the install carries on with a value.
+
+        Left under -u the assignment fails and the key stays unset, so the
+        reader reports the file as recording no K while the install is using
+        the K it records -- and every guard built on it inverts. The interview
+        guard stops warning about an answer the file really does not pin,
+        bootstrap_install_env_file stops seeing a detector the operator wrote
+        down, and nothing says why.
+
+        The neighbours are in the file because the batch is the unit: one
+        evaluation answers every key asked for, and a failure that aborted the
+        source would take the keys around it down too. It does not -- an
+        unbound expansion under -u fails that command, not the shell -- and
+        pinning BEFORE and AFTER is what would catch a fix that bought the
+        self-referential line by making the rest unreadable.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "self-referential.env"
+            env_file.write_text('BEFORE=1\nSELF="$SELF,extra"\nAFTER=1\n')
+            keys = "BEFORE SELF AFTER"
+            proc = self._parse(
+                "",
+                "\n".join(
+                    [
+                        # Exported into the sourcing shell on purpose: this is
+                        # the state the live readers are in, and it is what
+                        # makes the unset the only reason SELF is unbound. A
+                        # reader that stopped unsetting would pass this test
+                        # while reporting the caller's value instead of the
+                        # file's, which the value assertion below catches.
+                        "export SELF=from-the-environment",
+                        f"read_recorded_install_env_values '{env_file}' {keys}",
+                        f"for k in {keys}; do",
+                        f'  install_env_records_key \'{env_file}\' "$k" '
+                        '&& printf "records %s=[%s]\\n" "$k" '
+                        f'"$(recorded_install_env_value \'{env_file}\' "$k")" '
+                        '|| printf "unrecorded %s\\n" "$k"',
+                        "done",
+                    ]
+                ),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertEqual(
+                [],
+                [l for l in proc.stdout.splitlines() if l.startswith("unrecorded")],
+                f"the file assigns all three: {proc.stdout}",
+            )
+            # Empty-then-appended, not `from-the-environment,extra`: the unset
+            # is still in force, so what is reported is the file's own answer
+            # with nothing standing behind it. That is the honest one -- a line
+            # spelled this way pins no value, and the interview guard warning
+            # that this run's answer is unrecorded is correct rather than
+            # spurious.
+            self.assertIn(
+                "records SELF=[,extra]",
+                proc.stdout,
+                f"the unset must survive the fix for -u: {proc.stdout}",
+            )
+
     def test_turning_it_off_on_a_tf_var_ingress_says_the_detector_stops(self):
         """Both axes at once: the destroying is now, and nothing is destroyed.
 

@@ -1449,6 +1449,18 @@ read_recorded_install_env_values() {
   done
   [ "${#pending[@]}" -gt 0 ] || return 0
 
+  # The sourcing below runs under `set +u`, and the unset above is why. A file
+  # line that expands a requested key before assigning it -- K="$K,extra" --
+  # finds it unbound here and nowhere else: the live readers do not unset, so
+  # that line is answered by whatever the calling shell exports and the install
+  # carries on. Left under -u the assignment fails, the key stays unset, and the
+  # guard tells the operator the file records no K while the install is using
+  # the K it records. Unbound expands empty now, which is what the file assigns
+  # when nothing exports the key -- the question the unset was asked.
+  #
+  # The comment lives out here rather than beside the `set +u`: bash 3.2
+  # mis-scans some comment text inside a command substitution and swallows the
+  # rest of the file into it, with `bash -n` and shellcheck both clean.
   eval "$(
     {
       # set -E propagates this script's ERR trap into the subshell, where a
@@ -1463,8 +1475,10 @@ read_recorded_install_env_values() {
       for key in "$@"; do unset "$key" 2>/dev/null || true; done
       source_as_the_install_does() {
         set -a
+        set +u
         # shellcheck disable=SC1090
         . "$1" >/dev/null 2>&1 || true
+        set -u
         set +a
       }
       source_as_the_install_does "$file"
