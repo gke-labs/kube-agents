@@ -110,6 +110,13 @@ class HeadlineFromIssueTest(unittest.TestCase):
             f"**Security & RBAC Posture audit: clean.** [Ledger issue #231 ↗]({LEDGER})",
         )
 
+    def test_repro_e_a_stale_clean_ledger_is_not_named(self):
+        issue = {"title": "[audit] Security & RBAC Posture Audit — 0 findings (0 critical)", "body": "All clear."}
+        self.assertIsNone(sar.headline_from_issue(issue, REF, REPORT))
+
+    def test_more_new_findings_than_the_ledger_lists_does_not_parse(self):
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, "8 new — x"))
+
     def test_zero_in_the_title_with_findings_in_the_body_is_not_clean(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)")
         self.assertIsNone(sar.headline_from_issue(issue, REF))
@@ -165,6 +172,10 @@ class HeadlineFallbackTest(unittest.TestCase):
     def test_a_multi_line_report_leads_with_its_first_line(self):
         report = f"## Security audit: 3 findings\n\n- a finding\n\nLedger: {LEDGER}\n"
         self.assertTrue(sar.headline_fallback(report, REF).startswith("**Security audit: 3 findings**\n"))
+
+    def test_an_orienting_sentence_above_the_ledger_line_is_not_the_headline(self):
+        report = f"Here's this morning's security audit.\n{REPORT}"
+        self.assertEqual(sar.headline_fallback(report, REF), sar.headline_fallback(REPORT, REF))
 
     def test_a_bare_ledger_line_has_no_headline(self):
         self.assertIsNone(sar.headline_fallback(f"Ledger: {LEDGER}", REF))

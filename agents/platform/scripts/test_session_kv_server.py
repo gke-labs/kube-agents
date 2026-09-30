@@ -3280,6 +3280,52 @@ class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
         self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
 
 
+class TestIsFleetAuditJob(unittest.TestCase):
+    """Only a job whose cron roster entry runs fleet-audit gets the audit headline."""
+
+    def setUp(self):
+        import json
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = tmp.name
+        jobs = [
+            {"id": "compliance-audit", "skills": ["fleet-audit"]},
+            {"id": "single", "skills": "fleet-audit"},
+            {"id": "legacy", "skill": "fleet-audit"},
+            {"id": "stall-watch", "skills": []},
+        ]
+        for base in (self.home, os.path.join(self.home, "profiles", "platform")):
+            os.makedirs(os.path.join(base, "cron"))
+            with open(os.path.join(base, "cron", "jobs.json"), "w", encoding="utf-8") as handle:
+                json.dump({"jobs": jobs if base != self.home else jobs[3:]}, handle)
+        home = patch("gitops_workspace.agent_home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+
+    def test_a_fleet_audit_job_in_every_skill_shape(self):
+        for job_id in ("compliance-audit", "single", "legacy"):
+            with self.subTest(job_id=job_id):
+                self.assertTrue(session_kv_server._is_fleet_audit_job("platform", job_id))
+
+    def test_other_jobs_and_unknown_jobs_are_not(self):
+        self.assertFalse(session_kv_server._is_fleet_audit_job("platform", "stall-watch"))
+        self.assertFalse(session_kv_server._is_fleet_audit_job("platform", "user-made"))
+
+    def test_the_default_profile_reads_the_home_roster(self):
+        self.assertFalse(session_kv_server._is_fleet_audit_job("default", "compliance-audit"))
+
+    def test_an_unreadable_roster_is_not(self):
+        with self.assertLogs(session_kv_server.logger, "WARNING"):
+            self.assertFalse(session_kv_server._is_fleet_audit_job("seeded-a", "compliance-audit"))
+
+    def test_a_profile_that_is_not_one_path_segment_is_not(self):
+        for profile in ("..", ".", "../platform", "profiles/platform", ""):
+            with self.subTest(profile=profile):
+                self.assertFalse(session_kv_server._is_fleet_audit_job(profile, "compliance-audit"))
+
+
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -3325,7 +3371,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
 
     def _post(
         self, composed=COMPOSED, platforms=("slack",), turn_ok=True, fold_ok=True, job_id="rbac",
-        issue=ISSUE, managed=True,
+        issue=ISSUE, managed=True, fleet_audit=True,
     ):
         answers = {"slack": self.SLACK_THREAD, "google_chat": self.GCHAT_THREAD}
 
@@ -3337,12 +3383,14 @@ class TestSlackAuditHeadline(unittest.TestCase):
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value=composed if turn_ok else None), \
+             patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
              patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed), \
-             patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue), \
+             patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
              patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
             response = self.client.post(
                 "/v1/cron-reports", json={"job_id": job_id, "report": "raw audit"}
             )
+        self.is_audit, self.fetch = is_audit, fetch
         return response, sender.call_args_list
 
     def _stored(self):
@@ -3401,6 +3449,21 @@ class TestSlackAuditHeadline(unittest.TestCase):
     def test_flag_on_an_unmanaged_repository_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"
         _, calls = self._post(composed=self.ONE_LINE, managed=False)
+        self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, "", "")])
+
+    def test_flag_on_a_report_from_a_job_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        report = f"Drift fixed in the payments namespace.\nTracked here — {self.LEDGER}"
+        _, calls = self._post(composed=report, fleet_audit=False, job_id="drift-fixer")
+        self.assertEqual([c.args for c in calls], [("slack", report, "", "")])
+        self.is_audit.assert_called_once_with("platform", "drift-fixer")
+        self.fetch.assert_not_called()
+
+    def test_flag_on_a_headline_error_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        with patch.object(session_kv_server.slack_audit_report, "ledger_ref", side_effect=ValueError("boom")):
+            response, calls = self._post(composed=self.ONE_LINE)
+        self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, "", "")])
 
     def test_managed_repositories_unreadable_is_not_managed(self):

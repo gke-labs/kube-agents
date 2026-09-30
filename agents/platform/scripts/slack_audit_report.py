@@ -46,6 +46,9 @@ ANY_SECTION = re.compile(r"^###[ \t]", re.MULTILINE)
 FINDING_HEADING = re.compile(r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.MULTILINE)
 NEW_COUNT = re.compile(r"\b(?P<count>\d+)\s+new\b", re.IGNORECASE)
 TRAILING_AUDIT = re.compile(r"\s+Audit$")
+AUDIT_SUFFIX = " audit"
+#: What is left at the end of the fallback's line once the ledger URL is cut off.
+LEDGER_SEPARATORS = " —–-:"
 BACKTICK = "`"
 
 TOP_FINDINGS = 2
@@ -79,9 +82,13 @@ def _findings_phrase(count: int) -> str:
     return f"{count} finding" if count == 1 else f"{count} findings"
 
 
-def _new_phrase(report: str) -> str:
+def _new_count(report: str) -> int:
     match = NEW_COUNT.search(report)
-    count = int(match.group("count")) if match else 0
+    return int(match.group("count")) if match else 0
+
+
+def _new_phrase(report: str) -> str:
+    count = _new_count(report)
     if not count:
         return ""
     verb = "is" if count == 1 else "are"
@@ -118,8 +125,10 @@ def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | 
     title = LEDGER_TITLE.match(str(issue.get("title") or "").strip())
     if not title:
         return None
-    name = TRAILING_AUDIT.sub(" audit", title.group("name").strip())
+    name = TRAILING_AUDIT.sub(AUDIT_SUFFIX, title.group("name").strip())
     count, critical = int(title.group("count")), int(title.group("critical"))
+    if _new_count(report) > count:
+        return None  # a stale or wrong ledger: the report has more new findings than it lists
     findings = _severity_findings(str(issue.get("body") or ""))
     link = LEDGER_LINK.format(number=ref.number, url=ref.url)
     if count == 0:
@@ -135,13 +144,22 @@ def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | 
     return "\n".join([head, *rows, link + ALL_FINDINGS.format(count=count)])
 
 
-def headline_fallback(report: str, ref: LedgerRef) -> str | None:
-    """The report's first line in bold with the ledger link, for when the issue could not be read."""
-    first = next((line for line in report.splitlines() if line.strip()), "")
-    match = TRAILING_LEDGER.search(first)
+def _fallback_line(line: str) -> str:
+    match = TRAILING_LEDGER.search(line)
     if match:
-        first = first[: match.start()]
-    head = _clip(_plain(first).rstrip(" —–-:"), HEADLINE_MAX)
+        line = line[: match.start()]
+    return _clip(_plain(line).rstrip(LEDGER_SEPARATORS), HEADLINE_MAX)
+
+
+def headline_fallback(report: str, ref: LedgerRef) -> str | None:
+    """The report's ledger line in bold with the ledger link, for when the issue could not be read.
+
+    The ledger line is the report's last, the SOPs' one line; a sentence the
+    relay turn put above it is not the headline. A last line that is only the
+    link falls back to the first.
+    """
+    lines = [line for line in report.splitlines() if line.strip()]
+    head = (_fallback_line(lines[-1]) or _fallback_line(lines[0])) if lines else ""
     if not head:
         return None
     return f"**{head}**\n{LEDGER_LINK.format(number=ref.number, url=ref.url)}"

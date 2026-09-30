@@ -1998,8 +1998,21 @@ CRON_REPORT_MAX_LABEL_CHARS = 200
 
 # How long a Slack audit headline waits for its ledger issue before posting the
 # fallback. The relay turn can take 300 s of the caller's 360 s, and the forge
-# hop's own bound is 90 s, so this one is short.
+# hop's own bound is 90 s, so this one is short. It bounds the fetch alone: the
+# managed-repository read before it can fall back to `kubectl get configmap`
+# (`GITOPS_STATE_READ_TIMEOUT_SECONDS`) when the state file is not mounted, so
+# the worst case before the Slack send is the two together.
 AUDIT_LEDGER_FETCH_TIMEOUT_S = 20
+
+# Only a fleet-audit job's report gets the audit headline. The job is looked up
+# in its profile's cron roster under the agent home: the default profile's
+# roster is the home itself, a named profile's is under `profiles/<name>`.
+FLEET_AUDIT_SKILL = "fleet-audit"
+DEFAULT_PROFILE = "default"
+PROFILES_DIR = "profiles"
+CRON_ROSTER = ("cron", "jobs.json")
+# A profile name is one path segment; anything else is never a roster.
+_PROFILE_SEGMENT_RE = re.compile(r"\A(?!\.{1,2}\Z)[\w.-]+\Z")
 
 # Newlines and the tokens that could open a role or forge a fence. Labels get a
 # stricter scrub than the report body does: the body is reproduced into the
@@ -2401,21 +2414,25 @@ def _unrelayed_notice(profile: str, job_id: str) -> str:
     )
 
 
-def _slack_audit_headline(platform: str, message: str, unrelayed: bool, chat_id: str) -> str | None:
+def _slack_audit_headline(
+    platform: str, message: str, unrelayed: bool, chat_id: str, profile: str, job_id: str
+) -> str | None:
     """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with in Slack.
 
     None, and the leg posts `message` as it always has, unless every condition
     holds: the flag is on, the leg is Slack, the Chat Agent composed the message
     (an unrelayed report keeps its notice in the channel), a chat id is known,
     since the full report goes into the headline's thread and a reply cannot be
-    addressed without one, and the message ends with an issue URL in a managed
-    repository, which is where fleet-audit keeps its ledger. The headline is
-    built from that issue; when it cannot be read, it is the report's own line
-    in bold with the ledger link.
+    addressed without one, the job runs the fleet-audit skill, and the message
+    ends with an issue URL in a managed repository, which is where fleet-audit
+    keeps its ledger. The headline is built from that issue; when it cannot be
+    read, it is the report's own line in bold with the ledger link.
     """
     if platform != "slack" or unrelayed or not slack_presenter.enabled():
         return None
     if not (chat_id or _slack_home_channel()):
+        return None
+    if not _is_fleet_audit_job(profile, job_id):
         return None
     ref = slack_audit_report.ledger_ref(message)
     if ref is None or not _is_managed_github_repo(ref.repo):
@@ -2423,6 +2440,28 @@ def _slack_audit_headline(platform: str, message: str, unrelayed: bool, chat_id:
     issue = _fetch_ledger_issue(ref)
     headline = slack_audit_report.headline_from_issue(issue, ref, message) if issue else None
     return headline or slack_audit_report.headline_fallback(message, ref)
+
+
+def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
+    """Whether `job_id` in `profile`'s cron roster runs fleet-audit; False when it cannot be read."""
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return False
+    try:
+        from gitops_workspace import agent_home
+
+        base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+        with open(os.path.join(base, *CRON_ROSTER), encoding="utf-8") as handle:
+            store = json.load(handle)
+    except Exception as exc:
+        logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
+        return False
+    jobs = store.get("jobs") if isinstance(store, dict) else store
+    for job in jobs if isinstance(jobs, list) else []:
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+            # Hermes accepts a list, a single string, or the legacy `skill` field.
+            skills = job.get("skills") or job.get("skill") or []
+            return FLEET_AUDIT_SKILL in ([skills] if isinstance(skills, str) else skills)
+    return False
 
 
 def _is_managed_github_repo(repo: str) -> bool:
@@ -2444,17 +2483,19 @@ def _fetch_ledger_issue(ref: slack_audit_report.LedgerRef) -> dict | None:
     running then finishes in its own thread and is ignored. A failure costs the
     headline its counts and rows, never the report.
     """
-    executor = ThreadPoolExecutor(max_workers=1)
+    executor = None
     try:
         import forge
 
+        executor = ThreadPoolExecutor(max_workers=1)
         call = executor.submit(forge.call, "issue-view", {"number": ref.number}, ref.repo)
         issue = call.result(timeout=AUDIT_LEDGER_FETCH_TIMEOUT_S).get("issue")
     except Exception as exc:
         logger.warning(f"Audit headline: could not read {ref.url}: {exc!r}")
         return None
     finally:
-        executor.shutdown(wait=False)
+        if executor is not None:
+            executor.shutdown(wait=False)
     return issue if isinstance(issue, dict) else None
 
 
@@ -2644,7 +2685,11 @@ def relay_cron_report(
     threads: Dict[str, str] = {}
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
-        headline = _slack_audit_headline(platform, message, unrelayed, leg_chat_id)
+        try:
+            headline = _slack_audit_headline(platform, message, unrelayed, leg_chat_id, profile, job_id)
+        except Exception as exc:
+            logger.warning(f"Relay for {profile}/{job_id}: audit headline skipped: {exc!r}")
+            headline = None
         leg_message = truncation_notice + headline if headline else message
         new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
         if new_thread_id and headline and slack_audit_report.has_more(message):
