@@ -129,6 +129,12 @@ ARCHIVED_NOTE = "Archived"
 #: The notifier kind for a card the user unblocked: its waiting row runs again.
 UNBLOCKED_KIND = "unblocked"
 
+#: A dashboard move (a ``status`` event) to one of these columns settles the
+#: card's row as the event kind it maps to would. A move to any other column
+#: leaves the row's status alone: the dashboard cannot set ``running``, so a
+#: move never means the card runs.
+MOVE_KINDS = {"done": "completed", "blocked": "blocked", "review": "review_requested"}
+
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
 ASKS_MAX = 512
@@ -543,6 +549,7 @@ async def _settle_lapsed(
         return None
     changed = resumed = None
     for old in plans:
+        unrolled = done and card in old.rolling
         parked = _park(old, card, status, done)
         if done:
             old.rolling.discard(card)
@@ -551,7 +558,7 @@ async def _settle_lapsed(
             await _render(adapter, key, old)
             if row.status == _status.TASK_RUNNING:
                 resumed = old
-        elif not parked:
+        elif not (parked or unrolled):
             continue
         elif card in old.rolling and card not in old.waiting:
             resumed = old
@@ -602,19 +609,49 @@ async def _settle_current(
     return True
 
 
+async def _deliver_move(
+    adapter: Any, sub: dict, key: tuple, card: str, event_id: int, line: str, moved: str,
+) -> bool:
+    """Put a dashboard move on the card's row, settling it per :data:`MOVE_KINDS`.
+
+    A move opens no row: one for a card with no row on the current plan is
+    taken and dropped, unless the card rolls on a fallen-back plan, where its
+    rolling message takes it.
+    """
+    plan = _plans.get(key)
+    row = plan.rows.get(card) if plan is not None and not plan.fallback else None
+    if row is not None:
+        if event_id and event_id <= row.last_event_id:
+            return True  # an at-least-once replay already on the row
+        previous = (list(row.lines), row.last_event_id)
+        row.lines = [*row.lines, line][-_status.STEPS_MAX:]
+        row.last_event_id = max(row.last_event_id, event_id)
+    kind = MOVE_KINDS.get(moved)
+    if kind is not None:
+        await settle_row(adapter, sub, kind)
+    elif row is not None and not await _render(adapter, key, plan):
+        row.lines, row.last_event_id = previous
+        return False
+    return row is not None or plan is None or card not in plan.rolling
+
+
 async def deliver_row(
-    adapter: Any, sub: dict, event_id: int, title: str, line: str,
+    adapter: Any, sub: dict, event_id: int, title: str, line: str, moved: str | None = None,
 ) -> bool:
     """Put a progress note on the card's row in the thread's plan.
 
     True when the plan took it, which the caller reports as delivered; False
     when the caller should roll it into a progress line instead: no thread, no
     Slack client, or a plan that fell back, on this note or an earlier one.
+    ``moved`` is the column a ``status`` event moved the card to, which
+    :func:`_deliver_move` handles rather than marking the row running.
     """
     key = _thread(sub)
     card = str(sub.get("task_id") or "")
     if not (key[0] and key[1] and card and hasattr(adapter, "_get_client")):
         return False
+    if moved is not None:
+        return await _deliver_move(adapter, sub, key, card, event_id, line, moved)
     plan = _plans.get(key)
     if plan is None:
         plan = _Plan(str(sub.get("team_id") or ""))

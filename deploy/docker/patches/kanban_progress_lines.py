@@ -145,6 +145,11 @@ IN_PROGRESS = "⏳"
 FINISHED = "✓"
 STOPPED = "⏹"
 
+#: Under ``KAGE_SLACK_UX``, the marker a card's rolling message settles to when
+#: the thread's plan takes the card's notes over: the card still runs, and its
+#: notes go on the plan below.
+MOVED_TO_PLAN = "↓"
+
 #: The kinds that make a failure line the card still holds stale: the card
 #: recovered, and its report or review handoff is posting. So does a ``status``
 #: event moving the card to :data:`SUPERSEDING_STATUS`, a card dragged to done.
@@ -419,9 +424,11 @@ def _slack_plan(quiet: Any) -> Any:
         return None
 
 
-async def _plan_row(plan: Any, adapter: Any, sub: dict, event_id: int, title: str, line: str) -> bool:
+async def _plan_row(
+    plan: Any, adapter: Any, sub: dict, event_id: int, title: str, line: str, moved: Optional[str],
+) -> bool:
     try:
-        return bool(await plan.deliver_row(adapter, sub, event_id, title, line))
+        return bool(await plan.deliver_row(adapter, sub, event_id, title, line, moved))
     except Exception as exc:  # noqa: BLE001 — fall back to the progress line
         logger.debug("kanban progress: the plan row for %s failed: %s", sub.get("task_id"), exc)
         return False
@@ -472,10 +479,15 @@ def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
 
 def _supersedes(kind: str, payload: object) -> bool:
     """Whether an event says the card recovered, so a failure it still holds is stale."""
-    if kind in SUPERSEDING_KINDS:
-        return True
-    status = payload.get("status") if kind == "status" and isinstance(payload, dict) else None
-    return str(status or "").strip() == SUPERSEDING_STATUS
+    return kind in SUPERSEDING_KINDS or _moved_to(kind, payload) == SUPERSEDING_STATUS
+
+
+def _moved_to(kind: str, payload: object) -> Optional[str]:
+    """The column a ``status`` event moved the card to, ``""`` if it names none; None for another kind."""
+    if kind != "status":
+        return None
+    status = payload.get("status") if isinstance(payload, dict) else None
+    return str(status or "").strip()
 
 
 def _drop_superseded(watcher: Any, sub: dict, kind: str, ev: Any, event_id: int) -> None:
@@ -592,9 +604,22 @@ async def deliver(
             await _settle_reaction(adapter, sub, kind, board)
         return result
 
-    line = rolling_line(kind, getattr(ev, "payload", None)) or message
+    payload = getattr(ev, "payload", None)
+    line = rolling_line(kind, payload) or message
     plan = _slack_plan(quiet)
-    if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line):
+    if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line, _moved_to(kind, payload)):
+        if entry and entry["message_id"] and entry["lines"]:
+            # The plan took over a card that rolled while it stood fallen back.
+            try:
+                await adapter.edit_message(
+                    chat_id, entry["message_id"], render(header, entry["lines"][-1:], MOVED_TO_PLAN),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "kanban progress: could not settle the rolling message "
+                    "for %s: %s", sub.get("task_id"), exc,
+                )
+            tracked.pop(key, None)
         return None
     if entry and event_id and event_id <= entry["last_event_id"]:
         # An at-least-once replay of something this process already appended.

@@ -23,6 +23,7 @@ from kanban_progress_lines import (
     FINISHED,
     IN_PROGRESS,
     MAX_LINES,
+    MOVED_TO_PLAN,
     MAX_RENDER,
     MAX_TRACKED,
     STOPPED,
@@ -1014,14 +1015,16 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.rows = []
+        self.moves = []
         self.settled = []
         self.flag = True
         self.plan = True
         self.takes = True
         test = self
 
-        async def deliver_row(adapter, sub, event_id, title, line):
+        async def deliver_row(adapter, sub, event_id, title, line, moved=None):
             test.rows.append((sub["task_id"], event_id, title, line))
+            test.moves.append(moved)
             if isinstance(test.takes, Exception):
                 raise test.takes
             return test.takes
@@ -1080,6 +1083,29 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
                 self.plan = True
                 self.assertEqual((refused.sent, refused.edits), (without_plan.sent, without_plan.edits))
                 self.assertEqual(refused.edits[-1][1], f"{FINISHED} [default] @platform Reading pod state.")
+
+    async def test_a_plan_taking_over_a_rolling_card_settles_its_message(self):
+        adapter, watcher = _Adapter(), SimpleNamespace()
+        self.takes = False
+        await deliver(
+            watcher, adapter, SLACK_SUB, "heartbeat", _beat(1, "Checking seeded-a."),
+            f"{IN_PROGRESS} {HEADER}Checking seeded-a.", None, HEADER, title="check seeded-a",
+        )
+        self.takes = True
+        await deliver(
+            watcher, adapter, SLACK_SUB, "heartbeat", _beat(2, "Reading pod state."),
+            f"{IN_PROGRESS} {HEADER}Reading pod state.", None, HEADER, title="check seeded-a",
+        )
+        self.assertEqual(len(adapter.edits), 1)
+        self.assertTrue(adapter.edits[0][1].startswith(MOVED_TO_PLAN))
+        self.assertIn("Checking seeded-a.", adapter.edits[0][1])
+        self.assertEqual(tracked_messages(watcher), {})
+
+    async def test_a_status_move_reaches_the_plan_as_a_move(self):
+        move = SimpleNamespace(id=1, kind="status", payload={"status": "ready"})
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "status", move, "🔄", None, HEADER)
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "heartbeat", _beat(2, "note"), "note", None, HEADER)
+        self.assertEqual(self.moves, ["ready", None])
 
     async def test_other_platforms_never_reach_the_plan(self):
         await self._run(_Adapter(), SUB)
