@@ -90,6 +90,8 @@ An alert goes to **one** of them, not both: it opens a thread that the triage tu
 
 A governance watchdog's findings are not on this path. An audit publishes to its ledger issue and to the remediation pull requests that link back to it, so the report to read is the issue rather than a channel message — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
+With `KAGE_SLACK_UX` on, an audit's scheduled report that does reach Slack leads with a headline: the finding and critical counts, the two most severe findings, and a link to the ledger issue. The full report is posted as a reply in that message's thread, and a reply there is answered with the full report in context. A clean run is one line saying so, with a link to the closed ledger.
+
 ## First-run onboarding
 
 On a fresh install the first chat interaction gets a guided onboarding instead of a cold start. Two `no_agent` cron jobs on the Planning Agent profile (`agents/chat/defaults/cron/jobs.json`) drive it:

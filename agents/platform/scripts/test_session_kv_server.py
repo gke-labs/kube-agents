@@ -3280,6 +3280,129 @@ class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
         self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
 
 
+class TestSlackAuditHeadline(unittest.TestCase):
+    """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
+
+    The channel message is the headline; the full composed report goes into its
+    thread and is what the incident row stores. Flag off, every leg posts the
+    composed message exactly as before.
+    """
+
+    SLACK_THREAD = "1712345678.000100"
+    GCHAT_THREAD = "spaces/AAA/threads/T1"
+    HOME = "C0123456789"
+    LEDGER = "https://github.com/acme/fleet-config/issues/231"
+    COMPOSED = (
+        "## [audit] Security & RBAC Posture Audit — 7 findings (2 critical)\n\n"
+        "- **[critical] seeded-b** — cluster-admin bound to default\n"
+        f"Ledger: {LEDGER}\n"
+    )
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + ("KAGE_SLACK_UX",):
+            os.environ.pop(key, None)
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(self, composed=COMPOSED, platforms=("slack",), turn_ok=True, fold_ok=True, job_id="rbac"):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": self.GCHAT_THREAD}
+
+        def send(platform, message, chat_id="", thread_id=""):
+            if thread_id == self.SLACK_THREAD and not fold_ok:
+                return None
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value=composed if turn_ok else None), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post(
+                "/v1/cron-reports", json={"job_id": job_id, "report": "raw audit"}
+            )
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_flag_off_posts_the_composed_message_unchanged(self):
+        response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
+
+    def test_flag_on_leads_with_the_headline_and_folds_the_report_into_its_thread(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[0].args,
+            ("slack", session_kv_server.slack_audit_report.headline_message(self.COMPOSED), "", ""),
+        )
+        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit: 7 findings"))
+        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+        # A reply in the thread is answered with the whole report, not the headline.
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
+
+    def test_flag_on_leaves_google_chat_alone(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        _, calls = self._post(platforms=("google_chat", "slack"))
+        gchat = [c.args for c in calls if c.args[0] == "google_chat"]
+        self.assertEqual(gchat, [("google_chat", self.COMPOSED, "", "")])
+
+    def test_flag_on_a_report_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed="Two pods restarted overnight; nothing to do.")
+        self.assertEqual(
+            [c.args for c in calls],
+            [("slack", "Two pods restarted overnight; nothing to do.", "", "")],
+        )
+
+    def test_flag_on_an_unrelayed_report_keeps_its_notice(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(turn_ok=False)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("raw audit", calls[0].args[1])
+        self.assertNotIn("7 findings, 2 critical.**", calls[0].args[1])
+
+    def test_flag_on_with_no_home_channel_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ.pop("SLACK_HOME_CHANNEL")
+        with patch.object(session_kv_server, "_slack_home_channel", return_value=""):
+            _, calls = self._post()
+        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
+
+    def test_a_failed_fold_still_counts_as_delivered(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(fold_ok=False)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
+
+    def test_a_second_report_folds_into_the_existing_thread(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        self._post(job_id="rbac-2")
+        _, calls = self._post(job_id="rbac-2")
+        second = [c.args for c in calls]
+        self.assertEqual(second[0][2:], (self.HOME, self.SLACK_THREAD))
+        self.assertEqual(second[1], ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+
+
 class TestCronReportLabelSanitisation(unittest.TestCase):
     """`job_id`, `profile` and `title` are caller-supplied, not server-written.
 

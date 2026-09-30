@@ -22,6 +22,8 @@ import logging
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import findings_queue
+import slack_audit_report
+import slack_presenter
 
 # Configure logging
 logging.basicConfig(
@@ -2393,6 +2395,33 @@ def _unrelayed_notice(profile: str, job_id: str) -> str:
     )
 
 
+def _slack_audit_headline(platform: str, message: str, unrelayed: bool, chat_id: str) -> str | None:
+    """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with in Slack.
+
+    None, and the leg posts `message` as it always has, unless every condition
+    holds: the flag is on, the leg is Slack, the Chat Agent composed the message
+    (an unrelayed report keeps its notice in the channel), the composed message
+    still carries fleet-audit's ledger title and issue URL, and a chat id is
+    known, since the full report goes into the headline's thread and a reply
+    cannot be addressed without one.
+    """
+    if platform != "slack" or unrelayed or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    return slack_audit_report.headline_message(message)
+
+
+def _post_audit_fold(profile: str, job_id: str, message: str, chat_id: str, thread_id: str) -> None:
+    """Post the full composed report under its Slack headline; a failure is logged, not raised.
+
+    The headline has already landed, so the leg counts as delivered either way,
+    and the incident row still stores the full report for the thread's replies.
+    """
+    if not _send_to_chat("slack", message, chat_id or _slack_home_channel(), thread_id):
+        logger.error(f"Relay for {profile}/{job_id}: Slack headline posted but not the full report under it")
+
+
 def relay_cron_report(
     session_id: str,
     profile: str,
@@ -2569,7 +2598,11 @@ def relay_cron_report(
     threads: Dict[str, str] = {}
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
-        new_thread_id = _send_to_chat(platform, message, leg_chat_id, leg_thread_id)
+        headline = _slack_audit_headline(platform, message, unrelayed, leg_chat_id)
+        leg_message = truncation_notice + headline if headline else message
+        new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
+        if new_thread_id and headline:
+            _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id)
         if new_thread_id:
             threads[platform] = new_thread_id
         else:
