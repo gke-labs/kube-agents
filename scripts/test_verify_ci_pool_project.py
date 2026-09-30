@@ -1537,6 +1537,11 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "empty declares": good[: good.index("declares:")] + "declares: []\n---\n" + good[good.index("---\n\n`notification") + 4 :],
             "declares is a mapping": good[: good.index("declares:")] + "declares:\n  check: no-pdb\n---\n" + good[good.index("---\n\n`notification") + 4 :],
             "declares is a scalar": good[: good.index("declares:")] + "declares: yes\n---\n" + good[good.index("---\n\n`notification") + 4 :],
+            # PyYAML's safe constructors raise KeyError / AttributeError on these,
+            # outside the set the audit's parser catches; the file is the cause,
+            # so the check fails rather than reporting the machine unverified.
+            "tagged bool the constructor rejects": good.replace("type: decision\n", "type: !!bool maybe\n"),
+            "tagged timestamp the constructor rejects": good.replace("type: decision\n", "type: decision\nreviewed: !!timestamp later\n"),
         }
         # The reason the message gives for the shapes the audit's parser is
         # silent about, so the operator is not sent to look for a WARNING that
@@ -1555,6 +1560,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "empty declares": "`declares` list is empty",
             "declares is a mapping": "is not a list",
             "declares is a scalar": "is not a list",
+            "tagged bool the constructor rejects": "the audit's parser raises on it (KeyError",
+            "tagged timestamp the constructor rejects": "the audit's parser raises on it (AttributeError",
         }
         for label, body in rejected.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch("sys.stderr", new=io.StringIO()):

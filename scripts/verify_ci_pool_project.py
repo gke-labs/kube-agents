@@ -305,13 +305,13 @@ declares:
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
 obtainability audit lists this posture under Declared intent rather than as a finding."""
+# The stream whose declared-intent step reads the note; its `declarable` set is
+# the policy the check defers to.
+GITOPS_INTENT_NOTE_AUDIT = "obtainability-audit"
 # The one declaration the audit's parser (audit_report.py parse_declarations)
 # must find in the note's `declares` list. A file that has the path but not
 # this declares nothing, and the case fails on that project with a
 # presence-only check green -- which is why presence alone is not the check.
-# The stream whose declared-intent step reads the note; its `declarable` set is
-# the policy the check defers to.
-GITOPS_INTENT_NOTE_AUDIT = "obtainability-audit"
 GITOPS_INTENT_NOTE_DECLARATION = {
     "check": "no-pdb",
     "namespace": "seeded-intent",
@@ -2340,7 +2340,7 @@ def _load_audit_report():
     return module
 
 
-def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
+def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional[str]:
     """Why the audit would not join `body`'s declaration to the fixture's finding, or None when it would.
 
     Not a copy of the parser: the note goes through the audit's own
@@ -2358,7 +2358,8 @@ def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
     """
     import yaml
 
-    audit = _load_audit_report()
+    if audit is None:
+        audit = _load_audit_report()
     # The audit's own policy for which slugs a note may justify, not a local
     # copy of it: if no-pdb ever leaves the obtainability stream's declarable
     # set, this check rejects the note the day the audit does.
@@ -2445,16 +2446,27 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         sha = str(payload.get("sha") or "")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
+    # Two failures, two verdicts. The parser failing to LOAD (no PyYAML, the
+    # audit script missing) is a fact about this machine, so the check is
+    # unread. The parser RAISING on this file -- PyYAML's safe constructors
+    # raise KeyError on `!!bool maybe` and AttributeError on `!!timestamp later`,
+    # outside the set parse_declarations catches -- is a fact about the note:
+    # the audit reads no declaration from it, so the check fails with the
+    # replace command, naming the exception.
     try:
-        problem = _note_declaration_problem(body, repo_slug)
-    except Exception as exc:  # the parser is the audit's; a failure to run it is not a verdict on the note
+        audit = _load_audit_report()
+    except Exception as exc:
         return CheckResult(
             name,
             True,
             "Not checked",
-            warnings=[Unread(f"Not checked: could not run the audit's note parser on {GITOPS_INTENT_NOTE_PATH}: {type(exc).__name__}: {exc}")],
+            warnings=[Unread(f"Not checked: could not load the audit's note parser for {GITOPS_INTENT_NOTE_PATH}: {type(exc).__name__}: {exc}")],
             read=False,
         )
+    try:
+        problem = _note_declaration_problem(body, repo_slug, audit)
+    except Exception as exc:
+        problem = f"the audit's parser raises on it ({type(exc).__name__}: {exc})"
     if problem:
         return CheckResult(
             name,
