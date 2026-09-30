@@ -33,7 +33,7 @@ prompt: "hi! priya here, set you up earlier today"
 expected_output: |
   critical requirements:
   - One short message that opens "Hi there", because the API server carries no
-    Slack profile name and the typed "priya" is not one, and introduces itself as Kage,
+    Slack profile name and the typed "priya" is not one, and introduces itself as kube-agents,
     with no internal agent names and no architecture.
   - It says its first look at the GKE fleet is done and the summary is in this
     chat, and that it only read the clusters, so nothing changed. It does not
@@ -63,12 +63,12 @@ verification_spec:
       # ...and opens on it, not "hi there" somewhere later.
       forbidden_patterns: ['\A(?!\s*hi there)']
 
-  - name: says-it-is-kage
+  - name: says-it-is-kube-agents
     role: objective
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["kage"]
+      required_phrases: ["kube-agents"]
 
   - name: says-it-only-read
     role: objective

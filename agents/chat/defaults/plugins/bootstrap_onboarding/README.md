@@ -62,7 +62,7 @@ graph TD
 
     D -->|already greeted or completed?| DG{"skip / prime once"}
     DG -->|bind deliver: origin, touch .user_aligned, trigger, then .bootstrap_greeted| G["Delivery job pointed at this chat"]
-    DG -->|inject greeting instructions| H["LLM greets as Kage + asks one question (no inventory content)"]
+    DG -->|inject greeting instructions| H["LLM greets as kube-agents + asks one question (no inventory content)"]
 
     C -->|Periodic / triggered tick| I{"INVENTORY.md AND .user_aligned present, and not completed?"}
     I -->|No| J["Emit nothing -> silent run"]
@@ -104,7 +104,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
    - touches `/opt/data/.user_aligned`;
    - calls `trigger_job("bootstrap-inventory-delivery")` so it fires on the next tick;
    - writes `.bootstrap_greeted` so no later session repeats any of the above;
-   - injects `defaults/onboarding/scan_in_progress.md` (a short Kage greeting: read-only, "I'll post what I find here when it's done", changes come as pull requests, one closing question). It does **not** inject the inventory.
+   - injects `defaults/onboarding/scan_in_progress.md` (a short kube-agents greeting: read-only, "I'll post what I find here when it's done", changes come as pull requests, one closing question). It does **not** inject the inventory.
 
    If the turn is not from a supported durable chat adapter, or no chat origin can be bound, the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a later report, so onboarding stays armed for the next durable chat turn. An API-server turn matching an eval seam request (Rule 5) is greeted but still writes no marker. `DURABLE_CHAT_PLATFORMS` is a positive allowlist; new adapters must opt in only after implementing persistent delivery.
 
@@ -128,7 +128,7 @@ sequenceDiagram
     Hook->>Disk: touch /opt/data/.user_aligned
     Hook->>Disk: trigger_job(delivery)
     Hook->>Agent: Inject scan_in_progress.md (greeting only)
-    Agent->>User: Kage hello + "I'll post it here when it's done" + one question
+    Agent->>User: kube-agents hello + "I'll post it here when it's done" + one question
     Note over Scan: Discovery completes -> write raw findings, file prioritize card, return [SILENT]
     Scan->>Disk: Save complete /opt/data/INVENTORY.raw.md
     Note over Scan: Prioritize card (fresh worker) reads raw only
@@ -163,7 +163,7 @@ sequenceDiagram
     Agent->>Hook: pre_llm_call (is_first_turn=True)
     Hook->>Disk: update_job(delivery, deliver=origin) ; touch .user_aligned ; trigger_job(delivery)
     Hook->>Agent: Inject scan_completed.md (greeting only)
-    Agent->>User: Kage hello + "the summary is in this chat" + one question
+    Agent->>User: kube-agents hello + "the summary is in this chat" + one question
     Deliver->>Disk: Claim delivery (create .bootstrap_completed, O_EXCL)
     Deliver->>User: Emit INVENTORY.md verbatim -> delivered to origin
     Deliver->>Disk: _cleanup: archive INVENTORY.delivered.md, remove both jobs

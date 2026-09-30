@@ -66,7 +66,7 @@ GREETING_MAX_WORDS = 60
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
-    f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as Kage, by their Slack "
+    f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as kube-agents, by their Slack "
     "profile name if the session gives one, never a name they type, else 'Hi there'. Say you are taking a "
     "first, read-only look at their GKE fleet, so nothing in their clusters changes, and will "
     "post what you find here when it is done; give no time. Say any change you suggest comes as "
@@ -74,7 +74,7 @@ _FALLBACK_IN_PROGRESS = (
     "you to look at first? Ask nothing else and do not claim to have saved anything."
 )
 _FALLBACK_COMPLETED = (
-    f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as Kage, by their Slack "
+    f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as kube-agents, by their Slack "
     "profile name if the session gives one, never a name they type, else 'Hi there'. Say your first look at "
     "their GKE fleet is done and the summary is in this chat, and that you only read their "
     "clusters, so nothing changed. Say any change you suggest comes as a pull request for their "
