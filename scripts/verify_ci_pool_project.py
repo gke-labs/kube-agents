@@ -34,6 +34,9 @@ _UPSTREAM_SLUG = "gke-labs/kube-agents"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CHART_VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _FLEET_KUBECONFIGS = _ROOT / "hack" / "fleet-kubeconfigs.sh"
+# The audit's own note parser, loaded when the declared-intent check runs so
+# the check reads a note exactly as the audit will, rather than a copy of it.
+_AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
 # The runner refuses to write kubeconfigs on the caller's own credential unless
 # told to. The fleet check tells it: an operator, even a project owner, holds no
 # token-creator on the reader (roles/owner does not carry
@@ -2308,41 +2311,50 @@ def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
     )
 
 
-def _note_declaration_problem(body: str) -> Optional[str]:
-    """Why the audit's parser would read no declaration from `body`, or None when it would.
+def _load_audit_report():
+    """The fleet-audit script as a module, for its `parse_declarations` and join key."""
+    import importlib.util
 
-    Mirrors `parse_declarations` in agents/platform/skills/fleet-audit/scripts/
-    audit_report.py rather than searching for strings: the note must open with
-    `---` on its first line and close with `---` or `...` at column 0, the
-    frontmatter must be YAML carrying `type`, and `declares` must be a list
-    with an item whose check, namespace and object are the fixture's. A file
-    that has the path and the words but not that shape declares nothing, and
-    the case fails on the project with a presence-only check green.
+    spec = importlib.util.spec_from_file_location("kube_agents_audit_report", _AUDIT_REPORT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_AUDIT_REPORT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _note_declaration_problem(body: str, repo_slug: str) -> Optional[str]:
+    """Why the audit would not join `body`'s declaration to the fixture's finding, or None when it would.
+
+    Not a copy of the parser: the note goes through the audit's own
+    `parse_declarations` (frontmatter delimiters, YAML and its error classes,
+    `type`, `declares`, the item shape, the `cluster` rule) and the surviving
+    items are compared on the audit's own join key, which folds
+    `Deployment/notification-relay`, `deployment/notification-relay` and
+    `Deployment / notification-relay` to one. What passes here is what the
+    audit reads; what fails names the parser's reason as the audit logs it. A
+    fleet-wide item is required: one carrying `cluster` joins only that
+    cluster's finding, which is not the fixture's note.
     """
-    import yaml
-
-    lines = body.replace("\r\n", "\n").lstrip("\ufeff").split("\n")
-    if not lines or lines[0].rstrip() != "---":
-        return "the file does not open with a `---` frontmatter line"
-    close = next((i for i in range(1, len(lines)) if lines[i].rstrip() in ("---", "...")), None)
-    if close is None:
-        return "the frontmatter never closes (no `---` or `...` line after the opening one)"
-    try:
-        front = yaml.safe_load("\n".join(lines[1:close]))
-    except yaml.YAMLError as exc:
-        return f"the frontmatter is not valid YAML ({exc})"
-    if not isinstance(front, dict) or "type" not in front:
-        return "the frontmatter carries no `type`, so it is not an OKF note"
-    declares = front.get("declares")
-    if not isinstance(declares, list):
-        return "the frontmatter has no `declares` list"
-    for item in declares:
-        if isinstance(item, dict) and all(item.get(k) == v for k, v in GITOPS_INTENT_NOTE_DECLARATION.items()):
-            return None
-    return (
-        "no `declares` item has check no-pdb, namespace seeded-intent and object "
-        "Deployment/notification-relay"
-    )
+    audit = _load_audit_report()
+    declarable = frozenset({GITOPS_INTENT_NOTE_DECLARATION["check"]})
+    entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
+    if not entries:
+        return (
+            "parse_declarations reads no declaration from it (no OKF frontmatter with `type` and a "
+            "`declares` list, or no item of the right shape; the WARNING lines above say which)"
+        )
+    wanted = audit._declaration_key(GITOPS_INTENT_NOTE_DECLARATION, with_cluster=False)
+    for entry in entries:
+        if audit._declaration_key(entry, with_cluster=False) != wanted:
+            continue
+        if audit.DECLARATION_CLUSTER_FIELD in entry:
+            return (
+                f"its declaration names cluster {entry[audit.DECLARATION_CLUSTER_FIELD]!r}, so the audit joins it "
+                "to that cluster's finding only; the fixture's note is fleet-wide (no `cluster`)"
+            )
+        return None
+    return "no declares item is check no-pdb for Deployment/notification-relay in seeded-intent"
 
 
 def check_gitops_declaration(project_id: str) -> CheckResult:
@@ -2388,7 +2400,16 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         sha = str(payload.get("sha") or "")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
-    problem = _note_declaration_problem(body)
+    try:
+        problem = _note_declaration_problem(body, repo_slug)
+    except Exception as exc:  # the parser is the audit's; a failure to run it is not a verdict on the note
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: could not run the audit's note parser on {GITOPS_INTENT_NOTE_PATH}: {type(exc).__name__}: {exc}")],
+            read=False,
+        )
     if problem:
         return CheckResult(
             name,

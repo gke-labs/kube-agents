@@ -1515,25 +1515,42 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         # list without the fixture's item. Each fails, and the repair names the
         # blob's sha so the PUT replaces rather than 422s.
         good = checker.GITOPS_INTENT_NOTE_CONTENT
-        bodies = {
+        rejected = {
             "empty": "\n",
             "unclosed": good.replace("---\n\n`notification", "\n`notification", 1),
             "no type": good.replace("type: decision\n", ""),
             "no declares": good.replace("declares:", "declared:"),
             "other object": good.replace("Deployment/notification-relay", "Deployment/checkout-gateway"),
             "strings but no structure": "---\ncheck: no-pdb namespace: seeded-intent object: Deployment/notification-relay\n---\n",
+            # The parser skips an item whose cluster is empty, and keys one
+            # naming a cluster to that cluster alone; neither is the fixture's
+            # fleet-wide note.
+            "empty cluster": good.replace("    object: Deployment/notification-relay", "    object: Deployment/notification-relay\n    cluster: \"\""),
+            "another cluster": good.replace("    object: Deployment/notification-relay", "    object: Deployment/notification-relay\n    cluster: seeded-b"),
+            # PyYAML raises ValueError, not YAMLError, for this; the audit's
+            # parser catches it and reads nothing, and so must this check
+            # rather than ending the run in a traceback.
+            "unquoted impossible date": good.replace("type: decision\n", "type: decision\nreviewed: 2026-02-30\n"),
         }
-        for label, body in bodies.items():
-            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+        for label, body in rejected.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run, mock.patch("sys.stderr", new=io.StringIO()):
                 run.side_effect = [_ok(self._contents(body, sha="deadbeef"))]
                 result = checker.check_gitops_declaration("kube-agents-evals-3")
                 self.assertFalse(result.passed, label)
                 self.assertIn("the audit reads no declaration from it", result.message)
                 self.assertIn("-f sha=deadbeef", result.message)
-        # And the closing delimiter YAML also accepts.
-        with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(self._contents(good.replace("---\n\n`notification", "...\n\n`notification", 1)))]
-            self.assertTrue(checker.check_gitops_declaration("kube-agents-evals-3").passed)
+        # And what the audit accepts, this accepts: the `...` closer and the
+        # spellings the join key folds to one.
+        accepted = {
+            "dots closer": good.replace("---\n\n`notification", "...\n\n`notification", 1),
+            "kubectl spelling": good.replace("Deployment/notification-relay", "deployment/notification-relay"),
+            "spaces round the slash": good.replace("Deployment/notification-relay", "Deployment / notification-relay"),
+            "crlf": good.replace("\n", "\r\n"),
+        }
+        for label, body in accepted.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(body))]
+                self.assertTrue(checker.check_gitops_declaration("kube-agents-evals-3").passed, label)
 
     def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
         # One note, defined twice: the script seeds it, the verifier reads it
@@ -1545,8 +1562,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         ):
             self.assertIn(f'{name}="{value}"', script, name)
         self.assertIn(f"readonly GITOPS_INTENT_NOTE_CONTENT='{checker.GITOPS_INTENT_NOTE_CONTENT}'", script)
-        # The content the verifier expects passes its own parser-faithful check.
-        self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))
+        # The content the verifier expects is one the audit's parser joins.
+        self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", "gke-agentic/x-infra"))
 
 
 class GithubAppInstallationTest(unittest.TestCase):
