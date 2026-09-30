@@ -157,7 +157,8 @@ def _accepts(args: ast.arguments, positional: int, keywords: tuple[str, ...]) ->
     if positional > len(params) and args.vararg is None:
         return False
     named = (set(params[positional:]) - posonly) | {a.arg for a in args.kwonlyargs}
-    if args.kwarg is None and not set(keywords) <= named:
+    # A keyword naming a parameter already bound positionally is "multiple values", ``**kwargs`` or not.
+    if set(keywords) & set(params[:positional]) or (args.kwarg is None and not set(keywords) <= named):
         return False
     required_kw = {a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is None}
     return required_kw <= set(keywords)

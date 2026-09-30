@@ -218,6 +218,8 @@ class ApplierTest(unittest.TestCase):
         self.assertFalse(verifier._accepts(args, 1, ()))
         posonly = ast.parse("def _get_client(self, chat_id, team_id=None, /): pass").body[0].args
         self.assertFalse(verifier._accepts(posonly, 1, ("team_id",)))
+        swapped = ast.parse("def _get_client(self, team_id, chat_id=None, **kwargs): pass").body[0].args
+        self.assertFalse(verifier._accepts(swapped, 1, ("team_id",)))
 
 
 class FlagOffIdentityTest(unittest.TestCase):
