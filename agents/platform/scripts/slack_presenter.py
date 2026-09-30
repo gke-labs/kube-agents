@@ -1,16 +1,22 @@
-"""Slack presentation for kube-agents: the reactions an ask gets.
+"""Slack presentation for kube-agents: answer layout, buttons and reactions.
 
 Pure functions only. Nothing here imports the Hermes gateway, the Slack SDK or
 the network, so any process that posts to Slack can use it, and it can move
-with Slack ingress when it leaves the gateway. Today its one caller is the
-gateway's reactions patch (``slack_ux_reactions``), which the kanban notifier
-also reaches.
+with Slack ingress when it leaves the gateway. Today its callers are three
+gateway patches: reactions (``slack_ux_reactions``, which the kanban notifier
+also reaches), incident triage (``slack_ux_incident``) and button clicks
+(``slack_ux_clicks``).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
 Everything a caller changes on screen is gated on :func:`enabled`, the
 ``KAGE_SLACK_UX`` environment variable, off by default. With it off, callers
 take their upstream path unchanged; this module only answers questions.
+
+Layout: :func:`split_answer` takes the headline off an agent's markdown
+answer; url link buttons and choice buttons, whose value is the label, are
+built by ``_button`` and wrapped into rows by ``_actions``; :func:`fallback_text`
+is the headline and choices as plain mrkdwn, for the message's ``text`` field.
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model
@@ -22,6 +28,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 #: The flag, and the values that turn it on. Anything else (unset included) is off.
 FLAG_ENV = "KAGE_SLACK_UX"
@@ -100,6 +108,36 @@ INCIDENT_WORDS = re.compile(
 MENTION = re.compile(r"<[@#!][^>]*>")
 FIRST_WORD = re.compile(r"[A-Za-z']+")
 
+# --- layout ----------------------------------------------------------------
+
+#: Slack's limits: button label, button value, buttons shown per actions block
+#: before mobile wraps badly (Slack allows 25; Hermes uses 5).
+BUTTON_TEXT_MAX = 75
+BUTTON_VALUE_MAX = 2000
+BUTTONS_PER_ROW = 5
+HEADLINE_MAX = 150
+ELLIPSIS = "…"
+
+#: Action ids: ``<prefix>.link.<n>`` and ``<prefix>.choice.<n>``. Link buttons
+#: open their url client-side and Slack still sends a block_actions request,
+#: which the no-op handler acknowledges; a choice click is answered as the
+#: clicker's reply (the gateway's ``slack_ux_clicks``).
+LINK_ACTION = "link"
+CHOICE_ACTION = "choice"
+LINK_ACTION_ID_PATTERN = re.compile(r"\.link\.\d+$")
+CHOICE_ACTION_ID_PATTERN = re.compile(r"\.choice\.\d+$")
+
+CHOICES_LEAD = "Reply with one of: "
+CHOICE_SEPARATOR = " · "
+
+CODE_FENCE = "```"
+HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
+LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
+MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=\S)")
+
 
 def enabled() -> bool:
     """Whether ``KAGE_SLACK_UX`` is on in this process's environment."""
@@ -138,3 +176,134 @@ def settle_reaction(outcome: str) -> str | None:
 def settle_for_kanban_kind(kind: str) -> str | None:
     """``done``/``blocked``/``failed`` for a notifier event kind that settles work, else None."""
     return SETTLE_BY_KANBAN_KIND.get(kind)
+
+
+# --- markdown --------------------------------------------------------------
+
+
+def _paragraphs(markdown: str) -> list[str]:
+    """Blank-line separated blocks, never splitting inside a fenced code block."""
+    out: list[str] = []
+    current: list[str] = []
+    in_fence = False
+    for line in markdown.split("\n"):
+        if line.strip().startswith(CODE_FENCE):
+            in_fence = not in_fence
+        if not in_fence and not line.strip():
+            if current:
+                out.append("\n".join(current).strip("\n"))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        out.append("\n".join(current).strip("\n"))
+    return [p for p in out if p.strip()]
+
+
+def _plain(markdown: str) -> str:
+    """One line of markdown as plain text: no heading, list marker, emphasis or link syntax."""
+    text = HEADING.sub("", markdown.strip())
+    text = LIST_MARKER.sub("", text)
+    text = MD_LINK.sub(r"\1", text)
+    text = MD_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
+    return text.replace("*", "").replace("`", "").strip()
+
+
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - len(ELLIPSIS)].rsplit(" ", 1)[0] or text[: limit - len(ELLIPSIS)]
+    return cut.rstrip() + ELLIPSIS
+
+
+def _escape(text: str) -> str:
+    for raw, escaped in MRKDWN_ESCAPES:
+        text = text.replace(raw, escaped)
+    return text
+
+
+def split_answer(markdown: str) -> tuple[str, list[str]]:
+    """``(headline, body_sections)`` for an agent's markdown answer.
+
+    The headline is the first sentence of the first paragraph, as plain text
+    capped at ``HEADLINE_MAX``. The rest of that paragraph and every later
+    paragraph are the body sections, still markdown, in order. Empty input
+    gives ``("", [])``.
+    """
+    paragraphs = _paragraphs(markdown or "")
+    if not paragraphs:
+        return "", []
+    first, rest = paragraphs[0], paragraphs[1:]
+    if first.lstrip().startswith(CODE_FENCE):
+        return "", paragraphs
+    first_line, _, more_lines = first.partition("\n")
+    sentences = SENTENCE_END.split(first_line.strip(), maxsplit=1)
+    headline = _clip(_plain(sentences[0]), HEADLINE_MAX)
+    remainder = " ".join(s for s in sentences[1:]).strip()
+    tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
+    body = ([tail] if tail.strip() else []) + rest
+    return headline, body
+
+
+# --- blocks ----------------------------------------------------------------
+
+
+def _link_pairs(links: Iterable[Any]) -> list[tuple[str, str]]:
+    """``(label, url)`` from tuples or ``{"text", "url"}`` mappings; entries without a url dropped."""
+    pairs = []
+    for link in links or ():
+        if isinstance(link, Mapping):
+            label, url = link.get("text") or link.get("label") or "", link.get("url") or ""
+        else:
+            label, url = link
+        if url:
+            pairs.append((str(label or url), str(url)))
+    return pairs
+
+
+def _button(label: str, action_id: str, *, url: str | None = None, value: str | None = None) -> dict:
+    button: dict = {
+        "type": "button",
+        "text": {"type": "plain_text", "text": _clip(label, BUTTON_TEXT_MAX), "emoji": True},
+        "action_id": action_id,
+    }
+    if url is not None:
+        button["url"] = url
+    if value is not None:
+        button["value"] = value[:BUTTON_VALUE_MAX]
+    return button
+
+
+def _actions(buttons: Sequence[dict]) -> list[dict]:
+    return [
+        {"type": "actions", "elements": list(buttons[i : i + BUTTONS_PER_ROW])}
+        for i in range(0, len(buttons), BUTTONS_PER_ROW)
+    ]
+
+
+def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[str] = ()) -> str:
+    """The same layout as plain mrkdwn, with no buttons.
+
+    Used as the ``text`` of a blocks message (notifications, screen readers).
+    Links become inline ``<url|label>``; choices become one "Reply with one
+    of:" line. Every label is escaped, so none can mention anyone.
+    """
+    parts: list[str] = []
+    title = _clip(_plain(headline or ""), HEADLINE_MAX)
+    if title:
+        parts.append(f"*{_escape(title)}*")
+    pairs = _link_pairs(links)
+    if pairs:
+        parts.append(CHOICE_SEPARATOR.join(f"<{url}|{_escape(label)}>" for label, url in pairs))
+    labels = [_escape(str(c)) for c in choices or () if str(c).strip()]
+    if labels:
+        parts.append(CHOICES_LEAD + CHOICE_SEPARATOR.join(labels))
+    return "\n".join(parts)
+
+
+# --- link-button ack -------------------------------------------------------
+
+
+async def ack_link_click(ack: Any, body: Any = None, action: Any = None) -> None:
+    """Acknowledge a link-button click and do nothing else; Slack already opened the url."""
+    await ack()

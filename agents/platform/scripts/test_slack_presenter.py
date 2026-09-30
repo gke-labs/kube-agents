@@ -1,8 +1,9 @@
-"""Unit tests for slack_presenter — the reactions an ask gets.
+"""Unit tests for slack_presenter — answer layout, buttons and reactions.
 
 Run: python3 -m pytest agents/platform/scripts/test_slack_presenter.py
 """
 
+import asyncio
 import os
 import sys
 import unittest
@@ -100,6 +101,90 @@ class SettleReactionTest(unittest.TestCase):
             sp.REACTION_QUESTION, sp.REACTION_CHANGE, sp.REACTION_BOARD, sp.REACTION_INCIDENT,
         }
         self.assertEqual(len(names), 7)
+
+
+class SplitAnswerTest(unittest.TestCase):
+    def test_first_sentence_is_headline(self):
+        md = "checkout-gateway is crashlooping on an OOM. It hit its 256Mi limit.\n\nRaise it to 512Mi."
+        headline, body = sp.split_answer(md)
+        self.assertEqual(headline, "checkout-gateway is crashlooping on an OOM.")
+        self.assertEqual(body, ["It hit its 256Mi limit.", "Raise it to 512Mi."])
+
+    def test_markdown_stripped_from_headline(self):
+        headline, body = sp.split_answer("## **Yes**, [seeded-a](https://x) is `healthy`\n- one\n- two")
+        self.assertEqual(headline, "Yes, seeded-a is healthy")
+        self.assertEqual(body, ["- one\n- two"])
+
+    def test_empty(self):
+        self.assertEqual(sp.split_answer(""), ("", []))
+        self.assertEqual(sp.split_answer("   \n\n "), ("", []))
+
+    def test_code_fence_not_split(self):
+        md = "Here it is.\n\n```\na\n\nb\n```\n\nDone."
+        _, body = sp.split_answer(md)
+        self.assertEqual(body, ["```\na\n\nb\n```", "Done."])
+
+    def test_leading_code_block_has_no_headline(self):
+        headline, body = sp.split_answer("```\nkubectl get pods\n```")
+        self.assertEqual(headline, "")
+        self.assertEqual(body, ["```\nkubectl get pods\n```"])
+
+    def test_long_headline_clipped(self):
+        headline, _ = sp.split_answer("word " * 100)
+        self.assertLessEqual(len(headline), sp.HEADLINE_MAX)
+        self.assertTrue(headline.endswith("…"))
+
+
+class ButtonsTest(unittest.TestCase):
+    def test_link_button(self):
+        self.assertEqual(
+            sp._button("Open PR ↗", "kage.link.0", url="https://github.com/o/r/pull/1"),
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Open PR ↗", "emoji": True},
+                "action_id": "kage.link.0",
+                "url": "https://github.com/o/r/pull/1",
+            },
+        )
+        self.assertRegex("kage.link.0", sp.LINK_ACTION_ID_PATTERN)
+
+    def test_choice_button_value_is_label(self):
+        button = sp._button("Raise to 512Mi", "triage.choice.0", value="Raise to 512Mi")
+        self.assertEqual(button["value"], "Raise to 512Mi")
+        self.assertNotIn("url", button)
+        self.assertRegex(button["action_id"], sp.CHOICE_ACTION_ID_PATTERN)
+        self.assertIsNone(sp.LINK_ACTION_ID_PATTERN.search(button["action_id"]))
+
+    def test_buttons_wrap_at_five(self):
+        rows = sp._actions([sp._button(str(i), f"kage.choice.{i}", value=str(i)) for i in range(7)])
+        self.assertEqual([len(b["elements"]) for b in rows], [5, 2])
+        self.assertEqual({b["type"] for b in rows}, {"actions"})
+
+    def test_long_label_clipped(self):
+        button = sp._button("word " * 40, "kage.choice.0", value="word " * 40)
+        self.assertLessEqual(len(button["text"]["text"]), sp.BUTTON_TEXT_MAX)
+        self.assertEqual(button["value"], "word " * 40)
+
+
+class FallbackTextTest(unittest.TestCase):
+    def test_same_layout_as_mrkdwn(self):
+        text = sp.fallback_text("Two findings.", links=[("Open PR", "https://p")], choices=["Yes", "No"])
+        self.assertEqual(text, "*Two findings.*\n<https://p|Open PR>\nReply with one of: Yes · No")
+
+    def test_labels_cannot_mention_anyone(self):
+        text = sp.fallback_text("h", links=[("<!here>", "https://p")], choices=["<@U1> & <!channel>", "No"])
+        self.assertNotIn("<!", text)
+        self.assertNotIn("<@", text)
+        self.assertIn("&lt;@U1&gt; &amp; &lt;!channel&gt;", text)
+
+
+class LinkAckTest(unittest.TestCase):
+    def test_ack_does_nothing_else(self):
+        ack = mock.AsyncMock()
+        body = mock.Mock()
+        asyncio.run(sp.ack_link_click(ack, body, {"action_id": "kage.link.0"}))
+        ack.assert_awaited_once_with()
+        self.assertEqual(body.mock_calls, [])
 
 
 if __name__ == "__main__":

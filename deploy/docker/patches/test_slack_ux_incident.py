@@ -1,0 +1,348 @@
+"""Host tests for the KAGE_SLACK_UX incident-triage patch. No Hermes install required.
+
+Run: python3 -m pytest deploy/docker/patches/test_slack_ux_incident.py
+
+The notifier fixture is ``_send_event`` as ``apply_kanban_progress_lines``
+leaves it, which is where the anchor lives. With the flag off the patched
+call site hands ``_progress_deliver`` the notifier's own adapter, which is the
+flag-off identity for this surface. The runtime is driven with a stub adapter
+and a routing database written the way ``session_kv_server`` writes it.
+"""
+
+import asyncio
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import closing
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+SCRIPTS = HERE.parents[2] / "agents" / "platform" / "scripts"
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(SCRIPTS))
+
+import slack_presenter as presenter
+
+import apply_slack_ux_incident as applier
+import kanban_notifier
+import slack_ux_clicks as clicks
+import slack_ux_incident as runtime
+from apply_kanban_progress_lines import SEND_PATCHED
+
+CHANNEL = "C0KAGE"
+ALERT_TS = "1700000000.000100"
+LOGS_URL = "https://console.cloud.google.com/logs/query;query=x"
+WORKLOADS_URL = "https://console.cloud.google.com/kubernetes/workload/overview"
+
+REPORT = (
+    "## What's wrong\n\n"
+    "payments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02. "
+    "Nothing else changed.\n\n"
+    "## Why\n\n"
+    "- The container exits reading `payments-db-creds`, which **no longer exists**.\n\n"
+    "## What to do\n\n"
+    "- **Option A (Roll back to 14:02):** Revert the Deployment to revision 7.\n"
+    "- **Option B (Restore the secret):** Recreate payments-db-creds from the GitOps repo.\n"
+    "- ✅ **Recommended: Option B** — it fixes the cause rather than hiding it.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+    "or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
+    f"🔗 [GKE Workloads]({WORKLOADS_URL}) | [Cloud Logs]({LOGS_URL})\n"
+)
+
+SINGLE = (
+    "## What's wrong\n\nThe quota for n2 CPUs in us-central1 is exhausted.\n\n"
+    "## Why\n\n- Scale-up fails with QUOTA_EXCEEDED.\n\n"
+    "## What to do\n\n"
+    "- **Proposed fix (Lower the node pool max):** Set max nodes to 4 in the GitOps repo.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+)
+
+NOTIFIER = '''\
+"""Fixture standing in for gateway/kanban_watchers_notifier.py after apply_kanban_progress_lines."""
+calls = []
+
+
+async def _progress_deliver(runner, adapter, sub, kind, ev, msg, metadata, header, board):
+    calls.append(adapter)
+
+
+class Watcher:
+    def __init__(self, adapter, task, sub):
+        self.runner = object()
+        self.adapter = adapter
+        self.task = task
+        self.sub = sub
+        self.platform_str = "slack"
+        self.progress_header = ""
+        self.board_slug = "default"
+
+    async def _send_event(self, ev, msg):
+        sub, adapter = self.sub, self.adapter
+        metadata = {}
+''' + SEND_PATCHED
+
+
+class _Client:
+    def __init__(self, log, fail=False):
+        self.log = log
+        self.fail = fail
+
+    async def chat_update(self, **kwargs):
+        if self.fail:
+            raise RuntimeError("message_not_found")
+        self.log.append(("chat_update", kwargs))
+
+
+class _Adapter:
+    def __init__(self, fail_update=False):
+        self.log = []
+        self.fail_update = fail_update
+        self.name = "slack-adapter"
+
+    def _get_client(self, chat_id, team_id=None):
+        return _Client(self.log, self.fail_update)
+
+    async def send(self, chat_id, content, metadata=None):
+        self.log.append(("send", chat_id, content, metadata))
+        return SimpleNamespace(success=True, message_id="1700000000.000900")
+
+
+def _texts(block):
+    return "".join(e.get("text", "") for s in block["elements"] for e in s["elements"])
+
+
+class RuntimeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "session_kv.db")
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+            conn.execute(
+                "CREATE TABLE incidents (chat_id TEXT NOT NULL, thread_id TEXT NOT NULL, report TEXT, "
+                "PRIMARY KEY (chat_id, thread_id))"
+            )
+            conn.commit()
+        self.route("k8s-evt-0000abcd", "slack", CHANNEL, ALERT_TS)
+        gateway = types.ModuleType("gateway")
+        self.modules = mock.patch.dict(
+            sys.modules, {"gateway": gateway, "gateway.kanban_notifier": kanban_notifier}
+        )
+        self.modules.start()
+        self.env = mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "1", "SESSION_KV_DB_PATH": self.db})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.modules.stop()
+        self.tmp.cleanup()
+
+    def route(self, session_id, platform, chat_id, thread_id):
+        meta = {"platform": platform, "chat_id": chat_id, "thread_id": thread_id}
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT OR REPLACE INTO session_metadata VALUES (?, ?)", (session_id, json.dumps(meta)))
+            conn.commit()
+
+    def wrap(self, adapter, platform="slack", kind="completed", result=REPORT, thread=ALERT_TS):
+        return runtime.adapter_for(
+            adapter, platform, SimpleNamespace(kind=kind), SimpleNamespace(result=result),
+            {"chat_id": CHANNEL, "thread_id": thread},
+        )
+
+    def deliver(self, adapter, result=REPORT):
+        wrapped = self.wrap(adapter, result=result)
+        self.assertIsNot(wrapped, adapter)
+        res = asyncio.run(wrapped.send(CHANNEL, "the report", metadata={"thread_id": ALERT_TS}))
+        return wrapped, res
+
+    def test_flag_off_returns_the_adapter(self):
+        adapter = _Adapter()
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
+            self.assertIs(self.wrap(adapter), adapter)
+
+    def test_only_a_triage_report_for_an_open_slack_alert_is_taken(self):
+        adapter = _Adapter()
+        self.assertIs(self.wrap(adapter, platform="google_chat"), adapter)
+        self.assertIs(self.wrap(adapter, kind="gave_up"), adapter)
+        self.assertIs(self.wrap(adapter, result="All pods healthy; nothing to do."), adapter)
+        self.assertIs(self.wrap(adapter, thread="1700000000.000555"), adapter)
+
+    def test_a_cron_report_thread_is_never_edited(self):
+        adapter = _Adapter()
+        self.route("cron-daily-audit", "slack", CHANNEL, "1700000000.000777")
+        self.assertIs(self.wrap(adapter, thread="1700000000.000777"), adapter)
+
+    def test_a_thread_that_already_has_a_report_keeps_the_reply(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT INTO incidents VALUES (?, ?, ?)", (CHANNEL, ALERT_TS, "first"))
+            conn.commit()
+        adapter = _Adapter()
+        self.assertIs(self.wrap(adapter), adapter)
+
+    def test_the_alert_is_edited_into_the_triage(self):
+        adapter = _Adapter()
+        wrapped, res = self.deliver(adapter)
+        self.assertEqual([e[0] for e in adapter.log], ["chat_update"])
+        update = adapter.log[0][1]
+        self.assertEqual((update["channel"], update["ts"]), (CHANNEL, ALERT_TS))
+        self.assertTrue(res.success)
+        self.assertEqual(res.message_id, ALERT_TS)
+        self.assertEqual(wrapped.name, "slack-adapter")
+
+        headline, actions, fold = update["blocks"]
+        self.assertEqual(
+            _texts(headline),
+            "payments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02.",
+        )
+        buttons = actions["elements"]
+        self.assertEqual(
+            [b["text"]["text"] for b in buttons],
+            ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret",
+             "GKE Workloads ↗", "Cloud Logs ↗"],
+        )
+        self.assertEqual([b.get("style") for b in buttons], [None, "primary", None, None])
+        self.assertEqual([b.get("url") for b in buttons[2:]], [WORKLOADS_URL, LOGS_URL])
+        for button in buttons[:2]:
+            self.assertRegex(button["action_id"], presenter.CHOICE_ACTION_ID_PATTERN)
+        for button in buttons[2:]:
+            self.assertRegex(button["action_id"], presenter.LINK_ACTION_ID_PATTERN)
+        self.assertEqual(fold["type"], "container")
+        self.assertEqual(fold["title"]["text"], "why · what each option does")
+        self.assertIs(fold["is_collapsible"], True)
+        self.assertIs(fold["default_collapsed"], True)
+        self.assertIn("apply Option A", update["text"])
+
+    def test_the_fold_carries_every_word_of_the_report(self):
+        adapter = _Adapter()
+        self.deliver(adapter)
+        fold = adapter.log[0][1]["blocks"][-1]
+        shown = _texts(fold["child_blocks"][0])
+        for line in REPORT.strip().split("\n"):
+            plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+            plain = re.sub(r"^#+ |^- ", "", plain).replace("**", "").replace("`", "")
+            self.assertIn(plain, shown.replace("• ", ""))
+        styles = [e.get("style") for s in fold["child_blocks"][0]["elements"] for e in s["elements"]]
+        self.assertIn({"code": True}, styles)
+        self.assertIn({"bold": True}, styles)
+
+    def test_a_click_sends_apply_option_as_the_clicker(self):
+        adapter = _Adapter()
+        self.deliver(adapter)
+        blocks = adapter.log[0][1]["blocks"]
+        button = blocks[1]["elements"][1]
+        action = {"action_id": button["action_id"], "text": button["text"], "value": button["value"]}
+        self.assertTrue(clicks._shown_text(action).startswith("apply Option B"))
+        answered = clicks.answered_blocks(
+            blocks, lambda a: bool(presenter.CHOICE_ACTION_ID_PATTERN.search(a)), "✓ picked"
+        )
+        kept = [e["text"]["text"] for b in answered if b["type"] == "actions" for e in b["elements"]]
+        self.assertEqual(kept, ["GKE Workloads ↗", "Cloud Logs ↗"])
+
+    def test_a_failed_edit_falls_back_to_the_reply(self):
+        adapter = _Adapter(fail_update=True)
+        _wrapped, res = self.deliver(adapter)
+        self.assertEqual(adapter.log, [("send", CHANNEL, "the report", {"thread_id": ALERT_TS})])
+        self.assertEqual(res.message_id, "1700000000.000900")
+
+    def test_the_single_fix_shape_gets_one_apply_button(self):
+        adapter = _Adapter()
+        self.deliver(adapter, result=SINGLE)
+        _headline, actions, fold = adapter.log[0][1]["blocks"]
+        self.assertEqual([b["text"]["text"] for b in actions["elements"]], ["apply: Lower the node pool max"])
+        self.assertEqual(actions["elements"][0]["style"], "primary")
+        self.assertEqual(fold["title"]["text"], "why · what the fix does")
+
+    def test_a_report_with_no_parseable_option_keeps_the_reply(self):
+        adapter = _Adapter()
+        vague = "## What's wrong\n\nIt broke.\n\n## What to do\n\n- **To authorize:** reply **'apply'**.\n"
+        self.assertTrue(kanban_notifier.actionable_report(vague))
+        self.assertIs(self.wrap(adapter, result=vague), adapter)
+
+    def test_a_title_with_parentheses_is_kept_whole(self):
+        triage = runtime.parse_triage(REPORT.replace("Restore the secret", "Scale to 4 (from 2)"))
+        self.assertEqual(triage["choices"][1][0], "apply Option B: Scale to 4 (from 2)")
+        single = runtime.parse_triage(SINGLE.replace("Lower the node pool max", "Cap at 4 (was 8)"))
+        self.assertEqual(single["choices"], [("apply: Cap at 4 (was 8)", True)])
+
+    def test_only_the_links_line_becomes_buttons(self):
+        prose = REPORT.replace(
+            "Recreate payments-db-creds from the GitOps repo.",
+            "Recreate it per [the runbook](https://example.com/runbook).",
+        )
+        triage = runtime.parse_triage(prose)
+        self.assertEqual([label for label, _ in triage["links"]], ["GKE Workloads", "Cloud Logs"])
+
+    def test_a_thread_is_matched_exactly_not_by_substring(self):
+        self.route("k8s-evt-0000beef", "slack", CHANNEL, "1700000000.0001")
+        self.assertTrue(runtime.is_open_alert(CHANNEL, ALERT_TS, self.db))
+        self.assertFalse(runtime.is_open_alert(CHANNEL, "1700000000.00010", self.db))
+        self.assertFalse(runtime.is_open_alert("C0OTHER", ALERT_TS, self.db))
+
+    def test_a_code_block_in_the_report_is_not_a_heading(self):
+        fenced = REPORT.replace(
+            "Revert the Deployment to revision 7.\n",
+            "Revert the Deployment to revision 7.\n```\n# in seeded-debug\nkubectl rollout undo deploy/payments-api\n```\n",
+        )
+        triage = runtime.parse_triage(fenced)
+        self.assertEqual([c for c, _ in triage["choices"]],
+                         ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret"])
+        self.assertEqual(len(triage["links"]), 2)
+        section = runtime.rich_report(fenced)["elements"][0]["elements"]
+        self.assertIn(runtime._text("# in seeded-debug", code=True), section)
+        self.assertNotIn("```", "".join(e.get("text", "") for e in section))
+
+    def test_a_decorated_heading_still_gives_the_headline(self):
+        triage = runtime.parse_triage(REPORT.replace("## What's wrong", "## 🚨 What's wrong?"))
+        self.assertTrue(triage["headline"].startswith("payments-api in seeded-debug keeps crashing"))
+
+    def test_button_text_fits_slack(self):
+        long_title = "x" * 120
+        triage = runtime.parse_triage(REPORT.replace("Restore the secret", long_title))
+        blocks = runtime.blocks_triage(triage, REPORT)
+        for button in blocks[1]["elements"]:
+            self.assertLessEqual(len(button["text"]["text"]), presenter.BUTTON_TEXT_MAX)
+
+
+class ApplierTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "gateway").mkdir()
+        (self.root / applier.RELATIVE).write_text(NOTIFIER)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_send(self, source, adapter):
+        stub = types.ModuleType("gateway")
+        stub.slack_ux_incident = runtime
+        with mock.patch.dict(sys.modules, {"gateway": stub, "gateway.slack_ux_incident": runtime}):
+            namespace = {}
+            exec(compile(source, "notifier", "exec"), namespace)  # noqa: S102 — the fixture under test
+        watcher = namespace["Watcher"](adapter, SimpleNamespace(result=REPORT), {"chat_id": CHANNEL})
+        asyncio.run(watcher._send_event(SimpleNamespace(kind="completed"), "msg"))
+        return namespace["calls"]
+
+    def test_flag_off_the_patched_notifier_delivers_through_its_own_adapter(self):
+        applier.apply(self.root)
+        patched = (self.root / applier.RELATIVE).read_text()
+        self.assertIn(applier.BUILD_MARKER, patched)
+        adapter = _Adapter()
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
+            self.assertEqual(self.run_send(patched, adapter), [adapter])
+            self.assertEqual(self.run_send(NOTIFIER, adapter), [adapter])
+
+    def test_a_second_run_refuses(self):
+        applier.apply(self.root)
+        with self.assertRaises(SystemExit):
+            applier.apply(self.root)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -737,6 +737,19 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # upstream's body untouched. slack_presenter.py is staged here only so the
 # verifier can import it; the image ships it under /opt/defaults/scripts. Also
 # rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
+#
+# Slack: with KAGE_SLACK_UX on, a click on one of our choice buttons runs as the
+# clicker's own reply in the thread, echoed and marked answered; it passes the
+# same authorization as a typed message. Registered after the plugin action
+# handlers by gateway/slack_ux_clicks.py; with the flag off nothing is
+# registered. Also rides this COPY and RUN. See deploy/docker/patches/slack_ux_clicks.py.
+#
+# Slack: with KAGE_SLACK_UX on, an incident's triage report edits its alert in
+# place into the headline, one button per option and the report folded, instead
+# of replying under it. The kanban notifier's deliver call gets the adapter
+# gateway/slack_ux_incident.py returns, which is the notifier's own with the
+# flag off. Anchors on apply_kanban_progress_lines' call above. Also rides this
+# COPY and RUN. See deploy/docker/patches/slack_ux_incident.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -746,6 +759,12 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_reactions.py \
      deploy/docker/patches/verify_slack_ux_reactions.py \
      deploy/docker/patches/slack_ux_reactions.py \
+     deploy/docker/patches/apply_slack_ux_clicks.py \
+     deploy/docker/patches/verify_slack_ux_clicks.py \
+     deploy/docker/patches/slack_ux_clicks.py \
+     deploy/docker/patches/apply_slack_ux_incident.py \
+     deploy/docker/patches/verify_slack_ux_incident.py \
+     deploy/docker/patches/slack_ux_incident.py \
      agents/platform/scripts/slack_presenter.py \
      deploy/docker/patches/patchlib.py \
      /tmp/message-surface/
@@ -761,11 +780,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_reactions.py /opt/hermes && \
     grep -qF "_kage_slack_ux.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_clicks.py /opt/hermes/gateway/slack_ux_clicks.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_clicks.py /opt/hermes && \
+    grep -qF "_kage_slack_clicks.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_incident.py /opt/hermes/gateway/slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_incident.py /opt/hermes && \
+    grep -qF "_kage_slack_incident.adapter_for(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_clicks.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -2011,7 +2038,8 @@ RUN set -eu; \
 
 USER 10000:10000
 
-# Slack presentation (reactions by kind, settle reaction), off by
+# Slack presentation (reactions by kind, settle reaction, choice-button
+# clicks, incident alerts edited into triage), off by
 # default. An install turns it on through the PlatformAgent's
 # spec.deployment.env (the chart's platformAgent.deployment.env), which the
 # container's environment takes over this default. Read by
