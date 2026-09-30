@@ -10,7 +10,6 @@ surface; with it on, the runtime module takes over.
 """
 
 import asyncio
-import enum
 import importlib
 import os
 import shutil
@@ -111,6 +110,11 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _cards(*ids, board="default"):
+    """A board read: open cards as ``(board, id)``."""
+    return frozenset((board, task) for task in ids)
+
+
 class _Root:
     """A throwaway Hermes root holding the fixture adapter and the runtime module."""
 
@@ -161,9 +165,29 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(path.read_text(), UPSTREAM.replace("when message processing begins", "on start"))
 
     def test_verifier_passes_on_patched_tree(self):
+        # The board read needs the image's hermes_cli; the image build runs it.
         applier.apply(self.root.dir)
         with mock.patch.dict(os.environ, {}, clear=False):
-            verifier.main(self.root.dir)
+            verifier.main(self.root.dir, board_read=False)
+
+    def test_verifier_refuses_a_drifted_adapter_member(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        patched = path.read_text()
+        drifts = {
+            "react keyword": ("team_id, *, remove):", "team_id, remove=False):"),
+            "target arity": ("return (ts, team_id, marker) if", "return (ts, marker) if"),
+            "tracked set": ('self._reacting_message_ids = {"m"}', "self._reacting_message_ids = []"),
+            "target gone": ("def _reacting_target(self, event):", "def _target(self, event):"),
+        }
+        for name, (old, new) in drifts.items():
+            with self.subTest(drift=name):
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit):
+                    verifier.check_adapter(self.root.dir)
+        path.write_text(patched)
+        verifier.check_adapter(self.root.dir)
 
     def test_verifier_refuses_unpatched_tree(self):
         with self.assertRaises(SystemExit):
@@ -253,8 +277,8 @@ class RuntimeTest(unittest.TestCase):
         self.boards = []
         self.board_args = []
 
-        async def open_cards(chat_id, thread_id, board=None):
-            self.board_args.append((chat_id, thread_id, board))
+        async def open_cards(chat_id, thread_id):
+            self.board_args.append((chat_id, thread_id))
             return self.boards.pop(0)
 
         cards = mock.patch.object(runtime, "open_cards", open_cards)
@@ -295,15 +319,15 @@ class RuntimeTest(unittest.TestCase):
 
     def test_old_open_card_does_not_defer(self):
         # A card from an earlier ask is still running; this turn answered directly.
-        adapter = self._turn("why?", frozenset({"t_old"}), frozenset({"t_old"}))
+        adapter = self._turn("why?", _cards("t_old"), _cards("t_old"))
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
 
     def test_unreadable_board_settles_now(self):
-        adapter = self._turn("why?", None, frozenset({"t_a"}))
+        adapter = self._turn("why?", None, _cards("t_a"))
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
 
     def test_delegated_settles_when_the_last_card_does(self):
-        adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
+        adapter = self._turn("fix it", frozenset(), _cards("t_a"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         # A card this ask did not open finishes: nothing, and no board is read.
         reads = len(self.board_args)
@@ -324,14 +348,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(adapter.calls), 3)
 
     def test_delegated_failure(self):
-        adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
+        adapter = self._turn("fix it", frozenset(), _cards("t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
         self.assertEqual(adapter.calls[-1], ("x", False))
 
     def test_fan_out_with_a_give_up_settles_once_as_failed(self):
         # Hermes leaves a gave-up card at status 'blocked', so it still reads as
         # open on the board; the ask must settle on the event, not the board.
-        adapter = self._turn("fix it", frozenset(), frozenset({"t_a", "t_b"}))
+        adapter = self._turn("fix it", frozenset(), _cards("t_a", "t_b"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
@@ -340,7 +364,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(adapter.calls), 2)
 
     def test_a_stale_blocked_card_in_the_thread_does_not_hold_the_settle(self):
-        adapter = self._turn("fix it", frozenset({"t_old"}), frozenset({"t_old", "t_a"}))
+        adapter = self._turn("fix it", _cards("t_old"), _cards("t_old", "t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
         # The stale card finishing later touches nothing.
@@ -349,8 +373,8 @@ class RuntimeTest(unittest.TestCase):
 
     def test_two_asks_in_one_thread_settle_on_their_own_cards(self):
         log = []
-        first = self._turn("fix it", frozenset(), frozenset({"t_a"}), adapter=_Stub("111.001", log))
-        second = self._turn("scale it", frozenset({"t_a"}), frozenset({"t_a", "t_b"}), adapter=_Stub("111.002", log))
+        first = self._turn("fix it", frozenset(), _cards("t_a"), adapter=_Stub("111.001", log))
+        second = self._turn("scale it", _cards("t_a"), _cards("t_a", "t_b"), adapter=_Stub("111.002", log))
         _run(runtime.settle_delegated(second, self._sub("t_b"), "blocked"))
         self.assertEqual(log[-1], ("111.002", "double_vertical_bar"))
         _run(runtime.settle_delegated(second, self._sub("t_b"), "completed"))
@@ -366,24 +390,39 @@ class RuntimeTest(unittest.TestCase):
         self.boards[:] = [frozenset()]
         _run(runtime.on_processing_start(adapter, _event("fix it")))
 
-        async def read_then_race(chat_id, thread_id, board=None):
+        async def read_then_race(chat_id, thread_id):
             await runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up")
-            return frozenset({"t_a"})
+            return _cards("t_a")
 
         with mock.patch.object(runtime, "open_cards", read_then_race):
             _run(runtime.on_processing_complete(adapter, _event("fix it"), SimpleNamespace(value="success")))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
         self.assertFalse(runtime._deferred)
 
+    def test_a_card_on_another_board_settles_on_that_board_only(self):
+        adapter = self._turn("fix it", frozenset(), _cards("t_a", board="b2"))
+        # The same id on the default board is a different card.
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed", board="b2"))
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+
+    def test_a_thread_keeps_only_its_newest_deferred_asks(self):
+        for n in range(runtime.DEFERRED_PER_THREAD + 2):
+            self._turn("fix it", frozenset(), _cards(f"t_{n}"), adapter=_Stub(f"111.{n:03d}"))
+        asks = runtime._deferred[(CHANNEL, THREAD)]
+        self.assertEqual(len(asks), runtime.DEFERRED_PER_THREAD)
+        self.assertEqual(asks[0].ts, "111.002")
+
     def test_settle_ignores_other_platforms_and_unknown_threads(self):
-        adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
+        adapter = self._turn("fix it", frozenset(), _cards("t_a"))
         _run(runtime.settle_delegated(adapter, self._sub(platform="google_chat"), "completed"))
         other = dict(self._sub(), thread_id="999.000")
         _run(runtime.settle_delegated(adapter, other, "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
 
     def test_nothing_is_ever_removed(self):
-        adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
+        adapter = self._turn("fix it", frozenset(), _cards("t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "blocked"))
         self.boards[:] = [frozenset()]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
@@ -391,7 +430,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertTrue(all(remove is False for _emoji, remove in adapter.calls))
 
     def test_flag_off_settle_is_inert(self):
-        adapter = self._turn("fix it", frozenset(), frozenset({"t_a"}))
+        adapter = self._turn("fix it", frozenset(), _cards("t_a"))
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
             _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
@@ -412,6 +451,38 @@ class OpenCardsQueryTest(unittest.TestCase):
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
         self.assertEqual(sorted(r[0] for r in rows), ["a", "b"])
+
+    def test_reads_every_live_board_once(self):
+        # Two boards share a database, as a board listed twice would: one read
+        # under the first slug. A third board has its own database.
+        paths = {"default": "/k/default.db", "alias": "/k/default.db", "b2": "/k/b2.db"}
+        rows = {"/k/default.db": [("t_a",)], "/k/b2.db": [("t_b",), ("t_c",)]}
+        reads = []
+
+        class Conn:
+            def __init__(self, path):
+                self.path = path
+
+            def execute(self, sql, params):
+                reads.append((self.path, params))
+                return SimpleNamespace(fetchall=lambda: rows[self.path])
+
+            def close(self):
+                pass
+
+        kb = SimpleNamespace(
+            DEFAULT_BOARD="default",
+            list_boards=lambda include_archived: [{"slug": s, "db_path": p} for s, p in paths.items()],
+            kanban_db_path=lambda slug: Path(paths[slug]),
+        )
+        connect = SimpleNamespace(connect=lambda board=None: Conn(paths[board]))
+        hermes = SimpleNamespace(kanban_db=kb, kanban_db_connect=connect)
+        modules = {"hermes_cli": hermes, "hermes_cli.kanban_db": kb, "hermes_cli.kanban_db_connect": connect}
+        with mock.patch.dict(sys.modules, modules):
+            found = runtime._query_open_cards("C1", "111.000")
+        self.assertEqual(found, {("default", "t_a"), ("b2", "t_b"), ("b2", "t_c")})
+        self.assertEqual([path for path, _ in reads], ["/k/default.db", "/k/b2.db"])
+        self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
 
     def test_read_failure_is_none(self):
         with mock.patch.object(runtime, "_query_open_cards", side_effect=RuntimeError("locked")):
@@ -436,11 +507,6 @@ class MissingPresenterTest(unittest.TestCase):
             ), mock.patch.object(runtime.logger, "warning") as warning:
                 runtime.enabled()
                 self.assertEqual(warning.called, warns)
-
-
-# Keep the enum import used: the fixture's ProcessingOutcome is exec'd, this
-# module compares outcomes by value only.
-assert enum.Enum
 
 
 if __name__ == "__main__":

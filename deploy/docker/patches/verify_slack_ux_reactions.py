@@ -6,13 +6,21 @@ immediately after ``apply_slack_ux_reactions.py``, with ``slack_presenter.py``
 staged beside this script (``/opt/defaults/scripts`` is not populated yet at
 that point in the build).
 
-Two things are checked:
+Three things are checked:
 
 1. The adapter. Each hook's first statement after its docstring is the flag
    guard handing over to ``_kage_slack_ux``, and upstream's body still follows
    it, reacting through ``self._react`` — so with the flag off the hook is
-   upstream's. The import the guard names is bound at module level.
-2. The runtime module, loaded by path from ``gateway/`` and driven with a stub
+   upstream's. The import the guard names is bound at module level. The
+   members the runtime calls on the adapter are still there in the shape it
+   calls them: ``_reacting_target(event)`` returning a 3-tuple,
+   ``_react(channel, ts, emoji, team_id, *, remove)``, and
+   ``_reacting_message_ids`` as a set.
+2. The board read. The runtime's own kanban query runs against real boards
+   made with the built tree's ``hermes_cli``: an open card subscribed to the
+   thread on the default board and on a second board is found, and a finished
+   card, a card in another thread and a card for another platform are not.
+3. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it is inert; flag on, an ask gets the arrival reaction for
    its kind, a direct answer settles at once, a delegated one waits for the
    notifier, and no call anywhere is a removal.
@@ -27,7 +35,9 @@ import ast
 import asyncio
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +53,20 @@ GUARD_ALIAS = "_kage_slack_ux"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_reactions"
 UPSTREAM_HELPER = "_react"
+TARGET_HELPER = "_reacting_target"
+TRACKED_SET = "_reacting_message_ids"
+#: ``_react``'s positional parameters after ``self``, and its keyword-only one.
+REACT_POSITIONAL = 4
+REACT_KEYWORD = "remove"
+#: ``_reacting_target``'s return, ``(ts, team_id, marker)``.
+TARGET_ARITY = 3
+
+#: Environment the board check pins, as the sibling kanban verifiers do.
+KANBAN_HOME_ENV = "HERMES_KANBAN_HOME"
+KANBAN_UNSET_ENV = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK")
+SECOND_BOARD = "verify-second"
+OTHER_THREAD = "1700000000.000200"
+OTHER_PLATFORM = "telegram"
 
 ASK_TS = "1700000000.000100"
 CHANNEL = "C0KAGE"
@@ -121,6 +145,96 @@ def check_adapter(root: Path) -> None:
     )
     if not bound:
         raise _fail(f"{ADAPTER} does not import {IMPORT_MODULE}.{IMPORT_NAME} as {GUARD_ALIAS}")
+    _check_members(tree)
+
+
+def _method(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise _fail(f"{ADAPTER} has no def {name}() for the runtime to call")
+
+
+def _check_members(tree: ast.Module) -> None:
+    """The adapter members ``slack_ux_reactions`` calls, in the shape it calls them."""
+    react = _method(tree, UPSTREAM_HELPER)
+    if not isinstance(react, ast.AsyncFunctionDef):
+        raise _fail(f"{UPSTREAM_HELPER}() is no longer async")
+    positional = react.args.posonlyargs + react.args.args
+    if len(positional) != REACT_POSITIONAL + 1 or [a.arg for a in react.args.kwonlyargs] != [REACT_KEYWORD]:
+        raise _fail(
+            f"{UPSTREAM_HELPER}() is not (self, channel, ts, emoji, team_id, *, {REACT_KEYWORD})"
+        )
+    target = _method(tree, TARGET_HELPER)
+    if isinstance(target, ast.AsyncFunctionDef) or len(target.args.args) != 2:
+        raise _fail(f"{TARGET_HELPER}() is not a plain (self, event) method")
+    returns = [
+        node.value.body if isinstance(node.value, ast.IfExp) else node.value
+        for node in ast.walk(target)
+        if isinstance(node, ast.Return) and node.value is not None
+    ]
+    if not any(isinstance(r, ast.Tuple) and len(r.elts) == TARGET_ARITY for r in returns):
+        raise _fail(f"{TARGET_HELPER}() no longer returns (ts, team_id, marker)")
+    as_set = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            named = any(isinstance(tg, ast.Attribute) and tg.attr == TRACKED_SET for tg in targets)
+            value = node.value
+            is_set = isinstance(value, ast.Set) or (
+                isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set"
+            )
+            as_set = as_set or (named and is_set)
+    if not as_set:
+        raise _fail(f"{ADAPTER} no longer initialises self.{TRACKED_SET} as a set")
+
+
+def check_board_read(module, root: Path) -> None:
+    """Run the runtime's kanban query against real boards built with ``hermes_cli``."""
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    saved = {name: os.environ.get(name) for name in (KANBAN_HOME_ENV, *KANBAN_UNSET_ENV)}
+    home = Path(tempfile.mkdtemp())
+    os.environ[KANBAN_HOME_ENV] = str(home)
+    for name in KANBAN_UNSET_ENV:
+        os.environ.pop(name, None)
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kc
+        from hermes_cli import kanban_db_notify as kn
+
+        kb.create_board(SECOND_BOARD)
+        expected = set()
+
+        def card(board: str, title: str, thread: str = THREAD, platform: str = "slack", done: bool = False) -> None:
+            conn = kc.connect(board=board)
+            try:
+                task = kb.create_task(conn, title=title, assignee="platform")
+                kn.add_notify_sub(conn, task_id=task, platform=platform, chat_id=CHANNEL, thread_id=thread)
+                if done:
+                    kb.complete_task(conn, task, result="verified")
+                elif thread == THREAD and platform == "slack":
+                    expected.add((board, task))
+            finally:
+                conn.close()
+
+        card(kb.DEFAULT_BOARD, "open on default")
+        card(SECOND_BOARD, "open on the second board")
+        card(kb.DEFAULT_BOARD, "finished", done=True)
+        card(kb.DEFAULT_BOARD, "another thread", thread=OTHER_THREAD)
+        card(SECOND_BOARD, "another platform", platform=OTHER_PLATFORM)
+        # The query itself, not open_cards(), so a drift raises here instead
+        # of being logged at debug and read as "no cards".
+        found = set(module._query_open_cards(CHANNEL, THREAD))
+        if found != expected:
+            raise _fail(f"the kanban read found {sorted(found)!r}, expected {sorted(expected)!r}")
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(home, ignore_errors=True)
 
 
 class _StubAdapter:
@@ -162,7 +276,7 @@ async def _drive(module) -> None:
     os.environ[FLAG_ENV] = "1"
     boards: list[frozenset] = []
 
-    async def open_cards(chat_id, thread_id, board=None):
+    async def open_cards(chat_id, thread_id):
         return boards.pop(0)
 
     module.open_cards = open_cards
@@ -181,7 +295,7 @@ async def _drive(module) -> None:
 
     # A delegated answer: nothing at completion; the notifier's terminal event settles it.
     adapter = _StubAdapter()
-    boards[:] = [frozenset(), frozenset({CARD})]
+    boards[:] = [frozenset(), frozenset({(module.DEFAULT_BOARD, CARD)})]
     await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
     await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
     sub = {"platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD, "task_id": CARD}
@@ -195,11 +309,15 @@ async def _drive(module) -> None:
     os.environ.pop(FLAG_ENV, None)
 
 
-def main(root: Path = Path("/opt/hermes")) -> None:
+def main(root: Path = Path("/opt/hermes"), *, board_read: bool = True) -> None:
     check_adapter(root)
-    asyncio.run(_drive(_load_runtime(root)))
+    module = _load_runtime(root)
+    if board_read:
+        check_board_read(module, root)
+    asyncio.run(_drive(module))
     print(
         "slack_ux_reactions verify: both hooks guarded ahead of upstream's body; "
+        "adapter members in the shape the runtime calls; board read finds open cards on every board; "
         "runtime reacts by kind, settles direct answers, defers delegated ones, never removes"
     )
 

@@ -32,7 +32,9 @@ With the flag on:
   arrived is not its to wait on. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
-  or ❌ if any gave up. A fan-out settles once, when all of it has.
+  or ❌ if any gave up. A fan-out settles once, when all of it has. Cards are
+  read from every live board, as the notifier reads them, and known by board
+  and id.
 
 The deferred asks live in this process only (the notifier runs in the gateway
 process too). A gateway restart between the turn and the settle loses the
@@ -49,6 +51,7 @@ import asyncio
 import logging
 import os
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,10 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 
 #: The platform name kanban subscriptions carry for Slack.
 PLATFORM = "slack"
+
+#: Hermes's ``kanban_db.DEFAULT_BOARD``: the board a terminal event is on when
+#: the notifier names none.
+DEFAULT_BOARD = "default"
 
 #: Cards subscribed to one Slack thread that have not reached a final status.
 #: ``blocked`` counts as open: it waits on the user and will run on.
@@ -88,10 +95,13 @@ OUTCOME_SETTLES = {"success": "done", "failure": "failed"}
 STARTED_MAX = 512
 DEFERRED_MAX = 512
 FINISHED_MAX = 512
+#: Asks one thread can have waiting at once, oldest dropped first: a thread
+#: whose cards never finish would otherwise grow its list on every ask.
+DEFERRED_PER_THREAD = 32
 
 
 class _Ask:
-    """A Slack ask whose settle waits on the cards its turn opened.
+    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``.
 
     A plain class, not a dataclass: the build-time verify loads this module by
     path without registering it in ``sys.modules``, which ``@dataclass`` needs.
@@ -108,10 +118,11 @@ class _Ask:
 
 _started: OrderedDict[Any, frozenset | None] = OrderedDict()
 _deferred: OrderedDict[tuple, list[_Ask]] = OrderedDict()
-#: Cards the notifier has reported finished, and whether each failed. A card can
-#: finish between the turn's board read and the moment its ask is deferred; the
-#: turn checks here so it never waits on a card that has already settled.
-_finished: OrderedDict[str, bool] = OrderedDict()
+#: Cards the notifier has reported finished, as ``(board, id)``, and whether each
+#: failed. A card can finish between the turn's board read and the moment its
+#: ask is deferred; the turn checks here so it never waits on a card that has
+#: already settled.
+_finished: OrderedDict[tuple[str, str], bool] = OrderedDict()
 _warned_missing = False
 
 
@@ -136,21 +147,49 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
         store.popitem(last=False)
 
 
-def _query_open_cards(chat_id: str, thread_id: str, board: str | None) -> frozenset:
+def _live_boards(kb: Any) -> list[dict]:
+    """Every live board, listed as the kanban notifier lists them."""
+    try:
+        return kb.list_boards(include_archived=False)
+    except Exception:  # noqa: BLE001 — the notifier falls back to the default board too
+        return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+
+
+def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
+    """``(board, id)`` of every open card subscribed to this thread, on every live board.
+
+    Boards are walked as the notifier walks them: one read per database, under
+    the slug the notifier stamps on that database's deliveries. So a card read
+    here and the card a terminal event names compare equal.
+    """
+    from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect
 
-    conn = kanban_db_connect.connect(board=board)
-    try:
-        rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
-    finally:
-        conn.close()
-    return frozenset(row[0] for row in rows)
+    cards: set[tuple[str, str]] = set()
+    seen: set[str] = set()
+    for meta in _live_boards(kb):
+        slug = meta.get("slug") or kb.DEFAULT_BOARD
+        path = meta.get("db_path")
+        try:
+            resolved = str(Path(path).expanduser().resolve()) if path else str(kb.kanban_db_path(slug).resolve())
+        except Exception:  # noqa: BLE001 — as the notifier: key an unresolvable board by slug
+            resolved = f"slug:{slug}"
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        conn = kanban_db_connect.connect(board=slug)
+        try:
+            rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
+        finally:
+            conn.close()
+        cards.update((slug, row[0]) for row in rows)
+    return frozenset(cards)
 
 
-async def open_cards(chat_id: str, thread_id: str, board: str | None = None) -> frozenset | None:
-    """Ids of the open cards subscribed to this thread, or None when the board cannot be read."""
+async def open_cards(chat_id: str, thread_id: str) -> frozenset | None:
+    """``(board, id)`` of the open cards subscribed to this thread, or None when a board cannot be read."""
     try:
-        return await asyncio.to_thread(_query_open_cards, chat_id, thread_id, board)
+        return await asyncio.to_thread(_query_open_cards, chat_id, thread_id)
     except Exception as exc:  # noqa: BLE001 — a cosmetic read never fails a turn
         logger.debug("slack_ux_reactions: kanban read failed for %s/%s: %s", chat_id, thread_id, exc)
         return None
@@ -197,7 +236,7 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
         if waiting:
             asks = _deferred.get((chat_id, thread_id), [])
             ask = _Ask(ts, team_id, waiting, failed)
-            _remember(_deferred, (chat_id, thread_id), [*asks, ask], DEFERRED_MAX)
+            _remember(_deferred, (chat_id, thread_id), [*asks, ask][-DEFERRED_PER_THREAD:], DEFERRED_MAX)
             return
         if failed:
             settle = _presenter.SETTLE_FAILED
@@ -210,15 +249,15 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     ⏸️ goes on each ask waiting on the card as soon as it blocks. A final event
     takes the card off each ask's set; an ask whose set empties gets ✅, or ❌
     if any of its cards gave up, and is forgotten. A card no ask is waiting on
-    is left alone. ``board`` is accepted for the notifier's call and unused:
-    each ask already knows its cards, so no board is read.
+    is left alone. ``board`` is the notifier's slug for the card's board, which
+    with the card's id is how an ask knows it; no board is read here.
     """
     if not enabled() or (sub.get("platform") or "").lower() != PLATFORM:
         return
     settle = _presenter.settle_for_kanban_kind(kind)
-    card = sub.get("task_id")
-    if settle is None or not card:
+    if settle is None or not sub.get("task_id"):
         return
+    card = (board or DEFAULT_BOARD, sub["task_id"])
     key = (sub.get("chat_id"), str(sub.get("thread_id") or ""))
     provisional = settle in _presenter.PROVISIONAL_SETTLES
     if not provisional:
