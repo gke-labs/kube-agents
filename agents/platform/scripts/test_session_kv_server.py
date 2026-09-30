@@ -3280,6 +3280,268 @@ class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
         self.assertEqual(self._sent_to(sender), ["google_chat", "slack"])
 
 
+class TestIsFleetAuditJob(unittest.TestCase):
+    """Only a job whose cron roster entry runs fleet-audit gets the audit headline."""
+
+    def setUp(self):
+        import json
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = tmp.name
+        jobs = [
+            {"id": "compliance-audit", "skills": ["fleet-audit"]},
+            {"id": "single", "skills": "fleet-audit"},
+            {"id": "legacy", "skill": "fleet-audit"},
+            {"id": "stall-watch", "skills": []},
+        ]
+        for base in (self.home, os.path.join(self.home, "profiles", "platform")):
+            os.makedirs(os.path.join(base, "cron"))
+            with open(os.path.join(base, "cron", "jobs.json"), "w", encoding="utf-8") as handle:
+                json.dump({"jobs": jobs if base != self.home else jobs[3:]}, handle)
+        home = patch("gitops_workspace.agent_home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+
+    def test_a_fleet_audit_job_in_every_skill_shape(self):
+        for job_id in ("compliance-audit", "single", "legacy"):
+            with self.subTest(job_id=job_id):
+                self.assertTrue(session_kv_server._is_fleet_audit_job("platform", job_id))
+
+    def test_other_jobs_and_unknown_jobs_are_not(self):
+        self.assertFalse(session_kv_server._is_fleet_audit_job("platform", "stall-watch"))
+        self.assertFalse(session_kv_server._is_fleet_audit_job("platform", "user-made"))
+
+    def test_the_default_profile_reads_the_home_roster(self):
+        self.assertFalse(session_kv_server._is_fleet_audit_job("default", "compliance-audit"))
+
+    def test_an_unreadable_roster_is_not(self):
+        with self.assertLogs(session_kv_server.logger, "WARNING"):
+            self.assertFalse(session_kv_server._is_fleet_audit_job("seeded-a", "compliance-audit"))
+
+    def test_a_profile_that_is_not_one_path_segment_is_not(self):
+        for profile in ("..", ".", "../platform", "profiles/platform", ""):
+            with self.subTest(profile=profile):
+                self.assertFalse(session_kv_server._is_fleet_audit_job(profile, "compliance-audit"))
+
+
+class TestSlackAuditHeadline(unittest.TestCase):
+    """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
+
+    The channel message is the headline, built from the ledger issue the report
+    ends with; a composed report longer than one line goes into its thread, and
+    the full report is what the incident row stores. Flag off, every leg posts
+    the composed message exactly as before.
+    """
+
+    SLACK_THREAD = "1712345678.000100"
+    GCHAT_THREAD = "spaces/AAA/threads/T1"
+    HOME = "C0123456789"
+    LEDGER = "https://github.com/acme/fleet-config/issues/231"
+    COMPOSED = (
+        "## [audit] Security & RBAC Posture Audit — 7 findings (2 critical)\n\n"
+        "- **[critical] seeded-b** — cluster-admin bound to default\n"
+        f"Ledger: {LEDGER}\n"
+    )
+    #: The SOPs' relayed shape: one line ending in the ledger URL.
+    ONE_LINE = f"Security & RBAC posture audit: 2 new, 1 resolved across 3 clusters — {LEDGER}"
+    ISSUE = {
+        "title": "[audit] Security & RBAC Posture Audit — 7 findings (2 critical)",
+        "body": "### Critical (2)\n\n#### cluster-admin bound to default <!-- finding:rbac-1 -->\n",
+    }
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + ("KAGE_SLACK_UX",):
+            os.environ.pop(key, None)
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(
+        self, composed=COMPOSED, platforms=("slack",), turn_ok=True, fold_ok=True, job_id="rbac",
+        issue=ISSUE, managed=True, fleet_audit=True,
+    ):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": self.GCHAT_THREAD}
+
+        def send(platform, message, chat_id="", thread_id=""):
+            if thread_id == self.SLACK_THREAD and not fold_ok:
+                return None
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value=composed if turn_ok else None), \
+             patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
+             patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed), \
+             patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post(
+                "/v1/cron-reports", json={"job_id": job_id, "report": "raw audit"}
+            )
+        self.is_audit, self.fetch = is_audit, fetch
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_flag_off_posts_the_composed_message_unchanged(self):
+        response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
+
+    def test_flag_on_leads_with_the_headline_and_folds_the_report_into_its_thread(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 2)
+        ref = session_kv_server.slack_audit_report.ledger_ref(self.COMPOSED)
+        headline = session_kv_server.slack_audit_report.headline_from_issue(self.ISSUE, ref, self.COMPOSED)
+        self.assertEqual(calls[0].args, ("slack", headline, "", ""))
+        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit: 7 findings"))
+        self.assertEqual(calls[1].args, ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+        # A reply in the thread is answered with the whole report, not the headline.
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
+
+    def test_flag_on_the_sop_one_line_report_gets_the_headline_and_no_repeat_in_the_thread(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(composed=self.ONE_LINE)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC Posture audit: 7 findings, 2 critical.**"))
+        self.assertIn(f"[Ledger issue #231 ↗]({self.LEDGER})", calls[0].args[1])
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.ONE_LINE)])
+
+    def test_flag_on_an_unreadable_ledger_falls_back_to_the_line_and_its_link(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(composed=self.ONE_LINE, issue=None)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(
+            [c.args for c in calls],
+            [(
+                "slack",
+                "**Security & RBAC posture audit: 2 new, 1 resolved across 3 clusters**\n"
+                f"[Ledger issue #231 ↗]({self.LEDGER})",
+                "",
+                "",
+            )],
+        )
+
+    def test_flag_on_a_ledger_that_does_not_parse_falls_back(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.ONE_LINE, issue={"title": "something else", "body": ""})
+        self.assertTrue(calls[0].args[1].startswith("**Security & RBAC posture audit: 2 new"))
+
+    def test_flag_on_an_unmanaged_repository_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.ONE_LINE, managed=False)
+        self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, "", "")])
+
+    def test_flag_on_a_report_from_a_job_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        report = f"Drift fixed in the payments namespace.\nTracked here — {self.LEDGER}"
+        _, calls = self._post(composed=report, fleet_audit=False, job_id="drift-fixer")
+        self.assertEqual([c.args for c in calls], [("slack", report, "", "")])
+        self.is_audit.assert_called_once_with("platform", "drift-fixer")
+        self.fetch.assert_not_called()
+
+    def test_flag_on_a_headline_error_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        with patch.object(session_kv_server.slack_audit_report, "ledger_ref", side_effect=ValueError("boom")):
+            response, calls = self._post(composed=self.ONE_LINE)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.ONE_LINE, "", "")])
+
+    def test_managed_repositories_unreadable_is_not_managed(self):
+        with patch("gitops_workspace.get_managed_github_repos", side_effect=RuntimeError("no kubectl")):
+            self.assertFalse(session_kv_server._is_managed_github_repo("acme/fleet-config"))
+
+    def test_managed_repository_match_ignores_case(self):
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["Acme/Fleet-Config"]):
+            self.assertTrue(session_kv_server._is_managed_github_repo("acme/fleet-config"))
+            self.assertFalse(session_kv_server._is_managed_github_repo("evil/phish"))
+
+    def test_a_forge_failure_reads_as_no_issue(self):
+        import forge
+
+        ref = session_kv_server.slack_audit_report.ledger_ref(self.ONE_LINE)
+        with patch.object(forge, "call", side_effect=forge.ForgeError("FORGE_RATE_LIMITED")) as call:
+            self.assertIsNone(session_kv_server._fetch_ledger_issue(ref))
+        call.assert_called_once_with("issue-view", {"number": 231}, "acme/fleet-config")
+        with patch.object(forge, "call", return_value={"issue": self.ISSUE}):
+            self.assertEqual(session_kv_server._fetch_ledger_issue(ref), self.ISSUE)
+
+    def test_a_slow_forge_reads_as_no_issue(self):
+        import threading
+
+        import forge
+
+        release = threading.Event()
+        self.addCleanup(release.set)
+        ref = session_kv_server.slack_audit_report.ledger_ref(self.ONE_LINE)
+        with patch.object(session_kv_server, "AUDIT_LEDGER_FETCH_TIMEOUT_S", 0.05), \
+             patch.object(forge, "call", side_effect=lambda *a, **k: release.wait(5) and {"issue": self.ISSUE}):
+            self.assertIsNone(session_kv_server._fetch_ledger_issue(ref))
+
+    def test_flag_on_leaves_google_chat_alone(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
+        _, calls = self._post(platforms=("google_chat", "slack"))
+        gchat = [c.args for c in calls if c.args[0] == "google_chat"]
+        self.assertEqual(gchat, [("google_chat", self.COMPOSED, "", "")])
+
+    def test_flag_on_a_report_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed="Two pods restarted overnight; nothing to do.")
+        self.assertEqual(
+            [c.args for c in calls],
+            [("slack", "Two pods restarted overnight; nothing to do.", "", "")],
+        )
+
+    def test_flag_on_an_unrelayed_report_keeps_its_notice(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(turn_ok=False)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("raw audit", calls[0].args[1])
+        self.assertNotIn("7 findings, 2 critical.**", calls[0].args[1])
+
+    def test_flag_on_with_no_home_channel_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ.pop("SLACK_HOME_CHANNEL")
+        with patch.object(session_kv_server, "_slack_home_channel", return_value=""):
+            _, calls = self._post()
+        self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])
+
+    def test_a_failed_fold_still_counts_as_delivered(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(fold_ok=False)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.COMPOSED)])
+
+    def test_a_second_report_folds_into_the_existing_thread(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        self._post(job_id="rbac-2")
+        _, calls = self._post(job_id="rbac-2")
+        second = [c.args for c in calls]
+        self.assertEqual(second[0][2:], (self.HOME, self.SLACK_THREAD))
+        self.assertEqual(second[1], ("slack", self.COMPOSED, self.HOME, self.SLACK_THREAD))
+
+
 class TestCronReportLabelSanitisation(unittest.TestCase):
     """`job_id`, `profile` and `title` are caller-supplied, not server-written.
 
