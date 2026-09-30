@@ -156,7 +156,7 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
      lambda m: AUTH_FAILED),
     (re.compile(r"⚠️ The model provider rejected the request\. I kept the raw provider error out of chat; "
                 r"check gateway logs for details or try rephrasing\."),
-     "I can't help with that one."),
+     "I can't help with that one as asked — try rephrasing?"),
     (re.compile(r"⏱️ The model provider is rate-limiting requests\. Please wait a moment and try again\."),
      "I'm being rate-limited. Give me a minute and try again."),
     (re.compile(r"⚠️ The model server is not responding — it looks like the configured model endpoint is not "

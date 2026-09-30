@@ -864,7 +864,7 @@ class SystemReplyTest(unittest.TestCase):
                 "Still running.",
                 "Still running.\n\nRecent output:\n```\nstep 3/9\n```",
                 "I can't reach the model right now (authentication failed).",
-                "I can't help with that one.",
+                "I can't help with that one as asked — try rephrasing?",
                 "I'm being rate-limited. Give me a minute and try again.",
                 "I can't reach the model right now. Try again in a minute.",
                 "Something went wrong on my side. Try again?",
