@@ -116,15 +116,10 @@ def check_adapter(root: Path) -> None:
     if not path.is_file():
         raise _fail(f"{path} does not exist")
     tree = ast.parse(path.read_text())
-    hooks = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in HOOKS
-    }
     for name in HOOKS:
-        node = hooks.get(name)
-        if node is None:
-            raise _fail(f"{ADAPTER} has no async def {name}()")
+        node = _method(tree, name)
+        if not isinstance(node, ast.AsyncFunctionDef):
+            raise _fail(f"{ADAPTER_CLASS}.{name}() is no longer async")
         body = node.body
         if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
@@ -149,11 +144,21 @@ def check_adapter(root: Path) -> None:
     _check_members(tree)
 
 
+def _adapter_class(tree: ast.Module) -> ast.ClassDef:
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
+    )
+    if adapter is None:
+        raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
+    return adapter
+
+
 def _method(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
-    for node in ast.walk(tree):
+    """``name`` as defined on the adapter class, not a same-named def elsewhere in the module."""
+    for node in _adapter_class(tree).body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
-    raise _fail(f"{ADAPTER} has no def {name}() for the runtime to call")
+    raise _fail(f"{ADAPTER_CLASS} has no def {name}() for the runtime to call")
 
 
 def _check_members(tree: ast.Module) -> None:
@@ -188,11 +193,7 @@ def _check_members(tree: ast.Module) -> None:
         raise _fail(f"{TARGET_HELPER}() does not return only ({', '.join(TARGET_RETURN)}) or None: {shapes}")
     # Every assignment in the adapter class, not one anywhere in the module:
     # the runtime calls .discard() on the attribute the adapter holds.
-    adapter = next(
-        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
-    )
-    if adapter is None:
-        raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
+    adapter = _adapter_class(tree)
     kinds = []
     for node in ast.walk(adapter):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
