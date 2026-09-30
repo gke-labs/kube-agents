@@ -175,8 +175,9 @@ def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
     for line in out.splitlines():
         name = line.strip().rstrip("/").rsplit("/", 1)[-1]
         if name.isdecimal() and int(name) < int(newest):
-            ids.append(int(name))
-    return [str(i) for i in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
+            # The listed name is what is read back: int() is the sort key only.
+            ids.append((int(name), name))
+    return [name for _, name in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
 
 
 def _candidates(job: str, newest: str, runner, log=print):

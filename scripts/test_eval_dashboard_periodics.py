@@ -200,6 +200,14 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(periodics.load_readings(None), {})
 
 
+    def test_a_listed_build_is_read_under_the_name_that_was_listed(self):
+        # A non-canonical decimal name is Prow's to never write; if one is
+        # there, it is read as listed rather than rebuilt through int().
+        objects = archive(WEEKLY.job, {"200": (None, None), "0099": (finished(NOW - timedelta(hours=1), passed=False), None)})
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects))
+        self.assertEqual(readings[WEEKLY.job]["build"], "0099")
+
     def test_a_missing_bucket_is_warned_not_read_as_never_ran(self):
         class NoBucket:
             def __call__(self, cmd, **kwargs):
