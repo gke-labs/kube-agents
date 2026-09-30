@@ -62,7 +62,8 @@ prompt: >-
   exposed workload, and explain what makes it exposed, citing what you
   observed. Single-replica workloads are out of scope, and a workload whose
   missing budget a repository declares on purpose is declared intent, not
-  exposure. Do not change anything.
+  exposure: when you set one aside for that reason, name the repository and
+  the file that declares it. Do not change anything.
 expected_output: >-
   The agent sweeps the seeded clusters, finds two two-replica workloads
   without a PodDisruptionBudget, consults the linked repositories, sets
@@ -106,7 +107,8 @@ verification_spec:
     mode: assert
     check:
       # The step the prompt adds -- consult the repositories and set the
-      # declared workload aside -- graded on its trace: a reply that reached
+      # declared workload aside -- graded on the trace the prompt asks for:
+      # the file that declares the workload it set aside. A reply that reached
       # checkout-gateway without reading the note cannot name the knowledge/
       # file, and one that lists both workloads as exposed did not do the step.
       type: report_contains
