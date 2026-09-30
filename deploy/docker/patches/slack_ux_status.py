@@ -33,13 +33,13 @@ once the title is set, a follow-up ask in the thread keeps it.
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
 notes into one message per card. With the flag on, a Slack thread instead gets
 one message holding a plan with a row per card, edited in place with
-``chat.update`` as notes arrive. A heartbeat creates a card's row; a terminal
+``chat.update`` as notes arrive. A progress note creates a card's row; a terminal
 event settles an existing row (``complete``, ``error``, or ``pending`` for a
 card waiting on the user) and never creates one, so a card that finished
 without a note adds no plan above its report. Two kinds upstream never posts
 reach the plan through ``kanban_progress_lines.silent_event``:
 ``unblocked`` sets a waiting row running again, and ``archived`` settles a
-running or waiting row as stopped, with an ``Archived`` note. The row stays
+running or waiting row as failed, with an ``Archived`` note. The row stays
 rather than the message going: the credential proxy refuses ``chat.delete``,
 as it refuses every destructive Slack verb. ``crashed`` and ``timed_out``
 leave the row running, since the dispatcher retries the card, and
@@ -49,17 +49,19 @@ The plan holds the thread's session status: ``processing`` while a row runs,
 turn ending in the thread does not close it under either. Once no row is
 running or waiting, the session is closed and the plan is forgotten here, and
 the thread's next card starts a new plan. A plan with no note or settled row
-for :data:`PLAN_HOLD_SECONDS` closes the session itself; its next note opens
-it again. A plan evicted at :data:`PLANS_MAX` closes its session on the way
+for :data:`PLAN_HOLD_SECONDS` closes the session itself and is forgotten, so
+a card whose terminal event was lost does not hold the next card's Working…
+or put its row on a message far up the thread; the next note starts a new
+plan. A plan evicted at :data:`PLANS_MAX` closes its session on the way
 out, since nothing else would. The plan has no Stop button yet: ``/stop`` interrupts only the
 Planning Agent's turn, and the cards would run on.
 
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
 message was deleted), the thread drops to the rolling line until every card
 that rolled a note since has settled or been archived, which is what the
-thread showed before this module. A fallen-back plan with no news for
-:data:`PLAN_HOLD_SECONDS` is forgotten, so a card whose terminal event was
-lost does not keep the thread off the plan for good. Everything here is in process,
+thread showed before this module. A settle still edits a posted plan, best
+effort, so an edit refused once, for a rate limit say, does not leave its
+rows showing as running. Everything here is in process,
 like the progress-line map: a gateway restart forgets the plan, and the next
 note starts a new one.
 """
@@ -108,7 +110,7 @@ PLAN_HOLD_SECONDS = 1800.0
 #: ``fail_label`` for the adapter's status setter when the plan sets it.
 PLAN_STATUS_LABEL = "plan"
 
-#: The notifier kind for a card archived by hand: its row settles as stopped,
+#: The notifier kind for a card archived by hand: its row settles as failed,
 #: with :data:`ARCHIVED_NOTE` as its last step.
 ARCHIVED_KIND = "archived"
 ARCHIVED_NOTE = "Archived"
@@ -357,27 +359,20 @@ def _start_lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
 
 
 async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
-    """Close the session of a plan nothing has touched for :data:`PLAN_HOLD_SECONDS`.
+    """Forget a plan nothing has touched for :data:`PLAN_HOLD_SECONDS`, closing its session.
 
-    The plan stays: a late note puts its row back and opens the session again.
+    A row still running there lost its terminal event; the thread's next note
+    starts a new plan rather than reopening this one.
     """
     if _plans.get(key) is not plan or time.monotonic() - plan.touched < PLAN_HOLD_SECONDS:
         return
-    if plan.fallback:
-        # Its rolling cards went quiet; the next note tries a plan again.
-        logger.info(
-            "slack_ux_status: the fallen-back plan in %s/%s had no news for %ss; forgetting it",
-            key[0], key[1], int(PLAN_HOLD_SECONDS),
-        )
-        _plans.pop(key, None)
-        if plan.ts:
-            await _session(adapter, key, plan)
-        return
     logger.info(
-        "slack_ux_status: the plan in %s/%s had no news for %ss; closing its session",
+        "slack_ux_status: the plan in %s/%s had no news for %ss; forgetting it",
         key[0], key[1], int(PLAN_HOLD_SECONDS),
     )
-    await _session(adapter, key, plan)
+    _plans.pop(key, None)
+    if plan.ts:
+        await _session(adapter, key, plan)
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -483,7 +478,8 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
     elif moved:
         row.status = status
     plan.touched = time.monotonic()
-    if moved and plan.ts and not plan.fallback:
+    if moved and plan.ts:
+        # Best effort on a fallen-back plan too, so its rows do not stay running.
         await _render(adapter, key, plan)
     # A plan that fell back is still forgotten once its cards settle, so the
     # thread's next card tries a plan again.

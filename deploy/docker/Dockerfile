@@ -2024,10 +2024,10 @@ RUN set -eu; \
 USER 10000:10000
 
 # Slack presentation (reactions by kind and settle reaction, the quieter
-# kanban lines, the plan and its session status), off by default. An install turns it on through the PlatformAgent's
-# spec.deployment.env (the chart's platformAgent.deployment.env), which the
-# container's environment takes over this default. Read by
-# agents/platform/scripts/slack_presenter.py.
+# kanban lines, the plan and its session status), off by default. An install
+# turns it on through the PlatformAgent's spec.deployment.env (the chart's
+# platformAgent.deployment.env), which the container's environment takes over
+# this default. Read by agents/platform/scripts/slack_presenter.py.
 ENV KAGE_SLACK_UX=0
 
 # The build this image came from, for the `User-Agent` that remote MCP calls

@@ -552,7 +552,7 @@ class PlanTest(_RuntimeCase):
         tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
         self.assertEqual([t["status"] for t in tasks], ["in_progress"])
 
-    def test_an_archived_card_shows_as_stopped(self):
+    def test_an_archived_card_shows_as_failed_with_a_note(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs", task="t_a")
         self._note(adapter, 1, "reading metrics", task="t_b")
@@ -643,6 +643,18 @@ class PlanTest(_RuntimeCase):
             [v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed", "processing"],
         )
 
+    def test_a_settle_after_a_refused_edit_still_edits_the_plan(self):
+        # A rate-limited edit falls back; the settle must not leave the row running.
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        adapter.client.fail.add("update")
+        self.assertFalse(self._note(adapter, 2, "reading metrics"))
+        adapter.client.fail.clear()
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        self.assertEqual(tasks[0]["status"], "complete")
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
     def test_a_card_archived_after_it_finished_keeps_its_row(self):
         adapter = _Adapter()
         self._note(adapter, 1, "a", task="t_a")
@@ -722,7 +734,23 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed"])
-        self.assertIn((CHANNEL, THREAD), runtime._plans, "a late note can still reach the plan")
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_card_after_a_lapse_starts_a_new_plan(self):
+        # t_a's terminal event was lost; t_b must not land on its stale plan.
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "reading logs")
+            await asyncio.sleep(0.2)
+            await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "reading logs")
+            await runtime.settle_row(adapter, _sub("t_b"), "completed")
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter).count("post"), 2)
+        self.assertEqual(
+            [v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed", "processing", "closed"],
+        )
 
     def test_a_plan_that_settles_leaves_no_timer(self):
         async def scenario(adapter):

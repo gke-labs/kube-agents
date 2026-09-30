@@ -2,7 +2,8 @@
 
 Installed into the image at ``/opt/hermes/gateway/kanban_progress_lines.py``
 and wired into ``gateway/kanban_watchers_notifier.py`` (the notifier's
-``_EVENT_FORMATTERS`` table and ``_KanbanNotification._send_event``) by
+``_EVENT_FORMATTERS`` table, ``_KanbanNotification._send_event`` and, for
+the flag's silent kinds, the skip loop in ``_send_pings``) by
 ``deploy/docker/patches/apply_kanban_progress_lines.py``.
 
 **The problem.** A delegated card is silent from the moment it is claimed until
@@ -51,12 +52,16 @@ the rolling message is settled — the ``⏳`` becomes ``✓`` or ``⏹`` — an
 result posts as a message of its own, which is the one that should ping. With
 ``KAGE_SLACK_UX`` on, a Slack card settles to its last line only, a failure
 the creator's wake will explain is held for the wake step rather than posted,
-and no line carries the board tag or ``Kanban <id>``; see :func:`deliver`.
+no line carries the board tag or ``Kanban <id>``, and a card's notes go on its
+row in the thread's plan (``gateway/slack_ux_status.py``), the rolling line
+being the plan's fallback; :func:`silent_event` carries ``archived`` and
+``unblocked``, which upstream never posts, to the plan. See :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
 1. Every notifier line leaves through a single ``adapter.send`` call site, so
-   the whole behaviour hangs off one anchor.
+   the whole behaviour hangs off one anchor; only the flag's silent kinds need
+   a second, in the skip loop.
 2. ``BasePlatformAdapter.edit_message`` returns ``SendResult(success=False)``
    on platforms that cannot edit, so the fallback to a fresh message needs no
    capability check and no platform name test. Nothing is gated on
