@@ -189,8 +189,9 @@ verification_spec:
       # the skills from teaching the variable form again is the image build's
       # check_skill_commands.py, which runs their shell blocks through Tirith,
       # and for inline code tests/test_skill_inline_commands.py and the
-      # stockout plugin's test_skill_commands.py, whose patterns share this
-      # list's gaps.
+      # stockout plugin's test_skill_commands.py. Those read the skill's own
+      # text, so they see a chain's later commands, but their patterns miss
+      # the same unlisted wrappers and wrapper arguments.
       forbidden_patterns:
         - '((^|[;&|]|\$\()\s*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)*|\s((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)+)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
         - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*(/opt/vcs/libexec/git|submit_suggestion\.py)\b'

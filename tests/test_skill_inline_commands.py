@@ -20,10 +20,11 @@ from markdown_it import MarkdownIt
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
 
-# A shell keyword or a wrapper that runs the next word as a program
-# (`if $G diff`, `xargs $G add`).
+# A variable run as the program at the start of a span, after a shell join or
+# inside `$(`, and after a shell keyword or a wrapper that runs the next word
+# as a program (`if $G diff`, `xargs $G add`).
 PREFIX = (
-    r"(^|`|&&|;|\|)\s*"
+    r"(^|`|&&?|;|\||\$\()\s*"
     r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)*"
 )
 # The patterns agentplugins/gke-stockout-investigator/tests/test_skill_commands.py
@@ -35,7 +36,7 @@ PROGRAM_ASSIGNMENT_RE = re.compile(
 )
 # A script run by a path that starts with a variable, which the skills taught
 # for their helper scripts (`"$HERMES_HOME"/skills/.../resolver.py poll`). The
-# plugin's skill never did, so its test has no copy.
+# plugin's test carries it too.
 VARIABLE_PATH_PROGRAM_RE = re.compile(
     PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?/\S*\s+\S", re.MULTILINE
 )
@@ -46,9 +47,15 @@ REFUSED_EXAMPLE_RE = re.compile(r"whose program is a variable \(`[^`]*`\)")
 def inline_code(text):
     for token in MarkdownIt("commonmark").parse(text):
         if token.type == "inline":
+            # The parser gives a line only for the paragraph, so count the line
+            # breaks in its source up to the span's opening backticks.
+            end = 0
             for child in token.children:
                 if child.type == "code_inline":
-                    yield token.map[0] + 1, child.content
+                    start = token.content.index(child.markup, end)
+                    end = token.content.index(child.markup, start + len(child.markup))
+                    end += len(child.markup)
+                    yield token.map[0] + 1 + token.content.count("\n", 0, start), child.content
 
 
 def refused(span):
@@ -89,6 +96,8 @@ class SkillInlineCommandsTest(unittest.TestCase):
             'cd "$WS" && "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll',
             "if ! $G diff --quiet; then $G commit -m x; fi",
             "find . -name '*.yaml' | xargs $G add",
+            "SHA=$($G rev-parse HEAD)",
+            'cd "$WS" & $G add <path>',
         ):
             with self.subTest(span):
                 self.assertTrue(refused(span))
@@ -104,6 +113,14 @@ class SkillInlineCommandsTest(unittest.TestCase):
         ):
             with self.subTest(span):
                 self.assertFalse(refused(span))
+
+    def test_a_span_is_reported_at_its_own_line(self):
+        text = (
+            "Intro.\n\nA paragraph that wraps\nonto `$G add` and `a\nspan`, then\n`$S prepare`.\n"
+        )
+        self.assertEqual(
+            [(4, "$G add"), (4, "a span"), (6, "$S prepare")], list(inline_code(text))
+        )
 
 
 if __name__ == "__main__":
