@@ -3050,8 +3050,9 @@ fi
 # release-candidate lane, which reports NOT RUN rather than RED on them, and
 # for the dashboard: scripts/eval_dashboard/collect.py reads the artifact for
 # a build whose final line carries NOT EVALUATED and records the outcome on
-# the run, which is what keeps the run page and the health bot's comment
-# from calling it a hard failure. --baseline-rate is not passed: the rate is computed from the
+# the run for the infrastructure-loss shape (the transport shape below stays
+# a plain RED there), which is what keeps the run page and the health bot's
+# comment from calling it a hard failure. --baseline-rate is not passed: the rate is computed from the
 # store, per admitted case at its own version key. While the store holds
 # nothing, and until EVAL_AGGREGATE_ARMED is set to 1, the aggregate stays
 # advisory and the markdown says so, rather than implying a comparison that

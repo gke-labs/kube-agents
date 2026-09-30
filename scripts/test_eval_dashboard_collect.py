@@ -2108,6 +2108,47 @@ class TestNotEvaluatedRun(unittest.TestCase):
         self.assertEqual(misses, ["artifacts/eval-verdict.json"])
         self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
 
+    def test_the_transport_shape_stays_a_plain_red_with_a_note(self):
+        # Two writers share the outcome word (hack/ci-eval-pr.sh,
+        # announce_suite_verdict): weather that took an admitted case names
+        # it under not_evaluated; an inject-lane run whose every case was
+        # set aside as not graded on its transport names nothing there and
+        # the cases under not_graded, and the script's final line says so.
+        # Nothing was lost on the second, and the pages' "retest once the
+        # environment is healthy" would be the opposite of the gate's own
+        # banner ("the lane's roster is what to fix"), so it is not recorded
+        # as an infrastructure loss.
+        inner = collect._dir_reader(NOTEVAL_TESTDATA / BUILD_1782_NOT_EVALUATED)
+        transport_line = (
+            "❌ [2026-09-21T15:38:13Z] PR Smoke Test Evaluation Failed -- NOT EVALUATED: every case in the matrix was not graded"
+            " on this transport (every objective check not applicable), so this run graded nothing and cannot certify green."
+            " Not a finding against the change and not an environment failure: the lane's roster is what to fix."
+            " See /logs/artifacts/eval-verdict.md (Total Duration: 1631s)"
+        )
+        log = inner("build-log.txt")
+        infra_line = next(l for l in log.splitlines() if "NOT EVALUATED" in l)
+        transport_log = log.replace(infra_line, transport_line)
+        self.assertNotEqual(log, transport_log)
+        artifact = json.dumps({"green": False, "outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["agent-kanban-smoke", "reliability-pdb-probe"]})
+        for label, log_text in (("the transport line", transport_log), ("the infrastructure line", log)):
+            with self.subTest(label):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    run = collect.build_run(
+                        BUILD_1782_NOT_EVALUATED,
+                        lambda name: artifact if name == "artifacts/eval-verdict.json" else log_text if name == "build-log.txt" else inner(name),
+                    )
+                self.assertFalse({"eval_outcome", "not_evaluated"} & set(run), label)
+                self.assertEqual((run["eval_verdict"], run["duration_s"]), ("RED", 1631))
+                self.assertIn("says every case was not graded on its transport", err.getvalue())
+                self.assertIn("recorded as a plain RED, which is not an infrastructure loss", err.getvalue())
+                self.assertNotIn("warning:", err.getvalue(), "a designed fallback, not a disagreeing artifact")
+        # The artifact decides, not the words on the line: the infra shape
+        # under the transport line is still the infra shape.
+        with contextlib.redirect_stderr(io.StringIO()):
+            run = collect.build_run(BUILD_1782_NOT_EVALUATED, lambda name: transport_log if name == "build-log.txt" else inner(name))
+        self.assertEqual((run["eval_outcome"], run["not_evaluated"]), ("not_evaluated", ["security-overgrant-probe"]))
+
     def test_parse_eval_verdict(self):
         self.assertIsNone(collect.parse_eval_verdict(None))
         self.assertIsNone(collect.parse_eval_verdict("{"))
@@ -2116,6 +2157,15 @@ class TestNotEvaluatedRun(unittest.TestCase):
         self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated"})), [], "the outcome is the fact; the list is detail")
         self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": "a"})), [])
         self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a", 3, "", None, "b"]})), ["a", "b"])
+        # The inject lane's graded-nothing shape (scoring.py nothing_gradable):
+        # the script's own test, nothing under not_evaluated and something
+        # under not_graded, and only that shape.
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["a"]})))
+        self.assertIsNone(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_graded": ["a"]})))
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a"], "not_graded": ["b"]})), ["a"])
+        self.assertEqual(collect.parse_eval_verdict(json.dumps({"outcome": "not_evaluated", "not_evaluated": [], "not_graded": []})), [])
+        self.assertTrue(collect.graded_nothing({"not_evaluated": [], "not_graded": ["a"]}))
+        self.assertFalse(collect.graded_nothing({"not_evaluated": ["a"], "not_graded": ["b"]}))
 
     def test_parse_eval_verdict_keeps_only_case_id_shaped_strings(self):
         # The artifact is the pull request's own; its strings land in

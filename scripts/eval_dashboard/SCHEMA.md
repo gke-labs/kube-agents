@@ -256,7 +256,16 @@ the same layout and is collected from the moment it starts running.
   final line carries that marker, and only for one, the collector reads that
   one artifact; when its `outcome` agrees, the run carries
   `eval_outcome: "not_evaluated"` and `not_evaluated: [<case id>, ...]`, the
-  case ids the suite named (empty when the artifact names none; an entry
+  case ids the suite named. The same outcome and marker also end an
+  inject-lane run whose every case was set aside as not graded on its
+  transport (`scoring.py`'s `nothing_gradable`; the artifact then names
+  nothing under `not_evaluated` and the cases under `not_graded`, and the
+  script's final line says so). Nothing was lost on such a run, so the
+  collector applies the script's own test (`collect.graded_nothing`) and
+  records it as the plain RED with a note on stderr, never as this field;
+  the field is the infrastructure-loss shape only, until the next-mode view
+  gives the other one a lane. The list is empty when the artifact names
+  none (an entry
   that does not match the case-id grammar the pages use, stated under "URL
   contract" below, is dropped, and the list is cut at 64 entries, because
   the artifact is the pull request's own and the ids are posted in the bot's

@@ -54,9 +54,18 @@ announce_suite_verdict). The line alone is not trusted: for a build whose
 final line carries the marker, that one artifact is read as well, and only
 when its `outcome` agrees does the run carry `eval_outcome: "not_evaluated"`
 and the `not_evaluated` case ids -- the same double check the script makes
-before it prints the marker. `eval_verdict` stays `RED` either way, so a
-reader of that field alone keeps working; the consumers that tell the two
-apart (classify.py, gate_comment.py) read `eval_outcome`.
+before it prints the marker. The same outcome word and marker also end an
+inject-lane run whose every case was set aside as not graded on its
+transport (scoring.py, `nothing_gradable`): that artifact names nothing
+under `not_evaluated` and the cases under `not_graded`, and the script's
+final line says so instead of naming infrastructure. Nothing was lost on
+such a run and a retest would not change it, so the collector keeps it on
+the plain RED (graded_nothing, with a note on stderr) rather than recording
+an infrastructure loss the pages would tell the author to retest; a lane
+for that shape is the next-mode view's (#2008). `eval_verdict` stays `RED`
+in every case, so a reader of that field alone keeps working; the consumers
+that tell a not-evaluated run from a red one (classify.py, gate_comment.py)
+read `eval_outcome`.
 
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
@@ -274,6 +283,15 @@ BUILD_LOG_FILE = "build-log.txt"
 EVAL_VERDICT_FILE = "artifacts/eval-verdict.json"
 NOT_EVALUATED_MARKER = "NOT EVALUATED"
 EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
+# The artifact's two lists (scoring.py, SuiteVerdict.to_dict). Two writers
+# share the outcome word: weather that took an admitted case or every case
+# names the lost cases under `not_evaluated`; an inject-lane run whose every
+# case was set aside as not graded on its transport names nothing there and
+# the cases under `not_graded`. hack/ci-eval-pr.sh's announce_suite_verdict
+# tells them apart on the two lists before it prints its final line, and
+# graded_nothing() below is that test; only the first shape is recorded.
+NOT_EVALUATED_KEY = "not_evaluated"
+NOT_GRADED_KEY = "not_graded"
 # The artifact is written by the checkout under test, so its `not_evaluated[]`
 # strings are the pull request's to choose, and they end up in backticks in
 # the comment the health bot posts. Only a string shaped like a case id is
@@ -575,16 +593,12 @@ def parse_build_log(text: str) -> dict:
     }
 
 
-def parse_eval_verdict(text: str | None) -> list[str] | None:
-    """The case ids a not-evaluated `eval-verdict.json` names, or None.
-
-    None for a missing or malformed file and for any other `outcome`: the
-    caller then records the run as the plain RED its final line's `Failed`
-    word already says, never a not-evaluated one on the line's word alone.
-    A `not_evaluated` list that is absent or malformed reads as empty, and an
-    entry that is not shaped like a case id (`_CASE_ID_SHAPE`) is dropped;
-    the outcome is the fact and the list is detail.
-    """
+def load_eval_verdict(text: str | None) -> dict | None:
+    """The parsed `eval-verdict.json` when it is an object whose `outcome`
+    is `not_evaluated`, else None: a missing or malformed file, or any other
+    outcome. The caller then records the run as the plain RED its final
+    line's `Failed` word already says, never a not-evaluated one on the
+    line's word alone."""
     if text is None:
         return None
     try:
@@ -597,10 +611,43 @@ def parse_eval_verdict(text: str | None) -> list[str] | None:
         return None
     if not isinstance(doc, dict) or doc.get("outcome") != EVAL_OUTCOME_NOT_EVALUATED:
         return None
-    named = doc.get("not_evaluated")
+    return doc
+
+
+def graded_nothing(doc: dict) -> bool:
+    """True for the inject lane's shape of the outcome: nothing under
+    `not_evaluated` and something under `not_graded` (NOT_GRADED_KEY). The
+    same test hack/ci-eval-pr.sh makes before it prints the "not graded on
+    this transport" final line rather than the infrastructure one; the two
+    ask for opposite actions (a roster, or a rerun), so that shape is not
+    recorded as an infrastructure loss."""
+    return not doc.get(NOT_EVALUATED_KEY) and bool(doc.get(NOT_GRADED_KEY))
+
+
+def not_evaluated_ids(doc: dict) -> list[str]:
+    """The case ids under `not_evaluated`. A list that is absent or
+    malformed reads as empty, and an entry that is not shaped like a case id
+    (`_CASE_ID_SHAPE`) is dropped; the outcome is the fact and the list is
+    detail."""
+    named = doc.get(NOT_EVALUATED_KEY)
     if not isinstance(named, list):
         return []
     return [case for case in named if isinstance(case, str) and _CASE_ID_SHAPE.fullmatch(case)][:NOT_EVALUATED_MAX_CASES]
+
+
+def parse_eval_verdict(text: str | None) -> list[str] | None:
+    """The case ids a not-evaluated `eval-verdict.json` names, or None.
+
+    None for a missing or malformed file, for any other `outcome`, and for
+    the inject lane's graded-nothing shape (graded_nothing): the caller then
+    records the run as the plain RED its final line's `Failed` word already
+    says. build_run reads the three pieces itself so its stderr line can
+    say which of the two it was.
+    """
+    doc = load_eval_verdict(text)
+    if doc is None or graded_nothing(doc):
+        return None
+    return not_evaluated_ids(doc)
 
 
 def _iso(ts) -> str | None:
@@ -748,15 +795,25 @@ def build_run(
             verdict_text = read(EVAL_VERDICT_FILE)
             if verdict_text is not None:
                 break
-        lost = parse_eval_verdict(verdict_text)
-        if lost is None:
+        doc = load_eval_verdict(verdict_text)
+        if doc is None:
             print(
                 f"warning: build {build_id}: the final line says {NOT_EVALUATED_MARKER} but"
                 f" {EVAL_VERDICT_FILE} is missing or does not agree; recorded as a plain RED",
                 file=sys.stderr,
             )
+        elif graded_nothing(doc):
+            # The inject lane's shape (module docstring): not weather, and
+            # the run page and the comment have no lane for it yet, so it
+            # stays the plain RED rather than telling the author to retest.
+            print(
+                f"note: build {build_id}: {EVAL_VERDICT_FILE} says every case was not graded on"
+                f" its transport ({NOT_GRADED_KEY} named, {NOT_EVALUATED_KEY} empty); recorded as a"
+                " plain RED, which is not an infrastructure loss",
+                file=sys.stderr,
+            )
         else:
-            suite = {"eval_outcome": EVAL_OUTCOME_NOT_EVALUATED, "not_evaluated": lost}
+            suite = {"eval_outcome": EVAL_OUTCOME_NOT_EVALUATED, NOT_EVALUATED_KEY: not_evaluated_ids(doc)}
 
     # How the build ended (module docstring). A build that ran has a log and
     # costs no extra read; the two shapes a lost pod leaves -- no log at all,
