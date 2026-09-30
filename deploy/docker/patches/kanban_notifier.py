@@ -39,7 +39,9 @@ The concerns, in the order the notifier reaches them:
    drops the head line above the report, and :func:`explained_by_wake` tells
    ``kanban_progress_lines`` when a failure line can wait for the wake to
    explain it. :func:`hold_explained` keeps that line, and
-   :func:`tell_unexplained` posts it after all if the wake does not happen.
+   :func:`tell_unexplained` posts it after all if the wake does not happen;
+   :func:`drop_superseded` drops it once the card recovers. This step cuts
+   across steps 1 and 3 rather than following them.
 
 Step 3 is only defensible because steps 1 and 2 happened, which is the clearest
 argument for keeping them together: ``kanban.wake_on_events`` may drop
@@ -194,7 +196,8 @@ RESULT_LIMIT = 30000
 
 #: Separates the status line from the report. A blank line is enough: the
 #: status line is already on its own line under the ``✔ … done — <title>``
-#: header, so the result reads as the body of the same message.
+#: header (flag off; on Slack with ``KAGE_SLACK_UX`` the handoff leads), so the
+#: result reads as the body of the same message.
 SEPARATOR = "\n\n"
 
 CLIPPED_TAIL = (
@@ -1457,10 +1460,12 @@ def store_incident_report(
 # (:func:`tell_unexplained`): a wake that was admitted for the kind drops it;
 # a wake that raised, or a wake set that turned out not to hold the kind, posts
 # it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry, which
-# rewinds the claim and so replays the same event. A later event that posts
-# on the same card first (:func:`drop_superseded`) drops it, so a line held
-# across a ``WakeNotAccepted`` tick never lands beneath the card's later
-# completion. Five trade-offs, accepted:
+# rewinds the claim and so replays the same event. An event saying the card
+# recovered posting first (its completion, a review handoff, a move to done;
+# :func:`drop_superseded`) drops it, so a line held across a
+# ``WakeNotAccepted`` tick never lands beneath the recovery. Any other later
+# event leaves it held: a wake that then raises still posts it, after that
+# event rather than never. Six trade-offs, accepted:
 #
 # * A wake that raised and later succeeds on a retry tells the failure twice,
 #   once as the line and once in the creator's words. Twice is the safe side.
@@ -1474,6 +1479,9 @@ def store_incident_report(
 #   whatever delivery the subscription sees next, which can be the card's
 #   later completion: a stale failure line under a success.
 # * A held line evicted at :data:`HELD_MAX` goes untold, with a WARNING.
+# * A subscription dropped before its wake step runs (after
+#   ``MAX_SEND_FAILURES`` on a later event in the batch, or by the stale sweep)
+#   leaves its held line to that eviction: untold, and unlogged until then.
 # The flag is read through ``gateway.slack_ux_reactions.enabled()``, imported
 # when a delivery runs: that module is copied into the image after this one,
 # and an image without it reads as flag off.
@@ -1585,10 +1593,11 @@ def hold_explained(
 def drop_superseded(runner: object, sub: dict, event_id: int) -> None:
     """Drop ``sub``'s held lines for events older than ``event_id``, with a WARNING.
 
-    Called before a later event on the card is posted. A line still held then
-    was left by a ``WakeNotAccepted`` tick, and the wake step that would settle
-    it runs after the later post, so posting it there would put a stale failure
-    beneath the card's newer message. Never raises.
+    Called before an event saying the card recovered is posted. The wake step
+    that would settle a held line runs after that post, so posting the line
+    there would put a stale failure beneath the recovery. Only a recovery
+    supersedes: after a note or another failure the failure is still news, and
+    a wake that raises must still be able to tell it. Never raises.
     """
     try:
         held = getattr(runner, HELD_ATTR, None)
@@ -1597,8 +1606,8 @@ def drop_superseded(runner: object, sub: dict, event_id: int) -> None:
         for eid in stale:
             kind = pending.pop(eid)[0]
             logger.warning(
-                "kanban notifier: dropping the held %s line for %s untold; event %d "
-                "on the card posted before its wake settled",
+                "kanban notifier: dropping the held %s line for %s untold; the card "
+                "recovered (event %d) before its wake settled",
                 kind, sub.get("task_id"), int(event_id),
             )
         if stale and not pending:

@@ -52,10 +52,11 @@ the rolling message is settled — the ``⏳`` becomes ``✓`` or ``⏹`` — an
 result posts as a message of its own, which is the one that should ping. With
 ``KAGE_SLACK_UX`` on, a Slack card settles to its last line only, a failure
 the creator's wake will explain is held for the wake step rather than posted,
-no line carries the board tag or ``Kanban <id>``, and a card's notes go on its
-row in the thread's plan (``gateway/slack_ux_status.py``), the rolling line
-being the plan's fallback; :func:`silent_event` carries ``archived`` and
-``unblocked``, which upstream never posts, to the plan. See :func:`deliver`.
+the card recovering drops a failure line it still holds, no line carries the
+board tag or ``Kanban <id>``, and a card's notes go on its row in the thread's
+plan (``gateway/slack_ux_status.py``), the rolling line being the plan's
+fallback; :func:`silent_event` carries ``archived`` and ``unblocked``, which
+upstream never posts, to the plan. See :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -143,6 +144,13 @@ ROLLING_KINDS = ("heartbeat", "status")
 IN_PROGRESS = "⏳"
 FINISHED = "✓"
 STOPPED = "⏹"
+
+#: The kinds that make a failure line the card still holds stale: the card
+#: recovered, and its report or review handoff is posting. So does a ``status``
+#: event moving the card to :data:`SUPERSEDING_STATUS`, a card dragged to done.
+#: A note or another failure leaves the line held for its wake to settle.
+SUPERSEDING_KINDS = ("completed", "review_requested")
+SUPERSEDING_STATUS = "done"
 
 BULLET = "• "
 
@@ -462,10 +470,18 @@ def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
         return False
 
 
-def _drop_superseded(watcher: Any, sub: dict, event_id: int) -> None:
-    """Drop failure lines this card still holds from before ``event_id``."""
+def _supersedes(kind: str, payload: object) -> bool:
+    """Whether an event says the card recovered, so a failure it still holds is stale."""
+    if kind in SUPERSEDING_KINDS:
+        return True
+    status = payload.get("status") if kind == "status" and isinstance(payload, dict) else None
+    return str(status or "").strip() == SUPERSEDING_STATUS
+
+
+def _drop_superseded(watcher: Any, sub: dict, kind: str, ev: Any, event_id: int) -> None:
+    """Drop failure lines this card still holds from before ``event_id``, if it recovered."""
     quiet = _slack_quiet(sub) if event_id else None
-    if quiet is None:
+    if quiet is None or not _supersedes(kind, getattr(ev, "payload", None)):
         return
     try:
         quiet.drop_superseded(watcher, sub, event_id)
@@ -519,14 +535,16 @@ async def deliver(
     against the subscription's send-failure budget.
 
     That is the flag-off behaviour. With ``KAGE_SLACK_UX`` on and a Slack card,
-    the terminal path is quieter in two ways. The rolling message settles to its
+    the terminal path is quieter in three ways. The rolling message settles to its
     last line rather than the whole trail. And a failure the creator's wake will
     explain is held rather than posted, returning ``None`` like the replay path;
     the notifier's wake step drops it once the wake is admitted for the kind, and
     posts it if the wake raises or never covers the kind, so a failed wake does
-    not leave the failure untold. A line that cannot be held is posted. Section 6
-    of ``gateway/kanban_notifier.py`` has the retry and the gap it leaves. And
-    the card's progress goes on its row in the thread's plan rather than in a
+    not leave the failure untold. A line that cannot be held is posted. And an
+    event saying the card recovered (:func:`_supersedes`) drops a failure line
+    it still holds, so the line never posts beneath the recovery. Section 6 of
+    ``gateway/kanban_notifier.py`` has the retry and the gaps it leaves. Beyond
+    the terminal path, the card's progress goes on its row in the thread's plan rather than in a
     rolling message of its own, with the rolling message as the fallback when
     the plan cannot be posted; ``title`` is the card's, for the row. See
     ``gateway/slack_ux_status.py``. Every line it posts, holds or edits keeps
@@ -538,7 +556,7 @@ async def deliver(
     key = sub_key(sub)
     entry = tracked.get(key)
     event_id = int(getattr(ev, "id", 0) or 0)
-    _drop_superseded(watcher, sub, event_id)
+    _drop_superseded(watcher, sub, kind, ev, event_id)
     quiet = _slack_quiet(sub)
     header, message = _slack_heads(quiet, sub, header, board, message)
 

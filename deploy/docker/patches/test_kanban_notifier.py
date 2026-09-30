@@ -2260,8 +2260,8 @@ class _WakeNotAccepted(Exception):
 
 
 class _Ev:
-    def __init__(self, id, kind):
-        self.id, self.kind, self.payload = id, kind, None
+    def __init__(self, id, kind, payload=None):
+        self.id, self.kind, self.payload = id, kind, payload
 
 
 class _Delivery:
@@ -2362,13 +2362,13 @@ class DeliverEndToEndTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def run_ticks(self, source, flag, wake_outcomes, ticks=None):
+    def run_ticks(self, source, flag, wake_outcomes, ticks=None, events=None):
         self.flag = flag
         ns = {"__name__": "kanban_watchers_notifier_fixture"}
         exec(compile(source, "kanban_watchers_notifier.py", "exec"), ns)
         adapter = _SendLog()
         delivery = _Delivery(
-            self, ns, types.SimpleNamespace(), adapter, _sub(), [_Ev(7, "gave_up")], wake_outcomes,
+            self, ns, types.SimpleNamespace(), adapter, _sub(), events or [_Ev(7, "gave_up")], wake_outcomes,
         )
         for _ in range(ticks or len(wake_outcomes)):
             delivery.tick()
@@ -2417,6 +2417,42 @@ class DeliverEndToEndTest(unittest.TestCase):
         self.assertEqual([m for _, m, _ in delivery.adapter.sent], ["✖ card completed"])
         self.assertIn("dropping the held gave_up line", "\n".join(logs.output))
         self.assertFalse(getattr(delivery.runner, HELD_ATTR, None))
+
+    def test_flag_on_a_review_handoff_also_drops_the_held_line(self):
+        delivery, _ = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        delivery.events.append(_Ev(8, "review_requested"))
+        delivery.wake_outcomes.append(RuntimeError("profile gone"))
+        with self.assertLogs("gateway.run", level="WARNING"):
+            delivery.tick()
+        self.assertNotIn("✖ card gave_up", [m for _, m, _ in delivery.adapter.sent])
+
+    def test_flag_on_a_later_move_leaves_the_line_for_a_raising_wake(self):
+        # As above, but the card's next event moves it back to running, not
+        # to done: the failure is still news, and the raised wake must tell it.
+        delivery, sent = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        delivery.events.append(_Ev(8, "status", {"status": "running"}))
+        delivery.wake_outcomes.append(RuntimeError("profile gone"))
+        delivery.tick()
+        self.assertEqual([m for _, m, _ in delivery.adapter.sent].count("✖ card gave_up"), 1)
+        self.assertFalse(getattr(delivery.runner, HELD_ATTR, None))
+
+    def test_flag_on_a_raising_wake_tells_a_failure_followed_in_its_batch(self):
+        # One batch, a crash then a move back to running, and the wake raises.
+        _, sent = self.run_ticks(
+            patch_tree(UPSTREAM_NOTIFIER), True, [RuntimeError("profile gone")],
+            events=[_Ev(7, "crashed"), _Ev(8, "status", {"status": "running"})],
+        )
+        self.assertIn("✖ card crashed", sent)
+
+    def test_flag_on_two_held_failures_are_both_told_when_the_wake_raises(self):
+        # The dispatcher writes timed_out then gave_up back to back; holding
+        # the second must not drop the first.
+        with self.assertNoLogs("gateway.run", level="WARNING"):
+            _, sent = self.run_ticks(
+                patch_tree(UPSTREAM_NOTIFIER), True, [RuntimeError("profile gone")],
+                events=[_Ev(7, "timed_out"), _Ev(8, "gave_up")],
+            )
+        self.assertEqual(sent, ["✖ card timed_out", "✖ card gave_up"])
 
     def test_flag_on_a_wake_set_without_the_kind_posts_the_line(self):
         # The mirror in explained_by_wake predicted a wake; the notifier's own
