@@ -4264,9 +4264,11 @@ def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
     Also called by scripts/verify_ci_pool_project.py (`_note_declaration_problem`),
     which loads this module by path to read a pool repository's declared-intent
     note exactly as the audit would. It also reaches `parse_declarations`,
-    `explain_empty_declarations`, `audit_declarable_checks` and
-    `DECLARATION_CLUSTER_FIELD`; renaming any of them turns that check into
-    "Not checked" on every operator run until the verifier follows.
+    `explain_empty_declarations`, `audit_declarable_checks`,
+    `read_intent_paths`, `_under_prefixes`, `DECLARATION_CLUSTER_FIELD` and
+    `INTENT_FILE` (the verifier's `_AUDIT_REPORT_SYMBOLS` is the list);
+    renaming any of them turns that check into "Not checked" on every
+    operator run until the verifier follows.
 
     Each field goes through `_id_segment`, the reduction `derive_finding_id`
     applies, because the ledger's identity is the standard the join has to

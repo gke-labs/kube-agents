@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import base64
+import contextlib
+import io
 import json
 import math
 import os
@@ -163,7 +165,8 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING} - GITHUB_CHECKS
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks -- github_repo_and_app, gitops_declaration,
 # ledger_read_credential -- (each needs a credential the health bot must not
-# hold),
+# hold), not the minter's signing half (token_minter; the scan runs
+# token_minter_kms),
 # not the mapping (that is about the checkout, not the project), and not the
 # warm-cache check, whose read is in another project the bot holds nothing on.
 POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_TOKEN_MINTER_KMS)
@@ -325,8 +328,9 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
 GITOPS_INTENT_NOTE_MESSAGE = "Declare notification-relay's missing PodDisruptionBudget as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
-# verifier prints is self-contained and the check can read the file back
-# against it; a test pins the two copies to each other.
+# verifier prints is the note provisioning seeds; a test pins the two copies
+# to each other. The body read back is judged by the audit's parser, not
+# compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
 title: notification-relay runs without a PodDisruptionBudget on purpose
@@ -797,7 +801,7 @@ _UNREAD_PATTERNS = (
     # refused connection, a socket timeout or a TLS handshake that never
     # completed. None of these is a resource's name.
     re.compile(
-        r"error connecting to api\.github\.com|check your internet connection|githubstatus\.com|dial tcp \S*: (?:connect: )?(?:connection refused|i/o timeout|network is unreachable|no route to host)|dial tcp .*(?:connection refused|i/o timeout)|net/http: TLS handshake timeout|unexpected EOF",
+        r"error connecting to api\.github\.com|check your internet connection|githubstatus\.com|dial tcp \S*: (?:connect: )?(?:connection refused|i/o timeout|network is unreachable|no route to host)|dial tcp .*(?:connection refused|i/o timeout)|net/http: TLS handshake timeout|unexpected EOF|:\s*EOF\b|server closed idle connection",
         re.I,
     ),
 )
@@ -2375,12 +2379,13 @@ def _load_audit_report():
 
     Loading is not enough to know the parser can run: audit_report.py imports
     nothing beyond the standard library at module level and imports PyYAML
-    lazily inside `parse_declarations`, so on a machine without PyYAML the
-    module loads and the first `import yaml` fires later, from inside the
-    check's read of one repository's note. Importing PyYAML here, and reading
-    every name the check uses, makes "the parser cannot run on this machine"
-    one failure at one place -- an ImportError or AttributeError from this
-    function -- rather than something a note gets blamed for.
+    and `workspace_paths` lazily inside its readers (`_read_declares`,
+    `read_intent_paths`), so on a machine without them the module loads and
+    the first import fires later, from inside the check's read of one
+    repository's file. Importing both here, and reading every name the check
+    uses, makes "the parser cannot run on this machine" one failure at one
+    place -- an ImportError or AttributeError from this function -- rather
+    than something a repository's file gets blamed for.
     """
     import importlib.util
 
@@ -2496,11 +2501,11 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     fails here until someone runs the printed command. The body is read back
     and held to the audit parser's rules, not just the path. A 404 names both
     of its readings, because gh answers it for a private repository this token
-    cannot see as well as for a file that is not there; any other non-zero
-    exit goes through `_record_unreadable`, as the reads that classify their
-    failures do (the repository check above deliberately does not, and says
-    why), so a refusal or a transient leaves the check unverified and anything else
-    (a 409 on a repository with no commits, a 422) fails it.
+    cannot see as well as for a file that is not there. Every read goes
+    through `_gitops_path_state`, which classifies a refusal or a transient
+    before matching 404 (the repository check below deliberately does not,
+    and says why), so those leave the check unverified and anything else (a
+    409 on a repository with no commits, a 422) fails it.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
     repo_slug = _gitops_repo_slug(project_id)
@@ -2598,10 +2603,6 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         )
     if state == GITHUB_PATH_ABSENT:
         return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
-    import contextlib
-    import io
-    import tempfile
-
     try:
         with tempfile.TemporaryDirectory() as tmp:
             tree = Path(tmp)
@@ -2625,9 +2626,11 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     # The audit applies a bound only when every prefix names something at
     # this commit (its `_unmatched_prefixes`); one that names nothing, or is
     # a symlink, discards the bound and the whole tree is searched, note
-    # included. Each prefix is read once. A symlink at an earlier component
-    # of a prefix is not seen from here: the audit would discard that bound
-    # and this check fails the project, the one way the two still differ.
+    # included (directory mode; in content mode the broker withholds a
+    # symlink and the bound stands). Each prefix is read once. Two things
+    # this read cannot see: a symlink at an earlier component of a prefix,
+    # and a symlink the contents API resolves to its target file. The
+    # audit's walk follows neither.
     for prefix in prefixes:
         state, out = _gitops_path_state(repo_slug, prefix)
         if state == GITHUB_PATH_UNREAD:
@@ -2639,7 +2642,8 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
                 name,
                 True,
                 f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration; its {audit.INTENT_FILE} names `{prefix}`, "
-                f"which the repository lacks at this commit, so the audit discards the bound and searches the whole tree, note included",
+                f"which names nothing the audit's walk enters at this commit (absent, or a symlink), so the audit discards the bound "
+                f"and searches the whole tree, note included",
             )
     return CheckResult(
         name,

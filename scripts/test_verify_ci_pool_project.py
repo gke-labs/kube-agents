@@ -1577,6 +1577,13 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             result = checker.check_gitops_declaration("kube-agents-evals-3")
         self.assertFalse(result.passed)
         self.assertIn("Could not read", result.message)
+        large = json.dumps({"sha": "abc", "path": self._NOTE_PATH, "encoding": "none", "content": "", "size": 2_000_000})
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), undecodable]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("read raw", result.message)
+        self.assertIn("not UTF-8", result.message)
 
     def test_no_workspace_paths_leaves_the_check_unverified_like_no_pyyaml(self):
         # read_intent_paths imports workspace_paths lazily; a checkout without
@@ -1681,6 +1688,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: network is unreachable',
             "dial tcp 140.82.112.5:443: connect: no route to host",
             'Get "https://api.github.com/...": unexpected EOF',
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": EOF',
+            'Get "https://api.github.com/...": http: server closed idle connection',
         )
         for err in errs:
             with self.subTest(err[:40]), mock.patch.object(checker, "run_cmd") as run:
