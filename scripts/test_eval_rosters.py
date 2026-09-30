@@ -138,6 +138,8 @@ ADDED_AFTER_THE_MOVE = [
     "bootstrap-discovery-fanout",  # the onboarding discovery fan-out, PR #2085
     "first-install-hello-running",  # the first-install hello, both variants
     "first-install-hello-done",
+    "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
+    "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
 ]
 
 # Admitted after the split, each by a pull request that cited the record

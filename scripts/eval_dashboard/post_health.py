@@ -32,7 +32,11 @@ note (the gate's green runs are taking far longer than usual, #1586), the
 space hears it the first tick it appears and not again until it has cleared
 and come back; the digest repeats the line while it lasts. It is not a state
 change -- nothing is broken and /retest does not help -- so it moves nothing
-else.
+else. An eighth pair, the pool note: once when the pool-pressure periodic
+reports runs waiting to be scheduled and once when they stop (KIND_POOL,
+KIND_POOL_CLEAR). A ninth pair, the watched Prow periodics (KIND_PERIODIC,
+KIND_PERIODIC_CLEAR): a failed run or a stopped job once per episode and
+verdict, and once when a told job passes again.
 
 Every time a reader sees is on the reader's clock: America/Toronto, written
 "7:30 AM ET", never UTC (the deep links and the state file keep ISO UTC).
@@ -87,14 +91,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli, nightly
+    from eval_dashboard import gate_issue, ghcli, nightly, periodics
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
     from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli, nightly
+    from eval_dashboard import gate_issue, ghcli, nightly, periodics
     from eval_dashboard.health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED, PROW_JOB_TIMEOUT, minutes_text, pool_span, wait_text
 
 STATE_SCHEMA_VERSION = 1
@@ -158,6 +162,8 @@ KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
 KIND_FIXTURE_SCAN = "fixture_scan"  # the fleet scan sees nothing, or sees again
 KIND_POOL_SCAN = "pool_scan"  # the pool-state scan sees nothing, or sees again
+KIND_PERIODIC = "periodic"  # a watched Prow periodic failed or stopped; once per episode and verdict
+KIND_PERIODIC_CLEAR = "periodic_clear"  # ... and once when its next run passes
 
 # Where the message goes. The space is a resource name, the token a bearer
 # credential minted by the workflow; the webhook is the legacy alternative.
@@ -407,6 +413,14 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     pool_unknown = pool_state_unknown(health)
     if pool_unknown is not None and pool_unknown != bool((prev or {}).get("pool_state_unknown")):
         kinds.append(KIND_POOL_SCAN)
+    # A watched periodic: once per episode and verdict (a persistently
+    # failing hourly job is one message, not one an hour), and once more when
+    # a job the space was told about passes again. Only a reading clears --
+    # no reading is the bot losing sight of the job, not the job recovering.
+    if periodic_news(health, prev):
+        kinds.append(KIND_PERIODIC)
+    if periodic_clears(health, prev):
+        kinds.append(KIND_PERIODIC_CLEAR)
 
     # The slow note goes out when the note appears, not when it clears: the
     # digest carries it while it lasts, and "back to normal" is not news.
@@ -893,6 +907,82 @@ def render_pool_clear(health: dict) -> str:
     return f"✅ *Smoke gate: queue clear* — runs are starting on time again{typical}."
 
 
+def periodic_key(note: dict) -> str:
+    """What one message stands for: the job's verdict this episode. A newer
+    build that fails the same way is not news (the digest carries it daily);
+    a job that failed and then stopped is two facts, so the verdict flipping
+    is. The episode's end is a clean reading the poster itself saw
+    (`periodics_clean_seen`), not health.json's `since`, which a tick that
+    could not fetch the previous health.json stamps afresh."""
+    return str(note.get("verdict"))
+
+
+def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
+    """The notes not yet told this episode, by job: never told, told with
+    another verdict, or told and since read clean (the clear's send failed,
+    so the told key stayed) and failing again."""
+    told = (prev or {}).get("periodics_told") or {}
+    clean_seen = set((prev or {}).get("periodics_clean_seen") or [])
+    return {
+        job: note
+        for job, note in (health.get("periodics") or {}).items()
+        if told.get(job) != periodic_key(note) or job in clean_seen
+    }
+
+
+def periodic_clears(health: dict, prev: dict | None) -> list[str]:
+    """The jobs the space was told about that a reading now shows clean."""
+    told = (prev or {}).get("periodics_told") or {}
+    current = health.get("periodics") or {}
+    read = set(health.get("periodics_read") or [])
+    return sorted(job for job in told if job in read and job not in current)
+
+
+def render_periodic(health: dict, prev: dict | None) -> str:
+    """One block per job with news: what failed, the projects it names, where
+    the recovery is written, and the job's history."""
+    blocks = []
+    for job, note in sorted(periodic_news(health, prev).items()):
+        when = clock(parse_iso(note.get("finished_at")))
+        if note.get("verdict") == periodics.VERDICT_STALE:
+            if note.get("finished_at"):
+                blocks.append(
+                    f"⚪ *{note['label']} stopped* — last finished run {when}; `{job}` has finished nothing in {note['stale_after_h']}h."
+                    f" If the next one doesn't land, it needs checking.\n{note['history_url']}"
+                )
+            else:
+                blocks.append(
+                    f"⚪ *{note['label']}: last run's finish time unreadable* — build {note['build']} finished, but its finished.json gives no time for it,"
+                    f" so the {note['stale_after_h']}h window cannot be measured. Someone check the job.\n{note['history_url']}"
+                )
+            continue
+        dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
+        lines = [f"🟠 *{note['label']} failed* — build {note['build']} at {when}{dry}."]
+        lines.extend(f"- {line}" for line in note.get("detail") or [])
+        lines.append(f"Recovery: {note['doc']}.")
+        lines.append(note["history_url"])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def render_periodic_clear(health: dict, prev: dict | None) -> str:
+    return "\n".join(
+        f"✅ *{periodics.WATCHED_BY_JOB[job].label if job in periodics.WATCHED_BY_JOB else job} passed again* — its latest run finished clean."
+        for job in periodic_clears(health, prev)
+    )
+
+
+def periodic_digest_lines(health: dict) -> list[str]:
+    lines = []
+    for _, note in sorted((health.get("periodics") or {}).items()):
+        if note.get("verdict") == periodics.VERDICT_STALE:
+            last = f"no finished run since {clock(parse_iso(note.get('finished_at')))}" if note.get("finished_at") else f"build {note['build']} finished at a time its finished.json does not give"
+            lines.append(f"⚪ {note['label']}: {last}.")
+        else:
+            lines.append(f"🟠 {note['label']}: build {note['build']} failed {clock(parse_iso(note.get('finished_at')))}; {note['history_url']}")
+    return lines
+
+
 def render_fixture_scan(health: dict) -> str:
     block = fixture_state_of(health)
     when = clock(parse_iso(block.get("scanned_at")))
@@ -1097,6 +1187,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     pool_projects = pool_state_digest_line(health)
     if pool_projects:
         lines.append(pool_projects)
+    lines.extend(periodic_digest_lines(health))
     lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
@@ -1118,6 +1209,10 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_pool(health)
     if kind == KIND_POOL_CLEAR:
         return render_pool_clear(health)
+    if kind == KIND_PERIODIC:
+        return render_periodic(health, prev)
+    if kind == KIND_PERIODIC_CLEAR:
+        return render_periodic_clear(health, prev)
     return render_change(health, prev, issue)
 
 
@@ -1329,6 +1424,30 @@ def run(
         told_stale = told_stale or KIND_STALE not in kinds
         told_fixture = told_fixture or KIND_FIXTURE_SCAN not in kinds
         told_pool_scan = told_pool_scan or KIND_POOL_SCAN not in kinds
+    # The watched periodics: each job's told key moves only on a sent
+    # message (a failed send retries next tick), and a job leaves the map only
+    # on a sent clear, so "it is over" is never lost either.
+    periodics_told = dict(before.get("periodics_told") or {})
+    # A told job read clean is remembered as such whether or not the clear
+    # went out: the next failure is a new episode either way. A sent clear
+    # forgets the job; a sent note forgets the clean reading.
+    clean_seen = set(before.get("periodics_clean_seen") or [])
+    cleared = periodic_clears(health, prev)
+    if KIND_PERIODIC_CLEAR in kinds and KIND_PERIODIC_CLEAR not in sent:
+        clean_seen.update(cleared)
+    if KIND_PERIODIC_CLEAR in sent:
+        for job in cleared:
+            periodics_told.pop(job, None)
+            clean_seen.discard(job)
+    if KIND_PERIODIC in sent:
+        for job, note in (health.get("periodics") or {}).items():
+            periodics_told[job] = periodic_key(note)
+            clean_seen.discard(job)
+    # A job no longer watched is never read again, so it would never clear.
+    for job in list(periodics_told):
+        if job not in periodics.WATCHED_BY_JOB:
+            periodics_told.pop(job)
+            clean_seen.discard(job)
     source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -1356,6 +1475,8 @@ def run(
         "pool_breached": pool_breached,
         "pool_causes": pool_causes,
         "pool_drained": pool_drained,
+        "periodics_told": periodics_told,
+        "periodics_clean_seen": sorted(clean_seen),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

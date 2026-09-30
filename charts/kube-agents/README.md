@@ -392,18 +392,22 @@ of applying the port-443 check. The site's telemetry page is canonical for this
 rule as well as for the full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
-`platformAgent.podMonitoring` renders a `PodMonitoring` for the gateway pod, so
-GKE Managed Prometheus scrapes the event watcher's `k8s_event_watcher_*` metrics
-from the `agent-api-auth` sidecar's port 9095. The operator's gateway
-NetworkPolicy admits the collector on that port either way; the value only
-decides whether a scrape is configured. It is a tri-state: `null`, the default,
-renders it when the cluster serves the `PodMonitoring` API and nothing
-elsewhere, so an install off GKE, or on a GKE cluster with Managed Prometheus
-turned off, upgrades without setting anything; `true` renders it regardless and
-fails at apply time where the CRD is absent, the caveat `litellm.podMonitoring`
-carries; `false` never renders it. `helm template` alone has no cluster to ask:
-pass `--api-versions monitoring.googleapis.com/v1/PodMonitoring` to see the
-default render.
+`platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
+pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's
+port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+tool-invocation and request metrics from its metrics-only port 8766. The
+operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
+on those ports either way; the value only decides whether a scrape is configured.
+It is a tri-state: `null`,
+the default, renders them when the cluster serves the `PodMonitoring` API and
+nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed
+Prometheus turned off, upgrades without setting anything; `true` renders them
+regardless and fails at apply time where the CRD is absent, the caveat
+`litellm.podMonitoring` carries; `false` never renders them. `helm template`
+alone has no cluster to ask: pass
+`--api-versions monitoring.googleapis.com/v1/PodMonitoring` to see the default
+render.
 
 ### Turning telemetry off
 
@@ -466,9 +470,29 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `tenantId`, and user authorization is configured via `allowedUsers` (or
   `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
   fallback.
-- **GitHub** — `platformAgent.integration.github.org` sets the GitHub
-  Organization where the GitHub App is installed, and optional
-  `platformAgent.integration.github.gitRepo` sets the initial GitOps repository.
+- **Git forges and repositories** — `platformAgent.integration.forges` lists
+  the forges the agent talks to (`name`, `provider`, optional `host`,
+  `namespace` and `credentialsRef`), and
+  `platformAgent.integration.repositories` the repositories on them (`forge`,
+  `repository`, optional `namespace`, and `role`: `gitops` for the one the
+  agent publishes to, `managed` for others it may change, `context` for
+  read-only reference). `provider` defaults to `github`, the only one
+  registered today, and `credentialsRef` is ignored for it. A GitHub forge's
+  `host` must be a GitHub spelling (`github.com`, `www.github.com`,
+  `ssh.github.com`), and a repository must name a declared forge.
+  `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
+  alias for one GitHub forge and its gitops repository — set the lists or the
+  alias, not both. The alias is still what `install.sh` and the
+  `full-install` Terraform composition write. One GitHub forge with no
+  `credentialsRef` and at most one repository, the gitops one, with no
+  namespace of its own, renders as `github`, whichever key set it, because
+  `helm upgrade` does not update CRDs — provided the forge declares a
+  namespace or the repository, and the repository is one the operator would
+  accept for GitHub (`name`, `owner/name`, or an `http(s)://`, `ssh://` or `git://` URL, a schemeless host or an scp remote on `github.com`, `www.github.com` or `ssh.github.com`, with no port, naming `owner/name`). Anything else renders as the lists, and on a live
+  install the render fails unless the installed CRD has them — apply
+  `charts/kube-agents/crds/` first. Enabling `githubMinter` when forges are
+  declared and none is GitHub fails the render, since minty issues GitHub App
+  tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
@@ -595,19 +619,21 @@ before any GKE call. The
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
-### Projects, folders and organisations in scope
+### Projects, folders, organisations and selectors in scope
 
 `platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
-folders and organisations, beyond the project the agent runs in, whose GKE clusters get a Cluster
-Agent, and the projects and clusters it leaves unmanaged (the
+folders, organisations, Shared VPC hosts and Metrics Scopes, beyond the project the agent runs
+in, whose GKE clusters get a Cluster Agent, and the projects and clusters it leaves unmanaged (the
 [CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
-documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included (`folders` and `organizations` only when the value carries the key, so a release record written before the chart knew them re-renders without them and a retag's patch leaves the CR's lists alone; the composition always passes both; the reverse holds too: a chart rolled back past the two keys patches them off a CR that carries them, which an operator at or after phase 2 renders as emptied lists, a drop, so take the block off the CR first as the CRD page says), because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included (`folders`, `organizations`, `sharedVpcHosts` and `metricsScopes` only when the value carries the key, so a release record written before the chart knew them re-renders without them and a retag's patch leaves the CR's lists alone; the composition always passes all four; the reverse holds too: a chart rolled back past the keys patches them off a CR that carries them, which an operator that knows them renders as emptied lists, a drop, so take the block off the CR first as the CRD page says), because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty. While no earlier revision rendered the block, a `null` leaves a scope the CR already carries alone, because Helm patches a custom resource from the difference between its rendered manifests; once a revision has rendered it, a render without it removes `spec.scope` from the CR, which the reconcile reads as no declaration (the management project alone, nothing retired), so `null` clears a scope without retiring its projects and emptying `projects` is how projects are dropped. The
 `terraform/examples/full-install` composition always passes a map, so on that path a project
 leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
-The agent's service account needs the read roles in each project named, and the read roles plus
+The agent's service account needs the read roles in each project named, the read roles plus
 `roles/cloudasset.viewer` on each folder and organisation (numeric IDs, every project beneath
-inherits the grant); the composition binds them from the same value, and a chart installed on its
-own needs them granted by hand.
+inherits the grant), and the read roles in every project a Shared VPC host or Metrics Scope
+(project IDs) resolves to, in each scoping project, and `roles/compute.viewer` alone in a host not otherwise in scope; the composition binds them from the same
+value, resolving the two selectors at plan time, and a chart installed on its own needs them
+granted by hand.
 
 ### ServiceAccount ownership
 

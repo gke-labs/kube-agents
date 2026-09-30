@@ -2035,6 +2035,96 @@ class SandboxMirrorGateTest(unittest.TestCase):
         self.assertIn("REACHED-EXEC", proc.stdout)
 
 
+_TERMINAL_PIN_ASSIGNMENT = 'TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"'
+_TERMINAL_PIN_OPENER = (
+    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then'
+)
+
+
+class TerminalEnvPinGateTest(unittest.TestCase):
+    """Step 4b pins every profile's scheduled-run terminal, and is fatal.
+
+    The host never has the image path, so every other entrypoint test skips this block.
+    The block is extracted from its `if` so the script path can point at a temp file.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_TERMINAL_PIN_OPENER)
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, argv, script, target)`; `argv` is what the interpreter was called
+        with, or None when it never ran.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            target.mkdir()
+            script = tmp / "terminal_env_pin.py"
+            if install_script:
+                script.write_text("", encoding="utf-8")
+
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                f'#!/bin/sh\necho "$@" >"{marker}"\nexit {rc}\n',
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                    "TERMINAL_ENV_PIN_SCRIPT": str(script),
+                },
+            )
+            argv = marker.read_text(encoding="utf-8").split() if marker.exists() else None
+            return proc, argv, script, target
+
+    def test_a_failed_pin_ends_start_up(self):
+        proc, argv, _, _ = self._run(rc=1)
+        self.assertIsNotNone(argv, "the pin never ran, so this asserts nothing")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+        self.assertIn("refusing to start", proc.stderr)
+
+    def test_a_clean_pin_sweeps_every_profile_and_leaves_start_up_alone(self):
+        """Without --sweep only $TARGET_DIR is pinned, and named profiles stay on local."""
+        proc, argv, script, target = self._run(rc=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertEqual(argv, [str(script), "--hermes-home", str(target), "--sweep"])
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Run with a pin that would fail, so dropping the gate fails loudly."""
+        proc, argv, _, _ = self._run(rc=1, primary="0")
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_host_without_the_script_is_not_a_failure(self):
+        proc, argv, _, _ = self._run(rc=1, install_script=False)
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_script_runs_from_the_image_copy(self):
+        """The PVC copy under $TARGET_DIR is writable by the agent; the image copy is not."""
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        opener = lines.index(_TERMINAL_PIN_OPENER)
+        self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
+
+
 class A2AModeProbeTest(unittest.TestCase):
     """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
 

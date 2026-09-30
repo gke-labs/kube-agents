@@ -878,6 +878,10 @@ spec:
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
               value: /var/run/credential-proxy/backend.sock
+            - name: CREDENTIAL_PROXY_PORT
+              value: "8765"
+            - name: CREDENTIAL_PROXY_METRICS_PORT
+              value: "8766"
             - name: KUBECONFIG
               value: /var/run/event-watcher/watcher.config
             - name: KSA_TOKEN_FILE
@@ -933,6 +937,8 @@ spec:
           ports:
             - containerPort: 8765
               name: cred-proxy
+            - containerPort: 8766
+              name: cred-metrics
           readinessProbe:
             failureThreshold: 3
             httpGet:
@@ -1062,6 +1068,13 @@ spec:
               app: platformagent-gateway
       ports:
         - port: 8765
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8766
           protocol: TCP
   podSelector:
     matchLabels:

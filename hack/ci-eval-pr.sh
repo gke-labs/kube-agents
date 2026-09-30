@@ -2124,11 +2124,16 @@ export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
 # Whether the suite aggregate -- admitted-case pass rate against main's, over
 # at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
-# the default, it is computed and written into the verdict but cannot block:
-# the 0.05 margin has never been measured against how much an unchanged pull
-# request moves the aggregate on main, and arming a flat margin before the
-# store can say is arming a guess. Set it to 1 in the Prow job config, not
-# here, once the store holds enough nights to size it.
+# the default, it is computed and written into the verdict but cannot block.
+# The margin (EVAL_AGGREGATE_MARGIN, default 0.10 in bench-gate) was measured
+# on 2026-09-29 against 94 green presubmit runs and four clean nightlies: no
+# unchanged pull request fell more than 0.063 below main, so 0.10 reds none
+# of them; at main's rate that night (0.924) it reds the seventh failed
+# repetition out of 36, the sixth once main sits near 0.94. Arming is a Prow-config
+# decision, not a default here: one `EVAL_AGGREGATE_ARMED=1` line in the
+# presubmit's job config in oss-test-infra flips it, and
+# docs/eval-gate-roster.md ("The whole-suite rate") carries the recipe and
+# what the author sees when it fires.
 export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
 
 # Reads infrastructure.stack out of a task file. The loop uses it to decide

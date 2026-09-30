@@ -15,9 +15,13 @@ a job.
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
 written health.json in -- and, when the hourly scans have published them,
 fixture-state.json (scripts/eval_dashboard/fixture_state.py) and
-pool-state.json (scripts/eval_dashboard/pool_state.py) -- health.json out::
+pool-state.json (scripts/eval_dashboard/pool_state.py), and the watched
+periodics' readings (`--periodics-dir`, scripts/eval_dashboard/periodics.py)
+-- health.json out (abridged; SCHEMA.md has every key)::
 
-    {state, since, cause, failing_cases, evidence, advice, slow, pool, metrics, generated_at}
+    {state, since, cause, failing_cases, evidence, advice, slow, pool,
+     fixture_state, pool_state, periodics, periodics_read, periodics_since,
+     metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
 constants below -- each names the incident it was tuned on -- and the state
@@ -62,10 +66,11 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, pool_state, tiers
+    from . import fixture_state, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import fixture_state
+    import periodics
     import pool_state
     import tiers
 try:
@@ -2113,6 +2118,7 @@ def adjudicate(
     pool_pressure: dict | None = None,
     fixture_state_doc: dict | None = None,
     pool_state_doc: dict | None = None,
+    periodics_readings: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
@@ -2129,6 +2135,12 @@ def adjudicate(
     is published; rule 3c reads it and the `fixture_state` block below
     summarises it for the poster. `pool_state_doc` is the pool scan's
     pool-state.json the same way, for rule 3e and the `pool_state` block.
+    summarises it for the poster. `periodics_readings` is what
+    periodics.py fetched of the watched Prow periodics' latest finished
+    builds, by job; a failed or overdue one is a note beside the state
+    (`periodics`), never a state, and `periodics_read` names the jobs a
+    reading arrived for, so the poster can tell a job that recovered from
+    one it lost sight of.
     """
     if runs is None:
         runs = load_runs(data)
@@ -2202,6 +2214,27 @@ def adjudicate(
     pool = pool_note(pool_pressure, pool_clock, {"since": held, "breach_seen": bool(seen)})
     if pool:
         evidence.append(pool_evidence(pool))
+    readings = periodics_readings if isinstance(periodics_readings, dict) else {}
+    # An open note's start survives a blind tick through `periodics_since`,
+    # as the pool episode's does through `pool_since`: a tick with readings
+    # and no note for a job ends its episode; one with no readings keeps it.
+    # `periodics_since` carries every open note's start, noted or blind, so it
+    # is the one source the notes start from; jobs no longer watched drop out.
+    before_since = {
+        job: since
+        for job, since in ((prev or {}).get("periodics_since") or {}).items()
+        if isinstance(since, str) and job in periodics.WATCHED_BY_JOB
+    }
+    prev_notes = {job: {"since": since} for job, since in before_since.items()}
+    # The wall clock, as the pool note's: a job that stopped is measured
+    # against the time it is, not data.json's horizon, which a stalled
+    # archive freezes together with the jobs.
+    watched = periodics.assess(readings, pool_clock, prev_notes)
+    evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
+    # Per job: a job read this tick keeps its start only while it is noted;
+    # a job with no reading this tick keeps whatever start it had.
+    periodics_since = {job: since for job, since in before_since.items() if job not in readings}
+    periodics_since.update({job: note["since"] for job, note in watched.items()})
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -2229,6 +2262,9 @@ def adjudicate(
         "pool_state": scan_block(assessed["pool_state"]),
         "slow": slow,
         "pool": pool,
+        "periodics": watched,
+        "periodics_read": sorted(readings),
+        "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
@@ -2471,6 +2507,7 @@ def parse_args(argv):
     parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
     parser.add_argument("--pool-state", type=pathlib.Path, help="the hourly pool scan's pool-state.json, for the pool_drift condition (missing is fine)")
+    parser.add_argument("--periodics-dir", type=pathlib.Path, help="the directory periodics.py fetch wrote, one <job>.json per watched Prow periodic (missing is fine)")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
     roster.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
@@ -2520,6 +2557,7 @@ def main(argv=None) -> int:
             pool_pressure=load_json(args.pool_pressure),
             fixture_state_doc=load_json(args.fixture_state),
             pool_state_doc=load_json(args.pool_state),
+            periodics_readings=periodics.load_readings(args.periodics_dir),
         )
         text = json.dumps(health, indent=2) + "\n"
 

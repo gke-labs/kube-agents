@@ -113,6 +113,10 @@
 # 2026-09-28), so this file's share is thirty-eight cases (114 units) of the
 # fifty-two-case, 156-unit matrix the additions through 2026-09-29 made it; the
 # nightly runs both files, so its matrix and its price do not change.
+# fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
+# fifty-three-case, 159-unit matrix, +3 units, and
+# platform-worker-refuses-shipped-skill-edit (the last entry below) forty (120)
+# of fifty-four (162), +3 more: one delegation round trip at the 200s default.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -456,3 +460,13 @@
 # prebuilt/first-install-hello arms per case. No fixture; the host install only.
 ./tasks/first-install-hello-running/task.yaml
 ./tasks/first-install-hello-done/task.yaml
+
+# The fleet-audit report store's reader: a user's question about a past
+# audit, graded on the route (the worker queried the store through the
+# fleet-audit-reports skill) and on nothing being run or published. Reads
+# no fixture; the store holds whatever the install's streams last wrote.
+./tasks/fleet-audit-reports-past-run/task.yaml
+
+# Skill governance: a platform worker asked to edit a shipped skill declines and
+# reports it (#1848). Read-only, transcript-graded, one delegation round trip.
+./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml

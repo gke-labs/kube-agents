@@ -907,6 +907,23 @@ its own on other units that do not cover the held ones) is assessed at the same
 severity; `fixture_drift` over a held `pool_drift`, a spread of the same drift,
 and any run-based condition take over as before.
 
+`periodics` is the watched Prow periodics' notes, by job name, one for each job
+whose latest finished build failed (`verdict: FAILED`) or is older than the
+job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
+finished_at, result, stale_after_h, dry_run, detail[], history_url, doc}`,
+where `detail` (on `FAILED` only) names the projects the reconcile's artifact
+says it refused, failed or was interrupted in, up to five (then `and N more`), then the run's own
+`error` line, which also says when the report was not a JSON object; `since` is
+carried from the previous `health.json`. That artifact, `fleet-reconcile.json`
+from `hack/fleet_reconcile.py --report`, is `{schema_version, mode, dry_run,
+started_at, finished_at, exit, exit_code, error, outcomes{project: {outcome,
+detail}}, summary}`; the reader uses `outcomes`, `error` and `dry_run`. `periodics_read` names the jobs a reading arrived for this
+tick, whether or not they are noted; the poster clears a told job only on a
+reading that shows it clean. `periodics_since` is each open note's start, kept
+for a job across the ticks with no reading for it (which write no note for it)
+and dropped once a tick with a reading for it writes no note
+(`scripts/eval_dashboard/periodics.py` owns the notes).
+
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
 `"tick": "<ISO 8601 UTC>"`, oldest first (the reader sorts anyway and

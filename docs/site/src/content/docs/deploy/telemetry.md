@@ -11,16 +11,16 @@ For what's exported and how the agent surfaces it in Chat replies, see [Concepts
 
 ## What runs where
 
-| Signal          | Producer                                | Collector                               | Destination      |
-| --------------- | --------------------------------------- | --------------------------------------- | ---------------- |
-| Metrics         | LiteLLM, vLLM, Hindsight, event watcher | GKE Managed Prometheus                  | Cloud Monitoring |
-| Traces          | LiteLLM, vLLM, Hermes                   | GKE OTel collector (`gke-managed-otel`) | Cloud Trace      |
-| Container logs  | All containers                          | GKE built-in log agent                  | Cloud Logging    |
-| Tool-call audit | Hermes `tool_call_audit` plugin         | GKE built-in log agent (via `stdout`)   | Cloud Logging    |
+| Signal          | Producer                                                   | Collector                               | Destination      |
+| --------------- | ---------------------------------------------------------- | --------------------------------------- | ---------------- |
+| Metrics         | LiteLLM, vLLM, Hindsight, event watcher, credential broker | GKE Managed Prometheus                  | Cloud Monitoring |
+| Traces          | LiteLLM, vLLM, Hermes                                      | GKE OTel collector (`gke-managed-otel`) | Cloud Trace      |
+| Container logs  | All containers                                             | GKE built-in log agent                  | Cloud Logging    |
+| Tool-call audit | Hermes `tool_call_audit` plugin                            | GKE built-in log agent (via `stdout`)   | Cloud Logging    |
 
 ## GKE Managed Prometheus
 
-Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM, vLLM, and the Hindsight memory API expose Prometheus `/metrics` endpoints (LiteLLM on port 8080, vLLM on port 8000, Hindsight on port 8888); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`, the Hindsight one at `k8s-operator/config/integrations/hindsight/podmonitoring.yaml`, and the vLLM example manifests under `examples/`). The event watcher in the gateway pod's `agent-api-auth` sidecar exposes one too, on port 9095; the chart renders the `<name>-gateway-monitoring` `PodMonitoring` that scrapes it wherever the cluster serves the `PodMonitoring` API unless `platformAgent.podMonitoring` says otherwise, and the operator's gateway NetworkPolicy admits the collector on that port.
+Enabled at the cluster level (default on new GKE Standard clusters, opt-in on older). LiteLLM, vLLM, and the Hindsight memory API expose Prometheus `/metrics` endpoints (LiteLLM on port 8080, vLLM on port 8000, Hindsight on port 8888); managed Prometheus scrapes them via `PodMonitoring` resources shipped with each integration (the LiteLLM operator base at `k8s-operator/config/integrations/litellm/base/podmonitoring.yaml`, the Hindsight one at `k8s-operator/config/integrations/hindsight/podmonitoring.yaml`, and the vLLM example manifests under `examples/`). The event watcher in the gateway pod's `agent-api-auth` sidecar exposes one too, on port 9095, and the credential broker exposes its own on a metrics-only listener, port 8766; the chart renders the `<name>-gateway-monitoring` and `<name>-credential-proxy-monitoring` `PodMonitoring`s that scrape them wherever the cluster serves the `PodMonitoring` API unless `platformAgent.podMonitoring` says otherwise, and the operator's policies on both pods admit the collector on those ports and no other.
 
 ## Where token spend lives
 
@@ -119,7 +119,7 @@ The persona ([`SOUL.md §5`](https://github.com/gke-labs/kube-agents/blob/main/a
 The current wiring assumes GKE Managed OTel and Prometheus. On other Kubernetes distributions:
 
 - Deploy an OTel collector. You do not have to reconfigure the `hermes_otel` plugin by hand — see [Pointing at your own collector](#pointing-at-your-own-collector); a collector at one of the well-known names is picked up automatically, and anything else is one chart value.
-- Deploy Prometheus (kube-prometheus-stack works) and add scrape jobs for LiteLLM, vLLM and the event watcher (the gateway pod, port 9095). Set `litellm.podMonitoring=false` and `hindsight.podMonitoring=false`, since the `PodMonitoring` CRD is GKE's; the gateway's follows the cluster and renders nothing without it. Admit your Prometheus namespace on port 9095 with a NetworkPolicy of your own: the operator's gateway policy admits only `gke-gmp-system`.
+- Deploy Prometheus (kube-prometheus-stack works) and add scrape jobs for LiteLLM, vLLM, the event watcher (the gateway pod, port 9095) and the credential broker (the `<name>-credential-proxy` pod, port 8766). Set `litellm.podMonitoring=false` and `hindsight.podMonitoring=false`, since the `PodMonitoring` CRD is GKE's; the agent's two follow the cluster and render nothing without it. Admit your Prometheus namespace on ports 9095 and 8766 with NetworkPolicies of your own: the operator's policies on both pods admit only `gke-gmp-system`.
 - Configure a log-forwarding agent (Fluent Bit, Vector) to your log backend.
 
 The Hermes runtime and integrations are collector-agnostic; the shipping _config_ is GKE-specific.

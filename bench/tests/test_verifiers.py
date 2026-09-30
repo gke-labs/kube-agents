@@ -2644,3 +2644,199 @@ def test_no_task_still_grades_a_pull_request_by_substring():
         "report_contains cannot tell this run's pull request from a previous "
         f"rep's; use pull_request_opened: {offenders}"
     )
+
+
+# The read-only reports case lets a worker read through `gh`, so its
+# enumerated write forms are the whole guard; read them out of the task file.
+_PAST_RUN = TASKS / "fleet-audit-reports-past-run" / "task.yaml"
+_PAST_RUN_OBJECTIVE = "the-store-was-queried"
+# Each runs the query script: the recorded greens' two paths, the SKILL.md's
+# relative one, and the script run from its own directory.
+_STORE_QUERIES = [
+    "python3 ./skills/fleet-audit-reports/scripts/report_query.py streams",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit",
+    "python3 scripts/report_query.py --root /tmp/r show compliance-audit",
+    "cd scripts && python3 report_query.py findings compliance-audit",
+    "python -u report_query.py runs compliance-audit",
+]
+# Each only names the script.
+_STORE_QUERY_MENTIONS = [
+    "grep -n 'report_query.py show' ./skills/fleet-audit-reports/SKILL.md",
+    'echo "report_query.py streams"',
+    "cat ./skills/fleet-audit-reports/SKILL.md",
+]
+
+
+def _past_run_required():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_OBJECTIVE]
+    assert len(entries) == 1, f"{_PAST_RUN_OBJECTIVE} is not in {_PAST_RUN}"
+    return entries[0]["check"]["required_patterns"]
+
+
+@pytest.mark.parametrize("command", _STORE_QUERIES)
+def test_the_past_run_objective_matches_every_query(command):
+    assert any(re.search(p, command) for p in _past_run_required()), command
+
+
+@pytest.mark.parametrize("command", _STORE_QUERY_MENTIONS)
+def test_the_past_run_objective_ignores_a_mention(command):
+    assert not any(re.search(p, command) for p in _past_run_required()), command
+
+
+_PAST_RUN_SAFEGUARD = "nothing-was-run-or-published"
+# Each writes to the ledger issue or a remediation pull request, through gh or
+# git. `gh api` defaults to POST once a field is supplied.
+_LEDGER_WRITES = [
+    "gh api repos/o/r/issues/3/comments -f body=hi",
+    "gh api repos/o/r/issues/3 -F state=closed",
+    "gh api repos/o/r/issues/3/comments --raw-field body=hi",
+    "gh api repos/o/r/issues/3 --input body.json",
+    "gh api -iX POST repos/o/r/issues/3/comments",
+    "gh api --method=PATCH repos/o/r/issues/3",
+    "gh api -XDELETE repos/o/r/issues/comments/9",
+    "gh pr review 3 --approve",
+    "gh pr ready 3",
+    "gh issue transfer 3 o/other",
+    "gh issue pin 3",
+    "gh issue unlock 3",
+    "cd /tmp && gh api repos/o/r/issues/3/comments --field body=hi",
+    # Behind a wrapper: the proxy's rule has no start anchor, and neither may this.
+    'timeout 120 gh issue comment 3 -b "done"',
+    "env GH_PAGER= gh pr close 8",
+    'bash -lc "gh issue close 3"',
+    "echo 8 | xargs gh pr close",
+    "timeout 60 gh api repos/o/r/issues/3/comments -f body=hi",
+    "env X=1 gh api -X PATCH repos/o/r/issues/3",
+    # The repository flag gh accepts between the command and its verb.
+    "gh issue -R acme/fleet close 3",
+    "gh pr --repo=acme/fleet comment 8 -b x",
+    "gh -R acme/fleet issue edit 3 --body x",
+    # The git route to a remediation pull request's branch.
+    "git push origin fleet-audit/cost-fix",
+    "git push -f origin HEAD:fleet-audit/cost-fix",
+    "git -C /opt/data/gitops push origin fleet-audit/cost-fix",
+    "git -c user.name=x commit -am fix",
+    "git --no-pager commit -m fix",
+    "cd /opt/data/gitops && git commit -m fix && git push",
+    "timeout 60 git push origin fleet-audit/cost-fix",
+]
+# What the recorded greens ran, and `gh` reads a worker may make.
+_READS = [
+    "python3 scripts/report_query.py streams",
+    "python3 /opt/skills/fleet-audit-reports/scripts/report_query.py show fleet-wide-cost-analysis --repo acme/fleet",
+    "gh api repos/o/r/issues/3",
+    "gh api -X GET search/issues -f q=repo:o/r",
+    "gh api --method GET repos/o/r/issues -F per_page=100",
+    "gh api repos/o/r/pulls --paginate --jq '.[].number'",
+    "gh issue view 3",
+    "gh pr list",
+    "timeout 60 gh issue view 3 --comments",
+    "gh issue -R acme/fleet view 3",
+    "gh pr list --state closed",
+    'gh issue list --search "is:open close"',
+    "gh issue list --search close --repo acme/fleet",
+    'gh search issues "pr close" --repo acme/fleet',
+    # git reads, including ones whose arguments name a write verb.
+    "git -C /opt/data/gitops log --oneline -5",
+    "git log --grep push",
+    "git show HEAD --stat",
+    "git status",
+]
+
+
+def _past_run_forbidden():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_SAFEGUARD]
+    assert len(entries) == 1, f"{_PAST_RUN_SAFEGUARD} is not in {_PAST_RUN}"
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize("command", _LEDGER_WRITES)
+def test_the_past_run_safeguard_catches_every_ledger_write_form(command):
+    assert any(re.search(p, command) for p in _past_run_forbidden()), command
+
+
+@pytest.mark.parametrize("command", _READS)
+def test_the_past_run_safeguard_lets_reads_through(command):
+    assert not any(re.search(p, command) for p in _past_run_forbidden()), command
+
+
+_PAST_RUN_ENVELOPE_SAFEGUARD = "the-envelope-was-not-read-whole"
+# The store root audit_report.REPORTS_DIR defaults to.
+_STORE = "/opt/data/fleet-audit/reports/fleet-wide-cost-analysis/acme/fleet"
+# Each prints a whole envelope: the findings document and the ledger body.
+_WHOLE_ENVELOPE_READS = [
+    f"cat {_STORE}/latest.json",
+    f"head -n 40 {_STORE}/runs/20260929T010000Z.json",
+    f"cd /tmp && tail {_STORE}/latest.json",
+    # Behind a wrapper, which is why the pattern has no start anchor.
+    f"timeout 30 cat {_STORE}/latest.json",
+    f"sudo cat {_STORE}/latest.json",
+    # The file named before the command that prints it.
+    f"find {_STORE} -name latest.json -exec cat {{}} \\;",
+    f"find {_STORE}/runs -name '*.json' -exec /bin/cat {{}} +",
+    f"ls {_STORE}/runs/*.json | xargs cat",
+    f"find {_STORE} -name latest.json | xargs -0 head -c 4000",
+    f"cd {_STORE}/runs && cat 2026*.json",
+    "cd runs; less *.json",
+    # Filters that pass the whole file through, and the other printers.
+    f"jq . {_STORE}/latest.json",
+    f"jq '.' {_STORE}/latest.json",
+    f"jq -C . {_STORE}/runs/20260929T010000Z.json",
+    f"jq '' {_STORE}/latest.json",
+    f"jq . < {_STORE}/latest.json",
+    f"python3 -m json.tool {_STORE}/latest.json",
+    f"python -m json.tool {_STORE}/latest.json",
+    f"grep '' {_STORE}/latest.json",
+    f"grep -h '' {_STORE}/runs/20260929T010000Z.json",
+    f"sed -n p {_STORE}/latest.json",
+    f"sed '' {_STORE}/latest.json",
+    f"awk 1 {_STORE}/latest.json",
+    f"awk '{{print}}' {_STORE}/latest.json",
+    f"nl {_STORE}/latest.json",
+    f"bat {_STORE}/latest.json",
+    # One key, but the key is the payload.
+    f"jq .document {_STORE}/latest.json",
+    f"jq -r .ledger_body {_STORE}/latest.json",
+    f"jq -c '.document' {_STORE}/runs/20260929T010000Z.json",
+    f'jq -r ".ledger_body" {_STORE}/latest.json',
+    f"jq .ledger_document < {_STORE}/latest.json",
+]
+# What the recorded greens ran, and projections of one key.
+_ENVELOPE_PROJECTIONS = [
+    "python3 scripts/report_query.py streams",
+    "python3 /opt/skills/fleet-audit-reports/scripts/report_query.py show fleet-wide-cost-analysis --repo acme/fleet",
+    "python3 scripts/report_query.py runs fleet-wide-cost-analysis --repo acme/fleet",
+    f"jq .status {_STORE}/latest.json",
+    f"ls {_STORE}/runs",
+    f"cd {_STORE}/runs && ls",
+    f"jq -r .status {_STORE}/latest.json",
+    f"jq '.status' {_STORE}/latest.json",
+    f"grep -c FINDINGS {_STORE}/latest.json",
+    # Bounded reads of the payload keys.
+    f"jq '.document.findings | length' {_STORE}/latest.json",
+    f"jq -r .document_sha {_STORE}/latest.json",
+    f"jq '.ledger_body | length' {_STORE}/latest.json",
+]
+
+
+def _past_run_envelope_forbidden():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [
+        e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_ENVELOPE_SAFEGUARD
+    ]
+    assert len(entries) == 1, f"{_PAST_RUN_ENVELOPE_SAFEGUARD} is not in {_PAST_RUN}"
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize("command", _WHOLE_ENVELOPE_READS)
+def test_the_envelope_safeguard_catches_every_whole_read(command):
+    assert any(re.search(p, command) for p in _past_run_envelope_forbidden()), command
+
+
+@pytest.mark.parametrize("command", _ENVELOPE_PROJECTIONS)
+def test_the_envelope_safeguard_lets_projections_through(command):
+    assert not any(
+        re.search(p, command) for p in _past_run_envelope_forbidden()
+    ), command

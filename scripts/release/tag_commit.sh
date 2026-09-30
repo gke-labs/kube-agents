@@ -5,9 +5,10 @@
 # is being tagged, then call ensure_git_tag, which no-ops when the tag already
 # points at the same commit and fails when it points elsewhere.
 # create_release_tag.sh (rc_*), tag_validated_release.sh (_validated),
-# tag_eval_candidate.sh (evalcand_*), tag_staging_promotion.sh (staging_*) and
-# tag_ga_release.sh (GA SemVer) wrap it, each keeping only what is genuinely its
-# own.
+# tag_eval_candidate.sh (evalcand_*) and tag_staging_promotion.sh (staging_*)
+# wrap it, each keeping only what is genuinely its own. tag_ga_release.sh (GA
+# SemVer) prints the same banner but pushes its tag together with the release
+# line, atomically, through ensure_ga_release_refs.
 #
 # Usage: tag_commit.sh [--title TITLE] [--detail "Label: value"]... <tag> <commit-sha> [message]
 set -euo pipefail

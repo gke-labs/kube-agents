@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
 import cluster_agent_profile as cap  # noqa: E402
+import terminal_env_pin  # noqa: E402
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -200,11 +201,22 @@ class CreateProfileTest(unittest.TestCase):
         # predicate itself is covered in test_gke_endpoint.py.
         self.dns_args = []
         self._patch(cap, "dns_endpoint_args", lambda *a, **k: self.dns_args)
+        # The managed terminal pin needs Hermes, which is not installed here; its own
+        # behaviour is covered in tests/test_terminal_env_pin.py and at image build.
+        self.pinned = []
+        self.pin_error = None
+        self._patch(terminal_env_pin, "pin", self._fake_pin)
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
         setattr(obj, attr, value)
         self.addCleanup(setattr, obj, attr, original)
+
+    def _fake_pin(self, home):
+        self.pinned.append((Path(home), (Path(home) / "USER.md").exists()))
+        if self.pin_error:
+            raise self.pin_error
+        return True
 
     def _fake_ensure_profile(self, name, description, hermes_home):
         home = Path(hermes_home) / "profiles" / name
@@ -266,6 +278,28 @@ class CreateProfileTest(unittest.TestCase):
         # worker at a file that is not there.
         env_file = self.profile / ".env"
         self.assertNotIn("KUBECONFIG", env_file.read_text() if env_file.exists() else "")
+
+    def test_pins_the_managed_terminal_before_writing_user_md(self):
+        self.create()
+        self.assertEqual([(self.profile, False)], self.pinned)
+        self.assertTrue((self.profile / "USER.md").exists())
+
+    def test_a_failed_terminal_pin_leaves_the_profile_unfinished(self):
+        """USER.md is what reconcile and the roster read as "finished".
+
+        A re-scaffold starts with the USER.md an earlier run wrote, so a failed pin
+        has to remove it, or the profile keeps counting as usable while its
+        scheduled runs would not use the managed terminal.
+        """
+        self.create()
+        self.pin_error = terminal_env_pin.PinError("Hermes resolves TERMINAL_ENV='local'")
+
+        with self.assertRaises(SystemExit) as caught:
+            self.create()
+
+        self.assertIn(self.name, str(caught.exception))
+        self.assertIn("TERMINAL_ENV='local'", str(caught.exception))
+        self.assertFalse((self.profile / "USER.md").exists())
 
     def test_the_kubeconfig_is_looked_for_where_kubectl_will_run(self):
         """With a sandbox the file is on its volume, not on this one."""

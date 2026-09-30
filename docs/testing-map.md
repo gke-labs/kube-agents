@@ -106,13 +106,13 @@ Multiple automated jobs run on timers or tags across Prow and GitHub Actions. Se
 colloquial name "nightly" despite running on different platforms, with different triggers, budgets,
 and purposes:
 
-| Job                              | Platform        | Trigger                                                 | Input                                 | What it produces                                                                                 |
-| -------------------------------- | --------------- | ------------------------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `rc-release-pipeline.yml`        | GitHub Actions  | `rc-scheduler.yml`, `cron: "17 */3 * * *"`              | A commit on `main`                    | `rc_<ts>_<sha>`, then `rc_<ts>_<sha>_validated`                                                  |
-| `staging-promotion-pipeline.yml` | GitHub Actions  | `staging-promotion-scheduler.yml`, `cron: "17 2 * * *"` | A validated `rc_` tag                 | The E2E matrix, then a `staging_` tag                                                            |
-| `post-kube-agents-eval-rc`       | Prow postsubmit | A `staging_` tag push                                   | Staged candidate commit (`staging_*`) | A verdict on that candidate against the eval catalog (360m budget, parallelism 4)                |
-| `ci-kube-agents-eval-nightly`    | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                         | Baseline evidence store and dashboard rows against the eval catalog (480m budget, parallelism 6) |
-| `ci-kube-agents-pool-pressure`   | Prow periodic   | `cron: "23 * * * *"`                                    | None (leases nothing)                 | Pool health verification                                                                         |
+| Job                              | Platform        | Trigger                                                 | Input                                     | What it produces                                                                                                                   |
+| -------------------------------- | --------------- | ------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `rc-release-pipeline.yml`        | GitHub Actions  | `rc-scheduler.yml`, `cron: "17 */3 * * *"`              | A commit on `main`                        | `rc_<ts>_<sha>`, then `rc_<ts>_<sha>_validated`                                                                                    |
+| `staging-promotion-pipeline.yml` | GitHub Actions  | `staging-promotion-scheduler.yml`, `cron: "17 2 * * *"` | A validated `rc_` tag                     | The E2E matrix, then an `evalcand_` tag that nominates the commit for the eval below, then, on a green verdict, the `staging_` tag |
+| `post-kube-agents-eval-rc`       | Prow postsubmit | An `evalcand_` tag push                                 | Nominated candidate commit (`evalcand_*`) | A verdict on that candidate against the merge-blocking presubmit matrix, not the full catalog (360m budget, parallelism 4)         |
+| `ci-kube-agents-eval-nightly`    | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | Baseline evidence store and dashboard rows against the eval catalog (480m budget, parallelism 6)                                   |
+| `ci-kube-agents-pool-pressure`   | Prow periodic   | `cron: "23 * * * *"`                                    | None (leases nothing)                     | Pool health verification                                                                                                           |
 
 When diagnosing failures or reporting incidents, name the specific job rather than saying "the nightly":
 
@@ -120,7 +120,7 @@ When diagnosing failures or reporting incidents, name the specific job rather th
 
 `staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
 
-`post-kube-agents-eval-rc` runs the same evaluation catalog as `ci-kube-agents-eval-nightly` against candidate tags, but under a postsubmit trigger, tighter budget (360m vs 480m), and lower task parallelism (4 vs 6); neither failure implies the other.
+`post-kube-agents-eval-rc` grades nominated candidates against the merge-blocking presubmit matrix, the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
 
 ## Running on a pull request is not gating a merge
 

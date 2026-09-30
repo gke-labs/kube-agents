@@ -33,6 +33,7 @@ kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones 
 # clone is moved to the requested release only when its HEAD tracks this file,
 # so a repository that merely shares the directory name is left alone.
 KUBE_AGENTS_CLONE_MARKER="install.sh"
+KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
 # The fetch depth the fresh clone uses, and that a clone which is already
 # shallow (one an earlier install left) keeps; a complete clone is fetched
 # without it so it does not become shallow.
@@ -283,7 +284,7 @@ bootstrap_install_env() {
   # next run from a clean shell. A first install, which has no file yet, keeps
   # the environment and records it; a typed --scope-* flag still overrides
   # for one run and is warned about.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -391,6 +392,8 @@ PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
 PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
 PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
+PARAM_SCOPE_SHARED_VPC_HOSTS="${SCOPE_SHARED_VPC_HOSTS:-}"
+PARAM_SCOPE_METRICS_SCOPES="${SCOPE_METRICS_SCOPES:-}"
 PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
@@ -560,6 +563,11 @@ Flags for AI Agents & Automation:
                                 bound on the folder, and the Cloud Asset API is enabled
   --scope-organizations=IDS     Numeric GCP organisation IDs, bound the same way (wide;
                                 prefer folders)
+  --scope-shared-vpc-hosts=IDS  Shared VPC host project IDs; every attached service project
+                                is in scope, resolved when Terraform plans and granted the
+                                read roles (and roles/compute.viewer in the host, for the lookup)
+  --scope-metrics-scopes=IDS    Metrics Scope scoping-project IDs; every project the scope
+                                monitors is in scope, resolved and granted the same way
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
@@ -729,6 +737,8 @@ require_scope_flag_value() {
     --scope-projects) key="SCOPE_PROJECTS" ;;
     --scope-folders) key="SCOPE_FOLDERS" ;;
     --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
+    --scope-shared-vpc-hosts) key="SCOPE_SHARED_VPC_HOSTS" ;;
+    --scope-metrics-scopes) key="SCOPE_METRICS_SCOPES" ;;
     --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
     *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
   esac
@@ -775,6 +785,12 @@ parse_args() {
       --scope-organizations=*)
         PARAM_SCOPE_ORGANIZATIONS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_ORGANIZATIONS"; shift ;;
+      --scope-shared-vpc-hosts=*)
+        PARAM_SCOPE_SHARED_VPC_HOSTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_SHARED_VPC_HOSTS"; shift ;;
+      --scope-metrics-scopes=*)
+        PARAM_SCOPE_METRICS_SCOPES="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_METRICS_SCOPES"; shift ;;
       --scope-exclude-projects=*)
         PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
@@ -1023,14 +1039,128 @@ cluster_mode_label() {
   esac
 }
 
+# A release-line checkout between stamps. A patch is stamped as a child of the
+# line's head, so every backport that lands on release/<X.Y> after a release
+# descends from a stamped commit and carries its BAKED_RELEASE_VERSION, which is
+# the previous release's. True when this is a Git checkout whose HEAD descends
+# from the baked release's commit without being it: unreleased development on
+# the line, whose images are built per commit, so the release's tag is not the
+# tag to default to. Exactly the tag's commit is the release checkout, and a
+# HEAD that is neither is left to verify_local_source_ref, which refuses the
+# mismatch as before. A tag the checkout does not hold reads as "not past": the
+# release's own commit is on the line's history, so a clone of the line brings
+# the tag with it, and a checkout that lacks it is not one of these (the
+# refusal that follows says to fetch the tags). And only when the script that
+# is running is that checkout's own install.sh, carrying the same version: the
+# baked version belongs to the running script, so a release's piped installer
+# keeps its release as the default wherever it runs, whether standing in some
+# other checkout or resolving its sources to a HOME clone that has moved onto
+# a line, and verify_local_source_ref then fetches or refuses as before.
+# The directory this script runs from, when that is a kube-agents checkout;
+# empty under `curl … | bash`, where no file names one (BASH_SOURCE is then
+# empty, `main`, or the interpreter's path, none of which is a file in a
+# checkout). What acquire_source_repo prefers as the sources, so the
+# release-line reads below judge the same tree it will install from, whatever
+# the working directory is.
+script_checkout_dir() {
+  local script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+    printf '%s' "$script_dir"
+  fi
+}
+
+# The release a tree's own install.sh is stamped with, read the way
+# upgrade.sh's release_version_of_source_tree reads it (quotes and whitespace
+# stripped), so the two front doors agree on which trees carry a version.
+# Empty for the plain repository content.
+baked_version_of_tree() {
+  local repo_dir="${1:-.}"
+  grep -m1 -E '^BAKED_RELEASE_VERSION=' "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || echo ""
+}
+
+# What stands between such a tree and being recognised, for the refusals that
+# follow, mirroring checkout_is_past_baked_release's conditions: the release's
+# tag not fetched, or a shallow history the ancestry walk cannot cross (a
+# `--depth 1` clone of the line, which `git fetch --tags` alone does not mend);
+# else a running install.sh that is not the tree's own (piped, or run from
+# elsewhere); else a HEAD that does not descend from the release, which no
+# fetch mends. Printed only for a tree whose own install.sh carries the
+# version; the caller checks that.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" descends="false" line="${BAKED_RELEASE_VERSION%.*}"
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    descends="true"
+  fi
+  # The fetches the predicate's walk would need, and only those: no tag, or a
+  # shallow history the walk could not cross. A shallow clone deep enough to
+  # hold the release needs nothing fetched.
+  if [ -z "$tag_commit" ]; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$descends" != "true" ] && [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  script_dir="$(script_checkout_dir)"
+  local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
+  if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release install.sh, or one run from another directory: only the
+    # checkout's own install.sh recognises a release-line checkout, so that comes
+    # first, with whatever fetch it would also need.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the install.sh running is not this checkout's. If it is a checkout of a release line, run its own ./install.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ "$descends" = "true" ]; then
+    # Recognisable, and asked for the release by name anyway (--image-tag, or
+    # IMAGE_TAG in the shell or install.env, naming the baked version): the
+    # checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; run this checkout's ./install.sh with no --image-tag and IMAGE_TAG unset (in the shell and in install.env) to default to this commit's own images, or ${own_images}."
+  elif [ -n "$remedies" ]; then
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
+  else
+    # Tag present, history complete, the checkout's own script running: HEAD
+    # simply does not descend from the release (a cherry-picked or rebased
+    # stamp). No fetch changes that.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but ${head_commit:0:7} is neither that release's commit nor a descendant of it, so it is not a release-line checkout past it. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
+  fi
+}
+
+checkout_is_past_baked_release() {
+  local repo_dir="${1:-.}" tag_commit head_commit own_dir
+  [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
+  own_dir="$(script_checkout_dir)"
+  [ -n "$own_dir" ] && [ "$own_dir" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
+  [ "$(baked_version_of_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
+  head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  [ "$tag_commit" != "$head_commit" ] || return 1
+  git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
+}
+
 # The image tag doubles as the source ref that verify_local_source_ref checks the
 # checkout against. When downloaded as an official release via curl | bash, the baked
 # release tag takes precedence. In local Git checkouts, an exact SemVer release tag or
 # HEAD commit SHA is used as the default.
 default_image_tag() {
   local repo_dir="${1:-.}"
-  # 1. Baked release version takes precedence (for curl | bash from official release URLs)
+  # 1. Baked release version takes precedence (for curl | bash from official release URLs),
+  #    except in a checkout of a release line that has moved past that release: there the
+  #    baked version is the previous release's, and the checkout defaults the way a main
+  #    checkout does, to its own HEAD, whose images a merge onto the line built. Returned
+  #    here rather than through step 4, so a directory that happens to be named
+  #    kube-agents-<X.Y.Z> (step 3) cannot hand the release back.
+  #    Judged on the script's own checkout, which is what acquire_source_repo
+  #    installs from, so running one checkout's install.sh from inside another
+  #    resolves the same way as running it from its own directory.
   if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+    local own_dir
+    own_dir="$(script_checkout_dir)"
+    if [ -n "$own_dir" ] && checkout_is_past_baked_release "$own_dir"; then
+      git -C "$own_dir" rev-parse HEAD 2>/dev/null || echo ""
+      return 0
+    fi
     echo "$BAKED_RELEASE_VERSION"
     return 0
   fi
@@ -1071,6 +1201,12 @@ default_image_tag_label() {
 
   if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "$tag" = "$BAKED_RELEASE_VERSION" ]; then
     printf 'official release %s' "$tag"
+  elif [ -n "$(script_checkout_dir)" ] && checkout_is_past_baked_release "$(script_checkout_dir)"; then
+    # Say what the checkout is, since its scripts still name the previous release.
+    printf 'release line %s checkout %s, %s commit(s) past release %s' \
+      "${BAKED_RELEASE_VERSION%.*}" "${tag:0:7}" \
+      "$(git -C "$(script_checkout_dir)" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")" \
+      "$BAKED_RELEASE_VERSION"
   elif [ "$tag" = "$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")" ]; then
     printf 'release tag %s' "$tag"
   elif [[ "$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")" =~ ^kube-agents-${tag}$ ]]; then
@@ -1450,17 +1586,19 @@ bootstrap_install_env_file() {
     # next full upgrade regenerates from the file, so a project the file does
     # not name is dropped again, its bindings revoked and its profiles retired.
     local scope_key scope_flag scope_value
-    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
       case "$scope_key" in
         SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
         SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
         SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
+        SCOPE_SHARED_VPC_HOSTS) scope_flag="--scope-shared-vpc-hosts"; scope_value="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}" ;;
+        SCOPE_METRICS_SCOPES) scope_flag="--scope-metrics-scopes"; scope_value="${PARAM_SCOPE_METRICS_SCOPES:-}" ;;
         SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
         *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
       esac
       warn_flag_beats_unrecorded_file_value "$destination" "$scope_key" "$scope_flag" \
         "$scope_value" \
-        "A later run without it regenerates the scope from the file: a project, folder or organisation the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
+        "A later run without it regenerates the scope from the file: a project, folder, organisation, Shared VPC host or Metrics Scope the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
         false \
         "every later install.sh run"
     done
@@ -1522,6 +1660,8 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_FOLDERS "${SCOPE_FOLDERS:-}"
   write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
+  write_env_var "$tmp" SCOPE_SHARED_VPC_HOSTS "${SCOPE_SHARED_VPC_HOSTS:-}"
+  write_env_var "$tmp" SCOPE_METRICS_SCOPES "${SCOPE_METRICS_SCOPES:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
   write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
@@ -1655,6 +1795,14 @@ verify_local_source_ref() {
       return 0
     fi
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    # Only when the checkout's own install.sh carries the version, the line
+    # checkout_is_past_baked_release draws: the baked version belongs to the
+    # running script, and a release's piped installer standing in some other
+    # checkout that lacks the tag is not a line checkout to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     print_info "Pass --allow-unverified-source to provision anyway."
     return 1
   fi
@@ -1665,6 +1813,13 @@ verify_local_source_ref() {
       print_warning "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
     else
       print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+      # The tag is here and HEAD is not it: a line checkout asked for the release
+      # by name (--image-tag with the baked version), one the predicate could not
+      # walk (a shallow clone), or an unrelated commit. Same gate as above.
+      if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+        [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+        release_line_recognition_hint "$repo_dir"
+      fi
       print_info "Pass --allow-unverified-source to provision anyway."
       return 1
     fi
@@ -2463,11 +2618,17 @@ print_generate_only_handoff() {
   echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
   echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
   echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading APIs the"
+    echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
+    echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
+  fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
   echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
-  echo -e "  # SCOPE_ORGANIZATIONS and the two exclusions) is replaced by this apply, and the reconcile"
+  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions)"
+  echo -e "  # is replaced by this apply, and the reconcile"
   echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
   if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
     echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
@@ -3816,6 +3977,7 @@ run_menu_system() {
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
         check_scope_container_access || exit 1
+        enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -3889,7 +4051,7 @@ main() {
     # flag here would be validated and then dropped without a word.
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
       print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
-      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
     run_menu_system
@@ -4735,6 +4897,8 @@ main() {
   local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
   local scope_folders="${PARAM_SCOPE_FOLDERS:-}"
   local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
+  local scope_shared_vpc_hosts="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}"
+  local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
   # This rule is also written in init_var_platform_agent_permission_set
@@ -5067,6 +5231,8 @@ main() {
   export SCOPE_PROJECTS="$scope_projects"
   export SCOPE_FOLDERS="$scope_folders"
   export SCOPE_ORGANIZATIONS="$scope_organizations"
+  export SCOPE_SHARED_VPC_HOSTS="$scope_shared_vpc_hosts"
+  export SCOPE_METRICS_SCOPES="$scope_metrics_scopes"
   export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
   export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"
@@ -5256,7 +5422,7 @@ main() {
       fi
     )
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-      local np_status=0
+      local np_status=0 missing_apis=""
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
@@ -5279,6 +5445,14 @@ main() {
           print_info "To remediate manually beforehand, update each legacy node pool:"
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
+      elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \
+        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then
+        # The plan resolves a declared Shared VPC host or Metrics Scope by
+        # reading APIs a real run enables prior to apply; a dry run enables
+        # nothing, so its plan would be refused for a reason the real run
+        # does not have. A listing that failed runs the plan and lets it speak.
+        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan resolves the declared Shared VPC host or Metrics Scope through it (a real run enables it prior to apply)."
+        print_info "To preview anyway, enable it first: gcloud services enable ${missing_apis} --project=${project_id}"
       else
         # Reached with an unenforcing cluster only under --accept-no-network-policy,
         # whose tfvars carry the variable that passes the module's postcondition.
@@ -5358,6 +5532,10 @@ main() {
   # and the non-interactive flag path. Warns-only when GitHub is unreachable;
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
   check_github_org_is_organization "${GITOPS_ORG:-}"
+  # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
+  # reads APIs the apply below is what enables; on a first install they
+  # have to be on before the plan, or it is refused with the API disabled.
+  enable_scope_selector_apis "$project_id"
 
   # The three script behaviours a data source cannot express: CMEK, the
   # Workload Identity pool, and NetworkPolicy enforcement on a cluster that
