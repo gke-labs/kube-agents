@@ -4,7 +4,7 @@
 The pull sweep and the two seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
 from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
-then `finished.json`, then the artifact the job wrote, if it writes one) and turns a failed or overdue run into
+then `finished.json`, then, for a failed build, the artifact the job wrote) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
 link and, for the reconcile, the projects it refused or could not finish.
 
@@ -57,9 +57,13 @@ DETAIL_LIMIT = 5
 RECONCILE_ARTIFACT = "fleet-reconcile.json"
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
-# settled on for this archive: never a bare 404, because gsutil echoes the
-# failing URL and a 19-digit build id can contain those digits.
+# settled on for the Prow archive; the same wording here. Never a bare 404,
+# because gsutil echoes the failing URL and a 19-digit build id can contain
+# those digits.
 NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexception: 404")
+# A NotFound that names the bucket rather than an object: every job reads as
+# "never ran" for as long as it lasts, so it is warned, unlike an absent pointer.
+BUCKET_MISSING_MARKER = "bucket does not exist"
 # GitHub Actions renders a line with this prefix as a workflow warning, as the
 # sibling pool-pressure step's `echo "::warning::..."` does.
 WARNING_PREFIX = "::warning::"
@@ -99,8 +103,8 @@ class Periodic:
     label: str
     # A finished build older than this is a job that stopped running. It is a
     # window, not the cadence: the sweep runs every ten minutes and the hourly
-    # reconcile hourly, and each window is what the TestGrid stale-results
-    # setting was for the job.
+    # reconcile hourly. The sweep's and the hourly's windows are what their
+    # TestGrid stale-results settings were; the weekly's is a week and a day.
     stale_after: timedelta
     artifact: str | None
     # Where the recovery is written up.
@@ -193,6 +197,8 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     if out is None:
         if not _not_found(err):
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
+        elif BUCKET_MISSING_MARKER in err.lower():
+            log(f"{WARNING_PREFIX}{periodic.job}'s log bucket does not exist: {err.strip()}", file=sys.stderr)
         return None
     newest = out.strip()
     # isdecimal, not isdigit: the latter admits characters int() rejects.
@@ -221,28 +227,28 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             KEY_PASSED: bool(finished.get(KEY_PASSED)),
             KEY_RESULT: str(finished.get(KEY_RESULT) or ""),
         }
-        if periodic.artifact:
-            # Absent is a run that wrote none. Present but not a JSON object is
+        reading[KEY_ARTIFACT] = None
+        if periodic.artifact and not reading[KEY_PASSED]:
+            # Read for a failed build only: the note is what names the projects,
+            # and a passed build gets none. Absent is a run that wrote none. Present but not a JSON object is
             # a report cut short, which no later tick can read either, so the
             # failure is posted with that said rather than never. Any other
             # failure is unreadable and the tick is blind on this job, as for
             # finished.json: a note is posted once, and one written without its
             # projects would stay so.
             out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
-            artifact = None
             if out is not None:
                 try:
                     loaded = json.loads(out)
                 except ValueError:
                     loaded = None
                 if not isinstance(loaded, dict):
-                    log(f"{WARNING_PREFIX}{periodic.job}'s {build}/{periodic.artifact} is not a JSON object; the note will say so", file=sys.stderr)
+                    log(f"{WARNING_PREFIX}{periodic.job}'s {build}/{periodic.artifact} is not a JSON object; a failed build's note says so", file=sys.stderr)
                     loaded = {REPORT_KEY_ERROR: REPORT_UNREADABLE}
-                artifact = loaded
+                reading[KEY_ARTIFACT] = loaded
             elif not _not_found(err):
                 log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: {err.strip()}", file=sys.stderr)
                 return None
-            reading[KEY_ARTIFACT] = artifact
         return reading
     return None
 

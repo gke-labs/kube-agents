@@ -363,7 +363,7 @@ latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
-running), keeps the reconcile's `fleet-reconcile.json` when the build wrote
+running), keeps the reconcile's `fleet-reconcile.json` when a failed build wrote
 one, and hands the readings to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
@@ -652,8 +652,8 @@ The hourly `ci-kube-agents-fleet-reconcile`
 periodic re-applies the stack in the projects the scan names
 (`docs/ci-pool-projects.md` §6.2), and the
 recovery comment follows the first scan after that apply, one to two hours
-after the report. No recovery by then is a drift the re-apply did not fix, a
-plan it refused, an apply that failed, or a project leased each time the
+after the report. No recovery by then is the periodic still in `--dry-run`
+(its first week), a drift the re-apply did not fix, a plan it refused, an apply that failed, or a project leased each time the
 hourly ran; the periodic's own log says which.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the

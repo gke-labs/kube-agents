@@ -899,7 +899,7 @@ whose latest finished build failed (`verdict: FAILED`) or is older than the
 job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], history_url, doc}`,
 where `detail` (on `FAILED` only) names the projects the reconcile's artifact
-says it refused, failed or was interrupted in, up to five, then the run's own
+says it refused, failed or was interrupted in, up to five (then `and N more`), then the run's own
 `error` line, which also says when the report was not a JSON object; `since` is
 carried from the previous `health.json`. That artifact, `fleet-reconcile.json`
 from `hack/fleet_reconcile.py --report`, is `{schema_version, mode, dry_run,

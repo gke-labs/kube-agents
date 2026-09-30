@@ -11,9 +11,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the state changes plus one digest a day (scripts/eval_dashboard/
 # post_health.py). docs/ci-health.md explains the states, the rules and the
 # advice each one carries. The data and the verdict are fresh together; the
-# two inputs fetched outside that collect, pool-pressure's hourly artifact
-# (#1607) and the watched periodics' latest builds, are optional -- an absence
-# just drops that note.
+# inputs fetched outside that collect -- pool-pressure's hourly artifact
+# (#1607), the watched periodics' latest builds and the rest -- are optional;
+# an absence just drops its note.
 # The order is adjudicate ->
 # upload health.json -> append history -> render -> publish -> post ->
 # comment, so the Brief a reader opens from a message already shows the

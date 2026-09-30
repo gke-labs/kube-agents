@@ -1,5 +1,5 @@
 """scripts/eval_dashboard/periodics.py: the watched Prow periodics' latest
-finished builds, read from the archive, and the notes health.py carries.
+finished builds, read from the bucket they log to, and the notes health.py carries.
 
 * `fetch` reads the pointer, walks back to a finished build, keeps the
   artifact when the job writes one, writes one <job>.json per job with a
@@ -200,6 +200,16 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(periodics.load_readings(None), {})
 
 
+    def test_a_missing_bucket_is_warned_not_read_as_never_ran(self):
+        class NoBucket:
+            def __call__(self, cmd, **kwargs):
+                return subprocess.CompletedProcess(cmd, 1, "", f"BucketNotFoundException: 404 gs://{cmd[3].split('/')[2]} bucket does not exist.")
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=NoBucket(), log=lambda *a, **k: warnings.append(a[0])), {})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("log bucket does not exist", warnings[0])
+
 class AssessTest(unittest.TestCase):
     def reading(self, periodic, when, passed=True, artifact=None, build="100"):
         reading = {"job": periodic.job, "build": build, "finished_at": when.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE"}
@@ -273,6 +283,12 @@ class AssessTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertIn("not a JSON object", warnings[0])
         self.assertEqual(periodics.reconcile_detail(readings[WEEKLY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
+        # A passed build's artifact is not read: nothing would name its projects.
+        passed = FakeGsutil(archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=passed)
+        self.assertIsNone(readings[WEEKLY.job]["artifact"])
+        self.assertFalse([c for c in passed.calls if c[3].endswith(periodics.RECONCILE_ARTIFACT)])
         # A run that wrote no artifact is a reading without one.
         absent = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
@@ -315,8 +331,9 @@ class WorkflowWiring(unittest.TestCase):
         self.assertIn("--periodics-dir work/periodics", adjudicate["run"])
         self.assertLess(names.index(fetch["name"]), names.index("Adjudicate"))
 
-    def test_the_watched_jobs_are_the_periodics_in_oss_test_infra(self):
-        # The names are the Prow job names; a rename there is a rename here.
+    def test_the_watched_jobs_are_the_three_periodics(self):
+        # The names are the Prow job names in oss-test-infra, which nothing here
+        # can check; a rename there is a rename here.
         self.assertEqual([p.job for p in periodics.WATCHED], ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile", "ci-kube-agents-fleet-reconcile-all"])
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after >= timedelta(hours=1))
