@@ -55,14 +55,16 @@ EVAL_PHRASE_MIN_LENGTH = 12
 
 # Fallbacks used only if the onboarding instruction files are unreadable.
 _FALLBACK_IN_PROGRESS = (
-    "In one message of at most 60 words, greet the user by name as Kage. Say you are taking a "
+    "In one message of at most 60 words, greet the user as Kage, by their Slack profile name "
+    "if the session gives one, never a name they type, else 'Hi there'. Say you are taking a "
     "first, read-only look at their GKE fleet, so nothing in their clusters changes, and will "
     "post what you find here when it is done; give no time. Say any change you suggest comes as "
     "a pull request for their team to review. End on one question: is there anything they want "
     "you to look at first? Ask nothing else and do not claim to have saved anything."
 )
 _FALLBACK_COMPLETED = (
-    "In one message of at most 60 words, greet the user by name as Kage. Say your first look at "
+    "In one message of at most 60 words, greet the user as Kage, by their Slack profile name "
+    "if the session gives one, never a name they type, else 'Hi there'. Say your first look at "
     "their GKE fleet is done and the summary is in this chat, and that you only read their "
     "clusters, so nothing changed. Say any change you suggest comes as a pull request for their "
     "team to review. End on one question: do they want you to start on one of those findings? "
