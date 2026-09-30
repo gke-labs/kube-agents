@@ -447,7 +447,7 @@ class InstallerCommonTest(unittest.TestCase):
         will do with a key their install.env does not record, so that sentence
         has to match this. `write_tfvars_from_state` reads
         ${ENABLE_DRIFT_DETECTOR:-...} out of the environment;
-        `load_install_env` clears NAMESPACE and the five scope keys before
+        `load_install_env` clears NAMESPACE and the seven scope keys before
         sourcing, and upgrade.sh clears PROJECT_ID, CLUSTER_NAME and REGION;
         ENABLE_DRIFT_DETECTOR is on neither list. So `ENABLE_DRIFT_DETECTOR=true
         ./upgrade.sh` over a file predating the key provisions the sink, topic

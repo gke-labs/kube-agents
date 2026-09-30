@@ -143,12 +143,19 @@ REQUESTED_LOCAL_RE = re.compile(
 # ordinary install is refused; with `== null` in place of `!= true` a false
 # leaf passes, and false silences the detector exactly as null does.
 COUNTERMAND_LOCAL = "extra_helm_values_countermands_detector"
-LEAF_PATH = r"var\.extra_helm_values\." + r"\.".join(DRIFT_VALUE_PREFIX) + r"\.enabled"
+PARENT_PATH = r"var\.extra_helm_values\." + r"\.".join(DRIFT_VALUE_PREFIX)
+LEAF_PATH = PARENT_PATH + r"\.enabled"
+# The parent clause is pinned separately from the leaf clause because they
+# fail differently. Drop the leaf half and an `enabled: false` override is
+# accepted; drop the parent half and `driftDetector: null` is -- the spelling
+# Helm documents for deleting a key, which the leaf half cannot see because
+# attribute access on null raises and can() swallows it with the absent case.
 COUNTERMAND_LOCAL_RE = re.compile(
     COUNTERMAND_LOCAL + r"\s*=\s*\(\s*"
-    r"var\." + DETECTOR_FLAG_VARIABLE + r"\s*&&\s*"
-    r"can\(" + LEAF_PATH + r"\)\s*&&\s*"
-    r"try\(" + LEAF_PATH + r",\s*null\)\s*!=\s*true",
+    r"var\." + DETECTOR_FLAG_VARIABLE + r"\s*&&\s*\(\s*"
+    r"\(\s*can\(" + LEAF_PATH + r"\)\s*&&\s*"
+    r"try\(" + LEAF_PATH + r",\s*null\)\s*!=\s*true\s*\)\s*\|\|\s*"
+    r"try\(" + PARENT_PATH + r",\s*\"absent\"\)\s*==\s*null",
     re.S,
 )
 COUNTERMAND_PRECONDITION_RE = re.compile(
@@ -279,6 +286,9 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
         true`, the sink, topic and subscription are provisioned and bill, and
         the CR never starts a consumer — the state the other two
         preconditions exist to refuse, reached where neither of them looks.
+
+        The same door one level up is pinned with it: `driftDetector = null`
+        reaches the identical end state, and the leaf clause cannot see it.
         """
         single(
             COUNTERMAND_LOCAL_RE,

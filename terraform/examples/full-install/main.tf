@@ -230,10 +230,27 @@ locals {
   # that is absent. Absent is the ordinary case and must not be refused:
   # nothing overrides the computed document and `enabled: true` reaches the
   # CR.
+  #
+  # The second clause is the same door one level up: `driftDetector = null`
+  # reaches the identical end state and the first clause cannot see it, because
+  # attribute access on null raises and the can() that tolerates an absent leaf
+  # swallows a present null parent with it. Coalesce deletes a nil-valued key
+  # where the chart default is a table, and the template's `| default dict`
+  # then renders no driftDetector block at all -- no enabled, and no
+  # subscription either -- so the ingress bills and nothing reads it.
+  #
+  # The "absent" sentinel is what separates "the key is there and is null" from
+  # "the key is not there": try returns the sentinel in the second case, and a
+  # sentinel that is not null cannot collide with the value being tested for. A
+  # non-null non-map parent is deliberately not caught here -- coalesce keeps a
+  # scalar and values.schema.json types driftDetector as object, so the release
+  # fails validation with a message of its own.
   extra_helm_values_countermands_detector = (
-    var.enable_drift_detector &&
-    can(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) &&
-    try(var.extra_helm_values.platformAgent.harness.driftDetector.enabled, null) != true
+    var.enable_drift_detector && (
+      (can(var.extra_helm_values.platformAgent.harness.driftDetector.enabled) &&
+      try(var.extra_helm_values.platformAgent.harness.driftDetector.enabled, null) != true) ||
+      try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
+    )
   )
 }
 

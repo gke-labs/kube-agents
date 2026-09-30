@@ -7558,35 +7558,30 @@ class DomainScopedFlagsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
             destination.write_text("PROJECT_ID=p\n")
+            # The emptiness is read out of the same run that asserts the
+            # silence, rather than from a second subprocess: _parse already
+            # sources install.sh with the environment this needs -- the drift
+            # keys scrubbed, and KUBE_AGENTS_INSTALL_ENV pinned so that
+            # INSTALL_ENV_FILE cannot fall to the install.env beside install.sh
+            # and be sourced under `set -a` before the PARAM is seeded.
+            #
+            # Printed between the two calls, because bootstrap_install_env_file
+            # is downstream of the question: what is asserted is what
+            # resolve_shared_defaults left, not what survived the write.
+            #
+            # The marker carries the value and not the key's name, so the
+            # silence assertion below still reads the whole of stdout.
             proc = self._parse(
                 "-y",
                 "resolve_shared_defaults\n"
+                'printf "unchosen=[%s]\\n" "$PARAM_ENABLE_DRIFT_DETECTOR"\n'
                 f'bootstrap_install_env_file "{destination}" v1.2.3',
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            self.assertEqual(
-                "",
-                subprocess.run(
-                    ["bash", "-c",
-                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}" >/dev/null 2>&1\n'
-                     f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
-                     "resolve_shared_defaults\n"
-                     'printf "%s" "$PARAM_ENABLE_DRIFT_DETECTOR"'],
-                    capture_output=True, text=True, cwd=str(_REPO_ROOT),
-                    # KUBE_AGENTS_INSTALL_ENV, as the outer _parse pins it:
-                    # without it INSTALL_ENV_FILE falls to the install.env
-                    # beside install.sh, and bootstrap_install_env sources that
-                    # with `set -a` before PARAM_ENABLE_DRIFT_DETECTOR is
-                    # seeded. A developer who has run ./install.sh from this
-                    # checkout has one, and it now names this key, so the
-                    # assertion below would fail on the developer's file rather
-                    # than on resolve_shared_defaults. Scrubbing the
-                    # environment covers the other route in, not this one.
-                    env=_env_without_ambient_drift_keys(
-                        {"KUBE_AGENTS_INSTALL_ENV": str(destination)}
-                    ),
-                ).stdout,
-                "resolve_shared_defaults must leave this one empty",
+            self.assertIn(
+                "unchosen=[]",
+                proc.stdout,
+                f"resolve_shared_defaults must leave this one empty: {proc.stdout}",
             )
             self.assertNotIn("ENABLE_DRIFT_DETECTOR", proc.stdout + proc.stderr)
 
