@@ -40,6 +40,18 @@ _AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scri
 # The name the audit module is registered under when loaded by path; unregistered
 # in sys.modules, so it cannot shadow or be shadowed by an installed package.
 _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
+# Every name the declared-intent check reads off the loaded module. Read once
+# at load, so a rename upstream is a loader failure (the check unverified with
+# the AttributeError named) and never a verdict on a repository's note.
+_AUDIT_REPORT_SYMBOLS = (
+    "parse_declarations",
+    "split_frontmatter",
+    "audit_declarable_checks",
+    "_declaration_key",
+    "OKF_TYPE_KEY",
+    "DECLARES_KEY",
+    "DECLARATION_CLUSTER_FIELD",
+)
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
 GITOPS_REPO_ORG = "gke-agentic"
 GITOPS_REPO_SUFFIX = "-infra"
@@ -2329,14 +2341,28 @@ def _gitops_repo_slug(project_id: str) -> str:
 
 
 def _load_audit_report():
-    """The fleet-audit script as a module, for its `parse_declarations` and join key."""
+    """The fleet-audit script as a module, proven able to run its note parser here.
+
+    Loading is not enough to know the parser can run: audit_report.py imports
+    nothing beyond the standard library at module level and imports PyYAML
+    lazily inside `parse_declarations`, so on a machine without PyYAML the
+    module loads and the first `import yaml` fires later, from inside the
+    check's read of one repository's note. Importing PyYAML here, and reading
+    every name the check uses, makes "the parser cannot run on this machine"
+    one failure at one place -- an ImportError or AttributeError from this
+    function -- rather than something a note gets blamed for.
+    """
     import importlib.util
+
+    import yaml  # noqa: F401  (the parser's dependency, proven present here)
 
     spec = importlib.util.spec_from_file_location(_AUDIT_REPORT_MODULE_NAME, _AUDIT_REPORT)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {_AUDIT_REPORT}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    for name in _AUDIT_REPORT_SYMBOLS:
+        getattr(module, name)
     return module
 
 
@@ -2422,6 +2448,18 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     warnings: List[str] = []
     rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
     if rc != 0:
+        # A refusal or a transient is classified first: run_cmd's timeout text
+        # embeds the command line, and so the project id, which `\b404\b`
+        # would match in a project named `...-404`.
+        if _unread_reason(err or "") is not None:
+            _record_unreadable(
+                err or "",
+                absent="",
+                unchecked=f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} could not be read",
+                details=details,
+                warnings=warnings,
+            )
+            return CheckResult(name, True, "Not checked", warnings=warnings, read=False)
         if _GITHUB_NOT_FOUND.search(err or ""):
             return CheckResult(
                 name,
@@ -2431,28 +2469,21 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
                 f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
                 f"is seeded: {gitops_note_seed_command(repo_slug)}",
             )
-        if _record_unreadable(
-            err or "",
-            absent=f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}",
-            unchecked=f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} could not be read",
-            details=details,
-            warnings=warnings,
-        ):
-            return CheckResult(name, True, "Not checked", warnings=warnings, read=False)
-        return CheckResult(name, False, details[0])
+        return CheckResult(name, False, f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")
     try:
         payload = _load_json(out)
         body = base64.b64decode(payload.get("content") or "").decode("utf-8")
         sha = str(payload.get("sha") or "")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
-    # Two failures, two verdicts. The parser failing to LOAD (no PyYAML, the
-    # audit script missing) is a fact about this machine, so the check is
-    # unread. The parser RAISING on this file -- PyYAML's safe constructors
-    # raise KeyError on `!!bool maybe` and AttributeError on `!!timestamp later`,
-    # outside the set parse_declarations catches -- is a fact about the note:
-    # the audit reads no declaration from it, so the check fails with the
-    # replace command, naming the exception.
+    # Two failures, two verdicts. The parser failing to LOAD -- no PyYAML, the
+    # audit script missing, a name the check reads renamed; _load_audit_report
+    # proves all three before returning -- is a fact about this machine, so the
+    # check is unread. The parser RAISING on this file -- PyYAML's safe
+    # constructors raise KeyError on `!!bool maybe` and AttributeError on
+    # `!!timestamp later`, outside the set parse_declarations catches -- is a
+    # fact about the note: the audit reads no declaration from it, so the check
+    # fails with the replace command, naming the exception.
     try:
         audit = _load_audit_report()
     except Exception as exc:

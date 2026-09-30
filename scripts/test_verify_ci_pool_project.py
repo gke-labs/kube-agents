@@ -1595,6 +1595,44 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 # would also pass, with a warning.
                 self.assertEqual([], result.warnings, label)
 
+    def test_no_pyyaml_leaves_the_check_unverified_with_the_note_intact(self):
+        # audit_report.py imports PyYAML lazily, so the module loads on a
+        # machine without it; the loader has to import PyYAML itself, or the
+        # first failure lands inside the read of a correct note and the
+        # operator is told to overwrite it.
+        import sys
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.dict(sys.modules, {"yaml": None}):
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("ModuleNotFoundError", result.warnings[0])
+        self.assertNotIn("Replace it", result.message)
+
+    def test_a_renamed_audit_symbol_leaves_the_check_unverified(self):
+        # A rename upstream is a loader failure, named, never a bad note.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = pathlib.Path(tmp) / "audit_report.py"
+            stub.write_text("def parse_declarations(*a, **k):\n    return []\n")
+            with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(checker, "_AUDIT_REPORT", stub):
+                run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("AttributeError", result.warnings[0])
+
+    def test_a_timeout_naming_a_404_project_is_unverified_not_absent(self):
+        # run_cmd's timeout text embeds the command line and so the project id;
+        # `\b404\b` matched `-404-` and reported the note absent with a PUT.
+        err = "timed out after 30s: gh api repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_fail(err)]
+            result = checker.check_gitops_declaration("kube-agents-evals-404")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertNotIn("Seed it", result.message)
+
     def test_a_parser_that_cannot_run_leaves_the_check_unverified(self):
         # No PyYAML, or the audit script missing from the tree: a fact about
         # the machine, not the note, so the check is unread rather than failed
