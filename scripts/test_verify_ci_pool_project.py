@@ -1690,6 +1690,12 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             'Get "https://api.github.com/...": unexpected EOF',
             'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": EOF',
             'Get "https://api.github.com/...": http: server closed idle connection',
+            # Shapes no allow-list names: gh's raw `Get "<url>": <error>` line
+            # is transport whatever the error says, and a `-404-` in its URL
+            # is not a 404.
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-404-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: connection timed out',
+            'Get "https://api.github.com/...": x509: certificate signed by unknown authority',
+            'Get "https://api.github.com/...": write: broken pipe',
         )
         for err in errs:
             with self.subTest(err[:40]), mock.patch.object(checker, "run_cmd") as run:
@@ -1721,6 +1727,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "empty": "\n",
             "unclosed": good.replace("---\n\n`notification", "\n`notification", 1),
             "no type": good.replace("type: decision\n", ""),
+            "list frontmatter": "---\n- type: decision\n- declares: [{check: no-pdb, namespace: seeded-intent, object: Deployment/notification-relay}]\n---\n\nA list where a mapping belongs.\n",
             "no declares": good.replace("declares:", "declared:"),
             "other object": good.replace("Deployment/notification-relay", "Deployment/checkout-gateway"),
             "strings but no structure": "---\ncheck: no-pdb namespace: seeded-intent object: Deployment/notification-relay\n---\n",
@@ -1752,6 +1759,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "empty": "it has no frontmatter",
             "unclosed": "it has no frontmatter",
             "no type": "has no `type`",
+            "list frontmatter": "is a YAML list, not a mapping",
             "no declares": "has no `declares` list",
             "other object": "no declares item is check no-pdb",
             "strings but no structure": "not valid YAML",

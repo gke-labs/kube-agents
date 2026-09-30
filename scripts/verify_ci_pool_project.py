@@ -62,10 +62,11 @@ _AUDIT_REPORT_SYMBOLS = (
 GITHUB_CONTENT_ENCODING_NONE = "none"
 GITHUB_RAW_MEDIA_TYPE = "application/vnd.github.raw+json"
 # What one read of a repository path settles. A refusal or a transient is
-# classified before `404` is matched, because run_cmd's timeout text embeds
-# the command line, and so the project id, which `\b404\b` matches in a
-# project named `...-404`. Anything else gh refuses (a 409 on a repository
-# with no commits, a 422) is a failure the check reports, not an unread.
+# classified first, and absence only on gh's own 404 spelling, because
+# run_cmd's timeout text and gh's transport errors embed the URL, and so the
+# project id, which a bare `404` would match in a project named `...-404`.
+# Anything else gh refuses (a 409 on a repository with no commits, a 422) is
+# a failure the check reports, not an unread.
 GITHUB_PATH_PRESENT = "present"
 GITHUB_PATH_ABSENT = "absent"
 GITHUB_PATH_UNREAD = "unread"
@@ -811,6 +812,13 @@ _UNREAD_PATTERNS = (
 # it either knows a 404 cannot mean "absent" (check_github_repo_and_app) or
 # names both readings in what it reports (check_gitops_declaration).
 _GITHUB_NOT_FOUND = re.compile(r"\b404\b|\bnot found\b", re.I)
+# For the reads whose stderr can carry a URL (`gh api` on a repository path):
+# gh's own spelling of a 404, so a project id containing `-404-` inside a
+# transport error's URL is never read as absence, and gh's raw transport
+# shape, `Get "<url>": <Go error>`, which no allow-list of Go error texts
+# covers; every such line is a request that got no answer.
+_GH_NOT_FOUND_SPELLING = re.compile(r"\(HTTP 404\)|^gh: Not Found", re.M)
+_GH_TRANSPORT_LINE = re.compile(r'^(?:Get|Post|Put|Patch|Delete) "https?://[^"]*": ', re.M)
 
 # hack/fleet-kubeconfigs.sh reports a cluster it could not reach and a fleet
 # that is not what the catalog describes through the same "unresolved" count,
@@ -2479,7 +2487,9 @@ def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[st
     reason = _unread_reason(err or "")
     if reason is not None:
         return GITHUB_PATH_UNREAD, reason
-    if _GITHUB_NOT_FOUND.search(err or ""):
+    if _GH_TRANSPORT_LINE.search(err or ""):
+        return GITHUB_PATH_UNREAD, (err or "").strip()
+    if _GH_NOT_FOUND_SPELLING.search(err or ""):
         return GITHUB_PATH_ABSENT, ""
     return GITHUB_PATH_FAILED, (err or "").strip()
 

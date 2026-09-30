@@ -3953,7 +3953,9 @@ def _read_declares(text: str, *, where: str | None) -> tuple[dict | None, list |
         if where is not None:
             log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
         return None, None, f"its frontmatter is not valid YAML ({type(exc).__name__})"
-    if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
+    if not isinstance(front, dict):
+        return None, None, f"its frontmatter is a YAML {type(front).__name__}, not a mapping, so it is not an OKF note"
+    if OKF_TYPE_KEY not in front:
         return None, None, f"its frontmatter has no `{OKF_TYPE_KEY}`, so it is not an OKF note"
     declares = front.get(DECLARES_KEY)
     if declares is None:

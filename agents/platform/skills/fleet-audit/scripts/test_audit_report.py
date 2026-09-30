@@ -5658,6 +5658,10 @@ class ExplainEmptyDeclarationsTest(unittest.TestCase):
             "invalid yaml": ("---\ntype: [\n---\n", "not valid YAML ("),
             "pyyaml value error": ("---\ntype: decision\nreviewed: 2026-02-30\n---\n", "not valid YAML (ValueError)"),
             "no type": ("---\ndeclares: []\n---\n", "has no `type`"),
+            # A sequence or a scalar parses cleanly and is not a mapping; the
+            # reason names the shape rather than a key the text may contain.
+            "list frontmatter": ("---\n- type: decision\n- declares: []\n---\n", "is a YAML list, not a mapping"),
+            "scalar frontmatter": ("---\njust words\n---\n", "is a YAML str, not a mapping"),
             "no declares": ("---\ntype: decision\n---\n", "has no `declares` list"),
             "declares not a list": ("---\ntype: decision\ndeclares: yes\n---\n", "is not a list"),
             "declares empty": ("---\ntype: decision\ndeclares: []\n---\n", "list is empty"),
