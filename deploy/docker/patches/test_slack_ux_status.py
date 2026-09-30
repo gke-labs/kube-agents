@@ -808,16 +808,76 @@ class PlanTest(_RuntimeCase):
             await adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn")
             self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
             self.assertNotIn(("setStatus", "closed"), adapter.calls)
+            # Answered: the card runs on its plan again, which takes its next note.
             await runtime.settle_row(adapter, _sub(), "unblocked")
-            self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+            self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+            self.assertIn((CHANNEL, THREAD), runtime._plans)
+            await runtime.deliver_row(adapter, _sub(), 3, "check payments", "retrying")
             await runtime.settle_row(adapter, _sub(), "completed")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
         adapter = _Adapter()
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter).count("post"), 1)
         updates = [v for n, v in adapter.calls if n == "update"]
-        self.assertEqual([u[0]["tasks"][0]["status"] for u in updates], ["pending", "in_progress", "complete"])
+        self.assertEqual(
+            [u[0]["tasks"][0]["status"] for u in updates], ["pending", "in_progress", "in_progress", "complete"],
+        )
         self.assertEqual(runtime._lapsed, {})
+
+    def test_a_card_answered_beside_a_newer_plan_holds_working(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")
+            await runtime.settle_row(adapter, _sub("t_w"), "blocked")
+            await asyncio.sleep(0.2)
+            await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "reading logs")
+            await runtime.settle_row(adapter, _sub("t_b"), "blocked")
+            self.assertEqual(self._sent(adapter)[-1], "suspended")
+            await runtime.settle_row(adapter, _sub("t_w"), "unblocked")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+            await asyncio.sleep(0.2)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"), "the answered card's hold ran out")
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+
+    def test_the_per_thread_cap_drops_a_quiet_plan_before_a_waiting_one(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")
+            await runtime.settle_row(adapter, _sub("t_w"), "blocked")
+            await asyncio.sleep(0.2)
+            for event_id, card in ((2, "t_1"), (3, "t_2")):
+                await runtime.deliver_row(adapter, _sub(card), event_id, "check checkout", "reading logs")
+                await asyncio.sleep(0.2)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+            await runtime.settle_row(adapter, _sub("t_w"), "completed")
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05), mock.patch.object(
+            runtime, "LAPSED_PER_THREAD", 2,
+        ):
+            _run(scenario(adapter))
+        last = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
+        self.assertEqual([(t["task_id"], t["status"]) for t in last], [("t_w", "complete")])
+
+    def test_a_set_aside_thread_evicted_at_the_cap_sends_its_session(self):
+        other = "7.7"
+
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub(), 1, "check payments", "asking")
+            await runtime.settle_row(adapter, _sub(), "blocked")
+            await asyncio.sleep(0.2)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+            await runtime.deliver_row(adapter, _sub("t_b", thread=other), 2, "check checkout", "reading logs")
+            await asyncio.sleep(0.2)
+            self.assertNotIn((CHANNEL, THREAD), runtime._lapsed)
+            self.assertEqual(self._sent(adapter).count("closed"), 2, "both threads, the evicted one too")
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05), mock.patch.object(runtime, "PLANS_MAX", 1):
+            _run(scenario(adapter))
 
     def test_a_note_after_the_lapse_starts_a_new_plan_beside_a_waiting_card(self):
         async def scenario(adapter):

@@ -54,9 +54,12 @@ was lost does not hold the next card's Working… or put its row on a message
 far up the thread; the next note starts a new plan. A set-aside plan holds
 nothing running, so its session closes unless one of its cards waits on the
 user, which holds ``suspended`` until that card moves: waiting is not a lost
-event. Its cards' later events still update their rows on it. A plan evicted
-at :data:`PLANS_MAX` closes its session on the way out, since nothing else
-would. Past ``slack_status.ROWS_MAX`` rows the oldest settled rows leave the
+event. Its cards' later events still update their rows on it, and a card
+answered there runs on it again: it becomes the thread's plan once more, or,
+beside a newer plan, holds ``processing`` for another hold. Past
+:data:`LAPSED_PER_THREAD` a thread drops set-aside plans with no card waiting
+first. A plan evicted at :data:`PLANS_MAX`, current or set aside, has its
+session sent again on the way out, since nothing else would. Past ``slack_status.ROWS_MAX`` rows the oldest settled rows leave the
 plan first, so the cap hides a live card only when more than that many are
 live. The plan has no Stop button yet: ``/stop`` interrupts only the
 Planning Agent's turn, and the cards would run on.
@@ -283,21 +286,25 @@ def _thread(sub: dict) -> tuple:
 def _plan_session(chat_id: str, thread_ts: str) -> str:
     """The session status the thread's plans hold, or ``""`` when no card runs or waits.
 
-    Only the current plan runs: a card rolling after its posted plan fell back
-    counts, and no card counts as running once the plan is untouched for
-    :data:`PLAN_HOLD_SECONDS`. A card waiting on the user, on it or on a plan
-    the lapse set aside, holds ``suspended``.
+    A card runs on a plan touched within :data:`PLAN_HOLD_SECONDS`: a row
+    running, or a card rolling after its posted plan fell back. A set-aside
+    plan is untouched that long unless a card on it was answered since. A
+    card waiting on the user, on any of the thread's plans, holds
+    ``suspended``.
     """
     key = (chat_id, thread_ts)
     plan = _plans.get(key)
-    if plan is not None and time.monotonic() - plan.touched < PLAN_HOLD_SECONDS and (
-        (plan.ts and plan.rolling - plan.waiting) or _status.running(plan.rows.values())
-    ):
-        return _status.SESSION_PROCESSING
     plans = [*_lapsed.get(key, ()), *([plan] if plan is not None else [])]
+    now = time.monotonic()
+    if any(now - p.touched < PLAN_HOLD_SECONDS and _running(p) for p in plans):
+        return _status.SESSION_PROCESSING
     if any(_waiting(p) for p in plans):
         return _status.SESSION_SUSPENDED
     return ""
+
+
+def _running(plan: _Plan) -> bool:
+    return bool(plan.ts and plan.rolling - plan.waiting) or _status.running(plan.rows.values())
 
 
 def _waiting(plan: _Plan) -> bool:
@@ -413,7 +420,12 @@ async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
     where that card's events still settle its row (:func:`settle_row`) and a
     card waiting on the user keeps the session ``suspended``.
     """
-    if _plans.get(key) is not plan or time.monotonic() - plan.touched < PLAN_HOLD_SECONDS:
+    if time.monotonic() - plan.touched < PLAN_HOLD_SECONDS:
+        return
+    if _plans.get(key) is not plan:
+        # Set aside already, and answered beside a newer plan: that hold ran out.
+        if any(old is plan for old in _lapsed.get(key, ())):
+            await _session(adapter, key, plan)
         return
     logger.info(
         "slack_ux_status: the plan in %s/%s had no news for %ss; setting it aside",
@@ -421,9 +433,33 @@ async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
     )
     _plans.pop(key, None)
     if plan.ts and _held(plan):
-        _remember(_lapsed, key, [*_lapsed.get(key, ()), plan][-LAPSED_PER_THREAD:], PLANS_MAX)
+        await _set_aside(adapter, key, plan)
     if plan.ts:
         await _session(adapter, key, plan)
+
+
+async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """Add a lapsed plan to :data:`_lapsed`, within both bounds.
+
+    Past :data:`LAPSED_PER_THREAD` the oldest plan with no card waiting goes
+    first, so a wait keeps its ``suspended`` while quiet cards come and go. A
+    thread evicted at :data:`PLANS_MAX` has its session sent again, as
+    :func:`_keep` does, so a wait that can no longer settle does not stay
+    ``suspended``.
+    """
+    plans = [*_lapsed.get(key, ()), plan]
+    while len(plans) > LAPSED_PER_THREAD:
+        dropped = next((old for old in plans if not _waiting(old)), plans[0])
+        _disarm(dropped)
+        plans.remove(dropped)
+    _lapsed[key] = plans
+    _lapsed.move_to_end(key)
+    while len(_lapsed) > PLANS_MAX:
+        old_key, evicted = _lapsed.popitem(last=False)
+        for old in evicted:
+            _disarm(old)
+        logger.info("slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key)
+        await _session(adapter, old_key, evicted[-1])
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -485,14 +521,17 @@ def _park(plan: _Plan, card: str, status: str | None, done: bool) -> bool:
 async def _settle_lapsed(
     adapter: Any, key: tuple, card: str, kind: str, status: str | None, done: bool,
 ) -> _Plan | None:
-    """Settle the card on the plans the lapse set aside: edits only, no timer.
+    """Settle the card on the plans the lapse set aside.
 
-    Returns a plan that moved, for the caller to send the session status from.
+    A card answered there runs on that plan again: with no current plan it
+    becomes the thread's plan once more, so its next note lands on its row;
+    beside a newer one it is touched and timed like a current plan. Returns a
+    plan that moved, for the caller to send the session status from.
     """
     plans = _lapsed.get(key)
     if not plans:
         return None
-    changed = None
+    changed = resumed = None
     for old in plans:
         parked = _park(old, card, status, done)
         if done:
@@ -500,11 +539,24 @@ async def _settle_lapsed(
         row = old.rows.get(card)
         if row is not None and _move(row, kind):
             await _render(adapter, key, old)
+            if row.status == _status.TASK_RUNNING:
+                resumed = old
         elif not parked:
             continue
+        elif card in old.rolling and card not in old.waiting:
+            resumed = old
         changed = old
+    if resumed is not None:
+        resumed.touched = time.monotonic()
+        _arm(adapter, key, resumed)
+        if key not in _plans and _lapsed.get(key) is plans:
+            plans.remove(resumed)
+            await _keep(adapter, key, resumed)
     if changed is not None and _lapsed.get(key) is plans:
         left = [old for old in plans if _held(old)]
+        for old in plans:
+            if old not in left:
+                _disarm(old)
         if left:
             _lapsed[key] = left
         else:
