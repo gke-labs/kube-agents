@@ -91,6 +91,21 @@ misconfigurations:
       - "k8s-operator/testing/**"
       - "tests/**"
 
+  # Ignore DS-0002, KSV-0014 and KSV-0118 on the Inspect experiment's sandbox
+  # pods and image: inspect_swe installs the harness and Inspect's sandbox tools
+  # into the pod at run time, as root, under /var/tmp and $HOME. The pods are
+  # local, per-sample and deleted after each; baking the tools into the image
+  # would let them run hardened.
+  - id: DS-0002
+    paths:
+      - "hack/inspect/**"
+  - id: KSV-0014
+    paths:
+      - "hack/inspect/**"
+  - id: KSV-0118
+    paths:
+      - "hack/inspect/**"
+
   # Ignore KSV-0046: read-only explorer ClusterRoles in sample manifests use wildcard resource read
   - id: KSV-0046
     paths:
