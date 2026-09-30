@@ -32,7 +32,8 @@ prompt: "hi! priya here, just installed you"
 
 expected_output: |
   critical requirements:
-  - One short message that greets Priya by name and introduces itself as Kage,
+  - One short message that opens "Hi there", because the API server carries no
+    Slack profile name and the typed "priya" is not one, and introduces itself as Kage,
     with no internal agent names and no architecture.
   - It says it is taking a first look at the GKE fleet and only reading, so
     nothing in the clusters changes, and that it will post what it finds in
@@ -50,12 +51,15 @@ verification_spec:
   # only wait out the timeout. Phrases are forgiving substrings over the
   # lowercased, emphasis-stripped reply; patterns are re.search over it.
 
-  - name: greets-the-user-by-name
+  # The name comes from the Slack profile only. The API server carries none, so
+  # the prompt's typed "priya" must not be used and the fallback applies.
+  - name: greets-with-the-fallback-without-a-profile-name
     role: objective
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["priya"]
+      required_phrases: ["hi there"]
+      forbidden_phrases: ["priya"]
 
   - name: says-it-is-kage
     role: objective
