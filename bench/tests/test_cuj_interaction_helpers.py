@@ -105,6 +105,9 @@ def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
         "checking why checkout-gateway is restarting.",
         "Checking spot capacity in us-central1.",
         "**checking** `checkout-gateway`.",
+        "checking why the rollout failed.",
+        "reviewing the failed rollout in prod-a.",
+        "checking the seeded fleet.",
     ):
         assert substantive_output({"output": ack}) == "", ack
         assert substantive_output({"output": f"{ack}\n\n{REPORT}"}) == REPORT, ack
@@ -123,6 +126,17 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "looking at the logs, the pod restarted 4 times.",
         "checking the rollout, 3 replicas never became ready.",
         "checking checkout-gateway; it restarted 4 times.",
+        "**Running pods:** 12.",
+        "**Scaling plan:** add two nodes in prod-a.",
+        "restarting the pod cleared it.",
+        "Restarting the pod fixed it.",
+        "Draining the node cleared the pending pods.",
+        "provisioning failed.",
+        "provisioning failed on quota.",
+        "scaling completed.",
+        "looking very good.",
+        "autoscaling kicked in at 14:02.",
+        "looking at the events, nothing stands out.",
     ):
         assert substantive_output({"output": report}) == report, report
 

@@ -31,13 +31,16 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #: ellipsis. What keeps an answer from matching is what an answer carries and
 #: a target does not:
 #:
-#: - a verdict straight after the verb: "looking good.";
-#: - a finding verb before any clause opener: "checking the events shows the
-#:   pod was evicted." (while "checking why checkout-gateway is restarting."
-#:   is still a hand-off, because "why" comes first);
-#: - a label and a value: "Running pods: 12.";
-#: - a clause after a comma: "looking at the logs, the pod restarted 4
-#:   times." (a comma-separated list of targets is still a hand-off);
+#: - before any clause opener, a verdict ("looking very good."), a finding
+#:   verb ("checking the events shows the pod was evicted.") or a past tense
+#:   that no determiner turns into an adjective ("restarting the pod cleared
+#:   it.", while "reviewing the failed rollout." is a hand-off); after a
+#:   clause opener all three are part of the target ("checking why the
+#:   rollout failed.");
+#: - a label and a value, bold or not: "Running pods: 12.";
+#: - a clause after a comma, opening with a subject or a number or carrying a
+#:   past tense: "looking at the events, nothing stands out." (a
+#:   comma-separated list of targets is still a hand-off);
 #: - an opening that is a noun or adjective, not a verb: "nothing is
 #:   restarting.", "Missing quota in us-central1."
 #:
@@ -94,6 +97,20 @@ _ACK_CLAUSE_OPENERS = frozenset(
     {
         "why", "whether", "if", "what", "how", "where", "which", "when", "who",
         "that",
+    }
+)
+#: Words that make a following "-ed" word an adjective in the target.
+_ACK_DETERMINERS = frozenset(
+    {
+        "the", "a", "an", "this", "that", "these", "those", "my", "your", "its",
+        "their", "our", "each", "every", "all", "any", "some", "no",
+    }
+)
+#: Words that open a clause after a comma, where a list would name a target.
+_ACK_CLAUSE_SUBJECTS = frozenset(
+    {
+        "the", "it", "there", "nothing", "everything", "something", "none", "i",
+        "we", "they", "this", "all", "no",
     }
 )
 _ACK_CLOSING = re.compile(r"(?:\.{1,3}|…)\Z")
@@ -242,17 +259,22 @@ def _is_progress_ack(sentence: str) -> bool:
     bare = [word.strip(_ACK_WORD_WRAPPING).rstrip(",").casefold() for word in words]
     if not _ACK_VERB.fullmatch(bare[0]) or bare[0] in _ACK_NOT_VERBS:
         return False
-    if bare[1] in _ACK_VERDICTS:
+    if any(";" in word or word.endswith(":") for word in bare):
         return False
-    if any(";" in word or word.endswith(":") for word in words):
-        return False
-    for word in bare[1:]:
+    for previous, word in zip(bare, bare[1:]):
         if word in _ACK_CLAUSE_OPENERS:
             break
-        if word in _ACK_FINDING_VERBS:
+        if word in _ACK_VERDICTS or word in _ACK_FINDING_VERBS:
+            return False
+        if word.endswith(_ACK_PAST_TENSE) and previous not in _ACK_DETERMINERS:
             return False
     if "," in body:
-        after = body.rsplit(",", 1)[1].split()
+        after = [
+            word.strip(_ACK_WORD_WRAPPING).casefold()
+            for word in body.rsplit(",", 1)[1].split()
+        ]
+        if after and after[0] in _ACK_CLAUSE_SUBJECTS:
+            return False
         if any(
             word.endswith(_ACK_PAST_TENSE) or word[:1].isdigit() for word in after
         ):
