@@ -2,7 +2,7 @@
 finished builds, read from the bucket they log to, and the notes health.py carries.
 
 * `fetch` reads the pointer, walks back to a finished build, keeps the
-  artifact when the job writes one, writes one <job>.json per job with a
+  artifact for a failed build, writes one <job>.json per job with a
   build, and nothing for a job that never ran or whose pointer is denied;
 * `assess` notes a failed build and a job whose last finished build is older
   than its stale window, keeps `since` across ticks, and names the reconcile
