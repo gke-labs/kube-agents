@@ -17,7 +17,7 @@
 }## exit 0
 
 ## 2026-09-29T15:00:43Z [zonal/endpoint] G container clusters describe upg-11b --zone us-central1-a --format=value(endpoint,location,locations)
-136.112.225.99	us-central1-a	us-central1-a
+<ENDPOINT>	us-central1-a	us-central1-a
 ## exit 0
 
 ## 2026-09-29T15:00:56Z [zonal/upgrade] G container clusters upgrade upg-11b --master --cluster-version 1.35.8-gke.1380000 --zone us-central1-a --quiet

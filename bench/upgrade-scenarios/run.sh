@@ -8,7 +8,8 @@ set -u; NN=${1:?scenario number, two digits}; TRACK=$NN; CLUSTER=${CLUSTER:-upg-
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"; . "$H/scenarios/$NN.sh"
 START_VERSION=$(newest_patch "$CHANNEL" "$START"); note cluster "scenario $NN on $CLUSTER: $CHANNEL $START_VERSION"
-G container clusters describe "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=upgrade-scenarios,scenario=$NN --quiet ${CREATE_FLAGS:-}
+G container clusters describe "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=$SCENARIO_LABEL,scenario=$NN --quiet ${CREATE_FLAGS:-}
+require_scenario_cluster
 if [ -n "${POOL_FLAGS:-}" ]; then G container node-pools describe work-pool --cluster "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$START_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --quiet ${POOL_FLAGS}; fi
 G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 ev baseline nodes K get nodes -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool'

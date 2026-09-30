@@ -4,7 +4,7 @@
 # Run as: CLUSTER=upg-07 bash hold.sh 07
 set -u; NN=${1:?scenario number}; TRACK=$NN-hold; CLUSTER=${CLUSTER:?cluster name}
 # shellcheck source-path=SCRIPTDIR source=common.sh
-. "$(dirname "$0")/common.sh"
+. "$(dirname "$0")/common.sh"; require_scenario_cluster
 G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 SCHEMA1_IMAGE=gcr.io/google_containers/busybox:1.24     # a Docker schema 1 manifest, which containerd 2.0 refuses
 CD17_VERSION=1.31.14-gke.2704000                        # the newest 1.31 patch still on containerd 1.7

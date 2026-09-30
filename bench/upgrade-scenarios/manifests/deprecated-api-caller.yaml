@@ -1,0 +1,139 @@
+# Scenario 6's planted problem: a client that still writes through
+# flowcontrol.apiserver.k8s.io/v1beta3, which Kubernetes 1.32 stops serving.
+#
+# Every ten minutes a CronJob creates or patches one harmless FlowSchema through
+# that API version, the way an old in-house tool pinned to an old client would.
+# Each write lands in the cluster's Admin Activity audit log with the label
+# k8s.io/removed-release=1.32; GKE computes a DEPRECATION_K8S_1_32_API insight
+# from those entries (Recommender API, google.container.DiagnosisInsight) and
+# pauses the cluster's automatic upgrade to 1.32 while it keeps seeing them.
+#
+# After the control plane moves to 1.32 the same job fails: the discovery call
+# for v1beta3 returns 404 and the job exits 1, which is the post-upgrade break.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: legacy-flowcontrol-tuner
+  namespace: kubeagents-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: legacy-flowcontrol-tuner
+rules:
+  - apiGroups: ["flowcontrol.apiserver.k8s.io"]
+    resources: ["flowschemas"]
+    verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: legacy-flowcontrol-tuner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: legacy-flowcontrol-tuner
+subjects:
+  - kind: ServiceAccount
+    name: legacy-flowcontrol-tuner
+    namespace: kubeagents-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: legacy-flowcontrol-tuner
+  namespace: kubeagents-system
+data:
+  tuner.py: |
+    # An "old tool": writes a FlowSchema through flowcontrol v1beta3 and says
+    # plainly when the server no longer serves that version.
+    import json, ssl, sys, time, urllib.error, urllib.request
+
+    HOST = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    TOKEN = open(f"{SA}/token").read().strip()
+    CTX = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+    UA = "legacy-flowcontrol-tuner/0.3"
+    GV = "flowcontrol.apiserver.k8s.io/v1beta3"
+    NAME = "legacy-batch-lane"
+    BASE = f"{HOST}/apis/{GV}/flowschemas"
+
+    def call(method, url, body=None, ctype="application/json"):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {TOKEN}", "User-Agent": UA,
+            "Content-Type": ctype, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, context=CTX, timeout=20) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    st, body = call("GET", f"{HOST}/version")
+    server = json.loads(body).get("gitVersion", "?") if st == 200 else "?"
+    st, body = call("GET", f"{HOST}/apis/{GV}")
+    if st != 200:
+        print(f"BROKEN {now}: server {server} no longer serves {GV} (discovery returned {st}); this tool cannot run")
+        sys.exit(1)
+    schema = {"apiVersion": GV, "kind": "FlowSchema",
+              "metadata": {"name": NAME, "annotations": {"legacy-flowcontrol-tuner/last-run": now}},
+              "spec": {"priorityLevelConfiguration": {"name": "workload-low"},
+                       "matchingPrecedence": 9000,
+                       "distinguisherMethod": {"type": "ByUser"},
+                       "rules": [{"subjects": [{"kind": "ServiceAccount", "serviceAccount": {
+                                     "name": "legacy-flowcontrol-tuner", "namespace": "kubeagents-system"}}],
+                                  "resourceRules": [{"verbs": ["*"], "apiGroups": ["flowcontrol.apiserver.k8s.io"],
+                                                     "resources": ["flowschemas"], "namespaces": ["*"]}]}]}}
+    st, body = call("GET", f"{BASE}/{NAME}")
+    if st == 404:
+        st, body = call("POST", BASE, schema)
+        verb = "created"
+    else:
+        st, body = call("PATCH", f"{BASE}/{NAME}",
+                        {"metadata": {"annotations": {"legacy-flowcontrol-tuner/last-run": now}}},
+                        "application/merge-patch+json")
+        verb = "patched"
+    ok = st in (200, 201)
+    print(f"{'ok' if ok else 'ERROR'} {now}: {verb} FlowSchema {NAME} via {GV} on server {server} (HTTP {st})")
+    if not ok:
+        print(body[:400]); sys.exit(1)
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: legacy-flowcontrol-tuner
+  namespace: kubeagents-system
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 6
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: legacy-flowcontrol-tuner
+        spec:
+          serviceAccountName: legacy-flowcontrol-tuner
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: tuner
+              image: python:3.12-slim
+              command: ["python3", "/app/tuner.py"]
+              resources:
+                requests: { cpu: 20m, memory: 32Mi }
+                limits: { memory: 64Mi }
+              volumeMounts:
+                - { name: app, mountPath: /app, readOnly: true }
+          volumes:
+            - name: app
+              configMap:
+                name: legacy-flowcontrol-tuner

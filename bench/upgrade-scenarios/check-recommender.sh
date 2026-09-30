@@ -2,7 +2,7 @@
 # Read GKE's Recommender for each zone: every DiagnosisInsight and every DiagnosisRecommender recommendation.
 # Saves the raw responses under evidence/recommender/<stamp>/ (the proof) and writes recommender.json, which maps
 # each cluster to what was published about it (results.py reads that). Workload-level insights are mapped to
-# the cluster in their resource path.
+# the cluster in their resource path; a record that names no cluster is listed, not dropped silently.
 # Insights live in the cluster's own location, so every zone a scenario cluster sat in is read, including the zones the scenario 18 GPU runs chased capacity through.
 DEFAULT_ZONES="us-central1-a us-central1-c us-east4-c us-west1-b europe-west4-b asia-southeast1-b us-east1-d europe-west1-b us-central1-b us-west1-a europe-west4-a asia-east1-a"
 P=${PROJECT:?set PROJECT to the GCP project the scenario clusters are in}; ZONES=${ZONES:-$DEFAULT_ZONES}; H=$(cd "$(dirname "$0")" && pwd)
@@ -15,15 +15,17 @@ done
 python3 - "$OUT" "$H/recommender.json" <<'PY'
 import glob, json, re, sys, collections
 out_dir, dest = sys.argv[1], sys.argv[2]
-seen = collections.defaultdict(dict); newest = ""
+seen = collections.defaultdict(dict); newest = ""; unmatched = []
 def cluster_of(path):
     m = re.search(r"/clusters/([^/]+)", path or ""); return m.group(1) if m else None
 for kind, pattern, subkey, targets in (("insight", "insights-*.json", "insightSubtype", lambda r: r.get("targetResources", [])),
                                      ("recommendation", "recommendations-*.json", "recommenderSubtype",
-                                      lambda r: [o.get("resource", "") for g in r.get("content", {}).get("operationGroups", []) for o in g.get("operations", [])])):
+                                      lambda r: r.get("targetResources", []) + [o.get("resource", "") for g in r.get("content", {}).get("operationGroups", []) for o in g.get("operations", [])])):
     for r in (r for f in sorted(glob.glob(f"{out_dir}/{pattern}")) for r in json.load(open(f))):
         newest = max(newest, r.get("lastRefreshTime", ""))
-        for c in {cluster_of(t) for t in targets(r)} - {None}:
+        clusters = {cluster_of(t) for t in targets(r)} - {None}
+        if not clusters: unmatched.append(f"{kind} {r.get(subkey, '?')} {r.get('name', '')}")
+        for c in clusters:
             key = (kind, r[subkey])
             prev = seen[c].get(key)
             if not prev or r.get("lastRefreshTime", "") > prev["lastRefreshTime"]:
@@ -33,7 +35,10 @@ for kind, pattern, subkey, targets in (("insight", "insights-*.json", "insightSu
 zones = sorted(re.sub(r"^insights-|\.json$", "", f.rsplit("/", 1)[-1]) for f in glob.glob(f"{out_dir}/insights-*.json"))
 result = {"read_at": out_dir.rsplit("/", 1)[-1], "newest_refresh": newest, "raw": out_dir.split("/evidence/", 1)[-1], "zones": zones,
           "clusters": {c: sorted(v.values(), key=lambda x: (x["subtype"], x["kind"])) for c, v in sorted(seen.items())}}
-json.dump(result, open(dest, "w"), indent=1)
+# recommender.json is checked in, so the project number in every resource name becomes a placeholder here.
+open(dest, "w").write(re.sub(r"projects/[0-9]+/", "projects/<PROJECT_NUMBER>/", json.dumps(result, indent=1)) + "\n")
 print("read at", result["read_at"], "| newest refresh:", newest)
 for c, items in result["clusters"].items(): print(f"{c:22s}", sorted({i["subtype"] for i in items}))
+print(len(unmatched), "records named no cluster and are in no row:")
+for u in unmatched: print("  ", u)
 PY

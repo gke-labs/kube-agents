@@ -28,8 +28,8 @@ work-pool     1.31.14-gke.2759000  RUNNING
 
 ## 2026-09-29T14:44:05Z [skew/nodes] K get nodes -o wide
 NAME                                    STATUS   ROLES    AGE     VERSION                INTERNAL-IP    EXTERNAL-IP     OS-IMAGE                             KERNEL-VERSION   CONTAINER-RUNTIME
-gke-upg-10-default-pool-5cfba1bf-h58k   Ready    <none>   8m57s   v1.34.11-gke.1044000   10.128.0.138   34.16.36.216    Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
-gke-upg-10-work-pool-6fb8c002-0fdz      Ready    <none>   47m     v1.31.14-gke.2759000   10.128.0.94    35.192.76.244   Container-Optimized OS from Google   6.6.153+         containerd://2.0.10
+gke-upg-10-default-pool-5cfba1bf-h58k   Ready    <none>   8m57s   v1.34.11-gke.1044000   10.128.0.138   <EXTERNAL_IP>    Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
+gke-upg-10-work-pool-6fb8c002-0fdz      Ready    <none>   47m     v1.31.14-gke.2759000   10.128.0.94    <EXTERNAL_IP>   Container-Optimized OS from Google   6.6.153+         containerd://2.0.10
 ## exit 0
 
 ## 2026-09-29T14:44:05Z [skew/logs-through-kubelet] K -n scen logs deploy/steady --tail=1

@@ -150,8 +150,9 @@ The other files named below were recorded in the same runs and are not in the re
     re-run on 1.35. The add-on half (an add-on off its vendor matrix) was not
     planted, and kubectl's skew warning was not captured.
 11. A probe read and wrote every two to four seconds, from 10 seconds before the zonal control-plane upgrade to
-    30 seconds after it: 228 samples, about 211 inside the operation, all up. The file's `samples=229` also
-    counts its header line. The read-only run on `upg-11` saw 225 up. No gap was measurable.
+    30 seconds after it: 228 samples, about 211 inside the operation, all up; every sample is in
+    `11b/zonal-probe.txt`. The summary's `samples=229` also counts that file's header line. The read-only run
+    on `upg-11` saw 225 up. No gap was measurable.
 12. A pod selected a label set by hand with `kubectl`. The rebuilt node did not carry it, and the pod stayed
     Pending after GKE reported DONE. GKE form: the run tested a label the node pool does not declare, which
     a rebuild drops. Whether 1.35 still sets every standard label was not checked.
@@ -245,9 +246,10 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 
 `run.sh NN` does the following:
 
-1. Creates the cluster at the minor the scenario needs and, when the scenario sets `POOL_FLAGS`, adds a
-   `work-pool`.
-2. Plants the defect and records the before-state.
+1. Creates the cluster at the minor the scenario needs, stops unless the cluster carries the campaign's label,
+   and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
+2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
+   every other scenario writes its manifests inline.
 3. Breaks it. Twelve scenarios upgrade the control plane and then a node pool; scenario 13 upgrades only a
    node pool (a patch inside 1.31). Scenarios 05, 06, 09, 10 and 11 upgrade only the control plane. Scenarios 14 and 15 show the symptom with no upgrade; 14c then asks for
    the pool upgrade and runs the migration GKE demands.
@@ -256,7 +258,8 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code
 and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. The
 availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly. A re-run adds new files
-beside the checked-in ones; commit only a file a table row quotes, after replacing the project ID and number.
+beside the checked-in ones; commit only a file a table row or the catalogue quotes, after replacing the project
+ID and number and any public IP address.
 Redirect the console to `logs/<track>.log` if you want it; `logs/` is gitignored.
 
 Verdicts were judged by hand from those files. Each one then went to an independent reviewer told to refute it,
@@ -376,6 +379,7 @@ bash run.sh 01                                    # scenario 1 on cluster upg-01
 ZONE=us-central1-c CLUSTER=upg-XX bash run.sh NN  # run a scenario in another zone, or under another name
 CLUSTER=upg-XX bash hold.sh NN                    # re-plant a hazard in its before-state
 bash check-recommender.sh && python3 results.py   # fresh Recommender read, every zone used; re-render the table
+npx prettier@3.9.6 --write README.md              # re-align the table, as the repository's prettier check expects
 ```
 
 `check-recommender.sh` saves the raw responses under `evidence/recommender/<stamp>/`, which is gitignored
@@ -386,7 +390,9 @@ refresh times `results.py` reads, with the number replaced by a placeholder.
 During this campaign, several `gcloud container clusters create` and `get-credentials` calls wrote the shared
 `~/.kube/config` at once and corrupted it. That blanked the reads of the runs above for about three minutes.
 
-Everything the campaign created carries the label `purpose=upgrade-scenarios`:
+Every cluster the campaign created carries the label `purpose=upgrade-scenarios`. `run.sh` sets it at creation,
+and `run.sh`, `hold.sh` and `compat-probe.sh` refuse a cluster without it, so a mistyped `CLUSTER=` cannot plant
+a defect in, or upgrade, a cluster the campaign does not own:
 
 ```bash
 gcloud container clusters list --project "$PROJECT" --filter='resourceLabels.purpose=upgrade-scenarios' --format='value(name,location)'

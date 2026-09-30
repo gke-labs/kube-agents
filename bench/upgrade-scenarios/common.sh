@@ -7,6 +7,10 @@ H=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); EVID="$H/evidence/$TRACK"; mkdi
 CTX="gke_${PROJECT}_${ZONE}_${CLUSTER}"
 # One kubeconfig file per cluster: parallel gcloud writers racing on the shared ~/.kube/config corrupted it once.
 KCFG_DIR="$H/.kubeconfigs"; mkdir -p "$KCFG_DIR"; export KUBECONFIG="$KCFG_DIR/$CLUSTER"
+# run.sh labels every cluster it creates purpose=$SCENARIO_LABEL; every script that plants or upgrades refuses any other.
+SCENARIO_LABEL=upgrade-scenarios
+require_scenario_cluster(){ local p; p=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.purpose)' 2>/dev/null)
+  [ "$p" = "$SCENARIO_LABEL" ] || { echo "refusing: $CLUSTER in $ZONE is not labelled purpose=$SCENARIO_LABEL (label: '$p')" >&2; exit 1; }; }
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 in_days(){ date -u -v+"$1"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "+$1 days" +%Y-%m-%dT%H:%M:%SZ; }   # BSD date, then GNU
 ev(){ local sc=$1 st=$2; shift 2; local f="$EVID/$sc.txt"; { echo; echo "## $(ts) [$sc/$st] $*"; "$@" 2>&1; echo "## exit $?"; } | tee -a "$f"; }
@@ -26,13 +30,15 @@ await_op(){ local t=0; while [ -z "$(ops_running)" ] && [ $t -lt $OP_APPEAR_TIME
 # Service has already dropped it, so "serving" is Ready=True with an empty deletion stamp.
 poll_avail(){ local sc=$1 ns=$2 sel=$3; local f="$EVID/$sc-availability.txt"; echo "# $(ts) poll start $ns $sel" >>"$f"; await_op
   while [ -n "$(ops_running)" ]; do echo "$(ts) $(K -n "$ns" get pods -l "$sel" -o jsonpath='{range .items[*]}{.spec.nodeName}/{.status.phase}/{.status.conditions[?(@.type=="Ready")].status}/{.metadata.deletionTimestamp} {end}' 2>&1)" >>"$f"; sleep 10; done; echo "# $(ts) poll end" >>"$f"; }
-# poll_api <scenario>: every 5 s while an operation runs, record whether the API server answers (entry 11).
-poll_api(){ local sc=$1; local f="$EVID/$sc-api.txt"; echo "# $(ts) api poll start" >>"$f"; await_op
-  while [ -n "$(ops_running)" ]; do if K get --raw /version >/dev/null 2>&1; then echo "$(ts) up" >>"$f"; else echo "$(ts) DOWN" >>"$f"; fi; sleep 5; done; echo "# $(ts) api poll end" >>"$f"; }
+# poll_api <scenario> <stop-file>: every 5 s until <stop-file> exists, record whether the API server answers (entry 11).
+# upgrade_master creates the stop file once its blocking upgrade call returns, so another operation on the cluster
+# can neither end the poll before the control-plane upgrade nor keep it running after.
+poll_api(){ local sc=$1 stop=$2; local f="$EVID/$sc-api.txt"; echo "# $(ts) api poll start" >>"$f"
+  until [ -e "$stop" ]; do if K get --raw /version >/dev/null 2>&1; then echo "$(ts) up" >>"$f"; else echo "$(ts) DOWN" >>"$f"; fi; sleep 5; done; echo "# $(ts) api poll end" >>"$f"; }
 BUSY_RETRIES=5; BUSY_WAIT=30
 # GKE refuses an upgrade while any other operation runs on the cluster ("incompatible operation"): wait for it, retry.
 retry_busy(){ local f=$1 i; shift; for i in $(seq 1 $BUSY_RETRIES); do wait_ops; "$@"; tail -4 "$f" | grep -q "incompatible operation" || return 0; note upgrade "refused while another operation ran; retry $i"; sleep $BUSY_WAIT; done; }
-upgrade_master(){ local v=$1; note upgrade "master -> $v"; poll_api zonal-api & local p=$!; retry_busy "$EVID/upgrade.txt" ev upgrade master-$v G container clusters upgrade "$CLUSTER" --master --cluster-version "$v" --zone "$ZONE" --quiet; wait $p; wait_ops; ev upgrade master-$v-version G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; }
+upgrade_master(){ local v=$1 stop="$KCFG_DIR/$CLUSTER.master-done"; rm -f "$stop"; note upgrade "master -> $v"; poll_api zonal-api "$stop" & local p=$!; retry_busy "$EVID/upgrade.txt" ev upgrade master-$v G container clusters upgrade "$CLUSTER" --master --cluster-version "$v" --zone "$ZONE" --quiet; touch "$stop"; wait $p; rm -f "$stop"; wait_ops; ev upgrade master-$v-version G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; }
 upgrade_pool(){ local pool=$1 v=$2; shift 2; note upgrade "pool $pool -> $v"; for sc_ns_sel in "$@"; do IFS=: read -r sc ns sel <<<"$sc_ns_sel"; poll_avail "$sc" "$ns" "$sel" & done; retry_busy "$EVID/upgrade.txt" ev upgrade pool-$pool-$v G container clusters upgrade "$CLUSTER" --node-pool "$pool" --cluster-version "$v" --zone "$ZONE" --quiet --async; sleep 20; wait_ops; wait; ev upgrade pool-$pool-$v-nodes K get nodes -o wide; }
 # --- shared plants -------------------------------------------------------------------------------
 pause_deploy(){ # pause_deploy <name> <replicas> <pod-spec placement line, indented 6>; the default pins to the work pool

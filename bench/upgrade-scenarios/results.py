@@ -61,14 +61,17 @@ SCENARIOS = {
 }
 def main():
     rec_path = f"{H}/{REC_FILE}"
-    rec = json.load(open(rec_path)) if os.path.exists(rec_path) else {"clusters": {}}
+    if not os.path.exists(rec_path):
+        print(f"ERROR {REC_FILE} missing: run check-recommender.sh first", file=sys.stderr); return 1
+    rec = json.load(open(rec_path))
     published = {c: {i["subtype"] for i in items} for c, items in rec.get("clusters", {}).items()}
     rows = ["| # | Failure | Reproduced? | Proof (evidence file: quoted line) | GKE Recommender check for it | Published on the clusters carrying it | Caught? |",
             "| --- | --- | --- | --- | --- | --- | --- |"]
     caught = documented = 0; errors = []; csv_rows = []
     for n, (title, verdict, efile, quote, clusters, subtypes) in SCENARIOS.items():
         epath = f"{H}/{EVIDENCE_DIR}/{efile}"
-        text = open(epath).read() if os.path.exists(epath) else ""
+        if not os.path.exists(epath): errors.append(f"{n}: evidence file missing: {efile}"); continue
+        text = open(epath).read()
         if quote and quote not in text: errors.append(f"{n}: quote not found in {efile}")
         proof = f"`{efile}`: {code(quote[:QUOTE_MAX].replace(chr(9), ' '))}" if quote else f"`{efile}`"
         hits = sorted({s for c in clusters for s in published.get(c, set()) if s in subtypes})
@@ -99,7 +102,9 @@ def main():
         return 1
     table = "\n".join([summary, "", *rows, *every])
     path = f"{H}/{DOC}"; doc = open(path).read()
-    doc = re.sub(re.escape(BEGIN) + ".*?" + re.escape(END), lambda _: f"{BEGIN}\n{table}\n{END}", doc, flags=re.S)
+    doc, count = re.subn(re.escape(BEGIN) + ".*?" + re.escape(END), lambda _: f"{BEGIN}\n{table}\n{END}", doc, flags=re.S)
+    if count != 1:
+        print(f"ERROR {DOC} has {count} generated regions, expected 1", file=sys.stderr); return 1
     open(path, "w").write(doc); print(summary)
     with open(f"{H}/{CSV_FILE}", "w", newline="") as f:
         w = csv.writer(f, lineterminator="\n"); w.writerow(CSV_HEADER); w.writerows(csv_rows)

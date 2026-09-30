@@ -41,8 +41,8 @@ No resources found in kube-system namespace.
 
 ## 2026-09-29T14:59:34Z [dataplane/nodes] K get nodes -o wide
 NAME                                     STATUS   ROLES    AGE     VERSION                INTERNAL-IP    EXTERNAL-IP     OS-IMAGE                             KERNEL-VERSION   CONTAINER-RUNTIME
-gke-upg-16b-default-pool-33088bb0-l342   Ready    <none>   29m     v1.34.11-gke.1056000   10.128.0.131   34.16.67.72     Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
-gke-upg-16b-work-pool-3b947e45-p6m9      Ready    <none>   5m51s   v1.35.8-gke.1380000    10.128.0.30    34.136.32.120   Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
+gke-upg-16b-default-pool-33088bb0-l342   Ready    <none>   29m     v1.34.11-gke.1056000   10.128.0.131   <EXTERNAL_IP>     Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
+gke-upg-16b-work-pool-3b947e45-p6m9      Ready    <none>   5m51s   v1.35.8-gke.1380000    10.128.0.30    <EXTERNAL_IP>   Container-Optimized OS from Google   6.12.94+         containerd://2.2.7
 ## exit 0
 
 ## 2026-09-29T14:59:35Z [dataplane/calico-after] calico
