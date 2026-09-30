@@ -73,6 +73,9 @@ SUGGESTED_PROMPTS = (
     "which clusters are behind their release channel?",
 )
 
+#: Upstream's cap on ``bot_name`` wherever the manifest prints it.
+NAME_MAX = 35
+
 #: The helper both files gain. Its name is the guard against a second run.
 FLAG_HELPER = "_kage_slack_ux_on"
 BUILD_MARKER = f"def {FLAG_HELPER}("
@@ -96,7 +99,7 @@ AGENT_DESCRIPTION_ANCHOR = '''\
 AGENT_DESCRIPTION = f'''\
 {AGENT_DESCRIPTION_ANCHOR}\
         if {FLAG_HELPER}():
-            features["agent_view"]["agent_description"] = f"Chat with {{bot_name[:35]}} in Slack Messages."
+            features["agent_view"]["agent_description"] = f"Chat with {{bot_name[:{NAME_MAX}]}} in Slack Messages."
 '''
 
 PROMPTS_ANCHOR = '''\
