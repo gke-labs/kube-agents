@@ -277,11 +277,23 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.parse_triage(report)
         self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
 
-    def test_a_stray_heading_between_options_keeps_the_reply(self):
+    def test_a_stray_heading_between_options_still_shows_every_option(self):
         for cut in ("# undo it with kubectl rollout undo\n", "````\n```\n# undo\n```\n````\n"):
             with self.subTest(cut=cut):
                 report = REPORT.replace("- **Option B", cut + "- **Option B")
-                self.assertIsNone(runtime.parse_triage(report))
+                self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
+
+    def test_a_stray_heading_after_the_options_keeps_links_and_the_recommendation(self):
+        triage = runtime.parse_triage(REPORT.replace("- ✅ **Recommended", "# see the runbook\n- ✅ **Recommended"))
+        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual([label for label, _url in triage["links"]], ["GKE Workloads", "Cloud Logs"])
+
+    def test_a_link_emoji_inside_prose_is_not_the_links_line(self):
+        report = REPORT.replace(
+            "from the GitOps repo.", "from the GitOps repo per 🔗 [the runbook](https://example.com/runbook)."
+        )
+        triage = runtime.parse_triage(report)
+        self.assertEqual([label for label, _url in triage["links"]], ["GKE Workloads", "Cloud Logs"])
 
     def test_two_what_to_do_sections_keep_the_reply(self):
         second = "\n## What to do (cluster B)\n\n- **Option C (Drain the node):** moves the pods.\n"

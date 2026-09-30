@@ -92,8 +92,8 @@ TITLE = r"\(((?:[^()\n]|\([^()\n]*\))+)\)"
 OPTION_LINE = re.compile(r"^\s*[-*]\s+[*_]*Option ([A-Z])\s*" + TITLE)
 #: The single-fix bullet: ``- **Proposed fix (<title>):** ...``.
 PROPOSED_FIX_LINE = re.compile(r"^\s*[-*]\s+[*_]*Proposed fix\s*" + TITLE)
-#: The report's links line; links elsewhere in the prose stay in the fold only.
-LINKS_MARKER = "🔗"
+#: The report's links line, 🔗 first; links elsewhere in the prose stay in the fold only.
+LINKS_LINE = re.compile(r"^[^\w\n]*🔗")
 #: Any option the section names, parsed or not.
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
@@ -160,10 +160,10 @@ def parse_triage(report: str) -> dict | None:
     if len(starts) > 1:
         # Buttons from one section under a fold showing both would misstate the report.
         return None
-    # A stray `#` line can cut "What to do" short; options named after the cut still count.
+    # "What to do" runs to the end of the report, so a stray `#` line cannot cut it short, and a
+    # fenced block may quote the option shape, so only prose lines count.
     rest = "\n".join(body for _heading, body in sections[starts[0]:]) if starts else ""
-    # A fenced block may quote the option shape; only prose lines count.
-    lines = _unfenced(_section(sections, WHAT_TO_DO))
+    lines = _unfenced(rest)
     what_to_do = "\n".join(lines)
     choices: list[tuple[str, bool]] = []
     recommended = RECOMMENDED.search(what_to_do)
@@ -175,7 +175,7 @@ def parse_triage(report: str) -> dict | None:
             seen.add(letter)
             label = OPTION_LABEL.format(letter=letter, title=_presenter._plain(option.group(2)))
             choices.append((label, bool(recommended) and recommended.group(1) == letter))
-    if not set(OPTION_NAMED.findall("\n".join(_unfenced(rest)))) <= seen:
+    if not set(OPTION_NAMED.findall(what_to_do)) <= seen:
         # A button row missing an option the report offers would misstate it.
         return None
     if not choices:
@@ -190,7 +190,7 @@ def parse_triage(report: str) -> dict | None:
     return {
         "headline": headline,
         "choices": choices,
-        "links": [link for line in lines if LINKS_MARKER in line for link in MD_LINK.findall(line)],
+        "links": [link for line in lines if LINKS_LINE.match(line) for link in MD_LINK.findall(line)],
         "fold_title": FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE,
     }
 

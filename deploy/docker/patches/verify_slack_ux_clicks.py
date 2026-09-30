@@ -147,8 +147,8 @@ def _method_args(tree: ast.Module, member: ast.AST) -> ast.arguments | None:
 def _accepts(args: ast.arguments, positional: int, keywords: tuple[str, ...]) -> bool:
     """Whether a method with ``args`` accepts ``self`` plus the given call."""
     params = [a.arg for a in [*args.posonlyargs, *args.args]][1:]
-    required = len(params) - len(args.defaults)
-    if positional < required or (positional > len(params) and args.vararg is None):
+    required = params[: len(params) - len(args.defaults)]
+    if any(p not in keywords for p in required[positional:]) or (positional > len(params) and args.vararg is None):
         return False
     named = set(params[positional:]) | {a.arg for a in args.kwonlyargs}
     if args.kwarg is None and not set(keywords) <= named:
@@ -181,6 +181,8 @@ def check_members(tree: ast.Module) -> None:
     positional = tuple(a.arg for a in [*begin.args.posonlyargs, *begin.args.args])
     if positional != BEGIN_POSITIONAL:
         raise _fail(f"{BEGIN_INTERACTION} takes {positional!r}, slack_ux_clicks passes {BEGIN_POSITIONAL!r}")
+    if not _accepts(begin.args, len(BEGIN_POSITIONAL) - 1, ()):
+        raise _fail(f"{BEGIN_INTERACTION} requires a keyword argument slack_ux_clicks does not pass")
     returned = [
         tuple(e.id if isinstance(e, ast.Name) else ast.unparse(e) for e in n.value.elts)
         for n in ast.walk(begin)

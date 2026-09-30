@@ -9,6 +9,7 @@ they must be identical, which is the flag-off identity for this surface. The
 runtime module is driven with a stub adapter.
 """
 
+import ast
 import asyncio
 import importlib
 import os
@@ -191,6 +192,7 @@ class ApplierTest(unittest.TestCase):
             (returns, returns + ", None", "returns"),
             ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, *, team=None)",
              "_get_client no longer accepts"),
+            ("*, team_scoped=True)", "*, team_scoped)", "_begin_interaction requires a keyword"),
             ("def _handle_slack_message(self, event, payload=None)",
              "def _handle_slack_message(self, event, payload)", "_handle_slack_message no longer accepts"),
             ('_slack_disable_dms = _flag_getter("disable_dms")', "_slack_disable_dms = property(bool)",
@@ -204,6 +206,11 @@ class ApplierTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     verifier.main(self.root.dir)
                 self.assertIn(named, str(caught.exception))
+
+    def test_a_required_parameter_the_runtime_passes_by_keyword_is_accepted(self):
+        args = ast.parse("def _get_client(self, chat_id, team_id): pass").body[0].args
+        self.assertTrue(verifier._accepts(args, 1, ("team_id",)))
+        self.assertFalse(verifier._accepts(args, 1, ()))
 
 
 class FlagOffIdentityTest(unittest.TestCase):
