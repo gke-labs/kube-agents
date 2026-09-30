@@ -49,7 +49,14 @@ _AUDIT_REPORT_SYMBOLS = (
     "audit_declarable_checks",
     "_declaration_key",
     "DECLARATION_CLUSTER_FIELD",
+    "read_intent_paths",
+    "INTENT_FILE",
 )
+# The contents API answers `encoding: "none"` with an empty `content` for a
+# file over its inline limit (1 MiB); the raw media type returns the body
+# whole, and the audit reads the file whole from its clone.
+GITHUB_CONTENT_ENCODING_NONE = "none"
+GITHUB_RAW_MEDIA_TYPE = "application/vnd.github.raw+json"
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
 GITOPS_REPO_ORG = "gke-agentic"
 GITOPS_REPO_SUFFIX = "-infra"
@@ -2463,8 +2470,23 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         return CheckResult(name, False, f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")
     try:
         payload = _load_json(out)
-        body = base64.b64decode(payload.get("content") or "").decode("utf-8")
         sha = str(payload.get("sha") or "")
+        if payload.get("encoding") == GITHUB_CONTENT_ENCODING_NONE:
+            # Over the inline limit: the metadata carries no body. Read it the
+            # way the audit does, whole, rather than parse an empty string and
+            # tell the operator to overwrite a note the audit would have joined.
+            rc, raw, err = run_cmd(["gh", "api", "-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
+            if rc != 0:
+                return CheckResult(
+                    name,
+                    True,
+                    "Not checked",
+                    warnings=[Unread(f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} is over the contents API's inline limit and the raw read failed: {(err or '').strip()}")],
+                    read=False,
+                )
+            body = raw
+        else:
+            body = base64.b64decode(payload.get("content") or "").decode("utf-8")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
     # Two failures, two verdicts. The parser failing to LOAD -- no PyYAML, the
@@ -2496,7 +2518,43 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audit reads no declaration from it: "
             f"{problem}. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
         )
-    return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration")
+    # The audit reads notes only under the paths `.kube-agents/intent.yaml`
+    # names, when the repository has one; a note outside that bound is never
+    # read, and a check that parsed it in isolation would pass a project the
+    # case fails on. The bound is read with the audit's own reader, over a
+    # copy of the one file, so its rules (a bad path discards the bound, the
+    # whole tree is searched then) are the audit's.
+    rc, intent_out, err = run_cmd(["gh", "api", "-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}", f"repos/{repo_slug}/contents/{audit.INTENT_FILE}"])
+    if rc != 0 and not _GITHUB_NOT_FOUND.search(err or ""):
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: {audit.INTENT_FILE} in {repo_slug} could not be read, so whether it bounds the search away from the note is unknown: {(err or '').strip()}")],
+            read=False,
+        )
+    if rc == 0:
+        import contextlib
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp)
+            intent_file = tree / audit.INTENT_FILE
+            intent_file.parent.mkdir(parents=True)
+            intent_file.write_text(intent_out, encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()):
+                prefixes = audit.read_intent_paths(tree, repo_slug)
+        if prefixes and not any(GITOPS_INTENT_NOTE_PATH.startswith(p.rstrip("/") + "/") for p in prefixes):
+            return CheckResult(
+                name,
+                False,
+                f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
+                f"the audit's search to {', '.join(prefixes)}, so the audit never reads the note and "
+                f"obtainability-declared-intent-no-finding fails on this project. Add `knowledge/` to that file's "
+                f"`paths`, or move the note under one of them.",
+            )
+    return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
 
 
 def check_github_repo_and_app(

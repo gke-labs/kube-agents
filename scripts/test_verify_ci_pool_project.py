@@ -1458,13 +1458,55 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
     def _contents(body: str, sha: str = "abc") -> str:
         return json.dumps({"sha": sha, "path": "knowledge/notification-relay-no-pdb.md", "content": base64.b64encode(body.encode()).decode()})
 
+    _INTENT_ABSENT = _fail("gh: Not Found (HTTP 404)")
+
     def test_a_repository_with_the_note_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))]
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), self._INTENT_ABSENT]
             result = checker.check_gitops_declaration("kube-agents-evals-3")
         self.assertTrue(result.passed, result.message)
         self.assertEqual([], result.warnings)
         self.assertIn(f"repos/gke-agentic/kube-agents-evals-3-infra/contents/{self._NOTE_PATH}", " ".join(run.call_args_list[0].args[0]))
+        # The second read is the intent file, whose 404 means the whole tree is searched.
+        self.assertIn("/contents/.kube-agents/intent.yaml", " ".join(run.call_args_list[1].args[0]))
+
+    def test_an_intent_file_that_leaves_the_note_outside_its_paths_fails(self):
+        # The audit reads notes only under the intent file's paths; a note the
+        # verifier can fetch by path is one the audit never reads then.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        for paths, expected_pass in (("paths: [provisioning/]\n", False), ("paths: [knowledge/]\n", True), ("paths: [knowledge]\n", True), ("not: yaml: [\n", True)):
+            with self.subTest(paths), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(good)), _ok(paths)]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertEqual(expected_pass, result.passed, (paths, result.message))
+                if not expected_pass:
+                    self.assertIn("bounds the audit's search to provisioning", result.message)
+                    self.assertNotIn("-f sha=", result.message)
+
+    def test_an_unreadable_intent_file_is_unverified(self):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _fail("gh: HTTP 502")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("intent.yaml", result.warnings[0])
+
+    def test_a_note_over_the_inline_limit_is_read_raw(self):
+        # The contents API returns encoding "none" and no content for a file
+        # over 1 MiB; the check reads the body raw rather than parse "" and
+        # print a replace command over a note the audit would have joined.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        large = json.dumps({"sha": "abc", "path": self._NOTE_PATH, "encoding": "none", "content": "", "size": 2_000_000})
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), _ok(good), self._INTENT_ABSENT]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed, result.message)
+        self.assertIn("application/vnd.github.raw", " ".join(run.call_args_list[1].args[0]))
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(large), _fail("gh: HTTP 502")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
 
     def test_a_missing_note_fails_naming_both_readings_and_the_seed_command(self):
         # A project registered before the note existed: provisioning is not
@@ -1605,7 +1647,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         }
         for label, body in accepted.items():
             with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
-                run.side_effect = [_ok(self._contents(body))]
+                run.side_effect = [_ok(self._contents(body)), self._INTENT_ABSENT]
                 result = checker.check_gitops_declaration("kube-agents-evals-3")
                 self.assertTrue(result.passed, label)
                 # Not the unverified branch: a parser exception on this shape

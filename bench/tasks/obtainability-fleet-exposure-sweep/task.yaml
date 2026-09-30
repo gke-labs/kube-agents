@@ -25,10 +25,10 @@
 # notification-relay in seeded-intent (role declared-no-pdb-workload), is
 # declared on purpose by knowledge/notification-relay-no-pdb.md in the pool
 # project's GitOps repository, and the SOP's declared-intent step lists it
-# under Declared intent rather than as exposure. A sweep that names it as
-# exposed has skipped that step; the objective below requires the reply to
-# cite the knowledge/ note it set aside, so the step is graded here too and
-# not only by obtainability-declared-intent-no-finding.
+# under Declared intent rather than as exposure. The objective below holds
+# the reply to naming the note it set aside, the one trace of the step a
+# phrase check can grade; whether the agent then drew the right line is the
+# judged report's, and obtainability-declared-intent-no-finding's, question.
 # Isolation class: read-only.
 # Eligible tier: presubmit once admitted; nightly since 2026-09-22.
 id: obtainability-fleet-exposure-sweep
@@ -108,11 +108,13 @@ verification_spec:
     check:
       # The step the prompt adds -- consult the repositories and set the
       # declared workload aside -- graded on the trace the prompt asks for:
-      # the file that declares the workload it set aside. A reply that reached
-      # checkout-gateway without reading the note cannot name the knowledge/
-      # file, and one that lists both workloads as exposed did not do the step.
+      # the seeded file that declares the workload it set aside. A substring
+      # cannot tell "set aside" from "read and still reported exposed"; what
+      # it can hold the reply to is that the note was read and named, which a
+      # sweep that never consulted the repositories cannot do. The judged
+      # report is where the rest of the step is weighed.
       type: report_contains
-      required_phrases: ["knowledge/"]
+      required_phrases: ["knowledge/notification-relay-no-pdb.md"]
   - name: the-sweep-locates-the-finding
     role: objective
     mode: assert
