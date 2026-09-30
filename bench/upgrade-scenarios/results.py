@@ -102,9 +102,12 @@ def main():
         return 1
     table = "\n".join([summary, "", *rows, *every])
     path = f"{H}/{DOC}"; doc = open(path).read()
-    doc, count = re.subn(re.escape(BEGIN) + ".*?" + re.escape(END), lambda _: f"{BEGIN}\n{table}\n{END}", doc, flags=re.S)
-    if count != 1:
-        print(f"ERROR {DOC} has {count} generated regions, expected 1", file=sys.stderr); return 1
+    # Count the markers themselves: a stray second BEGIN or END still yields one matched region, and the substitution
+    # would then delete the stray BEGIN and everything between the two, or leave the stray END below the table.
+    b, e = doc.count(BEGIN), doc.count(END)
+    if (b, e) != (1, 1) or doc.index(BEGIN) > doc.index(END):
+        print(f"ERROR {DOC} has {b} BEGIN and {e} END markers, expected one pair in order; nothing written", file=sys.stderr); return 1
+    doc = re.sub(re.escape(BEGIN) + ".*?" + re.escape(END), lambda _: f"{BEGIN}\n{table}\n{END}", doc, flags=re.S)
     open(path, "w").write(doc); print(summary)
     with open(f"{H}/{CSV_FILE}", "w", newline="") as f:
         w = csv.writer(f, lineterminator="\n"); w.writerow(CSV_HEADER); w.writerows(csv_rows)

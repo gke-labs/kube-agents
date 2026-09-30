@@ -95,7 +95,9 @@ charts a GitOps repository declares, `image` is what a container image contains 
 CUDA build or entrypoint), `notes` is the target version's release notes, node image notes and
 vendor support matrices, and `node` is a read-only look inside a node or container. None of the
 entries needs application source code. Each entry links to its own section, which names the
-evidence; an entry with no public incident and no seeded-fleet fixture says so there.
+evidence: a public incident, the platform documentation that states the behaviour, or a
+seeded-fleet fixture. An entry resting on documentation alone says that no public incident is
+verified.
 
 During the drain and reschedule:
 

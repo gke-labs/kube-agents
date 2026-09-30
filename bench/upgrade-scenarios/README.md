@@ -296,7 +296,9 @@ The Recommender side has two parts:
   `google.container.DiagnosisRecommender` recommendation in each zone. It saves the raw JSON under
   `evidence/recommender/<stamp>/`, and writes `recommender.json`, which maps each insight and recommendation to
   the cluster in its resource path (for a recommendation, its `targetResources` or its operations). It prints any
-  record that names no cluster rather than dropping it, and replaces the project ID and number in what it writes.
+  record that names no cluster rather than dropping it, and replaces the project ID and number in every insight name
+  and description it writes; a cluster whose own name contains them is written as it is, so the table can still match
+  it, and the script says so.
 
 A scenario counts as **caught** when an insight subtype that GKE documents for that hazard was published on a
 cluster carrying the hazard. An unrelated insight on the same cluster does not count. Both catches so far came

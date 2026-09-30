@@ -17,6 +17,13 @@ done
 python3 - "$OUT" "$H/recommender.json" "$P" "$PROJECT_NUMBER" <<'PY'
 import glob, json, re, sys, collections
 out_dir, dest, project_id, project_number = sys.argv[1:5]
+# recommender.json is checked in, so the project ID and number become placeholders in the fields that carry them
+# (resource names, service-account addresses, console links in a description). Cluster names are the keys results.py
+# matches on and are written as they are; a cluster whose own name contains the project is reported at the end.
+def scrub(s):
+    for value, placeholder in ((project_number, "<PROJECT_NUMBER>"), (project_id, "<PROJECT_ID>")):
+        if value: s = s.replace(value, placeholder)
+    return s
 seen = collections.defaultdict(dict); newest = ""; unmatched = []
 def cluster_of(path):
     m = re.search(r"/clusters/([^/]+)", path or ""); return m.group(1) if m else None
@@ -32,19 +39,16 @@ for kind, pattern, subkey, targets in (("insight", "insights-*.json", "insightSu
             prev = seen[c].get(key)
             if not prev or r.get("lastRefreshTime", "") > prev["lastRefreshTime"]:
                 seen[c][key] = {"kind": kind, "subtype": r.get(subkey, "?"), "lastRefreshTime": r.get("lastRefreshTime", ""),
-                                "state": r.get("stateInfo", {}).get("state", ""), "description": r.get("description", "")[:200],
-                                "name": r.get("name", "")}
+                                "state": r.get("stateInfo", {}).get("state", ""), "description": scrub(r.get("description", "")[:200]),
+                                "name": scrub(r.get("name", ""))}
 zones = sorted(re.sub(r"^insights-|\.json$", "", f.rsplit("/", 1)[-1]) for f in glob.glob(f"{out_dir}/insights-*.json"))
 result = {"read_at": out_dir.rsplit("/", 1)[-1], "newest_refresh": newest, "raw": out_dir.split("/evidence/", 1)[-1], "zones": zones,
           "clusters": {c: sorted(v.values(), key=lambda x: (x["subtype"], x["kind"])) for c, v in sorted(seen.items())}}
-# recommender.json is checked in, so the project ID and number become placeholders wherever they appear
-# (resource names, service-account addresses, console links in a description).
-text = json.dumps(result, indent=1)
-for value, placeholder in ((project_number, "<PROJECT_NUMBER>"), (project_id, "<PROJECT_ID>")):
-    if value: text = text.replace(value, placeholder)
-open(dest, "w").write(text + "\n")
+open(dest, "w").write(json.dumps(result, indent=1) + "\n")
+named = [c for c in result["clusters"] if project_id in c or (project_number and project_number in c)]
 print("read at", result["read_at"], "| newest refresh:", newest)
 for c, items in result["clusters"].items(): print(f"{c:22s}", sorted({i["subtype"] for i in items}))
 print(len(unmatched), "records named no cluster and are in no row:")
 for u in unmatched: print("  ", u)
+if named: print("NOTE these cluster names contain the project ID or number and are written as they are, since results.py matches on them:", *named, file=sys.stderr)
 PY
