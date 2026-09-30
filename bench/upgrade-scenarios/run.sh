@@ -10,6 +10,12 @@ set -u; NN=${1:?scenario number, two digits}; TRACK=$NN; CLUSTER=${CLUSTER:-upg-
 START_VERSION=$(newest_patch "$CHANNEL" "$START"); note cluster "scenario $NN on $CLUSTER: $CHANNEL $START_VERSION"
 G container clusters describe "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=$SCENARIO_LABEL,scenario=$NN --quiet ${CREATE_FLAGS:-}
 require_scenario_cluster
+# And the scenario's own cluster: the label run.sh set at creation must be NN, or share NN's number as the base a lettered
+# re-run extends (CLUSTER=upg-10 bash run.sh 10b; CLUSTER=upg-14b bash run.sh 14c). A hold cluster (label ending in h) is
+# accepted only by its own scenario, since an upgrade there ends the multi-day hold the Recommender is waiting on.
+LABEL=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)'); BASE=${NN%%[a-z]*}
+[ "$LABEL" = "$NN" ] || { [ "${LABEL%%[a-z]*}" = "$BASE" ] && [[ $LABEL != *h ]]; } ||
+  { echo "refusing: $CLUSTER was built for scenario '$LABEL', which is not $NN, a base it extends, or the same number without a hold suffix" >&2; exit 1; }
 if [ -n "${POOL_FLAGS:-}" ]; then pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$START_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --quiet ${POOL_FLAGS} ||
   { note final "precondition not met: work-pool was not created; stopping before the plant"; exit 1; }; fi
 G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1

@@ -2,7 +2,9 @@
 # Sourced by run.sh, which reads CHANNEL, START, CREATE_FLAGS and POOL_FLAGS and calls plant, before, break_it and after.
 # 13: the container runtime changes with the node image: containerd 1.7 on 1.31, 2.0 on 1.32; a v1alpha2 CRI client breaks
 CHANNEL=EXTENDED; START=1.31; POOL_FLAGS="--num-nodes 1 --machine-type e2-standard-2"
-plant(){ K -n scen apply -f - <<'Y'
+CRICTL_VERSION=v1.22.0; CRICTL_URL=https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-$CRICTL_VERSION-linux-amd64.tar.gz
+CRICTL_SHA256=45e0556c42616af60ebe93bf4691056338b3ea0001c0201a6a8ff8b1dbc0652a   # the release's published .sha256; the fetch runs as root beside the containerd socket, so it is checked before anything is unpacked
+plant(){ K -n scen apply -f - <<Y
 apiVersion: apps/v1
 kind: DaemonSet
 metadata: {name: cri-v1alpha2-agent}
@@ -18,7 +20,7 @@ spec:
       initContainers:
         - name: fetch
           image: curlimages/curl:8.10.1
-          command: ["sh", "-c", "curl -sSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.22.0/crictl-v1.22.0-linux-amd64.tar.gz | tar -xz -C /bin-out"]
+          command: ["sh", "-c", "curl -fsSL -o /tmp/crictl.tgz $CRICTL_URL && echo \"$CRICTL_SHA256  /tmp/crictl.tgz\" | sha256sum -c - && tar -xz -C /bin-out -f /tmp/crictl.tgz"]
           volumeMounts: [{name: bin, mountPath: /bin-out}]
       containers:
         - name: agent

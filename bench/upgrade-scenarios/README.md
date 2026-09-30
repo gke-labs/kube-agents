@@ -249,8 +249,9 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 
 `run.sh NN` does the following:
 
-1. Creates the cluster at the minor the scenario needs, stops unless the cluster carries the campaign's label,
-   and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
+1. Creates the cluster at the minor the scenario needs, stops unless the cluster carries the campaign's label and
+   was built for this scenario (its `scenario` label is `NN`, or a base a lettered re-run extends, and never a hold
+   cluster of another run), and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
    every other scenario writes its manifests inline. If any step of the plant fails, the run stops here, before
    the upgrade, with a "precondition not met" note in the evidence.
@@ -268,8 +269,9 @@ availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` dir
 `zonal-api-1s.txt` and `zonal-probe.txt`. After a pool upgrade, `upgrade.txt` also carries the operation's final
 status and status message, which is where a stockout shows while the operation reads DONE. A re-run on the same
 cluster skips a node pool or maintenance exclusion already in place, and appends to the checked-in evidence
-files, each record under its own timestamp; commit only what the table or the notes above cite, after replacing
-the project ID and number and any public IP address.
+files, each record under its own timestamp; the pollers' files gain a block per run, and each summary reads only
+the last block. Commit only what the table or the notes above cite, after replacing the project ID and number
+and any public IP address.
 Redirect the console to `logs/<track>.log` if you want it; `logs/` is gitignored.
 
 Verdicts were judged by hand from those files. Each one then went to an independent reviewer told to refute it,

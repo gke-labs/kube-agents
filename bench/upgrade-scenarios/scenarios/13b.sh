@@ -5,10 +5,12 @@
 # was broken before any upgrade. This run starts the work pool on 1.31.14-gke.2704000 (containerd 1.7.34,
 # measured on gemma-gpu) and the break is a patch-only node upgrade inside 1.31.
 CHANNEL=EXTENDED; START=1.31; POOL_FLAGS=""
+CRICTL_VERSION=v1.22.0; CRICTL_URL=https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-$CRICTL_VERSION-linux-amd64.tar.gz
+CRICTL_SHA256=45e0556c42616af60ebe93bf4691056338b3ea0001c0201a6a8ff8b1dbc0652a   # the release's published .sha256; the fetch runs as root beside the containerd socket, so it is checked before anything is unpacked
 OLD_NODE_VERSION=1.31.14-gke.2704000
 AUTO_HOLD_DAYS=2; WORK_MACHINE=e2-small
 plant(){ has_exclusion hold-auto || ev cluster hold G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-auto --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$AUTO_HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet
-  pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$OLD_NODE_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --num-nodes 1 --machine-type "$WORK_MACHINE" --quiet; K -n scen apply -f - <<'Y'
+  pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$OLD_NODE_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --num-nodes 1 --machine-type "$WORK_MACHINE" --quiet; K -n scen apply -f - <<Y
 apiVersion: apps/v1
 kind: DaemonSet
 metadata: {name: cri-v1alpha2-agent}
@@ -24,7 +26,7 @@ spec:
       initContainers:
         - name: fetch
           image: curlimages/curl:8.10.1
-          command: ["sh", "-c", "curl -sSL https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.22.0/crictl-v1.22.0-linux-amd64.tar.gz | tar -xz -C /bin-out"]
+          command: ["sh", "-c", "curl -fsSL -o /tmp/crictl.tgz $CRICTL_URL && echo \"$CRICTL_SHA256  /tmp/crictl.tgz\" | sha256sum -c - && tar -xz -C /bin-out -f /tmp/crictl.tgz"]
           volumeMounts: [{name: bin, mountPath: /bin-out}]
       containers:
         - name: agent
