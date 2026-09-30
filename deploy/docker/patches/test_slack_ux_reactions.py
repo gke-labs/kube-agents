@@ -110,9 +110,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _cards(*ids, board="default", status="running", lineage=()):
+def _cards(*ids, board="default", status="running", creator=None):
     """A board read: open cards as ``{(board, id): _Card}``."""
-    return {(board, task): runtime._Card(status, frozenset(lineage)) for task in ids}
+    return {(board, task): runtime._Card(status, creator) for task in ids}
 
 
 class _Root:
@@ -474,28 +474,33 @@ class RuntimeTest(unittest.TestCase):
         self._turn_racing("yes, go ahead", blocked, blocked, [("t_a", "blocked")], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
 
-    def test_a_card_spawned_from_an_earlier_asks_card_is_not_the_turns(self):
+    def test_a_card_an_earlier_asks_worker_creates_is_not_the_turns(self):
         # Ask 1's worker files a follow-up while "why?" is answered; the
         # follow-up inherited the thread's subscription from t_a.
         adapter = _Stub()
-        after = {**_cards("t_a"), **_cards("t_b", lineage=["t_a"])}
+        after = {**_cards("t_a"), **_cards("t_b", creator="t_a")}
         self._turn_racing("why?", _cards("t_a"), after, [], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
         self.assertFalse(runtime._deferred)
 
-    def test_a_card_spawned_from_a_left_out_card_is_left_out_too(self):
+    def test_a_card_created_under_a_left_out_card_is_left_out_too(self):
         adapter = _Stub()
-        after = {**_cards("t_a"), **_cards("t_b", lineage=["t_a"]), **_cards("t_c", lineage=["t_b"])}
+        after = {**_cards("t_a"), **_cards("t_b", creator="t_a"), **_cards("t_c", creator="t_b")}
         self._turn_racing("why?", _cards("t_a"), after, [], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
 
-    def test_a_fan_in_over_the_turns_own_cards_is_its(self):
+    def test_a_card_the_turns_own_cards_worker_creates_is_its(self):
         adapter = _Stub()
-        after = {**_cards("t_a", "t_b"), **_cards("t_c", lineage=["t_a", "t_b"])}
+        after = {**_cards("t_a"), **_cards("t_b", creator="t_a")}
         self._turn_racing("fix it", {}, after, [], adapter)
-        self.assertEqual(
-            runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_a"), ("default", "t_b"), ("default", "t_c")},
-        )
+        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_a"), ("default", "t_b")})
+
+    def test_a_card_the_turn_creates_after_an_older_card_is_its(self):
+        # "Once t_a finishes, run the smoke test": the turn names t_a as the
+        # parent, which gives the new card no creator.
+        adapter = _Stub()
+        self._turn_racing("fix it", _cards("t_a"), _cards("t_a", "t_b"), [], adapter)
+        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_b")})
 
     def test_a_blocked_card_that_completes_during_the_turn_is_not_its(self):
         adapter = _Stub()
@@ -603,9 +608,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         conn.executescript(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);"
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
-            "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
-            "INSERT INTO task_links VALUES ('a','b'),('e','b');"
             "INSERT INTO task_events VALUES (1,'a','created','{\"creator_task_id\": null}'),"
             " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}');"
             "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready');"
@@ -614,7 +617,7 @@ class OpenCardsQueryTest(unittest.TestCase):
             " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000');"
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
-        self.assertEqual(sorted(rows), [("a", "running", None, None), ("b", "blocked", "a,e", "c")])
+        self.assertEqual(sorted(rows), [("a", "running", None), ("b", "blocked", "c")])
 
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
@@ -656,11 +659,11 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(default).touch()
         Path(b2).touch()
         paths = {"default": default, "alias": default, "b2": b2}
-        rows = {default: [("t_a", "running", None, None)], b2: [("t_b", "running", None, None), ("t_c", "blocked", "t_b,t_x", "t_y")]}
+        rows = {default: [("t_a", "running", None)], b2: [("t_b", "running", None), ("t_c", "blocked", "t_b")]}
         reads = []
         with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, reads)):
             found = runtime._query_open_cards("C1", "111.000")
-        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", lineage=["t_b", "t_x", "t_y"])})
+        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", creator="t_b")})
         self.assertEqual([path for path, _ in reads], [default, b2])
         self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
 
@@ -669,7 +672,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(good).touch()
         reads = []
         paths = {"default": good, "b3": absent}
-        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None, None)]}, reads)):
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None)]}, reads)):
             found = runtime._query_open_cards("C1", "111.000")
         self.assertEqual(found, _cards("t_a"))
         # b3 has no database: never connected to, so never created.
@@ -681,7 +684,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         good, bad = self._databases("good.db", "bad.db")
         Path(good).touch()
         Path(bad).touch()
-        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", None, None)]}, [], broken={"b2"})
+        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", None)]}, [], broken={"b2"})
         with mock.patch.dict(sys.modules, hermes):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
         hermes["hermes_cli.kanban_db"].list_boards = mock.Mock(side_effect=RuntimeError("locked"))

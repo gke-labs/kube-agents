@@ -32,9 +32,10 @@ With the flag on:
   its settle to those cards, and only those: a card already open when the ask
   arrived is not its to wait on, even one unblocked while the turn ran.
   Hermes records no actor on an unblock, so it may be the CLI's or another
-  turn's; that card's own ask carries its outcome. Nor is a new card spawned
-  from one it did not open: it inherited the thread's subscription from that
-  card, so it may be that card's worker's. A turn that failed
+  turn's; that card's own ask carries its outcome. Nor is a new card the
+  worker of a card it did not open created: Hermes copies the creator's
+  subscriptions onto it, so it is in the thread without being the turn's. A
+  turn that failed
   after opening them still settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
@@ -84,12 +85,11 @@ PLATFORM = "slack"
 DEFAULT_BOARD = "default"
 
 #: Cards subscribed to one Slack thread that have not reached a final status,
-#: with that status, the card's parents comma-joined, and the card that created
-#: it: Hermes copies either one's subscriptions onto the new card. ``blocked``
-#: counts as open: it waits on the user and will run on.
+#: with that status and the card whose worker created it, if one did: Hermes
+#: copies the creator's subscriptions onto the new card. ``blocked`` counts as
+#: open: it waits on the user and will run on.
 OPEN_CARDS_SQL = (
     "SELECT s.task_id, t.status, "
-    "(SELECT group_concat(l.parent_id, ',') FROM task_links l WHERE l.child_id = s.task_id), "
     "(SELECT json_extract(e.payload, '$.creator_task_id') FROM task_events e "
     "WHERE e.task_id = s.task_id AND e.kind = 'created') "
     "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
@@ -122,8 +122,9 @@ class _Card(NamedTuple):
     """An open card as one board read saw it."""
 
     status: str
-    #: Ids of the cards on its board it was spawned from: its parents and its creator.
-    lineage: frozenset = frozenset()
+    #: The id of the card on its board whose worker created it, or None when
+    #: a chat turn or the CLI did.
+    creator: str | None = None
 
 
 class _Turn:
@@ -218,7 +219,7 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
             rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
         finally:
             conn.close()
-        cards.update(((slug, row[0]), _Card(row[1], frozenset(filter(None, (*(row[2] or "").split(","), row[3]))))) for row in rows)
+        cards.update(((slug, row[0]), _Card(row[1], row[2])) for row in rows)
     return cards
 
 
@@ -242,10 +243,10 @@ def _own_cards(before: dict, after: dict, finished: dict) -> set:
     A card open at the start is never the turn's, even one unblocked while it
     ran: Hermes's ``unblocked`` event names no actor, so the turn cannot show
     the unblock was its own rather than the CLI's or another turn's. Nor is a
-    new card spawned from any card the turn did not open, such as a follow-up
-    an earlier ask's worker creates: only cards whose whole lineage the turn
-    opened count, so a fan-in over its own cards does. A card that opened and
-    closed within the turn was never read, so its lineage is unknown and it
+    new card created by the worker of a card the turn did not open, such as a
+    follow-up an earlier ask's worker files. Only workers set a creator; the
+    parents a turn names do not make a card anyone else's. A card that opened
+    and closed within the turn was never read, so its creator is unknown and it
     counts.
     """
     opened = {card for card in (*after, *finished) if card not in before}
@@ -253,7 +254,7 @@ def _own_cards(before: dict, after: dict, finished: dict) -> set:
         kept = {
             (board, task) for board, task in opened
             if (board, task) not in after
-            or after[(board, task)].lineage <= {t for b, t in opened if b == board}
+            or after[(board, task)].creator in {None, *(t for b, t in opened if b == board)}
         }
         if kept == opened:
             return opened

@@ -21,8 +21,8 @@ Three things are checked:
    made with the built tree's ``hermes_cli``: an open card subscribed to the
    thread on the default board and on a second board is found, and a finished
    card, a card in another thread and a card for another platform are not.
-   A card spawned from one of them is found through the subscription Hermes
-   copies onto it, with its parent and creator as its lineage.
+   A card another card's worker created is found through the subscription
+   Hermes copies onto it, with that card as its creator.
 3. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it is inert; flag on, an ask gets the arrival reaction for
    its kind, a direct answer settles at once, a delegated one waits for the
@@ -238,7 +238,7 @@ def check_board_read(module, root: Path) -> None:
         _, creator = card(kb.DEFAULT_BOARD, "creator")
         conn = kc.connect(board=kb.DEFAULT_BOARD)
         try:
-            # No subscription of its own: Hermes copies its parent's and creator's.
+            # No subscription of its own: Hermes copies its creator's.
             child = kb.create_task(
                 conn, title="spawned", assignee="platform", parents=(fresh,), creator_task_id=creator,
             )
@@ -255,9 +255,9 @@ def check_board_read(module, root: Path) -> None:
         found = set(read)
         if found != expected:
             raise _fail(f"the kanban read found {sorted(found)!r}, expected {sorted(expected)!r}")
-        lineage = read[(kb.DEFAULT_BOARD, child)].lineage
-        if lineage != {fresh, creator} or read[(kb.DEFAULT_BOARD, fresh)].lineage:
-            raise _fail(f"the kanban read does not see a card's parent and creator: {lineage!r}")
+        made_by = read[(kb.DEFAULT_BOARD, child)].creator
+        if made_by != creator or read[(kb.DEFAULT_BOARD, fresh)].creator is not None:
+            raise _fail(f"the kanban read does not see which card created a card: {made_by!r}")
     finally:
         for name, value in saved.items():
             if value is None:
