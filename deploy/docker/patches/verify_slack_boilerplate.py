@@ -33,7 +33,9 @@ Four things are checked:
    ``gateway/slash_commands.py``). With the flag on, ``system_text`` must
    reword every one, with no emoji, "Gateway", "gateway", "agent", "Hermes",
    ``/stop`` or exception text left; this is what catches an upstream
-   rewording.
+   rewording. The words a drain reply or the interrupted-cron-job notice
+   interpolates are read out of upstream too (``_status_action_gerund()`` and
+   the notice's ``action`` binding), and each must be one the runtime rewords.
 4. The runtime module, loaded by path: on Slack with the flag on,
    ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
    off, and for any platform other than Slack, every helper returns its input
@@ -108,6 +110,8 @@ LOCALE_REPLIES = {
 RUN_INBOUND = "gateway/run_inbound.py"
 RUN_TURN_RUNNER = "gateway/run_turn_runner.py"
 RUN = "gateway/run.py"
+#: The method whose return value the drain replies interpolate.
+ACTION_FN = "_status_action_gerund"
 BACKGROUND_FN = "_format_process_running_message"
 BACKGROUND_CMDS = ("make build", "")
 BACKGROUND_OUTPUTS = ("", "step 3/9")
@@ -122,7 +126,7 @@ SLACK_METHODS = {"send": "self._dm_target(", "edit_message": "return blocked"}
 
 #: (file, literal prefix, how many literals or f-strings carry it) for the
 #: replies read straight out of a module; ``self._status_action_gerund()`` is
-#: rendered for each of CRON_ACTIONS.
+#: rendered for each value upstream's method can return.
 SYSTEM_LITERALS = (
     (RUN_BUSY, "⏳ Gateway", 2),
     (RUN_BUSY, "⏳ Agent is running", 1),
@@ -146,9 +150,10 @@ SYSTEM_LEFTOVERS = (
     "⏳", "⚡", "⚠️", "⏱️", "⏩", "↪", "♻", "/stop", "Gateway", "agent", "gateway", "Hermes", "hermes", AUTH_ERROR,
 )
 
-#: Stands in for the names the interrupted-cron-job notice interpolates.
+#: Stands in for the job name the interrupted-cron-job notice interpolates;
+#: its ``action`` is read out of upstream.
 CRON_JOB_NAME = "inventory"
-CRON_ACTIONS = ("restarting", "shutting down")
+CRON_ACTION = "action"
 
 CHANNEL = "C0KAGE"
 REPORT = "Your fleet: 3 clusters, all healthy."
@@ -262,6 +267,47 @@ def _guard_line(fn: ast.AST, exit_type: type) -> int:
     return guards[0]
 
 
+def _literal_values(node: ast.expr, where: str) -> tuple[str, ...]:
+    """Every value ``node`` can take, through conditional expressions; string literals only."""
+    if isinstance(node, ast.IfExp):
+        return _literal_values(node.body, where) + _literal_values(node.orelse, where)
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return (node.value,)
+    raise _fail(f"{where} is no longer built from string literals: {ast.unparse(node)}")
+
+
+def action_gerunds(root: Path) -> tuple[str, ...]:
+    """Every value upstream's ``_status_action_gerund()`` can return."""
+    fn = _function(_tree(root, RUN), ACTION_FN, RUN)
+    returns = [node.value for node in ast.walk(fn) if isinstance(node, ast.Return) and node.value is not None]
+    if not returns:
+        raise _fail(f"{RUN} {ACTION_FN}() returns nothing")
+    return tuple(dict.fromkeys(v for node in returns for v in _literal_values(node, f"{ACTION_FN}()")))
+
+
+def cron_actions(root: Path) -> tuple[str, ...]:
+    """Every value the interrupted-cron-job notice's ``action`` can take."""
+    fn = _function(_tree(root, RUN_SHUTDOWN), CRON_INTERRUPT_FN, RUN_SHUTDOWN)
+    binds = [
+        node.value for node in ast.walk(fn)
+        if isinstance(node, ast.Assign) and _names(node.targets) == [CRON_ACTION]
+    ]
+    if len(binds) != 1:
+        raise _fail(f"{CRON_INTERRUPT_FN}() binds {CRON_ACTION} {len(binds)} times, expected 1")
+    return _literal_values(binds[0], f"{CRON_INTERRUPT_FN}()'s {CRON_ACTION}")
+
+
+def check_action_words(runtime, root: Path) -> None:
+    """Each interpolated action word upstream produces must be one the runtime rewords."""
+    for words, table, name in (
+        (action_gerunds(root), runtime.DRAIN_WHO, "DRAIN_WHO"),
+        (cron_actions(root), runtime.CRON_INTERRUPTED_WHY, "CRON_INTERRUPTED_WHY"),
+    ):
+        unknown = [word for word in words if word not in table]
+        if unknown:
+            raise _fail(f"upstream interpolates {unknown}, which {name} in {RUNTIME} does not reword")
+
+
 def check_notices(root: Path) -> list[str]:
     """Check the notice call sites; return every interrupting notice rendered from source."""
     notices: list[str] = []
@@ -282,8 +328,8 @@ def check_notices(root: Path) -> list[str]:
     if len(cron) != 1:
         raise _fail(f"{CRON_INTERRUPT_FN}() has {len(cron)} msg assignments, expected 1")
     rendered = compile(ast.Expression(body=cron[0]), RUN_SHUTDOWN, "eval")
-    for action in CRON_ACTIONS:
-        notices.append(eval(rendered, {}, {"job": {"name": CRON_JOB_NAME}, "job_id": "id", "action": action}))
+    for action in cron_actions(root):
+        notices.append(eval(rendered, {}, {"job": {"name": CRON_JOB_NAME}, "job_id": "id", CRON_ACTION: action}))
 
     tree = _tree(root, RUN_NOTIFICATIONS)
     if not _binds_alias(tree):
@@ -328,6 +374,7 @@ def _leading_text(node: ast.AST) -> str | None:
 def check_system(root: Path) -> list[str]:
     """Check the system-reply call sites; return every such reply rendered from source."""
     replies: list[str] = []
+    gerunds = action_gerunds(root)
     for relative, prefix, expected in SYSTEM_LITERALS:
         tree = _tree(root, relative)
         pieces = {id(part) for node in ast.walk(tree) if isinstance(node, ast.JoinedStr) for part in node.values}
@@ -338,7 +385,7 @@ def check_system(root: Path) -> list[str]:
         ]
         if len(nodes) != expected:
             raise _fail(f"{relative} has {len(nodes)} replies starting {prefix!r}, expected {expected}")
-        for node, action in itertools.product(nodes, CRON_ACTIONS):
+        for node, action in itertools.product(nodes, gerunds):
             self = SimpleNamespace(_status_action_gerund=lambda action=action: action)
             replies.append(_render(node, relative, {"self": self, "exc": AUTH_ERROR, **BUSY_ENV}))
 
@@ -499,7 +546,9 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_heartbeat(root)
     notices = check_notices(root)
     replies = check_system(root) + check_locale(root)
-    drive(_load_runtime(root), notices, replies)
+    runtime = _load_runtime(root)
+    check_action_words(runtime, root)
+    drive(runtime, notices, replies)
     print(
         "slack_boilerplate verify: Slack cron targets send the unwrapped report, the heartbeat "
         f"goes generic on Slack, {len(notices)} interrupting "

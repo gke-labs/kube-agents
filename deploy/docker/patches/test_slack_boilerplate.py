@@ -412,6 +412,11 @@ def _non_conversational_metadata(metadata, platform=None):
     return metadata
 
 
+class GatewayRunner:
+    def _status_action_gerund(self) -> str:
+        return "restarting" if self._restart_requested else "shutting down"
+
+
 _PROVIDER_ERROR_REPLIES = (
     (None, "⚠️ Provider authentication failed. Check the configured credentials; "
            "raw provider details are in the gateway logs."),
@@ -653,6 +658,30 @@ class ApplierTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     verifier.main(self.root.dir)
                 self.assertIn(expected, str(caught.exception))
+                path.write_text(patched)
+        verifier.main(self.root.dir)
+
+    def test_verifier_reads_the_action_words_from_upstream(self):
+        applier.apply(self.root.dir)
+        self.assertEqual(verifier.action_gerunds(self.root.dir), ("restarting", "shutting down"))
+        self.assertEqual(verifier.cron_actions(self.root.dir), ("restarting", "shutting down"))
+        for relative, old in (
+            (verifier.RUN, 'else "shutting down"'),
+            (verifier.RUN_SHUTDOWN, 'else "shutting down"'),
+        ):
+            with self.subTest(relative=relative, kind="new word"):
+                path = self.root.dir / relative
+                patched = path.read_text()
+                path.write_text(patched.replace(old, 'else "updating"'))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn("'updating'", str(caught.exception))
+                path.write_text(patched)
+            with self.subTest(relative=relative, kind="not a literal"):
+                path.write_text(patched.replace(old, "else self._reason"))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn("no longer built from string literals", str(caught.exception))
                 path.write_text(patched)
         verifier.main(self.root.dir)
 
@@ -952,6 +981,20 @@ class SystemReplyTest(unittest.TestCase):
         # Upstream logs the exception itself before replying.
         sent = self._sent(self.adapter, "⚠️ Steer failed: RuntimeError('queue closed')", FLAG_ON)
         self.assertEqual(sent, runtime.STEER_FAILED)
+
+    def test_agent_text_opening_with_an_error_prefix_passes_through(self):
+        for prefix in ("⚠️ Steer failed: ", "⚠️ Provider authentication failed: "):
+            for text in (
+                f"{prefix}the rollout.\n\nHere is what I found in the logs instead.",
+                prefix + "x" * (runtime.ERROR_TEXT_MAX + 1),
+            ):
+                with self.subTest(prefix=prefix, length=len(text)):
+                    self.assertEqual(self._sent(self.adapter, text, FLAG_ON), text)
+        steer = "⏩ Steer queued — arrives after the next tool call: '"
+        long_steer = f"{steer}{'y' * (runtime.STEER_PREVIEW_MAX + 1)}'"
+        self.assertEqual(self._sent(self.adapter, long_steer, FLAG_ON), long_steer)
+        preview = f"{steer}check\nthe ingress too'"
+        self.assertNotEqual(self._sent(self.adapter, preview, FLAG_ON), preview)
 
     def test_restart_reply_drops_the_console_command_and_the_notice_promise(self):
         with mock.patch.dict(os.environ, FLAG_ON):

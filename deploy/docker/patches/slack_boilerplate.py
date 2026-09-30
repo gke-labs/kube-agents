@@ -112,6 +112,14 @@ CRON_INTERRUPTED_WHY = {"restarting": "restarting", "shutting down": "going offl
 #: What Slack is told after ``/stop``, whether or not the turn had started.
 STOPPED = "Stopped. Send me a message whenever you want to carry on."
 
+#: The longest exception text a reworded error reply may carry: one line, this
+#: long. An agent reply that happens to open with the same prefix and runs on
+#: past a line or this length is not the gateway's, and passes through.
+ERROR_TEXT_MAX = 500
+
+#: ``/steer``'s preview: the first 60 characters of the steer, plus "...".
+STEER_PREVIEW_MAX = 63
+
 #: ``_status_action_gerund()``'s values, as the drain replies say them on Slack.
 DRAIN_WHO = {"restarting": "I'm restarting", "shutting down": "I'm going offline for a moment"}
 
@@ -145,11 +153,11 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
     (re.compile(r"⏳ Agent is running — `(?P<command>/[^`\n]+)` can't run mid-turn\. "
                 r"Wait for the current response or `/stop` first\."),
      lambda m: f"I'm in the middle of something — try `{m['command']}` again once I've answered."),
-    (re.compile(r"⏩ Steer queued — arrives after the next tool call: '.*'", re.DOTALL),
+    (re.compile(rf"⏩ Steer queued — arrives after the next tool call: '.{{0,{STEER_PREVIEW_MAX}}}'", re.DOTALL),
      "Got it — I'll fold this into what I'm working on now."),
     (re.compile(r"(?:Agent still starting|No active agent) — /steer queued for the next turn\."),
      "Got it — I'll pick this up next."),
-    (re.compile(r"⚠️ Steer failed: (?P<error>.*)", re.DOTALL),
+    (re.compile(rf"⚠️ Steer failed: (?P<error>[^\n]{{1,{ERROR_TEXT_MAX}}})"),
      # run_busy already logs the exception before replying.
      lambda m: STEER_FAILED),
     (re.compile(r"⏳ Queued for the next turn(?: \([^\n]*\))?\. I'll respond once the current task finishes\."),
@@ -181,7 +189,7 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
     (re.compile(r"⏳ Background task still running(?: — (?P<cmd>`[^\n]*`))?(?P<rest>\n\nRecent output:\n.*)?",
                 re.DOTALL),
      lambda m: (f"Still running {m['cmd']}." if m["cmd"] else "Still running.") + (m["rest"] or "")),
-    (re.compile(r"⚠️ Provider authentication failed: (?P<error>.*)", re.DOTALL),
+    (re.compile(rf"⚠️ Provider authentication failed: (?P<error>[^\n]{{1,{ERROR_TEXT_MAX}}})"),
      lambda m: _logged("provider authentication failed", m["error"], AUTH_FAILED)),
     (re.compile(r"⚠️ Provider authentication failed\. Check the configured credentials; "
                 r"raw provider details are in the gateway logs\."),
