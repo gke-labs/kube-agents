@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -241,5 +242,117 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 				t.Error("the relay token volume is rendered on an unarmed gateway")
 			}
 		})
+	}
+}
+
+// TestTheBrokerArmsTheA2ARelayUnderNext: one Chat consumer per install. The
+// broker's legacy relay instance is built from GOOGLE_CHAT_SUBSCRIPTION_NAME
+// and the A2A one from A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME; under next the
+// second gets the install's one subscription and the first is not set, so
+// exactly one instance pulls and the proxy's same-name refusal has nothing
+// to refuse. The third audience is what confers the a2a-chat role.
+func TestTheBrokerArmsTheA2ARelayUnderNext(t *testing.T) {
+	agent := gchatTestAgent("next", true)
+	env := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
+	want := map[string]string{
+		"GOOGLE_CHAT_PROJECT_ID":             "chat-project",
+		a2aGoogleChatSubscriptionEnvVar:      "projects/chat-project/subscriptions/platform-agent-chat-events-sub",
+		credentialProxyA2AChatAudienceEnvVar: credentialProxyA2AChatAudience,
+	}
+	for name, expected := range want {
+		if value, found := brokerEnvValue(env, name); !found || value != expected {
+			t.Errorf("%s = %q (present=%v), want %q", name, value, found, expected)
+		}
+	}
+	if value, found := brokerEnvValue(env, "GOOGLE_CHAT_SUBSCRIPTION_NAME"); found {
+		t.Errorf("GOOGLE_CHAT_SUBSCRIPTION_NAME=%q rendered beside the A2A subscription: two relay instances would split one subscription, and the proxy refuses to start on the pair", value)
+	}
+	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
+	if callers != "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
+	}
+}
+
+// TestTheBrokerKeepsTheLegacyRelayOffNext: today with Chat renders exactly
+// the pair main renders; nothing of the A2A side leaks into a today install.
+func TestTheBrokerKeepsTheLegacyRelayOffNext(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"today with chat", gchatTestAgent("", true)},
+		{"skew with chat", gchatTestAgent("later", true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := buildCredentialProxyDeployment(tc.agent, "policy-hash").Spec.Template.Spec.Containers[0].Env
+			if value, _ := brokerEnvValue(env, "GOOGLE_CHAT_SUBSCRIPTION_NAME"); value != "projects/chat-project/subscriptions/platform-agent-chat-events-sub" {
+				t.Errorf("legacy subscription = %q", value)
+			}
+			for _, name := range []string{a2aGoogleChatSubscriptionEnvVar, credentialProxyA2AChatAudienceEnvVar} {
+				if value, found := brokerEnvValue(env, name); found {
+					t.Errorf("%s=%q rendered on a today install", name, value)
+				}
+			}
+			if callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS"); strings.Contains(callers, "a2a-gateway") {
+				t.Errorf("the A2A gateway is a broker caller on a today install: %q", callers)
+			}
+		})
+	}
+}
+
+// TestNoRenderCarriesBothChatSubscriptions walks every container the
+// operator renders for one CR, under today and under next, and asserts the
+// two subscription variables never meet. This is the double-answer guard
+// in one assertion.
+func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
+	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("", true), gchatTestAgent("next", true)} {
+		containers := buildCredentialProxyDeployment(agent, "h").Spec.Template.Spec.Containers
+		containers = append(containers, buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers...)
+		containers = append(containers, buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers...)
+		legacy, a2a := false, false
+		for _, c := range containers {
+			env := gchatEnv(c)
+			if _, ok := env["GOOGLE_CHAT_SUBSCRIPTION_NAME"]; ok {
+				legacy = true
+			}
+			if _, ok := env[a2aGoogleChatSubscriptionEnvVar]; ok {
+				a2a = true
+			}
+		}
+		if legacy && a2a {
+			t.Errorf("mode %v: both Chat subscription variables are rendered; every message would be answered twice", ptr.Deref(agent.Spec.Mode, "today"))
+		}
+		if !legacy && !a2a {
+			t.Errorf("mode %v: neither Chat subscription variable is rendered; Chat is enabled and nobody consumes it", ptr.Deref(agent.Spec.Mode, "today"))
+		}
+	}
+}
+
+// TestTheBrokerFenceAdmitsTheGatewayWhenArmed: TokenReview rejects a caller
+// the broker does not serve; the NetworkPolicy is the layer that keeps it
+// from opening the connection, and the A2A gateway pod must be a peer on
+// the broker port when, and only when, it is a caller.
+func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
+	armed := buildCredentialProxyNetworkPolicy(gchatTestAgent("next", true))
+	from := armed.Spec.Ingress[0].From
+	if len(from) != 3 {
+		t.Fatalf("armed: %d peers on the broker port, want 3 (sandbox, gateway, A2A gateway): %#v", len(from), from)
+	}
+	var found bool
+	for _, peer := range from {
+		if peer.PodSelector != nil && peer.PodSelector.MatchLabels["app"] == "test-agent-a2a-gateway" {
+			found = true
+			if peer.NamespaceSelector != nil || peer.IPBlock != nil {
+				t.Errorf("the A2A gateway peer reaches outside the namespace: %#v", peer)
+			}
+		}
+	}
+	if !found {
+		t.Error("the A2A gateway pod is not a peer; its relay pulls would be refused before TokenReview")
+	}
+	for _, agent := range []*agentv1alpha1.PlatformAgent{gchatTestAgent("", true), a2aTestAgent()} {
+		if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
+			t.Errorf("unarmed: %d peers, want the two main renders", got)
+		}
 	}
 }

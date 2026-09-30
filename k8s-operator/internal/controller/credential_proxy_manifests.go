@@ -467,9 +467,10 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 }
 
 // buildCredentialProxyNetworkPolicy narrows who may reach the endpoint down to
-// the two callers that have a reason to: the sandbox, whose wrapped CLIs are the
-// proxy's purpose, and the gateway, which pulls chat events from the relay
-// hosted here. TokenReview already rejects a caller this pod does not serve;
+// the callers that have a reason to: the sandbox, whose wrapped CLIs are the
+// proxy's purpose, the gateway, which pulls chat events from the relay hosted
+// here, and, when the next stack takes Google Chat, the A2A gateway, which
+// pulls the same relay's A2A routes. TokenReview already rejects a caller this pod does not serve;
 // this is the layer that keeps such a caller from opening the connection.
 //
 // A second rule admits the managed-Prometheus collector, from its own
@@ -487,6 +488,18 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // where it is enforced and a statement of intent where it is not.
 func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
+	callers := []networkingv1.NetworkPolicyPeer{
+		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
+		{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+	}
+	// The A2A gateway pod, while its Google Chat adapter pulls the relay
+	// hosted here. The same condition as allowedBrokerCallers: a peer that
+	// is not a caller is a rule with nobody behind it.
+	if a2aChatArmed(agent) {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
+		})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -495,10 +508,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
 				{
-					From: []networkingv1.NetworkPolicyPeer{
-						{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
-						{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
-					},
+					From: callers,
 					Ports: []networkingv1.NetworkPolicyPort{{
 						Protocol: &tcp,
 						Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),

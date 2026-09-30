@@ -4069,7 +4069,21 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	}
 	if integration := agent.Spec.Integration; integration != nil {
 		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
-			envVars = append(envVars, corev1.EnvVar{Name: "GOOGLE_CHAT_PROJECT_ID", Value: gchat.ProjectID}, corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName)})
+			subscription := fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName)
+			envVars = append(envVars, corev1.EnvVar{Name: "GOOGLE_CHAT_PROJECT_ID", Value: gchat.ProjectID})
+			if a2aChatArmed(agent) {
+				// The next stack takes Chat: the install's one subscription
+				// goes to the A2A relay instance and the legacy instance is
+				// not built, so one consumer pulls it. The audience is what
+				// the broker confers the a2a-chat role by; the legacy chat
+				// caller's audience must not reach the A2A event routes.
+				envVars = append(envVars,
+					corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: subscription},
+					corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+				)
+			} else {
+				envVars = append(envVars, corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: subscription})
+			}
 		}
 		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
 			envVars = append(envVars,
@@ -4117,8 +4131,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// audience would collapse the two roles into one, which is how the
 		// broker spells "no split".
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE",
-		// The A2A gateway's audience and subscription are reserved before the
-		// operator renders them, for the same reason: one that could set the
+		// The A2A gateway's audience and subscription are reserved for the
+		// same reason: one that could set the
 		// audience would decide who holds the a2a-chat role, and one that
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
