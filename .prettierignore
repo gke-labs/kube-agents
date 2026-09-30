@@ -33,6 +33,12 @@ agents/*/skills/gke-*/**
 # invocation from rewriting them by accident.
 bench/tests/fixtures/runs/**/*.json
 
+# Recorded GitHub API responses (pull requests, file listings, refs) from a
+# pool project's GitOps repository, trimmed to the fields the verifiers read
+# and kept in the shape GitHub served them. Same reasoning and the same CI
+# filter as the run records above.
+bench/tests/fixtures/github/*.json
+
 # The fleet-upgrade-verification skill's removal table: one removed apiVersion
 # per line, which is the form a reviewer diffs against the upstream migration
 # guide. Prettier would spread each entry over six lines. CI's prettier job
@@ -46,3 +52,10 @@ agents/platform/skills/fleet-upgrade-verification/scripts/removed_apis.json
 # `.md`/`.yaml`/`.yml` and never sees JSON; this entry stops a wider local
 # invocation from rewriting them by accident.
 agents/platform/skills/fleet-audit/scripts/testdata/finish_without_manifest/*.json
+
+# The GitOps pilot's committed run records (devops-bench's results.json, rows.json,
+# manifest.json, the campaign stamp and the integrity sweep): what the harness and
+# the sweep wrote, kept as written. CI's prettier job filters to `.md`/`.yaml`/`.yml`
+# and never sees JSON; this entry stops a wider local invocation from rewriting
+# them by accident.
+bench/tasks/*/evidence/*/*.json

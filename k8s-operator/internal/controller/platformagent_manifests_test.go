@@ -6796,3 +6796,259 @@ func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider covers the state
+// ConfigMap half of docs/designs/version-control-support.md §6: each entry's
+// `type` is its forge's provider, each role lands in its own list, and a
+// repository on a host the provider does not serve seeds nothing rather than
+// being rewritten onto a host it does.
+func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
+	const githubEntry = `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"}]`
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "gke-labs"}}
+	gitops := func(repository string) []agentv1alpha1.RepositorySpec {
+		return []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: repository, Role: "gitops"}}
+	}
+
+	cases := []struct {
+		name    string
+		spec    agentv1alpha1.IntegrationSpec
+		managed string
+		context string
+	}{
+		{
+			name:    "lists",
+			spec:    agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("kube-agents")},
+			managed: githubEntry,
+		},
+		{
+			name: "lists with the provider defaulted",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "github"}},
+				Repositories: gitops("https://github.com/gke-labs/kube-agents.git")},
+			managed: githubEntry,
+		},
+		{
+			// The two spellings must seed the identical entry, or the deprecated
+			// alias is a second code path rather than an alias.
+			name: "deprecated github alias",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				Org: "gke-labs", GitRepo: "kube-agents"}},
+			managed: githubEntry,
+		},
+		{
+			// GitOps first whatever the declaration order, because the agent
+			// reads the first managed entry as the repository its GitOps work
+			// lands in; context entries go to their own list.
+			name: "every role",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"},` +
+				`{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			// An invalid entry is skipped, not the list: one typo must not take
+			// the GitOps repository out of the ConfigMap with it.
+			name: "an invalid repository does not drop its neighbours",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "git@gitlab.com:group/project.git", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			// With the webhook off (the chart default) nothing but the seeding
+			// itself stops an entry Problems refuses: "None" would qualify into
+			// gke-labs/None, a duplicate would be written twice, and a namespace
+			// outside GitHub's grammar would reach the minter's scopes.
+			name: "entries Problems refuses are not seeded",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "None", Role: "managed"},
+				{Forge: "github", Repository: "https://github.com/gke-labs/kube-agents", Role: "context"},
+				{Forge: "github", Repository: "apps", Namespace: "my.org", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			name: "a repository on a forge with a bad namespace is not seeded",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "my.org"}},
+				Repositories: gitops("kube-agents"),
+			},
+		},
+		{
+			// The agent reads the first managed_repos entry as its GitOps
+			// repository, so an accepted managed one must not take the place of
+			// a refused gitops one. Context repositories hold no such place.
+			name: "a refused gitops repository seeds no managed one in its place",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "in fra", Role: "gitops"},
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+			}},
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			name: "managed repositories are seeded where no gitops one is declared",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+		},
+		{
+			// Before this change the operator wrote
+			// {"type":"github","url":"https://github.com/group/project"} here: the
+			// host was discarded, the two remaining slashes passed the shape check,
+			// and the URL was rebuilt against github.com. The agent then had a
+			// registered repository nobody had declared.
+			name: "an scp remote on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("git@gitlab.com:group/project.git")},
+		},
+		{
+			// The other half of the same defect: CleanRepoURLWithOrg returned an
+			// https URL verbatim, so this seeded a gitlab.com URL under
+			// "type":"github" — an entry whose two fields named different forges.
+			name: "an https URL on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("https://gitlab.com/group/project")},
+		},
+		{
+			name: "a repository on an undeclared forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "gitlab", Repository: "group/project", Role: "gitops"}}},
+		},
+		{
+			name: "both spellings at once seed nothing",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       gh,
+				Repositories: gitops("kube-agents"),
+				GitHub:       &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+			},
+		},
+		{
+			name: "the no-repository sentinel seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: agentv1alpha1.NoRepositorySentinel}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: tc.spec},
+				},
+			}
+			data := buildGitopsStateConfigMap(agent).Data
+			if got := data["managed_repos"]; got != tc.managed {
+				t.Errorf("managed_repos = %q, expected %q", got, tc.managed)
+			}
+			if got := data["context_repos"]; got != tc.context {
+				t.Errorf("context_repos = %q, expected %q", got, tc.context)
+			}
+		})
+	}
+}
+
+// TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub is the upgrade half
+// of deriving the forge egress: an install that declares nothing, one on the
+// deprecated `github` alias, and one on the forge lists with GitHub must all
+// render the identical allowlist — and the forge patterns must sit where the
+// literals used to, so an upgrade re-renders a GitHub install's policy
+// unchanged rather than churning every FQDNNetworkPolicy in the fleet.
+func TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub(t *testing.T) {
+	render := func(integration *agentv1alpha1.PlatformAgentIntegrationSpec) []string {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+			Spec:       agentv1alpha1.PlatformAgentSpec{Integration: integration},
+		}
+		spec := buildFQDNNetworkPolicy(agent).Object["spec"].(map[string]interface{})
+		rule := spec["egress"].([]interface{})[0].(map[string]interface{})
+		var patterns []string
+		for _, m := range rule["matches"].([]interface{}) {
+			patterns = append(patterns, m.(map[string]interface{})["pattern"].(string))
+		}
+		return patterns
+	}
+
+	baseline := render(nil)
+	at := slices.Index(baseline, "*.pkg.dev")
+	if at < 0 || !slices.Equal(baseline[at+1:at+4], []string{"github.com", "*.github.com", "*.githubusercontent.com"}) {
+		t.Fatalf("GitHub's patterns moved from their pre-derivation position after *.pkg.dev: %v", baseline)
+	}
+
+	for name, integration := range map[string]*agentv1alpha1.PlatformAgentIntegrationSpec{
+		"deprecated alias": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "gke-labs", GitRepo: "kube-agents"}}},
+		"lists": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "github.com"}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "gke-labs/kube-agents", Role: "gitops"}}}},
+		"two github forges": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "ours", Namespace: "gke-labs"}, {Name: "upstream", Host: "www.github.com"}}}},
+	} {
+		if got := render(integration); !slices.Equal(got, baseline) {
+			t.Errorf("%s renders %v, expected the undeclared install's %v", name, got, baseline)
+		}
+	}
+}
+
+// The watcher's metrics listener, declared on the sidecar. Three things have
+// to agree for a scrape to work — the port the entrypoint binds, the container
+// port, and the collector's ingress rule — and all three read one constant.
+// This pins the constant's value and checks the two declarations here read it;
+// the ingress rule is TestBuildNetworkPolicy's.
+func TestAgentAPIAuthSidecarDeclaresTheWatcherMetricsPort(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var ports []corev1.ContainerPort
+	for _, p := range sidecar.Ports {
+		if p.Name == "event-metrics" {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) != 1 || ports[0].ContainerPort != 9095 {
+		t.Fatalf("want exactly one event-metrics container port on 9095, got %#v", sidecar.Ports)
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_METRICS_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_METRICS_PORT entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].Value != "9095" {
+		t.Errorf("EVENT_WATCHER_METRICS_PORT = %q, want the declared container port 9095", found[0].Value)
+	}
+}
+
+// Same hole as the three watcher variables beside it: appended after the merge,
+// so an unreserved name would sit beside a same-named spec.deployment.env entry
+// and server-side apply would reject the Deployment. And a CR that moved the
+// listener would leave the container port and the ingress rule pointing at a
+// port nothing answers on, so the operator's value has to be the only one.
+func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_METRICS_PORT", Value: "1"}},
+	}
+
+	var found []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_METRICS_PORT" {
+			found = append(found, e.Value)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_METRICS_PORT entry, got %d (%q); server-side apply rejects a duplicate key in env", len(found), found)
+	}
+	if found[0] != "9095" {
+		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
+	}
+}

@@ -79,6 +79,39 @@ _STALLED_CLIENT_READ_TIMEOUT_SECONDS = 5
 # under AgentAPIProxyHandler.max_request_bytes so the drain runs at all.
 _ANNOUNCED_BODY_NEVER_SENT = 1024 * 1024
 
+# Decimal places the fake clock keeps; enough for any poll interval the kill
+# uses, few enough that repeated sums stay exact.
+_FAKE_CLOCK_DECIMALS = 9
+
+
+class _FakeClock:
+    """A `time` stand-in for the kill's waits: `sleep` advances `monotonic`.
+
+    `ceiling` is fake seconds; a `sleep` that would carry the clock past it
+    raises instead, so a wait that stopped honouring its bound fails the test
+    with a line naming the cause rather than looping until the runner's own
+    timeout ends the job.
+    """
+
+    def __init__(self, ceiling):
+        self.now = 0.0
+        self.ceiling = ceiling
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        if self.now + seconds > self.ceiling:
+            raise AssertionError(
+                f"still waiting at fake t={self.now:.2f}s, past the "
+                f"{self.ceiling}s ceiling: a wait no longer honours its bound"
+            )
+        # Rounded so that the polls sum to the bound exactly: forty 0.05s
+        # sleeps in binary floating point land a hair past 2.0, and the
+        # deadline computed from there would then buy one poll more or fewer
+        # than the arithmetic says.
+        self.now = round(self.now + seconds, _FAKE_CLOCK_DECIMALS)
+
 
 class AgentAPIProxyTest(unittest.TestCase):
     def setUp(self):
@@ -3063,6 +3096,15 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.timed_out)
         grace_ms = credential_proxy.KILL_GRACE_SECONDS * 1000
         self.assertGreaterEqual(result.duration_ms, 1000 + grace_ms - 100)
+        # The ceiling says the second signal ended the command, not the sleep
+        # running out, so it needs seconds of slack rather than a fraction of
+        # one: the span includes forking the stub, which a loaded runner can
+        # take half a second over, and under a PID 1 that does not reap (the
+        # test process itself as PID 1 of a container, say) the killed sleep
+        # stays a zombie in the group and the wait after SIGKILL runs its
+        # whole bound. How quickly that wait returns once the group is gone
+        # is not a matter of wall-clock here; the fake-clock test below pins
+        # it.
         self.assertLess(result.duration_ms, 9000)
 
     def test_a_descendant_that_ignores_sigterm_is_killed_with_the_group(self):
@@ -3070,6 +3112,11 @@ class CommandExecutorTest(unittest.TestCase):
         # and so does that shell's sleep. The second signal has to reach the
         # group whether or not the leader is still there, or the survivors
         # keep the pipes and run on outside the slot they were counted under.
+        # The liveness read is immediate: the kill returns only once the group
+        # is empty, after SIGKILL as after SIGTERM. This read alone does not
+        # pin that wait -- the survivors hold the stub's pipes, so the drain
+        # after the kill cannot return until they have exited either way --
+        # and test_the_wait_after_sigkill_is_bounded is what does.
         pid_file = Path(self.temp_dir.name) / "stubborn.pid"
         executor = self.fake_kubectl(
             self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
@@ -3082,6 +3129,114 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertFalse(
             self.process_is_live(int(pid_file.read_text().strip())),
             "a descendant that ignored SIGTERM outlived the command",
+        )
+
+    def test_the_wait_after_sigkill_is_bounded(self):
+        # After SIGKILL the kill waits for the group to empty, so that what a
+        # command started is gone -- not merely signalled -- when `execute`
+        # returns. A group that never reads as empty (a member in
+        # uninterruptible sleep, an orphan its reaper has not collected) has
+        # to run that wait out rather than hold the slot: every signal-0 probe
+        # here answers that the group is still occupied, and the kill still
+        # returns once the grace and then the bound run out, the second signal
+        # sent once. The clock is faked and the probes counted, so the bound
+        # is pinned to its value; and a wait that stopped honouring it fails
+        # here at the clock's ceiling, not at the CI job's.
+        clock = _FakeClock(
+            ceiling=credential_proxy.KILL_GRACE_SECONDS
+            + 2 * credential_proxy.KILL_SETTLE_SECONDS
+        )
+        sent = []
+        probes_after_kill = []
+
+        def always_occupied(pgid, signum):
+            if signum != 0:
+                sent.append((signum, clock.now))
+                return None
+            if sent and sent[-1][0] == credential_proxy.signal.SIGKILL:
+                probes_after_kill.append(clock.now)
+            return None
+
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 4242
+        process.poll.return_value = None
+        with (
+            mock.patch.object(credential_proxy, "time", clock),
+            mock.patch("credential_proxy.os.killpg", always_occupied),
+            self.assertLogs("credential-proxy", level="WARNING") as logs,
+        ):
+            credential_proxy._kill_process_group(process)
+
+        self.assertEqual(
+            [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL],
+            [signum for signum, _ in sent],
+        )
+        killed_at = sent[-1][1]
+        self.assertGreaterEqual(killed_at, credential_proxy.KILL_GRACE_SECONDS)
+        # One probe per poll across the bound, plus the one at the deadline
+        # that finds the group still there and gives up.
+        self.assertEqual(
+            round(credential_proxy.KILL_SETTLE_SECONDS / credential_proxy.KILL_POLL_SECONDS)
+            + 1,
+            len(probes_after_kill),
+        )
+        self.assertAlmostEqual(
+            credential_proxy.KILL_SETTLE_SECONDS, clock.now - killed_at, places=6
+        )
+        # A bound that ran out is the one case an operator may later ask
+        # about, so it leaves a line.
+        self.assertTrue(
+            any("still occupied" in line and "after SIGKILL" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_the_wait_after_sigkill_returns_once_the_group_is_gone(self):
+        # The other half of the bound: the wait ends when the group empties,
+        # one poll later at most, not when KILL_SETTLE_SECONDS runs out. A
+        # wall-clock ceiling cannot pin that -- the span includes a fork and,
+        # under a PID 1 that does not reap, a zombie that holds the group for
+        # the whole bound -- so the clock is faked and the probes counted.
+        # The group here ignores SIGTERM, and after SIGKILL it reads occupied
+        # once (the members not yet scheduled to exit) and then empty.
+        clock = _FakeClock(
+            ceiling=credential_proxy.KILL_GRACE_SECONDS
+            + 2 * credential_proxy.KILL_SETTLE_SECONDS
+        )
+        sent = []
+        probes_after_kill = []
+
+        def group_that_empties_after_sigkill(pgid, signum):
+            if signum != 0:
+                sent.append((signum, clock.now))
+                return None
+            if sent and sent[-1][0] == credential_proxy.signal.SIGKILL:
+                probes_after_kill.append(clock.now)
+                if len(probes_after_kill) > 1:
+                    raise ProcessLookupError
+            return None
+
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 4242
+        process.poll.return_value = None
+        with (
+            mock.patch.object(credential_proxy, "time", clock),
+            mock.patch("credential_proxy.os.killpg", group_that_empties_after_sigkill),
+            self.assertNoLogs("credential-proxy", level="WARNING"),
+        ):
+            credential_proxy._kill_process_group(process)
+
+        self.assertEqual(
+            [credential_proxy.signal.SIGTERM, credential_proxy.signal.SIGKILL],
+            [signum for signum, _ in sent],
+        )
+        killed_at = sent[-1][1]
+        self.assertGreaterEqual(killed_at, credential_proxy.KILL_GRACE_SECONDS)
+        # Two probes: the one that found the group still there and the one
+        # that found it gone. A wait that ran to its bound would have made
+        # KILL_SETTLE_SECONDS / KILL_POLL_SECONDS of them.
+        self.assertEqual(2, len(probes_after_kill))
+        self.assertAlmostEqual(
+            credential_proxy.KILL_POLL_SECONDS, clock.now - killed_at, places=6
         )
 
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
@@ -3109,6 +3264,8 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.abandoned)
         self.assertFalse(result.timed_out)
         self.assertLess(time.monotonic() - started, 10)
+        # Immediate, like the other liveness reads: the sleep exits on SIGTERM,
+        # and the kill returns from its grace only once the group is empty.
         self.assertFalse(
             self.process_is_live(int(pid_file.read_text().strip())),
             "the sleep the command started outlived the hang-up",
@@ -3117,10 +3274,18 @@ class CommandExecutorTest(unittest.TestCase):
     def test_a_command_that_closes_its_pipes_and_runs_on_still_meets_the_deadline(self):
         # With both pipes closed there is nothing left to read, so the
         # deadline is enforced by the wait that follows -- at the deadline,
-        # not at the end of the drain grace a killed command gets.
+        # not at the end of the drain grace a killed command gets. The sleep
+        # replaces the shell rather than running under it so that the group
+        # holds one process, the child, which exits on SIGTERM and is reaped
+        # here: a sleep forked by the shell is reparented at the kill, and
+        # under a PID 1 that does not reap (the test process itself as PID 1
+        # of a container, say) it stays a zombie in the group, the kill runs
+        # the whole grace and then the whole wait after SIGKILL, and the span
+        # lands on the ceiling. The ceiling stays where the drain grace is
+        # what it has to tell the deadline apart from.
         executor = self.fake_kubectl(
             self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
-            body="exec >&- 2>&-; sleep 10",
+            body="exec >&- 2>&-; exec sleep 10",
         )
 
         result = executor.execute(["kubectl", "get", "pods"])
@@ -3133,7 +3298,14 @@ class CommandExecutorTest(unittest.TestCase):
 
     @staticmethod
     def process_is_live(pid):
-        """Is `pid` still running? A zombie or a missing entry both mean no."""
+        """Is `pid` still running? A zombie or a missing entry both mean no.
+
+        Read right after `execute()` returns, with no retry: `_kill_process_group`
+        returns only once the group is empty, after SIGTERM and after SIGKILL
+        alike, or once its bound for that has run out. The reads check that the
+        kill reached what the command started; the wait itself is pinned by
+        `test_the_wait_after_sigkill_is_bounded`.
+        """
         try:
             with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
                 for line in handle:
@@ -3169,6 +3341,8 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.abandoned)
         self.assertFalse(result.timed_out)
         self.assertLess(time.monotonic() - started, 10)
+        # Immediate, like the other liveness reads: the sleep exits on SIGTERM,
+        # and the kill returns from its grace only once the group is empty.
         self.assertFalse(
             self.process_is_live(int(pid_file.read_text().strip())),
             "the sleep the command started outlived the command",
@@ -3402,7 +3576,12 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_an_emptied_group_gets_no_sigkill(self):
         # Once the group is seen empty its id is free for reuse, so the second
-        # signal goes only to a group the grace ran out on.
+        # signal goes only to a group the grace ran out on. The sleep replaces
+        # the shell so that the group empties on SIGTERM wherever the test
+        # runs: a sleep forked under the shell is reparented at the kill, and
+        # under a PID 1 that does not reap it stays a zombie in the group
+        # through the whole grace, and the SIGKILL this test says must not be
+        # sent is sent.
         sent = []
         real_killpg = os.killpg
 
@@ -3411,7 +3590,8 @@ class CommandExecutorTest(unittest.TestCase):
             return real_killpg(pgid, signum)
 
         executor = self.fake_kubectl(
-            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1), body="sleep 10"
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="exec sleep 10",
         )
         with mock.patch("credential_proxy.os.killpg", recording):
             result = executor.execute(["kubectl", "get", "pods"])
@@ -5680,7 +5860,7 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "issue-list", "issue-view"},
+             "proposal-commits", "issue-list", "issue-view", "branch-view"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )

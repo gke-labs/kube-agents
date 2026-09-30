@@ -62,7 +62,8 @@ _Illustrative end-state shape._ It generalizes today's `PlatformAgent`: `tier` /
 and `iac.format` are **new**; `serviceAccountName` and `runtimeClassName` exist today **nested** under
 `spec.security` / `spec.deployment` (`k8s-operator/api/v1alpha1`), `spec.harness` is a **struct** (not
 the string shown), and `integration` (with per-platform `allowedUsers`) already exists nested under
-`spec.integration.{googleChat,slack}` (`platformagent_types.go:32–108`). `profile` denotes persona
+`spec.integration.{googleChat,slack}` plus the forge and repository declarations `spec.integration.forges` and
+`spec.integration.repositories` (with `spec.integration.github` as a deprecated alias) (`platformagent_types.go`). `profile` denotes persona
 selection — **v1 = a baked per-tier image** (`<tier>-agent:<tag>`, built from `agents/<tier>/` exactly as
 the platform image is today; [08](08-agent-runtime-and-identity.md) §2); a mounted profile is deferred.
 Phase 1/2 decide only which fields to **promote** vs keep nested ([07](07-implementation-roadmap.md)).

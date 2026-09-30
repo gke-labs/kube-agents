@@ -20,10 +20,11 @@ Every read runs as that project's seeded-fleet reader
 (`seeded-fleet-reader@<project>`, bench/tf/fleet). CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT
 makes gcloud impersonate it for the cluster listing, the credentials and the
 control-plane describes; FLEET_READONLY_SA makes the runner rewrite each
-kubeconfig so kubectl's token is minted as it too. The bot therefore needs
-exactly one grant per pool project -- roles/iam.serviceAccountTokenCreator on
-that account, the grant #1238 gave the presubmit's identity -- and nothing on
-the project itself. The impersonation is pre-flighted with one token mint, so
+kubeconfig so kubectl's token is minted as it too. For this scan the bot
+therefore needs one grant per pool project -- roles/iam.serviceAccountTokenCreator
+on that account, the grant #1238 gave the presubmit's identity; the read roles
+it holds on the project itself serve the pool-state scan (pool_state.py), not
+this one. The impersonation is pre-flighted with one token mint, so
 a project missing the grant is "not checked" with gcloud's own words rather
 than a runner that could not list clusters.
 
@@ -118,6 +119,13 @@ KEY_PREVIOUS = "previous"
 KEY_DRIFTED = "drifted"
 KEY_READER = "reader"
 KEY_ERROR = "error"
+# What the document covers: the whole mapping (the hourly job), or the ids a
+# hand run named with --projects. The health rule reads a project absent from
+# a pool-scoped document as retired from the mapping; from a selected one, as
+# not read. pool_state.py writes the same key.
+KEY_SCOPE = "scope"
+SCOPE_POOL = "pool"
+SCOPE_SELECTED = "selected"
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -364,6 +372,20 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
     return out
 
 
+def unread_units(document: dict | None) -> int:
+    """How many roles went unread on projects the scan did check."""
+    count = 0
+    projects = (document or {}).get(KEY_PROJECTS) if isinstance(document, dict) else None
+    for entry in (projects or {}).values() if isinstance(projects, dict) else []:
+        roles = (entry or {}).get(KEY_ROLES) if isinstance(entry, dict) else None
+        if not isinstance(roles, dict):
+            continue
+        states = [v.get(KEY_STATE) for v in roles.values() if isinstance(v, dict)]
+        if any(s in (ROLE_HEALTHY, ROLE_DRIFTED) for s in states):
+            count += sum(1 for s in states if s == ROLE_NOT_CHECKED)
+    return count
+
+
 def read_map(document: dict | None) -> dict[str, list[str]]:
     """{project: [roles the scan read there, healthy or drifted]}, sorted."""
     out: dict[str, list[str]] = {}
@@ -443,6 +465,7 @@ def scan(
     project_timeout: float = DEFAULT_PROJECT_TIMEOUT_S,
     impersonate: bool = True,
     which=shutil.which,
+    scope: str = SCOPE_POOL,
     **project_kwargs,
 ) -> dict:
     """fixture-state.json as a dict. `prior` is the previously published
@@ -468,6 +491,7 @@ def scan(
     document = {
         "schema_version": SCHEMA_VERSION,
         KEY_SCANNED_AT: iso(now),
+        KEY_SCOPE: scope,
         KEY_DURATION: int(time.monotonic() - started),
         KEY_PROJECTS: entries,
         KEY_SUMMARY: summarize(entries),
@@ -530,6 +554,7 @@ def main(argv=None) -> int:
             workdir,
             prior=load_json(args.prior),
             now=parse_iso(args.now),
+            scope=SCOPE_SELECTED if args.projects else SCOPE_POOL,
             workers=args.workers,
             project_timeout=args.project_timeout,
             impersonate=not args.no_impersonate,

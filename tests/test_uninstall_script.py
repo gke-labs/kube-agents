@@ -1134,7 +1134,7 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         # The scope keys for the same reason: the generator's triple check and
         # terraform's variable validation both run on the destroy path.
-        scope_at = text.find('export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
+        scope_at = text.find('export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
         self.assertNotEqual(scope_at, -1, "uninstall.sh must blank the SCOPE_* keys")
         self.assertLess(scope_at, call_at)
 

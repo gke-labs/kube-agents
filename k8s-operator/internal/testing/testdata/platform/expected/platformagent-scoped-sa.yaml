@@ -914,6 +914,10 @@ spec:
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
               value: /var/run/credential-proxy/backend.sock
+            - name: CREDENTIAL_PROXY_PORT
+              value: "8765"
+            - name: CREDENTIAL_PROXY_METRICS_PORT
+              value: "8766"
             - name: KUBECONFIG
               value: /var/run/event-watcher/watcher.config
             - name: KSA_TOKEN_FILE
@@ -975,6 +979,8 @@ spec:
           ports:
             - containerPort: 8765
               name: cred-proxy
+            - containerPort: 8766
+              name: cred-metrics
           readinessProbe:
             failureThreshold: 3
             httpGet:
@@ -1108,6 +1114,13 @@ spec:
               app: platformagent-gateway
       ports:
         - port: 8765
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8766
           protocol: TCP
   podSelector:
     matchLabels:
@@ -1526,6 +1539,8 @@ spec:
                   resource: limits.memory
             - name: EVENT_WATCHER_ENABLED
               value: "true"
+            - name: EVENT_WATCHER_METRICS_PORT
+              value: "9095"
             - name: DRIFT_DETECTOR_ENABLED
               value: "false"
             - name: CREDENTIAL_PROXY_ROLE
@@ -1536,6 +1551,8 @@ spec:
           ports:
             - containerPort: 8643
               name: proxy-api
+            - containerPort: 9095
+              name: event-metrics
           readinessProbe:
             failureThreshold: 3
             initialDelaySeconds: 5
@@ -1872,6 +1889,13 @@ spec:
         - port: 8643
           protocol: TCP
         - port: 9119
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9095
           protocol: TCP
   podSelector:
     matchLabels:

@@ -130,15 +130,20 @@ func completeTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client
 	name := buildA2AProvisionJob(agent).Name
 	job := &batchv1.Job{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, job); err != nil {
-		jobs := &batchv1.JobList{}
-		if lerr := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); lerr != nil {
-			t.Fatalf("get provision Job %s: %v (and listing Jobs failed: %v)", name, err, lerr)
+		if !errors.IsNotFound(err) {
+			t.Fatalf("get provision Job %s: %v", name, err)
 		}
-		var names []string
-		for i := range jobs.Items {
-			names = append(names, jobs.Items[i].Name)
+		// Absent: the Job's own creation waits on the callout, so on a rig
+		// where the callout has not reported yet there is nothing to
+		// complete. Create it under the render's exact name, as the pass
+		// that ran while the callout served would have; this models an
+		// install provisioned before its callout went away, the state the
+		// gateway gate's tests measure against.
+		job = buildA2AProvisionJob(agent)
+		withCommonLabels(job, agent)
+		if err := cl.Create(ctx, job); err != nil {
+			t.Fatalf("create provision Job %s for the rig: %v", name, err)
 		}
-		t.Fatalf("no A2A provision Job named %s; the namespace holds %v. The render and this helper disagree about the digest, so completing anything here would be completing the wrong Job", name, names)
 	}
 	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	if err := cl.Status().Update(ctx, job); err != nil {
@@ -824,6 +829,11 @@ func TestAFailedJobPassStillMaintainsTheA2AConditions(t *testing.T) {
 	r, cl, req := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
+	// The Job's creation waits on the callout, so it is the pass after the
+	// callout reports that creates it.
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
 	jobs := &batchv1.JobList{}
 	if err := cl.List(ctx, jobs); err != nil || len(jobs.Items) != 1 {
 		t.Fatalf("one provision Job expected after the render (got %d, err %v)", len(jobs.Items), err)
@@ -874,6 +884,94 @@ func TestAFailedJobPassStillMaintainsTheA2AConditions(t *testing.T) {
 	}
 	if cond := meta.FindStatusCondition(stored.Status.Conditions, a2aGatewayConditionType); cond != nil {
 		t.Errorf("the gateway is running and the parked CR still says it is withheld: %+v", cond)
+	}
+}
+
+// TestAHeldProvisionJobReadsProvisioningNamingTheCallout: the composition
+// with the Ready writer (#2057). On an install that is running and has been
+// provisioned once, a Job re-render (a spec edit moves the digest) while the
+// callout has no ready replica is held, and the previous Job is swept; the
+// CR must not read Ready over that. It does not, because the callout
+// Deployment itself is counted: the phase is Provisioning naming the callout,
+// whatever the provisioned-once record says, and the record survives so the
+// re-run does not count the Job again once the callout is back.
+func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(stored) {
+		t.Fatal("precondition: the install did not record the bus provisioned once")
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the gateway is not running: %v", err)
+	}
+
+	// The callout loses every ready replica and the Job is re-rendered.
+	reportCalloutStatus(t, ctx, cl, agent, 2, 0, 2)
+	t.Setenv(a2aProvisionImageEnvVar, "example.com/nats-box:rerender")
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the re-render: %v", i+1, err)
+		}
+	}
+	jobs := &batchv1.JobList{}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("%d provision Jobs exist with no callout replica ready, want none: the new one is held and the old one swept", len(jobs.Items))
+	}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, "Ready")
+	if stored.Status.Phase == "Ready" || ready == nil || ready.Status == metav1.ConditionTrue {
+		t.Fatalf("the CR reads Ready (phase %q, %+v) over a held provision Job and a callout with no ready replica", stored.Status.Phase, ready)
+	}
+	if !busProvisioned(stored) {
+		t.Error("the provisioned-once record was lost across the hold; the re-run would count the Job again")
+	}
+
+	// The message names the callout once the agent gateway itself reads
+	// ready (the fake runs no Deployment controller, so report it), which
+	// is the message an operator of a running install would see: the
+	// render's held state handed to the Ready writer.
+	gw := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gateway", Namespace: agent.Namespace}, gw); err != nil {
+		t.Fatalf("get the agent gateway Deployment: %v", err)
+	}
+	gw.Status.ReadyReplicas = 1
+	if err := cl.Status().Update(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	state, err := r.reconcileA2A(ctx, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.jobHeld {
+		t.Fatal("precondition: the re-rendered Job is not held with no callout replica ready")
+	}
+	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready = meta.FindStatusCondition(stored.Status.Conditions, "Ready")
+	if phase == "Ready" || ready == nil || !strings.Contains(ready.Message, "Deployment "+a2aCalloutName(agent)) {
+		t.Errorf("phase %q, message %q: want Provisioning naming the callout Deployment the held Job waits on", phase, ready.Message)
 	}
 }
 

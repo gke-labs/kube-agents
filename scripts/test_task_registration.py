@@ -28,8 +28,9 @@ retired: a case path inside a roster-file comment is a finding.
 
 This lint and scripts/test_domain_coverage.py ratchet together. That one
 counts a domain covered only when a task carrying its slug and a non-empty
-verification_spec is in the PRESUBMIT file, so a nightly-only task never
-counts as coverage; this one guarantees every task is at least registered
+verification_spec is on the BLOCKING ROSTER, so neither a nightly-only task
+nor a held-out presubmit seat counts as coverage; this one guarantees every
+task is at least registered
 and internally valid.
 
 The files are read with the parse in scripts/eval_rosters.py, the Python copy
@@ -840,6 +841,8 @@ class TestTheSanitizer(unittest.TestCase):
             "a Slack token": "xoxb-" + "0" * 10,
             "a JWT": "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10,
             "an sk- API key": "sk-" + "a" * 20,
+            "an Anthropic or hyphenated OpenAI key": "sk-ant-api03-" + "A1b2C3d4" * 5,
+            "an AWS access key id": "AKIAIOSFODNN7EXAMPLE",
         }
         for label, value in shapes.items():
             with self.subTest(shape=label):

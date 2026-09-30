@@ -41,11 +41,15 @@ re-initializing against that project's bucket and naming the project on the appl
 
 Local validation without credentials: `tofu init -backend=false && tofu validate`.
 
-Drift is corrected by re-applying this stack on a schedule — a scheduled GitHub
-workflow, because the repository's other recurring jobs already live there and the
-apply needs nothing Cloud Build has that Actions lacks. The workflow does not exist
-yet; creating it is the fleet owner's call (#1550). Until it does, a manual `tofu apply`
-after any suspected drift is the reconcile. Detecting the drift is a separate job, and
+Drift is corrected by re-applying this stack with `hack/fleet_reconcile.py`, which holds each
+project through Boskos for its one apply, applies only creates and in-place updates and
+refuses anything else; that apply is a person's. Its schedule is two Prow periodic entries in
+`oss-test-infra`, `main` only: hourly for the projects the CI health bot's scan reports
+drifted, weekly for all of them (`docs/ci-pool-projects.md` §6.2). Until those entries exist,
+a hand run of the script is the reconcile. Its `init` runs with `-lockfile=readonly`, so the
+providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
+changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
+here, and commit the result. Detecting the drift is a separate job, and
 it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one project
 when asked, and the CI health bot's hourly scan runs it against every pool project and
 reports a repeated drift the way it reports a lost build node
@@ -230,7 +234,8 @@ apart from "the cluster was unreachable" (an error).
 `hack/ci-eval-pr.sh` addresses this fleet directly in one place, §3b, the log-fixture
 subject, which `fixtures.json`'s description names as the sanctioned exception to its
 rule. It mutates nothing in-cluster, and nothing in the job repairs a drifted fleet:
-the hourly scan above detects one, and a manual `tofu apply` per project corrects it.
+the hourly scan above detects one, and the scheduled reconcile ("State and reconcile")
+corrects it.
 
 On every presubmit in a fleet-carrying project §3b discovers **slot c** by the same
 two labels and the trailing `-<slot>` name segment, verifies
@@ -261,15 +266,17 @@ account to the members in `var.fleet_reader_token_creators` — which defaults t
 presubmit runs as, to `eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com`,
 the nightly periodic's, and to `eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com`,
 the CI health bot, whose hourly fixture-state scan reads every pool project's fleet as
-the reader and holds nothing else on the project
+the reader; on the project itself it holds only the pool-state scan's roles, below
 ([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan").
 `hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
 account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential
 naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
 `kubectl` asks for one.
 
-Without the grant the script writes nothing and exits 3, and a run that leases the project —
-presubmit or nightly — stops at that step. On a fleet only you use, leave `FLEET_READONLY_SA` unset and set
+Without the token-creator grant the script writes nothing and exits 3, and a run that
+leases the project stops at that step.
+
+On a fleet only you use, leave `FLEET_READONLY_SA` unset and set
 `FLEET_ALLOW_RUNNER_CREDENTIAL=1` to read it on your own credential. The alternative
 was reading the fleet as the runner's own identity, which holds `roles/container.admin` among the twelve project roles
 `scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
@@ -288,6 +295,11 @@ is checkable rather than asserted:
       --impersonate-service-account="seeded-fleet-reader@<project>.iam.gserviceaccount.com" \
       | xargs -I{} kubectl --token={} auth can-i delete deployments -n seeded-debug
     # must print: no
+
+The stack also grants `var.pool_state_readers` (default: the bot) the roles in
+`local.pool_state_reader_roles` for its hourly pool-state scan
+([`docs/ci-health.md`](../../../docs/ci-health.md), "The pool-state scan"); a project
+applied before that default scans as "not checked".
 
 Three things about this are worth stating rather than assuming:
 

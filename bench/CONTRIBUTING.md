@@ -76,10 +76,10 @@ directories and fail on a line that carries either:
 - a credential-shaped string: the token-shaped subset of `AuditRedactor`'s patterns,
   imported from `agents/chat/defaults/plugins/common/redactor.py` so the scan and the audit
   log agree on what a credential looks like. `CREDENTIAL_SHAPES` in
-  `scripts/validate_bench_cases.py` is the list of record; today it is private-key blocks
-  and the `AIza`, `ya29.`, `gh*_`, `github_pat_`, `xox*-`, `sk-` and JWT shapes. The
-  redactor's bearer, key/value and e-mail patterns are left out because each matches
-  ordinary prose in a prompt.
+  `scripts/validate_bench_cases.py` is the list of record. The redactor's bearer,
+  key/value and e-mail patterns are left out because each matches ordinary prose in a
+  prompt, and its env-pair and URL-password patterns because they match the sample
+  manifests and connection strings a fixture carries on purpose.
 
 Paths with a component beginning with a dot, `*.tfstate*` and `*.tfvars` are skipped, so a
 local `tofu apply` cannot red the check.
@@ -123,7 +123,9 @@ answer stays demoted. The bar there is the same for a contributed case and an in
 
 A merged case runs every night, and on a pull request only once it is admitted: since
 2026-09-22 the presubmit runs the blocking roster and nothing else, so a presubmit seat is a
-roster seat and there is no in-between state that runs on pull requests without blocking.
+roster seat; the one in-between state is the held-out seat a coverage tracker may take in the
+presubmit file (`presubmit-cases.txt`'s last section), which runs on pull requests without
+blocking on a graded failure until its roster line lands.
 Admitted means named in `hack/eval/blocking-roster.txt` (the default of `BOOTSTRAP_ADMITTED`
 in `hack/ci-eval-pr.sh`) with the case's line in `hack/eval/presubmit-cases.txt`, where an
 admitted case can red a pull request on a graded failure. The evidence
@@ -141,7 +143,8 @@ Proposing admission is one pull request that moves the case's line from
 `hack/eval/nightly-cases.txt` to `hack/eval/presubmit-cases.txt` and adds its name to
 `hack/eval/blocking-roster.txt` — the three edits together, because `hack/ci-eval-pr.sh`
 refuses a roster name that is not a presubmit case, refuses a case listed in both files, and
-`scripts/test_eval_rosters.py` pins the two presubmit files as equal — and cites the record:
+`scripts/test_eval_rosters.py` pins the two presubmit files as equal less those held-out seats —
+and cites the record:
 the verdict's **Record says** column once the store holds a full window (`would-admit`), or
 before that the nightly runs, what failed and why each failure was the case's own regression
 or an infrastructure class the harness already excludes. The roster page's hold-out entries

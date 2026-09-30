@@ -25,20 +25,29 @@ RC_CANDIDATE_COMMIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --verify "${RC_CANDID
 
 RELEASE_COMMIT="$(create_stamped_release_commit "${RELEASE_VERSION}" "${RC_CANDIDATE_COMMIT_SHA}" "${REPO_ROOT}")"
 
-# The banner comes from tag_commit.sh, below, rather than being printed here:
-# the stamped release commit is resolved first, so the banner can name the commit
-# the tag actually lands on. This script keeps what is genuinely its own — the
-# pure-SemVer gate, the swapped-argument handling, and the stamping — and hands
-# the tag itself to the shared tagger. A mistaken GA tag is the one rung of the
-# ladder that cannot be fixed by deleting a tag, so it does not get a private
-# copy of the tagging logic either.
-GA_TAG_DETAILS=(--detail "Release Version:     ${RELEASE_VERSION}")
-GA_TAG_DETAILS+=(--detail "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}")
-if [ "${RELEASE_COMMIT}" != "${RC_CANDIDATE_COMMIT_SHA}" ]; then
-  GA_TAG_DETAILS+=(--detail "Release Commit:      ${RELEASE_COMMIT:0:7}")
-fi
+RELEASE_LINE_BRANCH="$(release_branch_for_line "$(release_line_for_version "${RELEASE_VERSION}")")"
 
-exec "${SCRIPT_DIR}/tag_commit.sh" \
-  --title "CREATING AND PUSHING GA RELEASE GIT TAG" \
-  "${GA_TAG_DETAILS[@]}" \
-  "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "Release ${RELEASE_VERSION}"
+# The banner is printed here rather than by tag_commit.sh: the GA rung pushes
+# two refs, the tag and its release line, and it pushes them atomically through
+# ensure_ga_release_refs so that neither can exist on the remote without the
+# other, and it reads where the line is before anything is pushed: a line at
+# any commit but the release commit, its candidate, or beyond it stops the run
+# with nothing pushed. The line's first release creates `release/X.Y` because
+# the line is absent; a later patch fast-forwards it because it is at the
+# candidate; a merge that lands on the line meanwhile rejects the whole push,
+# and the re-run stamps from the new head. This script keeps what is genuinely its own — the pure-SemVer gate, the
+# swapped-argument handling, the stamping — and the shared helpers keep the
+# idempotency contract every rung of the ladder has.
+echo "======================================================================"
+echo "🏷️ CREATING AND PUSHING GA RELEASE GIT TAG"
+echo "Tag:          ${RELEASE_VERSION}"
+echo "Commit SHA:   ${RELEASE_COMMIT}"
+echo "Release Version:     ${RELEASE_VERSION}"
+echo "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}"
+if [ "${RELEASE_COMMIT}" != "${RC_CANDIDATE_COMMIT_SHA}" ]; then
+  echo "Release Commit:      ${RELEASE_COMMIT:0:7}"
+fi
+echo "Release Line:        ${RELEASE_LINE_BRANCH}"
+echo "======================================================================"
+
+ensure_ga_release_refs "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "${RC_CANDIDATE_COMMIT_SHA}"

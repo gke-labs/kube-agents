@@ -586,6 +586,9 @@ def test_capture_survives_a_sentinel_without_json() -> None:
         ("ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnopqrstuv", "ANTHROPIC_API_KEY=", "abcdefghij"),
         ("SLACK_BOT=xoxb-1234567890-abcdefghij", "SLACK_BOT=", "1234567890"),
         ("https://user:hunter22@github.com/org/repo.git", "@github.com/org/repo.git", "hunter22"),
+        # A raw `@` in the password and a dotless in-cluster host, which the
+        # e-mail pattern does not catch either.
+        ("postgres://admin:p@ssw0rd@db/app", "@db/app", "ssw0rd"),
         (
             "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
             "[REDACTED_PRIVATE_KEY]",

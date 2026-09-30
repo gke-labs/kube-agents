@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Step 1's IAM bindings, installer path and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input, the composition's `scope` variable feeding the module and the chart from one value, and the installer's `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys. Steps 2 and 3's IAM bindings and installer paths (for step 3, the plan-time resolution of the two selectors), step 1's `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 and 2's IAM bindings, installer paths and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input binding `scope_roles` per explicit project and `scope_roles` plus `roles/cloudasset.viewer` on each folder and organisation, the composition's `scope` variable feeding the module and the chart from one value and enabling `cloudasset.googleapis.com` when a container is declared, the installer's `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys, and the pre-apply preflight for container IAM and the Asset API under organisation policy. Step 3's IAM bindings and installer path are implemented too: the composition resolves `shared_vpc_hosts` and `metrics_scopes` at plan time through the `kube-agents-scope-resolver` module, with the provider's own token (`data "http"` against the Compute, Monitoring and Resource Manager APIs), and `kube-agents-iam` binds `scope_roles` in every project resolved and in each scoping project, and `roles/compute.viewer` alone in a host not otherwise in scope, a failed read failing the plan; the composition and the installer's `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES` keys carry both to the module and the chart from one value, and the pre-apply scope check weighs them. Step 1's `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -77,7 +77,7 @@ Cluster Agent is named, stored, or driven:
 - PRUNE works per stamped identity, not per resolved project: `_cluster_exists`
   (`cluster_agent_reconcile.py:135-163`) runs `describe --project=<identity.project>`, so a profile
   for a cluster in another project is verified against the right project today.
-- `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:235-243`).
+- `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:366-369`).
 - The credential broker passes `--project` through as a value-taking flag
   (`_GCLOUD_FLAGS_WITH_VALUE` in `agents/platform/scripts/command_policy.py`), takes the project from the kubeconfig context
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project
@@ -134,9 +134,9 @@ Rules:
   explicitly appears once. An excluded project is dropped whether it was reached through a list or a
   container.
 - **`exclude.projects` entries are project IDs or shell-style globs.** A glob (`*-sandbox`) is
-  matched against the resolved project ID with `fnmatch`, after every selector has contributed.
+  matched against the resolved project ID with `fnmatch`, after every selector has contributed, and never against a project number, the handle a Metrics Scope names a monitored project by, which an entry matches by equality alone, as the install path's exact filter does.
   Globs are deterministic, so §5's byte-identical snapshot rule holds. An entry, ID or glob, that
-  matches the management project does not exclude it, by the rule above; the run keeps the project, logs the
+  matches the management project, by ID or by the number a Metrics Scope named it by, does not exclude it, by the rule above; the run keeps the project, logs the
   match, and records the first such entry under the snapshot's `ignoredExcludes` (§5), because a silently ignored
   exclusion is the kind of outcome §4 forbids. Decided 2026-09-21, from the first enterprise request for this feature.
 - **The resolved set is the management project plus every project a selector produced and no
@@ -218,10 +218,11 @@ host-project API enablement (`google_project_service.required` in
 `terraform/examples/full-install/main.tf`), and `cloudasset.googleapis.com` joins that list when a
 folder or organisation is declared and not otherwise: an install that names explicit projects only
 never calls the Asset API, and must not fail under an organisation policy that forbids it. Where a
-container is declared, the installer preflights, before the apply and with the identity running
-Terraform, that the API can be enabled in the host project and that this identity can set IAM
-policy on the container; the agent's own `roles/cloudasset.viewer` is bound by the apply that
-follows. A policy that forbids the API is reported by name (§6, §10). A Resource Manager walk (`projects list` per folder, recursing into every
+container is declared, the installer preflights before the apply that the API is enabled in the
+host project or that no enforced organisation policy forbids it (read through gcloud's active
+account, whose answer does not depend on who asks) and that the identity Terraform applies with,
+read the way the google provider reads its credentials, can set IAM policy on the container; the
+agent's own `roles/cloudasset.viewer` is bound by the apply that follows. A policy that forbids the API is reported by name (§6, §10). A Resource Manager walk (`projects list` per folder, recursing into every
 sub-folder) was considered and dropped from this design: it is one call per folder plus one per
 project, needs `resourcemanager.folders.list` and `resourcemanager.projects.list` at the
 container on top of the viewer roles, and `parent.id` matches the immediate parent only, so a
@@ -292,6 +293,7 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
   "declared": { "projects": [...], "folders": [...], "organizations": [...], "sharedVpcHosts": [...], "metricsScopes": [...], "exclude": {...} },
   "resolver": "asset-inventory",
   "ignoredExcludes": [{ "project": "ops-mgmt", "pattern": "ops-*" }],
+  "numbers": { "111222333444": "team-a" },
   "containers": [
     { "id": "folders/123456789012", "outcome": "ok", "projects": 3 }
   ],
@@ -323,7 +325,7 @@ that could read it did: a profile whose `cluster_identity` cannot be read this r
 through this map, so a `retiring` project whose remaining profile is unreadable stays `retiring`
 rather than leaving the snapshot and reading as never in scope once the identity is readable again.
 
-A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, and every later row for the project keeps it, explicit, management, container and `retiring` rows included, so a later run whose naming call is refused can still report the project under its ID (§10 step 3).
+A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, and every later row for the project keeps it, explicit, management, container and `retiring` rows included, so a later run whose naming call is refused can still report the project under its ID (§10 step 3). `numbers` keeps every number-to-ID pair the naming pass has returned while a selector still reports the number, so the pair outlives the project's row: a project an `exclude.projects` number names has no row, and without the pair a run whose naming call is cut would tie nothing to the ID and admit the project again on a route that names it by ID, creating profiles the next run retires. A number no selector reports any more leaves the map unless an `exclude.projects` entry names it, since the entry is what still needs the tie (a row keeps its number only until the project's last profile is pruned, and an entry that lost its tie with the row would admit the project again and re-create the profiles it had just deleted); every pair is kept on a run whose selector lookup failed or whose declaration could not be read.
 
 A project entry carries two fields that answer different questions. `outcome` (§4) says whether
 the run could read the project this tick. `state` says what the declaration wants: `in-scope` for
@@ -331,12 +333,15 @@ a project the current scope resolves, `retiring` for one the scope has dropped a
 §7 is still removing. `unmanaged` is a separate list, per profile rather than per project, of
 profiles on the PVC whose project the scope never produced.
 
-Today the roster is the set of profile directories under `$HERMES_HOME/profiles/`, read by the
-bootstrap gate (`agents/chat/scripts/bootstrap_scan_gate.py`) through one `hermes profile list`
-call (`_roster_command()`, `:148`). The gate keeps reading that; the snapshot sits beside it as
-`$HERMES_HOME/fleet_scope.json` and the gate's instructions to the sweep worker name any project
-whose outcome is not `ok`, so a partial roster is reported as partial rather than audited as
-complete.
+Today the roster is the set of profiles under `$HERMES_HOME/profiles/` that finished
+scaffolding and carry a cluster identity, read by the bootstrap gate
+(`agents/chat/scripts/bootstrap_scan_gate.py`) through `cluster_agent_profile.list_profiles()`,
+`profile_scaffold.is_scaffolded()`, `cluster_agent_reconcile.SCAFFOLD_ARTIFACTS` and
+`read_cluster_identity()` (`_cluster_agent_calls()`).
+The gate keeps reading that; the snapshot sits beside it as `$HERMES_HOME/fleet_scope.json` and,
+when the scope holds more than one project, the gate's instructions to the sweep worker name any
+project whose outcome is not `ok`, so a partial roster is reported as partial rather than audited
+as complete.
 
 The operator renders `spec.scope` to the pod the way it renders other agent configuration, as a
 mounted file rather than an environment variable: the lists are unbounded and the CRD already
@@ -361,7 +366,33 @@ follow the selector type:
   `roles/cloudasset.viewer`, on the folder.
 - **Organisation.** `google_organization_iam_member`, same roles, on the organisation.
 - **Shared VPC host and Metrics Scope selectors (phase 3).** Resolved at plan time and bound as
-  explicit projects; nothing is inherited through either.
+  explicit projects; nothing is inherited through either. The resolution is a module of its own,
+  `terraform/modules/kube-agents-scope-resolver`, which the composition calls beside
+  `kube-agents-iam` and whose `members` output is that module's `scope_selector_members` input:
+  three `data "http"` reads, the Compute API's `getXpnResources`, the Monitoring API's
+  `metricsScopes.get` and Resource Manager to name each monitored project, made with the google
+  provider's own access token so they are answered for the identity that applies. Not inside
+  `kube-agents-iam`, because the composition calls that module with a module-level `depends_on`
+  (the Workload Identity pool before its binding), which defers every data source in it to apply
+  time whenever a target has a planned change, a first install above all, and a `for_each` keyed
+  on a deferred read fails the plan as unknown; `kube-agents-iam` refuses a declared selector with
+  no entry in the input instead. The Metrics Scope's scoping project is bound with `scope_roles`
+  too, and a Shared VPC host not otherwise in scope with `roles/compute.viewer` alone, even when an
+  exclude entry names them, because the reconcile's lookups read them (`compute.projects.get` in
+  the host; `resourcemanager.projects.get` and `.list` in the scoping project, which both managing
+  roles carry) and an unbound one would read `denied` every tick and freeze the selector; the plan
+  is refused when the intersection lacks `roles/compute.viewer` beside a host. A read that fails
+  fails the plan, with the selector and the API's answer in the error, before anything is applied,
+  which is why the installer runs no preflight for the selectors' reads: a container's failure
+  lands inside the apply, a failed read in the plan with nothing changed. The bindings are the
+  explicit projects' case, a project the applying identity cannot set IAM policy in failing inside
+  the apply, and a `testIamPermissions` probe over the resolved set is a follow-up for both. An `exclude.projects` entry that names a resolved member exactly (by
+  ID for a Shared VPC service project, or by the number the Monitoring API returned for a
+  monitored project) keeps it out of the bindings, the one place an exclusion reaches IAM, because
+  a selector's member has no list to be dropped from; a monitored project excluded by ID keeps its
+  grant, because the reconcile names every monitored project with the agent's credentials before it
+  can match the entry and an unnamed member holds the scope prune; a project that is not a Shared
+  VPC host resolves to no members, as at runtime.
 
 `scope_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
 `project_roles` itself, and it is what every grant outside the host project carries, whether the
@@ -376,7 +407,7 @@ in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection m
 quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
 projects the agent only reads. Widening `project_roles` widens the host project alone; widening
 what the scope carries is an edit to the allowlist, in one file, on purpose. The module refuses the
-plan when `scope.projects` is non-empty and the intersection carries neither
+plan when `scope.projects`, `scope.folders`, `scope.organizations`, `scope.shared_vpc_hosts` or `scope.metrics_scopes` is non-empty and the intersection carries neither
 `roles/container.clusterViewer` nor `roles/container.viewer`, the two allowlist roles that carry
 `container.clusters.get` as well as `container.clusters.list`: `roles/iam.securityReviewer` lists
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
@@ -399,16 +430,38 @@ which §9 takes up.
 
 Prerequisites the design has to state and the installer has to preflight:
 
-- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Today it needs only
+- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Before phase 2 it needed only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
-  than failing on the first.
+  than failing on the first, and makes the IAM probe as the credentials Terraform applies with, read
+  the way the google provider reads them, rather than as gcloud's active account.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
-- When a folder or organisation is declared, the identity running Terraform can enable
-  `cloudasset.googleapis.com` in the host project, checked before the apply that then binds the
-  agent's `roles/cloudasset.viewer` on each container. The preflight names an organisation policy
-  that forbids the API rather than failing inside `google_project_service`; an install that
-  declares only explicit projects skips this check and never enables the API (§4).
+- For a Shared VPC host or a Metrics Scope, the identity running Terraform needs
+  `compute.projects.get` on each host, to read the Metrics Scope in its scoping project with
+  `monitoring.googleapis.com` enabled there, `resourcemanager.projects.get` on each monitored
+  project, and `setIamPolicy` in every project resolved. No shell preflight probes them: a read
+  the identity cannot make fails the plan itself, before anything is applied, and a binding it
+  cannot make fails inside the apply exactly as an explicit project's does (the phase 3 bullet
+  above says why). The reads name the management project as their consumer project, so they use
+  its `cloudresourcemanager` and `monitoring` APIs for a Metrics Scope and its `compute` API for a
+  Shared VPC host, whichever credential type applies; the composition enables those in the apply,
+  per selector, so `install.sh` enables whichever the declared selectors read is off before an
+  apply that carries one (nothing on an existing install, where they are on), the one
+  out-of-Terraform step the selectors add; its dry run skips the plan while one is off; and the
+  resolver's refusal names that project when the API's answer says the API is off, and the
+  `serviceusage.services.use` the identity lacks there when it says the consumer project refused
+  it. The resolved-set cap (100) is on the whole set, so the plan counts what it can of it as the
+  reconcile does, the management project, the explicit projects and every selector's members once
+  each less an exact exclude entry (by ID on either side, by number on the selector's as well; a project both explicit and excluded by its number alone stays counted, since the plan does not name a number the exclusion keeps it from reading, and is dropped from `projects` instead), and refuses a declaration past it while a selector is declared: the members past the cap
+  would read `over-cap` with nothing created, so their bindings would be reach the agent never
+  uses. Without a selector the count is `projects` and the management project, which the CRD's list cap bounds and the plan admitted before, so a declaration without one is not refused for it. A single selector past the cap is refused at its read, before the naming reads.
+- When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
+  the host project. The preflight checks, before the apply that then binds the agent's
+  `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced
+  organisation policy forbids it, and names the policy rather than failing inside
+  `google_project_service`; whether the applying identity holds `serviceusage.services.enable` is
+  left to the apply. An install that declares only explicit projects skips this check and never
+  enables the API (§4).
 - `project_roles` stays the list bound in the host project, and the mirror between it and
   `read_only_roles` that `tests/test_scoped_sa_pool_iam.py` checks is unchanged. The `scope_roles`
   allowlist lives beside it with a test that every entry is also in the default `project_roles`,
@@ -598,7 +651,7 @@ into a second project the tester controls.
    listing decides its outcome, and every row a scope named by number keeps the number, `retiring`
    rows included. A fifth: a monitored project whose ID the scope model cannot carry (a legacy
    domain-scoped ID) reads `denied` by number, a stable fact reported and never a lookup failure
-   that would hold the prune; `exclude.projects` by number drops it. A sixth: a member the run
+   that would hold the prune; `exclude.projects` by number drops it, and a number entry matches every row a scope named by that number, the ones a past run named to an ID included, so the number stays the lever once the install path has withheld the grant and the naming call is refused. A sixth: a member the run
    could not name and no run has named holds the scope prune like a frozen container, because
    the bare number could be any project, the one the same edit dropped from `projects` included,
    and §7's prune never runs on a guess; naming it once, or excluding the number, releases it.

@@ -669,6 +669,13 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(on["workflow_run"]["workflows"], ["Publish Images to GHCR"])
         self.assertIn("workflow_dispatch", on)
 
+    def test_only_mains_publishes_create_an_autopush_run(self):
+        """A release-line publish completing must not enter the single concurrency
+        group at all: a run created for it would cancel a pending main deploy
+        before the job's `if:` skipped it."""
+        on = self.doc.get("on", self.doc.get(True))
+        self.assertEqual(on["workflow_run"].get("branches"), ["main"])
+
     def test_concurrency_group_locks_autopush_deploy_without_cancelling(self):
         concurrency = self.doc.get("concurrency", {})
         self.assertEqual(concurrency.get("group"), "autopush-deploy")
@@ -729,6 +736,50 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         self.assertIn("publish-operator", self.jobs)
         self.assertIn("publish-agents", self.jobs)
         self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
+
+    _RELEASE_LINE_PUSH_PATTERN = "release/[0-9]+.[0-9]+"
+    _DECIDE_JOB = "decide"
+    _DECIDE_SCRIPT = "./scripts/release/decide_image_publish.sh"
+    _DECIDE_GUARD = "needs.decide.outputs.build == 'true'"
+
+    def test_a_release_line_push_builds_sha_tags_but_never_moves_latest(self):
+        """A backport merged onto `release/<X.Y>` needs `:<sha>` images, and only those.
+
+        Every rung of the release ladder checks GHCR for the candidate's SHA tag,
+        and this is the only workflow that publishes it, so it has to fire for the
+        release lines. Only for those: the pattern is the line shape, so neither
+        the per-release `release/<X.Y.Z>` branches nor an arbitrary
+        `release/anything` a collaborator pushes can mint signed images, and both
+        jobs build nothing the GA tagger pushes to a line, since it pushes as the
+        release App rather than as Tide.
+        `:latest` is what autopush and the presubmit cache follow and must keep
+        tracking `main` alone: each `:latest` line is guarded by the ref, and
+        `docker/build-push-action` drops the empty line the guard leaves behind.
+        """
+        on = self.doc.get("on", self.doc.get(True))
+        self.assertEqual(on["push"]["branches"], ["main", self._RELEASE_LINE_PUSH_PATTERN])
+        decide = self.jobs[self._DECIDE_JOB]
+        self.assertTrue(any(step.get("run") == self._DECIDE_SCRIPT for step in decide["steps"]))
+        for name, job in self.jobs.items():
+            if name == self._DECIDE_JOB:
+                continue
+            with self.subTest(job=name):
+                self.assertEqual(job.get("needs"), self._DECIDE_JOB)
+                self.assertIn(self._DECIDE_GUARD, str(job.get("if", "")))
+        build_steps = [
+            step
+            for job in self.jobs.values()
+            for step in (job.get("steps") or [])
+            if str(step.get("uses", "")).startswith("docker/build-push-action@")
+        ]
+        self.assertTrue(build_steps)
+        for step in build_steps:
+            tag_lines = [line.strip() for line in str(step["with"]["tags"]).splitlines() if line.strip()]
+            with self.subTest(tags=tag_lines):
+                self.assertTrue(any(":${{ github.sha }}" in line for line in tag_lines))
+                for line in tag_lines:
+                    if ":latest" in line:
+                        self.assertIn("github.ref == 'refs/heads/main'", line)
 
 
 class ReleaseBotTokenWiringTest(unittest.TestCase):

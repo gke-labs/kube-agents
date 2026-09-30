@@ -72,9 +72,10 @@ type ScopeSpec struct {
 	// Folders lists GCP folder IDs (numeric) whose every project, at any depth,
 	// contributes its GKE clusters, resolved through Cloud Asset Inventory on each
 	// run. The agent's service account needs roles/cloudasset.viewer and the read
-	// roles on the folder, granted by hand: the install's Terraform binds the
-	// projects `projects` names and no folder yet; a folder it cannot read
-	// freezes its previous members and is reported with the reason.
+	// roles on the folder: the install's Terraform binds them from the same scope
+	// input that renders this block, and a CR edited by hand needs the same grants
+	// made by hand; a folder it cannot read freezes its previous members and is
+	// reported with the reason.
 	// +kubebuilder:validation:MaxItems=100
 	// +kubebuilder:validation:items:Pattern=`^[0-9]{1,20}$`
 	// +listType=set
@@ -97,10 +98,12 @@ type ScopeSpec struct {
 	// API answers HTTP 400 for it, which the reconcile reads as an empty membership
 	// rather than a failed lookup, so a misdeclared host cannot hold the scope prune.
 	// Nothing is inherited through a Shared VPC, so the agent's service account
-	// needs the read roles in each resolved project, granted by hand until the
-	// install's Terraform resolves the selectors at plan time (the design's §10
-	// step 3), and compute.projects.get in the host project (roles/compute.viewer
-	// carries it). A lookup that fails freezes
+	// needs the read roles in each resolved project, and compute.projects.get in
+	// the host project (roles/compute.viewer carries it): the install's Terraform
+	// resolves the host at plan time and binds both (the design's §10 step 3),
+	// so a service project attached after the last apply reads denied until the
+	// next one; a CR edited by hand needs the grants made by hand. A lookup that
+	// fails freezes
 	// the selector's previous members and holds the scope prune, and is reported
 	// in the snapshot's containers array under sharedVpcHosts/<host>.
 	// +kubebuilder:validation:MaxItems=100
@@ -116,9 +119,11 @@ type ScopeSpec struct {
 	// gcloud projects describe, and a monitored project the agent cannot read is
 	// reported by number under the naming call's outcome (denied for a 403).
 	// Nothing is inherited through a Metrics Scope, so the agent's service account
-	// needs the read roles in each resolved project, granted by hand until the
-	// install's Terraform resolves the selectors at plan time (the design's §10
-	// step 3); the lookup itself needs to read the scope in the scoping project:
+	// needs the read roles in each resolved project: the install's Terraform
+	// resolves the scope at plan time and binds them (the design's §10 step 3),
+	// so a project linked after the last apply reads denied until the next one;
+	// a CR edited by hand needs the grants made by hand. The lookup itself needs
+	// to read the scope in the scoping project:
 	// roles/monitoring.metricsScopesViewer (resourcemanager.projects.get and
 	// resourcemanager.projects.list) is the narrowest role that grants it, and the
 	// read roles the scope binds carry both between them. The Monitoring API has to
@@ -180,6 +185,15 @@ type ScopeClusterRef struct {
 }
 
 // PlatformAgentIntegrationSpec extends common IntegrationSpec with platform-specific connections.
+//
+// The rules below are the schema half of the forge declaration's checks: the
+// two spellings are exclusive, and a repository names a declared forge. The
+// webhook refuses the same CRs, but the chart ships it off and its default
+// failurePolicy is Ignore, and a CR the schema admitted would reach the
+// reconciler, which seeds only the entries it accepts and reports the rest as
+// Degraded long after the apply that introduced them succeeded.
+// +kubebuilder:validation:XValidation:rule="!(has(self.github) && (has(self.forges) || has(self.repositories)))",message="set integration.forges and integration.repositories, or integration.github, not both; integration.github is a deprecated alias for one forge with provider github"
+// +kubebuilder:validation:XValidation:rule="!has(self.repositories) || self.repositories.all(r, has(self.forges) && self.forges.exists(f, f.name == r.forge))",message="every integration.repositories entry must name a forge declared in integration.forges"
 type PlatformAgentIntegrationSpec struct {
 	IntegrationSpec `json:",inline"`
 

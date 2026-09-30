@@ -75,7 +75,8 @@ an `issues: read` credential the Prow job supplied. That was rung 2 working, not
 mounts one now. The canary `compliance-rbac-overgrant` ran on every presubmit until 2026-09-22,
 when the presubmit became the blocking roster only (#1023) and the never-admitted canary joined the
 other audit scenarios in the nightly tier (`hack/eval/nightly-cases.txt`), where those had been kept
-out of the presubmit on cost. The
+out of the presubmit on cost, and since 2026-09-29 it runs on every presubmit again as a held-out seat
+(#2013), where rung 2 reaches it as before. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
 
@@ -115,7 +116,8 @@ it delegates, so `classify_rep()` classifies the repetition `infra` under a reas
 with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
 (`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
 and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
-the catastrophic score grades the cluster rather than the record, so a tripped safeguard is
+the catastrophic score grades the world outside the record — the cluster, and on the inject lane
+the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one still blocks at rung 2. The near-misses still block at rung 3:
@@ -130,20 +132,26 @@ reduces to correctness. A task with no spec at all produces no correctness and i
 
 **The inject lane sets aside what its transport cannot show.** A record from the harness's inject
 transport carries the task's lifecycle envelope as its trajectory (`inject.task`, `inject.post`,
-`inject.edit`, `a2a.status-update`) and no tool call, and there are no card ids to read worker logs
-by, so every `tool_called`, `worker_commands` and `worker_agents` check is blind there: the first matrix run through
-the door (#2007, 2026-09-25) collapsed `agent-kanban-smoke` 0 of 3 with a correct answer in every
-repetition. `classify_rep()` therefore re-reads such a record before the rungs. The
-condition is the record's, not the environment's: the trajectory carries the transport's task
-marker and nothing outside the envelope — `_inject_blind()` in `scoring.py`, whose literals
-`test_scoring.py` holds equal to the transport's. When it holds, every report entry the task
-declares whose check is made of `tool_called`, `worker_commands` or `worker_agents` leaves and nothing else
-(`CaseSpec.transport_blind_checks`, by entry name; a compound mixing in an applicable leaf is not
-in the set, because that leaf can fail on any transport and setting the entry aside would hide it)
-is set aside as `not_applicable`, whatever
+`inject.edit`, `a2a.status-update`) and, when the door showed the task's tool-call trace, an
+`a2a.activity` marker followed by the task's calls in the api path's shape. There are never card
+ids to read worker logs by (the trace carries calls without their results) and never a worker's
+tagged entries, so `worker_commands`, `worker_agents` and a `tool_called` in the `workers` or
+`all` scope are blind on every such record; a router-scope `tool_called` is blind only when the
+door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
+`agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
+re-reads such a record before the rungs. The condition is the record's, not the environment's: the
+trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
+router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
+or a marker that reports a loss (`_inject_blind()`); `test_scoring.py` holds the literals equal to
+the transport's. When it holds,
+every report entry the task declares whose check is made of `tool_called`, `worker_commands` or
+`worker_agents` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
+into `trace_blind_checks` and `worker_blind_checks` by which condition applies; a compound mixing
+in an applicable leaf is not in either set, because that leaf can fail on any transport and
+setting the entry aside would hide it) is set aside as `not_applicable`, whatever
 devops-bench recorded for it, and `VerificationCorrectness`, `VerificationCoverage` and
 `VerificationCatastrophic` are recomputed over the entries that remain with the same arithmetic as
-upstream's rollup. What remains grades on every rung as before: a cluster-state safeguard that
+upstream's rollup. What remains grades on every rung as before: a safeguard that reads the cluster or the GitOps repository and
 tripped still blocks at rung 1, an errored phrase check still blocks at rung 2, and a repetition
 passes or fails on the checks the transport can see, with the set-aside names in its reason. When
 no objective check remains the repetition is `not_applicable` — a fifth outcome beside `infra`,
@@ -153,10 +161,25 @@ least one such is **not graded on transport** (the `Rung` member and the build-l
 record is a crashed scoring pass on any transport and is not re-read; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
-that does carry a tool entry leaves the envelope and grades in full, so the rule retires itself
-on the first such record — getting one there is transport work not yet filed, since the relay
-never posts `activity` artifacts to a conversation and an executor publishing them (#2038) does
-not by itself reach the record. A case whose _premise_ needs the chat front door is a different matter from
+whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,
+with or without a call behind the marker. The transport writes that marker whenever the door's
+probe carried the task's tool-call trace at all (the relay never posts `activity` artifacts to a
+conversation, so the probe is where the harness reads them), so that half of the rule retires on
+the door's capability to show calls rather than on a call having happened: a `tool_called` check
+on a persona that made no call fails there as it would on the api transport. A marker whose
+`dropped`, `malformed`, `input_truncated` or `stale` argument is non-zero says the trajectory may
+not carry every call the persona made (the door's cap or the executor's budget dropped some, a
+part or a count could not be read, a wrapper's input was truncated and its nested names with it,
+or the read that ended the wait carried no trace and the fold holds an earlier read's), and such a
+record is treated as blind like one with no marker (`_inject_trace_vouched()`), since grading over
+it could fail a call that happened or pass a safeguard over one. One exception runs the other way:
+a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
+_failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows
+the forbidden call and a loss cannot unmake it; rung 1 blocks on it as on the api transport. The worker
+half is keyed on the transport alone (`_inject_record()`) and stays until a later change rebuilds
+the delegation wait for this path and takes those entries out of `worker_blind_checks`. A record
+from a door that cannot show the trace carries no marker and is graded as before. A case whose
+_premise_ needs the chat front door is a different matter from
 a check the transport blinds, and is the lane roster's
 ([`docs/eval-gate-roster.md`](../eval-gate-roster.md), "The inject lane").
 
@@ -178,11 +201,14 @@ the state everything ships in.
 **The suite aggregate** covers admitted cases only, excludes infra repetitions, and reds when
 `pr_rate < main_rate - margin` **over at least `EVAL_AGGREGATE_MIN_SCORED` scored repetitions**
 (default 30) — and only once `EVAL_AGGREGATE_ARMED` is set to `1` (or `true`/`yes`) in the job's
-environment. Unarmed,
-which is the default, a rate below the margin over a full sample is written into the verdict as a
-note rather than a reason: the flat margin has not been measured against how much an unchanged
-pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
-enough nights to say. Two job-level rules sit alongside it. Any blocking case reds the job
+environment. The margin is `EVAL_AGGREGATE_MARGIN`, default **0.10**
+(`DEFAULT_AGGREGATE_MARGIN` in `scoring.py`), measured on 2026-09-29 against how much an
+unchanged pull request moves the aggregate on `main` — [Sizing the aggregate
+margin](#sizing-the-aggregate-margin-measured-2026-09-29) below has the numbers. Unarmed, which
+is still the default, a rate below the margin over a full sample is written into the verdict as a
+note rather than a reason: arming is a Prow-config decision, one `EVAL_AGGREGATE_ARMED=1` line in
+the presubmit's job definition, and [the roster page](../eval-gate-roster.md#the-whole-suite-rate)
+carries the recipe and what an author sees when it fires. Two job-level rules sit alongside it. Any blocking case reds the job
 (`suite` exits 1). And green has a coverage floor: an admitted case with no scored repetition —
 every one excluded as infrastructure — makes the run **not evaluated**: `suite` exits 2, the code `case` already uses for
 "could not grade", and writes `outcome: not_evaluated` with the case ids under `not_evaluated`; the
@@ -204,8 +230,8 @@ not green.
 
 **Why the aggregate has a sample floor and the per-case rungs do not.** A flat margin is a
 suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 19/20
-admission bar the blocking threshold is 0.90, so a run of `n` scored repetitions survives
-`floor(n × 0.098)` failures — which is **zero** below `n = 11`. With one admitted case at three
+admission bar the blocking threshold is 0.85, so a run of `n` scored repetitions survives
+`floor(n × 0.15)` failures — which is **zero** below `n = 7`. With one admitted case at three
 repetitions, `n` is 3: one flaky repetition is 2/3 = 0.667, and the job reds. That is
 `agent-kanban-smoke`'s failure mode — one bad run reds an unchanged pull request — reintroduced
 through the aggregate on the day the first case is screened in, directly contradicting what the
@@ -217,9 +243,85 @@ below the margin — it just cannot block. The properly-sized replacement is a t
 which needs a variance estimate that does not exist until the nightly has run against `main` enough
 times to produce one.
 
+### Sizing the aggregate margin (measured 2026-09-29)
+
+The 0.05 the rule shipped with was a guess, and the issue that shipped it
+([#1493](https://github.com/gke-labs/kube-agents/issues/1493)) said to arm it only after measuring
+how much an unchanged pull request moves the aggregate. Measured on 2026-09-29, read-only, from
+two sources. The summary tables are below; the full measurement, including the 94-row table of
+every presubmit run counted, is in the pull request that set the margin (#2122).
+
+**What is compared to what.** The pull request's side is every admitted case's scored
+repetitions pooled: twelve roster cases × three repetitions = 36 units, `infra` and `blocked`
+repetitions and the inject lane's `not_applicable` ones excluded. `main`'s side is
+`_baseline_rate` in `gate.py`: for each of the same cases, the newest evidence lines at the
+current version key pooled until they hold `EVAL_ADMISSION_MIN_RUNS` (20) runs — seven nightly
+lines, 21 runs, or 20 when a two-run outage line is in the window — summed across the cases, so
+about 249 runs. Only the nightly writes those lines. The rule reds when
+`pr_rate < main_rate − margin`. With 36 units the pull request's rate moves in steps of
+1/36 = 0.028, so a margin is really a count of failed repetitions, and the count depends on where
+`main`'s window sits.
+
+**The nightly, as the gate would score it** (36 units over the twelve roster cases, from
+`gs://kube-agents-evals-bench/evidence`; the two cases admitted on 2026-09-22 are counted on the
+earlier nights too, so every night is the same 36):
+
+| night (UTC) | scored | passes | rate  | note                                           |
+| ----------- | ------ | ------ | ----- | ---------------------------------------------- |
+| 09-17       | 36     | 35     | 0.972 |                                                |
+| 09-18       | 36     | 35     | 0.972 |                                                |
+| 09-19       | —      | —      | —     | job failed before recording                    |
+| 09-20       | 36     | 31     | 0.861 | same `main` commit as 09-21                    |
+| 09-21       | 36     | 35     | 0.972 | same `main` commit as 09-20                    |
+| 09-22..24   | —      | —      | —     | outage, nothing recorded (#1852, #1889, #2011) |
+| 09-25       | 18     | 12     | 0.667 | outage tail: 7 of 12 cases recorded, 3 infra   |
+| 09-26       | 36     | 34     | 0.944 | clean, parallelism 8                           |
+| 09-27       | 36     | 35     | 0.972 | clean                                          |
+| 09-28       | 36     | 33     | 0.917 | clean                                          |
+| 09-29       | 36     | 33     | 0.917 | clean                                          |
+
+Night-to-night on the four clean nights: +0.028, **−0.056**, 0.000. The same commit on 09-20 and
+09-21 moved 0.111 with nothing changed. Against the window a pull request would have read at that
+moment (the store before that night's lines): +0.031, +0.053, −0.011, −0.007.
+
+**The presubmit.** Every non-aborted `pull-kube-agents-smoke-test` run since 2026-09-26 00:00Z:
+101 runs on 58 pull requests, all against `main`; 94 GREEN with a verdict artifact, 7 that died
+before grading. Over the 94, failed repetitions out of 36:
+
+| failed reps | 0   | 1   | 2   | 3   | 4   | 5   | 6+  |
+| ----------- | --- | --- | --- | --- | --- | --- | --- |
+| runs        | 26  | 31  | 29  | 6   | 1   | 1   | 0   |
+
+The worst was **five** (#2100, 31/36 = 0.861 against a window at 0.924: −0.063 — the only run
+the shipped 0.05 would have redded, and the verdict's advisory note said so). The next worst was
+four (#2056, −0.035). The 25 runs on pull requests that touched no agent, deployment or case file
+never lost more than three. `upgrades-lagging-master-probe` alone accounts for 52 of the 116
+failed repetitions.
+
+**What each margin would have done**, over the 94 runs and the clean nights:
+
+| margin                       | reds in the sample              | headroom over the worst run | failed reps tolerated at `main` = 0.924 / 0.94 / 0.96 |
+| ---------------------------- | ------------------------------- | --------------------------- | ----------------------------------------------------- |
+| 0.05 (shipped)               | #2100; the 09-27→28 night pair  | none                        | 4 / 3 / 3                                             |
+| 0.07 (smallest)              | none                            | 0.007, a quarter of a unit  | 5 / 4 / 3                                             |
+| **0.10**                     | none                            | 0.037, more than one unit   | 6 / 5 / 5                                             |
+| two-proportion, one-sided 5% | none (largest z 1.26, on #2100) | —                           | 5 / 4 / 3                                             |
+
+0.07 is the literal smallest and it is not a margin: the four clean nights pool to
+135/144 = 0.9375, which is where `main`'s window lands once the outage-era lines leave it, and at
+that rate 0.07 reds the five-failure run. **0.10** holds five failures until `main` passes 0.96
+and reds the seventh today, the sixth from about 0.934. Priced as a false-red rate under
+independent repetitions: at the presubmit's own failure rate (116/3348 = 0.035) seven of 36 is
+about one run in five thousand; at the nightly's window rate (0.076) about one in fifty-five. The
+two-proportion test reds nothing in the sample either and sits one failed repetition stricter at
+today's window, two at 0.96; it is the right replacement when the roster or the repetition count
+changes, and the flat margin stays for now because the verdict line prints it and a reader can
+check it by hand. Revisit the number when `main`'s window rate passes 0.96 or the roster leaves
+twelve.
+
 Every threshold above is a named constant read from the environment. All of them are starting
 points, to be tuned by running the suite against `main` and setting the bars above the observed
-movement.
+movement; the aggregate's is the first one tuned that way.
 
 ## What a score is
 
@@ -835,7 +937,9 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
+moved. A next-mode run (`EVAL_MODE_NEXT=1`) is the fourth condition and the second member of the
+class, for the same reason, enforced in `hack/ci-eval-pr.sh` alone until the key carries a mode
+field. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
 read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
@@ -1452,13 +1556,14 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
   repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
   margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
-  actually scales is a two-proportion test — which needs a variance estimate that does not exist
-  until the nightly has run against `main` enough times to produce one. Until then the aggregate is
-  advisory on small runs and says so in the verdict. Two things to watch when it is replaced: `30`
-  is not load-bearing except as "enough to tolerate two failed repetitions", and the advisory note
-  must keep reporting when the rate fell below the margin, or a rule that never fires goes
-  unnoticed. The rule is also unarmed by default above the floor (`EVAL_AGGREGATE_ARMED`), for
-  the same reason: until the store shows how much an unchanged pull request moves the aggregate,
-  a flat margin is a guess, and the note is how anyone watches it fire before arming it.
+  actually scales is a two-proportion test. The store now holds the variance estimate that test
+  needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
+  priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition
+  stricter, so the flat margin stays for its legibility. Two things to watch when it is replaced:
+  `30` is not load-bearing except as "enough to tolerate four failed repetitions at the 0.85
+  threshold", and the advisory note must keep reporting when the rate fell below the margin, or a
+  rule that never fires goes unnoticed. The rule is still unarmed by default above the floor
+  (`EVAL_AGGREGATE_ARMED`): the margin is measured now, so what remains is the decision, taken in
+  the Prow job config with the roster page's recipe, not a default here.
 - Every threshold here is a starting point. The way to tune them is to run the suite against `main`
   a few dozen times, see how much it moves when nothing changed, and set the bars above that.

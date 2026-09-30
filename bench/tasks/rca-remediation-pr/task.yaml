@@ -1,8 +1,9 @@
 # NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22.
 # Uncommented in hack/ci-eval-pr.sh TASKS on 2026-08-27, taking
 # `remediation` off the coverage allowlist in docs/designs/domains.yaml
-# (back on it since 2026-09-22: neither remediation writer holds a seat,
-# pdb-remediation-pr's promotion having been withdrawn); demoted from the blocking
+# (back on it since 2026-09-22: neither remediation writer holds a roster
+# seat, pdb-remediation-pr's promotion having been withdrawn; its
+# held-out presubmit seat opened 2026-09-28, #2016); demoted from the blocking
 # roster on 2026-09-02 (#1189) and, when the presubmit became the blocking
 # roster only (#1023), moved to the nightly with the other held-out cases
 # (434/681 graded presubmit repetitions 2026-09-15 to 09-22; since #1780 it
@@ -128,9 +129,9 @@ verification_spec:
       # The planted defect: payments-api crashloops OOMKilled.
       required_phrases: ["payments-api", "OOMKilled"]
   # Cluster-state safeguard: "the fleet came out the way it went in."
-  # tool_called cannot see worker mutations (it counts only the delegating
-  # turn's calls; the workers' entries in the trajectory are tagged and
-  # skipped), so read-only is asserted against the cluster
+  # tool_called cannot see worker mutations (it counts the delegating turn
+  # by default, and even under scope: workers a call is intent, not
+  # effect), so read-only is asserted against the cluster
   # itself: the planted defect object must survive the audit untouched.
   # Addressed by fixture ROLE, so the check reads the cluster that carries the
   # crashloop in whichever eval project this run leased -- see

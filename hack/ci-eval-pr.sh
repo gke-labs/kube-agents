@@ -35,6 +35,23 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# A fifth, applied on the same lane (#2079): the safeguards every case the
+# lane runs carries beside its own -- today the one that fails a repetition
+# on a GitHub write the case did not request. Appended to a copy of each
+# task file before devops-bench reads it (bench/kube_agents_bench/lane.py);
+# the files under bench/tasks/ and the api lane are untouched.
+readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/inject-lane-safeguards.yaml"
+# The fan-out's launch pacing. Every unit is launched this many seconds after
+# the one before, so N units do not open their first model call in the same
+# second (burst 429s at the model quota). A unit of a case that requests a
+# pull request -- the inject lane's second phase -- waits the settle instead:
+# the lane's GitHub-write safeguard opens its window max_clock_skew_sec
+# before the repetition starts (GitHubWritesVerifier in
+# bench/kube_agents_bench/verifiers.py, whose default this equals; a test
+# pins the two), so a write in the last seconds of the unit before must be
+# older than that before the next window can open.
+readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=5
+readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=120
 
 # What `bench-gate suite` exits, and writes as `outcome` in eval-verdict.json,
 # when the run could not be evaluated: an admitted case lost every repetition
@@ -52,7 +69,14 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before; section 4 below is the only site that reads the flag.
+# as before. Three places read the flag: section 4 below; the baseline
+# recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
+# step after the fan-out); and the dashboard publisher's gate, which mirrors
+# the recorder's. A flagged run passes neither: the next lane's periodic on
+# main runs under it with no PULL_NUMBER, the shape both otherwise write
+# from, and a next-mode sample in today's window would be indistinguishable
+# once written (VersionKey in bench/kube_agents_bench/baselines.py carries
+# no mode field), as would a dashboard that has no next lane to file it under.
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
@@ -549,7 +573,9 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # prerequisite 2 below puts the credential itself out of the presubmit's
 # reach; that split is what makes the boundary structural, exactly as
 # docs/designs/eval-scorer.md#the-two-service-accounts argues for the
-# baseline store.
+# baseline store. The recorder's fourth condition, EVAL_MODE_NEXT unset,
+# is mirrored too: the next lane's periodic reports nothing to a dashboard
+# that has no lane for it yet.
 #
 # Nothing publishes until BOTH prerequisites exist:
 #   1. the nightly periodic (NEVER the presubmit) exports
@@ -592,6 +618,10 @@ publish_eval_dashboard() {
   fi
   if [ -n "${RC_COMMIT_SHA:-}" ]; then
     echo "eval-dashboard publish skipped: RC_COMMIT_SHA=${RC_COMMIT_SHA} is set: a release-candidate run measures a candidate, it does not report main's history"
+    return 0
+  fi
+  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+    echo "eval-dashboard publish skipped: EVAL_MODE_NEXT=1 is set: a next-mode run does not report main's history, and the dashboard has no next lane yet"
     return 0
   fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
@@ -760,7 +790,10 @@ report_partial_verdict() {
 # cut-off night keeps (#1491). collect_gateway_log follows for the same reason
 # collect_bench_results runs on green: a green nightly whose repetitions ran to
 # the delegation ceiling used to leave no gateway log to say whether the worker
-# was starved by 429s or a stuck dispatcher.
+# was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
+# follows it: a pod replaced mid-run starts a fresh gateway log, and the
+# pod and event watch it stops, the previous containers and the restart
+# record are what say why.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -780,6 +813,7 @@ profile_and_dump_on_exit() {
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
+  collect_agent_pod_diagnostics
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -842,7 +876,11 @@ EVAL_HEARTBEAT_PID=$!
 disown "${EVAL_HEARTBEAT_PID}" 2>/dev/null || true
 
 START_TIME=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
+# Wall clock beside the elapsed counter: the leftovers report after the
+# fan-out asks GitHub what was written since this run began, and GitHub's
+# stamps are wall clock.
+EVAL_RUN_STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+echo "=== [${EVAL_RUN_STARTED_AT}] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
 
 # 2. Cluster Auth
 profile_begin "cluster-auth: gcloud get-credentials"
@@ -943,6 +981,9 @@ export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
 export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
+# From here to the EXIT trap, a replaced agent pod or restarted container is
+# on record however early it happens (collect_agent_pod_diagnostics).
+start_agent_pod_watch
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # The harness's default delegation wait (1800s) sits INSIDE the compliance
@@ -1614,13 +1655,15 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # 6. Task Matrix Execution Loop
-# The matrix is data, not code: four files under hack/eval/, read here at
+# The matrix is data, not code: five files under hack/eval/, read here at
 # startup (#1546, 2026-09-15). presubmit-cases.txt is what every pull request
 # runs (TASKS), nightly-cases.txt is what EVAL_TIER=nightly appends
 # (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
-# a pull request on a graded failure (BOOTSTRAP_ADMITTED), and
+# a pull request on a graded failure (BOOTSTRAP_ADMITTED),
 # inject-lane-exclusions.txt, read after the tier switch, is what the inject
-# lane leaves out of both (#2039). The split exists
+# lane leaves out of both (#2039), and inject-lane-safeguards.yaml, read
+# after that, is what every case on that lane carries beside its own checks
+# (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file and this script fall
 # through to the root approvers. Each file's header says what belongs in it;
@@ -1704,7 +1747,9 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
 # 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
-# also where every held-out case lives, with its hold-out reason.
+# where a held-out case lives, with its hold-out reason, unless a coverage
+# tracker seats it in the presubmit file held out (#2013, #2016; the
+# presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -1802,6 +1847,86 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
 fi
+
+# ─── The inject lane's safeguards (#2079) ────────────────────────────────────
+# The cluster safeguards a case carries say nothing about GitHub, and through
+# the inject door the platform persona opens a pull request where the chat
+# path inlined a manifest (#2037): the first matrix run through the door left
+# pull requests on the pool repository that no case had asked for.
+# hack/eval/inject-lane-safeguards.yaml holds the entries every case on the
+# lane carries beside its own -- one, a none-wrapped `github_writes` -- and
+# this step appends them to a COPY of each task file under a scratch
+# directory, `<dir>/<case>/task.yaml`, which run_one_unit hands to
+# devops-bench in place of the file under bench/tasks/ (unit_task_path). The
+# case id devops-bench records is the directory name, so it is unchanged;
+# `bench-gate case` still reads the file under bench/tasks/, and the appended
+# entry reaches it through the record's report, which is what rung 1 grades.
+# The check reads the repository from BENCH_GITOPS_REPO, exported here from
+# the same project mapping the deploy and the ledger reset read
+# (eval_gitops_repo; EVAL_GITOPS_REPO is a local deploy's own answer), and
+# refuses to start the lane without one: a lane whose safeguard cannot name
+# its repository would grade every repetition as an errored check. Applied on
+# the inject lane only; on the api lane the copy is never made and the file
+# is never read, so that lane's matrix and task files stay byte for byte what
+# they were. bench/kube_agents_bench/lane.py refuses a lane entry whose name
+# a case already declares -- devops-bench would refuse the duplicate as a
+# parse error on every repetition of that case, after the lease -- and
+# scripts/test_eval_rosters.py pins the file's shape and the set of cases
+# that request a pull request, which the fan-out runs in a phase of their
+# own after every other unit (INJECT_LANE_REQUESTING, below).
+INJECT_LANE_TASKS_DIR=""
+INJECT_LANE_REQUESTING=""
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  # The deploy's precedence (hack/ci-deploy.sh, section 2b): a developer's
+  # EVAL_GITOPS_REPO is where the agent was told to write, so it is what the
+  # safeguard reads; the project mapping otherwise. Prow refuses the
+  # override at deploy time, so in CI this is the mapping.
+  INJECT_LANE_REPO="${EVAL_LEDGER_REPO:-}"
+  if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+    INJECT_LANE_REPO="${EVAL_GITOPS_REPO}"
+  fi
+  if [ -z "${INJECT_LANE_REPO}" ]; then
+    echo "ERROR: AGENT_TRANSPORT=${AGENT_TRANSPORT} but no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project in hack/ci-deploy.sh, or EVAL_GITOPS_REPO on a local run); the lane's GitHub-write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the lane does not start." >&2
+    exit 1
+  fi
+  export BENCH_GITOPS_REPO="${INJECT_LANE_REPO}"
+  INJECT_LANE_TASKS_DIR="$(mktemp -d)"
+  # One `<requested> <case> <copy>` line per task: how many pull requests
+  # the case requests (its own checks, or the file's `requesting:` list for
+  # a case the persona answers with one before its checks say so), the case,
+  # and the copy's path. The cases with a
+  # non-zero count are the fan-out's second phase (INJECT_LANE_REQUESTING,
+  # read where the unit queue is built): writes are dated, not signed, so
+  # they run only after every other unit has finished, and a repetition of a
+  # case that requests nothing never shares the repository with a case that
+  # writes by design.
+  # --gitops-repo: a repository the lane's entries pin another organisation
+  # for (a local EVAL_GITOPS_REPO outside the pool's) is refused here, before
+  # the lease, rather than erroring the safeguard on every repetition.
+  if ! INJECT_LANE_COPIES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.lane \
+      --safeguards "${SCRIPT_DIR}/${EVAL_INJECT_LANE_SAFEGUARDS_FILE}" \
+      --gitops-repo "${INJECT_LANE_REPO}" \
+      --out-dir "${INJECT_LANE_TASKS_DIR}" "${TASKS[@]}")"; then
+    echo "ERROR: could not append the inject lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) to the matrix, or BENCH_GITOPS_REPO=${INJECT_LANE_REPO} is not a repository they can grade (above); the lane would run without a working GitHub-write safeguard, so it does not start." >&2
+    exit 1
+  fi
+  # `<requested> <case> <path>`: the count first and the path last, so a
+  # path with a space (a TMPDIR with one) cannot shift the fields read here.
+  INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { printf "%s%s", sep, $2; sep = "," }')"
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: every task in the matrix carries the lane's safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit: ${INJECT_LANE_REQUESTING:-none}"
+fi
+
+# The task file a unit hands devops-bench: the lane's copy when the step
+# above made one for this case, the file under bench/tasks/ otherwise. Its
+# own function so the fan-out's tests can run it; `${INJECT_LANE_TASKS_DIR:-}`
+# because those tests lift run_one_unit without this section.
+unit_task_path() { # <task-path> <task-name>
+  if [ -n "${INJECT_LANE_TASKS_DIR:-}" ] && [ -f "${INJECT_LANE_TASKS_DIR}/$2/task.yaml" ]; then
+    echo "${INJECT_LANE_TASKS_DIR}/$2/task.yaml"
+  else
+    echo "$1"
+  fi
+}
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -1941,6 +2066,37 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # new one, and until they have, this note is the projection rather than the
 # record. Still no Prow deadline change: the matrix shrank.
 #
+# 2026-09-29: the compliance canary is back in the presubmit file, held out
+# (#2013 step 2): THIRTEEN tasks, 39 units, against the same 360m deadline.
+# What arrived is three units at 1002s median / 2074s p90 (903 presubmit
+# repetitions, 2026-09-04 to 09-15), 3000s at the delegation ceiling,
+# serialized on their task lock: a ~50min chain at the median, ~104min at
+# p90, ~150min if every repetition runs to the ceiling. Against the
+# twelve-case fan-out that is +10-20min of wall clock in a typical run (the
+# chain hides inside the span; the cost is displaced lane time) and
+# +30-45min at p90, when the chain becomes the critical path. The
+# dispatcher-stall residual adds ~15-20min of wait per delegation and takes
+# a repetition to the ceiling only at p90. The record predates the
+# collector that moves check evaluation out of the worker; the first runs
+# of the thirteen-case matrix measure it, and until they have, this is the
+# projection. No Prow deadline change.
+#
+# pdb-remediation-pr, seat opened 2026-09-28, is seated held out beside it
+# (#2016 step 2): FOURTEEN tasks, 42 units, against the same 360m deadline.
+# What arrived is three units of ~15-25min each (420-1153s on the four
+# graded nights of 09-16 to 09-20, 980-1929s in its 2026-09-14 presubmit
+# run; hinted at 1250, the presubmit's largest), serialized on their own
+# task lock: a ~62min chain at the hint, ~96min if every repetition runs to
+# the measured maximum, in lanes beside the canary's chain. Under the
+# cost-hinted queue it launches first in each repetition round, ahead of the
+# canary (1000) and the incident probe (700), so at the hint it finishes
+# inside the round's tail and costs displaced lane time rather than wall
+# clock; #2016 prices it the same way (three units of 15-25 min; the case
+# launches early and was never the last unit in 385 recorded runs). Only a
+# repetition at its 1929s maximum could be the last unit, by minutes. The
+# first runs of the fourteen-case matrix measure it, and until they have,
+# this is the projection. No Prow deadline change.
+#
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
 # pull request. It is not a legitimate default: at 1 the collapse rung
@@ -1968,11 +2124,16 @@ export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
 # Whether the suite aggregate -- admitted-case pass rate against main's, over
 # at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
-# the default, it is computed and written into the verdict but cannot block:
-# the 0.05 margin has never been measured against how much an unchanged pull
-# request moves the aggregate on main, and arming a flat margin before the
-# store can say is arming a guess. Set it to 1 in the Prow job config, not
-# here, once the store holds enough nights to size it.
+# the default, it is computed and written into the verdict but cannot block.
+# The margin (EVAL_AGGREGATE_MARGIN, default 0.10 in bench-gate) was measured
+# on 2026-09-29 against 94 green presubmit runs and four clean nightlies: no
+# unchanged pull request fell more than 0.063 below main, so 0.10 reds none
+# of them; at main's rate that night (0.924) it reds the seventh failed
+# repetition out of 36, the sixth once main sits near 0.94. Arming is a Prow-config
+# decision, not a default here: one `EVAL_AGGREGATE_ARMED=1` line in the
+# presubmit's job config in oss-test-infra flips it, and
+# docs/eval-gate-roster.md ("The whole-suite rate") carries the recipe and
+# what the author sees when it fires.
 export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
 
 # Reads infrastructure.stack out of a task file. The loop uses it to decide
@@ -2131,15 +2292,18 @@ mkdir -p "${ARTIFACT_DIR}"
 CASE_RESULTS=()
 
 # Whether this run appends to the baseline store, decided once here and read
-# by record_case inside the fan-out and by the record step after it. The three
-# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate --
-# and why each one is there are explained at that step ("Baseline collection",
-# below the fan-out).
+# by record_case inside the fan-out and by the record step after it. The four
+# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate,
+# not a next-mode run -- and why each one is there are explained at that step
+# ("Baseline collection", below the fan-out).
 case "${JOB_TYPE:-}" in
   postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
   *) EVAL_IS_MAIN_RUN="false" ;;
 esac
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The commit each line is stamped with. A postsubmit carries it as
@@ -2185,6 +2349,11 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep and for the
+    # sweep's worker to file its cards and end its run (up to the stack's
+    # run_wait, 900s), and the agent turn is a board read. 340-520s a
+    # repetition on 2026-09-28.
+    bootstrap-discovery-fanout) echo 600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2195,18 +2364,28 @@ unit_cost_hint() {
     upgrades-master-behind-offered-elsewhere) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
-    # Nightly-only since 2026-09-22 (#1023; held out on #1171 and #1189),
-    # presubmit before that. The canary measured 1002s median, 2074s p90,
-    # over 903 presubmit repetitions 2026-09-04 to 09-15; the hint stays at
-    # the 700 it carried as a presubmit case until the nightly record says
-    # otherwise.
-    compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
-    # Nightly-only. The 2026-09-22 promotion (#1023) was withdrawn before
-    # merge: its record was graded by the check #1780 replaced. Measured
-    # 980-1929s across build 2099539376672346112's three repetitions (267-559s
-    # in August); median of the September run, kept although the four graded
-    # nights of 09-16 to 09-20 ran 420-1153s, until the nightly record under
-    # pull_request_opened says otherwise.
+    # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
+    # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
+    # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
+    # over 903 presubmit repetitions 2026-09-04 to 09-15; priced at that
+    # median, the way capacity (540) and the incident probe (700) are, so it
+    # launches first in each presubmit repetition round. Its three repetitions
+    # serialize on the task lock, so ~50min at the median and ~104min at p90
+    # is the chain a presubmit carries for it.
+    compliance-rbac-overgrant) echo 1000 ;;
+    # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
+    # before that, priced at the 700 it carried there.
+    rca-remediation-pr) echo 700 ;;
+    # Presubmit held out, seat opened 2026-09-28 (#2016 step 2); nightly 2026-09-15
+    # to then. The 2026-09-22 promotion (#1023) was withdrawn before merge:
+    # its record was graded by the check #1780 replaced. Measured 980-1929s
+    # across build 2099539376672346112's three repetitions (267-559s in
+    # August); median of the September run, kept although the four graded
+    # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
+    # under pull_request_opened says otherwise. The presubmit's largest hint,
+    # so it launches first in each repetition round; its three repetitions
+    # serialize on the task lock, ~62min at the hint and ~96min at the
+    # measured maximum.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -2236,11 +2415,14 @@ unit_cost_hint() {
     vcs-issue-resolver-triage) echo 1400 ;;
     vcs-review-feedback-read-back) echo 700 ;;
     # Nightly-only since #1840 (with cluster-agent-unlocated-crashloop-debug sharing
-    # the 720s hint as a sibling fleet fan-out workload). Median of four clean
+    # the 720s hint as a sibling fleet discovery workload). Median of four clean
     # dev-install repetitions for delegation-profile-lookup (710/710/735/1325s,
-    # 2026-09-23): the platform worker fans out to every Cluster Agent profile
+    # 2026-09-23): the platform worker enumerates the Cluster Agent profiles
     # in the fleet before the payments-api one reports.
     cluster-agent-delegation-profile-lookup | cluster-agent-unlocated-crashloop-debug) echo 720 ;;
+    # Two prepare/submit rounds and a close. Measured on `dev-1918-69fd3893`:
+    # 587-1512s a repetition, 937s the middle one.
+    vcs-spent-branch-reuse) echo 1000 ;;
     *) echo 200 ;;
   esac
 }
@@ -2463,7 +2645,7 @@ grade_case() { # <task-path> <task-name>
     --json-out "${ARTIFACT_DIR}/case-${name}.json")
 }
 
-# One case's baseline line, under the same three conditions as the record step
+# One case's baseline line, under the same four conditions as the record step
 # after the fan-out (EVAL_IS_MAIN_RUN, decided above it) and never fatal: an
 # append that fails here is retried by that step, which passes the same
 # manifest and so appends only what is not in it yet.
@@ -2617,9 +2799,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # leaks to a sibling lane; see unit_delegation_timeout.
   AGENT_DELEGATION_TIMEOUT="$(unit_delegation_timeout "${name}")"
   export AGENT_DELEGATION_TIMEOUT
-  local start end dir
+  local start end dir run_task
+  run_task="$(unit_task_path "${task}" "${name}")"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
@@ -2656,33 +2839,120 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
 # spent two of four lanes that way for its first twelve minutes under the
 # cost-first ordering this replaces.
+#
+# Two phases on the inject lane (#2079). The lane's GitHub-write safeguard
+# dates a write; it cannot sign it, and every unit of the run writes to one
+# repository. A case that requests a pull request (INJECT_LANE_REQUESTING,
+# from the lane step; empty on the api lane and on an inject matrix with no
+# such case) therefore runs only after every other unit has finished: a
+# repetition of a case that requests nothing never shares the repository with
+# one that writes by design, so a write inside its window is its own or a
+# concurrent sibling's mistake, either of which is the red the safeguard
+# exists for. The second phase runs one unit at a time, and every unit in it
+# waits EVAL_GITHUB_WRITE_SETTLE_SECONDS before it starts: two requesting
+# cases side by side would red each other's by-design pull requests (each
+# excuses only the ones its own reply names), and the safeguard's window
+# opens that many seconds before the repetition's start, so a write in the
+# last seconds of the unit before -- the same case's previous repetition, or
+# the first phase's last unit -- must be older than that before the next
+# window can open. The cost is one drain of the lanes at the phase boundary
+# and the settle plus the serial run of the requesting units (on the
+# presubmit tier, one case's repetitions, which the task lock already ran one
+# at a time, so three settles); the order inside each phase is unchanged.
+unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
+  case ",${INJECT_LANE_REQUESTING:-}," in
+    *",$1,"*) echo 1 ;;
+    *) echo 0 ;;
+  esac
+}
 UNIT_QUEUE="$(
   for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
     i=0
     for TASK in "${TASKS[@]}"; do
-      printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+        printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      fi
       i=$((i + 1))
     done
   done | sort -k1,1n -k2,2rn
 )"
-UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c .)"
+UNIT_QUEUE_WRITERS="$(
+  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+    i=0
+    for TASK in "${TASKS[@]}"; do
+      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+        printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      fi
+      i=$((i + 1))
+    done
+  done | sort -k1,1n -k2,2rn
+)"
+UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
+WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
-profile_begin "task fan-out: ${UNIT_TOTAL} units, parallelism=${EVAL_TASK_PARALLELISM}"
-while read -r REP _COST IDX; do
-  [ -n "${IDX:-}" ] || continue
-  while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${EVAL_TASK_PARALLELISM}" ]; do
-    sleep 3
-  done
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
-  UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
-  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
-  # Staggered, so N units do not open their first model call in the same
-  # second -- burst 429s at the model quota are the fan-out's failure mode.
-  sleep 5
-done <<EOF_UNIT_QUEUE
-${UNIT_QUEUE}
+# One phase's units, launched in queue order at the given parallelism, each
+# after the given pause. The caller `wait`s between phases; UNIT_SEQ carries
+# across them.
+launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
+  local queue="$1" parallelism="$2" pause="$3"
+  while read -r REP _COST IDX; do
+    [ -n "${IDX:-}" ] || continue
+    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
+      sleep 3
+    done
+    # Staggered, so N units do not open their first model call in the same
+    # second -- burst 429s at the model quota are the fan-out's failure mode;
+    # in the second phase the pause is the write-settle instead.
+    sleep "${pause}"
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+    UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
+    run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
+  done <<EOF_UNIT_QUEUE
+${queue}
 EOF_UNIT_QUEUE
+}
+
+profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
+launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
+if [ "${WRITER_TOTAL}" -gt 0 ]; then
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${EVAL_GITHUB_WRITE_SETTLE_SECONDS}s settle"
+  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
+  wait
+fi
+
+# ─── What the run left on GitHub (#2079) ─────────────────────────────────────
+# On the inject lane, once every unit is done: every pull request and branch
+# under the agent's prefix written to the leased project's repository since
+# this run began, in the job log by number and branch, so a red safeguard has
+# its subject named beside it and a run's leftovers are on record even when
+# no repetition graded them (a unit that died before verification). It closes
+# nothing: this job holds no credential that closes a pull request, by design
+# -- a presubmit runs the pull request's own code, and the one
+# `pull_requests: write` outside a run is the periodic sweep that executes
+# `main` alone (hack/ci_sweep_agent_pulls.py; docs/ci-pool-projects.md 5.3
+# and 5.5), which closes these and deletes their branches within its
+# ten-minute interval once the lease is released. A fresh read token first:
+# the one minted at preflight is hours old by now. Never fatal, and after
+# the fan-out rather than in the EXIT trap: a deadline-cut run loses this
+# line and keeps the per-repetition reasons, which is the right trade.
+report_github_leftovers() {
+  if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] || [ -z "${BENCH_GITOPS_REPO:-}" ]; then
+    return 0
+  fi
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
+  if ! mint_ledger_token "leftovers"; then
+    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes it once the lease is released."
+    return 0
+  fi
+  if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
+      --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
+    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) still closes what this run left once the lease is released."
+    return 0
+  fi
+  echo "GitHub leftovers: this job closes none of them (no pull_requests: write in a presubmit, docs/ci-pool-projects.md 5.3); the periodic sweep ci-kube-agents-pull-sweep (every ten minutes, on projects Boskos reports free) closes them and deletes their branches once the lease is released. The safeguard verdict above was read during each repetition and does not depend on this listing."
+}
+report_github_leftovers
 
 # ─── Per-case verdicts, in the order TASKS declares ───────────────────────────
 # Most cases were graded inside the fan-out by the unit that finished them
@@ -2746,6 +3016,17 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
+# EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
+# lane's periodic on main (ci-kube-agents-eval-next) is also a periodic with
+# no PULL_NUMBER, and the key has no mode field either, so its samples would
+# be today's the moment they landed. The deploy admits the flag on that job
+# by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what keeps
+# the admission from moving the window. Whatever the job's identity may hold
+# on the store is a grant in oss-test-infra this script cannot see, not a
+# property of it. A next record of its own is the mode field on the key;
+# until it exists a flagged run reads the store, when one is armed, and
+# appends nothing.
+#
 # The decision itself (EVAL_IS_MAIN_RUN) and the commit stamp are taken above
 # the fan-out, because record_case appends each case's line inside it as soon
 # as the case is graded. This pass covers what the fan-out did not record --
@@ -2763,6 +3044,8 @@ if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
+elif [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo "Next-mode run (EVAL_MODE_NEXT=1, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written — a next-mode sample has no key of its own and would land in today's window."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

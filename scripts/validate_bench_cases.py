@@ -121,7 +121,10 @@ SANITIZER_REASON_STRIP = " \t\r-:"
 # key/value and e-mail patterns are deliberately absent: each matches ordinary
 # prose in a prompt ("the token the workload presents", an address in an
 # expected_output), and a check that reds prose is a check that gets escaped
-# by reflex. The value is the reader-facing name for the finding.
+# by reflex. The env-pair and URL-password patterns are absent too: they match
+# structure (an env list, `scheme://user:pw@`), which a fixture's sample
+# manifests and connection strings carry on purpose, not a token shape. The
+# value is the reader-facing name for the finding.
 REDACTOR_FILE = REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "common" / "redactor.py"
 REDACTOR_CLASS = "AuditRedactor"
 # The name the redactor module is registered under when loaded from its file;
@@ -136,6 +139,8 @@ CREDENTIAL_SHAPES: dict[str, str] = {
     "SLACK_TOKEN_PATTERN": "a Slack token",
     "JWT_PATTERN": "a JWT",
     "OPENAI_TOKEN_PATTERN": "an sk- API key",
+    "PREFIXED_SK_TOKEN_PATTERN": "an Anthropic or hyphenated OpenAI key",
+    "AWS_ACCESS_KEY_ID_PATTERN": "an AWS access key id",
 }
 
 # Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.
@@ -163,6 +168,18 @@ KNOWN_UNREGISTERED = {
 # the issue; the entry goes when the fixture lands and the case moves to the
 # nightly file in the same pull request.
 FIXTURE_NOT_READY = {
+    "b-0011-gitops": (
+        "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
+        "and its credentials in the pool projects (the case takes the repository, "
+        "the project and the agent host as inputs and CI has none to give), so "
+        "no CI tier can run it yet; run it locally "
+        "with bench/hack/run-gitops-pilot.sh"
+    ),
+    "b-0022b-gitops": (
+        "#1307: the second task through the GitOps fix-cycle stack (gitops_task "
+        "b-0022b); parked for the same reason as b-0011-gitops; run it locally "
+        "with TASK=b-0022b bench/hack/run-gitops-pilot.sh"
+    ),
     "scope-second-project-denied": (
         "#1865: needs a second GCP project per pool project, declared in the "
         "harness install's spec.scope.projects, whose listing the agent's service "
@@ -186,6 +203,19 @@ FIXTURE_NOT_READY = {
         "on seeded cluster A waiting on a ConfigMap that does not exist; no "
         "fixture role plants a stall today"
     ),
+    "gitops-drift-noise-filtered-triage": (
+        "#911: needs an audit ingress on the eval install -- a drift-audit "
+        "topic, a subscription and a detector enabled to pull from it, none of "
+        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
+        "classifier and the case files no card at all, which is broken rather "
+        "than red. The umbrella owns it because the gap is the eval install "
+        "not asking for what the composition already builds behind "
+        "enable_drift_pubsub, not a defect anyone has filed separately. The "
+        "case's own header carries the rest: why the sink is the one part of "
+        "the trio it can do without, why #2137 is not a second blocker, and "
+        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
+        "alongside the ingress"
+    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
@@ -193,6 +223,11 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "platform-worker-refuses-shipped-skill-edit": (
+        "a skill-governance refusal graded on the worker's card result and on "
+        "its skill_manage calls (none may succeed); reads no fleet, and no "
+        "domains.yaml row describes skill or self-modification governance"
+    ),
     "vcs-history-only-fact": (
         "a repository-history question graded on the answer and on the route "
         "the worker took to it (the version-control verbs, never a credentialed "
@@ -212,6 +247,12 @@ KNOWN_NO_DOMAIN = {
         "took to the read-back; rca-remediation-pr owns the remediation "
         "journey -- a proposed fix landing as a pull request -- and this case "
         "proposes no fix"
+    ),
+    "vcs-spent-branch-reuse": (
+        "a second proposal opened under a branch name whose first proposal "
+        "was closed, graded on the branch the pull request came from; like "
+        "vcs-review-feedback-read-back it proposes no fix, and "
+        "rca-remediation-pr owns the remediation journey"
     ),
     "gpu-stress-test-diagnosis": (
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "
@@ -267,9 +308,16 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
+    # Likewise: "the run wrote to the GitOps repository since it started" is
+    # the assertion, and every field narrows it. The inject lane appends it
+    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # may also declare it.
+    "github_writes": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns"),
     "worker_agents": ("required_agents",),
+    # This repository, agent-disk-reading: the discovery sweep a cron job filed.
+    "bootstrap_fanout": ("require",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

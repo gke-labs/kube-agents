@@ -1,0 +1,16 @@
+{
+  "worker_entries": 69,
+  "agents": [
+    "cluster-fuxiaogao-gkedemos-gitops-pilot-20260918-14552-f6aca55c",
+    "platform"
+  ],
+  "delegated_to_cluster_agent": true,
+  "fix_submitted_at": "2026-09-18T19:18:28.862987+00:00",
+  "cluster_reads_before_fix": 14,
+  "repo_lookups_before_fix": 1,
+  "repo_lookups": [
+    "terminal {\"command\": \"cd /tmp && gh api \\\"repos/gke-agentic/kage-eval-20260918-claude-1/commits?sha=run/gitops-pilot-20260918-145529/b-0022b&path=tasks/b-0022b&"
+  ],
+  "gitops_outcome": "merged",
+  "pr_url": "https://github.com/gke-agentic/kage-eval-20260918-claude-1/pull/2"
+}

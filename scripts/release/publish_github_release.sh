@@ -31,7 +31,9 @@ RELEASE_COMMIT="$(resolve_release_commit "${RELEASE_VERSION}")"
 # previous_tag_name on the generate-notes API, which takes any existing tag.
 # PREVIOUS_VERSION from the environment overrides the lookup (nothing in the
 # release workflow sets it; it is for a hand run); unset, the highest GA tag
-# strictly below RELEASE_VERSION is used. With no lower tag the call goes out
+# strictly below RELEASE_VERSION in the release commit's own history is used
+# (get_base_ga_tag_for_commit), so a patch cut on a release line is not where
+# the next minor's notes start. With no lower tag the call goes out
 # without the flag: that is right for the first release and wrong for a
 # checkout that did not fetch its tags, and the script cannot tell the two
 # apart locally, so it warns rather than fails.
@@ -43,7 +45,7 @@ if [ -n "${PREVIOUS_VERSION}" ]; then
     exit 1
   fi
 else
-  PREVIOUS_VERSION="$(get_previous_ga_tag "${RELEASE_VERSION}")"
+  PREVIOUS_VERSION="$(get_base_ga_tag_for_commit "${RELEASE_COMMIT}" "${RELEASE_VERSION}")"
   if [ -z "${PREVIOUS_VERSION}" ]; then
     echo "⚠️ WARNING: No GA tag below '${RELEASE_VERSION}' in this checkout; GitHub will pick where the release notes start. Expected only for the first release. Otherwise the checkout is missing tags (fetch-depth: 0) or set PREVIOUS_VERSION." >&2
   fi
@@ -111,11 +113,24 @@ if ! is_ci_pipeline; then
   exit 0
 fi
 
+# GitHub's "latest release" pointer, said explicitly rather than left to the
+# default, which is the release created most recently: a patch cut on a release
+# line after a newer minor exists would otherwise become "latest" and what
+# `releases/latest` and the install docs point at. Latest is the numerically
+# highest GA tag, which by now includes this release.
+NEWEST_GA_TAG="$(get_latest_ga_tag)"
+LATEST_FLAG="--latest=true"
+if [ -n "${NEWEST_GA_TAG}" ] && [ "$(compare_semver "${RELEASE_VERSION}" "${NEWEST_GA_TAG}")" = "-1" ]; then
+  LATEST_FLAG="--latest=false"
+  echo "ℹ️ ${RELEASE_VERSION} is below ${NEWEST_GA_TAG}; publishing without the 'latest' mark."
+fi
+
 gh release create "${RELEASE_VERSION}" ${dist_files[@]+"${dist_files[@]}"} \
   --repo "${TARGET_REPO}" \
   --target "${RELEASE_COMMIT}" \
   --title "Release ${RELEASE_VERSION}" \
   --generate-notes \
+  "${LATEST_FLAG}" \
   ${notes_args[@]+"${notes_args[@]}"}
 
 echo "✅ Successfully published GitHub Release '${RELEASE_VERSION}' for commit ${RELEASE_COMMIT:0:7}."

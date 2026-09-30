@@ -168,7 +168,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Six read what the run produced, from this repository
+Seven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
@@ -177,11 +177,22 @@ which no substring can express), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's), and `worker_commands` (regular expressions over the terminal commands
+repetition's), `github_writes` (every pull request or branch under the agent's
+prefix written to the case's GitOps repository since the repetition started; it
+passes on a write, so a case wraps it in `none` to say the agent wrote nothing
+it was not asked for, and the inject lane appends exactly that entry to every
+case it runs), and `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
 purges it), and `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries).
+
+One reads the install under test, from the same file: `bootstrap_fanout` compares the
+cards the onboarding discovery sweep filed, read from the agent pod's board, against the
+Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
+one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
+card for anything else) or `no_card_waits_on_the_sweep` (no cluster card has the sweep as a
+parent).
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
@@ -251,7 +262,8 @@ anything, and the conservative reading is an unmet objective.
 
 `domain:` is a slug from `docs/designs/domains.yaml`, and it is how coverage is counted.
 `scripts/test_domain_coverage.py` treats a domain as covered when some case claims its
-slug, carries a non-empty spec, and is an entry in `hack/eval/presubmit-cases.txt`.
+slug, carries a non-empty spec, and is a name on `hack/eval/blocking-roster.txt` (a presubmit
+seat held out of the roster covers nothing).
 Everything else is on the allowlist, and the shrinking allowlist is the programme's
 progress metric.
 
@@ -312,7 +324,9 @@ the night it merges, its record accrues in the evidence store, and a presubmit s
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as
-equal) and cites that record — never the pull request that makes it pass. Cases that stay in the nightly for good are
+equal less the held-out seats, `HELD_OUT_IN_PRESUBMIT`: the one exception, a coverage tracker
+may first seat its candidate in the presubmit file without a roster line, to earn its record at
+presubmit volume; it cannot red a pull request on quality there, only on rungs 1–3) and cites that record — never the pull request that makes it pass. Cases that stay in the nightly for good are
 the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
 seat, or because what they grade is not one of the core journeys the presubmit gate is
 for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case

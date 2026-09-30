@@ -90,12 +90,12 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 		wantBudget  int
 		wantRender  int
 	}{
-		{"unset stays at the shipped cap", nil, 58, 64},
-		{"below the floor does not tighten it", ptr.To(2), 34, 64},
-		{"just under the floor still does not", ptr.To(12), 64, 64},
-		{"the first value above the floor derives", ptr.To(13), 67, 67},
-		{"above the floor derives", ptr.To(20), 88, 88},
-		{"the CRD maximum", ptr.To(10000), 30028, 30028},
+		{"unset stays at the shipped cap", nil, 62, 64},
+		{"below the floor does not tighten it", ptr.To(2), 38, 64},
+		{"just under the floor still does not", ptr.To(10), 62, 64},
+		{"the first value above the floor derives", ptr.To(11), 65, 65},
+		{"above the floor derives", ptr.To(20), 92, 92},
+		{"the CRD maximum", ptr.To(10000), 30032, 30032},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -129,7 +129,7 @@ func TestTasksStreamCarriesItsLimits(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--max-msgs-per-subject=4096",
-		"--max-consumers=148",
+		"--max-consumers=152",
 		"--discard=old",
 	} {
 		if !strings.Contains(add, want) {
@@ -213,11 +213,11 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			liveJSON: `{"name":"TASKS","max_consumers":64,"max_msgs_per_subject":4096}`,
 			wantExit: 2,
 			wantStderr: []string{
-				"max_consumers=64", "needs 328",
+				"max_consumers=64", "needs 332",
 				"stream configuration update can not change MaxConsumers",
-				"lower spec.harness.tuning.maxSessions to at most 12",
+				"lower spec.harness.tuning.maxSessions to at most 10",
 				"delete the TASKS stream",
-				"recreates TASKS at 328",
+				"recreates TASKS at 332",
 				"Delete the Job to re-run it now",
 				// The recreate's third step. Deleting a stream
 				// deletes every consumer on it, and the two
@@ -264,7 +264,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// Below the reserved block, where the first way out
 			// does not exist at all. maxSessions carries
 			// +kubebuilder:validation:Minimum=1 and one session
-			// still needs 31 consumers, so no value of the field
+			// still needs 35 consumers, so no value of the field
 			// fits a stream this narrow - offering "lower
 			// maxSessions" here would be a remedy the API server
 			// refuses. The script says why, and leaves the
@@ -273,10 +273,10 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			liveJSON: `{"name":"TASKS","max_consumers":8,"max_msgs_per_subject":4096}`,
 			wantExit: 2,
 			wantStderr: []string{
-				"max_consumers=8", "needs 328",
-				"minimum is 1, and one session still needs 31",
+				"max_consumers=8", "needs 332",
+				"minimum is 1, and one session still needs 35",
 				"That leaves deleting the TASKS stream",
-				"recreates TASKS at 328",
+				"recreates TASKS at 332",
 				// The only way out here is the recreate, so the
 				// restart it needs is not optional detail.
 				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
@@ -289,19 +289,19 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 		},
 		{
 			// The boundary between the two branches above, and the
-			// only place they can be told apart: 31 is the
+			// only place they can be told apart: 35 is the
 			// narrowest stream that has room for a legal
-			// maxSessions at all - the 28 reserved plus one
+			// maxSessions at all - the 32 reserved plus one
 			// session's 3 - so it takes the "lower it" branch with
-			// nothing to spare, and 30 takes the other one. A gate
+			// nothing to spare, and 34 takes the other one. A gate
 			// off by one in either direction sends one of these
 			// two cases down the wrong branch, and only a pair
 			// sitting on the seam catches that.
 			name:     "the narrowest stream that a legal maxSessions still fits",
-			liveJSON: `{"name":"TASKS","max_consumers":31,"max_msgs_per_subject":4096}`,
+			liveJSON: `{"name":"TASKS","max_consumers":35,"max_msgs_per_subject":4096}`,
 			wantExit: 2,
 			wantStderr: []string{
-				"max_consumers=31",
+				"max_consumers=35",
 				"lower spec.harness.tuning.maxSessions to at most 1 -",
 				"delete the TASKS stream",
 				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
@@ -310,22 +310,22 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// the split have to be: the recreate's restart above,
 			// and no claim that the lowering half needs a Job
 			// deleted to take effect.
-			notStderr: []string{"one session still needs 31", "--max-consumers=", "Neither way out clears this on its own"},
+			notStderr: []string{"one session still needs 35", "--max-consumers=", "Neither way out clears this on its own"},
 		},
 		{
 			name:     "one consumer short of that, and lowering stops being a way out",
-			liveJSON: `{"name":"TASKS","max_consumers":30,"max_msgs_per_subject":4096}`,
+			liveJSON: `{"name":"TASKS","max_consumers":34,"max_msgs_per_subject":4096}`,
 			wantExit: 2,
 			wantStderr: []string{
-				"max_consumers=30",
-				"minimum is 1, and one session still needs 31",
+				"max_consumers=34",
+				"minimum is 1, and one session still needs 35",
 				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns",
 			},
 			notStderr: []string{"So either lower", "to at most", "--max-consumers=", "finishes on its own"},
 		},
 		{
 			name:      "a stream sized for it passes",
-			liveJSON:  `{"name":"TASKS","max_consumers":328,"max_msgs_per_subject":4096}`,
+			liveJSON:  `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096}`,
 			wantExit:  0,
 			notStderr: []string{"max_consumers", "max_msgs_per_subject"},
 		},
@@ -353,7 +353,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			// can still evict another session's history is telling them
 			// something false about their own install.
 			name:       "a cap the operator chose is drift, not the unbounded gap",
-			liveJSON:   `{"name":"TASKS","max_consumers":328,"max_msgs_per_subject":8192}`,
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":8192}`,
 			wantExit:   0,
 			wantStderr: []string{"max_msgs_per_subject=8192", "drift between"},
 			notStderr:  []string{"predates the limit", "can still evict", "--max-consumers"},
@@ -376,7 +376,7 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 		},
 		{
 			name:       "an answer the subject-cap extractor cannot read is retryable",
-			liveJSON:   `{"name":"TASKS","max_consumers":328,"per_subject_limit":4096}`,
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"per_subject_limit":4096}`,
 			wantExit:   1,
 			wantStderr: []string{"could not read max_msgs_per_subject"},
 		},

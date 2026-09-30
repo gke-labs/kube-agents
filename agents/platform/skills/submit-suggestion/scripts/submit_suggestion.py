@@ -171,10 +171,10 @@ def validate_repo(repo: str) -> str:
     return gitops_workspace.validate_repo_org(repo)
 
 
-#: How far back the branch-name history is read. A name is looked up to find
-#: out whether the remote still holds a spent branch under it; one answer
-#: settles that, and `proposal-list` answers newest first. The handful above
-#: one is slack for a forge that orders differently, not a page to walk.
+#: How far back the branch-name history is read. What is wanted is the newest
+#: proposal from the name that is no longer open, and `proposal-list` answers
+#: newest first, so it is almost always the first entry. The rest are slack for
+#: a forge that orders differently, not a page to walk.
 PROPOSAL_HISTORY_LIMIT = 5
 
 
@@ -343,11 +343,11 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
     merged with a merge commit leaves its tip reachable from the base, so a
     branch cut from the base descends from what the remote holds and `publish`
     fast-forwards it. A squash-merge or a close leaves it unreachable, and that
-    is the one this refuses.
+    is the one `prepare` clears the branch for.
 
-    The tip is the proposal's own `sourceRevision`, which every forge reports
-    on the proposal itself and which is the last revision its branch was at
-    when the proposal was read. Not the last entry of `proposal-commits`: that
+    The tip is the proposal's own `sourceRevision`: where its branch was when
+    the proposal was read. For a closed or merged one GitHub reports where it
+    was when it closed, and the design requires the same of any other forge. Not the last entry of `proposal-commits`: that
     listing is oldest first and bounded by `limit`, so a proposal with more
     revisions than the page held answered with the oldest handful and the
     "tip" was whichever of them came last -- a revision the base may well
@@ -371,6 +371,127 @@ def stale_tip(repo: str, proposal: dict, session: dict) -> str:
         session, ["merge-base", "--is-ancestor", tip, "HEAD"], "merge-base"
     )
     return "" if contained.get("exitCode") == 0 else tip
+
+
+# Delete refusals that say nothing about the name: the call did not finish
+# (FORGE_CALL_FAILED, GIT_FAILED), the branch moved since it was read
+# (BRANCH_MOVED), or a proposal was opened on it since `prepare` looked
+# (OPEN_PROPOSAL). `prepare` run again reads the branch afresh, and on an
+# open proposal it takes a copy of that branch and adds to it.
+RETRY_THE_DELETE = frozenset(
+    {"FORGE_CALL_FAILED", "GIT_FAILED", "BRANCH_MOVED", "OPEN_PROPOSAL"}
+)
+# The forge throttled or failed one of the delete's own reads. Transient, so
+# not a verdict on the name either, but retrying at once meets the same limit.
+WAIT_THEN_RETRY_THE_DELETE = frozenset({"FORGE_RATE_LIMITED", "FORGE_UNAVAILABLE"})
+# The `branch-view` read that comes before the delete failed the same way.
+READ_FAILED = frozenset({"FORGE_CALL_FAILED", "GIT_FAILED"})
+# The delete's verdicts on the name itself, the only refusals a different name
+# answers. Anything else -- a credential the forge turned away on one of the
+# delete's own reads, say -- would meet a new name the same way, so it keeps
+# its code and the skill's rule for that code applies.
+NAME_REFUSED = frozenset(
+    {"BRANCH_NOT_OURS", "NOT_SPENT", "DELETE_REFUSED", "PROTECTED_BRANCH", "FORGE_UNSUPPORTED"}
+)
+
+
+def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, base: str) -> None:
+    """Make a spent branch's name usable again, or refuse before the change is written.
+
+    Reached only when `stale_tip` found the spent proposal's last revision
+    missing from the base -- a squash-merge or a close. Whether that revision is
+    actually in the way depends on whether the remote still holds the branch,
+    which is the forge's to answer and is asked here rather than guessed: a
+    repository that deletes a branch as it merges it has already freed the name,
+    and one that keeps head branches -- GitHub's default -- has not.
+
+    Still there, the branch is deleted, and only the broker decides whether it
+    may be: under the install's own prefix, no proposal on it open, and its tip
+    exactly what a merged or closed proposal this install opened carried, at
+    the revision read a moment ago. The refusal it answers with otherwise is kept whole, because it
+    names which of those failed.
+    """
+    spent_named = (
+        f"'{branch}' was the source of "
+        f"{spent.get('url') or 'an earlier proposal'}, which is "
+        f"{spent.get('state') or 'no longer open'}. That proposal's last "
+        f"revision, {in_the_way[:12]}, is not in '{base}', so it was "
+        "squash-merged or closed rather than merged whole"
+    )
+    try:
+        held = (vcs_client.forge("branch-view", {"branch": branch}, repository=repo)
+                .get("branch") or {})
+    except vcs_client.VcsError as unserved:
+        if unserved.code in READ_FAILED or not unserved.code:
+            # The read did not finish, which says nothing about the name.
+            raise ValueError(
+                f"{spent_named}. Reading whether the repository still holds the "
+                f"branch did not complete ({unserved.code or 'error'}: "
+                f"{unserved}). The name is still usable: run prepare again."
+            ) from unserved
+        if unserved.code in WAIT_THEN_RETRY_THE_DELETE:
+            raise ValueError(
+                f"{spent_named}. The forge turned away the read of whether the "
+                f"repository still holds the branch for now ({unserved.code}: "
+                f"{unserved}). The name is still usable: wait a few minutes, then "
+                "run prepare again."
+            ) from unserved
+        if unserved.code != vcs_client.BROKER_ROUTE_UNSUPPORTED:
+            raise
+        # A broker older than this helper -- the sandbox and the credential
+        # proxy are pinned separately, so a rollout can briefly pair them. It
+        # cannot say whether the branch is there, so the name is refused
+        # rather than risked on a BRANCH_DIVERGED after the change is written.
+        raise ValueError(
+            f"{spent_named}. This install's broker cannot yet say whether the "
+            f"repository still holds the branch ({unserved.code}), so the name "
+            "may be in the way. Submit this one under a branch name the "
+            "repository has not used, or retry once the credential proxy is "
+            "updated."
+        ) from unserved
+    if not held.get("exists"):
+        log(f"{spent_named}. The repository no longer holds the branch, so the name is free.")
+        return
+    revision = str(held.get("revision") or "")
+    try:
+        answer = vcs_client.forge(
+            "branch-delete", {"branch": branch, "revision": revision}, repository=repo
+        )
+    except vcs_client.VcsError as refused:
+        if refused.code in RETRY_THE_DELETE or not refused.code:
+            # Not a verdict on the name. The broker or the remote did not
+            # finish (a codeless error is a broker that could not be reached),
+            # or something pushed to the branch since it was read. The push may
+            # have landed before the failure, so this does not say nothing was
+            # deleted; a second `prepare` reads the branch afresh either way.
+            raise ValueError(
+                f"{spent_named}. The repository held the branch at "
+                f"{revision[:12]}, and deleting it did not complete "
+                f"({refused.code or 'error'}: {refused}). The name is still "
+                "usable: run prepare again, which reads the branch afresh."
+            ) from refused
+        if refused.code in WAIT_THEN_RETRY_THE_DELETE:
+            raise ValueError(
+                f"{spent_named}. The repository held the branch at "
+                f"{revision[:12]}, and the forge turned the delete away for now "
+                f"({refused.code}: {refused}). The name is still usable: wait a "
+                "few minutes, then run prepare again, which reads the branch afresh."
+            ) from refused
+        if refused.code not in NAME_REFUSED:
+            raise
+        raise ValueError(
+            f"{spent_named}. The repository still holds the branch at "
+            f"{revision[:12]}, so a change cut fresh from '{base}' does not build "
+            "on it and publishing it would be refused as BRANCH_DIVERGED; "
+            f"deleting the spent branch was refused ({refused.code or 'error'}: "
+            f"{refused}). Submit this one under a branch name the repository has "
+            "not used: the derived name is a default, not a requirement."
+        ) from refused
+    if not (answer.get("branch") or {}).get("deleted"):
+        log(f"{spent_named}. The branch went from the repository while this run "
+            "was deleting it, so the name is free.")
+        return
+    log(f"{spent_named}. Deleted the spent branch at {revision[:12]}; the name is free.")
 
 
 def handle_prepare(args) -> int:
@@ -423,37 +544,8 @@ def handle_prepare(args) -> int:
                 # this copy is standing on already contains the old tip, and that is
                 # answered in the copy.
                 in_the_way = stale_tip(repo, spent, vcs_client.resolve_session(repo, key=branch))
-                spent_named = (
-                    f"'{branch}' was the source of "
-                    f"{spent.get('url') or 'an earlier proposal'}, which is "
-                    f"{spent.get('state') or 'no longer open'}. That proposal's last "
-                    f"revision, {in_the_way[:12]}, is not in '{base}', so it was "
-                    "squash-merged or closed rather than merged whole"
-                ) if in_the_way else ""
-                if in_the_way and getattr(args, "allow_reused_branch", False):
-                    # Said, not silent. If the caller is wrong about the branch
-                    # being gone, `publish` refuses BRANCH_DIVERGED at the end of
-                    # the turn, and this line is what makes that refusal legible
-                    # rather than a surprise.
-                    log(
-                        f"{spent_named}. --allow-reused-branch says the repository "
-                        "no longer holds the branch, so the name is free; if it "
-                        "does still hold it, publishing will be refused as "
-                        "BRANCH_DIVERGED."
-                    )
-                elif in_the_way:
-                    raise ValueError(
-                        f"{spent_named}. If the remote still holds the branch "
-                        "there, a change cut fresh from "
-                        f"'{base}' does not build on it, and publishing it would be "
-                        "refused as BRANCH_DIVERGED after the whole change had been "
-                        "written. Submit this one under a branch name the repository "
-                        "has not used: the derived name is a default, not a "
-                        "requirement. If the repository deletes a branch when it "
-                        "merges it, the name is already free — nothing here can see "
-                        "that, because no read verb reports whether a branch exists "
-                        "— so say so with --allow-reused-branch."
-                    )
+                if in_the_way:
+                    clear_spent_branch(repo, branch, spent, in_the_way, base)
             # Before the switch below, not after it. The branch the copy came down
             # on is the remote's default, and `check_branch` cannot know its name:
             # a fleet whose trunk is `release-trunk` gets past the list of three.
@@ -838,6 +930,14 @@ RETIRED = {
     "--base-sha": "`publish` checks ancestry against what it cloned",
 }
 
+# The same, for flags that took no value. Kept apart because a retired flag above
+# is declared to take one, and declaring a switch that way would swallow the
+# argument after it.
+RETIRED_SWITCHES = {
+    "--allow-reused-branch": "`prepare` asks the forge whether a spent branch is "
+                             "still there, and deletes it when it is",
+}
+
 # The read half of content mode, which had its own subcommands. Same bargain as
 # RETIRED and the same one turn of the shell: the call cannot be rescued -- the
 # broker holds no tree to read -- but "there is no working copy" names the
@@ -864,12 +964,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Replace an existing copy even if it holds unpublished work",
-    )
-    prepare.add_argument(
-        "--allow-reused-branch",
-        action="store_true",
-        help="The repository deleted this branch when it merged it, so the name "
-        "is free to use again",
     )
 
     submit = subparsers.add_parser(
@@ -912,11 +1006,16 @@ def build_parser() -> argparse.ArgumentParser:
                 flag, dest=f"retired_{flag.lstrip('-').replace('-', '_')}",
                 default=None, help=argparse.SUPPRESS,
             )
+    for flag in RETIRED_SWITCHES:
+        prepare.add_argument(
+            flag, dest=f"retired_{flag.lstrip('-').replace('-', '_')}",
+            action="store_true", help=argparse.SUPPRESS,
+        )
     return parser
 
 
 def warn_about_retired(args) -> None:
-    for flag, replaced_by in RETIRED.items():
+    for flag, replaced_by in {**RETIRED, **RETIRED_SWITCHES}.items():
         if getattr(args, f"retired_{flag.lstrip('-').replace('-', '_')}", None):
             log(f"{flag} is no longer read: {replaced_by}.")
 

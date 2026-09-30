@@ -18,6 +18,32 @@ export DEFAULT_INITIAL_VERSION="0.1.0"
 # The shape of a GA release tag: pure numeric X.Y.Z, no 'v' prefix. One
 # definition, so the validator and the two tag lookups below cannot drift apart.
 readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
+# The subject the GA tagger gives the stamped release commit; the version
+# follows. What is_valid_stamped_or_direct_release_commit recognises.
+readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
+
+# The branch each GA release commit is pushed to, alongside its tag: the
+# release line `release/<X.Y>`. The first release of a line creates it at its
+# stamped commit (a minor, or the first patch of a minor that predates the
+# lines); each later patch is stamped as a child of the line's head and
+# fast-forwards it, so nothing is ever force-pushed and every release commit on
+# the line stays reachable from a branch. (Releases 0.1.0 to 0.7.0 predate the
+# lines and sit on per-release `release/<X.Y.Z>` branches, left as they are.)
+readonly RELEASE_BRANCH_PREFIX="release/"
+# The shape of a release line: `X.Y`, the version with its patch component off.
+readonly RELEASE_LINE_SHAPE_REGEX='^[0-9]+\.[0-9]+$'
+# A Conventional Commits feature subject, which bumps MINOR on main and is
+# refused on a release line. Read by calculate_next_version.sh.
+# shellcheck disable=SC2034
+readonly FEAT_SUBJECT_REGEX='^feat(\([^)]+\))?:'
+# The full ref a branch lives under, for the lookups and refspecs that must not
+# be satisfied by a tag of the same name.
+readonly GIT_BRANCH_REF_PREFIX="refs/heads/"
+# The branch every nightly and eval candidate is cut from, the remote-tracking
+# ref a full clone keeps for it, and the ref a bare `git fetch` leaves behind.
+readonly RELEASE_MAIN_BRANCH="main"
+readonly RELEASE_MAIN_TRACKING_REF="refs/remotes/origin/main"
+readonly GIT_FETCH_HEAD_REF="FETCH_HEAD"
 
 # The registry the docker-free existence probe below knows how to query, and the
 # manifest media types that probe must accept. Omitting the OCI types gets a
@@ -25,6 +51,9 @@ readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
 # 404 that reads as a missing image rather than as a wrong header.
 export GHCR_REGISTRY_HOST="ghcr.io"
 export GHCR_MANIFEST_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# The two registry answers ghcr_image_status tells apart; anything else is an error.
+readonly HTTP_STATUS_OK="200"
+readonly HTTP_STATUS_NOT_FOUND="404"
 
 # Declarative registry of all required release container images
 export REQUIRED_RELEASE_IMAGES=(
@@ -251,45 +280,195 @@ get_latest_ga_tag() {
   fi
 }
 
-# Finds the highest pure numeric GA tag strictly below a version (e.g. 0.4.0 for
-# 0.5.0). Prints nothing when no lower GA tag exists, as for the first release.
+# Whether a GA tag sits on the stamped child the tagger creates (single parent,
+# subject `chore(release): stamp release version <tag>`), as 0.3.0 onward do.
+# 0.1.0 and 0.2.0 predate stamping and sit directly on main.
+# Arguments: $1 = tag, $2 = the tag's commit
+ga_tag_is_stamped() {
+  local tag="${1:-}" tag_commit="${2:-}" parent
+  parent="$(git rev-parse --verify --quiet "${tag_commit}^1" 2>/dev/null)" || return 1
+  is_valid_stamped_or_direct_release_commit "${parent}" "${tag_commit}" "${tag}" 2>/dev/null
+}
+
+# A GA tag is a base for a candidate when the tag's commit — or, for a stamped
+# tag, the commit the stamp was cut from, which is where the branch's history
+# meets it — is in the history of `tip`, which defaults to the candidate itself.
+# `--is-ancestor` holds for equality, which is what lets a re-run whose tag
+# already exists (parent == candidate) find its own release.
 #
-# Separate from get_latest_ga_tag because the two answer different questions at
-# different moments: by the time publish_github_release.sh runs, tag_ga_release.sh
-# has already created the new tag, so the latest GA tag *is* the release being
-# published, and what the release notes need is the one before it. Order comes
-# from compare_semver rather than from `--sort`, so 0.10.0 ranks above 0.9.0.
-#
-# Arguments: $1 = the version to look below (pure numeric X.Y.Z). Returns
-# non-zero without one, or with one that is not a GA version.
-get_previous_ga_tag() {
-  local version="${1:-}"
-  if [ -z "${version}" ]; then
-    echo "❌ ERROR: version is required for get_previous_ga_tag." >&2
+# The tip is the branch the candidate is released from, when that is more than
+# the candidate: main's callers pass main's head, so a release somebody cut by
+# hand from a later main commit still counts as main's base and an older
+# candidate reads as "nothing new" rather than as a new release that would
+# collide with it. A release line's stamps have parents off main, so they never
+# qualify for main whichever tip is given.
+# Arguments: $1 = tag, $2 = candidate commit, $3 = branch tip (optional)
+ga_tag_is_base_of() {
+  local tag="${1:-}" candidate="${2:-}" tip="${3:-}" tag_commit
+  tip="${tip:-${candidate}}"
+  tag_commit="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" || return 1
+  git merge-base --is-ancestor "${tag_commit}" "${tip}" 2>/dev/null && return 0
+  ga_tag_is_stamped "${tag}" "${tag_commit}" || return 1
+  git merge-base --is-ancestor "${tag_commit}^1" "${tip}" 2>/dev/null
+}
+
+# The highest GA tag in a candidate's own history: the base the version bump,
+# the scheduled-release range and the release notes all start from. Found by
+# ancestry, not by number, so main's base stays 0.7.0 once 0.7.1 exists on
+# release/0.7, and 0.7.1's base is 0.7.0. Optional $2 looks strictly below a
+# version: the notes step passes the release being published, whose own tag is
+# by then in its history. Optional $3 is the branch tip the tags are qualified
+# against (see ga_tag_is_base_of). Prints nothing when no GA tag qualifies.
+# Arguments: $1 = candidate commit-ish, $2 = ceiling version (exclusive), optional,
+#            $3 = branch tip commit-ish, optional
+get_base_ga_tag_for_commit() {
+  local candidate="${1:-}" below="${2:-}" tip="${3:-}" candidate_sha best="" tag
+
+  if [ -z "${candidate}" ]; then
+    echo "❌ ERROR: a candidate commit is required for get_base_ga_tag_for_commit." >&2
     return 1
   fi
-  validate_pure_numeric_semver "${version}" "Version" || return 1
+  if ! candidate_sha="$(git rev-parse --verify "${candidate}^{commit}" 2>/dev/null)"; then
+    echo "❌ ERROR: '${candidate}' does not resolve to a commit." >&2
+    return 1
+  fi
+  if [ -n "${below}" ]; then
+    validate_pure_numeric_semver "${below}" "Ceiling version" || return 1
+  fi
 
-  local previous="" tag
   while IFS= read -r tag; do
     [ -n "${tag}" ] || continue
-    if [ "$(compare_semver "${tag}" "${version}")" != "-1" ]; then
+    if [ -n "${below}" ] && [ "$(compare_semver "${tag}" "${below}")" != "-1" ]; then
       continue
     fi
-    if [ -z "${previous}" ] || [ "$(compare_semver "${tag}" "${previous}")" = "1" ]; then
-      previous="${tag}"
+    ga_tag_is_base_of "${tag}" "${candidate_sha}" "${tip}" || continue
+    if [ -z "${best}" ] || [ "$(compare_semver "${tag}" "${best}")" = "1" ]; then
+      best="${tag}"
     fi
   done < <(git tag -l '[0-9]*' 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" || true)
-
-  echo "${previous}"
+  echo "${best}"
 }
 
-# Finds the latest validated release candidate tag (rc_*_validated)
+# The ref that stands for `main` in this checkout. In CI it is the release
+# repository's `main`, fetched now: a checkout whose origin is a fork, or whose
+# remote-tracking ref is stale, must not answer with an old main, so a fetch
+# that fails is an error there rather than a fall-through to the tracking ref.
+# A shallow CI checkout is unshallowed first and refused if that fails, since
+# past a shallow boundary every ancestry test reads "no", which would drop every
+# candidate but the tip. Off CI nothing is fetched: the tracking ref or a local
+# `main` answers, with a note that it is only as fresh as the last fetch, and a
+# shallow checkout resolves nothing. Prints the ref, or nothing.
+release_main_ref() {
+  local shallow
+  shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)"
+  if is_ci_pipeline; then
+    if [ "${shallow}" = "true" ]; then
+      git fetch --unshallow "$(release_repo_url)" >/dev/null 2>&1 || true
+      if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+        echo "❌ ERROR: This checkout is shallow, and ancestry against main cannot be read past its boundary." >&2
+        return 1
+      fi
+    fi
+    # The full ref, so a tag that happens to be named `main` cannot answer for
+    # the branch: a bare `main` refspec resolves tags before heads.
+    if ! git fetch "$(release_repo_url)" "${GIT_BRANCH_REF_PREFIX}${RELEASE_MAIN_BRANCH}" >/dev/null 2>&1; then
+      echo "❌ ERROR: Could not fetch ${RELEASE_MAIN_BRANCH} from $(release_repo_url); not falling back to a tracking ref that may be stale." >&2
+      return 1
+    fi
+    echo "${GIT_FETCH_HEAD_REF}"
+    return 0
+  fi
+  if [ "${shallow}" = "true" ]; then
+    return 1
+  fi
+  local ref
+  for ref in "${RELEASE_MAIN_TRACKING_REF}" "${GIT_BRANCH_REF_PREFIX}${RELEASE_MAIN_BRANCH}"; do
+    if git rev-parse --verify --quiet "${ref}" >/dev/null 2>&1; then
+      echo "ℹ️ Filtering candidates against ${ref}, which is as fresh as this checkout's last fetch." >&2
+      echo "${ref}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The commit main is at, for the callers that qualify a GA base against main's
+# whole history rather than the candidate's (get_base_ga_tag_for_commit). In CI
+# an unreadable main is an error; off CI it prints nothing, and the caller
+# falls back to the candidate's own history.
+release_main_tip() {
+  local main_ref
+  if ! main_ref="$(release_main_ref)"; then
+    if is_ci_pipeline; then
+      echo "❌ ERROR: Could not resolve main in this checkout; refusing to pick a GA base without it." >&2
+      return 1
+    fi
+    echo "⚠️ Warning: main cannot be read reliably here; qualifying the GA base against the candidate alone." >&2
+    return 0
+  fi
+  git rev-parse --verify "${main_ref}^{commit}"
+}
+
+# Lists the tags matching a glob whose commit is on main, newest by name first,
+# which for the rc_ families is newest by timestamp. The candidate pickers below
+# sort tags by name, and a release line's RC tags share the namespace: without
+# this the first `rc_` tag cut on `release/<X.Y>` would be the newest of all,
+# and the nightly promotion and the Prow eval would both adopt a line commit
+# as main's candidate. In CI a `main` that cannot be read is an error rather
+# than a guess; off CI the list passes through unfiltered with a warning, so a
+# hand run in a partial checkout still answers. A caller that has already
+# resolved main (release_main_tip) passes it, so one run fetches it once.
+# Arguments: $1 = tag glob, $2 = main's commit or ref, already resolved (optional)
+list_tags_on_main() {
+  local glob="${1:-}"
+  local main_ref="${2:-}"
+
+  if [ -z "${glob}" ]; then
+    echo "❌ ERROR: a tag glob is required for list_tags_on_main." >&2
+    return 1
+  fi
+
+  if [ -n "${main_ref}" ]; then
+    :
+  elif ! main_ref="$(release_main_ref)"; then
+    if is_ci_pipeline; then
+      echo "❌ ERROR: Could not resolve main in this checkout; refusing to pick a candidate without it." >&2
+      return 1
+    fi
+    echo "⚠️ Warning: main cannot be read reliably here (missing, or a shallow checkout); not filtering candidates to it." >&2
+    git tag -l --sort=-v:refname "${glob}" 2>/dev/null || true
+    return 0
+  fi
+  # A tag that does not peel to a commit is passed through rather than dropped:
+  # `--merged` cannot place it, and the caller's own resolution then fails
+  # loudly, which is what a broken tag graph owes rather than a quiet
+  # "no candidate" that stays green until somebody deletes the tag.
+  local all_tags on_main tag
+  all_tags="$(git tag -l --sort=-v:refname "${glob}" 2>/dev/null || true)"
+  on_main="$(git tag -l --sort=-v:refname --merged "${main_ref}" "${glob}" 2>/dev/null || true)"
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    if grep -Fxq "${tag}" <<<"${on_main}"; then
+      echo "${tag}"
+    elif ! git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null 2>&1; then
+      echo "${tag}"
+    fi
+  done <<<"${all_tags}"
+}
+
+# Finds the latest validated release candidate tag (rc_*_validated) on main.
+# A release line's validation is the gate for that line's own patch release,
+# never a nightly candidate: see list_tags_on_main.
 get_latest_validated_rc_tag() {
-  git tag -l --sort=-v:refname 'rc_*_validated' 2>/dev/null | grep -E '^rc_.*_validated$' | head -n 1 || echo ""
+  local on_main validated
+  on_main="$(list_tags_on_main 'rc_*_validated')" || return 1
+  # Materialised before `head`: under pipefail, `head` closing the pipe after
+  # the first line would end the producer with SIGPIPE and read as a failure.
+  validated="$(grep -E '^rc_.*_validated$' <<<"${on_main}" || true)"
+  head -n 1 <<<"${validated}"
 }
 
-# Reads the commits between the last GA tag and a candidate, into
+# Reads the commits between a base GA tag and a candidate, into
 # RELEASE_RANGE_SUBJECTS (`%s`) and RELEASE_RANGE_BODIES (`%b`).
 #
 # Shared for the same reason the predicate below is: calculate_next_version.sh
@@ -391,6 +570,13 @@ get_target_repo() {
   fi
 }
 
+# The https URL of the release repository, which the release scripts use as the
+# remote when `origin` is not it: a checkout whose origin is a fork, or a plain
+# lookup that should answer for the repository being released regardless.
+release_repo_url() {
+  echo "https://github.com/$(get_target_repo).git"
+}
+
 # Resolves registry prefix (e.g. ghcr.io/gke-labs/kube-agents)
 get_registry_prefix() {
   if [ -n "${REGISTRY_PREFIX:-}" ]; then
@@ -471,6 +657,62 @@ registry_image_exists() {
     "https://${GHCR_REGISTRY_HOST}/v2/${repo}/manifests/${reference}" >/dev/null 2>&1
 }
 
+# Whether a GHCR image is there, with the answer the boolean probe above
+# cannot give: `present`, `absent` (the registry said 404) or `error` (the
+# registry could not be asked, or answered anything else). A caller deciding
+# whether to overwrite a tag needs the third answer; a probe failure read as
+# "absent" is a rebuild over manifests that were validated. Always exits 0 and
+# prints one word; the registry is asked over its API, never through docker,
+# whose `manifest inspect` exits 1 for a missing image and an outage alike.
+# Arguments: $1 = image reference under GHCR_REGISTRY_HOST
+ghcr_image_status() {
+  local img="${1:-}"
+
+  case "${img}" in
+    "${GHCR_REGISTRY_HOST}"/*) ;;
+    *)
+      echo "error"
+      return 0
+      ;;
+  esac
+
+  local path="${img#"${GHCR_REGISTRY_HOST}"/}"
+  local last_segment="${path##*/}"
+  local repo reference
+  if [ "${path}" != "${path#*@}" ]; then
+    repo="${path%%@*}"
+    reference="${path#*@}"
+  elif [ "${last_segment}" != "${last_segment%:*}" ]; then
+    repo="${path%:*}"
+    reference="${path##*:}"
+  else
+    repo="${path}"
+    reference="latest"
+  fi
+
+  local token
+  token="$(curl -fsSL "https://${GHCR_REGISTRY_HOST}/token?scope=repository:${repo}:pull&service=${GHCR_REGISTRY_HOST}" 2>/dev/null |
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  if [ -z "${token}" ]; then
+    echo "error"
+    return 0
+  fi
+
+  local http_code
+  if ! http_code="$(curl -sS -o /dev/null -I -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H "Accept: ${GHCR_MANIFEST_ACCEPT}" \
+    "https://${GHCR_REGISTRY_HOST}/v2/${repo}/manifests/${reference}" 2>/dev/null)"; then
+    echo "error"
+    return 0
+  fi
+  case "${http_code}" in
+    "${HTTP_STATUS_OK}") echo "present" ;;
+    "${HTTP_STATUS_NOT_FOUND}") echo "absent" ;;
+    *) echo "error" ;;
+  esac
+}
+
 # Checks if all required candidate container images exist in GHCR for a specific commit SHA
 check_commit_images_exist() {
   local sha="$1"
@@ -486,18 +728,27 @@ check_commit_images_exist() {
   return 0
 }
 
-# Finds an existing rc_* tag for a commit SHA (excluding *_validated tags)
+# Finds the RC pipeline's own rc_<ts>_<sha> tag on a commit, for resolve_rc_tag.sh to
+# reuse; empty when there is none. Matched by name (rc_tag_name_regex, the sha field
+# bound to this commit), not the rc_* glob and not the bare shape: a hand-named
+# `rc_tag` dispatch input, whether `rc_hotfix` or a pipeline-shaped name carrying
+# another commit's sha, earns `<name>_validated`, which a release line's gate does
+# not read (validated_rc_tags_at_commit, the same name rule), and reusing that name
+# on the next dispatch would re-earn the same refused marker. A re-dispatch with the
+# input empty mints the pipeline's name beside the hand-named tag instead, and the
+# gate clears.
 get_existing_rc_tag() {
-  local sha="$1"
-  git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -v '_validated$' | head -n 1 || echo ""
+  local sha="$1" full tags
+  full="$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null || echo "${sha}")"
+  tags="$(git tag --points-at "${full}" "rc_*" 2>/dev/null | grep -E "$(rc_tag_name_regex "${full}")" || true)"
+  head -n 1 <<<"${tags}"
 }
 
-# Checks if a commit SHA has already been attempted in a previous RC run (rc_* tag exists)
+# Checks if a commit SHA has already been attempted in a previous RC run: any
+# unvalidated rc_* tag, hand-named included, since a hand dispatch is an attempt too.
 is_commit_already_attempted() {
   local sha="$1"
-  local rc_tag
-  rc_tag=$(get_existing_rc_tag "${sha}")
-  [ -n "${rc_tag}" ]
+  [ -n "$(git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -v '_validated$' || true)" ]
 }
 
 # Checks if a commit SHA carries the RC pipeline's validation marker (rc_*_validated).
@@ -505,14 +756,18 @@ is_commit_already_attempted() {
 # Anchored to the rc_ family, and named for it: this gates resolve_rc_tag.sh's
 # skip decision and the nightly promotion, so a marker minted by some other tag
 # family must not read as an RC validation. get_latest_validated_rc_tag anchors
-# the same way. The GA gate does not appear in that list any more:
-# verify_release_eligibility.sh reads the staging family alone, and takes the RC
-# validation as implied by it — see STAGING_TAG_SHAPE_REGEX below.
+# the same way. For a release from main the GA gate reads the staging family
+# alone and takes the RC validation as implied by it (STAGING_TAG_SHAPE_REGEX
+# below); for a release line it reads this family by the pipeline's own name
+# for the commit (validated_rc_tags_at_commit, rc_validated_tag_name_regex).
+#
+# The glob, not the shape: this is the "already tried" marker the RC scheduler
+# and the nightly read, and a hand-placed marker suppressing a re-validation is
+# the operator's own doing. The release line's gate is the stricter question,
+# "did the RC pipeline pass here", and reads the shape (validated_rc_tags_at_commit).
 is_rc_candidate_commit_already_validated() {
-  local sha="$1"
-  local validated_tags
-  validated_tags=$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || echo "")
-  [ -n "${validated_tags}" ]
+  local sha="${1:-}"
+  [ -n "$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || true)" ]
 }
 
 # ─── Promotion tag cores ──────────────────────────────────────────────────────
@@ -677,9 +932,27 @@ staging_tag_for_rc() {
 # tag anyone with push access could create — but it is not the stronger
 # guarantee the shape makes it look like.
 export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
+# The RC pipeline's own names for a commit: `rc_<ts>_<its short sha>`, as
+# resolve_rc_tag.sh mints it when the dispatch names none, and that with
+# `_validated` appended, which tag_validated_release.sh places when the suite
+# passes. The release line's gate and the name reuse both match these, with the
+# sha field bound to the commit in question, rather than the `rc_*` globs or the
+# bare shape: a hand-typed `rc_hotfix_validated` and a composed
+# `rc_<ts>_0000000_validated` must not read as "the RC suite passed here", and a
+# hand-named tag must not be the name the next dispatch reuses (see
+# get_existing_rc_tag). The pipeline never mints anything else, so a genuine
+# validation loses nothing.
+export RC_TAG_TIMESTAMP_PREFIX_REGEX='^rc_[0-9]{10}_'
+# Arguments: $1 = commit sha (full or short; the first seven characters are the field)
+rc_tag_name_regex() {
+  echo "${RC_TAG_TIMESTAMP_PREFIX_REGEX}${1:0:7}\$"
+}
+rc_validated_tag_name_regex() {
+  echo "${RC_TAG_TIMESTAMP_PREFIX_REGEX}${1:0:7}_validated\$"
+}
 
-# Finds the newest shape-valid staging promotion tag anywhere in the repository.
-# Empty output means nothing has been promoted to staging.
+# Finds the newest shape-valid staging promotion tag on main. Empty output
+# means nothing has been promoted to staging.
 #
 # `--sort=-v:refname` orders by the timestamp immediately after the prefix, which
 # is why staging_tag_for_rc puts it there. The list is materialised before it is
@@ -687,9 +960,14 @@ export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
 # closing the pipe early makes grep exit 141, which a trailing `|| echo ""` then
 # turns into "nothing has passed the gate" — a skipped release, silently, once
 # the tag list outgrows a pipe buffer.
+# On main, like the rc_ pickers (list_tags_on_main): the GA gate, the publish
+# auto-resolve, the version calculator and the staging deploy all read this,
+# and a staging_ tag a hand-dispatched promotion left on a release-line commit
+# must not become main's release candidate.
+# Arguments: $1 = main's commit, already resolved (optional; see list_tags_on_main)
 get_latest_staging_tag() {
   local tags
-  tags="$(git tag -l --sort=-v:refname "${STAGING_TAG_PREFIX}*" 2>/dev/null || true)"
+  tags="$(list_tags_on_main "${STAGING_TAG_PREFIX}*" "${1:-}")" || return 1
   grep -m1 -E "${STAGING_TAG_SHAPE_REGEX}" <<<"${tags}" || true
 }
 
@@ -966,9 +1244,6 @@ ensure_git_tag() {
     return 1
   fi
 
-  local target_repo
-  target_repo="$(get_target_repo)"
-
   release_fetch_tags
 
   # Canonicalize commit SHA to full 40-character hash before comparison
@@ -996,15 +1271,547 @@ ensure_git_tag() {
     return 0
   fi
 
-  local push_err
-  if push_err=$(git push origin "${rc_tag}" 2>&1); then
-    echo "✅ Git tag '${rc_tag}' successfully pushed to remote repository (${target_repo})!"
-  elif push_err=$(git push "https://github.com/${target_repo}.git" "${rc_tag}" 2>&1); then
-    echo "✅ Git tag '${rc_tag}' successfully pushed to remote repository (${target_repo})!"
-  else
-    echo "❌ ERROR: Could not push git tag '${rc_tag}' to remote repository (${target_repo}): ${push_err}" >&2
+  release_push_ref "${rc_tag}" "Git tag '${rc_tag}'"
+}
+
+# Pushes refs to the release repository in one atomic push: all of them land or
+# none does. `origin` first, then the plain https URL of the target repository.
+# Never `--force`: a ref the remote already holds at another commit is refused
+# there, the whole push with it, and the error names it.
+# Arguments: $1 = what is being pushed, for the messages; $2... = refspecs
+release_push_refs() {
+  local label="${1:-}"
+  shift || true
+
+  if [ $# -eq 0 ]; then
+    echo "❌ ERROR: at least one refspec is required for release_push_refs." >&2
     return 1
   fi
+
+  local target_repo
+  target_repo="$(get_target_repo)"
+
+  local fallback_url
+  fallback_url="$(release_repo_url)"
+
+  local origin_err fallback_err
+  if origin_err=$(git push --atomic origin "$@" 2>&1); then
+    echo "✅ ${label} successfully pushed to remote repository (${target_repo})!"
+  elif fallback_err=$(git push --atomic "${fallback_url}" "$@" 2>&1); then
+    echo "✅ ${label} successfully pushed to remote repository (${target_repo})!"
+  else
+    # Both attempts are reported: in CI they name the same repository and
+    # usually agree, but a mis-set GH_ORG/GH_REPO makes the fallback fail for a
+    # reason of its own, and origin's is then the one that says what happened.
+    echo "❌ ERROR: Could not push ${label} to remote repository (${target_repo})." >&2
+    echo "   origin: ${origin_err}" >&2
+    echo "   ${fallback_url}: ${fallback_err}" >&2
+    return 1
+  fi
+}
+
+# One ref, the form the candidate-rung taggers use.
+# Arguments: $1 = refspec, $2 = what it is, for the messages ("Git tag '0.7.0'")
+release_push_ref() {
+  local refspec="${1:-}"
+  local label="${2:-ref '${1:-}'}"
+
+  if [ -z "${refspec}" ]; then
+    echo "❌ ERROR: a refspec is required for release_push_ref." >&2
+    return 1
+  fi
+  release_push_refs "${label}" "${refspec}"
+}
+
+# The release line a version belongs to: `X.Y.Z` -> `X.Y`.
+release_line_for_version() {
+  local version="${1:-}"
+  validate_pure_numeric_semver "${version}" "Version" || return 1
+  echo "${version%.*}"
+}
+
+# The branch of a release line: `X.Y` -> `release/X.Y`.
+release_branch_for_line() {
+  local line="${1:-}"
+  if ! [[ "${line}" =~ ${RELEASE_LINE_SHAPE_REGEX} ]]; then
+    echo "❌ ERROR: '${line}' is not a release line; expected X.Y." >&2
+    return 1
+  fi
+  echo "${RELEASE_BRANCH_PREFIX}${line}"
+}
+
+# Prints the commit a tag points at on the release repository (peeled, so an
+# annotated tag reads as its commit), empty when the remote has no such tag,
+# and fails when the remote cannot be read.
+# Arguments: $1 = tag name
+release_tag_remote_commit() {
+  local tag="${1:-}"
+
+  if [ -z "${tag}" ]; then
+    echo "❌ ERROR: a tag name is required for release_tag_remote_commit." >&2
+    return 1
+  fi
+
+  local remote_url
+  remote_url="$(release_repo_url)"
+
+  local listing
+  if ! listing="$(git ls-remote --tags "${remote_url}" "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>&1)"; then
+    echo "❌ ERROR: Could not read tags of ${remote_url}: ${listing}" >&2
+    return 1
+  fi
+  # The peeled line (`^{}`) is the commit; the plain line is the tag object for an
+  # annotated tag and the commit itself for a lightweight one.
+  local peeled plain
+  peeled="$(awk -v ref="refs/tags/${tag}^{}" '$2 == ref { print $1 }' <<<"${listing}")"
+  plain="$(awk -v ref="refs/tags/${tag}" '$2 == ref { print $1 }' <<<"${listing}")"
+  echo "${peeled:-${plain}}"
+}
+
+# The commit the release repository's copy of a branch points at, or nothing
+# when it has none. The match is exact: ls-remote's own pattern is tail-matched,
+# so `refs/heads/release/0.7` alone would also answer for a stray
+# `x/refs/heads/release/0.7`. A remote that cannot be read is an error rather
+# than an empty answer: in CI the remote is the truth about the branch, and a
+# guess of "absent" would let a plain push fast-forward a branch that exists.
+# Arguments: $1 = branch ref (refs/heads/...)
+release_branch_remote_commit() {
+  local branch_ref="${1:-}"
+
+  if [ -z "${branch_ref}" ]; then
+    echo "❌ ERROR: a branch ref is required for release_branch_remote_commit." >&2
+    return 1
+  fi
+
+  local remote_url
+  remote_url="$(release_repo_url)"
+
+  local listing
+  if ! listing="$(git ls-remote --heads "${remote_url}" "${branch_ref}" 2>&1)"; then
+    echo "❌ ERROR: Could not read branches of ${remote_url}: ${listing}" >&2
+    return 1
+  fi
+  awk -v ref="${branch_ref}" '$2 == ref { print $1 }' <<<"${listing}"
+}
+
+# The head of a release line: on the release repository in CI (fetched into
+# this checkout if it is not already here), the local branch off CI. An
+# unreadable remote or a line that does not exist is an error.
+# Arguments: $1 = line (X.Y)
+release_line_head() {
+  local line="${1:-}" branch branch_ref head
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+
+  if is_ci_pipeline; then
+    head="$(release_branch_remote_commit "${branch_ref}")" || return 1
+    if [ -z "${head}" ]; then
+      echo "❌ ERROR: No release line '${branch}' on $(get_target_repo)." >&2
+      return 1
+    fi
+    if ! git rev-parse --verify --quiet "${head}^{commit}" >/dev/null 2>&1; then
+      git fetch "$(release_repo_url)" "${branch_ref}" >/dev/null 2>&1 || true
+    fi
+    if ! git rev-parse --verify --quiet "${head}^{commit}" >/dev/null 2>&1; then
+      echo "❌ ERROR: The head of '${branch}' (${head}) is not in this checkout and could not be fetched." >&2
+      return 1
+    fi
+    echo "${head}"
+    return 0
+  fi
+
+  # Off CI: the local branch, else the tracking ref a developer's clone holds.
+  if ! head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null)" &&
+    ! head="$(git rev-parse --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null)"; then
+    echo "❌ ERROR: No local release line '${branch}'." >&2
+    return 1
+  fi
+  echo "${head}"
+}
+
+# Whether a release line exists: on the release repository in CI, locally off
+# CI. Returns 2 when the remote cannot be read, so a caller fails closed rather
+# than treat "unknown" as "no".
+# Arguments: $1 = line (X.Y)
+release_line_branch_exists() {
+  local line="${1:-}" branch branch_ref head
+  branch="$(release_branch_for_line "${line}")" || return 2
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+  if is_ci_pipeline; then
+    head="$(release_branch_remote_commit "${branch_ref}")" || return 2
+  else
+    head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null ||
+      git rev-parse --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null || true)"
+  fi
+  [ -n "${head}" ]
+}
+
+# The commit a release line's next patch is cut from: the head, unless the head
+# is a GA release's stamped commit, in which case the commit that stamp was cut
+# from. That is what makes an idle line, or a re-run after its tag was pushed,
+# resolve to the same candidate as the run that released it, and so land in the
+# eligibility check's idempotent path rather than as a new release of nothing.
+#
+# A version names a release to resume instead: when its tag exists on the line
+# (a stamped commit whose parent is in the head's history), the candidate is
+# that parent, whatever has merged since. That is the pin for a line release
+# that died after its push and whose line moved on before the re-run — on main
+# the same pin is target_commit — so the re-run finishes that release rather
+# than cutting the next patch from the new head and leaving a tag with nothing
+# published behind it.
+# Arguments: $1 = line (X.Y), $2 = version to resume (optional)
+release_line_candidate() {
+  local line="${1:-}" version="${2:-}" head tag tag_commit
+  head="$(release_line_head "${line}")" || return 1
+  if [ -n "${version}" ] && tag_commit="$(git rev-parse --verify --quiet "refs/tags/${version}^{commit}" 2>/dev/null)"; then
+    if ga_tag_is_stamped "${version}" "${tag_commit}" &&
+      git merge-base --is-ancestor "${tag_commit}^1" "${head}" 2>/dev/null; then
+      git rev-parse --verify "${tag_commit}^1"
+      return 0
+    fi
+  fi
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    if ga_tag_is_stamped "${tag}" "${head}"; then
+      git rev-parse --verify "${head}^1"
+      return 0
+    fi
+  done < <(git tag --points-at "${head}" 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" || true)
+  echo "${head}"
+}
+
+# The line's candidate, or an error when a commit named alongside the line is
+# not it. The calculator and the eligibility check both resolve through this,
+# so the two cannot disagree about which commit a line releases: the branch
+# step can only fast-forward from the head, and the line's branch protection,
+# once it exists, vouches for the head alone.
+# Arguments: $1 = line (X.Y), $2 = commit-ish named by the caller (optional),
+#            $3 = version to resume (optional; see release_line_candidate)
+release_line_resolve_candidate() {
+  local line="${1:-}" named="${2:-}" version="${3:-}" candidate named_sha
+  candidate="$(release_line_candidate "${line}" "${version}")" || return 1
+  if [ -n "${named}" ] && [ "${named}" != "null" ]; then
+    named_sha="$(git rev-parse --verify "${named}^{commit}" 2>/dev/null || echo "")"
+    if [ "${named_sha}" != "${candidate}" ]; then
+      echo "❌ ERROR: Release line ${line} resolves to its own head (${candidate:0:7}), not to '${named}'. Either a target commit was named — a line takes none — or the line moved since it was last read. Nothing has been pushed; re-run without a target commit." >&2
+      return 1
+    fi
+  fi
+  echo "${candidate}"
+}
+
+# The RC validation markers on a commit, one per line: a release line's gate.
+# Matched to the pipeline's own name for this commit (rc_validated_tag_name_regex;
+# RC_TAG_TIMESTAMP_PREFIX_REGEX says why that and not the glob or the bare shape),
+# on a branch whose only gate this is.
+validated_rc_tags_at_commit() {
+  local sha="${1:-}" full tags
+  full="$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null || echo "${sha}")"
+  tags="$(git tag --points-at "${full}" "rc_*_validated" 2>/dev/null || true)"
+  grep -E "$(rc_validated_tag_name_regex "${full}")" <<<"${tags}" || true
+}
+
+# Where a version's release line is, relative to the release commit and the
+# candidate it was stamped from: prints `remote` or `local` (at the release
+# commit, on the release repository or in this checkout only), `remote-candidate`
+# or `local-candidate` (at the candidate, which is the stamped commit's parent,
+# so the branch has a fast-forward ahead of it), `remote-past` or `local-past`
+# (already beyond the release commit, which is where a re-run finds a line that
+# took a merge after the release's push landed: nothing to move), or `absent`. A
+# branch anywhere else is an error naming both commits, and so is a remote that
+# cannot be read. In CI the remote is what is read: a local branch the remote
+# lacks is a leftover (a dry run's, or a killed run's) and reads as `absent`,
+# and a local branch that has moved on from the remote's line is an error; off
+# CI the local branch stands in for the remote. Read-only; ensure_ga_release_refs
+# reads it before anything is pushed.
+# Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
+release_branch_placement() {
+  local version="${1:-}"
+  local release_commit="${2:-}"
+  local candidate="${3:-}"
+
+  if [ -z "${version}" ] || [ -z "${release_commit}" ]; then
+    echo "❌ ERROR: version and release commit are required for release_branch_placement." >&2
+    return 1
+  fi
+
+  local line branch branch_ref
+  line="$(release_line_for_version "${version}")" || return 1
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+
+  local target_full_sha candidate_full_sha=""
+  target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
+  if [ -n "${candidate}" ]; then
+    candidate_full_sha="$(git rev-parse --verify "${candidate}^{commit}" 2>/dev/null || echo "${candidate}")"
+  fi
+
+  # Names what a branch at `sha` is, or fails naming where it is instead. A
+  # commit the checkout does not hold yet is fetched first, so the ancestry
+  # test can read it.
+  classify() {
+    local sha="$1" where="$2" whose="$3"
+    if [ "${sha}" = "${target_full_sha}" ]; then
+      echo "${where}"
+      return 0
+    fi
+    if [ -n "${candidate_full_sha}" ] && [ "${sha}" = "${candidate_full_sha}" ]; then
+      echo "${where}-candidate"
+      return 0
+    fi
+    if ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null 2>&1; then
+      git fetch "$(release_repo_url)" "${branch_ref}" >/dev/null 2>&1 || true
+    fi
+    if git merge-base --is-ancestor "${target_full_sha}" "${sha}" 2>/dev/null; then
+      echo "${where}-past"
+      return 0
+    fi
+    echo "❌ ERROR: Release line '${branch}' already exists ${whose} but points to commit ${sha}, not the release commit ${target_full_sha}${candidate_full_sha:+ or its candidate ${candidate_full_sha}}!" >&2
+    return 1
+  }
+
+  local local_sha
+  local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+
+  # Whether a local copy of the line, in CI, is one this run may move: at the
+  # release commit or its candidate, a stamp of this version (what a dry run or a
+  # run killed before its push leaves), or behind the remote's head. Anything else
+  # holds work the remote never took, which no run may drop from the branch.
+  local_is_leftover() {
+    local sha="$1" remote="$2"
+    [ "${sha}" = "${target_full_sha}" ] && return 0
+    [ -n "${candidate_full_sha}" ] && [ "${sha}" = "${candidate_full_sha}" ] && return 0
+    [ "$(git log -1 --format=%s "${sha}" 2>/dev/null)" = "${RELEASE_STAMP_SUBJECT_PREFIX} ${version}" ] && return 0
+    [ -n "${remote}" ] && git merge-base --is-ancestor "${sha}" "${remote}" 2>/dev/null && return 0
+    return 1
+  }
+
+  if is_ci_pipeline; then
+    local remote_sha
+    remote_sha="$(release_branch_remote_commit "${branch_ref}")" || return 1
+    # In CI the remote decides, and a local branch is a leftover or a mistake: a
+    # fresh checkout has no local release/ branch at all. A leftover (a dry run's,
+    # or a killed run's, or a rejected push's before the take-back existed) is
+    # moved, since reading it would refuse the re-run once the candidate has moved
+    # on; a branch that has moved on from the remote's line is refused before
+    # anything is moved.
+    local placement
+    if [ -n "${remote_sha}" ]; then
+      placement="$(classify "${remote_sha}" "remote" "on $(get_target_repo)")" || return 1
+    fi
+    if [ -n "${local_sha}" ] && ! local_is_leftover "${local_sha}" "${remote_sha}"; then
+      echo "❌ ERROR: Release line '${branch}' in this checkout is at ${local_sha}: not the release commit, its candidate, a stamp of ${version}, or behind $(get_target_repo)'s line, so it holds work the remote never took. Move it aside (git branch -m) and re-run; nothing has been pushed." >&2
+      return 1
+    fi
+    if [ -n "${remote_sha}" ]; then
+      echo "${placement}"
+      return 0
+    fi
+    if [ -n "${local_sha}" ]; then
+      echo "ℹ️ Release line '${branch}' exists only in this checkout, at ${local_sha:0:7}: left behind by a run that did not push. Recreating it at release commit ${target_full_sha:0:7}." >&2
+    fi
+    echo "absent"
+    return 0
+  fi
+
+  if [ -n "${local_sha}" ]; then
+    classify "${local_sha}" "local" "locally"
+    return
+  fi
+  echo "absent"
+}
+
+# Sets the local copy of a release line to the release commit according to its
+# placement: created when absent, left alone when already there, fast-forwarded
+# from the candidate otherwise. Not while it is checked out: update-ref would
+# advance HEAD under a worktree still at the candidate, leaving the stamp staged
+# as a reversal.
+# Arguments: $1 = placement, $2 = branch, $3 = branch ref, $4 = release commit
+set_release_branch_locally() {
+  local placement="${1:-}" branch="${2:-}" branch_ref="${3:-}" target_full_sha="${4:-}"
+  case "${placement}" in
+    absent)
+      # --force for the leftover release_branch_placement reads as absent in CI;
+      # git still refuses to move a branch that is checked out.
+      if ! git branch --force "${branch}" "${target_full_sha}"; then
+        echo "❌ ERROR: Could not set release line '${branch}' to release commit ${target_full_sha:0:7} in this checkout; nothing has been pushed." >&2
+        return 1
+      fi
+      ;;
+    local | remote | local-past | remote-past) ;;
+    remote-candidate | local-candidate)
+      if [ "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)" = "${branch}" ]; then
+        echo "❌ ERROR: Release line '${branch}' is checked out here; switch to another branch before releasing from it." >&2
+        return 1
+      fi
+      # A compare-and-swap against the value read here, and a failure is a
+      # failure: the ref moved between the read and the swap, or something else
+      # holds it, and a run that read that as done would push a line that is
+      # not at the release commit.
+      local local_sha
+      local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+      if [ -n "${local_sha}" ]; then
+        if ! git update-ref "${branch_ref}" "${target_full_sha}" "${local_sha}"; then
+          echo "❌ ERROR: Could not fast-forward release line '${branch}' from ${local_sha:0:7} to release commit ${target_full_sha:0:7} in this checkout: the ref moved or is held. Nothing has been pushed; re-run." >&2
+          return 1
+        fi
+      elif ! git branch "${branch}" "${target_full_sha}"; then
+        echo "❌ ERROR: Could not create release line '${branch}' at release commit ${target_full_sha:0:7} in this checkout; nothing has been pushed." >&2
+        return 1
+      fi
+      echo "➡️ Release line '${branch}' fast-forwards to release commit ${target_full_sha:0:7}."
+      ;;
+    *)
+      echo "❌ ERROR: Unexpected release line placement '${placement}'." >&2
+      return 1
+      ;;
+  esac
+}
+
+# The GA rung: the tag and the release line, pushed in one atomic push so that
+# neither can exist on the remote without the other. That is what makes the run
+# repeatable whatever happens around it: a merge that lands on the line between
+# the placement check and the push rejects both refs, nothing is published, and
+# the re-run stamps from the new head; a run that dies after the push re-runs
+# like one that failed at image promotion, reusing the tagged commit, and a
+# line that took a merge in between is already past the release commit and is
+# left where it is. A tag or a line already on the remote at the release commit
+# is skipped, and whichever is missing is pushed alone; "already there" is read
+# from the remote, so a re-run in the checkout a rejected push left its tag in
+# pushes the tag too. Off CI both are set locally and neither is pushed.
+# Arguments: $1 = version, $2 = release commit, $3 = candidate commit
+ensure_ga_release_refs() {
+  local version="${1:-}"
+  local release_commit="${2:-}"
+  local candidate="${3:-}"
+
+  if [ -z "${version}" ] || [ -z "${release_commit}" ]; then
+    echo "❌ ERROR: version and release commit are required for ensure_ga_release_refs." >&2
+    return 1
+  fi
+
+  local placement
+  placement="$(release_branch_placement "${version}" "${release_commit}" "${candidate}")" || return 1
+
+  local line branch branch_ref
+  line="$(release_line_for_version "${version}")" || return 1
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+
+  local target_full_sha
+  target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
+
+  release_fetch_tags
+
+  local tag_ref="refs/tags/${version}" refspecs=() push_tag="false" push_line="false"
+  local existing_tag_sha prior_branch_sha
+  existing_tag_sha="$(git rev-parse --verify --quiet "${tag_ref}^{commit}" 2>/dev/null || true)"
+  prior_branch_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+
+  # In CI the remote decides whether the tag is still to be pushed, not this
+  # checkout: a dry run, or a run killed before its push, leaves the local tag
+  # behind (release_fetch_tags does not prune), and a CI run in that checkout
+  # that read the local tag as "already there" would push the line alone, which
+  # is the state the atomic push exists to rule out. A local tag the remote lacks
+  # is that leftover, and is recreated at the release commit, which after a merge
+  # on the line is a new stamp. Off CI nothing is pushed and the local tag is what
+  # a dry run inspects, so there the local read stands.
+  if is_ci_pipeline; then
+    local remote_tag_sha
+    remote_tag_sha="$(release_tag_remote_commit "${version}")" || return 1
+    if [ -n "${remote_tag_sha}" ] && [ "${remote_tag_sha}" != "${target_full_sha}" ]; then
+      echo "❌ ERROR: Tag '${version}' already exists on $(get_target_repo) but points to commit ${remote_tag_sha}, not target SHA ${target_full_sha}!" >&2
+      return 1
+    fi
+    if [ -z "${remote_tag_sha}" ] && [ -n "${existing_tag_sha}" ]; then
+      echo "ℹ️ Git tag '${version}' exists only in this checkout, at ${existing_tag_sha:0:7}: left behind by a push that did not land. Recreating it at release commit ${target_full_sha:0:7}."
+      git tag -d "${version}" >/dev/null
+      existing_tag_sha=""
+    fi
+  fi
+
+  if [ -n "${existing_tag_sha}" ]; then
+    if [ "${existing_tag_sha}" != "${target_full_sha}" ]; then
+      echo "❌ ERROR: Tag '${version}' already exists but points to commit ${existing_tag_sha}, not target SHA ${target_full_sha}!" >&2
+      return 1
+    fi
+    echo "✅ Git tag '${version}' already exists and points to target commit ${target_full_sha}. Idempotent skip."
+  else
+    setup_git_bot_user
+    git tag -a "${version}" "${target_full_sha}" -m "Release ${version}"
+    refspecs+=("${tag_ref}")
+    push_tag="true"
+  fi
+
+  # A run that fails from here on leaves the checkout as it was found: the tag
+  # this run created is deleted and the line put back. The workflow's fresh
+  # checkout would not care, but a persistent clone would, and off CI the
+  # calculator does not prune: a local tag no push ever took would be the next
+  # run's GA base and its notes-start tag. Reads the enclosing locals.
+  take_back_local_refs() {
+    local taken=()
+    if [ "${push_tag}" = "true" ]; then
+      git tag -d "${version}" >/dev/null 2>&1 || true
+      taken+=("Git tag '${version}'")
+    fi
+    if [ "${push_line}" = "true" ]; then
+      if [ -n "${prior_branch_sha}" ]; then
+        git update-ref "${branch_ref}" "${prior_branch_sha}" 2>/dev/null || true
+      else
+        git branch -D "${branch}" >/dev/null 2>&1 || true
+      fi
+      taken+=("release line '${branch}'")
+    fi
+    if [ ${#taken[@]} -gt 0 ]; then
+      echo "↩️ Nothing was pushed; $(IFS=,; echo "${taken[*]}") taken back from this checkout, which is left as it was found." >&2
+    fi
+  }
+
+  case "${placement}" in
+    remote)
+      echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
+      ;;
+    remote-past)
+      echo "✅ Release line '${branch}' on $(get_target_repo) is already past release commit ${target_full_sha:0:7}; nothing to move."
+      ;;
+    *)
+      if ! set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}"; then
+        take_back_local_refs
+        return 1
+      fi
+      if [ "${placement}" = "local-past" ]; then
+        echo "✅ Local release line '${branch}' is already past release commit ${target_full_sha:0:7}; nothing to move."
+      else
+        refspecs+=("${branch_ref}:${branch_ref}")
+        push_line="true"
+      fi
+      ;;
+  esac
+
+  # Safety Guard: Remote push executes exclusively inside CI
+  if ! is_ci_pipeline; then
+    echo "⚠️ [Local Execution] Dry-run: Git tag '${version}' and release line '${branch}' set locally. Remote push skipped (runs only in CI)."
+    return 0
+  fi
+
+  if [ ${#refspecs[@]} -eq 0 ]; then
+    echo "✅ Nothing to push: the tag and the release line are already on the remote."
+    return 0
+  fi
+
+  local label
+  if [ "${push_tag}" = "true" ] && [ "${push_line}" = "true" ]; then
+    label="Git tag '${version}' and release line '${branch}'"
+  elif [ "${push_tag}" = "true" ]; then
+    label="Git tag '${version}'"
+  else
+    label="Release line '${branch}'"
+  fi
+  if release_push_refs "${label}" "${refspecs[@]}"; then
+    return 0
+  fi
+  take_back_local_refs
+  return 1
 }
 
 # Stamps BAKED_RELEASE_VERSION into root installer scripts (install.sh, uninstall.sh, upgrade.sh)
@@ -1149,7 +1956,7 @@ is_valid_stamped_or_direct_release_commit() {
 
   local commit_subject
   commit_subject="$(git log -1 --format=%s "${tag_commit}" 2>/dev/null || echo "")"
-  local expected_subject="chore(release): stamp release version ${version}"
+  local expected_subject="${RELEASE_STAMP_SUBJECT_PREFIX} ${version}"
   if [ "${commit_subject}" != "${expected_subject}" ]; then
     echo "⚠️ Tag commit ${tag_commit:0:7} subject '${commit_subject}' does not match expected stamped subject '${expected_subject}'." >&2
     return 1
@@ -1232,7 +2039,7 @@ create_stamped_release_commit() {
     echo "📝 Stamping release version '${version}' in release tag commit..." >&2
     setup_git_bot_user
     git -C "${repo_dir}" add "${modified_files[@]}"
-    git -C "${repo_dir}" commit -m "chore(release): stamp release version ${version}" >/dev/null
+    git -C "${repo_dir}" commit -m "${RELEASE_STAMP_SUBJECT_PREFIX} ${version}" >/dev/null
     git -C "${repo_dir}" rev-parse HEAD
   else
     echo "${target_sha}"
