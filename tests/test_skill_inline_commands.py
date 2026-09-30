@@ -7,7 +7,8 @@ command whose program is a shell variable (`$G add`) and the refusal is final.
 The image build's deploy/docker/check_skill_commands.py runs the fenced shell
 blocks through that scanner but not inline code, most of which is JSON, report
 templates or fragments the scanner cannot rate. This reads the inline code of
-the same three skill trees for the variable form the skills used to teach.
+the same three skill trees for the variable forms the skills used to teach: a
+variable as the program, or a script run by a path that starts with one.
 """
 
 import re
