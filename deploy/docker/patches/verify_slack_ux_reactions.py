@@ -52,6 +52,7 @@ HOOKS = ("on_processing_start", "on_processing_complete")
 GUARD_ALIAS = "_kage_slack_ux"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_reactions"
+ADAPTER_CLASS = "SlackAdapter"
 UPSTREAM_HELPER = "_react"
 TARGET_HELPER = "_reacting_target"
 TRACKED_SET = "_reacting_message_ids"
@@ -159,28 +160,43 @@ def _check_members(tree: ast.Module) -> None:
     target = _method(tree, TARGET_HELPER)
     if isinstance(target, ast.AsyncFunctionDef) or len(target.args.args) != 2:
         raise _fail(f"{TARGET_HELPER}() is not a plain (self, event) method")
-    returns = [
-        node.value.body if isinstance(node.value, ast.IfExp) else node.value
-        for node in ast.walk(target)
-        if isinstance(node, ast.Return) and node.value is not None
-    ]
-    names = [
-        tuple(e.id if isinstance(e, ast.Name) else None for e in r.elts) for r in returns if isinstance(r, ast.Tuple)
-    ]
-    if TARGET_RETURN not in names:
-        raise _fail(f"{TARGET_HELPER}() no longer returns ({', '.join(TARGET_RETURN)}): {names}")
-    as_set = False
-    for node in ast.walk(tree):
+    # Every value it can return, both arms of a conditional included: the
+    # runtime unpacks whatever is not None into three names, so one other
+    # tuple on any path raises there.
+    values = [node.value for node in ast.walk(target) if isinstance(node, ast.Return)]
+    shapes = []
+    while values:
+        value = values.pop()
+        if isinstance(value, ast.IfExp):
+            values += [value.body, value.orelse]
+        elif value is None or (isinstance(value, ast.Constant) and value.value is None):
+            continue
+        elif isinstance(value, ast.Tuple):
+            shapes.append(tuple(e.id if isinstance(e, ast.Name) else None for e in value.elts))
+        else:
+            shapes.append(None)
+    if not shapes or any(shape != TARGET_RETURN for shape in shapes):
+        raise _fail(f"{TARGET_HELPER}() does not return only ({', '.join(TARGET_RETURN)}) or None: {shapes}")
+    # Every assignment in the adapter class, not one anywhere in the module:
+    # the runtime calls .discard() on the attribute the adapter holds.
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
+    )
+    if adapter is None:
+        raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
+    kinds = []
+    for node in ast.walk(adapter):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            named = any(isinstance(tg, ast.Attribute) and tg.attr == TRACKED_SET for tg in targets)
+            if not any(isinstance(tg, ast.Attribute) and tg.attr == TRACKED_SET for tg in targets):
+                continue
             value = node.value
-            is_set = isinstance(value, ast.Set) or (
-                isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set"
+            kinds.append(
+                isinstance(value, ast.Set)
+                or (isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set")
             )
-            as_set = as_set or (named and is_set)
-    if not as_set:
-        raise _fail(f"{ADAPTER} no longer initialises self.{TRACKED_SET} as a set")
+    if not kinds or not all(kinds):
+        raise _fail(f"{ADAPTER_CLASS} does not only ever assign self.{TRACKED_SET} a set")
 
 
 def check_board_read(module, root: Path) -> None:
