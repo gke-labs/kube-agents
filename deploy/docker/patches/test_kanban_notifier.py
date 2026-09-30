@@ -2272,7 +2272,7 @@ class _Delivery:
     routes it), the wake, and the cursor and failure accounting.
     """
 
-    def __init__(self, test, notifier_ns, runner, adapter, sub, events, wake_outcomes):
+    def __init__(self, notifier_ns, runner, adapter, sub, events, wake_outcomes):
         base = notifier_ns["_KanbanNotification"]
         record = self
 
@@ -2313,13 +2313,12 @@ class _Delivery:
                 pass
 
             def _owner_scope(self):
-                record.scopes += 1
                 return contextlib.nullcontext()
 
         self.cls = Notification
         self.runner, self.adapter, self.sub, self.events = runner, adapter, sub, events
         self.wake_outcomes = list(wake_outcomes)
-        self.wakes = self.failures = self.rewinds = self.advanced = self.scopes = 0
+        self.wakes = self.failures = self.rewinds = self.advanced = 0
 
     def tick(self):
         """One notifier tick: a fresh object per delivery, as upstream builds it."""
@@ -2368,7 +2367,7 @@ class DeliverEndToEndTest(unittest.TestCase):
         exec(compile(source, "kanban_watchers_notifier.py", "exec"), ns)
         adapter = _SendLog()
         delivery = _Delivery(
-            self, ns, types.SimpleNamespace(), adapter, _sub(), events or [_Ev(7, "gave_up")], wake_outcomes,
+            ns, types.SimpleNamespace(), adapter, _sub(), events or [_Ev(7, "gave_up")], wake_outcomes,
         )
         for _ in range(ticks or len(wake_outcomes)):
             delivery.tick()
