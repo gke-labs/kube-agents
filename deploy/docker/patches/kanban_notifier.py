@@ -110,6 +110,7 @@ __all__ = [
     "slack_ux_on",
     "completion_text",
     "explained_by_wake",
+    "drop_superseded",
     "hold_explained",
     "tell_unexplained",
 ]
@@ -1456,7 +1457,10 @@ def store_incident_report(
 # (:func:`tell_unexplained`): a wake that was admitted for the kind drops it;
 # a wake that raised, or a wake set that turned out not to hold the kind, posts
 # it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry, which
-# rewinds the claim and so replays the same event. Five trade-offs, accepted:
+# rewinds the claim and so replays the same event. A later event that posts
+# on the same card first (:func:`drop_superseded`) drops it, so a line held
+# across a ``WakeNotAccepted`` tick never lands beneath the card's later
+# completion. Five trade-offs, accepted:
 #
 # * A wake that raised and later succeeds on a retry tells the failure twice,
 #   once as the line and once in the creator's words. Twice is the safe side.
@@ -1576,6 +1580,31 @@ def hold_explained(
             ", ".join(sorted(entry[0] for entry in evicted.values())) or "no",
             evicted_key[0], HELD_MAX,
         )
+
+
+def drop_superseded(runner: object, sub: dict, event_id: int) -> None:
+    """Drop ``sub``'s held lines for events older than ``event_id``, with a WARNING.
+
+    Called before a later event on the card is posted. A line still held then
+    was left by a ``WakeNotAccepted`` tick, and the wake step that would settle
+    it runs after the later post, so posting it there would put a stale failure
+    beneath the card's newer message. Never raises.
+    """
+    try:
+        held = getattr(runner, HELD_ATTR, None)
+        pending = held.get(_held_key(sub)) if held else None
+        stale = sorted(eid for eid in (pending or {}) if eid < int(event_id))
+        for eid in stale:
+            kind = pending.pop(eid)[0]
+            logger.warning(
+                "kanban notifier: dropping the held %s line for %s untold; event %d "
+                "on the card posted before its wake settled",
+                kind, sub.get("task_id"), int(event_id),
+            )
+        if stale and not pending:
+            held.pop(_held_key(sub), None)
+    except Exception:
+        logger.warning("kanban notifier: dropping superseded held lines failed", exc_info=True)
 
 
 async def tell_unexplained(

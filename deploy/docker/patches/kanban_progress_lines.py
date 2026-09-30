@@ -433,6 +433,19 @@ def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
         return False
 
 
+def _drop_superseded(watcher: Any, sub: dict, event_id: int) -> None:
+    """Drop failure lines this card still holds from before ``event_id``."""
+    quiet = _slack_quiet(sub) if event_id else None
+    if quiet is None:
+        return
+    try:
+        quiet.drop_superseded(watcher, sub, event_id)
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug(
+            "kanban progress: dropping held lines for %s failed: %s", sub.get("task_id"), exc,
+        )
+
+
 def _hold(
     quiet: Any, watcher: Any, sub: dict, kind: str, event_id: int,
     message: str, metadata: Optional[dict],
@@ -496,6 +509,7 @@ async def deliver(
     key = sub_key(sub)
     entry = tracked.get(key)
     event_id = int(getattr(ev, "id", 0) or 0)
+    _drop_superseded(watcher, sub, event_id)
     quiet = _slack_quiet(sub)
     header, message = _slack_heads(quiet, sub, header, board, message)
 

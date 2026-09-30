@@ -2404,6 +2404,20 @@ class DeliverEndToEndTest(unittest.TestCase):
         )
         self.assertEqual(sent, ["✖ card gave_up"])
 
+    def test_flag_on_a_later_event_drops_a_line_held_across_a_full_queue(self):
+        # Tick 1 holds the failure and the queue refuses the wake. The card is
+        # retried and completes before tick 2, whose wake raises: the held line
+        # must not post beneath the completion.
+        delivery, sent = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        self.assertEqual(sent, [])
+        delivery.events.append(_Ev(8, "completed"))
+        delivery.wake_outcomes.append(RuntimeError("profile gone"))
+        with self.assertLogs("gateway.run", level="WARNING") as logs:
+            delivery.tick()
+        self.assertEqual([m for _, m, _ in delivery.adapter.sent], ["✖ card completed"])
+        self.assertIn("dropping the held gave_up line", "\n".join(logs.output))
+        self.assertFalse(getattr(delivery.runner, HELD_ATTR, None))
+
     def test_flag_on_a_wake_set_without_the_kind_posts_the_line(self):
         # The mirror in explained_by_wake predicted a wake; the notifier's own
         # gate did not ask for one. The line is then the only word.
