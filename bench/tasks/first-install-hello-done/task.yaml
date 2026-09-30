@@ -152,6 +152,9 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '(?m)^\s*(?:[-•]|\d+[.)])\s'
+        # A `*` bullet: the normaliser deletes every `*` and keeps the space
+        # after it, so the line opens with a space.
+        - '(?m)^ \S'
         - "i can help( you)? with"
 
   - name: no-apology-hype-or-filler

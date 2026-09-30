@@ -68,10 +68,13 @@ variable "variant" {
 
 variable "phrase" {
   type        = string
-  description = "Substring of the case's prompt; only a first turn containing it takes the request"
+  description = "Substring of the case's prompt and of no other case's; only a turn containing it gets the greeting"
 
+  # The plugin matches by substring on every turn, so a short phrase (" ", "hi")
+  # would greet any concurrent case's turn. scripts/validate_bench_cases.py
+  # checks the same floor and that the phrase is in the case's own prompt.
   validation {
-    condition     = length(var.phrase) > 0 && !can(regex("'", var.phrase))
-    error_message = "phrase must be non-empty and contain no single quote (it is passed through a shell)."
+    condition     = length(trimspace(var.phrase)) >= 12 && !can(regex("'", var.phrase))
+    error_message = "phrase must be at least 12 characters after trimming and contain no single quote (it is passed through a shell)."
   }
 }

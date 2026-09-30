@@ -326,6 +326,14 @@ ENTRY_SEVERITIES = frozenset({"recoverable", "catastrophic"})
 # it is a documented word that no spec may use.
 ENTRY_MODES = frozenset({"converge", "assert"})
 
+# The first-install-hello stack arms the bootstrap_onboarding plugin's eval
+# seam, which greets any turn whose message contains the case's phrase. A
+# phrase outside the case's own prompt is a request nothing answers, and a
+# short one matches other cases' turns. The floor matches the stack's
+# variables.tf validation.
+GREET_EVAL_STACK = "prebuilt/first-install-hello"
+GREET_EVAL_PHRASE_MIN_LENGTH = 12
+
 
 def _populated(value: Any) -> bool:
     """Whether an assertion field actually asserts something.
@@ -763,6 +771,25 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "block. hack/ci-eval-pr.sh's task_has_spec matches a bare "
                 "'verification_spec:' line, so an inline spec runs its checks "
                 "and is still graded by the judge-only fallback"
+            )
+
+    infrastructure = spec.get("infrastructure")
+    if isinstance(infrastructure, dict) and infrastructure.get("stack") == GREET_EVAL_STACK:
+        variables = infrastructure.get("variables")
+        phrase = variables.get("phrase") if isinstance(variables, dict) else None
+        prompt = spec.get("prompt")
+        if not isinstance(phrase, str) or len(phrase.strip()) < GREET_EVAL_PHRASE_MIN_LENGTH:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                f"shorter than {GREET_EVAL_PHRASE_MIN_LENGTH} characters after "
+                "trimming; the plugin matches it by substring on every turn, so "
+                "a short phrase greets other cases' turns"
+            )
+        elif not isinstance(prompt, str) or phrase not in prompt:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                "that is not a substring of its own 'prompt:', so no turn of "
+                "this case ever gets the greeting"
             )
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
