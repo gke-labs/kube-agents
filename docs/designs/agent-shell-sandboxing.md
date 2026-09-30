@@ -2245,11 +2245,13 @@ are questions about this pod that a file in the other one cannot answer.
 
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
-directory nothing else reads. Every other agent-side reader still looks on the
-gateway's volume and still finds nothing, and generalising this — a tool the model
-can call to bring a file across on demand, with a landing directory that persists
-past a single delivery — is a decision about the boundary that still wants its own
-design.
+directory nothing else reads. The one other agent-side reader that crosses is
+`bootstrap_delivery.py`, which reads the single file it posts, `INVENTORY.md`, by
+name once its markers say a delivery is due, and lands nothing on disk. Every other
+agent-side reader still looks on the gateway's volume and still finds nothing, and
+generalising either — a tool the model can call to bring a file across on demand,
+with a landing directory that persists past a single delivery — is a decision about
+the boundary that still wants its own design.
 
 ### Three of the proxy's five roles move
 

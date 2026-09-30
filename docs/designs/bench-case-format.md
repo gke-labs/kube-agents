@@ -187,14 +187,14 @@ purges it), and `worker_agents` (regular expressions every one of which must mat
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries).
 
-One reads the install under test, from the same file: `bootstrap_fanout` compares the
+Four read the install under test, all from the same file. `bootstrap_fanout` compares the
 cards the onboarding discovery sweep filed, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
 card for anything else) or `no_card_waits_on_the_sweep` (no cluster card has the sweep as a
 parent).
 
-`bootstrap_findings`, from the same file, reads the shell sandbox of the install under test:
+`bootstrap_findings` reads the shell sandbox of the install under test:
 `INVENTORY.items.json`, which the onboarding prioritization stage's `inventory_findings.py
 extract` writes through the worker's terminal. It passes when those items carry exactly the
 `(check, object)` pairs listed in `expected_findings`. `bootstrap_report_read` reads the

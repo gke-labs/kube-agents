@@ -77,8 +77,9 @@ SANDBOX_TIMEOUT_SECONDS = 30
 # over ssh bounded by SANDBOX_TIMEOUT_SECONDS.
 RETIRE_AFTER_SECONDS = 300
 
-# By absolute path: the terminal login sources a ~/.bashrc the model owns, and a
-# shell function or alias cannot shadow a name with a slash in it.
+# By absolute path, so no PATH entry picks the binary. A function defined under
+# this name in the ~/.bashrc the model owns still shadows it, since bash allows a
+# slash in a function name; that loses only the rename, as the claim comes first.
 REMOTE_MV = "/bin/mv"
 
 
