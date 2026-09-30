@@ -166,10 +166,12 @@ verification_spec:
       # joined with spaces, so `cd "$WS"` followed by a `grep` line reads as
       # `"$WS" grep`. The first pattern therefore takes a variable as the
       # program only at the start of the summary or after `;`, `&`, `|` or
-      # `(`: the `"$S" prepare` a `;` or `&&` chain shows as its first command.
+      # `$(`: the `"$S" prepare` a `;` or `&&` chain shows as its first command.
+      # A bare `(` is left out because a quoted message holds one far more often
+      # than a subshell does: `echo "opened PR (${SHA} commit)"`.
       # What follows it is a listed git subcommand, `submit_suggestion.py`'s
       # `prepare` or `submit`, or a flag (`$G -C dir`): any word would also
-      # match a variable inside a quoted message, `"done (${SHA} pushed)"`.
+      # match a variable inside a quoted message, `"done; ${SHA} pushed"`.
       # The second is the assignment, which is how a multi-line call's
       # `G=...` then `$G add` shows up once its lines are joined; capturing
       # git's output, `SHA=$(/opt/vcs/libexec/git rev-parse HEAD)`, is not one.
@@ -177,7 +179,7 @@ verification_spec:
       # command nor in the same call as its assignment, since the summary
       # drops a chain's later commands and its `export` segments.
       forbidden_patterns:
-        - '(^|[;&|(]\s*)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
+        - '(^|([;&|]|\$\()\s*)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
         - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*(/opt/vcs/libexec/git|submit_suggestion\.py)\b'
   - name: the-pull-request-is-real-and-this-runs
     role: objective

@@ -28,6 +28,12 @@ PROGRAM_ASSIGNMENT_RE = re.compile(
     r"\b[A-Za-z_]\w*=(?!\"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*"
     r"(/opt/vcs/libexec/git|submit_suggestion\.py)\b"
 )
+# A script run by a path that starts with a variable, which the skills taught
+# for their helper scripts (`"$HERMES_HOME"/skills/.../resolver.py poll`). The
+# plugin's skill never did, so its test has no copy.
+VARIABLE_PATH_PROGRAM_RE = re.compile(
+    r"(^|`|&&|;|\|)\s*\"?\$\{?[A-Za-z_]\w*\}?\"?/\S*\s+\S", re.MULTILINE
+)
 # A caution names the refused form so a reader knows what not to write.
 REFUSED_EXAMPLE_RE = re.compile(r"whose program is a variable \(`[^`]*`\)")
 
@@ -41,7 +47,10 @@ def inline_code(text):
 
 
 def refused(span):
-    return any(pattern.search(span) for pattern in (VARIABLE_PROGRAM_RE, PROGRAM_ASSIGNMENT_RE))
+    return any(
+        pattern.search(span)
+        for pattern in (VARIABLE_PROGRAM_RE, PROGRAM_ASSIGNMENT_RE, VARIABLE_PATH_PROGRAM_RE)
+    )
 
 
 class SkillInlineCommandsTest(unittest.TestCase):
@@ -63,6 +72,8 @@ class SkillInlineCommandsTest(unittest.TestCase):
             '$G add config/manifest.yaml && $G commit -m "feat: x"',
             "export G=/opt/vcs/libexec/git",
             '"$S" prepare --repo <owner>/<repo>',
+            '"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
+            'cd "$WS" && "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll',
         ):
             with self.subTest(span):
                 self.assertTrue(refused(span))
@@ -71,6 +82,8 @@ class SkillInlineCommandsTest(unittest.TestCase):
         for span in (
             "/opt/vcs/libexec/git add <path>",
             "$HERMES_HOME/skills",
+            '"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py',
+            'python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
         ):
             with self.subTest(span):
