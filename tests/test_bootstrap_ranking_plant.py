@@ -186,7 +186,11 @@ elif '"kanban", "create"' in stdin:
     (state / "create_argv").write_text("\n".join(cmd))
     if os.environ.get("CREATE_FAIL") == "1":
         unreachable()
-    print(os.environ.get("CARD_ID", "t_card"))
+    card = os.environ.get("CARD_ID", "t_card")
+    if card:
+        with open(state / "created", "a") as fh:
+            fh.write(card + "\n")
+    print(card)
 elif "task_runs" in stdin:
     record("run_state")
     states = os.environ.get("RUN_STATES", "1 1 1").split(";")
@@ -199,7 +203,8 @@ elif "idempotency_key LIKE" in stdin:
     if str(bump("listings") + 1) in os.environ.get("FAILED_LISTINGS", "").split():
         unreachable()
     archived = (state / "archived").read_text().split() if (state / "archived").exists() else []
-    open_cards = [c for c in os.environ.get("OPEN_CARDS", "").split() if c not in archived]
+    created = (state / "created").read_text().split() if (state / "created").exists() else []
+    open_cards = [c for c in os.environ.get("OPEN_CARDS", "").split() + created if c not in archived]
     print(" ".join(open_cards + os.environ.get("STUCK_CARDS", "").split()))
 elif "base64 -d" in script:
     record("plant " + target)
@@ -470,6 +475,9 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("Plant failed", completed.stderr)
         self.assertLess(self._indices(calls, "[arm]")[0], self._indices(calls, "[disarm]")[0])
+        archived = self._indices(calls, "archive t_card [archive]")
+        self.assertEqual(len(archived), 1, calls)
+        self.assertLess(self._indices(calls, "[create]")[0], archived[0])
 
     def test_step_5_reports_a_card_no_worker_picked_up(self):
         completed, calls = self._run(RUN_STATES="0 0 0")
@@ -657,7 +665,9 @@ class ArmDisarmTest(unittest.TestCase):
         return json.loads(path.read_text())["jobs"]
 
     def _py(self, code):
-        return subprocess.run([sys.executable, "-"], input=code, env=self._env, capture_output=True, text=True)
+        return subprocess.run(
+            [sys.executable, "-"], input=code, env=self._env, capture_output=True, text=True, timeout=60
+        )
 
     def test_arm_refuses_a_missing_job_or_a_bound_delivery_and_changes_nothing(self):
         for jobs, message in (
@@ -713,7 +723,9 @@ class ArmDisarmTest(unittest.TestCase):
         started = time.monotonic()
         out = self._py(self._disarm)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertGreaterEqual(time.monotonic() - started, 2.0)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 2.0)
+        self.assertLess(elapsed, 10.0)
         self.assertFalse((self._home / ".bench-onboarding-jobs.json").exists())
 
 

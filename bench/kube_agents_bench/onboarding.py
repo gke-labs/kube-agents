@@ -54,6 +54,9 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
+# How much of a failed exec's stderr the debug log keeps.
+_STDERR_LOG_CHARS = 200
+
 # The operator's StatefulSet for the agent is `<agent>-shell` with one replica
 # (shellSandboxName in k8s-operator/internal/controller/shell_sandbox_manifests.go).
 SANDBOX_POD_SUFFIX = "-shell-0"
@@ -141,7 +144,7 @@ def _kubectl_exec(target: str, container: str, script: str, timeout: float) -> s
         _log.debug("kubectl exec into %s failed: %s", target, exc)
         return ""
     if proc.returncode != 0:
-        _log.debug("kubectl exec into %s exited %d: %s", target, proc.returncode, proc.stderr.strip()[:200])
+        _log.debug("kubectl exec into %s exited %d: %s", target, proc.returncode, proc.stderr.strip()[:_STDERR_LOG_CHARS])
         return ""
     return proc.stdout
 

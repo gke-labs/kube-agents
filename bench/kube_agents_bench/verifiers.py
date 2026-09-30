@@ -97,6 +97,7 @@ _NO_WORKER_CALLS_REASON = (
     "the workers cannot observe its subject"
 )
 _FANOUT_READ_TIMEOUT_SEC = 60.0
+_ONBOARDING_READ_TIMEOUT_SEC = 60.0
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -2488,9 +2489,6 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
                 raw=raw,
             )
         return result
-
-
-_ONBOARDING_READ_TIMEOUT_SEC = 60.0
 
 
 class ExpectedFinding(BaseModel):

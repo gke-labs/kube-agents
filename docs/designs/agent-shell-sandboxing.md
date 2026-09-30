@@ -1243,8 +1243,10 @@ delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
 built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once
 its markers say a delivery is due, as the bootstrap onboarding section below describes.
-Nothing crosses the other way at runtime: `sandbox_mirror.py`'s one-time copy on first
-start, described above, is the only agent-to-sandbox copy. Nothing crosses because a path
+What crosses the other way is `sandbox_mirror.py`'s work, described above: it copies the
+working directories once on first start, and on every start and each new profile it creates
+the profile's working directories and copies each Cluster Agent's identity file. Nothing
+crosses because a path
 happened to match. The entrypoint writes a `.sandbox` marker into the
 sandbox's copy, which is how a script or a person tells which side they are on.
 
