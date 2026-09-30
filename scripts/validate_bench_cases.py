@@ -329,10 +329,12 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 # The first-install-hello stack arms the bootstrap_onboarding plugin's eval
 # seam, which greets any turn whose message contains the case's phrase. A
 # phrase outside the case's own prompt is a request nothing answers, and a
-# short one matches other cases' turns. The floor matches the stack's
-# variables.tf validation.
+# short one matches other cases' turns. The floor and the forbidden character
+# match the stack's variables.tf validation: main.tf writes the request through a
+# single-quoted shell string.
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
+GREET_EVAL_PHRASE_FORBIDDEN = "'"
 
 
 def _populated(value: Any) -> bool:
@@ -784,6 +786,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 f"shorter than {GREET_EVAL_PHRASE_MIN_LENGTH} characters after "
                 "trimming; the plugin matches it by substring on every turn, so "
                 "a short phrase greets other cases' turns"
+            )
+        elif GREET_EVAL_PHRASE_FORBIDDEN in phrase:
+            problems.append(
+                f"uses the {GREET_EVAL_STACK} stack with a 'phrase' variable "
+                f"containing {GREET_EVAL_PHRASE_FORBIDDEN!r}, which the stack "
+                "passes through a single-quoted shell string and refuses"
             )
         elif not isinstance(prompt, str) or phrase not in prompt:
             problems.append(

@@ -566,6 +566,10 @@ class TestTheRulesReject(unittest.TestCase):
     def test_a_greet_eval_phrase_outside_the_prompt_is_rejected(self):
         self._only("not a substring", **self._greet_eval("set you up earlier today"))
 
+    def test_a_greet_eval_phrase_with_an_apostrophe_is_rejected(self):
+        spec = self._greet_eval("I've just installed you", prompt="hi! I've just installed you")
+        self._only("single-quoted shell string", **spec)
+
     # -- the case-level keys --
 
     def test_the_task_id_alias_is_rejected(self):
