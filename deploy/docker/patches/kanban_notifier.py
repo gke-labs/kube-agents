@@ -1455,8 +1455,8 @@ def store_incident_report(
 # watcher (:func:`hold_explained`), and the notifier's wake step settles it
 # (:func:`tell_unexplained`): a wake that was admitted for the kind drops it;
 # a wake that raised, or a wake set that turned out not to hold the kind, posts
-# it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry. Four
-# trade-offs, accepted:
+# it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry, which
+# rewinds the claim and so replays the same event. Five trade-offs, accepted:
 #
 # * A wake that raised and later succeeds on a retry tells the failure twice,
 #   once as the line and once in the creator's words. Twice is the safe side.
@@ -1465,10 +1465,11 @@ def store_incident_report(
 # * A push wake is admission, not narration (``gateway/wake.py``). The line is
 #   dropped once the wake is queued, so a queued turn lost to a restart or an
 #   interrupt before it speaks still leaves the failure untold.
-# * A post that fails is tried :data:`TELL_ATTEMPTS` times in place, then kept
-#   for the next wake attempt. Where there is none (no wake was asked for, or
-#   the attempt that failed was the one that drops the subscription) the line
-#   is lost, and a WARNING names the card.
+# * A post that fails is tried :data:`TELL_ATTEMPTS` times in place, then
+#   dropped with a WARNING naming the card. Holding it again would hand it to
+#   whatever delivery the subscription sees next, which can be the card's
+#   later completion: a stale failure line under a success.
+# * A held line evicted at :data:`HELD_MAX` goes untold, with a WARNING.
 # The flag is read through ``gateway.slack_ux_reactions.enabled()``, imported
 # when a delivery runs: that module is copied into the image after this one,
 # and an image without it reads as flag off.
@@ -1493,8 +1494,8 @@ DEFAULT_DELIVERY_MODE = "notify"
 HELD_ATTR = "_kage_explained_pings"
 HELD_MAX = 256
 
-#: How often a held line's post is tried before it waits for the next wake
-#: attempt, and the pause between tries.
+#: How often a held line's post is tried before it is dropped, and the pause
+#: between tries.
 TELL_ATTEMPTS = 3
 TELL_RETRY_SECONDS = 1.0
 
@@ -1588,7 +1589,8 @@ async def tell_unexplained(
     notification's ``_owner_scope``, so the post reads the subscriber profile's
     config as upstream's pings do. Never raises: it runs inside that step's
     ``try``. A post is tried :data:`TELL_ATTEMPTS` times; a line that still
-    fails is held again for the next wake attempt, if there is one.
+    fails is dropped with a WARNING, since the next delivery on the
+    subscription may be a later event the stale line would contradict.
     """
     try:
         held = getattr(runner, HELD_ATTR, None)
@@ -1624,8 +1626,7 @@ async def tell_unexplained(
             break
         if error is not None:
             logger.warning(
-                "kanban notifier: posting the %s line for %s failed %d times: %s; holding it "
-                "for the next wake attempt, and it goes untold if there is none",
+                "kanban notifier: posting the %s line for %s failed %d times: %s; "
+                "dropping it, so the failure goes untold",
                 kind, sub.get("task_id"), TELL_ATTEMPTS, error,
             )
-            held.setdefault(key, {})[event_id] = pending[event_id]

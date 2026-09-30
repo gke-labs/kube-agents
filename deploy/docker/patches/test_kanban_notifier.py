@@ -1747,18 +1747,23 @@ class HeldFailureLinesTest(unittest.TestCase):
         self.tell(adapter, set(), sub=other)
         self.assertEqual(len(adapter.sent), 1)
 
-    def test_a_failed_post_is_held_for_the_retry(self):
+    def test_a_failed_post_is_dropped_not_held_for_a_later_delivery(self):
+        # The next delivery on the subscription can be the card's completion
+        # after "try again"; a re-held line would post under the report.
         for outcome in (RuntimeError("slack down"), types.SimpleNamespace(success=False, error="x")):
             with self.subTest(outcome=outcome):
                 self.runner = types.SimpleNamespace()
                 hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
                 failing = _SendLog(outcome)
-                with self.assertLogs("gateway.run", level="WARNING"):
+                with self.assertLogs("gateway.run", level="WARNING") as captured:
                     self.tell(failing, set())
                 self.assertEqual(len(failing.sent), TELL_ATTEMPTS)
+                self.assertIn("t_e0c1", captured.output[-1])
+                self.assertIn("untold", captured.output[-1])
                 adapter = _SendLog()
+                self.tell(adapter, {"completed"})
                 self.tell(adapter, set())
-                self.assertEqual(len(adapter.sent), 1)
+                self.assertEqual(adapter.sent, [])
 
     def test_a_post_that_fails_once_is_retried_in_place(self):
         hold_explained(self.runner, _sub(), "gave_up", 7, "✖ gave up", None)
