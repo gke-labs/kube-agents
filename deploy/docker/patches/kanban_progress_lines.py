@@ -138,6 +138,11 @@ IN_PROGRESS = "⏳"
 FINISHED = "✓"
 STOPPED = "⏹"
 
+#: The one kind that makes a failure line the card still holds stale: the card
+#: recovered and its report is posting. A note, a comment or another failure
+#: leaves the line held for its wake to settle.
+SUPERSEDING_KIND = "completed"
+
 BULLET = "• "
 
 #: Rendered in place of the bullets dropped to stay inside the budget.
@@ -319,9 +324,9 @@ def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
         return False
 
 
-def _drop_superseded(watcher: Any, sub: dict, event_id: int) -> None:
-    """Drop failure lines this card still holds from before ``event_id``."""
-    quiet = _slack_quiet(sub) if event_id else None
+def _drop_superseded(watcher: Any, sub: dict, kind: str, event_id: int) -> None:
+    """Drop failure lines this card still holds from before its completion, ``event_id``."""
+    quiet = _slack_quiet(sub) if event_id and kind == SUPERSEDING_KIND else None
     if quiet is None:
         return
     try:
@@ -388,7 +393,7 @@ async def deliver(
     key = sub_key(sub)
     entry = tracked.get(key)
     event_id = int(getattr(ev, "id", 0) or 0)
-    _drop_superseded(watcher, sub, event_id)
+    _drop_superseded(watcher, sub, kind, event_id)
 
     if kind not in ROLLING_KINDS:
         quiet = _slack_quiet(sub)
