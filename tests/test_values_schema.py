@@ -20,6 +20,7 @@ misspelt key, so the README's claim has a test that goes red when the schema
 stops being enforced.
 """
 
+import ast
 import json
 import pathlib
 import re
@@ -45,6 +46,9 @@ _UPGRADE_SCRIPT = _REPO_ROOT / "upgrade.sh"
 # `--set <key>=<tag>` the regex below cannot see, so the call sites are read instead.
 _RETAG_CALL_RE = re.compile(r'helm_retag((?:\s+"[A-Za-z][A-Za-z0-9_.]*")+)')
 _RETAG_KEY_RE = re.compile(r'"([^"]+)"')
+# The schema keywords `prune` in upgrade.sh stops at, read from the script so the
+# walker below stops where it does.
+_UNMODELLED_KEYWORDS_RE = re.compile(r"^UNMODELLED_KEYWORDS = (\(.*\))$", re.MULTILINE)
 
 # The three values the chart requires, as validate.yml passes them.
 _REQUIRED_SET_FLAGS = (
@@ -120,30 +124,45 @@ def _resolve(schema: dict, path: tuple[str, ...]) -> dict | None:
     return node
 
 
-def _closes_an_object(node) -> bool:
-    """Whether some object at or below `node` refuses keys it does not declare."""
-    if isinstance(node, list):
-        return any(_closes_an_object(item) for item in node)
-    if not isinstance(node, dict):
+def _unmodelled_keywords() -> tuple[str, ...]:
+    match = _UNMODELLED_KEYWORDS_RE.search(_UPGRADE_SCRIPT.read_text())
+    if match is None:
+        raise AssertionError(f"UNMODELLED_KEYWORDS not found in {_UPGRADE_SCRIPT}")
+    return ast.literal_eval(match.group(1))
+
+
+def _prune_stops_at(node, unmodelled: tuple[str, ...]) -> bool:
+    return not isinstance(node, dict) or any(keyword in node for keyword in unmodelled)
+
+
+def _prune_reaches_a_closed_object(node, unmodelled: tuple[str, ...]) -> bool:
+    """Whether `prune`, walking down from `node`, reaches an object that refuses unknown keys."""
+    if _prune_stops_at(node, unmodelled):
         return False
-    return node.get("additionalProperties", True) is False or any(_closes_an_object(child) for child in node.values())
+    if node.get("additionalProperties", True) is False:
+        return True
+    children = [*node.get("properties", {}).values(), node.get("additionalProperties"), node.get("items")]
+    return any(_prune_reaches_a_closed_object(child, unmodelled) for child in children)
 
 
-def _maps_keyed_into_a_closed_object(node, path: tuple[str, ...] = ()) -> list[str]:
-    """Paths of the `additionalProperties` schemas with a closed object below them."""
-    if isinstance(node, list):
-        return [
-            found
-            for index, item in enumerate(node)
-            for found in _maps_keyed_into_a_closed_object(item, path + (f"[{index}]",))
-        ]
-    if not isinstance(node, dict):
+def _maps_keyed_into_a_closed_object(
+    node, unmodelled: tuple[str, ...], path: tuple[str, ...] = ()
+) -> list[str]:
+    """Values paths of the maps whose keys `prune` would carry into a refused key's path.
+
+    Follows the schema the way `prune` does, through `properties`, `items` and an
+    `additionalProperties` schema, stopping at the keywords it leaves to Helm.
+    """
+    if _prune_stops_at(node, unmodelled):
         return []
     found = []
-    if isinstance(node.get("additionalProperties"), dict) and _closes_an_object(node["additionalProperties"]):
-        found.append("/".join(path) or "<root>")
-    for key, child in node.items():
-        found.extend(_maps_keyed_into_a_closed_object(child, path + (key,)))
+    if isinstance(node.get("additionalProperties"), dict) and _prune_reaches_a_closed_object(
+        node["additionalProperties"], unmodelled
+    ):
+        found.append(".".join(path) or "<root>")
+    for key, child in node.get("properties", {}).items():
+        found.extend(_maps_keyed_into_a_closed_object(child, unmodelled, path + (key,)))
+    found.extend(_maps_keyed_into_a_closed_object(node.get("items"), unmodelled, path + (_ITEM,)))
     return found
 
 
@@ -297,7 +316,7 @@ class SchemaShapeTest(unittest.TestCase):
         open in one release and closed in the next prints its keys on a re-tag
         between them, which no test here sees.
         """
-        self.assertEqual(_maps_keyed_into_a_closed_object(_load_schema()), [])
+        self.assertEqual(_maps_keyed_into_a_closed_object(_load_schema(), _unmodelled_keywords()), [])
 
 
 class ValuesYamlTest(unittest.TestCase):
@@ -409,21 +428,20 @@ class ResolverTest(unittest.TestCase):
         self.assertIsNone(_resolve(schema, ("global", "imagePullSecrets", _ITEM, "name")))
         self.assertIsNone(_resolve(schema, ("platformAgent", "harness", "tuning", "platform", "maxTurns")))
 
-    def test_a_map_is_reported_only_when_its_keys_lead_to_a_closed_object(self) -> None:
+    def test_a_map_is_reported_only_where_prune_would_print_its_keys(self) -> None:
+        unmodelled = _unmodelled_keywords()
+        self.assertIn("anyOf", unmodelled)
         closed = {"type": "object", "additionalProperties": False, "properties": {"a": {"type": "string"}}}
         schema = {
             "properties": {
+                "byTeam": {"type": "object", "additionalProperties": closed},
+                "teams": {"type": "array", "items": {"additionalProperties": {"properties": {"x": closed}}}},
                 "labels": {"type": "object", "additionalProperties": {"type": "string"}},
-                "byTeam": {
-                    "type": "array",
-                    "items": {"anyOf": [{"additionalProperties": {"properties": {"x": closed}}}]},
-                },
+                "either": {"anyOf": [{"type": "null"}, {"additionalProperties": closed}]},
+                "additionalProperties": closed,
             }
         }
-        self.assertEqual(
-            _maps_keyed_into_a_closed_object(schema),
-            ["properties/byTeam/items/anyOf/[0]"],
-        )
+        self.assertEqual(_maps_keyed_into_a_closed_object(schema, unmodelled), ["byTeam", "teams.[]"])
 
     def test_hcl_walker_skips_for_expression_arrows(self) -> None:
         paths = _composition_value_paths(
