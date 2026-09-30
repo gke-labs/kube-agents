@@ -401,76 +401,137 @@ def webhook_config(kind, name, hooks):
     return {"kind": kind, "metadata": {"name": name}, "webhooks": hooks}
 
 
-def hook(name, policy=None, service=("scen", "absent-hook"), url=None):
-    record = {"name": name, "clientConfig": {}}
+def rule(resources, operations=("CREATE",), groups=("",), scope=None):
+    record = {"apiGroups": list(groups), "apiVersions": ["*"], "operations": list(operations), "resources": list(resources)}
+    if scope is not None:
+        record["scope"] = scope
+    return record
+
+
+def hook(name, rules, policy=None, service=("scen", "gate-svc"), port=None, url=None):
+    record = {"name": name, "rules": rules, "clientConfig": {}}
     if policy is not None:
         record["failurePolicy"] = policy
     if url is not None:
         record["clientConfig"]["url"] = url
     elif service is not None:
         record["clientConfig"]["service"] = {"namespace": service[0], "name": service[1]}
+        if port is not None:
+            record["clientConfig"]["service"]["port"] = port
     return record
 
 
-def endpoint_slice(namespace, service, ready_flags):
+def service(namespace, name, ports=((443, "https"),)):
+    return {"kind": "Service", "metadata": {"namespace": namespace, "name": name}, "spec": {"ports": [{"port": p, "name": n} for p, n in ports]}}
+
+
+def endpoint_slice(namespace, svc, ready_flags, port_name="https"):
     return {
         "kind": "EndpointSlice",
-        "metadata": {"namespace": namespace, "name": f"{service}-abc", "labels": {"kubernetes.io/service-name": service}},
+        "metadata": {"namespace": namespace, "name": f"{svc}-abc", "labels": {"kubernetes.io/service-name": svc}},
+        "ports": [{"name": port_name, "port": 8443}],
         "endpoints": [{"conditions": {} if flag is None else {"ready": flag}} for flag in ready_flags],
     }
 
 
-class WebhookTest(unittest.TestCase):
-    def test_fail_closed_with_no_endpoints_blocks(self):
-        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("gate.scen.example.com", policy="Fail")])]
-        graded = r.grade_webhooks(configs, [])
+POD_GATE = [rule(["pods"])]
+LIVE = [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [True])]
+
+
+def grade(hooks, services=(), slices=(), kind="ValidatingWebhookConfiguration"):
+    return r.grade_webhooks([webhook_config(kind, "gate", hooks)], list(services), list(slices))
+
+
+class WebhookBackendTest(unittest.TestCase):
+    def test_missing_service_blocks_a_pod_gate(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")])
         self.assertEqual(len(graded["blocking"]), 1)
         finding = graded["blocking"][0]
-        self.assertEqual(finding["webhook"], "gate/gate.scen.example.com")
-        self.assertEqual(finding["service"], "scen/absent-hook")
-        self.assertEqual(finding["ready_endpoints"], 0)
-        self.assertIn("no ready endpoints", r.describe_webhook_finding(finding))
-        self.assertEqual(graded["evaluated"], 1)
+        self.assertEqual(finding["webhook"], "gate/g.example.com")
+        self.assertEqual(finding["reason"], "Service scen/gate-svc does not exist")
+        self.assertEqual(finding["upgrade_path"], ["CREATE pods"])
+        self.assertIn("matches CREATE pods", r.describe_webhook_finding(finding))
 
     def test_absent_failure_policy_is_fail_the_v1_default(self):
-        configs = [webhook_config("MutatingWebhookConfiguration", "defaulter", [hook("d.example.com")])]
-        self.assertEqual(len(r.grade_webhooks(configs, [])["blocking"]), 1)
+        self.assertEqual(len(grade([hook("d.example.com", POD_GATE)], kind="MutatingWebhookConfiguration")["blocking"]), 1)
 
-    def test_ready_backend_does_not_block_and_absent_ready_counts_as_ready(self):
-        slices = [endpoint_slice("scen", "absent-hook", [None])]
-        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("g.example.com", policy="Fail")])]
-        graded = r.grade_webhooks(configs, slices)
+    def test_ready_backend_on_the_webhook_port_does_not_block(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], *LIVE)
+        self.assertEqual((graded["blocking"], graded["outage"], graded["evaluated"]), ([], [], 1))
+
+    def test_endpoint_without_a_ready_condition_counts_as_ready(self):
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [None])])
         self.assertEqual(graded["blocking"], [])
-        self.assertEqual(graded["evaluated"], 1)
 
     def test_every_endpoint_not_ready_blocks(self):
-        slices = [endpoint_slice("scen", "absent-hook", [False, False])]
-        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("g.example.com", policy="Fail")])]
-        self.assertEqual(len(r.grade_webhooks(configs, slices)["blocking"]), 1)
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail")], [service("scen", "gate-svc")], [endpoint_slice("scen", "gate-svc", [False, False])])
+        self.assertEqual(graded["blocking"][0]["reason"], "Service scen/gate-svc has no ready endpoints on port 443")
 
-    def test_fail_open_is_counted_not_graded(self):
-        configs = [webhook_config("ValidatingWebhookConfiguration", "advisor", [hook("a.example.com", policy="Ignore")])]
-        graded = r.grade_webhooks(configs, [])
-        self.assertEqual(graded["blocking"], [])
-        self.assertEqual(graded["fail_open"], 1)
-        self.assertEqual(graded["evaluated"], 0)
+    def test_service_without_the_webhook_port_blocks(self):
+        # The API server refuses to resolve the webhook: no Service port equals the webhook's port.
+        graded = grade([hook("g.example.com", POD_GATE, policy="Fail", port=9443)], *LIVE)
+        self.assertEqual(graded["blocking"][0]["reason"], "Service scen/gate-svc has no port 9443")
 
-    def test_url_backend_is_counted_not_graded(self):
-        configs = [webhook_config("ValidatingWebhookConfiguration", "external", [hook("e.example.com", policy="Fail", service=None, url="https://hook.example.com/validate")])]
-        graded = r.grade_webhooks(configs, [])
-        self.assertEqual(graded["blocking"], [])
-        self.assertEqual(graded["url_backends"], 1)
+    def test_endpoints_on_another_named_port_do_not_count(self):
+        services = [service("scen", "gate-svc", ports=((443, "https"), (8080, "metrics")))]
+        slices = [endpoint_slice("scen", "gate-svc", [True], port_name="metrics")]
+        self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
+
+    def test_unnamed_single_port_matches_an_unnamed_slice_port(self):
+        services = [service("scen", "gate-svc", ports=((443, None),))]
+        slices = [endpoint_slice("scen", "gate-svc", [True], port_name=None)]
+        self.assertEqual(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"], [])
 
     def test_slices_of_another_service_or_namespace_do_not_count(self):
-        slices = [endpoint_slice("scen", "other-svc", [None]), endpoint_slice("prod", "absent-hook", [None])]
-        configs = [webhook_config("ValidatingWebhookConfiguration", "gate", [hook("g.example.com", policy="Fail")])]
-        self.assertEqual(len(r.grade_webhooks(configs, slices)["blocking"]), 1)
+        services = [service("scen", "gate-svc")]
+        slices = [endpoint_slice("scen", "other-svc", [True]), endpoint_slice("prod", "gate-svc", [True])]
+        self.assertEqual(len(grade([hook("g.example.com", POD_GATE, policy="Fail")], services, slices)["blocking"]), 1)
+
+    def test_fail_open_and_url_backends_are_counted_not_graded(self):
+        graded = grade([hook("a.example.com", POD_GATE, policy="Ignore"), hook("e.example.com", POD_GATE, policy="Fail", service=None, url="https://localhost:5443/v")])
+        self.assertEqual((graded["blocking"], graded["outage"]), ([], []))
+        self.assertEqual((graded["fail_open"], graded["url_backends"], graded["evaluated"]), (1, 1, 0))
+
+
+class WebhookScopeTest(unittest.TestCase):
+    def _path(self, rules):
+        return r.upgrade_path_matches({"rules": rules})
+
+    def test_a_gate_outside_the_upgrade_path_is_an_outage_not_a_blocker(self):
+        # The seeded fleet's fixture: a gate on ConfigMaps with no Service.
+        graded = grade([hook("gate.seeded.invalid", [rule(["configmaps"])], policy="Fail", service=("seeded-upgrade", "nonexistent-admission-gate"))])
+        self.assertEqual(graded["blocking"], [])
+        self.assertEqual(len(graded["outage"]), 1)
+        self.assertIn("matches nothing a node upgrade needs", r.describe_webhook_finding(graded["outage"][0]))
+
+    def test_each_upgrade_path_target(self):
+        self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["pods/eviction"])]), ["CREATE pods/eviction"])
+        self.assertEqual(self._path([rule(["nodes"], operations=("CREATE", "UPDATE"))]), ["CREATE nodes", "UPDATE nodes"])
+        self.assertEqual(self._path([rule(["leases"], operations=("UPDATE",), groups=("coordination.k8s.io",))]), ["UPDATE leases"])
+
+    def test_resource_wildcards(self):
+        self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
+        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/eviction", "CREATE nodes"])
+        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/eviction"])  # subresources only, not pods itself
+        self.assertEqual(self._path([rule(["*/eviction"])]), ["CREATE pods/eviction"])
+
+    def test_operation_group_and_scope_must_all_match(self):
+        self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
+        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "CREATE nodes", "UPDATE nodes", "UPDATE leases"])
+        self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
+        self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
+
+    def test_monitoring_resources_are_outside_the_path(self):
+        # GKE's managed Prometheus operator gates its own resources fail-closed.
+        self.assertEqual(self._path([rule(["rules", "clusterrules", "globalrules"], groups=("monitoring.googleapis.com",), operations=("CREATE", "UPDATE"))]), [])
 
     def test_split_webhook_items(self):
-        items = [webhook_config("ValidatingWebhookConfiguration", "v", []), webhook_config("MutatingWebhookConfiguration", "m", []), endpoint_slice("scen", "s", [True]), {"kind": "PodDisruptionBudget"}, "junk"]
-        configs, slices = r.split_webhook_items(items)
-        self.assertEqual([c["metadata"]["name"] for c in configs], ["v", "m"])
-        self.assertEqual(len(slices), 1)
+        items = [webhook_config("ValidatingWebhookConfiguration", "v", []), webhook_config("MutatingWebhookConfiguration", "m", []), service("scen", "s"), endpoint_slice("scen", "s", [True]), {"kind": "PodDisruptionBudget"}, "junk"]
+        configs, services, slices = r.split_webhook_items(items)
+        self.assertEqual(([c["metadata"]["name"] for c in configs], len(services), len(slices)), (["v", "m"], 1, 1))
 
 
 if __name__ == "__main__":
