@@ -15,6 +15,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
 import logging
@@ -1995,6 +1996,11 @@ CRON_REPORT_MAX_CHARS = int(os.getenv("CRON_REPORT_MAX_CHARS", "12000") or "1200
 # ("Security & RBAC Posture Audit") many times over.
 CRON_REPORT_MAX_LABEL_CHARS = 200
 
+# How long a Slack audit headline waits for its ledger issue before posting the
+# fallback. The relay turn can take 300 s of the caller's 360 s, and the forge
+# hop's own bound is 90 s, so this one is short.
+AUDIT_LEDGER_FETCH_TIMEOUT_S = 20
+
 # Newlines and the tokens that could open a role or forge a fence. Labels get a
 # stricter scrub than the report body does: the body is reproduced into the
 # user's channel, so `_defang_report` deliberately leaves markdown-shaped text
@@ -2400,16 +2406,56 @@ def _slack_audit_headline(platform: str, message: str, unrelayed: bool, chat_id:
 
     None, and the leg posts `message` as it always has, unless every condition
     holds: the flag is on, the leg is Slack, the Chat Agent composed the message
-    (an unrelayed report keeps its notice in the channel), the composed message
-    still carries fleet-audit's ledger title and issue URL, and a chat id is
-    known, since the full report goes into the headline's thread and a reply
-    cannot be addressed without one.
+    (an unrelayed report keeps its notice in the channel), a chat id is known,
+    since the full report goes into the headline's thread and a reply cannot be
+    addressed without one, and the message ends with an issue URL in a managed
+    repository, which is where fleet-audit keeps its ledger. The headline is
+    built from that issue; when it cannot be read, it is the report's own line
+    in bold with the ledger link.
     """
     if platform != "slack" or unrelayed or not slack_presenter.enabled():
         return None
     if not (chat_id or _slack_home_channel()):
         return None
-    return slack_audit_report.headline_message(message)
+    ref = slack_audit_report.ledger_ref(message)
+    if ref is None or not _is_managed_github_repo(ref.repo):
+        return None
+    issue = _fetch_ledger_issue(ref)
+    headline = slack_audit_report.headline_from_issue(issue, ref, message) if issue else None
+    return headline or slack_audit_report.headline_fallback(message, ref)
+
+
+def _is_managed_github_repo(repo: str) -> bool:
+    """Whether `repo` is a managed GitHub repository; False when the list cannot be read."""
+    try:
+        from gitops_workspace import get_managed_github_repos
+
+        managed = {slug.lower() for slug in get_managed_github_repos()}
+    except Exception as exc:
+        logger.warning(f"Audit headline skipped: managed repositories unreadable: {exc}")
+        return False
+    return repo.lower() in managed
+
+
+def _fetch_ledger_issue(ref: slack_audit_report.LedgerRef) -> dict | None:
+    """The ledger issue, read through the forge broker; None on any failure.
+
+    Read-only and bounded by `AUDIT_LEDGER_FETCH_TIMEOUT_S`; a call still
+    running then finishes in its own thread and is ignored. A failure costs the
+    headline its counts and rows, never the report.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        import forge
+
+        call = executor.submit(forge.call, "issue-view", {"number": ref.number}, ref.repo)
+        issue = call.result(timeout=AUDIT_LEDGER_FETCH_TIMEOUT_S).get("issue")
+    except Exception as exc:
+        logger.warning(f"Audit headline: could not read {ref.url}: {exc!r}")
+        return None
+    finally:
+        executor.shutdown(wait=False)
+    return issue if isinstance(issue, dict) else None
 
 
 def _post_audit_fold(profile: str, job_id: str, message: str, chat_id: str, thread_id: str) -> None:
@@ -2601,7 +2647,7 @@ def relay_cron_report(
         headline = _slack_audit_headline(platform, message, unrelayed, leg_chat_id)
         leg_message = truncation_notice + headline if headline else message
         new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
-        if new_thread_id and headline:
+        if new_thread_id and headline and slack_audit_report.has_more(message):
             _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id)
         if new_thread_id:
             threads[platform] = new_thread_id
