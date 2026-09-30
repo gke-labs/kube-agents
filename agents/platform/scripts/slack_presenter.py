@@ -249,7 +249,8 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     if first.lstrip().startswith(CODE_FENCES):
         return "", paragraphs
     first_line, _, more_lines = first.partition("\n")
-    sentence, remainder = _first_sentence(first_line.strip())
+    # The list marker goes first, or "1. Checkout is down." would end at "1.".
+    sentence, remainder = _first_sentence(LIST_MARKER.sub("", first_line.strip()))
     headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest

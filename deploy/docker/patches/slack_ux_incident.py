@@ -93,7 +93,8 @@ LINKS_MARKER = "🔗"
 #: Any option the section names, parsed or not.
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 RECOMMENDED = re.compile(r"Recommended:?[*_\s]*Option ([A-Z])\b")
-MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+#: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
+MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: A code fence line; nothing between two is a heading, a bullet or markup.
 FENCE = re.compile(r"^\s*(```|~~~)")
 
@@ -127,14 +128,26 @@ def _section(sections: dict[str, str], name: re.Pattern) -> str:
     return next((body for heading, body in sections.items() if name.search(heading)), "")
 
 
+def _unfenced(text: str) -> list[str]:
+    """The lines of ``text`` outside code fences, fence lines dropped."""
+    out, fenced = [], False
+    for line in text.split("\n"):
+        if FENCE.match(line):
+            fenced = not fenced
+        elif not fenced:
+            out.append(line)
+    return out
+
+
 def parse_triage(report: str) -> dict | None:
     """The headline, choices and links of a triage report, or None if it has no option.
 
     ``choices`` are ``(label, recommended)`` pairs in the report's order.
     """
     sections = _sections(report)
-    what_to_do = _section(sections, WHAT_TO_DO)
-    lines = what_to_do.split("\n")
+    # A fenced block may quote the option shape; only prose lines count.
+    lines = _unfenced(_section(sections, WHAT_TO_DO))
+    what_to_do = "\n".join(lines)
     choices: list[tuple[str, bool]] = []
     recommended = RECOMMENDED.search(what_to_do)
     seen = set()

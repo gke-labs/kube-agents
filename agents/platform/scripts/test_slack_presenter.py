@@ -136,6 +136,11 @@ class SplitAnswerTest(unittest.TestCase):
         ):
             self.assertEqual(sp.split_answer(line), (line, []))
 
+    def test_a_numbered_line_is_not_cut_at_its_number(self):
+        headline, body = sp.split_answer("1. Checkout is crashlooping on OOM. It hit 256Mi.")
+        self.assertEqual(headline, "Checkout is crashlooping on OOM.")
+        self.assertEqual(body, ["It hit 256Mi."])
+
     def test_leading_tilde_block_has_no_headline(self):
         headline, body = sp.split_answer("~~~\nkubectl get pods\n~~~")
         self.assertEqual(headline, "")

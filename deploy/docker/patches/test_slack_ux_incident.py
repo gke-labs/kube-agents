@@ -306,6 +306,19 @@ class RuntimeTest(unittest.TestCase):
                          ["apply Option A: Roll back to 14:02", "apply Option B: Restore the secret"])
         self.assertEqual(len(triage["links"]), 2)
 
+    def test_a_fenced_option_shape_is_not_an_option(self):
+        quoted = REPORT.replace(
+            "## What to do\n\n",
+            "## What to do\n\n```\n- **Option A (<Action Title>):** <what it does>\n```\n",
+        )
+        triage = runtime.parse_triage(quoted)
+        self.assertEqual(triage["choices"][0][0], "apply Option A: Roll back to 14:02")
+
+    def test_a_link_url_keeps_its_parentheses(self):
+        url = "https://console.cloud.google.com/logs/query;query=(severity>=ERROR)"
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
+        self.assertEqual(triage["links"][1], ("Cloud Logs", url))
+
     def test_a_decorated_heading_still_gives_the_headline(self):
         for heading in ("## 🚨 What's wrong?", "## What is wrong"):
             triage = runtime.parse_triage(REPORT.replace("## What's wrong", heading))
