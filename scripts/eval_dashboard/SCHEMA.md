@@ -916,8 +916,9 @@ is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, then the run's own `error`
 line; for the sweep the projects whose sweep failed with GitHub's answer, then
-the writes left for the next run under its budget, then why the run ended early
-or its `error` line; either says when the report was not a JSON object.
+the writes left for the next run under its budget, then the projects held and
+released unswept after the run stopped, then why the run ended early or its
+`error` line; either says when the report was not a JSON object.
 `summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
 of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
 previous `health.json`;

@@ -21,10 +21,10 @@ job runs as. The token is narrowed at mint to one repository and those two
 writes; the key never leaves KMS.
 
 Which projects: the ones Boskos hands out as `free`. Each is acquired into a
-`cleaning` state for the seconds the sweep takes and released back to `free`,
-so a project a run holds is never touched, and a run arriving mid-sweep waits
-those seconds at its own acquire. No listing endpoint is needed and no run's
-state is read.
+`cleaning` state for as long as its sweep takes -- seconds, or minutes after a
+gap, the hold heartbeated -- and released back to `free`, so a project a run
+holds is never touched, and a run arriving mid-sweep waits at its own acquire.
+No listing endpoint is needed and no run's state is read.
 
 The writes are paced to GitHub's published burst limits for an App -- a second
 between writes, 500 writes an hour -- with a budget of writes per run past which
@@ -74,11 +74,15 @@ REQUEST_TIMEOUT_SECONDS = 30
 # across runs instead of in one burst. What a run leaves is logged and reported.
 WRITE_PAUSE_SECONDS = 1.0
 WRITE_BUDGET_PER_RUN = 80
+# A pull request left unclosed will cost its close and its branch delete.
+WRITES_PER_PULL_REQUEST = 2
+# GitHub answers a limit with a 429, or with a 403 it marks: a Retry-After, a
+# spent rate-limit budget in the headers, or a body naming a limit. Any other
+# 403 (an archived repository, a protected branch) is that repository's fault,
+# as before.
 RATE_LIMITED_CODE = 403
+TOO_MANY_REQUESTS_CODE = 429
 RETRY_AFTER_HEADER = "Retry-After"
-# A 403 is the burst limit only when GitHub says so: a Retry-After, a spent
-# rate-limit budget in the headers, or a body naming a limit. Any other 403 (an
-# archived repository, a protected branch) is that repository's fault, as before.
 RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
 RATE_LIMIT_BODY_MARKERS = ("rate limit", "abuse detection")
 # Without the header, or with one past this, a refused write waits this long
@@ -167,8 +171,8 @@ DEFAULT_BOSKOS_OWNER = "ci-kube-agents-pull-sweep"
 # Boskos to return anything that has sat there longer than this to free -- its
 # own /reset, a Go duration. Under the periodic's ten-minute interval, so the
 # very next run returns a strand (15m would have let one sit for two or three
-# runs). A sweep holds a project for seconds, so nothing live is inside the
-# window.
+# runs). A live hold's LastUpdate is refreshed by the heartbeat, so a sweep
+# that runs for minutes stays outside the window; only a dead run's is inside.
 BOSKOS_STRANDED_AFTER = "5m"
 TERMINATED_EXIT_CODE = boskos_pool.TERMINATED_EXIT_CODE
 Terminated = boskos_pool.Terminated
@@ -412,7 +416,9 @@ def _retry_after(exc):
 
 
 def is_rate_limited(exc):
-    """A 403 that GitHub marks as its burst limit, not a permission."""
+    """A 429, or a 403 GitHub marks as its burst limit rather than a permission."""
+    if exc.code == TOO_MANY_REQUESTS_CODE:
+        return True
     if exc.code != RATE_LIMITED_CODE:
         return False
     headers = getattr(exc, "headers", None) or {}
@@ -428,21 +434,24 @@ def write(method, path, authorization, body=None):
     here rather than visiting every project during the cooldown. Any other
     error is the caller's, as before."""
     try:
-        result = api(method, path, authorization, body)
-    except urllib.error.HTTPError as exc:
-        if not is_rate_limited(exc):
-            raise
-        wait = _retry_after(exc)
-        print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
-        pause(wait)
         try:
-            result = api(method, path, authorization, body)
-        except urllib.error.HTTPError as again:
-            if not is_rate_limited(again):
+            return api(method, path, authorization, body)
+        except urllib.error.HTTPError as exc:
+            if not is_rate_limited(exc):
                 raise
-            raise RateLimited("GitHub refused %s %s twice (%s)" % (method, path, boskos_pool.describe(again)))
-    pause(WRITE_PAUSE_SECONDS)
-    return result
+            wait = _retry_after(exc)
+            print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
+            pause(wait)
+            try:
+                return api(method, path, authorization, body)
+            except urllib.error.HTTPError as again:
+                if not is_rate_limited(again):
+                    raise
+                raise RateLimited("GitHub refused %s %s twice (%s)" % (method, path, boskos_pool.describe(again)))
+    finally:
+        # After every attempt, refused ones included: the second between writes
+        # is what keeps the next one under the limit.
+        pause(WRITE_PAUSE_SECONDS)
 
 
 def delete_branch(repo, ref, authorization):
@@ -493,7 +502,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             closed += 1
             gone.add(ref)
             continue
-        if budget is not None and not budget.take(repo, writes_left_if_not=2):
+        if budget is not None and not budget.take(repo, writes_left_if_not=WRITES_PER_PULL_REQUEST):
             still_open.add(ref)
             continue
         # Each close stands alone. One that fails is reported and the sweep
@@ -650,8 +659,7 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
     # The hold is heartbeated: one repository's sweep can now run for minutes
     # (paced writes, a Retry-After wait), and the pool's reaper frees a hold
     # not updated for about five minutes.
-    _, release_failures = boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit, heartbeat=True)
-    failures.update(release_failures)
+    boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit, heartbeat=True, release_failures=failures)
     print(
         "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped, %d skipped, %d write(s) left for the next run"
         % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped), len(skipped), budget.left)

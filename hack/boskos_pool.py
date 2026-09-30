@@ -190,7 +190,7 @@ def reset_stranded(server, hold_state, expire, what):
             {"type": RESOURCE_TYPE, "state": hold_state, "dest": FREE_STATE, "expire": expire},
         )
     except (BoskosError,) + REACH_ERRORS as exc:
-        print("could not reset stranded projects: %s" % exc, file=sys.stderr)
+        print("could not reset stranded projects: %s" % describe(exc), file=sys.stderr)
         return []
     names = sorted(stranded or {})
     for name in names:
@@ -203,7 +203,7 @@ def _heartbeat(server, owner, hold_state, name, stop):
         try:
             update(server, owner, hold_state, name)
         except (BoskosError,) + REACH_ERRORS as exc:
-            print("  %s: heartbeat failed (%s)" % (name, exc), file=sys.stderr)
+            print("  %s: heartbeat failed (%s)" % (name, describe(exc)), file=sys.stderr)
 
 
 # Termination signals deferred while a hold is between its acquire and its
@@ -271,8 +271,12 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
         beater = None
         try:
             if heartbeat:
-                beater = threading.Thread(target=_heartbeat, args=(server, owner, hold_state, name, stop), daemon=True)
-                beater.start()
+                # Bound to `beater` only once started: a start that fails must
+                # not leave a thread the finally would try to join before the
+                # release.
+                thread = threading.Thread(target=_heartbeat, args=(server, owner, hold_state, name, stop), daemon=True)
+                thread.start()
+                beater = thread
             _hold_signals(False)
             return visit(name)
         finally:
@@ -299,7 +303,7 @@ def hold(server, owner, hold_state, name, visit, release_failures, heartbeat=Fal
     return acquire_and_hold(server, owner, hold_state, lambda: name, visit, release_failures, heartbeat=heartbeat)
 
 
-def walk(server, owner, hold_state, pool_size, visit, heartbeat=False):
+def walk(server, owner, hold_state, pool_size, visit, heartbeat=False, release_failures=None):
     """Offer every project Boskos will hand out as free to visit(name), once each.
 
     Returns (visited names in order, release failures by name). Bounded twice:
@@ -308,7 +312,9 @@ def walk(server, owner, hold_state, pool_size, visit, heartbeat=False):
     """
     visited = []
     seen = set()
-    release_failures = {}
+    # The caller's dict when given, so a release that fails before a
+    # termination unwinds the walk is still on the caller's record.
+    release_failures = release_failures if release_failures is not None else {}
     repeats = 0
     for _ in range(2 * pool_size + MAX_CONSECUTIVE_REPEATS):
 

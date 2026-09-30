@@ -392,7 +392,8 @@ a one-line summary of what the run did from its report, and the report's detail
 lines, up to five: for the reconcile the projects it refused, failed or was
 interrupted in with each one's reason; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
-budget, and why it ended early if it did. `periodics_runs` carries every read
+budget, the projects it did not reach after stopping, and why it stopped if it
+did. `periodics_runs` carries every read
 job's latest build and its summary, which is what the recovery message says. A
 job with no reading writes no note and ends none: that is the bot losing sight
 of the job, not the job recovering.

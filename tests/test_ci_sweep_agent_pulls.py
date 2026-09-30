@@ -617,7 +617,26 @@ class PacingTest(unittest.TestCase):
         self.assertTrue(sweeper.is_rate_limited(_http_error(403, headers={"X-RateLimit-Remaining": "0"})))
         self.assertTrue(sweeper.is_rate_limited(_http_error(403, body=b'{"message":"You have exceeded a secondary rate limit."}')))
         self.assertFalse(sweeper.is_rate_limited(_http_error(403, body=b'{"message":"Repository was archived so is read-only."}')))
-        self.assertFalse(sweeper.is_rate_limited(_http_error(429, headers={"Retry-After": "5"})))
+        # GitHub answers a limit with a 403 it marks or with a 429; a 429 needs no marker.
+        self.assertTrue(sweeper.is_rate_limited(_http_error(429, headers={"Retry-After": "5"})))
+        self.assertTrue(sweeper.is_rate_limited(_http_error(429)))
+
+    def test_a_429_ends_the_run_like_a_marked_403(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+        refused = _http_error(429, headers={"Retry-After": "30"})
+        github = _GitHub(pulls={REPO: [agent_pull(number=1)], eight: [agent_pull(head_repo=eight)]}, close_errors={1: [refused, refused]})
+        report = {}
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            (closed, failures, _), boskos, github = run_pool(["kube-agents-evals-7", "kube-agents-evals-8"], github, report=report)
+        self.assertIn(30, _PAUSES)
+        self.assertIn("twice", report["ended_early"])
+        self.assertEqual(report["skipped"], ["kube-agents-evals-8"])
+        self.assertFalse(any("evals-8-infra" in key for key, _ in github.calls))
+
+    def test_a_refused_write_is_followed_by_the_pause_too(self):
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(422)})
+        run_repo(github)
+        self.assertEqual([p for p in _PAUSES if p == sweeper.WRITE_PAUSE_SECONDS], [sweeper.WRITE_PAUSE_SECONDS] * 4, "four writes, four pauses, the refused delete included")
 
     def test_a_refused_write_waits_what_github_asks_and_is_retried_once(self):
         refused = _http_error(403, body=b'{"message":"You have exceeded a secondary rate limit"}', headers={"Retry-After": "7"})
@@ -663,6 +682,53 @@ class HoldTest(unittest.TestCase):
 
     def setUp(self):
         del _PAUSES[:]
+
+    def test_the_pool_walk_heartbeats_its_holds(self):
+        # A sweep can run for minutes after a gap; the heartbeat keeps its
+        # LastUpdate fresh against the reaper and the next run's reset.
+        import time
+
+        class _Slow(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "/pulls?" in request.full_url:
+                    time.sleep(0.2)
+                return super().__call__(request, timeout=timeout)
+
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with mock.patch.object(sweeper.boskos_pool, "HEARTBEAT_SECONDS", 0.05), mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_Slow(), boskos)):
+            sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertGreaterEqual(len(boskos.beats), 2)
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+
+    def test_a_release_that_fails_before_a_termination_is_on_the_record(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+
+        class _Terminating(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "evals-8-infra" in request.full_url:
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
+        report = {}
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_Terminating(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]}), boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(sweeper.Terminated):
+                sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud(), report=report)
+        self.assertIn("release failed", report["failures"]["kube-agents-evals-7"])
+
+    def test_a_heartbeat_thread_that_cannot_start_does_not_skip_the_release(self):
+        class _NoThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with mock.patch.object(sweeper.boskos_pool.threading, "Thread", _NoThread), mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
 
     def test_a_hold_lasts_at_least_a_second_before_its_release(self):
         with mock.patch.object(sweeper.boskos_pool, "clock", lambda: 100.0):
