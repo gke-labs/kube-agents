@@ -190,6 +190,30 @@ def test_a_question_keeps_what_it_asks_about():
     )
 
 
+def test_known_misreads_are_pinned():
+    # The word lists are closed on purpose; these are the misreads they leave.
+    # A change that fixes one flips its assertion here, and that should be a
+    # decision rather than a side effect.
+    read_as_hand_off = [
+        "checking the rollout, it's stuck.",
+        "looking at the logs, it's crashlooping.",
+        "looking at the logs, four restarts.",
+        "upgrading prod-a blocks on quota.",
+        "provisioning staging hit quota limits.",
+        "deleting prod-a removes all workloads.",
+        "provisioning failed when quota ran out.",
+        "restarting fixed checkout-gateway.",
+    ]
+    for answer in read_as_hand_off:
+        assert substantive_output({"output": answer}) == "", answer
+    read_as_answer = [
+        "creating a staging cluster named foo.",
+        "checking pods labeled app=web.",
+        "reviewing the cluster called prod-a.",
+    ]
+    for ack in read_as_answer:
+        assert substantive_output({"output": ack}) == ack, ack
+
 def test_a_long_gerund_sentence_is_an_answer():
     report = (
         "restarting the pod cleared the stale mount and the checkout path "

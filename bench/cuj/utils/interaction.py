@@ -58,9 +58,16 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #: - a closing question mark or exclamation mark: "draining node-3 in
 #:   prod-a — confirm?" asks the user something, and a hand-off does not.
 #:
-#: It is a heuristic over free text: an answer that opens with a hand-off
-#: verb and carries none of these (a present-tense verb outside the lists,
-#: followed by a bare noun, say) is still read as a hand-off.
+#: It is a heuristic over closed word lists, and they stay closed: every
+#: extension so far moved the misreads rather than ending them. Known
+#: misreads, pinned in ``test_known_misreads_are_pinned``: an answer read as
+#: a hand-off when it carries none of the above (a verb outside the lists
+#: before a bare noun, "upgrading prod-a blocks on quota."; a past tense
+#: straight after the verb before an unlisted word, "restarting fixed
+#: checkout-gateway."; a two-word comma clause with a contraction or a
+#: spelled number, "checking the rollout, it's stuck."), and a hand-off read
+#: as an answer when its target carries a participle after a plain noun
+#: ("checking pods labeled app=web.").
 #:
 #: ``_DELEGATION_ACK`` is the receipt that template replaced, still sent by an
 #: install on an older image:
