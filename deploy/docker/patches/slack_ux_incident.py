@@ -79,6 +79,8 @@ OPTION_LABEL = "apply Option {letter}: {title}"
 SINGLE_LABEL = "apply: {title}"
 LINK_LABEL = "{label} ↗"
 PRIMARY = "primary"
+#: Slack refuses a button url longer than this, and with it the whole message.
+BUTTON_URL_MAX = 3000
 #: A report longer than this keeps the threaded reply; triage reports are a
 #: few hundred words, and Slack's limit on a container's content is not published.
 FOLD_TEXT_MAX = 12000
@@ -205,7 +207,11 @@ def parse_triage(report: str) -> dict | None:
     return {
         "headline": headline,
         "choices": choices,
-        "links": [link for line in lines if LINKS_LINE.match(line) for link in MD_LINK.findall(line)],
+        # A clipped url is a dead one, so an overlong link is dropped; the fold still has it.
+        "links": [
+            (label, url) for line in lines if LINKS_LINE.match(line)
+            for label, url in MD_LINK.findall(line) if len(url) <= BUTTON_URL_MAX
+        ],
         "fold_title": FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE,
     }
 

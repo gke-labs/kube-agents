@@ -33,8 +33,9 @@ With the flag on, :func:`register` adds two listeners:
 
 A message is answered once: the first authorized click wins, and a second
 click on the same message, before the rewrite lands, is dropped in this
-process and logged. If the rewrite fails, the buttons stay on the message and
-the next click on them is answered again.
+process and logged. If the rewrite fails, the buttons stay on the message but
+the click still counts: its turn runs, so a later click on them is dropped and
+logged rather than running a second apply.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
 still runs, because the click was the user's answer.
@@ -202,8 +203,10 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
             blocks=answered_blocks(message.get("blocks"), _answered_by, note),
         )
     except Exception as exc:  # noqa: BLE001 — the click still answers
-        _answered.pop(key, None)
-        logger.warning("slack_ux_clicks: could not mark %s answered, its buttons stay live: %s", msg_ts, exc)
+        logger.warning(
+            "slack_ux_clicks: could not mark %s answered; its buttons stay but further clicks are dropped: %s",
+            msg_ts, exc,
+        )
     try:
         await client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts, text=ECHO.format(user=user_id, label=shown),

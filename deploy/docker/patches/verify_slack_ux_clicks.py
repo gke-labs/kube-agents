@@ -55,12 +55,14 @@ BEGIN_INTERACTION = "_begin_interaction"
 BEGIN_POSITIONAL = ("self", "ack", "body", "action", "kind")
 #: What ``_begin_interaction`` returns, unpacked positionally by ``answer()``.
 BEGIN_RETURNS = ("team_id", "action_id", "value", "message", "msg_ts", "channel_id", "user_name", "user_id")
-#: How ``slack_ux_clicks`` calls the other members: positional arguments after ``self``, and keywords.
+#: How the runtime calls the other members: positional arguments after ``self``, and keywords.
+#: ``_get_client`` has two callers: ``slack_ux_clicks`` passes ``team_id``, ``slack_ux_incident``'s
+#: alert edit does not.
 CALL_SHAPES = {
-    "_slack_allowed_channels": (0, ()),
-    "_slack_disable_dms": (0, ()),
-    "_get_client": (1, ("team_id",)),
-    "_handle_slack_message": (1, ()),
+    "_slack_allowed_channels": ((0, ()),),
+    "_slack_disable_dms": ((0, ()),),
+    "_get_client": ((1, ("team_id",)), (1, ())),
+    "_handle_slack_message": ((1, ()),),
 }
 
 CHANNEL = "C0KAGE"
@@ -130,7 +132,8 @@ def _members(cls: ast.ClassDef) -> dict[str, ast.AST]:
 def _method_args(tree: ast.Module, member: ast.AST) -> ast.arguments | None:
     """The arguments of a method, or of the function a module-level factory returns for it."""
     if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return member.args
+        # A decorator (``@property``, ``@staticmethod``) changes how the call binds.
+        return None if member.decorator_list else member.args
     if not (isinstance(member, ast.Assign) and isinstance(member.value, ast.Call)
             and isinstance(member.value.func, ast.Name)):
         return None
@@ -147,10 +150,13 @@ def _method_args(tree: ast.Module, member: ast.AST) -> ast.arguments | None:
 def _accepts(args: ast.arguments, positional: int, keywords: tuple[str, ...]) -> bool:
     """Whether a method with ``args`` accepts ``self`` plus the given call."""
     params = [a.arg for a in [*args.posonlyargs, *args.args]][1:]
+    posonly = {a.arg for a in args.posonlyargs}
     required = params[: len(params) - len(args.defaults)]
-    if any(p not in keywords for p in required[positional:]) or (positional > len(params) and args.vararg is None):
+    if any(p not in keywords or p in posonly for p in required[positional:]):
         return False
-    named = set(params[positional:]) | {a.arg for a in args.kwonlyargs}
+    if positional > len(params) and args.vararg is None:
+        return False
+    named = (set(params[positional:]) - posonly) | {a.arg for a in args.kwonlyargs}
     if args.kwarg is None and not set(keywords) <= named:
         return False
     required_kw = {a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is None}
@@ -166,17 +172,18 @@ def check_members(tree: ast.Module) -> None:
     missing = [name for name in RUNTIME_MEMBERS if name not in members]
     if missing:
         raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which slack_ux_clicks calls")
-    for name, (positional, keywords) in CALL_SHAPES.items():
+    for name, calls in CALL_SHAPES.items():
         args = _method_args(tree, members[name])
         if args is None:
-            raise _fail(f"{ADAPTER_CLASS}.{name} is no longer a method slack_ux_clicks can call")
-        if not _accepts(args, positional, keywords):
-            raise _fail(
-                f"{ADAPTER_CLASS}.{name} no longer accepts {positional} positional argument(s)"
-                f" and {keywords!r}, as slack_ux_clicks calls it"
-            )
+            raise _fail(f"{ADAPTER_CLASS}.{name} is no longer a method the runtime can call")
+        for positional, keywords in calls:
+            if not _accepts(args, positional, keywords):
+                raise _fail(
+                    f"{ADAPTER_CLASS}.{name} no longer accepts {positional} positional argument(s)"
+                    f" and {keywords!r}, as the runtime calls it"
+                )
     begin = members[BEGIN_INTERACTION]
-    if not isinstance(begin, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if not isinstance(begin, (ast.FunctionDef, ast.AsyncFunctionDef)) or begin.decorator_list:
         raise _fail(f"{ADAPTER_CLASS}.{BEGIN_INTERACTION} is no longer a method")
     positional = tuple(a.arg for a in [*begin.args.posonlyargs, *begin.args.args])
     if positional != BEGIN_POSITIONAL:

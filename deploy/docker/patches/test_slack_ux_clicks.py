@@ -193,6 +193,11 @@ class ApplierTest(unittest.TestCase):
             ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, *, team=None)",
              "_get_client no longer accepts"),
             ("*, team_scoped=True)", "*, team_scoped)", "_begin_interaction requires a keyword"),
+            ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, team_id)",
+             "_get_client no longer accepts 1 positional argument(s) and ()"),
+            ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, team_id=None, /)",
+             "_get_client no longer accepts 1 positional argument(s) and ('team_id',)"),
+            ("    def _get_client(", "    @property\n    def _get_client(", "_get_client is no longer a method"),
             ("def _handle_slack_message(self, event, payload=None)",
              "def _handle_slack_message(self, event, payload)", "_handle_slack_message no longer accepts"),
             ('_slack_disable_dms = _flag_getter("disable_dms")', "_slack_disable_dms = property(bool)",
@@ -211,6 +216,8 @@ class ApplierTest(unittest.TestCase):
         args = ast.parse("def _get_client(self, chat_id, team_id): pass").body[0].args
         self.assertTrue(verifier._accepts(args, 1, ("team_id",)))
         self.assertFalse(verifier._accepts(args, 1, ()))
+        posonly = ast.parse("def _get_client(self, chat_id, team_id=None, /): pass").body[0].args
+        self.assertFalse(verifier._accepts(posonly, 1, ("team_id",)))
 
 
 class FlagOffIdentityTest(unittest.TestCase):
@@ -468,13 +475,14 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["message"])
 
-    def test_buttons_left_by_a_failed_rewrite_still_answer(self):
+    def test_buttons_left_by_a_failed_rewrite_do_not_run_a_second_turn(self):
         adapter = _Adapter(fail=("chat_update",))
-        with self.assertLogs(runtime.logger, level="WARNING"):
+        with self.assertLogs(runtime.logger, level="INFO") as logs:
             self._answer(adapter, *_choice(1, "Leave it"))
             self._answer(adapter, *_choice(0, "Raise to 512Mi"))
         turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]
-        self.assertEqual(turns, ["Leave it", "Raise to 512Mi"])
+        self.assertEqual(turns, ["Leave it"])
+        self.assertTrue(any("dropping a second" in line for line in logs.output))
 
     def test_empty_label_does_nothing(self):
         adapter = _Adapter()

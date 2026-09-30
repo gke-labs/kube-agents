@@ -309,6 +309,11 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
         self.assertEqual(len(triage["links"]), 2)
 
+    def test_a_url_slack_would_refuse_is_dropped_not_sent(self):
+        url = "https://console.cloud.google.com/logs/query;query=" + "a" * runtime.BUTTON_URL_MAX
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
+        self.assertEqual(triage["links"], [("GKE Workloads", WORKLOADS_URL)])
+
     def test_two_what_to_do_sections_keep_the_reply(self):
         second = "\n## What to do (cluster B)\n\n- **Option C (Drain the node):** moves the pods.\n"
         self.assertIsNone(runtime.parse_triage(REPORT + second))
