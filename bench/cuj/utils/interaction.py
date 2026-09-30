@@ -23,51 +23,43 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #:
 #:     checking checkout-gateway.
 #:
-#: The template fixes the lowercase and the period but not the verb, the
-#: length of the target, or whether it is a link, and a model drifts on all of
-#: them, so ``_is_progress_ack`` matches the shape rather than the words: one
-#: line opening with a hand-off verb from ``_ACK_VERBS`` in either case, then
-#: a target of up to ``_ACK_MAX_TARGET_WORDS`` words, with or without a
-#: closing period or ellipsis. A line opening with any other word is an
-#: answer ("staging cluster has 3 nodes.", "running normally."). Past the
-#: verb, what keeps an answer from matching is what an answer carries and a
-#: target does not:
+#: The template fixes the shape: one lowercase line, a hand-off verb, the
+#: target, a period. ``_is_progress_ack`` strips a line only when every word
+#: of it fits that shape and keeps it otherwise, because a kept ack is text a
+#: reviewer reads in the transcript while a stripped answer is gone. The
+#: verb comes from ``_ACK_VERBS`` in lowercase ("Checking the logs showed a
+#: crash." is an answer); a closing period or ellipsis is optional; the target
+#: runs to ``_ACK_MAX_TARGET_WORDS`` words. Past the verb, a word belongs to
+#: the target when it is:
 #:
-#: - before any clause opener, a verdict ("looking very good."), a finite
-#:   verb from ``_ACK_FINDING_VERBS`` ("restarting the pod took 3 minutes.",
-#:   "restarting requires approval.") or a past tense ("restarting the pod
-#:   cleared it."); after a clause opener all three are part of the target
-#:   ("checking why the rollout failed.");
-#: - an object after a verb: a determiner or pronoun from ``_ACK_OBJECTS``
-#:   that does not follow the hand-off verb, a preposition, a particle or a
-#:   conjunction ("restarting fixed it.", "draining evicts the pods."), where
-#:   a target's own determiner follows one of those ("looking at the logs.");
-#: - an ``-ed`` word is read as an adjective in the target, not a past tense,
-#:   after a determiner or preposition ("reviewing the failed rollout.",
-#:   "looking for orphaned disks.") or straight after the verb when a noun
-#:   follows it ("reviewing failed rollouts in prod-a.", while "provisioning
-#:   failed again." and "upgrading failed silently." are answers). A word
-#:   ending "-eed" or holding a hyphen or digit is a noun or a name, not a
-#:   past tense ("checking the fleet's seed.", "checking node-pool-red.");
-#: - a label and a value, bold or not: "Running pods: 12.";
-#: - a clause after the last comma that opens with a subject, holds a number
-#:   or a past tense, or runs to ``_ACK_MIN_CLAUSE_WORDS`` words without a
-#:   list joiner: "looking at the events, nothing stands out.", "checking the
-#:   rollout, replicas never became ready." (a comma-separated list of
-#:   targets, "checking seeded-a, seeded-b and seeded-c.", is a hand-off);
-#: - a closing question mark or exclamation mark: "draining node-3 in
-#:   prod-a — confirm?" asks the user something, and a hand-off does not.
+#: - a name: a word holding one of ``_ACK_NAME_CHARACTERS`` or wrapped in
+#:   backticks ("checkout-gateway", "us-central1", "app=web");
+#: - a function word from ``_ACK_OBJECT_LEADS``, or a determiner or pronoun
+#:   from ``_ACK_OBJECTS`` straight after the verb or one of those ("looking
+#:   at the logs.", "checking all the nodes.");
+#: - a naming participle from ``_ACK_NAMING_PARTICIPLES`` and the one word it
+#:   names ("checking pods labeled app=web.");
+#: - an "-ed" word after a determiner or preposition from
+#:   ``_ACK_ADJECTIVE_CUES`` ("reviewing the failed rollout."),
+#:   or straight after the verb when a plain word follows it ("reviewing
+#:   failed rollouts in prod-a.");
+#: - any other plain word, in a run of at most ``_ACK_MAX_PLAIN_RUN`` of
+#:   them, that is not a verdict or a verb from ``_ACK_FINDING_VERBS``; a
+#:   plain word straight after a name counts only when one of
+#:   ``_ACK_OBJECTS`` came before the name ("reviewing the checkout-gateway
+#:   rollout." is a target; "upgrading prod-a blocks on quota." and "checking
+#:   quota in us-central1 hit limits." are not);
+#: - after a clause opener straight after the verb, anything ("checking why
+#:   the rollout failed.").
 #:
-#: It is a heuristic over closed word lists, and they stay closed: every
-#: extension so far moved the misreads rather than ending them. Known
-#: misreads, pinned in ``test_known_misreads_are_pinned``: an answer read as
-#: a hand-off when it carries none of the above (a verb outside the lists
-#: before a bare noun, "upgrading prod-a blocks on quota."; a past tense
-#: straight after the verb before an unlisted word, "restarting fixed
-#: checkout-gateway."; a two-word comma clause with a contraction or a
-#: spelled number, "checking the rollout, it's stuck."), and a hand-off read
-#: as an answer when its target carries a participle after a plain noun
-#: ("checking pods labeled app=web.").
+#: Anything else keeps the line: a comma, semicolon, colon outside a link,
+#: dash, question or exclamation mark ("checking the rollout, it's stuck."); a contraction of a
+#: pronoun ("checking it's stuck."); a past tense elsewhere ("restarting
+#: fixed checkout-gateway.", "provisioning failed when quota ran out."); a
+#: determiner after a plain word ("restarting the pod cleared it."). The one
+#: shape it cannot tell apart is a verb outside the lists inside a short run
+#: of plain words: "scaling staging broke." has the words of "auditing
+#: version skew." and is stripped, pinned in ``test_known_misreads_are_pinned``.
 #:
 #: ``_DELEGATION_ACK`` is the receipt that template replaced, still sent by an
 #: install on an older image:
@@ -175,22 +167,25 @@ _ACK_OBJECTS = frozenset(
 _ACK_OBJECT_LEADS = _ACK_ADJECTIVE_CUES | {
     "and", "or", "but", "back", "up", "down", "out", "off", "through",
 }
-#: Words that join the items of a list, so a clause after the last comma
-#: holding one is the list's tail rather than a sentence of its own.
-_ACK_LIST_JOINERS = frozenset({"and", "or", "&"})
-_ACK_MIN_CLAUSE_WORDS = 3
+#: Participles that introduce a target's name after its noun.
+_ACK_NAMING_PARTICIPLES = frozenset({"named", "called", "labeled", "labelled", "tagged"})
+#: The most plain words in a row a target holds between names and function
+#: words. "auditing unused node pools." is three.
+_ACK_MAX_PLAIN_RUN = 3
+#: Characters a hand-off's one line never holds.
+_ACK_BREAKS = frozenset(",;:\u2014\u2013")
+#: A Markdown link's URL, whose colon is not a clause break.
+_ACK_LINK_TARGET = re.compile(r"\]\([^)\s]*\)")
+#: Pronouns whose contraction ("it's", "there's") opens a clause of its own.
+_ACK_CONTRACTED_SUBJECTS = frozenset(
+    {"it", "there", "that", "what", "here", "they", "we", "i", "you", "he", "she", "who"}
+)
 _ACK_QUESTION_MARKS = ("?", "!")
 _ACK_NOUN_SUFFIX = "eed"
-_ACK_NAME_CHARACTERS = "-0123456789"
-#: Words that open a clause after a comma, where a list would name a target.
-_ACK_CLAUSE_SUBJECTS = frozenset(
-    {
-        "the", "it", "there", "nothing", "everything", "something", "none", "i",
-        "we", "they", "this", "all", "no",
-    }
-)
+_ACK_NAME_CHARACTERS = "-0123456789./_=@#"
 _ACK_CLOSING = re.compile(r"(?:\.{1,3}|…)\Z")
 _ACK_WORD_WRAPPING = "*_`[]()\"'"
+_ACK_CODE = "`"
 _ACK_PAST_TENSE = "ed"
 _ACK_CURLY_APOSTROPHE = "\u2019"
 
@@ -322,79 +317,84 @@ def tool_operations(
     ]
 
 
+def _is_name(word: str) -> bool:
+    return word.startswith(_ACK_CODE) or any(
+        character in word.strip(_ACK_WORD_WRAPPING) for character in _ACK_NAME_CHARACTERS
+    )
+
+
 def _is_past_tense(word: str) -> bool:
-    return (
-        word.endswith(_ACK_PAST_TENSE)
-        and not word.endswith(_ACK_NOUN_SUFFIX)
-        and not any(character in word for character in _ACK_NAME_CHARACTERS)
-    )
-
-
-def _is_adjective(bare: list[str], index: int) -> bool:
-    """Whether the "-ed" word at ``index`` modifies a noun in the target."""
-
-    if bare[index - 1] in _ACK_ADJECTIVE_CUES:
-        return True
-    following = bare[index + 1] if index + 1 < len(bare) else ""
-    return (
-        index == 1
-        and bool(following)
-        and following not in _ACK_AFTER_FINITE
-        and not following.endswith(_ACK_ADVERB_SUFFIX)
-    )
+    return word.endswith(_ACK_PAST_TENSE) and not word.endswith(_ACK_NOUN_SUFFIX)
 
 
 def _is_progress_ack(sentence: str) -> bool:
     """Whether ``sentence`` is the one-line hand-off, per the comment on
-    ``_DELEGATION_ACK``."""
+    ``_DELEGATION_ACK``: every word fits the template's shape."""
 
     text = sentence.strip()
-    if "\n" in text:
+    if "\n" in text or _ACK_BREAKS & set(_ACK_LINK_TARGET.sub("", text)):
         return False
     if text.rstrip(_ACK_WORD_WRAPPING).endswith(_ACK_QUESTION_MARKS):
         return False
-    body = _ACK_CLOSING.sub("", text)
-    words = body.split()
+    words = _ACK_CLOSING.sub("", text).split()
     if not 2 <= len(words) <= _ACK_MAX_TARGET_WORDS + 1:
         return False
+    lead = words[0].strip(_ACK_WORD_WRAPPING)
+    if lead not in _ACK_VERBS:
+        return False
+    names = [_is_name(word) for word in words]
     bare = [
-        word.replace(_ACK_CURLY_APOSTROPHE, "'")
-        .strip(_ACK_WORD_WRAPPING)
-        .rstrip(",")
-        .casefold()
+        word.replace(_ACK_CURLY_APOSTROPHE, "'").strip(_ACK_WORD_WRAPPING).casefold()
         for word in words
     ]
-    if bare[0] not in _ACK_VERBS:
-        return False
-    if any(";" in word or word.endswith(":") for word in bare):
-        return False
-    for index, word in enumerate(bare[1:], start=1):
-        if word in _ACK_CLAUSE_OPENERS:
-            break
-        if word in _ACK_VERDICTS or word in _ACK_FINDING_VERBS:
+    if bare[1] in _ACK_CLAUSE_OPENERS:
+        return True
+    run = 0
+    introduced = True
+    naming = False
+    for index in range(1, len(bare)):
+        word, previous = bare[index], bare[index - 1]
+        following = bare[index + 1] if index + 1 < len(bare) else ""
+        if naming:
+            naming = False
+            continue
+        if names[index]:
+            run = 0
+            introduced = previous in _ACK_OBJECTS
+            continue
+        if "'" in word and word.split("'", 1)[0] in _ACK_CONTRACTED_SUBJECTS:
             return False
-        if _is_past_tense(word) and not _is_adjective(bare, index):
+        if word in _ACK_OBJECTS:
+            if index > 1 and previous not in _ACK_OBJECT_LEADS and previous not in _ACK_OBJECTS:
+                return False
+            run, introduced = 0, True
+            continue
+        if word in _ACK_OBJECT_LEADS:
+            run, introduced = 0, True
+            continue
+        if word in _ACK_NAMING_PARTICIPLES and index > 1:
+            naming = True
+            continue
+        if word in _ACK_VERDICTS or word in _ACK_FINDING_VERBS or word in _ACK_CLAUSE_OPENERS:
             return False
-        if (
-            word in _ACK_OBJECTS
-            and index > 1
-            and bare[index - 1] not in _ACK_OBJECT_LEADS
-        ):
+        if _is_past_tense(word):
+            adjective = previous in _ACK_ADJECTIVE_CUES or (
+                index == 1
+                and bool(following)
+                and not names[index + 1]
+                and following not in _ACK_AFTER_FINITE
+                and following not in _ACK_OBJECTS
+                and following not in _ACK_CLAUSE_OPENERS
+                and not following.endswith(_ACK_ADVERB_SUFFIX)
+            )
+            if not adjective:
+                return False
+        if index > 1 and names[index - 1] and not introduced:
             return False
-    if "," in body:
-        after = [
-            word.strip(_ACK_WORD_WRAPPING).casefold()
-            for word in body.rsplit(",", 1)[1].split()
-        ]
-        if after and after[0] in _ACK_CLAUSE_SUBJECTS:
+        run += 1
+        if run > _ACK_MAX_PLAIN_RUN:
             return False
-        if any(_is_past_tense(word) or word[:1].isdigit() for word in after):
-            return False
-        if len(after) >= _ACK_MIN_CLAUSE_WORDS and not _ACK_LIST_JOINERS & set(
-            after
-        ):
-            return False
-    return True
+    return not naming
 
 
 def substantive_output(interaction: dict[str, Any]) -> str:

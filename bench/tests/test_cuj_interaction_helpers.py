@@ -92,18 +92,17 @@ def test_every_ack_shape_the_template_names_scores_as_no_answer():
 
 
 def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
-    # The template fixes case and the period, not the verb, the target's
-    # length or whether it is a link; a model drifts on all of them.
+    # The template fixes case and the one line, not the period, the verb,
+    # the target's length or whether it is a link; a model drifts on those.
     for ack in (
-        "Checking checkout-gateway.",
         "checking checkout-gateway",
         "checking checkout-gateway…",
         "provisioning the staging cluster.",
         "scaling checkout-gateway down to two replicas in prod-a.",
         "reviewing [PR 412](https://github.com/o/r/pull/412).",
-        "checking seeded-a, seeded-b and seeded-c.",
+        "checking seeded-a and seeded-c.",
         "checking why checkout-gateway is restarting.",
-        "Checking spot capacity in us-central1.",
+        "checking spot capacity in us-central1.",
         "**checking** `checkout-gateway`.",
         "checking why the rollout failed.",
         "reviewing the failed rollout in prod-a.",
@@ -117,9 +116,23 @@ def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
         "checking node-pool-red.",
         "looking at the logs in prod-a.",
         "checking all the nodes in prod-a.",
+        "creating a staging cluster named foo.",
+        "checking pods labeled app=web.",
+        "reviewing the cluster called prod-a.",
     ):
         assert substantive_output({"output": ack}) == "", ack
         assert substantive_output({"output": f"{ack}\n\n{REPORT}"}) == REPORT, ack
+
+
+def test_a_line_off_the_template_is_kept_even_when_it_is_an_ack():
+    # Keeping an ack costs a reviewer one line; stripping an answer costs the
+    # answer. A line the template does not describe errs toward the first.
+    for line in (
+        "Checking checkout-gateway.",
+        "Checking spot capacity in us-central1.",
+        "checking seeded-a, seeded-b and seeded-c.",
+    ):
+        assert substantive_output({"output": line}) == line, line
 
 
 def test_a_short_answer_shaped_like_an_ack_is_kept():
@@ -175,6 +188,18 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "checking the events, pods crashloop on startup.",
         "draining node-3 in prod-a — confirm?",
         "Deleting prod-a?",
+        "checking the rollout, it's stuck.",
+        "looking at the logs, it's crashlooping.",
+        "looking at the logs, four restarts.",
+        "checking it's stuck.",
+        "upgrading prod-a blocks on quota.",
+        "provisioning staging hit quota limits.",
+        "deleting prod-a removes all workloads.",
+        "provisioning failed when quota ran out.",
+        "restarting fixed checkout-gateway.",
+        "rolling back fixed checkout-gateway.",
+        "checking quota in us-central1 hit limits.",
+        "checking pods in prod-a restart constantly.",
     ):
         assert substantive_output({"output": report}) == report, report
 
@@ -191,28 +216,12 @@ def test_a_question_keeps_what_it_asks_about():
 
 
 def test_known_misreads_are_pinned():
-    # The word lists are closed on purpose; these are the misreads they leave.
-    # A change that fixes one flips its assertion here, and that should be a
-    # decision rather than a side effect.
-    read_as_hand_off = [
-        "checking the rollout, it's stuck.",
-        "looking at the logs, it's crashlooping.",
-        "looking at the logs, four restarts.",
-        "upgrading prod-a blocks on quota.",
-        "provisioning staging hit quota limits.",
-        "deleting prod-a removes all workloads.",
-        "provisioning failed when quota ran out.",
-        "restarting fixed checkout-gateway.",
-    ]
-    for answer in read_as_hand_off:
+    # A verb outside the lists inside a short run of plain words has the
+    # words of "auditing version skew across the fleet." and nothing else to
+    # tell it apart. A change that fixes it flips the assertion here.
+    for answer in ("scaling staging broke.",):
         assert substantive_output({"output": answer}) == "", answer
-    read_as_answer = [
-        "creating a staging cluster named foo.",
-        "checking pods labeled app=web.",
-        "reviewing the cluster called prod-a.",
-    ]
-    for ack in read_as_answer:
-        assert substantive_output({"output": ack}) == ack, ack
+
 
 def test_a_long_gerund_sentence_is_an_answer():
     report = (
