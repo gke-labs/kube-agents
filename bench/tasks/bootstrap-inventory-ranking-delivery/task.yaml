@@ -30,7 +30,7 @@
 # that did so, which it must for the report to be posted.
 #
 # The stack refuses an install where a person has connected, onboarding has
-# already delivered, either onboarding cron job is gone, or the delivery job
+# already delivered, either onboarding cron job is gone or paused, or the delivery job
 # is bound to a chat: the ranked report this produces is the one onboarding
 # sends to the user. It also refuses one whose gate has not filed its sweep,
 # and one without exactly one shell sandbox pod.

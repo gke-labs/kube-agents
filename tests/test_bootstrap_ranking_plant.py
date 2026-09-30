@@ -363,6 +363,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
             "completed": "onboarding already delivered",
             "unfiled": "has not filed its discovery sweep",
             "nojobs": "is not in the cron store",
+            "paused": "is paused",
             "bound": "delivers to a chat, not local",
             "": "could not read the onboarding markers",
         }
@@ -663,6 +664,10 @@ class ArmDisarmTest(unittest.TestCase):
         }
         self._arm = _in_pod("arm_py", values)
         self._disarm = _in_pod("disarm_py", values)
+        state = re.search(r"read_state\(\) \{\n\s*agent_py <<'PY' \|\| true\n(.*?)\n\s*PY\n", _MODULE.read_text(), re.S)
+        self._read_state = re.sub(
+            r"\$\{([^}]*)\}", lambda m: values[m.group(1).strip()], textwrap.dedent(state.group(1)) + "\n"
+        )
         self._jobs([_SCAN, _DELIVERY])
 
     def _jobs(self, jobs=None):
@@ -676,9 +681,11 @@ class ArmDisarmTest(unittest.TestCase):
             [sys.executable, "-"], input=code, env=self._env, capture_output=True, text=True, timeout=60
         )
 
-    def test_arm_refuses_a_missing_job_or_a_bound_delivery_and_changes_nothing(self):
+    def test_arm_refuses_a_missing_paused_or_bound_job_and_changes_nothing(self):
         for jobs, message in (
             ([_SCAN], "bootstrap-inventory-delivery are not in the cron store"),
+            ([_SCAN, {**_DELIVERY, "enabled": False}], "bootstrap-inventory-delivery are paused"),
+            ([{**_SCAN, "enabled": False}, _DELIVERY], "bootstrap-inventory-scan are paused"),
             ([_SCAN, {**_DELIVERY, "deliver": "origin"}], "delivers to 'origin', not local"),
         ):
             with self.subTest(message=message):
@@ -687,6 +694,18 @@ class ArmDisarmTest(unittest.TestCase):
                 self.assertNotEqual(out.returncode, 0)
                 self.assertIn(message, out.stderr)
                 self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
+
+    def test_step_1_reads_a_paused_job_as_paused(self):
+        (self._home / ".bootstrap_scan_filed").touch()
+        for jobs, answer in (
+            ([_SCAN, _DELIVERY], "clear"),
+            ([_SCAN, {**_DELIVERY, "enabled": False}], "paused"),
+            ([{**_SCAN, "enabled": False}, _DELIVERY], "paused"),
+        ):
+            with self.subTest(answer=answer, jobs=jobs):
+                self._jobs(jobs)
+                out = self._py(self._read_state)
+                self.assertEqual((out.returncode, out.stdout.strip()), (0, answer), out.stderr)
 
     def test_arm_records_the_jobs_then_touches_the_marker_once(self):
         out = self._py(self._arm)

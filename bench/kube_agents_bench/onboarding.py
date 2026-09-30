@@ -161,8 +161,9 @@ def sandbox_shell(script: str, timeout: float) -> str:
 def agent_shell(script: str, timeout: float) -> str:
     """Run ``script`` in the agent container, as ``harness._agent_shell`` does.
 
-    Its own copy because the verifiers do not import the harness. Best effort:
-    any failure returns ``""``.
+    Through ``_kubectl_exec``, like ``sandbox_shell``, so the onboarding
+    verifiers reach both pods the same way. Best effort: any failure returns
+    ``""``.
     """
     agent = os.environ.get("AGENT_SERVICE_NAME", DEFAULT_AGENT_SERVICE)
     container = os.environ.get("AGENT_CONTAINER", DEFAULT_AGENT_CONTAINER)

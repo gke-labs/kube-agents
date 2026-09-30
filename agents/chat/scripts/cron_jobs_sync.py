@@ -57,9 +57,9 @@ The ledger cannot help on its *first* run, though, because it starts empty: a
 deployment that finished onboarding before this script existed has no record that
 the two onboarding jobs were retired, so they would look new and come back. They
 would come back inert — both scripts check ``.bootstrap_completed`` and return
-silently — but they would tick every minute forever. ``--assume-retired`` closes
-that: the caller, which is the only thing that knows *why* a job is gone, seeds
-those ids into the ledger. The entrypoint passes the onboarding ids when
+silently — until the delivery script's first run retires them again.
+``--assume-retired`` closes that: the caller, which is the only thing that knows
+*why* a job is gone, seeds those ids into the ledger. The entrypoint passes the onboarding ids when
 ``.bootstrap_completed`` exists.
 
 Concurrency
