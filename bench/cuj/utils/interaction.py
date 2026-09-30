@@ -18,17 +18,18 @@ if TYPE_CHECKING:
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 
-#: The hand-off Kage is told to send (agents/chat/SOUL.md §2, step 4) is one
+#: The hand-off the front door is told to send (agents/chat/SOUL.md §2, step 4) is one
 #: line naming what it is checking:
 #:
 #:     checking checkout-gateway.
 #:
 #: The template fixes the shape: one lowercase line, a hand-off verb, the
-#: target, a period. ``_is_progress_ack`` strips a line only when every word
+#: target, a period. A model capitalises a sentence's first letter out of
+#: habit, so that one letter may be either case. ``_is_progress_ack`` strips a line only when every word
 #: of it fits that shape and keeps it otherwise, because a kept ack is text a
 #: reviewer reads in the transcript while a stripped answer is gone. The
-#: verb comes from ``_ACK_VERBS`` in lowercase ("Checking the logs showed a
-#: crash." is an answer); a closing period or ellipsis is optional; the target
+#: verb comes from ``_ACK_VERBS`` ("Checking the logs showed a crash." is an
+#: answer by its finite verb, not its capital); a closing period or ellipsis is optional; the target
 #: runs to ``_ACK_MAX_TARGET_WORDS`` words. Past the verb, a word belongs to
 #: the target when it is:
 #:
@@ -317,9 +318,14 @@ def tool_operations(
     ]
 
 
+def _bare(word: str) -> str:
+    """``word`` without its emphasis or quotes and a closing period inside them."""
+    return _ACK_CLOSING.sub("", word.strip(_ACK_WORD_WRAPPING)).strip(_ACK_WORD_WRAPPING)
+
+
 def _is_name(word: str) -> bool:
     return word.startswith(_ACK_CODE) or any(
-        character in word.strip(_ACK_WORD_WRAPPING) for character in _ACK_NAME_CHARACTERS
+        character in _bare(word) for character in _ACK_NAME_CHARACTERS
     )
 
 
@@ -340,11 +346,12 @@ def _is_progress_ack(sentence: str) -> bool:
     if not 2 <= len(words) <= _ACK_MAX_TARGET_WORDS + 1:
         return False
     lead = words[0].strip(_ACK_WORD_WRAPPING)
+    lead = lead[:1].lower() + lead[1:]
     if lead not in _ACK_VERBS:
         return False
     names = [_is_name(word) for word in words]
     bare = [
-        word.replace(_ACK_CURLY_APOSTROPHE, "'").strip(_ACK_WORD_WRAPPING).casefold()
+        _bare(word.replace(_ACK_CURLY_APOSTROPHE, "'")).casefold()
         for word in words
     ]
     if bare[1] in _ACK_CLAUSE_OPENERS:

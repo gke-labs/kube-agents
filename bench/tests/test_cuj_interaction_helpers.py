@@ -31,7 +31,7 @@ REPORT = (
 
 @pytest.fixture
 def ack() -> str:
-    """The hand-off Kage is instructed to send, read from its own SOUL.md.
+    """The hand-off the front door is instructed to send, read from its own SOUL.md.
 
     Hand-written prose drifts from the instruction it stands in for: an
     earlier version of this fixture had no emphasis markers or backticks, so
@@ -92,9 +92,13 @@ def test_every_ack_shape_the_template_names_scores_as_no_answer():
 
 
 def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
-    # The template fixes case and the one line, not the period, the verb,
-    # the target's length or whether it is a link; a model drifts on those.
+    # The template fixes the one line, not the period, the verb, the
+    # target's length, the first letter's case or whether it is a link; a
+    # model drifts on those.
     for ack in (
+        "Checking checkout-gateway.",
+        "Checking spot capacity in us-central1.",
+        "Reviewing the cluster called prod-a.",
         "checking checkout-gateway",
         "checking checkout-gateway…",
         "provisioning the staging cluster.",
@@ -128,8 +132,7 @@ def test_a_line_off_the_template_is_kept_even_when_it_is_an_ack():
     # Keeping an ack costs a reviewer one line; stripping an answer costs the
     # answer. A line the template does not describe errs toward the first.
     for line in (
-        "Checking checkout-gateway.",
-        "Checking spot capacity in us-central1.",
+        "CHECKING checkout-gateway.",
         "checking seeded-a, seeded-b and seeded-c.",
     ):
         assert substantive_output({"output": line}) == line, line
@@ -197,6 +200,9 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "deleting prod-a removes all workloads.",
         "provisioning failed when quota ran out.",
         "restarting fixed checkout-gateway.",
+        "**scaling completed.**",
+        "_provisioning failed._",
+        '"restarting helps."',
         "rolling back fixed checkout-gateway.",
         "checking quota in us-central1 hit limits.",
         "checking pods in prod-a restart constantly.",
