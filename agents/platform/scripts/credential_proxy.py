@@ -174,6 +174,16 @@ CALLER_GONE_EVENTS = select.POLLHUP | select.POLLERR | select.POLLNVAL
 # leased workspace fails every later git there until the pod restarts.
 KILL_GRACE_SECONDS = 2
 KILL_POLL_SECONDS = 0.05
+# How long the kill waits, after SIGKILL, for the group to be gone. Sending
+# the signal is asynchronous: killpg returns once it is queued, and each
+# member still has to be scheduled to exit, so a kill that returned at once
+# left "everything the command started is gone" a few milliseconds short of
+# true -- and the slot a command is counted under is released when `execute`
+# returns. A member ordinarily exits within a millisecond or two of the
+# signal; the bound is for the ones no wait would end, a member in
+# uninterruptible sleep or an orphan whose reaper is slow, since a zombie
+# keeps the group's id until it is reaped.
+KILL_SETTLE_SECONDS = 1
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -3342,6 +3352,12 @@ def _kill_process_group(process: subprocess.Popen) -> None:
     allocated for as long as any member lives. A group seen empty gets no
     SIGKILL at all -- with the child reaped its id is free for reuse, and the
     next new session in this container is the likeliest taker.
+
+    On return the group is empty, or a bound ran out: the grace after SIGTERM,
+    or KILL_SETTLE_SECONDS after SIGKILL. The second wait is what makes the
+    first sentence true when the grace did not: SIGKILL is queued, not
+    delivered, when killpg returns, and a caller that went on at once could
+    find a member still alive for a few milliseconds more.
     """
 
     def signal_group(signum: int) -> None:
@@ -3361,19 +3377,34 @@ def _kill_process_group(process: subprocess.Popen) -> None:
             return False
         return False
 
+    def wait_for_group_to_empty(bound_seconds: float) -> bool:
+        deadline = time.monotonic() + bound_seconds
+        while True:
+            # Reap the child if it has exited; a zombie would otherwise keep
+            # the group looking occupied for the whole wait.
+            process.poll()
+            if group_is_empty():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(KILL_POLL_SECONDS)
+
     signal_group(signal.SIGTERM)
-    grace_ends = time.monotonic() + KILL_GRACE_SECONDS
-    while time.monotonic() < grace_ends:
-        # Reap the child if it has exited; a zombie would otherwise keep the
-        # group looking occupied for the whole grace.
-        process.poll()
-        if group_is_empty():
-            # Nothing left to kill, and once the child is reaped the group's
-            # id is free for reuse -- by another command's new session, most
-            # likely -- so an emptied group is left alone.
-            return
-        time.sleep(KILL_POLL_SECONDS)
+    if wait_for_group_to_empty(KILL_GRACE_SECONDS):
+        # Nothing left to kill, and once the child is reaped the group's id
+        # is free for reuse -- by another command's new session, most likely
+        # -- so an emptied group is left alone.
+        return
     signal_group(signal.SIGKILL)
+    if not wait_for_group_to_empty(KILL_SETTLE_SECONDS):
+        # The one case the bound exists for, and the only place it is known:
+        # the slot is released with something still in the group, and an
+        # operator later asking what outlived the command starts here.
+        LOGGER.warning(
+            "process group %d still occupied %ss after SIGKILL; giving up the wait",
+            process.pid,
+            KILL_SETTLE_SECONDS,
+        )
 
 
 def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:

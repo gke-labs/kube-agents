@@ -1793,8 +1793,8 @@ mechanism is sound — `subprocess.run(capture_output=True)` returns stdout verb
 `ssh` forwards both remote stdout and the remote exit code, so verbatim delivery
 survives the hop. There is just nothing left to wrap. Every one of the five is bound to
 the agent pod: `profile_cron_tick.py` and `cluster_agent_reconcile.py` drive `hermes`
-against profile state on the PVC; `bootstrap_scan_gate.py` shells
-`/opt/hermes/.venv/bin/hermes profile list`; and `bootstrap_delivery.py` and
+against profile state on the PVC; `bootstrap_scan_gate.py` reads each profile's
+`config.yaml` on the PVC; and it, `bootstrap_delivery.py` and
 `github_scan_gate.py` import Hermes' own Python namespace — `from cron.jobs import
 remove_job` and `from hermes_cli.kanban import run_slash`, which no amount of packaging
 reproduces in the sandbox. Moving them would make both of the deferred problems below

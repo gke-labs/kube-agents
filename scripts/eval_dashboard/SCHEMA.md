@@ -821,7 +821,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -845,7 +845,13 @@ role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
 `fixture_state` block beside `metrics`; the pages show it as the generic
 degraded headline, and `fixture-state.json` beside `health.json` is the
-scan's own document, which no page reads. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+scan's own document, which no page reads. `pool_drift` (the hourly pool-state
+scan found a pool project no longer shaped as the verifier requires;
+docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
+verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
+command}}`), and the `pool_state` block beside `fixture_state` summarises the
+scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean. Both scan
+incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
@@ -893,6 +899,13 @@ day with no runs. The poster needs the difference — going blind must not read 
 the episode ending. `metrics.pool_since` is the open episode's start, held
 across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
+
+A held scan condition (`fixture_drift` or `pool_drift` whose scan is stale,
+blind, or still shows the drift) keeps its `condition` and `incident` while a
+scan condition ranking at or below it (`pool_drift` below `fixture_drift`, or
+its own on other units that do not cover the held ones) is assessed at the same
+severity; `fixture_drift` over a held `pool_drift`, a spread of the same drift,
+and any run-based condition take over as before.
 
 `periodics` is the watched Prow periodics' notes, by job name, one for each job
 whose latest finished build failed (`verdict: FAILED`) or is older than the

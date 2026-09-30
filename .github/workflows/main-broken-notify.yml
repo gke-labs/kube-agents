@@ -33,14 +33,21 @@ name: Notify on Broken Main
 # after this list was written, and nothing revisited it. Each runs its whole
 # suite on every push with no `paths:` filter.
 #
-# `Python Unit Tests` also carries `Run Bench Harness Tests`, which is not a
-# required context, so watching at run level files an issue when only that job
-# is red. That job resolves devops-bench and its dependencies at run time, so a
-# resolver outage during a push run would file an issue naming an innocent
-# commit. Accepted: the alternative is not watching the suite that took
-# thirteen hours to notice. `Validate Repo Structure` is the same shape with
-# both jobs required -- `validate`, and `prompt-assets`, which reports the
-# `Agent instructions cite assets that exist` context.
+# `Python Unit Tests` also carries two jobs that are not required contexts, so
+# watching at run level files an issue when only one of them is red. `Run
+# Bench Harness Tests` resolves devops-bench and its dependencies at run time,
+# so a resolver outage during a push run would file an issue naming an
+# innocent commit. Accepted: the alternative is not watching the suite that
+# took thirteen hours to notice. `Run Python Unit Tests on the agent image's
+# Python` runs the same sweep again on `.agent-python-version`, the interpreter
+# inside the platform agent image, where the required job runs it on
+# `.python-version`. An issue from it is wanted, not tolerated: a suite that
+# passes on CI's Python and not on the one the agent executes is a break in
+# the tree, the job is unrequired only until it has earned the status, and this
+# watch is the one thing that reports its red on main. `Validate Repo
+# Structure` is the same shape with both jobs required -- `validate`, and
+# `prompt-assets`, which reports the `Agent instructions cite assets that
+# exist` context.
 #
 # `Prettier Check` is required and deliberately absent. It scopes itself to the
 # files the push changed, so its green says those files are formatted and

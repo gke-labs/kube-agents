@@ -844,8 +844,9 @@ Consequences:
   within 60 seconds of admission. Envoy's stream idle timeout in front of the
   runtime is twenty minutes: the broker writes nothing to a stream until the
   request is answered, so the silent worst case is that deadline plus the
-  slot wait, the kill grace and the drain, a little over six minutes at the
-  defaults, and a silent request that reaches its deadline is still answered
+  slot wait, the kill grace and its settle after `SIGKILL`, and the drain, a
+  little over six minutes at the defaults, and a silent request that reaches
+  its deadline is still answered
   with its partial output and the timed-out notice rather than reset by Envoy
   first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` keeps the
   Envoy timeout above it plus the minute.

@@ -50,9 +50,12 @@ func TestClientConfigForIdentity(t *testing.T) {
 		},
 		host: "https://gke-abc.us-central1.gke.goog",
 	}, {
-		// Published but closed to external traffic: reaching it from here
-		// would 403, so it is not an address at all.
-		name: "a DNS endpoint that refuses external traffic is ignored",
+		// Published but closed to external traffic, with an IP endpoint
+		// beside it: the DNS host would 403 from outside the VPC, so the IP
+		// endpoint is the address. Only the case below, where the IP
+		// endpoint is gone and GKE reports the DNS hostname in Endpoint,
+		// takes a closed DNS endpoint as the address.
+		name: "a DNS endpoint that refuses external traffic is ignored beside an IP endpoint",
 		cluster: &container.Cluster{
 			Endpoint:                    "10.0.0.2",
 			MasterAuth:                  &container.MasterAuth{ClusterCaCertificate: ca},
@@ -60,6 +63,49 @@ func TestClientConfigForIdentity(t *testing.T) {
 		},
 		host: "https://10.0.0.2",
 		ca:   "ca-bytes",
+	}, {
+		// With the IP endpoint disabled, GKE publishes the DNS hostname in
+		// Endpoint whether or not external traffic is allowed. The host is
+		// the same Google frontend, so the cluster CA must not be attached:
+		// paired, every request fails with an x509 error.
+		name: "the DNS hostname in Endpoint takes no CA even with external traffic off",
+		cluster: &container.Cluster{
+			Endpoint:                    "gke-abc.us-central1.gke.goog",
+			MasterAuth:                  &container.MasterAuth{ClusterCaCertificate: ca},
+			ControlPlaneEndpointsConfig: &container.ControlPlaneEndpointsConfig{DnsEndpointConfig: internal},
+		},
+		host: "https://gke-abc.us-central1.gke.goog",
+	}, {
+		// The same shape without MasterAuth: no CA is needed on a Google
+		// frontend, so its absence is not the IP branch's missing-CA error.
+		name: "the DNS hostname in Endpoint needs no MasterAuth",
+		cluster: &container.Cluster{
+			Endpoint:                    "gke-abc.us-central1.gke.goog",
+			ControlPlaneEndpointsConfig: &container.ControlPlaneEndpointsConfig{DnsEndpointConfig: internal},
+		},
+		host: "https://gke-abc.us-central1.gke.goog",
+	}, {
+		// A DNS config with no hostname published cannot match Endpoint, so
+		// the IP branch decides, CA included.
+		name: "an empty DNS hostname never matches Endpoint",
+		cluster: &container.Cluster{
+			Endpoint:                    "10.0.0.2",
+			MasterAuth:                  &container.MasterAuth{ClusterCaCertificate: ca},
+			ControlPlaneEndpointsConfig: &container.ControlPlaneEndpointsConfig{DnsEndpointConfig: &container.DNSEndpointConfig{}},
+		},
+		host: "https://10.0.0.2",
+		ca:   "ca-bytes",
+	}, {
+		// Both fields empty, the transient shape of a cluster still
+		// provisioning: two empty strings are equal, and without the
+		// non-empty guard the equality branch would return "https://" as
+		// the host, the relative-URL client the function exists to refuse.
+		name: "two empty endpoints are the missing-address error, not an empty host",
+		cluster: &container.Cluster{
+			MasterAuth:                  &container.MasterAuth{ClusterCaCertificate: ca},
+			ControlPlaneEndpointsConfig: &container.ControlPlaneEndpointsConfig{DnsEndpointConfig: &container.DNSEndpointConfig{}},
+		},
+		wantErr: "neither",
 	}, {
 		name:    "IP endpoint with no DNS config",
 		cluster: &container.Cluster{Endpoint: "10.0.0.2", MasterAuth: &container.MasterAuth{ClusterCaCertificate: ca}},

@@ -1,0 +1,58 @@
+name: GitOps run-branch check
+
+# Required check for the Option C pilot (gke-labs/kube-agents#1307). PRs opened by
+# the platform agent target a per-run branch `run/<cluster>/<task>`. This job
+# validates the change and, because rulesets and required checks are not
+# available on this private repo under the org's plan, performs the merge itself
+# when everything passes. A PR that fails here stays open, so Argo CD never sees
+# it and the task cluster stays broken.
+on:
+  pull_request:
+    branches:
+      - "run/**"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: gitops-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: YAML parses
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for path in sorted(glob.glob("tasks/**/*.yaml", recursive=True)):
+              try:
+                  list(yaml.safe_load_all(open(path)))
+              except Exception as exc:  # noqa: BLE001
+                  bad += 1
+                  print(f"::error file={path}::{exc}")
+          print(f"checked YAML files; {bad} invalid")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: kustomize builds
+        run: |
+          set -euo pipefail
+          for dir in tasks/*/; do
+            [ -f "${dir}kustomization.yaml" ] || continue
+            echo "==> kustomize build ${dir}"
+            kubectl kustomize "${dir}" > /dev/null
+          done
+
+      - name: Merge on green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr merge "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --squash --delete-branch

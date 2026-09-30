@@ -66,7 +66,14 @@ cp /path/to/your/install/install.env .
 
 - `--upgrade-mode=harness` re-tags the Platform Agent image, the sandbox image it reaches over
   ssh, and every plugin image the release records — all are built from the same revision —
-  through `helm upgrade --reset-then-reuse-values`.
+  through one `helm upgrade` that re-applies the values the release recorded over the chart's
+  defaults. Before any of the new release is applied it names and stops on any recorded key the
+  chart's values schema refuses as undeclared, since Helm would refuse the whole upgrade over it. On an upgrade
+  the usual cause is a setting the new chart renamed or removed: take that upgrade through
+  `--upgrade-mode=full`. On a rollback to a release that predates the key, pass
+  `--drop-undeclared-values` to drop and name each one instead; a later release that declares the
+  key renders it from that chart's default until a full-mode run there renders `install.env` onto
+  the chart again.
 - `--upgrade-mode=operator` applies the chart's CRDs with `kubectl` first — Helm never touches
   `crds/` on an upgrade — then re-tags the operator image the same way.
 - `--upgrade-mode=full`, the default, applies the CRDs and then runs a full `terraform apply`
@@ -167,7 +174,7 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first three are
-settled before the run touches the cluster at all. The last two need the cluster: they are settled
+settled before the run touches the cluster at all. The last three need the cluster: they are settled
 after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
 skips those — but still before any CRD, chart or Terraform change of the new release.
 
@@ -193,6 +200,12 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   pointed elsewhere, the credentials have expired, the API server times out — the run stops instead
   of guessing. Record `MEMORY=hindsight|file|off` in `install.env`, or restore access to the cluster
   and re-run.
+- **The chart does not declare a value the release recorded.** The operator and harness modes
+  re-apply the values the release recorded, and name each one the new chart's values schema refuses
+  as undeclared. On an upgrade that is usually a setting the new chart renamed or removed: run
+  `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
+  release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
+  that flag, since it has no recorded values to drop.
 
 ## Where to go next
 

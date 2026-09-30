@@ -453,9 +453,9 @@ const (
 	//	|       | its replacement and the old three have not yet reached their 5s   |
 	//	|       | inactive threshold                                                |
 	//	|    10 | a2aTasksWebReaders: the web rail's concurrent readers             |
-	//	|    12 | a2aTasksReplayConsumers: tasks/get replay ephemerals, derived     |
+	//	|    16 | a2aTasksReplayConsumers: tasks/get replay ephemerals, derived     |
 	//	|       | below                                                             |
-	//	|    28 | a2aTasksReservedConsumers                                         |
+	//	|    32 | a2aTasksReservedConsumers                                         |
 	//
 	// The replay term, and the mechanism it is sized from. lib.TasksGet
 	// opens an ordered consumer on TASKS and its cleanup stops the local
@@ -493,7 +493,8 @@ const (
 	//
 	//   - handleMessage, once per submission for a task it is not running,
 	//     which is every new task; cancelOrphan, once per cancel for a task
-	//     it is not running.
+	//     it is not running whose newest event is not already final (a
+	//     final one is answered by direct get, no consumer).
 	//   - sweepTask and synthesizeTerminal at start, before it consumes, one
 	//     to four per in-flight key the prior incarnation left, sequentially.
 	//
@@ -535,27 +536,33 @@ const (
 	//	|       | and after its wait -- and in the shape this operator renders     |
 	//	|       | the running conversations are the bridge's                       |
 	//	|       | a2aBridgeDefaultConcurrency runs                                  |
-	//	|     6 | in flight                                                         |
+	//	|     2 | a2aTasksReplayBridgeLookAhead: the pre-spawn look-ahead, at      |
+	//	|       | most one lib.TaskInReplay per spawn from each of the bridge's     |
+	//	|       | a2aBridgeDefaultConcurrency workers, concurrently                 |
+	//	|     8 | in flight                                                         |
 	//	|   x 2 | a2aTasksReplayTailFactor                                          |
-	//	|    12 | a2aTasksReplayConsumers                                           |
+	//	|    16 | a2aTasksReplayConsumers                                           |
 	//
-	// One row this table does not have, and what puts it back. gke-labs#2010,
-	// open and held at this writing, gives the bridge a pre-spawn look-ahead:
-	// lib.TaskInReplay, once per spawn, from each of the bridge's
-	// a2aBridgeDefaultConcurrency workers, concurrently. That is a
-	// trigger-paced source like the others -- 2 in flight, 4 after the tail
-	// factor -- and it was a row here, a2aTasksReplayBridgeLookAhead, before
-	// the symbol was in the tree. Sizing for a caller that cannot run is not
-	// caution, it is a refusal: those four slots took the first maxSessions
-	// the provision gate refuses on an existing 64-wide TASKS from 13 down to
-	// 11, for code no render reaches. The row comes back with the code:
-	// whoever lands #2010 restores a2aTasksReplayBridgeLookAhead =
-	// a2aBridgeDefaultConcurrency to the sum below, which takes in flight to
-	// 8, a2aTasksReplayConsumers to 16 and a2aTasksReservedConsumers to 32,
-	// and re-derives every number this block states from them.
-	// TestBridgeLookAheadIsNotInTheA2AModule reads the bridge's sources and
-	// fails on the day TaskInReplay appears in one, so the two halves cannot
-	// land in the wrong order unnoticed.
+	// The look-ahead row is the bridge's second replay per task:
+	// lib.TaskInReplay, at most once per spawn, from each of the bridge's
+	// a2aBridgeDefaultConcurrency workers, concurrently -- a trigger-paced
+	// source like the others, 2 in flight and 4 after the tail factor. At
+	// most, because the worker answers from the in subject's newest message
+	// by direct get first and replays only when that message is neither the
+	// submission nor a cancel, and the replay that remains is paced by the
+	// bridge itself (replaySlots in a2a/hermes-bridge/bridge.go: at most
+	// Concurrency fallback replays in hand at once, each slot held until
+	// its ephemeral's threshold has run after the replay returned), so the
+	// bridge holds the look-ahead to Concurrency live consumers and this
+	// row, with the tail factor, is a bound with margin whatever shape a
+	// backlog has, not a rate it usually stays under. The
+	// row was out of this table while the call was still gke-labs#2010's
+	// proposal, because sizing for a caller no render could reach took the
+	// provision gate's first refused maxSessions on an existing 64-wide
+	// TASKS from 13 down to 11 for nothing, and it came back with the call.
+	// TestBridgeLookAheadIsInTheA2AModule reads the bridge's sources and
+	// fails on the day the call leaves them, naming the arithmetic that has
+	// to move back with it.
 	//
 	// The asks row is the one that rests on the shape of the install rather
 	// than on a lock, so the shape is stated. A conversation has one asker:
@@ -578,24 +585,30 @@ const (
 	// becomes per-session, and it moves into the multiplier beside
 	// a2aSessionConsumersPerSession.
 	//
-	// Two more things the two bridge rows rest on, both settable on the
+	// Two more things the three bridge rows rest on, both settable on the
 	// CR and neither read by this render. BRIDGE_CONCURRENCY: the sidecar is
 	// declared in spec.deployment.sidecars, so its env is the CR's, and an
-	// install that raises it (docs/designs/eval-next-transport.md commits the
-	// eval install to at least its task parallelism) scales the asks row with
-	// it while this reserve stays put -- at 6, in flight is 1+1+12 = 14 and
-	// the term would be 28, which such an install carries today only because
-	// it spawns no session pods and so spends none of its maxSessions*3.
+	// install that raises it (hack/ci-deploy.sh sets the eval install's to
+	// its task parallelism: 4 on the presubmit, 8 on the nightly) scales the
+	// asks and look-ahead rows with it while this reserve stays put. At 4,
+	// in flight is 1+1+8+4 = 14 and the term would be 28, and 16+28 = 44
+	// sits inside a 64-wide stream; at 8 it is 1+1+16+8 = 26, the term 52,
+	// and 16+52 = 68 is past the 64 the default render creates. Such an
+	// install runs today because its trigger-paced sources never all fire
+	// inside one five-second window and it spawns no session pods, so it
+	// spends none of its maxSessions*3 -- an observation about load, not a
+	// guarantee this reserve gives it.
 	// Reading the sidecar's env into the budget is the follow-up, not a
 	// number here. And one agent replica: replicas share the bridge's
 	// durable and each brings its own workers, so a second replica doubles
 	// the dispatch row.
 	//
-	// Where the floor hides all this. The budget is maxSessions*3 + 28 and a
+	// Where the floor hides all this. The budget is maxSessions*3 + 32 and a
 	// stream is created at max(64, budget), so a default install
-	// (maxSessions=10, budget 58) still renders 64. The first maxSessions
-	// whose budget clears the floor is 13 (67); it was 17 when the reserve
-	// was 16. Above it the stream is 12 wider than it would have been, and
+	// (maxSessions=10, budget 62) still renders 64. The first maxSessions
+	// whose budget clears the floor is 11 (65); it was 13 when the reserve
+	// was 28 and 17 when it was 16. Above it the stream is 16 wider than it
+	// would have been, and
 	// so is the web user's unreapable-durable ceiling, which is the trade
 	// the block above already states.
 	a2aTasksStandingDurables     = 2
@@ -619,14 +632,19 @@ const (
 	// read's probeConversation before and after its wait.
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
+	// a2aTasksReplayBridgeLookAhead is the bridge's pre-spawn look-ahead:
+	// lib.TaskInReplay at most once per dequeue from each worker, and at most
+	// Concurrency of them in hand at once, which the bridge paces.
+	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
 	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
 	// the replay running and the one before it, still inside its five-second
 	// inactive threshold.
 	a2aTasksReplayTailFactor = 2
 	a2aTasksReplayConsumers  = a2aTasksReplayTailFactor *
-		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks)
+		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks +
+			a2aTasksReplayBridgeLookAhead)
 
-	a2aTasksReservedConsumers = 28
+	a2aTasksReservedConsumers = 32
 
 	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
 	// default install still gets. Never render below it.
@@ -867,12 +885,14 @@ func a2aSeedJetStreamGrants() []string {
 // against a real server running this render
 // (TestBridgeJetStreamGrantOnARealServer). Per stream:
 //
-//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet and the sweep),
-//     CONSUMER.CREATE (the durable through CreateOrUpdateConsumer, and
-//     the replay's ordered consumer; nats.go puts the filter subject in the API
-//     subject, so the grant ends in `>`), CONSUMER.MSG.NEXT (every pull), and
-//     DIRECT.GET (GetLastMsgForSubject: the replay horizon and the sweep's CAS
-//     baseline). Acks are $JS.ACK.TASKS.>, granted beside this list.
+//   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet, lib.TaskInReplay,
+//     lib.LastEnvelope and the sweep), CONSUMER.CREATE (the durable through
+//     CreateOrUpdateConsumer, and the replay's ordered consumer; nats.go puts
+//     the filter subject in the API subject, so the grant ends in `>`),
+//     CONSUMER.MSG.NEXT (every pull), and DIRECT.GET (GetLastMsgForSubject:
+//     the replay horizon, the sweep's CAS baseline, the worker's look-ahead
+//     reading the in subject's newest message, and the orphan cancel reading
+//     the newest event). Acks are $JS.ACK.TASKS.>, granted beside this list.
 //   - KV_runtime-state, the in-flight registry: STREAM.INFO
 //     (js.KeyValue binds a bucket by reading its stream), and CONSUMER.CREATE
 //     with CONSUMER.DELETE (kv.Keys is a push ordered consumer that nats.go
@@ -906,7 +926,7 @@ func a2aSeedJetStreamGrants() []string {
 // does emit here without a grant. The only emitter is the ordered consumer's
 // reset path, which fires DeleteConsumer for the consumer it is replacing in
 // a goroutine and ignores the result; the ephemeral it could not delete is
-// reaped by the inactive threshold lib.TasksGet sets on it,
+// reaped by the inactive threshold lib.TasksGet and lib.TaskInReplay set on it,
 // lib.EphemeralConsumerInactiveThreshold (five seconds -- nats.go's own
 // ordered default is five MINUTES, which is what the replay carried before
 // gke-labs/kube-agents#1741). TasksGet does not delete its own replay
@@ -3179,7 +3199,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// what the script's gate compares a live stream
 				// against; the recreate width is what a fresh render
 				// creates, which floors at the cap TASKS shipped with,
-				// so a default install needs 58 and recreates at 64.
+				// so a default install needs 62 and recreates at 64.
 				// The third — what the live stream actually holds — is
 				// on the bus, and it is the one the maxSessions that
 				// fits is derived from, so that half of the remedy

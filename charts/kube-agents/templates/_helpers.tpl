@@ -187,6 +187,26 @@ true
 {{- end }}
 
 {{/*
+Whether the gateway PodMonitoring renders. platformAgent.podMonitoring is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the PodMonitoring API is served where GKE Managed Prometheus is
+installed and nowhere else, so an install on a cluster without it takes no
+object it cannot apply. helm template alone has no cluster to ask: pass
+--api-versions monitoring.googleapis.com/v1/PodMonitoring to see the default
+render, or --validate to ask the cluster the kubeconfig points at.
+*/}}
+{{- define "kube-agents.platformAgentPodMonitoring" -}}
+{{- $explicit := .Values.platformAgent.podMonitoring -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "monitoring.googleapis.com/v1/PodMonitoring" -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 The OTLP/HTTP collector base URL for the chart's own consumers (the LiteLLM exporter).
 
 Unset means the GKE Managed OpenTelemetry collector, which is what these consumers have

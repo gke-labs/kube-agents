@@ -40,15 +40,16 @@ var reserveTableRow = regexp.MustCompile(`^\s*//\s*\|\s*(\d+)\s*\|\s*(a2a[A-Za-z
 // the table names that is missing here fails the test, so adding a row means
 // adding it here too.
 var reserveTerms = map[string]int{
-	"a2aTasksStandingDurables":     a2aTasksStandingDurables,
-	"a2aTasksAuditDurableHeadroom": a2aTasksAuditDurableHeadroom,
-	"a2aTasksIncarnationOverlap":   a2aTasksIncarnationOverlap,
-	"a2aTasksWebReaders":           a2aTasksWebReaders,
-	"a2aTasksReplayConsumers":      a2aTasksReplayConsumers,
-	"a2aTasksReservedConsumers":    a2aTasksReservedConsumers,
-	"a2aTasksReplayBridgeDispatch": a2aTasksReplayBridgeDispatch,
-	"a2aTasksReplayGatewaySweep":   a2aTasksReplayGatewaySweep,
-	"a2aTasksReplayAsks":           a2aTasksReplayAsks,
+	"a2aTasksStandingDurables":      a2aTasksStandingDurables,
+	"a2aTasksAuditDurableHeadroom":  a2aTasksAuditDurableHeadroom,
+	"a2aTasksIncarnationOverlap":    a2aTasksIncarnationOverlap,
+	"a2aTasksWebReaders":            a2aTasksWebReaders,
+	"a2aTasksReplayConsumers":       a2aTasksReplayConsumers,
+	"a2aTasksReservedConsumers":     a2aTasksReservedConsumers,
+	"a2aTasksReplayBridgeDispatch":  a2aTasksReplayBridgeDispatch,
+	"a2aTasksReplayGatewaySweep":    a2aTasksReplayGatewaySweep,
+	"a2aTasksReplayAsks":            a2aTasksReplayAsks,
+	"a2aTasksReplayBridgeLookAhead": a2aTasksReplayBridgeLookAhead,
 }
 
 // The literal equals the sum of its named terms. The total is a literal and
@@ -66,9 +67,10 @@ func TestReservedConsumersIsTheSumOfItsTerms(t *testing.T) {
 			a2aTasksReservedConsumers, sum, a2aTasksStandingDurables, a2aTasksAuditDurableHeadroom,
 			a2aTasksIncarnationOverlap, a2aTasksWebReaders, a2aTasksReplayConsumers)
 	}
-	inFlight := a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks
-	if inFlight != 6 {
-		t.Errorf("replays in flight = %d, the table above a2aTasksReservedConsumers says 6; re-derive the row that moved and the table with it", inFlight)
+	inFlight := a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep + a2aTasksReplayAsks +
+		a2aTasksReplayBridgeLookAhead
+	if inFlight != 8 {
+		t.Errorf("replays in flight = %d, the table above a2aTasksReservedConsumers says 8; re-derive the row that moved and the table with it", inFlight)
 	}
 	for name, v := range reserveTerms {
 		if v <= 0 {
@@ -166,10 +168,10 @@ func TestProvisionRefusalMovesWithTheReserve(t *testing.T) {
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
 	script := a2aProvisionScript(agent)
 	for _, want := range []string{
-		"required_consumers=328",
-		"plus 28 reserved for the standing durables, the web rail and tasks/get replays.",
-		"fits=$(( (live_consumers - 28) / 3 ))",
-		"one session still needs 31",
+		"required_consumers=332",
+		"plus 32 reserved for the standing durables, the web rail and tasks/get replays.",
+		"fits=$(( (live_consumers - 32) / 3 ))",
+		"one session still needs 35",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("the provision script does not contain %q; the refusal is computed from a reserve other than a2aTasksReservedConsumers=%d", want, a2aTasksReservedConsumers)
@@ -183,7 +185,7 @@ func TestProvisionRefusalMovesWithTheReserve(t *testing.T) {
 // The floor's edge, stated in the comment and pinned here: the first
 // maxSessions whose budget clears a2aTasksMaxConsumersFloor, and the default
 // install still under it.
-func TestTheFloorHidesTheReserveUpToTwelve(t *testing.T) {
+func TestTheFloorHidesTheReserveUpToTen(t *testing.T) {
 	first := 0
 	for m := 1; m <= a2aTasksMaxConsumersFloor; m++ {
 		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
@@ -193,12 +195,12 @@ func TestTheFloorHidesTheReserveUpToTwelve(t *testing.T) {
 			break
 		}
 	}
-	if first != 13 {
-		t.Errorf("the first maxSessions rendering above the floor is %d, the comment above a2aTasksReservedConsumers says 13", first)
+	if first != 11 {
+		t.Errorf("the first maxSessions rendering above the floor is %d, the comment above a2aTasksReservedConsumers says 11", first)
 	}
 	def := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
-	if got := a2aTasksConsumerBudget(def); got != 58 {
-		t.Errorf("default budget = %d, the comment says 58", got)
+	if got := a2aTasksConsumerBudget(def); got != 62 {
+		t.Errorf("default budget = %d, the comment says 62", got)
 	}
 	if got := a2aTasksMaxConsumers(def); got != a2aTasksMaxConsumersFloor {
 		t.Errorf("default install renders max_consumers=%d, want the floor %d", got, a2aTasksMaxConsumersFloor)
@@ -208,32 +210,43 @@ func TestTheFloorHidesTheReserveUpToTwelve(t *testing.T) {
 // a2aBridgeSourceDirs are the bridge's own packages in the a2a module: the
 // command that configures and starts it, and the package that consumes,
 // dispatches and sweeps. Globbed rather than listed file by file, so a file
-// gke-labs#2010 adds is read too; an empty glob is a failure, not a pass.
+// added beside them is read too; an empty glob is a failure, not a pass.
 var a2aBridgeSourceDirs = map[string]string{
 	"../../../a2a/hermes-bridge":     "TasksGet",
 	"../../../a2a/cmd/hermes-bridge": "New",
 }
 
-// The reserve has no look-ahead term because the bridge has no look-ahead,
-// and this is what holds those two facts together.
+// a2aBridgeLookAheadCall names the bridge's pre-spawn replay by substring:
+// lib.TaskInReplay today, and any sibling look-ahead read that ends up called
+// something else, since a pre-spawn "is this task already in replay" call is
+// a tasks/get replay whatever it is named.
+const a2aBridgeLookAheadCall = "InReplay"
+
+// The reserve has a look-ahead term because the bridge has a look-ahead, and
+// this is what holds those two facts together.
 //
-// gke-labs#2010 adds lib.TaskInReplay, called once per spawn from each of the
-// bridge's workers, and the reserve carried a term for it before the call
-// existed: four slots on every install, reserved against code no render could
-// reach, moving the provision gate's first refused maxSessions on an existing
-// 64-wide TASKS from 13 to 11. The term came out. The hazard now runs the
-// other way -- #2010 lands and nothing reminds anyone to put it back -- so
-// this fails on the day the call appears in the bridge's sources, naming the
-// arithmetic that has to move with it.
+// The bridge's worker calls lib.TaskInReplay at most once per dequeue (it
+// answers from the in subject's newest message by direct get first) and
+// holds at most Concurrency of those replays in hand at once (it paces the
+// rest), and the reserve counts that ceiling: a2aTasksReplayBridgeLookAhead,
+// one slot per worker and its tail.
+// Before the call existed the term was out, because four slots reserved
+// against code no render could reach moved the provision gate's first refused
+// maxSessions on an existing 64-wide TASKS from 13 to 11 for nothing, and a
+// test of the opposite sense failed on the day the call appeared. The hazard
+// now runs this way -- the look-ahead is removed and nothing reminds anyone to
+// take the term out -- so this fails on the day the call leaves the bridge's
+// sources, naming the arithmetic that has to move with it.
 //
-// It is a source-reading test, so it is built to fail loudly rather than
-// quietly: a glob that finds nothing, a file that is empty, a file that does
+// It is a source-reading test, so it is built to fail loudly and for the right
+// reason: a glob that finds nothing, a file that is empty, a file that does
 // not parse, and a directory whose known call the walk does not find are all
-// failures. That last one is the positive control -- the bridge really does
-// call TasksGet, and main really does call hermesbridge.New, so a walk that
-// stopped collecting call names would report "no TaskInReplay" and pass
-// forever without it.
-func TestBridgeLookAheadIsNotInTheA2AModule(t *testing.T) {
+// failures of their own. That last one is the positive control -- the bridge
+// really does call TasksGet, and main really does call hermesbridge.New -- so
+// a walk that stopped collecting call names is reported as a broken extractor
+// rather than as a look-ahead that left.
+func TestBridgeLookAheadIsInTheA2AModule(t *testing.T) {
+	var lookAheadCalls []string
 	for dir, control := range a2aBridgeSourceDirs {
 		files, err := filepath.Glob(filepath.Join(dir, "*.go"))
 		if err != nil {
@@ -247,7 +260,7 @@ func TestBridgeLookAheadIsNotInTheA2AModule(t *testing.T) {
 			sources = append(sources, f)
 		}
 		if len(sources) == 0 {
-			t.Fatalf("no non-test .go files under %s; the bridge's sources are no longer where this test reads them, and it would otherwise pass by reading nothing", dir)
+			t.Fatalf("no non-test .go files under %s; the bridge's sources are no longer where this test reads them, and it would otherwise fail for the wrong reason", dir)
 		}
 
 		// Every call name in the package, as the parser sees it:
@@ -282,19 +295,21 @@ func TestBridgeLookAheadIsNotInTheA2AModule(t *testing.T) {
 		}
 
 		if len(called[control]) == 0 {
-			t.Fatalf("the walk over %s found no call to %s, which is there: the extractor is broken, and every assertion below it would pass by finding nothing", dir, control)
+			t.Fatalf("the walk over %s found no call to %s, which is there: the extractor is broken, and a missing look-ahead reported below would be its symptom, not a finding", dir, control)
 		}
 
-		// The guard itself. TaskInReplay by name, and any sibling
-		// look-ahead read that ends up called something else: a
-		// pre-spawn "is this task already in replay" call is a
-		// tasks/get replay whatever it is named.
 		for name, where := range called {
-			if !strings.Contains(name, "InReplay") {
-				continue
+			if strings.Contains(name, a2aBridgeLookAheadCall) {
+				lookAheadCalls = append(lookAheadCalls, name+" in "+strings.Join(where, ", "))
 			}
-			t.Errorf("%s calls %s (in %s): the bridge replays per spawn again, so the reserve needs its look-ahead term back. Restore a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency to the a2aTasksReplayConsumers sum, which takes replays in flight to 8, a2aTasksReplayConsumers to 16 and a2aTasksReservedConsumers to 32, and re-derive the two tables above the constants and the numbers the tests here pin. Without it the budget under-counts by one slot per bridge worker and its tail.",
-				dir, name, strings.Join(where, ", "))
 		}
+	}
+
+	// The guard itself. The call sites are logged on the way through, so a
+	// run's record names where the look-ahead lives on the day it moves.
+	t.Logf("bridge look-ahead reads: %s", strings.Join(lookAheadCalls, "; "))
+	if len(lookAheadCalls) == 0 {
+		t.Errorf("no bridge source calls a *%s read: the bridge no longer replays per spawn, so a2aTasksReplayBridgeLookAhead reserves slots for code no render reaches. Remove it from the a2aTasksReplayConsumers sum, which takes replays in flight to 6, a2aTasksReplayConsumers to 12 and a2aTasksReservedConsumers to 28, and re-derive the two tables above the constants and the numbers the tests here pin.",
+			a2aBridgeLookAheadCall)
 	}
 }

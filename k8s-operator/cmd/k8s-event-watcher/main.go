@@ -709,9 +709,23 @@ func realMain(argv []string) error {
 	// see the two run paths below. Everything constructed here (filter,
 	// metrics, injector) is stateless or goroutine-safe and is shared.
 
+	// A metrics listener that cannot bind costs the watcher its /metrics, not
+	// its job: the events it exists to triage are still watched. Exiting here
+	// would hand the process to the entrypoint's supervisor, which retries with
+	// backoff and after three short exits reports that NO cluster events are
+	// being watched — true of a port conflict only if this line makes it so.
+	// The ALERT line is the signal instead: it names the consequence and stays
+	// greppable beside the supervisor's own. startMetrics returns a nil server
+	// on failure, which Run treats as "no listener".
 	metricsSrv, err := startMetrics(f.metricsAddr, m)
 	if err != nil {
-		return fmt.Errorf("metrics server start: %w", err)
+		log.Printf("k8s-event-watcher: ALERT %v — running without a /metrics listener; cluster events are still watched", err)
+	}
+	if metricsSrv != nil {
+		// The bound address, so a scrape target that is down can be read
+		// against what the process opened: the entrypoint forwards whatever
+		// port it was given, and a port other than the declared one binds fine.
+		log.Printf("k8s-event-watcher: /metrics listening on %s", metricsSrv.ln.Addr())
 	}
 
 	// Set up context cancellation on SIGINT/SIGTERM for clean shutdown.

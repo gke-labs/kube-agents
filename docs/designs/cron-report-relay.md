@@ -689,9 +689,10 @@ identity no write on anything a watcher could use (the site's
 the canonical account of what it does grant), the credential proxy refuses
 every write verb before RBAC is consulted, and the operator reads nothing the
 pod writes, so a condition or an Event needs a new pod-to-operator path and a
-new grant first. The operator binds no metrics endpoint in the shipped deploy
-and no container in the agent pod exposes one unless it is switched on; the
-`PodMonitoring` objects the chart renders are LiteLLM's and Hindsight's. Those are the next step, with this
+new grant first. The operator binds no metrics endpoint in the shipped deploy;
+the one the agent pod exposes is the event watcher's, scraped through the
+chart's `PodMonitoring` for the gateway beside LiteLLM's and Hindsight's, and it
+carries nothing about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

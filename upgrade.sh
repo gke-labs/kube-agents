@@ -61,6 +61,9 @@ KUBE_AGENTS_FETCH_DEPTH_OPT="--depth=1"
 # package_release_bundle.sh writes it into every bundle it produces, with
 # `version=` and `tag=` both set to the release tag.
 readonly KUBE_AGENTS_RELEASE_BUNDLE_MARKER=".release-bundle"
+# The schema the re-tag modes filter the release's recorded values against,
+# relative to the sources this run applies.
+readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -73,6 +76,10 @@ PARAM_DRY_RUN="false"
 # environment has drifted from the composition on main.
 PARAM_PLAN="false"
 PARAM_KEEP_IMAGE_TAG="false"
+# Off by default: a key the target chart no longer declares is as often a
+# renamed setting as a newer release's addition, and dropping it silently would
+# take the setting off the release. A rollback to an older release passes it.
+PARAM_DROP_UNDECLARED_VALUES="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -299,6 +306,10 @@ Options:
                            the tag the install already serves. Use instead of
                            --image-tag, not alongside it; a script carrying a
                            baked release version already has one, and refuses it.
+  --drop-undeclared-values With --upgrade-mode=operator or harness, drop the
+                           release's recorded values the target chart's schema
+                           does not declare, instead of refusing the upgrade
+                           over them. For a rollback to an older release.
   --help, -h               Show this help message
 
 Examples:
@@ -357,8 +368,8 @@ random_hex_32() {
 #
 # A fresh install generates these (the composition's random_password
 # resources), and the harness/operator fast paths never touch
-# platform-agent-secrets — `helm upgrade
-# --reset-then-reuse-values` re-tags images and nothing else, so a Secret from an old
+# platform-agent-secrets — their `helm upgrade`
+# re-tags images over the release's recorded values, so a Secret from an old
 # enough install keeps missing the keys until something adds them. The
 # operator marks both Secret references optional, so
 # a Secret without the keys yields containers without the variables rather than
@@ -550,39 +561,31 @@ release_version_of_source_tree() {
 }
 
 # Sets RECORDED_PLUGIN_IMAGE_TAG_KEYS to the Helm keys, one per line, of the
-# plugin image tags the release's user-supplied values record
-# (`plugins.<name>.image.tag`), for the harness step to re-tag with the agent
-# and sandbox tags. Read from the recorded values rather than from the enabled
-# flags because the composition records the tag for a disabled plugin too;
-# derived from the values rather than from a list of plugin names so that a
-# plugin added to the chart and the composition is covered without a change
-# here. The chart the keys are applied to is pinned to this script's commit by
-# the source check, so its `plugins` block matches.
+# plugin image tags the given values record (`plugins.<name>.image.tag`), for
+# the harness step to re-tag with the agent and sandbox tags. Read from the
+# recorded values rather than from the enabled flags because the composition
+# records the tag for a disabled plugin too; derived from the values rather
+# than from a list of plugin names so that a plugin added to the chart and the
+# composition is covered without a change here. The harness step passes what
+# retag_values kept, so a plugin the chart this run applies does not declare
+# is not put back by its `--set`.
 #
-# A read that fails is an error, not an empty list: an empty list would run
-# the pre-fix re-tag and leave the plugin images behind, with the omission
-# surfacing only from the image check after the Helm move. It assigns rather
-# than prints, as gke_dns_endpoint_flag does, so that the caller runs it as a
-# plain command: print_error writes to stdout, which a command substitution
-# would swallow, and under `set -E` the ERR trap would fire in the
+# A malformed `plugins` value is an error, not an empty list: an empty list
+# would run the pre-fix re-tag and leave the plugin images behind, with the
+# omission surfacing only from the image check after the Helm move. It assigns
+# rather than prints, as gke_dns_endpoint_flag does, so that the caller runs it
+# as a plain command: print_error writes to stdout, which a command
+# substitution would swallow, and under `set -E` the ERR trap would fire in the
 # substitution's subshell and again in the parent. `trap - ERR` inside its own
 # substitutions for the same reason, on bash 3.2 in particular. Arguments:
-# release, namespace.
+# values as JSON.
 RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
 recorded_plugin_image_tag_keys() {
-  local release="$1" namespace="$2" values keys stderr_file
+  local values="$1" keys stderr_file
   RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
-  # stderr kept apart from the JSON: Helm writes warnings there on successful
-  # commands too (a group-readable kubeconfig, for one), and merged into the
-  # capture they would break the jq parse of values that are fine.
   stderr_file="$(mktemp)"
-  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>"$stderr_file")"; then
-    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: $(cat "$stderr_file")"
-    rm -f "$stderr_file"
-    return 1
-  fi
   if ! keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else error("plugins is not an object") end' <<<"$values" 2>"$stderr_file")"; then
-    print_error "Could not read the plugin image tags from the values of Helm release '${release}': $(cat "$stderr_file")"
+    print_error "Could not read the plugin image tags from the release's recorded values: $(cat "$stderr_file")"
     rm -f "$stderr_file"
     return 1
   fi
@@ -591,16 +594,15 @@ recorded_plugin_image_tag_keys() {
 }
 
 # Sets HARNESS_RETAG_KEYS, the Helm keys the harness step re-tags: the agent
-# and sandbox tags, then every plugin tag the release records. A function of
-# its own so the assembly runs under test with a stub helm, rather than being
-# pinned by the text of the case branch. A read loop rather than the bash 4
-# array builtin: operators run this from macOS, whose bash is 3.2. Arguments:
-# release, namespace.
+# and sandbox tags, then every plugin tag the given values record. A function
+# of its own so the assembly runs under test, rather than being pinned by the
+# text of the case branch. A read loop rather than the bash 4 array builtin:
+# operators run this from macOS, whose bash is 3.2. Arguments: values as JSON.
 HARNESS_RETAG_KEYS=()
 harness_retag_keys() {
-  local release="$1" namespace="$2" key
+  local values="$1" key
   HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag" "agentSandbox.image.tag")
-  recorded_plugin_image_tag_keys "$release" "$namespace"
+  recorded_plugin_image_tag_keys "$values"
   # An if, not `[ -n ] &&`: with nothing recorded the here-string is one empty
   # line, the test fails, the loop's status is that failure, and under
   # `set -e` the harness step would stop on an install with no plugins.
@@ -609,6 +611,144 @@ harness_retag_keys() {
       HARNESS_RETAG_KEYS+=("$key")
     fi
   done <<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
+}
+
+# Sets RETAG_VALUES_JSON to the values the release recorded, less every key the
+# chart this run applies would refuse as undeclared. Refuses, naming each such
+# key, unless --drop-undeclared-values was passed; then prints each key it
+# drops. The values are those of the revision --reset-then-reuse-values would
+# reuse: the latest when it deployed, otherwise the last one that did, since a
+# failed upgrade leaves the revision before it serving. A rollback re-tags with N-1's chart, and a key N's install recorded
+# that N-1's values.schema.json does not declare fails Helm's schema check for
+# the whole upgrade (#2109).
+#
+# A key is dropped only where Helm would refuse it: under an object the schema
+# closes with `additionalProperties: false`. An open object keeps everything,
+# and a node using a keyword the walk does not model (`$ref`, `allOf`, ...) is
+# left for Helm to judge. A chart without a schema drops nothing. Names are
+# printed, never values: the recorded values carry the install's credentials.
+# A name is printed through `echo -e`, so its backslashes and unprintable
+# characters are written as escapes a terminal shows rather than acts on, a
+# backslash as `\\` so that it cannot be read as the start of one.
+# Assigns rather than prints, for the reasons recorded_plugin_image_tag_keys
+# gives. Arguments: release, namespace, schema path.
+RETAG_VALUES_JSON=""
+retag_values() {
+  local release="$1" namespace="$2" schema="$3" revision values stderr_file dropped_file key
+  RETAG_VALUES_JSON=""
+  # stderr kept apart from the JSON: Helm writes warnings there on successful
+  # commands too (a group-readable kubeconfig, for one).
+  stderr_file="$(mktemp)"
+  if ! revision="$(trap - ERR; helm history "$release" -n "$namespace" -o json 2>"$stderr_file" | python3 -c '
+import json
+import sys
+
+DEPLOYED = "deployed"
+
+revisions = json.loads(sys.stdin.buffer.read())
+latest = max(revisions, key=lambda r: r["revision"])
+deployed = [r for r in revisions if r.get("status") == DEPLOYED]
+if latest.get("status") != DEPLOYED and deployed:
+    latest = max(deployed, key=lambda r: r["revision"])
+print(latest["revision"])
+' 2>>"$stderr_file")"; then
+    print_error "Could not read the history of Helm release '${release}' in '${namespace}' to re-tag it: $(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    return 1
+  fi
+  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" --revision "$revision" -o json 2>"$stderr_file")"; then
+    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to re-tag it: $(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    return 1
+  fi
+  # The kept values on stdout, and each dropped key on a line of its own file,
+  # since splitting one string in bash takes time quadratic in its length.
+  # UTF-8 in and out whatever the locale. Every character from U+007F to U+FFFF
+  # is written as a \u escape: Helm's YAML parser refuses some of them raw and
+  # reads NEL, U+2028 and U+2029 as line breaks, and escaping the whole range
+  # keeps a character nobody listed from corrupting a value. Those above U+FFFF
+  # stay raw, since the parser refuses the surrogate-pair escape they would need.
+  dropped_file="$(mktemp)"
+  if ! RETAG_VALUES_JSON="$(trap - ERR; printf '%s' "$values" | python3 -c '
+import json
+import re
+import sys
+
+UNMODELLED_KEYWORDS = ("$ref", "allOf", "anyOf", "oneOf", "not", "if", "patternProperties", "dependencies")
+BELOW_ASTRAL = re.compile("[\u007f-\uffff]")
+
+values = json.loads(sys.stdin.buffer.read()) or {}
+try:
+    with open(sys.argv[1], encoding="utf-8") as schema_file:
+        schema = json.load(schema_file)
+except FileNotFoundError:
+    schema = {}
+dropped = []
+
+
+def visible(key):
+    out = []
+    for char in key:
+        if char == "\\":
+            out.append("\\\\\\\\")
+        elif char.isprintable():
+            out.append(char)
+        elif ord(char) <= 0xFFFF:
+            out.append(f"\\\\u{ord(char):04x}")
+        else:
+            out.append(f"\\\\U{ord(char):08x}")
+    return "".join(out)
+
+
+def prune(node, node_schema, path):
+    if not isinstance(node_schema, dict) or any(k in node_schema for k in UNMODELLED_KEYWORDS):
+        return
+    if isinstance(node, dict):
+        properties = node_schema.get("properties", {})
+        additional = node_schema.get("additionalProperties", True)
+        for key in list(node):
+            key_path = f"{path}.{key}" if path else key
+            if key in properties:
+                prune(node[key], properties[key], key_path)
+            elif additional is False:
+                dropped.append(key_path)
+                del node[key]
+            else:
+                prune(node[key], additional, key_path)
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            prune(item, node_schema.get("items"), f"{path}[{index}]")
+
+
+prune(values, schema, "")
+with open(sys.argv[2], "w", encoding="utf-8") as dropped_file:
+    dropped_file.write("".join(f"{visible(key)}\n" for key in dropped))
+text = BELOW_ASTRAL.sub(lambda match: f"\\u{ord(match.group()):04x}", json.dumps(values, ensure_ascii=False))
+sys.stdout.buffer.write(text.encode("utf-8"))
+' "$schema" "$dropped_file" 2>"$stderr_file")"; then
+    RETAG_VALUES_JSON=""
+    print_error "Could not filter the values of Helm release '${release}' against ${schema}: $(cat "$stderr_file")"
+    rm -f "$stderr_file" "$dropped_file"
+    return 1
+  fi
+  rm -f "$stderr_file"
+  if [ ! -s "$dropped_file" ]; then
+    rm -f "$dropped_file"
+    return 0
+  fi
+  if [ "$PARAM_DROP_UNDECLARED_VALUES" != "true" ]; then
+    RETAG_VALUES_JSON=""
+    while IFS= read -r key; do
+      print_error "The release's recorded values set '${key}', which the chart this run applies does not declare."
+    done <"$dropped_file"
+    rm -f "$dropped_file"
+    print_error "Helm would refuse this upgrade over the keys above. If the target is an older release that predates them, re-run with --drop-undeclared-values to drop them; the settings they carry then leave the release until an --upgrade-mode=full run sets them again. If the target renamed or removed them, run --upgrade-mode=full instead."
+    return 1
+  fi
+  while IFS= read -r key; do
+    print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. A later release that declares it renders it from that chart's default until an --upgrade-mode=full run there sets it again."
+  done <"$dropped_file"
+  rm -f "$dropped_file"
 }
 
 # The two refusals that do not need a ref to make sense: an unversioned source
@@ -952,6 +1092,7 @@ parse_args() {
       --non-interactive|-y) PARAM_NON_INTERACTIVE="true"; shift ;;
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
+      --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -1223,6 +1364,10 @@ main() {
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
+  if [ "$PARAM_DROP_UNDECLARED_VALUES" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
+    exit 1
+  fi
 
   if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
@@ -1247,7 +1392,7 @@ main() {
   fi
 
   # python3: installer_common's state readers and the pre-apply scope check
-  # compare JSON with it.
+  # compare JSON with it, and the re-tag modes filter the release's values.
   local required_tools=(gcloud kubectl helm python3)
   # jq: the harness step's plugin re-tag reads the release's values with it,
   # and the post-upgrade image check that harness and full modes run has
@@ -1482,22 +1627,26 @@ main() {
   # against an old sandbox, and the second one's reused values would have to
   # re-read what the first wrote.
   #
-  # --reset-then-reuse-values, not --reuse-values. --reuse-values renders this
-  # checkout's chart against only the previous release's values, so any key the
-  # chart gained since that release is simply absent: upgrading a pre-split
-  # install this way hits a nil pointer in operator-deployment.yaml, or renders
-  # the sandbox image as ":<tag>" and leaves the StatefulSet unable to start.
-  # Resetting first takes the checkout's defaults for the new keys and re-applies
-  # the release's own overrides on top, which is what the redeploy workflows
-  # already do for the same reason.
+  # --reset-values with the release's own values, not --reuse-values.
+  # --reuse-values renders this checkout's chart against only the previous
+  # release's values, so any key the chart gained since that release is simply
+  # absent: upgrading a pre-split install this way hits a nil pointer in
+  # operator-deployment.yaml, or renders the sandbox image as ":<tag>" and
+  # leaves the StatefulSet unable to start. Resetting first takes the checkout's
+  # defaults for the new keys and re-applies the release's own overrides on top,
+  # which is what --reset-then-reuse-values does. The overrides come from retag_values rather than that flag so that a key this
+  # chart does not declare can be dropped: the flag has no way to leave one out.
+  # Piped, so the recorded values never land in a file. The newline is not
+  # optional: Helm 4 drops an unterminated last line of a length that is a
+  # multiple of 4096 bytes, which here is every value at once.
   helm_retag() {
     local set_args=()
     local set_key
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
-    helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
-      --namespace "$target_namespace" --reset-then-reuse-values \
+    printf '%s\n' "$RETAG_VALUES_JSON" | helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
+      --namespace "$target_namespace" --reset-values --values - \
       "${set_args[@]}" --wait --timeout 10m
   }
 
@@ -1576,10 +1725,11 @@ main() {
   # UPGRADE_APPLY_STARTED is set inside each arm below rather than here, and
   # the difference is load-bearing. Both previews have exited above, so it is
   # tempting to read "past the previews" as "past the point of no return" — but
-  # two arms still refuse after the dispatch and before they write anything:
+  # every arm can still refuse after the dispatch and before it writes anything:
   # full runs the scope check, the container preflight, the minter/KMS guard
-  # and the service-account 409 check, and
-  # harness reads the release's values to learn which plugin tags to move. A run
+  # and the service-account 409 check, and operator and harness read the
+  # release's values to re-tag it (harness also takes from them which plugin
+  # tags to move). A run
   # that stops on one of those has applied none of the new release, so the
   # checkout this run detached has to go back. Each arm therefore flips the gate
   # on its own last line before its first mutating command, and
@@ -1588,6 +1738,7 @@ main() {
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
+      retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
@@ -1603,11 +1754,14 @@ main() {
       # The plugin images move with them for the same reason, when the
       # release records them: the operator renders them into the gateway as
       # stage-<plugin> init containers or plugin-<name> image volumes, and
-      # the image check below reads both. A plain call, not a substitution: a
-      # failed read stops the run here, once, with its own message shown.
-      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
-      # After the read, not before it: `helm get values` is the last thing this
-      # arm does that can fail without having changed anything.
+      # the image check below reads both. From the filtered values, so a
+      # plugin block retag_values dropped is not put back by a `--set`. Plain
+      # calls, not substitutions: a failed read stops the run here, once, with
+      # its own message shown.
+      retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      harness_retag_keys "$RETAG_VALUES_JSON"
+      # After the reads, not before them: they are the last things this arm
+      # does that can fail without having changed anything.
       UPGRADE_APPLY_STARTED="true"
       helm_retag "${HARNESS_RETAG_KEYS[@]}"
       print_success "Platform Agent deployment upgraded successfully!"

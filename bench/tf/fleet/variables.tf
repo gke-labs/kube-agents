@@ -56,6 +56,26 @@ variable "fleet_reader_token_creators" {
   }
 }
 
+variable "pool_state_readers" {
+  description = "IAM members granted the read-only project roles the CI health bot's hourly pool-state scan needs (scripts/eval_dashboard/pool_state.py runs scripts/verify_ci_pool_project.py's read-only checks against every pool project as the bot itself; docs/ci-health.md, 'The pool-state scan'). The roles are `local.pool_state_reader_roles` in main.tf, kept equal to POOL_STATE_READER_ROLES in the verifier by its tests. Defaults to the bot, eval-dashboard-publisher@kube-agents-prow, so an apply of this stack in a pool project grants it with no separate step; a project without the grant scans as 'not checked' and drift there goes unseen. Override it when applying this stack outside the CI pool."
+  type        = list(string)
+
+  # Defaulted here for the reason fleet_reader_token_creators is: the resource
+  # is keyed by member and role, so an apply that does not carry the value
+  # plans every binding for destruction.
+  default = [
+    "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com",
+  ]
+
+  validation {
+    condition = alltrue([
+      for m in var.pool_state_readers :
+      can(regex("^(serviceAccount|user|group|domain|principal|principalSet):", m))
+    ])
+    error_message = "Each member must carry an IAM type prefix, e.g. serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com."
+  }
+}
+
 variable "exclusion_window_hours" {
   description = "Length in hours of seeded-b's NO_MINOR_UPGRADES maintenance exclusion, re-stamped from now on every apply. The GKE API rejects an endTime past the held minor's end of life (observed live: 'endTime needs to be before minor version 1.34 end of life: (2027-1-25)'), so now + this window must stay inside the EOL -- which no fixed window can do forever. When a reconcile starts failing with that 400, that IS the EOL approaching: shorten this variable to fit, or accept the self-heal and re-lag seeded-b by replacement at EOL (see README). 90 days balances a long protective window against how soon the 400s begin."
   type        = number

@@ -24,6 +24,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import eval_rosters
+from test_eval_rosters import INJECT_LANE_REQUESTING
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -72,6 +73,14 @@ def safeguards_step() -> str:
 def presubmit_tasks() -> list[str]:
     excluded = set(eval_rosters.inject_lane_exclusions())
     return [f"./tasks/{c}/task.yaml" for c in eval_rosters.presubmit_cases() if c not in excluded]
+
+
+def requesting_among(tasks: list[str]) -> str:
+    """The cases of `tasks` that request a pull request, in matrix order, as
+    the step's INJECT_LANE_REQUESTING spells them. The set is the one
+    scripts/test_eval_rosters.py pins, so seating or demoting a requesting
+    case edits that pin and nothing here."""
+    return ",".join(n for n in (pathlib.Path(t).parent.name for t in tasks) if n in INJECT_LANE_REQUESTING)
 
 
 def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file: pathlib.Path = LANE_FILE) -> subprocess.CompletedProcess:
@@ -165,18 +174,25 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertEqual(spec_names(pathlib.Path(path)), original + [LANE_ENTRY])
         self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
-        # One presubmit case is in the file's `requesting:` list (the persona
-        # answers it with a pull request before its own check says so), so
-        # the second phase holds it and the log says so.
-        self.assertEqual(value(result, "REQUESTING"), "obtainability-remediation-proposal")
-        self.assertIn("run after every other unit: obtainability-remediation-proposal", result.stdout)
+        # The presubmit cases that request a pull request, by their own
+        # checks or the file's `requesting:` list (the persona answers the
+        # case with one before its own check says so): the second phase
+        # holds them and the log says so. The matrix has one of each today.
+        requesting = requesting_among(presubmit_tasks())
+        self.assertIn("obtainability-remediation-proposal", requesting.split(","))
+        self.assertEqual(value(result, "REQUESTING"), requesting)
+        self.assertIn(f"run after every other unit: {requesting}\n", result.stdout)
 
     def test_the_requesting_cases_are_named_for_the_second_phase(self):
-        tasks = presubmit_tasks() + ["./tasks/pdb-remediation-pr/task.yaml", "./tasks/rca-remediation-pr/task.yaml"]
+        # Every pinned requesting case the presubmit matrix does not seat,
+        # added to it: each is named once, in matrix order.
+        seated = {pathlib.Path(t).parent.name for t in presubmit_tasks()}
+        tasks = presubmit_tasks() + [f"./tasks/{c}/task.yaml" for c in INJECT_LANE_REQUESTING if c not in seated]
         result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, tasks=tasks)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(value(result, "REQUESTING"), "obtainability-remediation-proposal,pdb-remediation-pr,rca-remediation-pr")
-        self.assertIn("run after every other unit: obtainability-remediation-proposal,pdb-remediation-pr,rca-remediation-pr", result.stdout)
+        self.assertEqual(sorted(value(result, "REQUESTING").split(",")), sorted(INJECT_LANE_REQUESTING))
+        self.assertEqual(value(result, "REQUESTING"), requesting_among(tasks))
+        self.assertIn(f"run after every other unit: {requesting_among(tasks)}\n", result.stdout)
 
     def test_the_task_files_under_bench_tasks_are_not_written(self):
         before = {p: p.read_bytes() for p in (BENCH_DIR / "tasks").glob("*/task.yaml")}
