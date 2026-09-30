@@ -25,8 +25,9 @@ the reach the App has. The branch goes because a leftover branch refuses the
 next lease's identical fix "nothing to commit" (#1755 item 2).
 
 Fourth, which projects. The sweep takes only what Boskos hands out as free,
-holds each for the seconds it takes, and gives every one back -- on success, on
-a fault, on an unmapped name. A project a run holds is never asked for.
+holds each for as long as it takes (heartbeated), and gives every one back --
+on success, on a fault, on an unmapped name. A project a run holds is never
+asked for.
 
 Fifth, a permission the organisation has withdrawn has to read as what it is.
 GitHub answers that with a 403 or a 422 whose text is about tokens; the usual
@@ -691,7 +692,7 @@ class HoldTest(unittest.TestCase):
         class _Slow(_GitHub):
             def __call__(self, request, timeout=None):
                 if "/pulls?" in request.full_url:
-                    time.sleep(0.2)
+                    time.sleep(0.3)
                 return super().__call__(request, timeout=timeout)
 
         boskos = _Boskos(["kube-agents-evals-7"])
@@ -729,6 +730,9 @@ class HoldTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
         self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+        # And the signal hold is balanced afterwards: an unbalanced depth would
+        # leave the process's termination handlers deferred for good.
+        self.assertEqual(sweeper.boskos_pool._HOLD_DEPTH, 0)
 
     def test_a_hold_lasts_at_least_a_second_before_its_release(self):
         with mock.patch.object(sweeper.boskos_pool, "clock", lambda: 100.0):

@@ -457,10 +457,15 @@ def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known
         else:
             _record(project, outcomes, runner, dry_run)
 
-    _, release_failures = boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True)
-    for project, reason in release_failures.items():
-        outcomes[project] = (OUTCOME_FAILED, reason)
-        _line(project, outcomes[project])
+    # Merged in a finally, so a release that failed before a termination
+    # unwound the walk is on the record the run writes on its way out.
+    release_failures = {}
+    try:
+        boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True, release_failures=release_failures)
+    finally:
+        for project, reason in release_failures.items():
+            outcomes[project] = (OUTCOME_FAILED, reason)
+            _line(project, outcomes[project])
     return outcomes
 
 

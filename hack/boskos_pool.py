@@ -269,6 +269,7 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
         held_since = clock()
         stop = threading.Event()
         beater = None
+        unblocked = False
         try:
             if heartbeat:
                 # Bound to `beater` only once started: a start that fails must
@@ -278,13 +279,18 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
                 thread.start()
                 beater = thread
             _hold_signals(False)
+            unblocked = True
             return visit(name)
         finally:
             # A termination raised out of the swap below (a signal in the
             # moment before the handlers are held) must not skip the release:
             # the raise itself leaves later signals held, so the release runs.
+            # The hold is re-taken only if it was given up: a heartbeat that
+            # failed to start never reached the unblock, and a second block
+            # would leave the depth above zero for the rest of the process.
             try:
-                _hold_signals(True)
+                if unblocked:
+                    _hold_signals(True)
             finally:
                 stop.set()
                 if beater is not None:

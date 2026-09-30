@@ -69,7 +69,7 @@ USER_AGENT = "kube-agents-pull-sweep"
 REQUEST_TIMEOUT_SECONDS = 30
 # GitHub's secondary limits for one App: at least a second between writes, and
 # no more than 500 content-generating requests an hour, answered otherwise with
-# a 403 for every call for some minutes. A close and its branch delete are two
+# a 429 or a marked 403 for every call for some minutes. A close and its branch delete are two
 # writes; six runs an hour at this budget stay under 500, and a backlog drains
 # across runs instead of in one burst. What a run leaves is logged and reported.
 WRITE_PAUSE_SECONDS = 1.0
@@ -429,10 +429,10 @@ def is_rate_limited(exc):
 
 
 def write(method, path, authorization, body=None):
-    """One GitHub write, paced. A 403 GitHub marks as its burst limit is waited
-    out once, for what it asks, and tried again; refused again, the run ends
-    here rather than visiting every project during the cooldown. Any other
-    error is the caller's, as before."""
+    """One GitHub write, paced. A refusal GitHub marks as its burst limit (a
+    429, or a 403 with its markers) is waited out once, for what it asks, and
+    tried again; refused again, the run ends here rather than visiting every
+    project during the cooldown. Any other error is the caller's, as before."""
     try:
         try:
             return api(method, path, authorization, body)
