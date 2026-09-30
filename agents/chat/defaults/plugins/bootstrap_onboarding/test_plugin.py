@@ -21,6 +21,9 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import plugin  # noqa: E402
 
+# The one bench stack that writes the eval seam's marker.
+EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
+
 
 def _fake_session_env(**values):
     def _get(name, default=""):
@@ -302,7 +305,7 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertTrue(running.exists())
         self.assertTrue(done.exists())
 
-    def test_only_bench_and_this_plugin_name_the_eval_marker(self):
+    def test_only_the_hello_stack_and_this_plugin_name_the_eval_marker(self):
         repo = Path(__file__).resolve().parents[5]
         try:
             listed = subprocess.run(
@@ -316,7 +319,7 @@ class PreLlmCallTest(unittest.TestCase):
         plugin_dir = Path(__file__).resolve().parent.relative_to(repo).as_posix() + "/"
         strays = [
             path for path in listed.stdout.splitlines()
-            if not (path.startswith("bench/") or path.startswith(plugin_dir))
+            if not (path.startswith(EVAL_STACK_DIR) or path.startswith(plugin_dir))
         ]
         self.assertEqual(strays, [], "only the bench stack may write the eval seam's marker")
 
