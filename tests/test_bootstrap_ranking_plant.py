@@ -338,7 +338,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
             self.skipTest("no GNU stat, which the sandbox image has")
         completed, _ = self._run()
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        script = next(line for line in self._plant.splitlines() if "base64 -d" in line)
+        script = next(line for line in self._plant.splitlines() if "sh -c 'base64 -d" in line)
         in_pod = re.search(r"sh -c '([^']*)'", script).group(1)
         home = self._root / "data"
         home.mkdir()
