@@ -1102,8 +1102,11 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 		return nil, err
 	}
 	winner, gerr := g.reg.Get(ctx, msg.Conversation)
-	if gerr != nil || winner == nil {
-		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %v", gerr)
+	if gerr != nil {
+		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %w", gerr)
+	}
+	if winner == nil {
+		return nil, errors.New("lost the mint race but winner record not found")
 	}
 	return winner, nil
 }

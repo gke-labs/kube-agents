@@ -505,6 +505,11 @@ func TestIsMaxBytesDetection(t *testing.T) {
 		{fmt.Errorf("session discord:123/456: %w", &jetstream.APIError{Code: 500, ErrorCode: jsErrCodeStorageResourcesExceeded, Description: "insufficient storage resources available"}), true},
 		// Typed jetstream.APIError with max bytes description:
 		{&jetstream.APIError{Code: 503, ErrorCode: 10077, Description: "maximum bytes exceeded"}, true},
+		// Lost mint race with a key containing "max bytes" or "maximum bytes" and a transient winner-read error:
+		{fmt.Errorf("lost the mint race but cannot read the winner: %w", fmt.Errorf("session inject:test max bytes: %w", errors.New("connection timeout"))), false},
+		{fmt.Errorf("lost the mint race but cannot read the winner: %w", fmt.Errorf("session inject:test maximum bytes: %w", errors.New("temporary failure"))), false},
+		// And when the underlying root error genuinely is max bytes, it still detects:
+		{fmt.Errorf("lost the mint race but cannot read the winner: %w", fmt.Errorf("session inject:test: %w", jetstream.ErrMaxBytesExceeded)), true},
 	}
 	for _, tc := range cases {
 		got := isMaxBytes(tc.err)
@@ -806,7 +811,7 @@ func TestLiveSessionLifecycleAgainstCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gateway connect: %v", err)
 	}
-	defer client.Close()
+	t.Cleanup(client.Close)
 
 	reg := NewRegistry(client)
 
