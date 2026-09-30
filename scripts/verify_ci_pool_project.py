@@ -340,13 +340,17 @@ GITHUB_ISSUES_URL = "https://api.github.com/repos/{repo}/issues?per_page=1&state
 # prepare starts each remediation workspace from the repository's default
 # branch, so a default moved onto an agent branch that already carries the fix
 # makes every rca write a no-op ("nothing to commit", a leftover proposal
-# quoted back) and the case reads 0/3 whatever the agent does. That is what
-# the pilot-only gitops_switch_default_branch mode of
-# bench/tf/prebuilt/gitops-fix-cycle left behind on four pool repositories
-# between 2026-08-28 and 2026-09-30, unseen, when its restore never ran. One
+# quoted back) and the case reads 0/3 whatever the agent does. Four pool
+# repositories sat on a platform-agent/* default from 2026-08-28 to
+# 2026-09-30 and one on master, unseen; what moved them is not known (no
+# repository events; the org audit log needs an owner), so this read is the
+# net whatever the mover was, and #1970 (the broker refusing a proposal onto
+# any base but the configured one) is the guard on the product side. One
 # `gh api` read of the repository per project; a PATCH of the same field is
-# the repair. The repositories are private, so the read needs a credential
-# they are visible to, carried in GITOPS_READ_TOKEN_ENV (gh's own variable).
+# the repair, and that field needs repository admin, so an owner of
+# gke-agentic runs it. The repositories are private, so the read needs a
+# credential they are visible to, carried in GITOPS_READ_TOKEN_ENV (gh's own
+# variable).
 GITOPS_DEFAULT_BRANCH = "main"
 GITOPS_REPO_API_PATH = "repos/{repo}"
 GITOPS_READ_TOKEN_ENV = "GH_TOKEN"
@@ -2470,7 +2474,8 @@ def check_gitops_default_branch(project_id: str) -> CheckResult:
         FINDING_GITOPS_DEFAULT_BRANCH,
         f"Repository {repo_slug}'s default branch is {observed}, not {GITOPS_DEFAULT_BRANCH}: "
         "submit_suggestion.py prepare starts every remediation workspace from it, so a fix "
-        "already on that branch is a no-op and the case fails on a leftover proposal",
+        "already on that branch is a no-op and the case fails on a leftover proposal (the "
+        "repair changes a field that needs repository admin: run it as an owner of gke-agentic)",
         REPAIR_GITOPS_DEFAULT_BRANCH.format(repo=repo_slug, branch=GITOPS_DEFAULT_BRANCH),
     )
     return CheckResult(name, False, f"{repo_slug} does not default to {GITOPS_DEFAULT_BRANCH}", details=details, findings=findings)

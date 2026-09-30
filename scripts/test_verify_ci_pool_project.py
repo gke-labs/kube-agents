@@ -1660,10 +1660,11 @@ class GithubAppInstallationTest(unittest.TestCase):
 
 class GitopsDefaultBranchTest(unittest.TestCase):
     """The GitOps repository defaults to main. Four pool repositories sat on a
-    platform-agent/* default from late August to 2026-09-30 (the pilot's
-    gitops_switch_default_branch mode, restore never run) and one on master,
+    platform-agent/* default from late August to 2026-09-30 and one on master,
     and every rca write on them was a no-op that quoted a leftover proposal;
-    nothing read the pointer until a triage did by hand."""
+    nothing read the pointer until a triage did by hand. What moved them is
+    not known (no repository events; the org audit log needs an owner), so
+    the check is cause-agnostic; #1970 is the guard on the product side."""
 
     def _check(self, rc, out="", err="", project="kube-agents-evals-27"):
         with mock.patch.object(checker, "run_cmd", return_value=(rc, out, err)) as run:
@@ -1686,6 +1687,7 @@ class GitopsDefaultBranchTest(unittest.TestCase):
         self.assertEqual(finding.id, "gitops/default-branch")
         self.assertIn("gke-agentic/kube-agents-evals-27-infra's default branch is platform-agent/fix-payments-api-crashloop, not main", finding.observed)
         self.assertIn("submit_suggestion.py prepare", finding.observed)
+        self.assertIn("owner of gke-agentic", finding.observed)
         self.assertEqual(finding.repair, "gh api -X PATCH repos/gke-agentic/kube-agents-evals-27-infra -f default_branch=main")
         self.assertEqual(result.details, [finding.observed])
 
@@ -1721,6 +1723,22 @@ class GitopsDefaultBranchTest(unittest.TestCase):
             self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED, (rc, out, err))
             self.assertEqual(result.findings, [])
         self.assertIn(checker.NO_OUTPUT_REASON, self._check(1, "", "")[0].warnings[0])
+
+    def test_a_transient_github_error_is_not_checked_never_drift(self):
+        # gh exits 1 on every non-2xx and puts the error body on stdout; a
+        # rate limit, a 5xx and a revoked token all read as "could not read",
+        # with gh's own line as the reason, and never as a moved default.
+        for rc, out, err, mark in (
+            (1, '{"message":"API rate limit exceeded for user ID 1."}', "gh: API rate limit exceeded for user ID 1 (HTTP 403)\n", "HTTP 403"),
+            (1, "", "gh: Bad Gateway (HTTP 502)\n", "HTTP 502"),
+            (1, '{"message":"Bad credentials"}', "gh: Bad credentials (HTTP 401)\n", "HTTP 401"),
+        ):
+            result, _ = self._check(rc, out, err)
+            self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED, (rc, out, err))
+            self.assertTrue(result.passed)
+            self.assertIs(result.read, False)
+            self.assertEqual(result.findings, [])
+            self.assertIn(mark, result.warnings[0])
 
     def test_the_scan_selects_it_and_is_not_stopped_at_the_door_for_it(self):
         self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.POOL_STATE_CHECKS)
