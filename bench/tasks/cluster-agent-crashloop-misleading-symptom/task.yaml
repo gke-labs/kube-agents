@@ -26,7 +26,7 @@
 #     container block in bench/tf/fleet/defects-a.tf declares none. That is
 #     not an oversight and not a closure: bench/tf/fleet/README.md's "Accepted
 #     background findings" table carries SOP-3.10 `probes-liveness` as a
-#     finding that stays OPEN on all three planted workloads, declared rather
+#     finding that stays OPEN on all four planted workloads, declared rather
 #     than closed so the fleet is not asymmetric. Every audit of this fleet
 #     returns it. So the absence is a documented standing property the case
 #     can rely on, which is what matters here.

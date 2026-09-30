@@ -1485,7 +1485,10 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertNotIn("$GITOPS_INTENT_NOTE_CONTENT", result.message)
         self.assertNotIn("-f sha=", result.message)
 
-    def test_an_unreadable_note_is_unverified_not_failed(self):
+    def test_a_transient_read_failure_is_unverified_not_failed(self):
+        # Through _record_unreadable like every other read: a 502 is a read
+        # that did not happen, so the check passes with an Unread warning and
+        # the run exits 2.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [_fail("gh: HTTP 502")]
             result = checker.check_gitops_declaration("kube-agents-evals-3")
@@ -1495,17 +1498,42 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIsInstance(result.warnings[0], checker.Unread)
         self.assertFalse(result.read)
 
-    def test_a_note_without_the_declaration_fails_with_a_replacing_command(self):
-        # The file is there but declares nothing (an empty seed, a hand edit):
-        # the audit's parser returns no declaration and the case fails with a
-        # presence-only check green. The repair names the blob's sha so the PUT
-        # replaces rather than 422s.
+    def test_a_read_that_failed_for_another_reason_fails_the_check(self):
+        # `gh api .../contents/<path>` on a repository with no commits answers
+        # 409, which is neither a denial nor a transient: the sibling reads
+        # fail on it, so this one does too rather than filing it as unread.
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(self._contents("\n", sha="deadbeef"))]
+            run.side_effect = [_fail("gh: Git Repository is empty. (HTTP 409)")]
             result = checker.check_gitops_declaration("kube-agents-evals-3")
         self.assertFalse(result.passed)
-        self.assertIn("does not declare no-pdb", result.message)
-        self.assertIn("-f sha=deadbeef", result.message)
+        self.assertEqual([], result.warnings)
+        self.assertIn("HTTP 409", result.message)
+
+    def test_a_note_the_audit_parser_rejects_fails_with_a_replacing_command(self):
+        # The file is there but the audit reads no declaration from it: no
+        # frontmatter, an unclosed one, no `type`, no `declares` list, or a
+        # list without the fixture's item. Each fails, and the repair names the
+        # blob's sha so the PUT replaces rather than 422s.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT
+        bodies = {
+            "empty": "\n",
+            "unclosed": good.replace("---\n\n`notification", "\n`notification", 1),
+            "no type": good.replace("type: decision\n", ""),
+            "no declares": good.replace("declares:", "declared:"),
+            "other object": good.replace("Deployment/notification-relay", "Deployment/checkout-gateway"),
+            "strings but no structure": "---\ncheck: no-pdb namespace: seeded-intent object: Deployment/notification-relay\n---\n",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(body, sha="deadbeef"))]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertFalse(result.passed, label)
+                self.assertIn("the audit reads no declaration from it", result.message)
+                self.assertIn("-f sha=deadbeef", result.message)
+        # And the closing delimiter YAML also accepts.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(good.replace("---\n\n`notification", "...\n\n`notification", 1)))]
+            self.assertTrue(checker.check_gitops_declaration("kube-agents-evals-3").passed)
 
     def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
         # One note, defined twice: the script seeds it, the verifier reads it
@@ -1517,8 +1545,8 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         ):
             self.assertIn(f'{name}="{value}"', script, name)
         self.assertIn(f"readonly GITOPS_INTENT_NOTE_CONTENT='{checker.GITOPS_INTENT_NOTE_CONTENT}'", script)
-        for line in checker.GITOPS_INTENT_NOTE_DECLARES:
-            self.assertIn(line, checker.GITOPS_INTENT_NOTE_CONTENT)
+        # The content the verifier expects passes its own parser-faithful check.
+        self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n"))
 
 
 class GithubAppInstallationTest(unittest.TestCase):
@@ -3772,8 +3800,8 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), (127, "", "no gh")]):
             self.assertEqual(len(checker.check_toolchain(needs_gh=True)), 1)
         self.assertFalse(checker.GITHUB_CHECKS.intersection(checker.POOL_STATE_CHECKS))
-        # Only the repo-and-app check shells out to gh; the minter and ledger
-        # checks read GitHub over urllib and KMS over gcloud.
+        # The repo-and-app and declared-intent-note checks shell out to gh; the
+        # minter and ledger checks read GitHub over urllib and KMS over gcloud.
         self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION})
 
 

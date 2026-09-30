@@ -294,15 +294,15 @@ declares:
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
 obtainability audit lists this posture under Declared intent rather than as a finding."""
-# The lines the audit's parser reads (audit_report.py parse_declarations): the
-# check, the namespace and the object of the one declaration. A file that has
-# the path but not these declares nothing, and the case fails on that project
-# with the verifier green -- which is why presence alone is not the check.
-GITOPS_INTENT_NOTE_DECLARES = (
-    "check: no-pdb",
-    "namespace: seeded-intent",
-    "object: Deployment/notification-relay",
-)
+# The one declaration the audit's parser (audit_report.py parse_declarations)
+# must find in the note's `declares` list. A file that has the path but not
+# this declares nothing, and the case fails on that project with a
+# presence-only check green -- which is why presence alone is not the check.
+GITOPS_INTENT_NOTE_DECLARATION = {
+    "check": "no-pdb",
+    "namespace": "seeded-intent",
+    "object": "Deployment/notification-relay",
+}
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -2308,21 +2308,60 @@ def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
     )
 
 
+def _note_declaration_problem(body: str) -> Optional[str]:
+    """Why the audit's parser would read no declaration from `body`, or None when it would.
+
+    Mirrors `parse_declarations` in agents/platform/skills/fleet-audit/scripts/
+    audit_report.py rather than searching for strings: the note must open with
+    `---` on its first line and close with `---` or `...` at column 0, the
+    frontmatter must be YAML carrying `type`, and `declares` must be a list
+    with an item whose check, namespace and object are the fixture's. A file
+    that has the path and the words but not that shape declares nothing, and
+    the case fails on the project with a presence-only check green.
+    """
+    import yaml
+
+    lines = body.replace("\r\n", "\n").lstrip("\ufeff").split("\n")
+    if not lines or lines[0].rstrip() != "---":
+        return "the file does not open with a `---` frontmatter line"
+    close = next((i for i in range(1, len(lines)) if lines[i].rstrip() in ("---", "...")), None)
+    if close is None:
+        return "the frontmatter never closes (no `---` or `...` line after the opening one)"
+    try:
+        front = yaml.safe_load("\n".join(lines[1:close]))
+    except yaml.YAMLError as exc:
+        return f"the frontmatter is not valid YAML ({exc})"
+    if not isinstance(front, dict) or "type" not in front:
+        return "the frontmatter carries no `type`, so it is not an OKF note"
+    declares = front.get("declares")
+    if not isinstance(declares, list):
+        return "the frontmatter has no `declares` list"
+    for item in declares:
+        if isinstance(item, dict) and all(item.get(k) == v for k, v in GITOPS_INTENT_NOTE_DECLARATION.items()):
+            return None
+    return (
+        "no `declares` item has check no-pdb, namespace seeded-intent and object "
+        "Deployment/notification-relay"
+    )
+
+
 def check_gitops_declaration(project_id: str) -> CheckResult:
     """Verify the GitOps repository carries the declared-intent note, with the declaration in it.
 
     Provisioning seeds it for a new project, and the provisioning script is not
     re-run on a registered one, so a project registered before the note existed
-    fails here until someone runs the printed command. The body is read back,
-    not just the path: a file without the `declares:` lines declares nothing,
-    and the case then fails on the project with this check green. A read that
-    fails for a reason other than 404 is unverified, not absent, as every other
-    read in this script is; a 404 names both of its readings, because gh
-    answers it for a private repository this token cannot see as well as for a
-    file that is not there.
+    fails here until someone runs the printed command. The body is read back
+    and held to the audit parser's rules, not just the path. A 404 names both
+    of its readings, because gh answers it for a private repository this token
+    cannot see as well as for a file that is not there; any other non-zero
+    exit goes through `_record_unreadable`, as every read in this script does,
+    so a refusal or a transient leaves the check unverified and anything else
+    (a 409 on a repository with no commits, a 422) fails it.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
     repo_slug = f"gke-agentic/{project_id}-infra"
+    details: List[str] = []
+    warnings: List[str] = []
     rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
     if rc != 0:
         if _GITHUB_NOT_FOUND.search(err or ""):
@@ -2334,27 +2373,28 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
                 f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
                 f"is seeded: {gitops_note_seed_command(repo_slug)}",
             )
-        return CheckResult(
-            name,
-            True,
-            "Not checked",
-            warnings=[Unread(f"Not checked: could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")],
-            read=False,
-        )
+        if _record_unreadable(
+            err or "",
+            absent=f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}",
+            unchecked=f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} could not be read",
+            details=details,
+            warnings=warnings,
+        ):
+            return CheckResult(name, True, "Not checked", warnings=warnings, read=False)
+        return CheckResult(name, False, details[0], details=details)
     try:
         payload = _load_json(out)
         body = base64.b64decode(payload.get("content") or "").decode("utf-8")
         sha = str(payload.get("sha") or "")
     except Exception as exc:
         return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
-    missing = [line for line in GITOPS_INTENT_NOTE_DECLARES if line not in body]
-    if not body.startswith("---\n") or missing:
+    problem = _note_declaration_problem(body)
+    if problem:
         return CheckResult(
             name,
             False,
-            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but it does not declare no-pdb for "
-            f"Deployment/notification-relay in seeded-intent (frontmatter lacks: {', '.join(missing) or 'the --- opening'}), "
-            f"so the audit reads no declaration from it. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but the audit reads no declaration from it: "
+            f"{problem}. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
         )
     return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration")
 

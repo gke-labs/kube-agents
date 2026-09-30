@@ -131,8 +131,8 @@
 #
 # 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
 # three units, measured 209-1317s a repetition on its green presubmit run, so
-# this file's share is thirty-eight cases (114 units) of a fifty-two-case,
-# 156-unit matrix.
+# this file's share is thirty-nine cases (117 units) of a fifty-three-case,
+# 159-unit matrix (with the presubmit file's fourteen).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
