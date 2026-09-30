@@ -59,6 +59,14 @@ def refused(span):
 
 
 class SkillInlineCommandsTest(unittest.TestCase):
+    def test_each_tree_holds_a_skill(self):
+        for tree in SKILL_TREES:
+            with self.subTest(tree):
+                self.assertTrue(
+                    any((REPO_ROOT / tree).rglob("SKILL.md")),
+                    f"{tree} holds no SKILL.md, so its inline code would pass unread",
+                )
+
     def test_no_inline_command_runs_a_variable_as_its_program(self):
         found = [
             f"{skill.relative_to(REPO_ROOT)}:{line}: {span}"
