@@ -10,8 +10,9 @@ Three things are checked:
 
 1. The adapter. Each hook's first statement after its docstring is the flag
    guard handing over to ``_kage_slack_ux``, and upstream's body still follows
-   it, reacting through ``self._react`` — so with the flag off the hook is
-   upstream's. The import the guard names is bound at module level. The
+   it — so with the flag off the hook is upstream's. That the body still
+   reacts is ``verify_slack_reactions_scope.py``'s check, run just before this
+   one. The import the guard names is bound at module level. The
    members the runtime calls on the adapter are still there in the shape it
    calls them: ``_reacting_target(event)`` returning a 3-tuple,
    ``_react(channel, ts, emoji, team_id, *, remove)``, and
@@ -127,16 +128,6 @@ def check_adapter(root: Path) -> None:
         body = node.body
         if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
-        upstream = ast.Module(body=body[2:], type_ignores=[])
-        if not any(
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == UPSTREAM_HELPER
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "self"
-            for call in ast.walk(upstream)
-        ):
-            raise _fail(f"{name}() no longer runs upstream's reaction body after the guard")
     bound = any(
         isinstance(stmt, ast.ImportFrom)
         and stmt.module == IMPORT_MODULE

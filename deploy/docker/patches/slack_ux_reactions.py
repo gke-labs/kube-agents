@@ -3,8 +3,9 @@
 Installed into the image at ``/opt/hermes/gateway/slack_ux_reactions.py``.
 ``apply_slack_ux_reactions.py`` makes the Slack adapter's two reaction hooks
 (``on_processing_start``, ``on_processing_complete``) hand over to this module
-when ``KAGE_SLACK_UX`` is on, and ``apply_kanban_progress_lines.py`` calls
-:func:`settle_delegated` after the kanban notifier delivers a terminal event.
+when ``KAGE_SLACK_UX`` is on, and ``kanban_progress_lines.py`` (installed by
+``apply_kanban_progress_lines.py``) calls :func:`settle_delegated` after the
+kanban notifier delivers a terminal event.
 With the flag off neither caller reaches anything here, and the adapter keeps
 upstream's 👀 then ✅/❌.
 
