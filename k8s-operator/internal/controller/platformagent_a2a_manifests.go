@@ -364,6 +364,33 @@ const (
 	a2aDiscordBotSecretName = "discord-bot"
 	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
 
+	// The Google Chat backend the operator renders under mode: next when
+	// spec.integration.googleChat is enabled (a2aChatArmed). Names are the
+	// gateway's (a2a/gateway/config.go, FromEnv) and the broker's
+	// (credential_proxy.py, build_authenticator and serve); docs/README.md
+	// says this file must agree with the gateway's.
+	a2aGchatRelayURLEnvVar      = "A2A_GCHAT_RELAY_URL"
+	a2aGchatAllowedUsersEnvVar  = "A2A_GCHAT_ALLOWED_USERS"
+	a2aGchatAllowAllUsersEnvVar = "A2A_GCHAT_ALLOW_ALL_USERS"
+	a2aChatDisplayModeEnvVar    = "A2A_CHAT_DISPLAY_MODE"
+	// The CR field's own default. The gateway's unset resolves to "debug"
+	// so Discord installs render as they always have; the operator is what
+	// makes the CR and the env agree, so unset on the CR renders this.
+	a2aChatDisplayModeDefault = "default"
+	// The relay token: the env naming its path, the directory it is mounted
+	// in, the projected file, and the two joined, which is the gateway's
+	// defaultGchatTokenPath and is rendered explicitly so a reader of the
+	// live Deployment sees it. One hour, like every broker token.
+	a2aGchatTokenPathEnvVar = "A2A_GCHAT_TOKEN_PATH" // #nosec G101 -- Environment variable name, not a credential
+	a2aGchatTokenDir        = "/var/run/secrets/a2a-chat-relay"
+	a2aGchatTokenKey        = "token" // #nosec G101 -- Projected file name, not a credential
+	a2aGchatTokenPath       = a2aGchatTokenDir + "/" + a2aGchatTokenKey
+	a2aGchatTokenVolume     = "a2a-chat-relay-token" // #nosec G101 -- Volume name, not a credential
+	a2aGchatTokenTTLSeconds = 3600
+	// The broker's side of the same backend.
+	a2aGoogleChatSubscriptionEnvVar      = "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME"
+	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE"
+
 	// The condition the status writers publish while a next install's gateway
 	// is withheld for want of a backend (#1660, option 1). Informational rather
 	// than Degraded: the install did nothing wrong, it configured no chat
@@ -701,6 +728,55 @@ func a2aStrictEventsWriter() string {
 // here "relaxed" is the shut door.
 func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
+}
+
+// a2aChatArmed reports whether this install's Google Chat is consumed by the
+// next stack: spec.mode is next and spec.integration.googleChat is enabled.
+// That pair is the whole of the arming condition, on purpose. The design
+// decision (spec-chatops-gateway.md, "Coexistence is by mode") is that a
+// next install's Chat goes to the A2A gateway and the legacy Hermes consumer
+// is not rendered, on the one subscription the install already has; a topic
+// fans out to every subscription, and two consumers on one subscription
+// split its deliveries, so exactly one consumer must hold it and the mode is
+// what chooses. The per-component override the mode-switch spec sketches
+// (modeOverrides) is where a next install that wanted legacy Chat would say
+// so; it does not exist, and this predicate is the one place it would be
+// consulted.
+//
+// renderMode is fail-closed, so an unrecognized mode (version skew) reads as
+// today here: the legacy consumer renders and the A2A side is unarmed, which
+// leaves a frozen next-stack gateway without a relay rather than beside a
+// second consumer.
+func a2aChatArmed(agent *agentv1alpha1.PlatformAgent) bool {
+	return renderMode(agent, "gateway") == ModeNext && googleChatEnabled(agent)
+}
+
+// legacyChatConsumer is the complement: the Hermes google_chat platform and
+// its relay env render exactly when Chat is enabled and the next stack is
+// not taking it. Every legacy Chat render site asks this rather than the
+// enabled flag, so the two consumers cannot both render.
+func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
+	return googleChatEnabled(agent) && !a2aChatArmed(agent)
+}
+
+// googleChatEnabled is the enabled test every Chat render site has always
+// made, in one place.
+func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Integration == nil {
+		return false
+	}
+	gchat := agent.Spec.Integration.GoogleChat
+	return gchat != nil && gchat.Enabled != nil && *gchat.Enabled
+}
+
+// a2aChatDisplayMode maps the CR's googleChat.mode onto A2A_CHAT_DISPLAY_MODE:
+// the field's value when set, its own default when not. Not the gateway's
+// default, which is debug; see a2aChatDisplayModeDefault.
+func a2aChatDisplayMode(mode string) string {
+	if mode == "" {
+		return a2aChatDisplayModeDefault
+	}
+	return strings.ToLower(mode)
 }
 
 // a2aNATSName and a2aCredsSecretName are spelled in the API package, because

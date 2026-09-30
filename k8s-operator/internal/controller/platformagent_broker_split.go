@@ -66,6 +66,17 @@ const (
 	// had and nothing checked. credential_proxy.py's ROUTE_ROLES is the table.
 	credentialProxyChatAudience = "kubeagents-credential-proxy-chat" // #nosec G101 -- Token audience name, not a credential
 
+	// credentialProxyA2AChatAudience is the third audience: the A2A gateway's
+	// relay token, minted for it when the operator arms the gateway's Google
+	// Chat backend under mode: next. Its own audience because the broker
+	// confers roles by audience and the a2a-chat role must not be reachable
+	// from the legacy chat caller: that caller is the LLM-driven Hermes pod,
+	// and a shared role would let a prompt-injected agent pull and ack the
+	// A2A gateway's events (spec-chatops-gateway.md, "The Google Chat
+	// adapter"). credential_proxy.py refuses to confer the role when this
+	// equals either audience above.
+	credentialProxyA2AChatAudience = "kubeagents-credential-proxy-a2a-chat" // #nosec G101 -- Token audience name, not a credential
+
 	// credentialProxyTokenMountPath is where the agent container finds the
 	// token it presents to the broker.
 	credentialProxyTokenMountPath = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- Mount path, not a credential
