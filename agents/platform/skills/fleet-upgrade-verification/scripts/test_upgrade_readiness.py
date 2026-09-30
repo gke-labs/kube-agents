@@ -506,21 +506,30 @@ class WebhookScopeTest(unittest.TestCase):
 
     def test_each_upgrade_path_target(self):
         self.assertEqual(self._path([rule(["pods"])]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["pods/binding"])]), ["CREATE pods/binding"])
+        self.assertEqual(self._path([rule(["pods/status"], operations=("UPDATE",))]), ["UPDATE pods/status"])
+        self.assertEqual(self._path([rule(["pods"], operations=("DELETE",))]), ["DELETE pods"])
         self.assertEqual(self._path([rule(["pods/eviction"])]), ["CREATE pods/eviction"])
-        self.assertEqual(self._path([rule(["nodes"], operations=("CREATE", "UPDATE"))]), ["CREATE nodes", "UPDATE nodes"])
-        self.assertEqual(self._path([rule(["leases"], operations=("UPDATE",), groups=("coordination.k8s.io",))]), ["UPDATE leases"])
+        self.assertEqual(self._path([rule(["nodes"], operations=("CREATE", "UPDATE", "DELETE"))]), ["CREATE nodes", "UPDATE nodes", "DELETE nodes"])
+        self.assertEqual(self._path([rule(["nodes/status"], operations=("UPDATE",))]), ["UPDATE nodes/status"])
+        self.assertEqual(self._path([rule(["leases"], operations=("CREATE", "UPDATE"), groups=("coordination.k8s.io",))]), ["CREATE leases", "UPDATE leases"])
+
+    def test_a_gate_on_scheduling_alone_blocks(self):
+        # A scheduling-policy webhook on pods/binding stops every replacement pod from being placed.
+        graded = grade([hook("bind.example.com", [rule(["pods/binding"])], policy="Fail")])
+        self.assertEqual([f["upgrade_path"] for f in graded["blocking"]], [["CREATE pods/binding"]])
 
     def test_resource_wildcards(self):
         self.assertEqual(self._path([rule(["*"])]), ["CREATE pods", "CREATE nodes"])  # `*` covers resources, not subresources
-        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/eviction", "CREATE nodes"])
-        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/eviction"])  # subresources only, not pods itself
+        self.assertEqual(self._path([rule(["*/*"])]), ["CREATE pods", "CREATE pods/binding", "CREATE pods/eviction", "CREATE nodes"])
+        self.assertEqual(self._path([rule(["pods/*"])]), ["CREATE pods/binding", "CREATE pods/eviction"])  # subresources only, not pods itself
         self.assertEqual(self._path([rule(["*/eviction"])]), ["CREATE pods/eviction"])
 
     def test_operation_group_and_scope_must_all_match(self):
         self.assertEqual(self._path([rule(["pods"], operations=("UPDATE",))]), [])
-        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods"])
+        self.assertEqual(self._path([rule(["pods"], operations=("*",))]), ["CREATE pods", "DELETE pods"])
         self.assertEqual(self._path([rule(["pods"], groups=("apps",))]), [])
-        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "CREATE nodes", "UPDATE nodes", "UPDATE leases"])
+        self.assertEqual(self._path([rule(["*"], groups=("*",), operations=("*",))]), ["CREATE pods", "DELETE pods", "CREATE nodes", "UPDATE nodes", "DELETE nodes", "CREATE leases", "UPDATE leases"])
         self.assertEqual(self._path([rule(["nodes"], scope="Namespaced")]), [])
         self.assertEqual(self._path([rule(["pods"], scope="Cluster")]), [])
 

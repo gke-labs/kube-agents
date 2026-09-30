@@ -497,17 +497,17 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     rule `unknown`, and any failure makes the run exit 1.
     """
     path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
-    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "kubeconfig": path}
+    result = {"items": None, "error": None, "webhook_items": None, "webhook_error": None, "credentials_error": None, "kubeconfig": path}
     try:
         os.makedirs(kubeconfig_dir, exist_ok=True)
     except OSError as e:
-        result["error"] = result["webhook_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
+        result["error"] = result["webhook_error"] = result["credentials_error"] = f"cannot create kubeconfig directory {kubeconfig_dir}: {e}"
         return result
     env = {**os.environ, KUBECONFIG_ENV: path}
     cmd = get_credentials_cmd(cluster, project)
     rc, _, stderr = run_cmd(cmd, GCLOUD_TIMEOUT_SECONDS, env)
     if rc != 0:
-        result["error"] = result["webhook_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
+        result["error"] = result["webhook_error"] = result["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return result
     result["items"], result["error"] = _kubectl_items(KUBECTL_RESOURCES, env)
     result["webhook_items"], result["webhook_error"] = _kubectl_items(KUBECTL_WEBHOOK_RESOURCES, env)
@@ -528,10 +528,13 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime) -> d
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None)
 
     notes = []
-    if read_error:
-        notes.append("PDB read failed; PDBs not graded")
-    if read["webhook_error"]:
-        notes.append("webhook read failed; webhooks not graded")
+    if read["credentials_error"]:
+        notes.append("credentials for the cluster could not be fetched; PDBs and webhooks not graded")
+    else:
+        if read_error:
+            notes.append("PDB read failed; PDBs not graded")
+        if read["webhook_error"]:
+            notes.append("webhook read failed; webhooks not graded")
     if target is None:
         notes.append("no target; exclusion scope and skew not graded")
     if pdbs:

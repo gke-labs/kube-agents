@@ -48,7 +48,7 @@ Neither reads versions against a target.
 
 The script runs `gcloud container clusters list`, `gcloud container get-server-config` and
 `gcloud config get-value project`, each with a 60-second timeout, and with `--readiness` one
-`gcloud container clusters get-credentials` and one `kubectl get` per member. It changes nothing
+`gcloud container clusters get-credentials` and two `kubectl get` per member. It changes nothing
 in GCP or in any cluster; the only things it writes are its own record under
 `/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
 needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
@@ -172,8 +172,7 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
   endpoint without a `ready` condition counts as ready, as the API requires). Such a webhook
   rejects every request its rules match, and what it matches decides the grade. When a rule can
-  match something a node upgrade needs — creating the replacement pods, the eviction the drain
-  issues, the new node registering or the old one being cordoned, the kubelet's lease — the
+  match something a node upgrade needs — the replacement pods' creation, scheduling (`pods/binding`) and status, the old pods' deletion, the eviction the drain issues, the nodes' registration, cordon, status and deletion, the kubelet's lease — the
   member is `blocked`: the workloads it gates lose their pods on the drain and cannot get them
   back, a budget over one of them also stalls the drain, and a gate on evictions or nodes stops
   the drain itself. When no rule matches any of those, the webhook is still a current outage for
@@ -181,7 +180,7 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   API group, operation, resource (with the API's `*`, `*/*` and `pods/*` semantics) and scope;
   `namespaceSelector`, `objectSelector` and `matchConditions` are not evaluated, so a webhook they
   narrow is reported as able to match. The cell names the configuration, the webhook, the reason
-  and what it matches; each JSON finding carries `reason`, `ready_endpoints` and `upgrade_path`,
+  and what it matches; each JSON finding carries `reason` and `upgrade_path`,
   split into `blocking` and `outage`. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
   GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`).
