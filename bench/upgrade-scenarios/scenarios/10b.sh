@@ -4,6 +4,8 @@
 # the upstream maximum); this asks GKE for a 1.35 control plane over the same nodes (four minors) and,
 # if GKE allows it, checks what still works against the old kubelets. Run as: CLUSTER=upg-10 bash run.sh 10b
 CHANNEL=EXTENDED; START=1.34; POOL_FLAGS=""
+G container node-pools describe work-pool --cluster "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 ||
+  { echo "10b extends scenario 10's cluster and $CLUSTER has no work-pool; run as: CLUSTER=upg-10 bash run.sh 10b" >&2; exit 1; }
 plant(){ pause_deploy steady 1; }
 before(){ ev skew before G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; ev skew pools-before G container node-pools list --cluster "$CLUSTER" --zone "$ZONE" --format='table(name,version,status)'; }
 break_it(){ local V; V=$(newest_patch EXTENDED 1.35); note skew "attempt: master -> $V with the pools four minors behind"

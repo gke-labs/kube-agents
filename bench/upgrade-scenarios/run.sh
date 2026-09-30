@@ -14,5 +14,9 @@ if [ -n "${POOL_FLAGS:-}" ]; then G container node-pools describe work-pool --cl
 G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 ev baseline nodes K get nodes -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool'
 K create ns scen --dry-run=client -o yaml | K apply -f - >/dev/null
-plant; sleep "$PLANT_SETTLE"; ev plant pods K -n scen get pods -o wide; before; break_it; after
+# Any failing step inside plant (a manifest that does not apply, a create that fails) marks the run, and it stops
+# before the upgrade rather than recording an after-state for a hazard that was never there.
+PLANT_FAILED=0; set -E; trap 'PLANT_FAILED=1' ERR; plant; trap - ERR; set +E
+[ "$PLANT_FAILED" -eq 0 ] || { note final "precondition not met: a step in plant failed (see the console); stopping before the upgrade"; exit 1; }
+sleep "$PLANT_SETTLE"; ev plant pods K -n scen get pods -o wide; before; break_it; after
 ev final pods K -n scen get pods -o wide; ev final events K -n scen get events --sort-by=.lastTimestamp -o custom-columns='T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message'; note final "scenario $NN done"

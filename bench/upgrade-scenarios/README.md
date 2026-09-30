@@ -252,10 +252,12 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 1. Creates the cluster at the minor the scenario needs, stops unless the cluster carries the campaign's label,
    and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
-   every other scenario writes its manifests inline.
+   every other scenario writes its manifests inline. If any step of the plant fails, the run stops here, before
+   the upgrade, and says so in `final.txt`.
 3. Breaks it. Twelve scenarios upgrade the control plane and then a node pool; scenario 13 upgrades only a
    node pool (a patch inside 1.31). Scenarios 05, 06, 09, 10 and 11 upgrade only the control plane. Scenarios 14 and 15 show the symptom with no upgrade; 14c then asks for
-   the pool upgrade and runs the migration GKE demands.
+   the pool upgrade and runs the migration GKE demands. An upgrade GKE refuses five times in a row because another
+   operation is running stops the run.
 4. Records the after-state.
 
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code
@@ -279,7 +281,8 @@ The Recommender side has two parts:
 
 - **Holds.** `hold.sh NN` (and the `06h`, `08h` and `16h` scenarios) keep a hazard planted in its **before**
   state, with no upgrade. GKE's Recommender looks at a cluster as it is at refresh time, and a cluster that has
-  already broken and moved on shows it nothing to warn about.
+  already broken and moved on shows it nothing to warn about. `hold.sh` refuses a scenario it has no hold for,
+  and stops with a note in the evidence when a pool, manifest or add-on change it needs does not take.
 - **The read.** `check-recommender.sh` reads every `google.container.DiagnosisInsight` insight and every
   `google.container.DiagnosisRecommender` recommendation in each zone. It saves the raw JSON under
   `evidence/recommender/<stamp>/`, and writes `recommender.json`, which maps each insight and recommendation to

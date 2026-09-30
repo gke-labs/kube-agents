@@ -45,7 +45,7 @@ spec:
               image: python:3.14-slim
               command: ["python3", "-c", "import json,ssl,os,urllib.request,time\nt=open('/var/run/secrets/kubernetes.io/serviceaccount/token').read()\nctx=ssl.create_default_context(cafile='/var/run/secrets/kubernetes.io/serviceaccount/ca.crt')\nbody=json.dumps({'metadata':{'annotations':{'last-run':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}}}).encode()\nreq=urllib.request.Request('https://'+os.environ['KUBERNETES_SERVICE_HOST']+'/api/v1/namespaces/scen/endpoints/lane',data=body,method='PATCH',headers={'Authorization':'Bearer '+t,'Content-Type':'application/merge-patch+json','User-Agent':'legacy-endpoints-writer/1.0'})\nprint(urllib.request.urlopen(req,context=ctx).status)"]
 Y
-K -n scen create job --from=cronjob/ep-writer first >/dev/null; sleep 40; }
+K -n scen delete job first --ignore-not-found >/dev/null; K -n scen create job --from=cronjob/ep-writer first >/dev/null; sleep 40; }
 before(){ ev deprecated-served before K -n scen logs job/first; sleep 30; ev deprecated-served audit G logging read "resource.type=k8s_cluster AND resource.labels.cluster_name=$CLUSTER AND protoPayload.authenticationInfo.principalEmail=\"system:serviceaccount:scen:ep-writer\"" --freshness 1h --limit 2 --format='value(timestamp,protoPayload.methodName,labels."k8s.io/deprecated",labels."k8s.io/removed-release")'; }
 break_it(){ V=$(newest_patch REGULAR 1.35); upgrade_master "$V"; }
 after(){ K -n scen create job --from=cronjob/ep-writer after >/dev/null; sleep 40; ev deprecated-served after K -n scen logs job/after; }

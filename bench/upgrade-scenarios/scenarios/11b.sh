@@ -7,7 +7,7 @@
 CHANNEL=REGULAR; START=1.34; CREATE_FLAGS="--cluster-ipv4-cidr=/19"
 PROBE_TIMEOUT=3s
 probe_loop(){ local f="$EVID/zonal-probe.txt" i=0; echo "# $(ts) probe start (read=/version, write=create+delete ConfigMap, timeout $PROBE_TIMEOUT)" >"$f"
-  while [ -f "$EVID/probing" ]; do i=$((i+1))
+  while [ -f "$EVID/probing" ] && kill -0 $$ 2>/dev/null; do i=$((i+1))   # $$ is run.sh: an interrupted run leaves no prober
     if K --request-timeout=$PROBE_TIMEOUT get --raw /version >/dev/null 2>&1; then r=up; else r=DOWN; fi
     if K --request-timeout=$PROBE_TIMEOUT -n scen create configmap "probe-$i" --from-literal=t="$(ts)" >/dev/null 2>&1; then w=up; K --request-timeout=$PROBE_TIMEOUT -n scen delete configmap "probe-$i" --wait=false >/dev/null 2>&1; else w=DOWN; fi
     echo "$(ts) read=$r write=$w" >>"$f"; sleep 1; done; echo "# $(ts) probe end" >>"$f"; }

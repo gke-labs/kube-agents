@@ -7,12 +7,13 @@
 DEFAULT_ZONES="us-central1-a us-central1-c us-east4-c us-west1-b europe-west4-b asia-southeast1-b us-east1-d europe-west1-b us-central1-b us-west1-a europe-west4-a asia-east1-a"
 P=${PROJECT:?set PROJECT to the GCP project the scenario clusters are in}; ZONES=${ZONES:-$DEFAULT_ZONES}; H=$(cd "$(dirname "$0")" && pwd)
 INSIGHT_TYPE=google.container.DiagnosisInsight; RECOMMENDER=google.container.DiagnosisRecommender
+PROJECT_NUMBER=$(gcloud projects describe "$P" --format='value(projectNumber)') && [ -n "$PROJECT_NUMBER" ] ||
+  { echo "cannot read the project number of $P; recommender.json would keep it unscrubbed" >&2; exit 1; }
 STAMP=$(date -u +%Y-%m-%dT%H%MZ); OUT="$H/evidence/recommender/$STAMP"; mkdir -p "$OUT"
 for Z in $ZONES; do
   gcloud recommender insights list --project "$P" --location "$Z" --insight-type "$INSIGHT_TYPE" --format=json >"$OUT/insights-$Z.json"
   gcloud recommender recommendations list --project "$P" --location "$Z" --recommender "$RECOMMENDER" --format=json >"$OUT/recommendations-$Z.json"
 done
-PROJECT_NUMBER=$(gcloud projects describe "$P" --format='value(projectNumber)')
 python3 - "$OUT" "$H/recommender.json" "$P" "$PROJECT_NUMBER" <<'PY'
 import glob, json, re, sys, collections
 out_dir, dest, project_id, project_number = sys.argv[1:5]

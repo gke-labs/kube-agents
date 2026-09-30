@@ -7,10 +7,10 @@
 # upgraded anyway; the disable is now retried and the run stops before the upgrade if the driver stays on.
 CHANNEL=REGULAR; START=1.34; POOL_FLAGS="--num-nodes 1 --machine-type e2-standard-2"
 DISK="$CLUSTER-intree"
-DISABLE_TRIES=4; DISABLE_WAIT=120
+DISABLE_TRIES=4; DISABLE_WAIT=120; ROLLOUT_TIMEOUT=300s
 csi_state(){ G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(addonsConfig.gcePersistentDiskCsiDriverConfig)'; }
 pd_events(){ K -n scen get events --field-selector involvedObject.kind=Pod -o custom-columns='T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message' | grep -v "Pulling\|Pulled\|Created\|Started" | tail -8; }
-plant(){ G compute disks create "$DISK" --zone "$ZONE" --size 10GB --type pd-balanced --quiet >/dev/null 2>&1 || true; K apply -f - <<Y
+plant(){ G compute disks describe "$DISK" --zone "$ZONE" >/dev/null 2>&1 || G compute disks create "$DISK" --zone "$ZONE" --size 10GB --type pd-balanced --quiet >/dev/null; K apply -f - <<Y
 apiVersion: v1
 kind: PersistentVolume
 metadata: {name: intree-pd}
@@ -40,13 +40,15 @@ spec:
       volumes: [{name: data, persistentVolumeClaim: {claimName: intree-pd}}]
       containers: [{name: c, image: busybox:1.36, command: ["sh", "-c", "date -u >> /data/log; while true; do sleep 3600; done"], volumeMounts: [{name: data, mountPath: /data}], resources: {requests: {cpu: 10m, memory: 16Mi}}}]
 Y
-}
+  K -n scen rollout status deploy/pd-user --timeout="$ROLLOUT_TIMEOUT"; }   # the pod must have mounted the disk before the driver goes off
 before(){ ev csi addon-default csi_state; sleep 60; ev csi pod-with-driver K -n scen get pods -l app=pd-user -o wide
   disable_driver || { note csi "precondition not met: the PD CSI driver is still on after $DISABLE_TRIES tries; stopping before the upgrade"; exit 1; }
   sleep 60; ev csi addon-disabled csi_state; ev csi pod-still-running K -n scen get pods -l app=pd-user -o wide; }
-disable_driver(){ local i; for i in $(seq 1 $DISABLE_TRIES); do
+# An empty state reads as off, but only from a describe that succeeded: a failed one also prints nothing.
+disable_driver(){ local i s; for i in $(seq 1 $DISABLE_TRIES); do
     ev csi disable-driver G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=GcePersistentDiskCsiDriver=DISABLED --quiet; wait_ops
-    csi_state | grep -q "enabled=True" || return 0; note csi "driver still on after try $i; retrying in ${DISABLE_WAIT}s"; sleep $DISABLE_WAIT; done; return 1; }
+    if s=$(csi_state); then case $s in *enabled=True*) note csi "driver still on after try $i; retrying in ${DISABLE_WAIT}s" ;; *) return 0 ;; esac
+    else note csi "could not read the add-on state after try $i; retrying in ${DISABLE_WAIT}s"; fi; sleep $DISABLE_WAIT; done; return 1; }
 break_it(){ V=$(newest_patch REGULAR 1.35); upgrade_master "$V"; upgrade_pool work-pool "$V" csi:scen:app=pd-user; }
 after(){ sleep 120; ev csi pod-after-upgrade K -n scen get pods -l app=pd-user -o wide; ev csi events-after-upgrade pd_events
   note csi "fix: enable the PD CSI driver add-on"; ev csi enable-driver G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=GcePersistentDiskCsiDriver=ENABLED --quiet; wait_ops; sleep 180
