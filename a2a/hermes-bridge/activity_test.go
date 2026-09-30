@@ -388,7 +388,7 @@ func TestRedactInput(t *testing.T) {
 		}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput(json.RawMessage(tc.in))) })
+		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput("terminal", json.RawMessage(tc.in))) })
 	}
 }
 
@@ -498,7 +498,7 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 
 func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
 	in := `{"command": "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI; aws s3 ls --secret-access-key hunter6; kubectl --token eyJhbGciOiJSUzI1NiIsImtpZCI6In0 get pods; gcloud x --password hunter5; curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
-	out := string(redactInput(json.RawMessage(in)))
+	out := string(redactInput("terminal", json.RawMessage(in)))
 	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy", "eyJhbGciOiJSUzI1NiIsImtpZCI6In0", "hunter5", "wJalrXUtnFEMI", "hunter6"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
@@ -516,7 +516,7 @@ func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
 // trace carries what the worker adapter's would.
 func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 	in := `{"command": "git commit -m 'basic refactoring'; date -u 12:30; sort -u a:b; kubectl get secret my-secret -o yaml", "secretName": "db-creds", "tokenizer": "cl100k", "max_tokens": 4096, "SECRET_KEY": "s3"}`
-	out := string(redactInput(json.RawMessage(in)))
+	out := string(redactInput("terminal", json.RawMessage(in)))
 	for _, kept := range []string{"basic refactoring", "date -u 12:30", "sort -u a:b", "kubectl get secret my-secret -o yaml", `"secretName":"db-creds"`, `"tokenizer":"cl100k"`} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("ordinary text %q was scrubbed: %s", kept, out)
@@ -526,6 +526,113 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 	// when it is a count, so SECRET_KEY-style keys are caught.
 	if !strings.Contains(out, `"max_tokens":"[redacted]"`) || strings.Contains(out, `"s3"`) {
 		t.Fatalf("component rule not applied as documented: %s", out)
+	}
+}
+
+// camelCase is the native key style of most MCP and HTTP tool schemas: a
+// secret word that starts a component there is blanked like its snake_case
+// twin, while a name that merely starts with the word (secretName,
+// tokenizer) still ships.
+func TestRedactInput_CamelCaseKeys(t *testing.T) {
+	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x"}`
+	out := string(redactInput("http_request", json.RawMessage(in)))
+	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("leaked %q in %s", leaked, out)
+		}
+	}
+	// The accepted price, the camelCase twin of max_tokens.
+	if !strings.Contains(out, `"accessTokenExpiry":"[redacted]"`) {
+		t.Fatalf("component rule not applied to a camelCase suffix: %s", out)
+	}
+	// A word at the front of a camelCase key is a name (secretName,
+	// credentialsPath), as the pattern's comment says.
+	for _, kept := range []string{`"secretName":"db-creds"`, `"tokenizer":"cl100k"`, `"credentialsPath":"/x"`} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("name %q was scrubbed: %s", kept, out)
+		}
+	}
+}
+
+// A quoted secret with spaces in it is scrubbed whole: the tail of a
+// passphrase must not ship behind a marker that says it was redacted.
+func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
+	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail", "plain": "kubectl get pods -h db"}`
+	out := string(redactInput("terminal", json.RawMessage(in)))
+	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("leaked %q in %s", leaked, out)
+		}
+	}
+	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("text after the secret was lost: %q missing in %s", kept, out)
+		}
+	}
+	// An unterminated quote falls back to the whitespace rule: the first
+	// word is scrubbed and the rest of the line survives.
+	if !strings.Contains(out, ` tail"`) {
+		t.Fatalf("unterminated-quote fallback lost the line: %s", out)
+	}
+}
+
+// hermes's tool_call wrapper over the cap keeps its nested tool names: each
+// call's arguments is capped on its own, so a tool_called check on a nested
+// tool still sees it, and the wrapper is not the whole-input stand-in.
+func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
+	big := strings.Repeat("x", activityInputCap)
+	in := `{"calls":[{"name":"kanban_create","arguments":{"title":"a","body":"` + big + `","token":"s1"}},{"name":"kanban_comment","arguments":{"body":"` + big + `"}},{"name":"kanban_list"}]}`
+	out := redactInput(hermesToolCallWrapper, json.RawMessage(in))
+	if len(out) > activityInputCap {
+		t.Fatalf("wrapper still over the cap: %d bytes", len(out))
+	}
+	var v struct {
+		Truncated *bool `json:"truncated"`
+		Calls     []struct {
+			Name string         `json:"name"`
+			Args map[string]any `json:"arguments"`
+		} `json:"calls"`
+	}
+	if err := json.Unmarshal(out, &v); err != nil || v.Truncated != nil {
+		t.Fatalf("wrapper became the whole stand-in: %s (%v)", out, err)
+	}
+	if len(v.Calls) != 3 || v.Calls[0].Name != "kanban_create" || v.Calls[1].Name != "kanban_comment" || v.Calls[2].Name != "kanban_list" {
+		t.Fatalf("nested names lost: %s", out)
+	}
+	for i := 0; i < 2; i++ {
+		if v.Calls[i].Args["truncated"] != true || v.Calls[i].Args["bytes"] == nil {
+			t.Fatalf("call %d arguments not a stand-in: %s", i, out)
+		}
+		head, _ := v.Calls[i].Args["head"].(string)
+		if len(head) == 0 || len(head) > activityInputCallHead {
+			t.Fatalf("call %d head = %d bytes", i, len(head))
+		}
+	}
+	if strings.Contains(string(out), "s1") {
+		t.Fatalf("secret under a nested key survived: %s", out)
+	}
+	if v.Calls[2].Args != nil {
+		t.Fatalf("a call without arguments grew some: %s", out)
+	}
+
+	// The same wrapper under another tool name is capped whole, as before.
+	whole := redactInput("terminal", json.RawMessage(in))
+	if !strings.HasPrefix(string(whole), `{"bytes":`) && !strings.Contains(string(whole), `"truncated":true`) {
+		t.Fatalf("non-wrapper over the cap was not the stand-in: %s", whole)
+	}
+	if strings.Contains(string(whole), `"name":"kanban_comment"`) {
+		t.Fatalf("whole stand-in carried a full nested call: %s", whole)
+	}
+
+	// Too many calls to fit even with the heads dropped fall back to the
+	// whole stand-in rather than an over-cap wrapper.
+	var many []string
+	for i := 0; i < activityInputCap/8; i++ {
+		many = append(many, `{"name":"kanban_create_`+strings.Repeat("y", 40)+`","arguments":{"b":"`+big+`"}}`)
+	}
+	fallback := redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(many, ",")+`]}`))
+	if len(fallback) > activityInputCap || !strings.Contains(string(fallback), `"truncated":true`) {
+		t.Fatalf("oversized wrapper did not fall back: %d bytes %s", len(fallback), fallback[:min(len(fallback), 120)])
 	}
 }
 

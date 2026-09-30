@@ -106,6 +106,17 @@ const (
 	activityInputCap = 2048
 	// activityInputHead is how much of an over-cap input survives, as text.
 	activityInputHead = 1024
+	// hermesToolCallWrapper is hermes's batching tool: one call whose input
+	// is {"calls":[{"name":...,"arguments":{...}},...]}. The verifier
+	// unwraps the nested names, so an over-cap wrapper is capped per nested
+	// call - each arguments object becomes its own stand-in with
+	// activityInputCallHead of text - and the names survive; only a wrapper
+	// still over the cap with every head dropped falls back to the whole
+	// stand-in.
+	hermesToolCallWrapper = "tool_call"
+	wrapperCallsKey       = "calls"
+	wrapperCallArgsKey    = "arguments"
+	activityInputCallHead = 256
 	// activityBodyCap bounds one delivery read; hermes's own payloads are
 	// tool inputs and results, never more than a few KiB.
 	activityBodyCap = 1 << 20
@@ -183,13 +194,18 @@ var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 var (
 	// A key is secret-looking when one of the words is a whole component of
-	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key), not a substring
-	// (tokenizer, secretName): the latter are names, and blanking them would
-	// put "[redacted]" where the worker adapter's trace carries the value.
-	// A count or a path that ends in the word (max_tokens, credentials_file)
-	// is blanked too; that is the accepted price of catching SECRET_KEY.
-	redactedKeyPattern    = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|authorization|api[_-]?key|credential)s?(?:$|[_.-])`)
-	redactedValuePatterns = []*regexp.Regexp{
+	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key, and in camelCase
+	// accessToken, clientSecret, dbPassword), not a substring (tokenizer,
+	// secretName): the latter are names, and blanking them would put
+	// "[redacted]" where the worker adapter's trace carries the value.
+	// A count or a path that ends in the word (max_tokens, credentials_file,
+	// accessTokenExpiry) is blanked too; that is the accepted price of
+	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
+	// starts a component when a lowercase letter or digit precedes its
+	// capital, and ends one at the end, a separator or the next capital.
+	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|authorization|api[_-]?key|credential)s?(?:$|[_.-])`)
+	redactedCamelKeyPattern = regexp.MustCompile(`[a-z0-9](?:Token|Secret|Password|Passwd|Authorization|Api[_-]?Key|APIKey|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedValuePatterns   = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
@@ -202,10 +218,14 @@ var (
 		// "sort -u a:b" are not.
 		regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*\s(?:-u|--user)[\s=]+\S+:\S+`),
 		// key=value / key: value / "key": "value", where a secret word is a
-		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY).
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*["']?[^"'\s,}]+`),
-		// --flag value, the word a component of the flag (--token, --secret-access-key).
-		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+\S+`),
+		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
+		// quoted value runs to its closing quote, spaces included, so a
+		// passphrase does not leave its tail behind the marker; an unquoted
+		// or unterminated one stops at whitespace as before.
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?[^"'\s,}]+)`),
+		// --flag value, the word a component of the flag (--token, --secret-access-key);
+		// a quoted value runs to its closing quote as above.
+		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
 	}
 )
 
@@ -350,7 +370,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.open[id] = ActivityEntry{
 			Tool:   d.ToolName,
-			Input:  redactInput(d.ToolInput),
+			Input:  redactInput(d.ToolName, d.ToolInput),
 			CallID: d.Extra.ToolCallID,
 			At:     d.Timestamp,
 		}
@@ -364,7 +384,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		status := activityStatus(d)
 		e := ActivityEntry{
 			Tool:       d.ToolName,
-			Input:      redactInput(d.ToolInput),
+			Input:      redactInput(d.ToolName, d.ToolInput),
 			CallID:     d.Extra.ToolCallID,
 			Status:     status,
 			DurationMs: d.Extra.DurationMs,
@@ -483,8 +503,10 @@ func removeString(list []string, s string) []string {
 
 // redactInput returns the tool input fit for the bus: secret-looking keys
 // blanked at every depth, and the whole thing capped. Over the cap the entry
-// carries the size and a rune-safe head rather than a JSON fragment.
-func redactInput(raw json.RawMessage) json.RawMessage {
+// carries the size and a rune-safe head rather than a JSON fragment; for
+// hermes's tool_call wrapper the cap is applied to each nested call's
+// arguments instead, so the nested tool names stay readable.
+func redactInput(tool string, raw json.RawMessage) json.RawMessage {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil
@@ -499,22 +521,87 @@ func redactInput(raw json.RawMessage) json.RawMessage {
 	if err := dec.Decode(&v); err != nil {
 		return json.RawMessage(`{"unparseable":true}`)
 	}
-	out, err := json.Marshal(redactValue(v))
+	red := redactValue(v)
+	out, err := json.Marshal(red)
 	if err != nil {
 		return json.RawMessage(`{"unparseable":true}`)
 	}
-	if len(out) > activityInputCap {
-		head := chunkString(string(out), activityInputHead)[0]
-		out, _ = json.Marshal(map[string]any{"truncated": true, "bytes": len(out), "head": head})
+	if len(out) <= activityInputCap {
+		return out
 	}
+	if tool == hermesToolCallWrapper {
+		if capped, ok := capWrapperCalls(red); ok {
+			return capped
+		}
+	}
+	out, _ = json.Marshal(truncatedStandIn(out, activityInputHead))
 	return out
+}
+
+// truncatedStandIn is what replaces an input over the cap: the size it had
+// and headLen bytes of it, cut at a rune boundary.
+func truncatedStandIn(out []byte, headLen int) map[string]any {
+	head := ""
+	if headLen > 0 {
+		head = chunkString(string(out), headLen)[0]
+	}
+	return map[string]any{"truncated": true, "bytes": len(out), "head": head}
+}
+
+// capWrapperCalls caps a tool_call wrapper per nested call: every
+// arguments object becomes its own stand-in, first with a short head, then
+// with none, until the wrapper fits. False when it does not, or when the
+// input is not the wrapper's shape, and the caller falls back to the whole
+// stand-in.
+func capWrapperCalls(red any) (json.RawMessage, bool) {
+	m, ok := red.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	calls, ok := m[wrapperCallsKey].([]any)
+	if !ok || len(calls) == 0 {
+		return nil, false
+	}
+	type nested struct {
+		call map[string]any
+		raw  []byte
+	}
+	var args []nested
+	for _, c := range calls {
+		call, ok := c.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		a, has := call[wrapperCallArgsKey]
+		if !has {
+			continue
+		}
+		raw, err := json.Marshal(a)
+		if err != nil {
+			return nil, false
+		}
+		args = append(args, nested{call: call, raw: raw})
+	}
+	for _, headLen := range []int{activityInputCallHead, 0} {
+		for _, n := range args {
+			n.call[wrapperCallArgsKey] = truncatedStandIn(n.raw, headLen)
+		}
+		out, err := json.Marshal(m)
+		if err != nil {
+			return nil, false
+		}
+		if len(out) <= activityInputCap {
+			return out, true
+		}
+	}
+	return nil, false
 }
 
 func redactValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			if redactedKeyPattern.MatchString(k) {
+			if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) {
 				t[k] = redactedValue
 			} else {
 				t[k] = redactValue(val)

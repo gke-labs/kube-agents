@@ -319,12 +319,17 @@ so a guardrail refusal stays distinguishable from a tool failure. hermes retries
 that timed out, so each is remembered by its id and a retry is one call. A call still open when the
 task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. `input` is capped (2 KiB); values under keys
-matching `token`, `secret`, `password`, `passwd`, `authorization`, `api_key`/`api-key` or
-`credential` are replaced before publishing, and so are the credential shapes a value can
-carry under an innocent key (a bearer token, a Google OAuth or API key, a GitHub token, a
-`key=value` pair whose key looks like a secret) — a terminal command is one string, so this
-is best-effort, and anything else the model pastes into a command line ships. Tool results are not published: no check
+nothing of it follows the final event. `input` is capped (2 KiB): over the cap it becomes
+`{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
+where each nested call's `arguments` is capped on its own so the nested tool names stay
+readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
+`api_key`/`api-key` or `credential` as a whole component (`access_token`, `SECRET_KEY`,
+`accessToken`, `clientSecret`; not `tokenizer` or `secretName`) are replaced before
+publishing, and so are the credential shapes a value can carry under an innocent key (a
+bearer token, a Google OAuth or API key, a GitHub token, a `key=value` pair or `--flag value`
+whose key looks like a secret, a quoted value taken whole to its closing quote) — a terminal
+command is one string, so this is best-effort, and anything else the model pastes into a
+command line ships. Tool results are not published: no check
 reads them and they are the riskiest payload in the pod. One task publishes at most 3000
 trace parts: the task's events subject is capped at 4096 messages, and a looping persona
 publishing without bound would evict its own `submitted` and `working`. Past the budget,
