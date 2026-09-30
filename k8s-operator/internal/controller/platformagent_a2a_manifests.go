@@ -3006,8 +3006,8 @@ type a2aProvisionState struct {
 	// guaranteed to wake the reconcile that finally sees it.
 	gatewayHeld bool
 	// gatewayDark reports that the gateway Deployment was withheld because
-	// the install configures no chat backend for it: no discord-bot Secret
-	// and no door armed (a2aGatewayBackend). gatewayDarkReason is the
+	// the install configures no chat backend for it: no discord-bot Secret,
+	// no door armed and Chat not taken by next (a2aGatewayBackend). gatewayDarkReason is the
 	// remedy, for the condition the status writer publishes. A gateway that
 	// already exists is never withheld on this account; see the call site.
 	gatewayDark       bool
@@ -3027,10 +3027,11 @@ type a2aProvisionState struct {
 // start without one (a2a/gateway/config.go, "no chat backend"), so rendering
 // its Deployment without one is a crash loop by construction; the render
 // asks first. The answers, in the order the gateway itself accepts them:
-// the inject door armed on the operator (the eval install's case, #1660's
-// decision that the door alone is an ingress); the discord-bot Secret
-// present in the namespace. The Google Chat relay joins here when the
-// operator renders it (#1705), and the A2A door when its render lands.
+// the inject door armed on the operator (the eval install's case; the door
+// alone is an ingress by the A2A owner's decision recorded in the spec); the
+// CR's Google Chat integration under next (a2aChatArmed, which needs no read
+// at all); the discord-bot Secret present in the namespace. The A2A door
+// joins when its render lands.
 //
 // The Secret is read through a2aReader, uncached, for the reason every other
 // Secret read here is (see removeA2AInjectBackend): the operator ships
@@ -3038,6 +3039,11 @@ type a2aProvisionState struct {
 // informer whose LIST is forbidden.
 func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, string, error) {
 	if a2aInjectBackendEnabled() {
+		return true, "", nil
+	}
+	// Before the Secret read: the answer is on the CR, and a Chat install
+	// should pay nothing for a Secret it never created.
+	if a2aChatArmed(agent) {
 		return true, "", nil
 	}
 	secret := &corev1.Secret{}
@@ -3051,13 +3057,15 @@ func (r *PlatformAgentReconciler) a2aGatewayBackend(ctx context.Context, agent *
 		// token and exit on "no chat backend", which is the crash loop this
 		// check exists to prevent. Withheld, with the key named.
 		return false, fmt.Sprintf("the %s Secret in %s carries no %q key, so the A2A gateway has no chat backend and its "+
-			"Deployment is not rendered: put the Discord bot token under that key; an eval install arms the inject door "+
-			"(%s=true on the operator) instead", a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar), nil
+			"Deployment is not rendered: put the Discord bot token under that key, or enable spec.integration.googleChat "+
+			"so the next stack takes Google Chat; an eval install arms the inject door (%s=true on the operator) instead",
+			a2aDiscordBotSecretName, agent.Namespace, a2aDiscordBotTokenKey, a2aInjectBackendEnvVar), nil
 	case !errors.IsNotFound(err):
 		return false, "", err
 	}
 	return false, fmt.Sprintf("no chat backend is configured for the A2A gateway, so its Deployment is not rendered: "+
-		"create the %s Secret (key %s) in %s; an eval install arms the inject door (%s=true on the operator) instead",
+		"enable spec.integration.googleChat so the next stack takes Google Chat, or create the %s Secret (key %s) in %s; "+
+		"an eval install arms the inject door (%s=true on the operator) instead",
 		a2aDiscordBotSecretName, a2aDiscordBotTokenKey, agent.Namespace, a2aInjectBackendEnvVar), nil
 }
 
