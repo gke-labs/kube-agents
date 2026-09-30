@@ -6,6 +6,9 @@ from pathlib import Path
 from command_policy import (
     evaluate,
     GCLOUD_READ_COMMANDS,
+    _GCLOUD_IDENTITY_FLAGS,
+    _IMPERSONATION_FLAGS,
+    _KUBECTL_FILE_WRITE_FLAGS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -1892,6 +1895,31 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
                 self.assertIn(self.BOUNDARY_PHRASE, decision.message)
                 self.assertIn(self.FLAG_PHRASE, decision.message)
                 self.assertNotIn(self.ACTION_PHRASE, decision.message)
+
+    def test_a_flag_refusal_names_every_flag_its_rule_refuses(self):
+        # The notice says "retried without the flag", so the message must name
+        # the flag the caller passed. A refusal that names a subset of its
+        # rule's set leaves "the flag" without an antecedent for the rest; the
+        # name lists are derived from the sets so a flag added to a set fails
+        # here until the message names it. The kubectl identity set is wider
+        # than its message and closes the gap with "and the other credential
+        # flags"; the gcloud identity message uses the same catch-all, so it
+        # is held to the three it names plus that phrase.
+        for argv, flags, catch_all in (
+            (["kubectl", "get", "pods", "--as-uid", "1000"], _IMPERSONATION_FLAGS, None),
+            (["kubectl", "get", "pods", "--output-directory=/tmp/x"],
+             _KUBECTL_FILE_WRITE_FLAGS, None),
+            (["gcloud", "info", "--credential-file-override=/k.json"],
+             {"--access-token-file", "--configuration", "--account"},
+             "and the other identity flags"),
+        ):
+            with self.subTest(argv=argv):
+                message = evaluate(argv).message
+                for flag in sorted(flags):
+                    self.assertIn(flag, message)
+                if catch_all:
+                    self.assertIn(catch_all, message)
+                    self.assertTrue(_GCLOUD_IDENTITY_FLAGS > set(flags))
 
     def test_refusals_a_respelling_answers_do_not_claim_a_boundary(self):
         # Re-running with a spelling the policy accepts is the legitimate
