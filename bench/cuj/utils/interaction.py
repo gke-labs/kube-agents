@@ -18,6 +18,88 @@ if TYPE_CHECKING:
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 
+#: The hand-off Kage is told to send (agents/chat/SOUL.md §2, step 4) is one
+#: line naming what it is checking:
+#:
+#:     checking checkout-gateway.
+#:
+#: The template fixes the lowercase and the period but not the verb, the
+#: length of the target, or whether it is a link, and a model drifts on all of
+#: them, so ``_is_progress_ack`` matches the shape rather than the words: one
+#: line opening with an ``-ing`` verb in either case, then a target of up to
+#: ``_ACK_MAX_TARGET_WORDS`` words, with or without a closing period or
+#: ellipsis. What keeps an answer from matching is what an answer carries and
+#: a target does not:
+#:
+#: - a verdict straight after the verb: "looking good.";
+#: - a finding verb before any clause opener: "checking the events shows the
+#:   pod was evicted." (while "checking why checkout-gateway is restarting."
+#:   is still a hand-off, because "why" comes first);
+#: - a label and a value: "Running pods: 12.";
+#: - a clause after a comma: "looking at the logs, the pod restarted 4
+#:   times." (a comma-separated list of targets is still a hand-off);
+#: - an opening that is a noun or adjective, not a verb: "nothing is
+#:   restarting.", "Missing quota in us-central1."
+#:
+#: ``_DELEGATION_ACK`` is the receipt that template replaced, still sent by an
+#: install on an older image:
+#:
+#:     > 🔀 Delegated to the **<agent-name>** agent
+#:
+#:     I've started this as task `<task_id>`. The answer will post into this
+#:     thread as soon as it's ready.
+#:
+#: Matching has to survive that formatting — the agent name arrives wrapped in
+#: bold markers and the task id in backticks — and must not fire on a report
+#: that merely cites its own task id. Each of those branches therefore pairs
+#: hand-off phrasing with the thing handed off.
+#:
+#: Each receipt branch is the template's own wording, not a paraphrase of it: "Results
+#: for the design will post below" and "Assigned under task t_...: start at
+#: 14:00" are answers that a looser matcher stripped.
+_DELEGATION_ACK = re.compile(
+    r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
+    r"|\bstarted this as task\s+[`'\"]?t_[0-9a-f]+"
+    r"|\bwill post into this thread\b",
+    re.IGNORECASE,
+)
+
+#: The most words a hand-off's target runs to after its verb. "scaling
+#: checkout-gateway down to two replicas in prod-a." is seven.
+_ACK_MAX_TARGET_WORDS = 12
+_ACK_VERB = re.compile(r"[^\W\d_]{2,}ing", re.IGNORECASE)
+#: Words ending in "ing" that open an answer rather than a hand-off.
+_ACK_NOT_VERBS = frozenset(
+    {
+        "nothing", "everything", "something", "anything", "during", "missing",
+        "pending", "existing", "remaining", "following", "outstanding",
+        "interesting", "matching",
+    }
+)
+_ACK_VERDICTS = frozenset(
+    {
+        "good", "fine", "great", "healthy", "ok", "okay", "well", "bad", "better",
+        "worse", "normal", "clean",
+    }
+)
+_ACK_FINDING_VERBS = frozenset(
+    {
+        "is", "isn't", "was", "wasn't", "are", "aren't", "were", "weren't", "shows",
+        "showed", "shown", "found", "finds", "reveals", "revealed", "confirms",
+        "confirmed", "indicates", "indicated", "returned", "returns", "says",
+        "said", "looks", "seems", "appears",
+    }
+)
+_ACK_CLAUSE_OPENERS = frozenset(
+    {
+        "why", "whether", "if", "what", "how", "where", "which", "when", "who",
+        "that",
+    }
+)
+_ACK_CLOSING = re.compile(r"(?:\.{1,3}|…)\Z")
+_ACK_WORD_WRAPPING = "*_`[]()\"'"
+_ACK_PAST_TENSE = "ed"
+
 
 @dataclass(frozen=True)
 class InteractionRunner:
@@ -146,43 +228,36 @@ def tool_operations(
     ]
 
 
-#: The hand-off Kage is told to send (agents/chat/SOUL.md §2, step 4) is one
-#: lowercase line naming what it is checking:
-#:
-#:     checking checkout-gateway.
-#:
-#: The last branch matches that line only when it is the whole sentence,
-#: starts lowercase, case-sensitively, opens with one of the verbs the
-#: template shows, and follows it with one to five words and no comma, colon
-#: or semicolon before the closing period. A report sentence opens with a
-#: capital, so "Checking the logs showed a crash." is kept as an answer; so is
-#: a lowercase answer such as "nothing is restarting." that does not open with
-#: one of those verbs, and "looking at the logs, the pod restarted 4 times.",
-#: which does but runs past the target into a finding.
-#:
-#: The other branches are the receipt that template replaced, still sent by an
-#: install on an older image:
-#:
-#:     > 🔀 Delegated to the **<agent-name>** agent
-#:
-#:     I've started this as task `<task_id>`. The answer will post into this
-#:     thread as soon as it's ready.
-#:
-#: Matching has to survive that formatting — the agent name arrives wrapped in
-#: bold markers and the task id in backticks — and must not fire on a report
-#: that merely cites its own task id. Each of those branches therefore pairs
-#: hand-off phrasing with the thing handed off.
-#:
-#: Each receipt branch is the template's own wording, not a paraphrase of it: "Results
-#: for the design will post below" and "Assigned under task t_...: start at
-#: 14:00" are answers that a looser matcher stripped.
-_DELEGATION_ACK = re.compile(
-    r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
-    r"|\bstarted this as task\s+[`'\"]?t_[0-9a-f]+"
-    r"|\bwill post into this thread\b"
-    r"|(?-i:\A(?:checking|looking|reviewing|auditing|investigating)(?: [^\s,;:]+){1,5}\.\Z)",
-    re.IGNORECASE,
-)
+def _is_progress_ack(sentence: str) -> bool:
+    """Whether ``sentence`` is the one-line hand-off, per the comment on
+    ``_DELEGATION_ACK``."""
+
+    text = sentence.strip()
+    if "\n" in text:
+        return False
+    body = _ACK_CLOSING.sub("", text)
+    words = body.split()
+    if not 2 <= len(words) <= _ACK_MAX_TARGET_WORDS + 1:
+        return False
+    bare = [word.strip(_ACK_WORD_WRAPPING).rstrip(",").casefold() for word in words]
+    if not _ACK_VERB.fullmatch(bare[0]) or bare[0] in _ACK_NOT_VERBS:
+        return False
+    if bare[1] in _ACK_VERDICTS:
+        return False
+    if any(";" in word or word.endswith(":") for word in words):
+        return False
+    for word in bare[1:]:
+        if word in _ACK_CLAUSE_OPENERS:
+            break
+        if word in _ACK_FINDING_VERBS:
+            return False
+    if "," in body:
+        after = body.rsplit(",", 1)[1].split()
+        if any(
+            word.endswith(_ACK_PAST_TENSE) or word[:1].isdigit() for word in after
+        ):
+            return False
+    return True
 
 
 def substantive_output(interaction: dict[str, Any]) -> str:
@@ -204,7 +279,9 @@ def substantive_output(interaction: dict[str, Any]) -> str:
             continue
         sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
         remainder = [sentence for sentence in sentences if sentence.strip()]
-        while remainder and _DELEGATION_ACK.search(remainder[0]):
+        while remainder and (
+            _DELEGATION_ACK.search(remainder[0]) or _is_progress_ack(remainder[0])
+        ):
             remainder.pop(0)
         if remainder:
             skipping = False

@@ -91,6 +91,50 @@ def test_every_ack_shape_the_template_names_scores_as_no_answer():
         assert substantive_output({"output": ack}) == ""
 
 
+def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
+    # The template fixes case and the period, not the verb, the target's
+    # length or whether it is a link; a model drifts on all of them.
+    for ack in (
+        "Checking checkout-gateway.",
+        "checking checkout-gateway",
+        "checking checkout-gateway…",
+        "provisioning the staging cluster.",
+        "scaling checkout-gateway down to two replicas in prod-a.",
+        "reviewing [PR 412](https://github.com/o/r/pull/412).",
+        "checking seeded-a, seeded-b and seeded-c.",
+        "checking why checkout-gateway is restarting.",
+        "Checking spot capacity in us-central1.",
+        "**checking** `checkout-gateway`.",
+    ):
+        assert substantive_output({"output": ack}) == "", ack
+        assert substantive_output({"output": f"{ack}\n\n{REPORT}"}) == REPORT, ack
+
+
+def test_a_short_answer_shaped_like_an_ack_is_kept():
+    for report in (
+        "looking good.",
+        "Looking fine",
+        "checking shows nothing wrong.",
+        "Checking the logs showed a crash on startup.",
+        "Running pods: 12.",
+        "Pending pods are stuck on quota.",
+        "Missing quota in us-central1.",
+        "Everything is healthy.",
+        "looking at the logs, the pod restarted 4 times.",
+        "checking the rollout, 3 replicas never became ready.",
+        "checking checkout-gateway; it restarted 4 times.",
+    ):
+        assert substantive_output({"output": report}) == report, report
+
+
+def test_a_long_gerund_sentence_is_an_answer():
+    report = (
+        "restarting the pod cleared the stale mount and the checkout path "
+        "recovered within two minutes of the rollout finishing."
+    )
+    assert substantive_output({"output": report}) == report
+
+
 def test_delegation_acknowledgment_alone_scores_as_no_answer(ack):
     assert substantive_output({"output": ack}) == ""
 
