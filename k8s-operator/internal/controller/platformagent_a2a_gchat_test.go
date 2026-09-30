@@ -118,3 +118,128 @@ func TestTheRelayTokenPathIsTheGatewaysDefault(t *testing.T) {
 		t.Error("the a2a-chat audience collides with another; the broker would not confer the a2a-chat role")
 	}
 }
+
+// TestAnArmedGatewayCarriesTheChatBackend: everything the gateway reads to
+// select and run the Google Chat adapter, and the token it presents to the
+// broker, from one CR under next.
+func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := gchatTestAgent("next", true)
+	dep := buildA2AGatewayDeployment(agent)
+	c := dep.Spec.Template.Spec.Containers[0]
+	env := gchatEnv(c)
+
+	want := map[string]string{
+		a2aGchatRelayURLEnvVar:      "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765",
+		a2aGchatAllowedUsersEnvVar:  "one@example.com,two@example.com",
+		a2aGchatAllowAllUsersEnvVar: "false",
+		a2aChatDisplayModeEnvVar:    "default",
+		a2aGchatTokenPathEnvVar:     a2aGchatTokenPath,
+	}
+	for name, value := range want {
+		if got, ok := env[name]; !ok || got.Value != value {
+			t.Errorf("%s = %q (present=%v), want %q", name, got.Value, ok, value)
+		}
+	}
+	// One backend per gateway process: the gateway's guard refuses two, so
+	// the render hands it one. The explicit CR field beats a hand-made
+	// Secret, and the Discord reference is omitted rather than left
+	// optional, because the Secret being present would otherwise arm both.
+	if _, ok := env["DISCORD_TOKEN"]; ok {
+		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; with the discord-bot Secret present the gateway would refuse to start on two backends")
+	}
+
+	var mount *corev1.VolumeMount
+	for i := range c.VolumeMounts {
+		if c.VolumeMounts[i].Name == a2aGchatTokenVolume {
+			mount = &c.VolumeMounts[i]
+		}
+	}
+	if mount == nil {
+		t.Fatalf("no mount of %s; the gateway reads its relay token from %s", a2aGchatTokenVolume, a2aGchatTokenPath)
+	}
+	if mount.MountPath != a2aGchatTokenDir || !mount.ReadOnly {
+		t.Errorf("token mount = %+v, want read-only at %s", *mount, a2aGchatTokenDir)
+	}
+	vol := podVolume(dep.Spec.Template, a2aGchatTokenVolume)
+	if vol == nil || vol.Projected == nil || len(vol.Projected.Sources) != 1 || vol.Projected.Sources[0].ServiceAccountToken == nil {
+		t.Fatalf("volume %s is not a single projected ServiceAccount token: %+v", a2aGchatTokenVolume, vol)
+	}
+	tok := vol.Projected.Sources[0].ServiceAccountToken
+	if tok.Audience != credentialProxyA2AChatAudience {
+		t.Errorf("token audience %q, want %q: the broker confers the a2a-chat role by audience", tok.Audience, credentialProxyA2AChatAudience)
+	}
+	if tok.ExpirationSeconds == nil || *tok.ExpirationSeconds != a2aGchatTokenTTLSeconds {
+		t.Errorf("token expiry %v, want %d", tok.ExpirationSeconds, a2aGchatTokenTTLSeconds)
+	}
+	if tok.Path != a2aGchatTokenKey {
+		t.Errorf("token path %q, want %q so the file lands at %s", tok.Path, a2aGchatTokenKey, a2aGchatTokenPath)
+	}
+	if vol.Projected.DefaultMode == nil || *vol.Projected.DefaultMode != 0400 {
+		t.Errorf("token defaultMode %v, want 0400", vol.Projected.DefaultMode)
+	}
+}
+
+// TestAnEmptyAllowlistArmsAllowAllUnderNext: the legacy pin's rule, kept.
+// The gateway refuses to start the gchat adapter with neither an allowlist
+// nor the explicit allow-all, and the CR's empty list has always meant all.
+func TestAnEmptyAllowlistArmsAllowAllUnderNext(t *testing.T) {
+	agent := gchatTestAgent("next", true)
+	agent.Spec.Integration.GoogleChat.AllowedUsers = nil
+	env := gchatEnv(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0])
+	if env[a2aGchatAllowAllUsersEnvVar].Value != "true" || env[a2aGchatAllowedUsersEnvVar].Value != "" {
+		t.Errorf("empty allowlist renders %s=%q %s=%q, want allow-all true and an empty list",
+			a2aGchatAllowAllUsersEnvVar, env[a2aGchatAllowAllUsersEnvVar].Value,
+			a2aGchatAllowedUsersEnvVar, env[a2aGchatAllowedUsersEnvVar].Value)
+	}
+}
+
+// TestDisplayModeFollowsTheCRField: debug on the CR reaches the gateway.
+func TestDisplayModeFollowsTheCRField(t *testing.T) {
+	agent := gchatTestAgent("next", true)
+	agent.Spec.Integration.GoogleChat.Mode = "debug"
+	env := gchatEnv(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0])
+	if env[a2aChatDisplayModeEnvVar].Value != "debug" {
+		t.Errorf("%s = %q, want debug", a2aChatDisplayModeEnvVar, env[a2aChatDisplayModeEnvVar].Value)
+	}
+}
+
+// TestAnUnarmedGatewayRendersAsBefore: today with Chat, next without Chat,
+// and next with Chat disabled all render the gateway exactly as main does,
+// Discord reference included. Compared field by field rather than against
+// a golden, because the golden path cannot produce a gateway (the callout
+// gate holds it in a fake client).
+func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"next without chat", a2aTestAgent()},
+		{"next with chat disabled", gchatTestAgent("next", false)},
+		{"today with chat", gchatTestAgent("", true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := buildA2AGatewayDeployment(tc.agent)
+			c := dep.Spec.Template.Spec.Containers[0]
+			env := gchatEnv(c)
+			for _, name := range []string{a2aGchatRelayURLEnvVar, a2aGchatAllowedUsersEnvVar, a2aGchatAllowAllUsersEnvVar, a2aChatDisplayModeEnvVar, a2aGchatTokenPathEnvVar} {
+				if _, ok := env[name]; ok {
+					t.Errorf("%s rendered on an unarmed gateway", name)
+				}
+			}
+			discord, ok := env["DISCORD_TOKEN"]
+			if !ok || discord.ValueFrom == nil || discord.ValueFrom.SecretKeyRef == nil || discord.ValueFrom.SecretKeyRef.Name != a2aDiscordBotSecretName {
+				t.Errorf("DISCORD_TOKEN is not the optional discord-bot reference on an unarmed gateway: %+v", discord)
+			}
+			for _, m := range c.VolumeMounts {
+				if m.Name == a2aGchatTokenVolume {
+					t.Error("the relay token is mounted on an unarmed gateway")
+				}
+			}
+			if podVolume(dep.Spec.Template, a2aGchatTokenVolume) != nil {
+				t.Error("the relay token volume is rendered on an unarmed gateway")
+			}
+		})
+	}
+}

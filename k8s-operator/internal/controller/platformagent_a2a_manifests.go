@@ -2741,10 +2741,12 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-chatops-gateway.md: Discord adapter and session manager).
-// It is expected to crash-loop until the gateway image is reachable and the
-// discord-bot Secret is created — both are optional references so the render
-// never blocks the rest of the stack.
+// docs/designs/spec-chatops-gateway.md). Which chat backend it starts on is
+// the install's: the Google Chat env and relay token when a2aChatArmed, the
+// optional discord-bot Secret reference otherwise, and the inject door under
+// its own flag beside either. The render is withheld while none of those is
+// configured (a2aGatewayBackend); once rendered, a pod still crash-loops
+// until the gateway image is reachable.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	labels := a2aLabels(agent, "gateway")
@@ -2790,6 +2792,132 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}
 	}
 
+	// The Google Chat backend, applied the same way: three slices, empty
+	// when the install does not arm it, so every other render is
+	// byte-identical to what it was. What arms it is a2aChatArmed; what it
+	// renders is the env the gateway's FromEnv reads for the gchat adapter,
+	// the projected token the adapter presents to the broker's relay, and
+	// NOT the Discord reference: the gateway refuses two real backends, so
+	// an install with both a discord-bot Secret and Chat enabled under next
+	// gets the one its CR names.
+	discordEnv := []corev1.EnvVar{
+		// Created by hand at install time (the bot token is operator input,
+		// never repo content); the reference is optional so the pod
+		// schedules before it.
+		{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
+			Key:                  a2aDiscordBotTokenKey,
+			Optional:             ptr.To(true),
+		}}},
+	}
+	var chatEnv []corev1.EnvVar
+	var chatMounts []corev1.VolumeMount
+	var chatVolumes []corev1.Volume
+	if a2aChatArmed(agent) {
+		gchat := agent.Spec.Integration.GoogleChat
+		discordEnv = nil
+		chatEnv = []corev1.EnvVar{
+			// The relay is the broker; the gateway pod holds no cloud credential.
+			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
+			// The allowed-users gate, carried as environment because
+			// environment is what the agent cannot rewrite, from the same
+			// CR list the legacy pin uses and with the same empty-means-all
+			// rule (allowAllUsers). The gateway refuses to start the adapter
+			// with neither.
+			{Name: a2aGchatAllowedUsersEnvVar, Value: strings.Join(gchat.AllowedUsers, ",")},
+			{Name: a2aGchatAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(gchat.AllowedUsers))},
+			{Name: a2aChatDisplayModeEnvVar, Value: a2aChatDisplayMode(gchat.Mode)},
+			// Rendered explicitly at the gateway's default, like
+			// A2A_MAX_SESSIONS: the path and the mount below are one fact.
+			{Name: a2aGchatTokenPathEnvVar, Value: a2aGchatTokenPath},
+		}
+		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
+		chatVolumes = []corev1.Volume{{
+			Name: a2aGchatTokenVolume,
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: ptr.To(int32(0400)),
+				Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+					Audience:          credentialProxyA2AChatAudience,
+					ExpirationSeconds: ptr.To(int64(a2aGchatTokenTTLSeconds)),
+					Path:              a2aGchatTokenKey,
+				}}},
+			}},
+		}}
+	}
+
+	// The container env, in the order it has always had: the bus, the
+	// Discord reference (when not displaced by Chat), the gateway's own
+	// settings, then the Chat backend's and the inject door's additions.
+	env := []corev1.EnvVar{
+		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+		{Name: "NATS_USER", Value: "gateway"},
+		{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+			Key:                  a2aGatewayPasswordKey,
+		}}},
+	}
+	env = append(env, discordEnv...)
+	env = append(env, []corev1.EnvVar{
+		// Rendered explicitly even when the CR is silent:
+		// the number a `kubectl describe` reader sees is
+		// the same one the session quota was sized above,
+		// so the two halves cannot drift apart silently.
+		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// Arms the spawner. The gateway shipped its
+		// session-spawn path dark behind this flag; the
+		// worker image it spawns and the Role that lets
+		// it are in this same change, so the flag flips
+		// where all three become true together.
+		{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
+		// The image those sessions run. Rendered even
+		// when it matches the gateway's own default, so
+		// the operator-side override reaches it.
+		{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
+		// Rendered explicitly at its default, like
+		// A2A_MAX_SESSIONS above: a reader of the live
+		// Deployment can see which posture the events
+		// writer-class check is in without knowing the
+		// gateway binary's default, and the flip after
+		// the retention window is an edit to a value
+		// that is already there.
+		{Name: a2aStrictEventsWriterEnvVar, Value: a2aStrictEventsWriter()},
+		// The namespace from the downward API, not a baked
+		// default: the boot-time owner resolution below
+		// reads the gateway's own Deployment in THIS
+		// namespace.
+		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
+			FieldPath: "metadata.namespace",
+		}}},
+		// The attribution salt is SESSION_KV_SALT, the
+		// same Secret key the platform agent hashes
+		// session metadata with — one human, one
+		// pseudonym, on the bus and in session metadata,
+		// or the cross-surface audit join silently yields
+		// nothing. Same resolver as the agent render,
+		// same optional posture: a pod without it
+		// degrades to the gateway's derived fallback, the
+		// recorded deviation.
+		{Name: "SESSION_KV_SALT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVSaltSecretRef(agent)}},
+		// The gateway's own Deployment: spawned session
+		// pods carry an ownerReference to it, so
+		// Kubernetes GC reaps sessions when cleanupA2A —
+		// or anything else — deletes the gateway. The
+		// Role above grants the one get this needs.
+		{Name: "A2A_OWNER_DEPLOYMENT", Value: name},
+		// The identity spawned sessions run as. Rendered
+		// rather than baked for the same reason as the
+		// creds Secret above: the gateway's default spells
+		// it for a CR named platform-agent, and on a
+		// renamed CR every session pod would fail to
+		// schedule against a ServiceAccount that does not
+		// exist. The callout's map is keyed on this exact
+		// name, so the render and the spawner must agree
+		// or every session is refused at connect.
+		{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
+	}...)
+	env = append(env, chatEnv...)
+	env = append(env, injectEnv...)
+
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
@@ -2834,92 +2962,20 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						// write.
 						WorkingDir: "/",
 						Resources:  a2aResources(a2aGatewayCPURequest, a2aGatewayMemoryRequest, a2aGatewayCPULimit, a2aGatewayMemoryLimit),
-						Env: append([]corev1.EnvVar{
-							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
-							{Name: "NATS_USER", Value: "gateway"},
-							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
-								Key:                  a2aGatewayPasswordKey,
-							}}},
-							// Created by hand at install time (the bot token is
-							// operator input, never repo content); the
-							// reference is optional so the pod schedules
-							// before it.
-							{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
-								Key:                  a2aDiscordBotTokenKey,
-								Optional:             ptr.To(true),
-							}}},
-							// Rendered explicitly even when the CR is silent:
-							// the number a `kubectl describe` reader sees is
-							// the same one the session quota was sized above,
-							// so the two halves cannot drift apart silently.
-							{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
-							// Arms the spawner. The gateway shipped its
-							// session-spawn path dark behind this flag; the
-							// worker image it spawns and the Role that lets
-							// it are in this same change, so the flag flips
-							// where all three become true together.
-							{Name: "A2A_SPAWN_SESSIONS", Value: "true"},
-							// The image those sessions run. Rendered even
-							// when it matches the gateway's own default, so
-							// the operator-side override reaches it.
-							{Name: "A2A_WORKER_IMAGE", Value: a2aWorkerImage()},
-							// Rendered explicitly at its default, like
-							// A2A_MAX_SESSIONS above: a reader of the live
-							// Deployment can see which posture the events
-							// writer-class check is in without knowing the
-							// gateway binary's default, and the flip after
-							// the retention window is an edit to a value
-							// that is already there.
-							{Name: a2aStrictEventsWriterEnvVar, Value: a2aStrictEventsWriter()},
-							// The namespace from the downward API, not a baked
-							// default: the boot-time owner resolution below
-							// reads the gateway's own Deployment in THIS
-							// namespace.
-							{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
-								FieldPath: "metadata.namespace",
-							}}},
-							// The attribution salt is SESSION_KV_SALT, the
-							// same Secret key the platform agent hashes
-							// session metadata with — one human, one
-							// pseudonym, on the bus and in session metadata,
-							// or the cross-surface audit join silently yields
-							// nothing. Same resolver as the agent render,
-							// same optional posture: a pod without it
-							// degrades to the gateway's derived fallback, the
-							// recorded deviation.
-							{Name: "SESSION_KV_SALT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVSaltSecretRef(agent)}},
-							// The gateway's own Deployment: spawned session
-							// pods carry an ownerReference to it, so
-							// Kubernetes GC reaps sessions when cleanupA2A —
-							// or anything else — deletes the gateway. The
-							// Role above grants the one get this needs.
-							{Name: "A2A_OWNER_DEPLOYMENT", Value: name},
-							// The identity spawned sessions run as. Rendered
-							// rather than baked for the same reason as the
-							// creds Secret above: the gateway's default spells
-							// it for a CR named platform-agent, and on a
-							// renamed CR every session pod would fail to
-							// schedule against a ServiceAccount that does not
-							// exist. The callout's map is keyed on this exact
-							// name, so the render and the spawner must agree
-							// or every session is refused at connect.
-							{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
-						}, injectEnv...),
-						Ports: injectPorts,
-						VolumeMounts: append([]corev1.VolumeMount{{
+						Env:        env,
+						Ports:      injectPorts,
+						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
-						}}, injectMounts...),
+						}}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append([]corev1.Volume{{
+					Volumes: append(append([]corev1.Volume{{
 						Name: "principal-map",
 						VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "principal-map"},
 							Optional:             ptr.To(true),
 						}},
-					}}, injectVolumes...),
+					}}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},
