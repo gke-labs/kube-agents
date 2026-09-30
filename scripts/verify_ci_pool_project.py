@@ -2614,13 +2614,18 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     if state == GITHUB_PATH_ABSENT:
         return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            tree = Path(tmp)
-            intent_file = tree / audit.INTENT_FILE
-            intent_file.parent.mkdir(parents=True)
-            intent_file.write_text(intent_out, encoding="utf-8")
-            with contextlib.redirect_stderr(io.StringIO()):
-                prefixes = audit.read_intent_paths(tree, repo_slug)
+        scratch = tempfile.TemporaryDirectory()
+        tree = Path(scratch.name)
+        intent_file = tree / audit.INTENT_FILE
+        intent_file.parent.mkdir(parents=True)
+        intent_file.write_text(intent_out, encoding="utf-8")
+    except OSError as exc:
+        # A scratch area this machine cannot write is a machine fault, unread
+        # like the loader's, never a verdict on the repository's file.
+        return unread(f"{audit.INTENT_FILE} (no writable temporary directory to hand it to the audit's reader)", f"{type(exc).__name__}: {exc}")
+    try:
+        with scratch, contextlib.redirect_stderr(io.StringIO()):
+            prefixes = audit.read_intent_paths(tree, repo_slug)
     except Exception as exc:
         # PyYAML's safe constructors raise outside the set the reader
         # catches (`paths: !!bool maybe` is a KeyError); the audit stops on

@@ -1585,6 +1585,18 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIn("read raw", result.message)
         self.assertIn("not UTF-8", result.message)
 
+    def test_an_unwritable_temp_directory_is_unverified_not_the_intent_files_fault(self):
+        # The intent file is handed to the audit's reader through a temp tree;
+        # a scratch area this machine cannot write is a machine fault.
+        with mock.patch.object(checker, "run_cmd") as run, mock.patch.object(
+            checker.tempfile, "TemporaryDirectory", side_effect=FileNotFoundError("No usable temporary directory found")
+        ):
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _ok("paths: [knowledge/]\n")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertIn("temporary directory", result.warnings[0])
+
     def test_no_workspace_paths_leaves_the_check_unverified_like_no_pyyaml(self):
         # read_intent_paths imports workspace_paths lazily; a checkout without
         # it is a machine fault the loader proves, not a repository's fault.
