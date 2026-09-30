@@ -476,8 +476,13 @@ fi
 # service address is not in this file at all — the operator derives it from the
 # agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
 # when the file is silent. That is why no `api_url` key belongs here.
+#
+# The onboarding prompts are in this list because bootstrap_onboarding reads the PVC
+# copy ahead of the image's, and the first-install-hello eval cases grade the greeting
+# they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
+        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.

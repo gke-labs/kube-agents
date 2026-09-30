@@ -307,7 +307,13 @@ class PreLlmCallTest(unittest.TestCase):
                 self.assertIn("written_at", logs.output[0])
 
     def test_eval_marker_without_a_readable_written_at_is_ignored(self):
-        for suffix, written_at in (("-none", None), ("-text", "now"), ("-bool", True), ("-nan", float("nan"))):
+        for suffix, written_at in (
+            ("-none", None),
+            ("-text", "now"),
+            ("-bool", True),
+            ("-nan", float("nan")),
+            ("-huge", 10**400),
+        ):
             request = {"variant": "in_progress", "phrase": "just installed you"}
             if written_at is not None:
                 request["written_at"] = written_at
@@ -318,6 +324,7 @@ class PreLlmCallTest(unittest.TestCase):
     def test_unreadable_eval_marker_is_ignored(self):
         (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")
         (self.data_dir / ".bootstrap_greet_eval-b").write_text("[]", encoding="utf-8")
+        (self.data_dir / ".bootstrap_greet_eval-c").write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
         self.assertIsNone(self._eval_call())
 
     def test_concurrent_eval_markers_are_each_taken_by_their_own_phrase(self):

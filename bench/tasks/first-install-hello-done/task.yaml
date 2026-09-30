@@ -160,7 +160,10 @@ verification_spec:
       forbidden_patterns:
         - '(?m)^\s*(?:[-•]|\d+[.)])\s'
         # Two `*` bullets: the normaliser deletes every `*` and keeps the
-        # space after it, so each line opens with a space. One such line
+        # space after it, so each line opens with a space. It also folds any
+        # other leading whitespace to one space, so two consecutive indented
+        # lines fail too; this greeting is two or three plain sentences, and
+        # an indented block in it is list-shaped either way. One such line
         # alone is only leading whitespace, which is not a list.
         - '(?m)^ \S.*\n+ \S'
         - "i can help( you)? with"

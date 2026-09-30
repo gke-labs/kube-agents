@@ -147,7 +147,7 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
         except FileNotFoundError:
             continue
-        except (OSError, ValueError, AttributeError) as e:
+        except (OSError, ValueError, AttributeError, RecursionError) as e:
             logger.warning("Ignoring unreadable %s: %s", marker, e)
             continue
         if len(phrase) < EVAL_PHRASE_MIN_LENGTH:
@@ -155,11 +155,15 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
             continue
         if phrase not in user_message:
             continue
+        try:
+            age = abs(time.time() - float(written_at))
+        except (TypeError, ValueError, OverflowError):
+            age = math.inf
         if (
             isinstance(written_at, bool)
             or not isinstance(written_at, (int, float))
-            or not math.isfinite(written_at)
-            or abs(time.time() - written_at) > EVAL_REQUEST_MAX_AGE_SECONDS
+            or not math.isfinite(age)
+            or age > EVAL_REQUEST_MAX_AGE_SECONDS
         ):
             logger.warning(
                 "Ignoring %s: written_at %r is missing or more than %d seconds from now; "
@@ -189,8 +193,9 @@ def _greeting(data_dir: Path, completed: bool) -> Dict[str, str]:
 def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Prime first-time onboarding on the opening interactive user turn.
 
-    Runs at most ONCE per deployment. On the one human turn that primes it,
-    this:
+    Runs at most ONCE per deployment, the eval seam below aside: an API-server
+    turn naming a live eval request is greeted every time. On the one human
+    turn that primes it, this:
       1. binds the delivery job to this chat and, only if that succeeded,
          marks ``.user_aligned`` so the delivery job may fire against a valid
          target;
