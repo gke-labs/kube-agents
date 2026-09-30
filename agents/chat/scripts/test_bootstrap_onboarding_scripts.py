@@ -54,6 +54,8 @@ ALIGNED = ".user_aligned"
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
 UNANSWERED = ".bootstrap_sandbox_unanswered"
+# A fixed clock for the unanswered-sandbox streak.
+T0 = 1_800_000_000
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -357,49 +359,68 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.assertTrue((self.d / UNANSWERED).exists())
                 self.run_.assert_not_called()
 
+    def _read_at(self, t, **read):
+        self.read.reset_mock(return_value=True, side_effect=True)
+        self.read.configure_mock(**(read or {"side_effect": sandbox_exec.SandboxUnavailable("Connection refused")}))
+        with mock.patch.object(bootstrap_delivery.time, "time", return_value=t):
+            return self._run()
+
+    def _ticks(self, start, stop):
+        """rc of an unanswered read each minute from start up to, not including, stop."""
+        return {self._read_at(t)[0] for t in range(start, stop, 60)}
+
     def test_a_sandbox_gone_past_the_limit_fails_the_run(self):
         # A rejected key or a config with no ssh_host raises the same
         # SandboxUnavailable as a rolling pod, and never clears on its own.
-        self.read.side_effect = sandbox_exec.SandboxUnavailable("Permission denied (publickey)")
-        marker = self.d / UNANSWERED
-        marker.touch()
-        since = time.time() - bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS - 1
-        os.utime(marker, (since, since))
-        rc, out, err = self._run()
+        limit = bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
+        self.assertEqual(self._ticks(T0, T0 + limit), {0})
+        rc, out, err = self._read_at(
+            T0 + limit, side_effect=sandbox_exec.SandboxUnavailable("Permission denied (publickey)")
+        )
         self.assertEqual((rc, out), (1, ""))
-        self.assertIn("has not answered for", err)
+        self.assertIn(f"has not answered for {limit} s", err)
         self.assertIn("Permission denied (publickey)", err)
         self.assertFalse((self.d / COMPLETED).exists())
-        # The first unanswered read's time is kept, not moved on.
-        self.assertAlmostEqual(marker.stat().st_mtime, since, delta=1)
 
-    def test_a_sandbox_inside_the_limit_stays_silent(self):
-        self.read.side_effect = sandbox_exec.SandboxUnavailable("Connection refused")
-        marker = self.d / UNANSWERED
-        marker.touch()
-        since = time.time() - bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS + 60
-        os.utime(marker, (since, since))
-        rc, out, _ = self._run()
-        self.assertEqual((rc, out), (0, ""))
+    def test_past_the_limit_the_run_fails_again_only_after_the_realert_interval(self):
+        # Each failed run is an alert in the user's chat.
+        limit = T0 + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
+        again = limit + bootstrap_delivery.UNANSWERED_REALERT_SECONDS
+        self._ticks(T0, limit)
+        self.assertEqual(self._read_at(limit)[0], 1)
+        self.assertEqual(self._ticks(limit + 60, again), {0})
+        self.assertEqual(self._read_at(again)[0], 1)
+
+    def test_a_gap_in_the_reads_starts_the_streak_again(self):
+        # Reads stop while no delivery is due or the agent pod is down, and
+        # the sandbox may answer in between.
+        self.assertEqual(self._read_at(T0)[0], 0)
+        later = T0 + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS + bootstrap_delivery.UNANSWERED_STREAK_GAP_SECONDS
+        self.assertEqual(self._ticks(later, later + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS), {0})
 
     def test_a_read_the_sandbox_answers_restarts_the_limit(self):
-        since = time.time() - bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS - 1
+        limit = bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
         for answered in (
             {"return_value": None},
             {"side_effect": sandbox_exec.SandboxReadFailed("/opt/data/INVENTORY.md is not a readable regular file")},
         ):
             with self.subTest(answered=answered):
-                marker = self.d / UNANSWERED
-                marker.touch()
-                os.utime(marker, (since, since))
-                self.read.reset_mock(return_value=True, side_effect=True)
-                self.read.configure_mock(**answered)
-                self._run()
-                self.assertFalse(marker.exists())
-                self.read.configure_mock(side_effect=sandbox_exec.SandboxUnavailable("Connection refused"))
-                rc, out, _ = self._run()
-                self.assertEqual((rc, out), (0, ""))
-                marker.unlink()
+                self._ticks(T0, T0 + limit - 60)
+                self._read_at(T0 + limit - 60, **answered)
+                self.assertFalse((self.d / UNANSWERED).exists())
+                self.assertEqual(self._ticks(T0 + limit, T0 + 2 * limit - 60), {0})
+                (self.d / UNANSWERED).unlink()
+
+    @unittest.skipIf(os.geteuid() == 0, "root writes through a read-only mode")
+    def test_a_streak_that_cannot_be_recorded_stays_silent(self):
+        # Without a record of the alert, every later tick would repeat it.
+        limit = T0 + bootstrap_delivery.SANDBOX_UNANSWERED_ALERT_SECONDS
+        self._ticks(T0, limit)
+        (self.d / UNANSWERED).chmod(0o444)
+        self.addCleanup((self.d / UNANSWERED).chmod, 0o644)
+        rc, _, err = self._read_at(limit)
+        self.assertEqual(rc, 0)
+        self.assertIn("could not record the unanswered read", err)
 
     def test_a_sandbox_report_that_cannot_be_read_is_a_failure(self):
         # The local path exits 1 on an unreadable report; the sandbox path must

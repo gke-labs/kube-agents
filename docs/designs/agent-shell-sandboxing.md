@@ -1870,7 +1870,7 @@ That split is now the smaller half of what has already happened. `resolver.py` r
 `gh` through `sandbox_exec.run`, so every `gh` call the poll makes executes in the
 sandbox today; what is left to move is the script around them.
 
-`bootstrap_delivery.py` takes the same shape. Its markers, `.user_aligned` and
+`bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
 `.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
 first; only once they say a delivery is due does it read `INVENTORY.md` out of the
 sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
@@ -1878,9 +1878,9 @@ and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as
 for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
 `agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
 because a failing `no_agent` script posts an alert to the user's chat on every tick it
-fails. The silence ends after 15 minutes without an answer, when the run starts failing:
-the same exception covers a rejected key, a changed host key and a config with no
-`ssh_host`, none of which clear on their own. A read that reaches the sandbox and does not return the report fails the run with
+fails. The silence ends after 15 minutes without an answer, when the run fails once and
+then hourly: the same exception covers a rejected key, a changed host key and a
+config with no `ssh_host`, none of which clear on their own. A read that reaches the sandbox and does not return the report fails the run with
 the reason, as an unreadable report does on the agent pod, instead of waiting on it
 silently. The next tick reads again, so a passing fault clears and a lasting one alerts on
 each tick until it is fixed. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on

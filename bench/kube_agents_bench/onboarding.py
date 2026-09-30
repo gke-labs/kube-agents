@@ -88,7 +88,8 @@ FILE_ABSENT = "absent"
 
 # The scheduler's record of each run of the delivery job (bootstrap_delivery.py:
 # DELIVERY_JOB_ID), which Hermes keeps in the agent pod's cron store. Read with
-# the agent's own interpreter: the agent image ships no sqlite3 binary.
+# the agent's own interpreter, falling back to python3 as the other reads do:
+# the agent image ships no sqlite3 binary.
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 EXECUTIONS_DB = f"{DATA_ROOT}/cron/executions.db"
 RUNS_READ = "__ONBOARDING_RUNS_READ__"

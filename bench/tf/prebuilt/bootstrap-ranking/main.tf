@@ -40,10 +40,11 @@
 # so the gate files no other.
 #
 # These checks are one read at the start, so the case is for an eval install
-# nobody chats with: a person's first chat on the install after the arm is
-# sent the ranked report. One before it fails the arm at step 6, and that
-# person is sent the report only if a delivery tick claims it before the exit
-# trap clears it. A teardown after the arm removes their `.user_aligned`.
+# nobody chats with: a person's first chat on the install after the arm and
+# before the delivery job claims the report is sent the ranked report. One
+# before the arm fails it at step 6, and that person is sent the report only if
+# a delivery tick claims it before the exit trap clears it. A teardown after the
+# arm removes their `.user_aligned`.
 #
 # Arming writes the two onboarding job records to `state_file` first. The
 # teardown, and the exit trap on a failed apply, remove `.user_aligned` and
@@ -198,6 +199,8 @@ locals {
     remove(home + "/.user_aligned")
     settle()
     remove(home + "/.bootstrap_completed")
+    # The delivery job's record of reads the sandbox did not answer during this arm.
+    remove(home + "/.bootstrap_sandbox_unanswered")
     # A run that saw the marker before it went may be removing the jobs.
     settle()
     with _jobs_lock():

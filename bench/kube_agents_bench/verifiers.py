@@ -2648,7 +2648,7 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
 
     Where the output went is not checked: the bench stack delivers to
     ``local``, which the scheduler records as ``suppressed``. The agent pod
-    unreadable is ``status="error"``.
+    unreadable, or a cron store sqlite cannot read, is ``status="error"``.
     """
 
     type: Literal["bootstrap_delivered"]

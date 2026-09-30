@@ -823,6 +823,7 @@ class ArmDisarmTest(unittest.TestCase):
         self.assertEqual(self._py(self._arm).returncode, 0)
         self._jobs([_SCAN])
         (self._home / ".bootstrap_completed").write_text("")
+        (self._home / ".bootstrap_sandbox_unanswered").write_text("")
         out = self._py(self._disarm)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("put back: bootstrap-inventory-delivery", out.stdout)
