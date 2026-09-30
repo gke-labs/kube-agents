@@ -71,16 +71,20 @@ stored against that thread — are reused unchanged.
 
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
 headline in place of the composed message (`slack_audit_report.py`, called from
-`relay_cron_report`). The headline reads the finding and critical counts and the
-top two findings from the report's ledger issue, if that issue is open, labelled
-`agent:audit`, and in a managed repository. Below them go the relayed line, which
-alone carries coverage, resolved counts and remediation pull requests, and the
-ledger link. When the issue cannot be read, is closed (a clean run closes it
-without rewriting its title) or does not parse, the leg posts the relayed line in
-bold with the link. A report longer than one line is also posted in full into the
-headline's thread, and the incident row stores the full report either way, so a
-reply in the thread is answered with the whole report. Google Chat, and every
-report with the flag off, gets the composed message unchanged.
+`relay_cron_report`), provided the Chat Agent composed it, the job's `skills`
+include `fleet-audit`, and the message ends with a link to an issue in a managed
+repository. The headline reads the finding and critical counts and the top two
+findings from that issue if it is open and labelled `agent:audit`. Below them go
+the relayed line, which alone carries coverage, resolved counts and remediation
+pull requests, and the ledger link. When the issue cannot be read, is closed (a
+clean run closes it without rewriting its title) or does not parse, the leg posts
+the relayed line in bold with the link. The full report is also posted into the
+headline's thread when it is longer than one line or the headline lost part of
+its line (a link target, a clipped tail), and the incident row stores the full
+report either way, so a reply in the thread is answered with the whole report.
+Every other report (Google Chat, an unrelayed report, one that does not end with
+a managed-repository issue link, a job the scheduler already delivered to Slack
+itself, or any report with the flag off) gets the composed message unchanged.
 
 ## Why the Chat Agent composes but does not send
 

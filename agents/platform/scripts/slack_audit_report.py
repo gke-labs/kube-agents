@@ -113,6 +113,18 @@ def has_more(report: str) -> bool:
     return len([line for line in report.splitlines() if line.strip()]) > 1
 
 
+def needs_fold(report: str, headline: str) -> bool:
+    """Whether the full report goes into the headline's thread: it says more than
+    one line, or the headline lost part of its line (a link target, a clipped tail)."""
+    if has_more(report):
+        return True
+    line = report.strip()
+    match = TRAILING_LEDGER.search(line)
+    if match:
+        line = line[: match.start()]
+    return line.rstrip(LEDGER_SEPARATORS).strip() not in headline
+
+
 def _findings_phrase(count: int) -> str:
     return f"{count} finding" if count == 1 else f"{count} findings"
 

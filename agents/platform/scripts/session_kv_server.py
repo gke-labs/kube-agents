@@ -2693,7 +2693,7 @@ def relay_cron_report(
             headline = None
         leg_message = truncation_notice + headline if headline else message
         new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
-        if new_thread_id and headline and slack_audit_report.has_more(message):
+        if new_thread_id and headline and slack_audit_report.needs_fold(message, headline):
             _post_audit_fold(profile, job_id, message, leg_chat_id, new_thread_id)
         if new_thread_id:
             threads[platform] = new_thread_id

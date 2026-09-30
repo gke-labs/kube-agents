@@ -210,6 +210,27 @@ class HeadlineFallbackTest(unittest.TestCase):
         self.assertIsNone(sar.headline_fallback(f"Ledger: {LEDGER}", REF))
 
 
+class NeedsFoldTest(unittest.TestCase):
+    def test_a_line_shown_whole_is_not_folded(self):
+        report = f"{LINE} — {LEDGER}"
+        self.assertFalse(sar.needs_fold(report, sar.headline_from_issue(ISSUE, REF, report)))
+        self.assertFalse(sar.needs_fold(report, sar.headline_fallback(report, REF)))
+
+    def test_a_line_whose_pr_links_were_flattened_is_folded(self):
+        report = f"{LINE}, remediation PRs opened: [#12](https://github.com/acme/fleet-config/pull/12) — {LEDGER}"
+        self.assertTrue(sar.needs_fold(report, sar.headline_from_issue(ISSUE, REF, report)))
+
+    def test_a_clipped_line_is_folded(self):
+        prs = ", ".join(f"https://github.com/acme/fleet-config/pull/{n}" for n in range(1230, 1236))
+        report = f"{LINE}, remediation PRs opened: {prs} — {LEDGER}"
+        self.assertTrue(sar.needs_fold(report, sar.headline_from_issue(ISSUE, REF, report)))
+        self.assertTrue(sar.needs_fold(report, sar.headline_fallback(report, REF)))
+
+    def test_several_lines_are_folded(self):
+        report = f"Audit\n\n- a finding\n{LEDGER}"
+        self.assertTrue(sar.needs_fold(report, sar.headline_fallback(report, REF) or ""))
+
+
 class HasMoreTest(unittest.TestCase):
     def test_one_line_has_nothing_more(self):
         self.assertFalse(sar.has_more(REPORT + "\n"))

@@ -2,9 +2,10 @@
 
 Pure functions only. Nothing here imports the Hermes gateway, the Slack SDK or
 the network, so any process that posts to Slack can use it, and it can move
-with Slack ingress when it leaves the gateway. Today its one caller is the
-gateway's reactions patch (``slack_ux_reactions``), which the kanban notifier
-also reaches.
+with Slack ingress when it leaves the gateway. Its callers are the gateway's
+reactions patch (``slack_ux_reactions``), which the kanban notifier also
+reaches, and ``session_kv_server``'s cron relay, which reads only
+:func:`enabled` to gate the fleet-audit headline (``slack_audit_report``).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
