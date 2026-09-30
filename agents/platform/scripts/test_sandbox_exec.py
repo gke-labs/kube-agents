@@ -357,20 +357,31 @@ class ReadBytesTestCase(unittest.TestCase):
             self.completed(returncode=sandbox_exec._READ_UNREADABLE),
             self.completed(returncode=sandbox_exec._READ_INCOMPLETE,
                            stderr="head: read error: Input/output error"),
-            self.completed(returncode=255, stderr="bash: line 1: exec: zsh: not found"),
+            self.completed(returncode=127, stderr="bash: line 1: exec: zsh: not found"),
         ):
             with self.subTest(returncode=completed.returncode):
                 with self.assertRaises(sandbox_exec.SandboxReadFailed):
                     self.read(completed)
 
-    def test_the_failure_names_the_path_and_bounds_the_stderr(self):
+    def test_the_failure_names_the_path_and_keeps_the_end_of_the_stderr(self):
+        # The login shell's startup output comes first; the failing command's
+        # message comes last.
         noise = "x" * (sandbox_exec._READ_STDERR_CHARS * 10)
         with self.assertRaises(sandbox_exec.SandboxReadFailed) as caught:
             self.read(self.completed(returncode=sandbox_exec._READ_INCOMPLETE,
-                                     stderr=noise))
+                                     stderr=noise + "\nmktemp: No space left on device"))
         message = str(caught.exception)
         self.assertIn("/opt/data/report.md", message)
+        self.assertIn("No space left on device", message)
         self.assertLess(len(message), sandbox_exec._READ_STDERR_CHARS * 2)
+
+    def test_an_ssh_failure_run_does_not_recognise_is_unavailable(self):
+        # The script never exits 255, so the path was never looked at.
+        failure = self.completed(
+            255, stderr="mux_client_request_session: read from master failed: Broken pipe"
+        )
+        with self.assertRaises(sandbox_exec.SandboxUnavailable):
+            self.read(failure)
 
     def test_output_without_the_marker_raises(self):
         # A read that produced something this function cannot account for is
@@ -489,6 +500,13 @@ class ReadScriptTestCase(unittest.TestCase):
         )
         self.assertEqual(result.returncode, sandbox_exec._READ_ABSENT)
         self.assertEqual(result.stdout, "")
+
+    def test_a_dangling_symlink_is_unreadable_not_absent(self):
+        # Read as absent, a caller polling the path would wait on it forever.
+        target = os.path.join(self.tmp.name, "report.md")
+        os.symlink(os.path.join(self.tmp.name, "gone.md"), target)
+        result = self.run_script(self.script_for(target))
+        self.assertEqual(result.returncode, sandbox_exec._READ_UNREADABLE)
 
     def test_a_path_that_is_not_a_regular_file_exits_before_anything_else(self):
         target = os.path.join(self.tmp.name, "report.md")

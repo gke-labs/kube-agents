@@ -24,7 +24,9 @@ markers say a delivery is due — the ssh read is the one check with a cost.
 When all three hold, the script claims delivery, prints ``INVENTORY.md``
 (delivered verbatim) and sets the report aside where it was read. Otherwise it
 prints nothing, which the ``no_agent`` cron path treats as a silent run (no
-message). The first run ``RETIRE_AFTER_SECONDS`` or more after a delivery
+message). A report it cannot read, or one over ``REPORT_MAX_BYTES``, fails the
+run instead (exit 1), which the scheduler posts as an alert; an unreachable
+sandbox stays silent and is retried on the next tick. The first run ``RETIRE_AFTER_SECONDS`` or more after a delivery
 removes the two onboarding cron jobs; ``_retire_jobs`` says why the delivering
 run cannot.
 
@@ -111,8 +113,8 @@ def _read_report(data_dir: Path, in_sandbox: bool) -> bytes | None:
 
     Raises ``sandbox_exec.SandboxUnavailable`` or ``subprocess.TimeoutExpired``
     when the sandbox did not answer, ``sandbox_exec.SandboxReadFailed`` when the
-    sandbox holds something at the path it could not read, and ``OSError`` when
-    the local file could not be read.
+    read ran and did not return the report, and ``OSError`` when the local file
+    could not be read.
     """
     if in_sandbox:
         return sandbox_exec.read_bytes(

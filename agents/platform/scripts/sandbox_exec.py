@@ -103,7 +103,8 @@ TERMINAL_PRINCIPAL = "agent"
 # by writing the file differently.
 _READ_MARKER = "--- sandbox-exec read ---"
 
-# `read_bytes`' exit code for a path with nothing at it. It is the only failed
+# `read_bytes`' exit code for a path with nothing at it that the reading login
+# can see. It is the only failed
 # read that answers None: a caller polling for a file it expects has to tell
 # "not written yet" from "written and unreadable", and wait only on the first.
 _READ_ABSENT = 5
@@ -113,17 +114,17 @@ _READ_ABSENT = 5
 _READ_UNREADABLE = 3
 
 # `read_bytes`' exit code for a file that was a readable regular file when it
-# was tested and could not be read through to the cap anyway -- unlinked or
-# replaced in between, an I/O error, a mode change, no scratch space to land it
-# in. It exists because the read and the encode cannot be a pipeline: the
+# was tested and could not be read through to the cap anyway -- replaced in
+# between, an I/O error, a mode change, no scratch space to land it in; a file
+# unlinked in between exits `_READ_ABSENT` instead. It exists because the read and the encode cannot be a pipeline: the
 # pipeline's status is the encoder's, `base64` exits 0 on the empty input a
 # failed `head` hands it, and a failed read would arrive here as a successful
 # zero-byte file and be delivered as the report.
 _READ_INCOMPLETE = 4
 
-# How much of a failed read's stderr `SandboxReadFailed` carries. The login
-# shell runs first and the model owns its startup file, so the stream has no
-# natural bound.
+# How much of a failed read's stderr `SandboxReadFailed` carries, from the end.
+# The login shell runs first and the model owns its startup file, so the stream
+# has no natural bound, and the failing command's own message comes last.
 _READ_STDERR_CHARS = 200
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
@@ -160,6 +161,8 @@ _KNOWN_HOSTS_NAME = "known_hosts"
 # one failing, which is the only signal available: a wrapper that appended its
 # own exit-code sentinel to stdout would corrupt the output of every command
 # that returns anything but text.
+_SSH_FAILURE_EXIT = 255
+
 _SSH_LEVEL_ERRORS = re.compile(
     r"(ssh: connect to host|Connection (refused|closed|timed out|reset)|"
     r"Could not resolve hostname|Permission denied \(publickey|"
@@ -206,7 +209,12 @@ class SandboxMisconfigured(RuntimeError):
 
 
 class SandboxReadFailed(RuntimeError):
-    """Something is at the path in the sandbox, and `read_bytes` could not read it."""
+    """`read_bytes` reached the sandbox and did not get the file back.
+
+    Something other than a readable regular file is at the path, the read
+    failed partway, the remote shell exited non-zero, or the output did not
+    survive the trip.
+    """
 
 
 class SandboxUnavailable(RuntimeError):
@@ -465,10 +473,10 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
                config_path: str | None = None) -> bytes | None:
     """Up to `max_bytes` bytes of `path` in the sandbox, or None.
 
-    None is "there is nothing at this path". `SandboxReadFailed` is "something
-    is there and did not arrive": not a regular file, not readable, a read that
-    failed partway, or output that did not survive the trip. `SandboxUnavailable`
-    means the sandbox was never reached, which a caller may want to retry.
+    None is "nothing at this path that the reading login can see".
+    `SandboxReadFailed` is "the read ran and did not return the file".
+    `SandboxUnavailable` means the sandbox was never reached or ssh itself
+    failed, so nothing is known about the path and a caller may want to retry.
 
     Reads at most `max_bytes`, and bounds the transfer as well as the result:
     the cap is applied by `head` on the far side, so a caller asking for 32 KiB
@@ -509,16 +517,19 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     sandbox is configured. Call it behind `sandbox_enabled()`.
     """
     quoted = shlex.quote(path)
-    # A file removed between the test and the read is absent, not a fault: the
-    # re-test after a failed `head` keeps that race from reading as one.
+    # Every failed test asks again whether anything is there, so a file removed
+    # partway reads as absent rather than as a fault. `-L` keeps a dangling
+    # symlink out of "absent": left at a path a caller polls, it would read as
+    # "not written yet" forever.
+    absent = f'[ -e {quoted} ] || [ -L {quoted} ] || exit {_READ_ABSENT}'
     script = (
-        f'if [ ! -e {quoted} ]; then exit {_READ_ABSENT}; fi; '
+        f'{absent}; '
         f'if [ ! -f {quoted} ] || [ ! -r {quoted} ]; then '
-        f'exit {_READ_UNREADABLE}; fi; '
+        f'{absent}; exit {_READ_UNREADABLE}; fi; '
         f'scratch=$(mktemp) || exit {_READ_INCOMPLETE}; '
         f"trap 'rm -f \"$scratch\"' EXIT; "
         f'head -c {int(max_bytes)} -- {quoted} > "$scratch" '
-        f'|| {{ [ -e {quoted} ] || exit {_READ_ABSENT}; exit {_READ_INCOMPLETE}; }}; '
+        f'|| {{ {absent}; exit {_READ_INCOMPLETE}; }}; '
         f'printf "%s\\n" {shlex.quote(_READ_MARKER)}; '
         f'base64 -w0 < "$scratch"'
     )
@@ -528,8 +539,12 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
         return None
     if completed.returncode == _READ_UNREADABLE:
         raise SandboxReadFailed(f"{path} is not a readable regular file")
+    stderr = (completed.stderr or "").strip()[-_READ_STDERR_CHARS:]
+    if completed.returncode == _SSH_FAILURE_EXIT:
+        # The script never exits 255, so this is ssh failing with a message
+        # `run` does not recognise, and the script may never have run.
+        raise SandboxUnavailable(f"ssh failed reading {path}: {stderr}")
     if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()[:_READ_STDERR_CHARS]
         raise SandboxReadFailed(
             f"reading {path} exited {completed.returncode}: {stderr}"
         )

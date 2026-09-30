@@ -61,7 +61,8 @@ locals {
   python   = "/opt/hermes/.venv/bin/python3"
   key_like = "bootstrap-inventory-%"
   raw_file = "${local.home}/INVENTORY.raw.md"
-  # Every file the prioritization stage and delivery write, on either pod.
+  # Every file this plant, the prioritization stage and delivery write, on
+  # either pod.
   inventory = join(" ", [for name in [
     "INVENTORY.raw.md",
     "INVENTORY.raw.md.tmp",

@@ -373,6 +373,18 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.assertIn(self.SANDBOX_REPORT, err)
                 self.assertFalse((self.d / COMPLETED).exists())
 
+    def test_an_ssh_failure_the_transport_does_not_name_is_a_silent_retry(self):
+        # A rolling sandbox is not the user's problem, whichever message ssh
+        # prints for it.
+        self.read.side_effect = self._REAL_READ_BYTES
+        self.run_.return_value = subprocess.CompletedProcess(
+            ["sh"], 255, stdout="", stderr="mux_client_request_session: read from master failed: Broken pipe"
+        )
+        rc, out, err = self._run()
+        self.assertEqual((rc, out), (0, ""))
+        self.assertIn("did not answer", err)
+        self.assertFalse((self.d / COMPLETED).exists())
+
     def test_nothing_at_the_sandbox_path_is_a_silent_run(self):
         self.read.side_effect = self._REAL_READ_BYTES
         self.run_.return_value = subprocess.CompletedProcess(
