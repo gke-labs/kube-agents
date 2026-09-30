@@ -1342,215 +1342,49 @@ write_secret_env_var() {
 # are recomputed wherever they are used, and the cluster shape written here is
 # the one the interview asked for, never the probed TFVARS_CLUSTER_MODE, which
 # write_tfvars_from_state re-derives on every run.
+
 # The value install.env records for one key, empty when it records none.
-# Reads the file rather than the environment: install.env was sourced at
-# startup into these very names, and the interview has since overwritten them,
-# so the environment no longer remembers what the file said.
+#
+# Asks bash rather than parsing the file, because bash is the other reader and
+# the only one whose answer matters: load_install_env sources install.env into
+# the environment every guard here compares against. A reader that parses the
+# line instead has to reimplement the grammar bash applies to it -- assignment
+# prefixes and command words, redirections, `&>`, comments, quoting, backslash
+# escapes, parameter and command substitution, a reassignment later on the same
+# line -- and stay right about all of it. Sourcing is correct for every
+# spelling by construction, and it is what actually happens.
+#
+# `unset "$key"` first, so a value coming back means the *file* assigned it.
+# Without that the caller's own exported ENABLE_DRIFT_DETECTOR would read back
+# as a recorded line, which is the one distinction the drift guard exists to
+# make. The rest of the environment is inherited on purpose: a file recording
+# `K=$OTHER` assigns whatever the real sourcing will assign, so the reader has
+# to see the same shell the install runs in.
+#
+# Executing the file is not a new exposure. bootstrap_install_env sources it in
+# the real shell at startup, and load_install_env again on every front door; a
+# throwaway subshell that reads one key back is strictly less than either.
+#
+# `set -a` matches load_install_env, `>/dev/null 2>&1` keeps a chatty file out
+# of the caller's output, and `${!key-}` distinguishes nothing from empty --
+# both of which this returns as empty, as the callers expect.
 #
 # Always returns 0. A `return 1` for "no such key" would be the natural
 # signature and is the wrong one here: this is called from a command
 # substitution, `set -E` propagates the ERR trap into that subshell, and the
 # trap fires on the non-zero return before the caller's `||` is ever consulted
 # -- printing an abort banner per absent key. Callers test presence separately.
-#
-# The value is unquoted the way sourcing the file would unquote it, because
-# both things that write install.env quote it. write_env_var here and
-# save_env_var in scripts/installer/installer_common.sh both serialise with
-# `printf '%s=%q\n'`, and %q renders the empty string as the two-character
-# literal '' and escapes anything the shell would treat specially -- so
-# `#gke-alerts` is written `\#gke-alerts`. Comparing a quoted recorded value
-# against an unquoted environment one reports every empty key as drifted, and
-# the line the banner prints for each (`KEY=`) changes nothing, so the next run
-# reports them again. That buries the
-# one case the warning exists for.
-#
-# A hand-authored file is the other half of the same problem and the reason
-# this cannot simply re-quote the current value and compare the quoted forms:
-# an operator writes `SLACK_HOME_CHANNEL="#gke-alerts"`, which %q would render
-# `\#gke-alerts`, and the two spellings of one value would not match.
-unquote_shell_value() {
-  local raw="${1:-}"
-  case "$raw" in
-    # Single quotes are literal all the way through, which is also how %q
-    # spells the empty string.
-    "'"*"'")
-      raw="${raw#\'}"
-      printf '%s' "${raw%\'}"
-      return 0
-      ;;
-    '"'*'"')
-      raw="${raw#\"}"
-      raw="${raw%\"}"
-      ;;
-  esac
-  # Outside single quotes a backslash escapes the next character. That is how
-  # %q writes '#', a space, and every other metacharacter.
-  printf '%s' "$raw" | sed 's/\\\(.\)/\1/g'
-}
-
-# Cut a recorded line down to what bash assigns from it.
-#
-# install.env is sourced, so `TF_VAR_enable_drift_pubsub=true # keeps the
-# ingress on` puts `true` in the environment: an unquoted `#` that starts a
-# word begins a comment, and the unquoted whitespace before it is not part of
-# the value either. Reading everything after the first `=` gives
-# `true # keeps the ingress on` instead, and is_truthy -- which strips all
-# whitespace and then matches the whole string -- reads that as off. Every
-# caller here compares a recorded value against a chosen one, so the guards
-# would report a reversal the next run cannot perform, or miss one it can.
-#
-# Only an unquoted, unescaped `#`, and only one that starts a word. `x#y`,
-# `"a # b"`, `'a # b'` and `x\#y` are all values bash keeps whole, and
-# SLACK_HOME_CHANNEL is written the last of those by %q. Hence the scan rather
-# than a sed: it carries the same quote and backslash state unquote_shell_value
-# reads afterwards, and `keep` marks the last character that is quoted,
-# escaped, or not whitespace -- which drops the trailing run bash drops too.
-#
-# A comment is not the only thing that can follow the value, and the rest of
-# what can is why the value word alone is not the answer. Bash's simple
-# command is `(assignment | redirection)* [word ...]`, and it assigns to the
-# environment of the caller only when no word follows -- so what comes after
-# the blank decides whether bash assigns anything at all:
-#
-#   K=true; export K     assignment, then a second command   -> true
-#   K=true && true       same, through a list operator       -> true
-#   K=true > /dev/null   assignment with a redirection       -> true
-#   K=true 2>&1          the fd digits belong to the redirect-> true
-#   K=true &>/dev/null   and `&>` is one operator, not two   -> true
-#   K=true V=2           a second assignment is not a word   -> true
-#   export K=true V=2    `export` takes both as arguments    -> true
-#   export K=true :      and a plain word is an argument too -> true
-#   K= true              `true` is the command, K= its prefix-> unset
-#   K=a b                same shape, `a` never lands         -> unset
-#   K=true | cat         prefix of a pipeline element        -> unset
-#   K=true &             prefix of a background job          -> unset
-#   K=true 2>/dev/null | cat   a redirection does not end it -> unset
-#
-# The last five are the ones worth the code. Returning the tail for them --
-# `true`, or `a`, or `true | cat` -- tells a guard the file records a value
-# the shell that sources it will not have, and the guard then announces a
-# reversal of something that was never set. An empty answer is what
-# recorded_install_env_value returns for a key the file does not mention at
-# all, which is exactly what those spellings amount to.
-#
-# Hence two phases rather than one. The first reads the value word, stopping
-# at the unquoted blank or metacharacter that ends it. The second walks the
-# rest a word at a time and answers one question -- assignment, redirection,
-# terminator, comment, or a command word -- because no single character
-# decides it. A redirection in particular does not end the scan: `2>/dev/null`
-# leaves the value standing, and the `| cat` after it still takes it away.
-#
-# One spelling has no single right answer: `K=true &>>/dev/null` sets K under
-# bash 4 and later, where `&>>` is one operator, and leaves it unset under the
-# bash 3.2 macOS ships, which reads `&` and then `>>` and backgrounds the
-# assignment. The scan takes the former, which is what CI and every Linux
-# install run use. That is the only place it picks a version, and the parity
-# table leaves the row out rather than asserting whichever bash runs the test.
-#
-# The second argument is why that list has an `export` row. The grep in
-# recorded_install_env_value admits the prefix, and it changes the grammar
-# rather than decorating it: after `export`, every word is an argument to the
-# builtin, so `export K=true :` exports K and then fails to export `:`, where
-# the bare `K=true :` runs `:` with K in its environment alone. The word test
-# below is the only difference, and a pipeline or a background job still take
-# the value away in both -- the assignment lands in a subshell either way.
-#
-# `dropped` carries that verdict out of the loop, since awk's exit would skip
-# the print and leave the distinction to a side effect.
-bash_assigned_value() {
-  printf '%s' "${1:-}" | awk -v exported="${2:-}" '
-    # Advance past unquoted whitespace.
-    function skipblank(p,   c) {
-      while (p <= n) { c = substr($0, p, 1); if (c != " " && c != "\t") break; p++ }
-      return p
-    }
-    # Advance past one word, carrying the same quote state as phase one.
-    function skipword(p,   c, s, d) {
-      s = 0; d = 0
-      while (p <= n) {
-        c = substr($0, p, 1)
-        if (!s && c == "\\" && p < n) { p += 2; continue }
-        if (!d && c == "\x27") { s = !s; p++; continue }
-        if (!s && c == "\"") { d = !d; p++; continue }
-        if (!s && !d && (c == " " || c == "\t" || c == ";" || c == "&" || c == "|" || c == "<" || c == ">")) break
-        p++
-      }
-      return p
-    }
-    # p is the < or > of a redirection operator, past any fd digits or &.
-    # Consume the operator and the target word it applies to.
-    function skipredir(p,   c) {
-      c = substr($0, p, 1); p++
-      if (substr($0, p, 1) == c) p++     # >> or <<
-      if (substr($0, p, 1) == "&") p++   # >& or <&
-      return skipword(skipblank(p))
-    }
-    {
-      n = length($0)
-      # Phase one: the value word.
-      out = ""; keep = 0; sq = 0; dq = 0; dropped = 0; i = 1
-      while (i <= n) {
-        c = substr($0, i, 1)
-        if (!sq && c == "\\" && i < n) { out = out c substr($0, i + 1, 1); i += 2; keep = length(out); continue }
-        if (!dq && c == "\x27") { sq = !sq; out = out c; i++; keep = length(out); continue }
-        if (!sq && c == "\"") { dq = !dq; out = out c; i++; keep = length(out); continue }
-        if (!sq && !dq && (c == " " || c == "\t" || c == ";" || c == "&" || c == "|" || c == "<" || c == ">")) break
-        out = out c; i++; keep = length(out)
-      }
-      # Phase two: what follows decides whether bash assigns it.
-      while (i <= n) {
-        i = skipblank(i)
-        if (i > n) break
-        c = substr($0, i, 1)
-        # A comment or a terminator: the value stands.
-        if (c == "#" || c == ";") break
-        if (c == "&") {
-          if (substr($0, i + 1, 1) == "&") break              # && ends the command
-          if (substr($0, i + 1, 1) == ">") { i = skipredir(i + 1); continue }
-          dropped = 1; break                                  # a background job
-        }
-        if (c == "|") {
-          if (substr($0, i + 1, 1) == "|") break              # || ends the command
-          dropped = 1; break                                  # a pipeline element
-        }
-        if (c == ">" || c == "<") { i = skipredir(i); continue }
-        # Digits then > or < are a redirection, not a word.
-        j = i
-        while (j <= n && substr($0, j, 1) ~ /[0-9]/) j++
-        if (j > i && j <= n && (substr($0, j, 1) == ">" || substr($0, j, 1) == "<")) { i = skipredir(j); continue }
-        # A second assignment is not a word either: it joins this one. Under
-        # `export` nothing here is a command word at all.
-        if (exported != "") { i = skipword(i); continue }
-        if (c ~ /[A-Za-z_]/) {
-          j = i
-          while (j <= n && substr($0, j, 1) ~ /[A-Za-z0-9_]/) j++
-          if (j <= n && substr($0, j, 1) == "=") { i = skipword(j); continue }
-        }
-        dropped = 1; break                                    # a command word
-      }
-      if (!dropped) printf "%s", substr(out, 1, keep)
-    }
-  '
-}
-
 recorded_install_env_value() {
-  local file="${1:-}" key="${2:-}" line="" exported=""
-  [ -n "$file" ] && [ -f "$file" ] || return 0
-  # install.env.example tells the operator `export K=V` is harmless, and every
-  # other reader of the file honours that: save_env_var, live_test_lease.py and
-  # project_config.py all skip an optional `export`. Matching it here keeps this
-  # reader in step -- missing the prefix skips the key silently, and in the
-  # direction of no warning at all.
-  # The `${line#*=}` below strips through the first `=`, so the longer prefix
-  # needs nothing further -- but bash_assigned_value has to be told it was
-  # there, because it decides what a word after the value means.
-  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
-  [ -n "$line" ] || return 0
-  case "${line#"${line%%[![:space:]]*}"}" in
-    export[[:space:]]*) exported="export" ;;
-  esac
-  line="${line#*=}"
-  unquote_shell_value "$(bash_assigned_value "$line" "$exported")"
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 0
+  bash -c '
+    unset "$2"
+    set -a
+    # shellcheck disable=SC1090
+    . "$1" >/dev/null 2>&1 || true
+    set +a
+    printf "%s" "${!2-}"
+  ' _ "$file" "$key" 2>/dev/null || true
 }
 
 # Say so when an interactive answer changed something the file still records
@@ -1867,7 +1701,17 @@ bootstrap_install_env_file() {
       drift_ingress_keeper_now="$drift_ingress_keeper_file"
     elif is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
       drift_ingress_keeper_now="TF_VAR_enable_drift_pubsub in this shell's environment"
-      drift_ingress_caveat=" ${destination} does not record it, so the first run from a shell without that export destroys them along with the audit records retained there."
+      # Only when the file does not record the detector on. With
+      # ENABLE_DRIFT_DETECTOR=true in the file, the run from a clean shell this
+      # caveat warns about re-reads that line and writes both drift tfvars keys,
+      # which provisions the ingress -- so the trio stands whether or not the
+      # export came along, and the caveat would contradict the sentence it is
+      # spliced into, which says in the next breath that a later run starts the
+      # detector again. A recorded `false`, or no line at all, leaves the export
+      # as the only thing holding the trio up, and then it is the whole warning.
+      if ! is_truthy "${drift_detector_recorded:-false}"; then
+        drift_ingress_caveat=" ${destination} does not record it, so the first run from a shell without that export destroys them along with the audit records retained there."
+      fi
     fi
     if [ -n "$drift_detector_turning_off" ]; then
       if [ -n "$drift_ingress_keeper_now" ]; then

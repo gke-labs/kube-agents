@@ -6449,6 +6449,24 @@ echo "$rc" > "{rc_file}"
         self.assertIn("the wrapped output", log_file.read_text())
 
 
+def _env_without_ambient_drift_keys(overrides=None, asked_for=None):
+    """get_isolated_test_env, minus the two keys the drift guards read.
+
+    get_isolated_test_env starts from os.environ, so anything exported in the
+    shell that runs pytest reaches the script under test. For most keys that
+    is harmless. These two are the guards' own inputs: an exported
+    ENABLE_DRIFT_DETECTOR arrives at parse_args indistinguishable from an
+    operator's choice, and every assertion below about the unset default then
+    turns on whose machine is running. Dropped unless the caller asked for
+    them, in which case the caller's value is the point of the test.
+    """
+    env = get_isolated_test_env(overrides=overrides)
+    for key in ("ENABLE_DRIFT_DETECTOR", "TF_VAR_enable_drift_pubsub"):
+        if key not in (asked_for or {}):
+            env.pop(key, None)
+    return env
+
+
 class DomainScopedFlagsTest(unittest.TestCase):
     """The CLI surface issue #1540 defines.
 
@@ -6480,7 +6498,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
                 ["bash", "-c", script],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(overrides=overrides),
+                env=_env_without_ambient_drift_keys(overrides, env),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -7032,56 +7050,71 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertNotIn("applies to this run only", combined)
 
-    # Spellings bash resolves differently from "everything after the first =".
-    # The comment cases are the finding; the rest are what a fix for it must
-    # not break -- a '#' mid-word, inside either quote, or backslash-escaped,
-    # which is how %q writes SLACK_HOME_CHANNEL="#gke-alerts".
+    # Every spelling a review round found, as (key, what the file says). The
+    # reader sources the file rather than parsing it, so this no longer has to
+    # anticipate anything -- it is the regression record of what a parser got
+    # wrong, kept because a future reader that stops sourcing would have to
+    # rediscover the whole list.
     #
-    # L through S are the other half: a word after the value, where what the
-    # word is decides whether bash assigns anything at all. L to O leave the
-    # assignment standing, P to S make it a one-command prefix and the key
-    # stays unset -- which the reader has to spell as the empty string it
-    # returns for a key the file never mentions, or a guard announces the
-    # reversal of a value nobody has.
+    # Three groups. A to K are where the value ends: a '#' starts a comment
+    # only at the start of a word, not mid-word, inside either quote, or
+    # backslash-escaped, which is how %q writes SLACK_HOME_CHANNEL="#gke-alerts".
+    # L to AD are whether bash assigns at all: a word after the value can make
+    # the assignment a one-command prefix and leave the key unset (P to S, AC),
+    # unless the word is a second assignment (T) or an argument to `export`
+    # (U, W); a redirection leaves it standing but does not end the command, so
+    # a pipeline or a background job after one still takes it away (X, Y); and
+    # `&>` and `>&` are single operators, not the `&` that backgrounds (Z, AB).
+    # AE onwards are the ones only a shell can answer: expansions, substitution,
+    # a reassignment further down, `declare` and `readonly`, a continued line,
+    # and two keys off one `export`.
     #
-    # T onwards are the combinations no single character settles. A second
-    # assignment is not a command word (T), `export` makes even a plain word
-    # an argument rather than a command (U, W), a redirection leaves the value
-    # standing but does not end the command, so a pipeline or a background job
-    # after one still takes it away (X, Y) -- and `&>` and `>&` are single
-    # operators that must not be read as the `&` that backgrounds (Z, AB).
-    # `&>>` is the one spelling left out on purpose: bash 4 and later read it
-    # as one operator and bash 3.2 as two, so the row would assert whichever
-    # bash runs the test. bash_assigned_value's comment says which it takes.
+    # `&>>` is left out. bash 4 reads it as one operator and bash 3.2 -- which
+    # is what macOS ships -- as `&>` followed by a stray `>`, a syntax error
+    # that aborts the source at that line and takes every row after it with it.
+    # The reader and load_install_env still agree about such a file, because
+    # both of them source it and both stop in the same place; what cannot go in
+    # this table is a row whose effect is the rest of the table.
     QUOTING_SPELLINGS = [
-        "A=true # comment",
-        "B=#hash",
-        "C=x#y",
-        'D="a # b"',
-        "E=x\\#y",
-        "F='a # b'",
-        "G=true   ",
-        'H="a "',
-        "I=trailing\\ space\\ ",
-        "J='a' # after a quote",
-        "K=  ",
-        "L=true; export L",
-        "M=true && true",
-        "N=true > /dev/null",
-        "O=true 2>/dev/null",
-        "P= true",
-        "Q=true true",
-        "R=true | cat",
-        "S=true &",
-        "T=true SECOND_ASSIGNMENT=2",
-        "export U=true ANOTHER_ASSIGNMENT=2",
-        "export W=true ANOTHER_ASSIGNMENT",
-        "X=true 2>/dev/null | cat",
-        "Y=true >/dev/null &",
-        "Z=true &>/dev/null",
-        "AB=true >&2",
-        "AC=true THIRD_ASSIGNMENT=2 true",
-        "AD=a>/dev/null",
+        ("A", "A=true # comment"),
+        ("B", "B=#hash"),
+        ("C", "C=x#y"),
+        ("D", 'D="a # b"'),
+        ("E", "E=x\\#y"),
+        ("F", "F='a # b'"),
+        ("G", "G=true   "),
+        ("H", 'H="a "'),
+        ("I", "I=trailing\\ space\\ "),
+        ("J", "J='a' # after a quote"),
+        ("K", "K=  "),
+        ("L", "L=true; export L"),
+        ("M", "M=true && true"),
+        ("N", "N=true > /dev/null"),
+        ("O", "O=true 2>/dev/null"),
+        ("P", "P= true"),
+        ("Q", "Q=true true"),
+        ("R", "R=true | cat"),
+        ("S", "S=true &"),
+        ("T", "T=true SECOND_ASSIGNMENT=2"),
+        ("U", "export U=true ANOTHER_ASSIGNMENT=2"),
+        ("W", "export W=true ANOTHER_ASSIGNMENT"),
+        ("X", "X=true 2>/dev/null | cat"),
+        ("Y", "Y=true >/dev/null &"),
+        ("Z", "Z=true &>/dev/null"),
+        ("AB", "AB=true >&2"),
+        ("AC", "AC=true THIRD_ASSIGNMENT=2 true"),
+        ("AD", "AD=a>/dev/null"),
+        ("AE", "AE=$HOME"),
+        ("AF", 'AF="${NOPE:-true}"'),
+        ("AG", "AG=$(printf true)"),
+        ("AH", "AH=`printf true`"),
+        ("AJ", "AJ=first\nAJ=true"),
+        ("AK", "declare -x AK=true"),
+        ("AL", "readonly AL=true"),
+        ("AM", "AM=one\\\ntwo"),
+        ("AN", "AN=~"),
+        ("AQ", "export AQ=true AR=2"),
+        ("AR", "export AQ=true AR=2"),
     ]
 
     def test_the_recorded_value_is_what_sourcing_the_file_would_assign(self):
@@ -7089,20 +7122,19 @@ class DomainScopedFlagsTest(unittest.TestCase):
 
         load_install_env sources install.env, so every guard that compares a
         recorded value against a chosen one is comparing against what bash put
-        in the environment. Asserting the reader against bash rather than
-        against a list of expected strings is what makes this hold for the
-        spelling nobody thought of: the two readers cannot disagree without
-        this failing.
+        in the environment. recorded_install_env_value sources it too, which is
+        what makes the two agree on the spelling nobody thought of; this is the
+        test that the sourcing stays sourcing, and it fails on the day someone
+        replaces it with a parser that is right about the table and wrong about
+        the next line anyone writes.
         """
-        # removeprefix because the reader's grep admits `export K=V` and two
-        # rows spell it that way; without it the key here would be `export U`.
-        keys = [
-            line.split("=", 1)[0].removeprefix("export ")
-            for line in self.QUOTING_SPELLINGS
-        ]
+        keys = [key for key, _ in self.QUOTING_SPELLINGS]
+        # dict.fromkeys: AQ and AR are two keys off one line, and writing that
+        # line twice would be harmless but puzzling to read.
+        lines = list(dict.fromkeys(line for _, line in self.QUOTING_SPELLINGS))
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "spellings.env"
-            env_file.write_text("\n".join(self.QUOTING_SPELLINGS) + "\n")
+            env_file.write_text("\n".join(lines) + "\n")
             body = "\n".join(
                 [
                     f'for k in {" ".join(keys)}; do',
@@ -7252,13 +7284,19 @@ class DomainScopedFlagsTest(unittest.TestCase):
         clears NAMESPACE and the five SCOPE_ keys, upgrade.sh three more. So an
         exported TF_VAR_enable_drift_pubsub keeps the sink, topic and
         subscription through this run exactly as a file line would, and telling
-        that operator their audit records are being deleted is false. What
-        differs is how long it holds, which the caveat carries: the file records
-        nothing, so the first run from a shell without the export takes the trio
-        after all. The turning-on direction is the contrast and stays as it was
+        that operator their audit records are being deleted is false. The
+        turning-on direction is the contrast and stays as it was
         (test_an_exported_tf_var_ingress_is_still_reported_as_destroyed) --
         that sentence is about a later run from an unknown shell, where only
         the file line counts.
+
+        No caveat here, and that is the assertion. The file records the
+        detector on, so the run from a clean shell the caveat warns about
+        re-reads that line, writes both drift tfvars keys and provisions the
+        ingress -- which is what the rest of this same sentence promises when
+        it says a later run starts the detector again. The caveat holds only
+        where the shell is the last thing holding the trio up, which is the
+        test below.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -7274,8 +7312,39 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("it stops the detector now", combined)
             self.assertIn("keeps the Log Router sink", combined)
             self.assertIn("this shell's environment", combined)
+            self.assertNotIn("does not record it", combined)
+            self.assertNotIn("destroys them", combined)
+
+    def test_the_caveat_lands_when_the_shell_is_holding_up_both_halves(self):
+        """The one arrangement where the next clean shell really does take it.
+
+        Nothing in install.env: the detector is on because this shell exports
+        ENABLE_DRIFT_DETECTOR, and the ingress stands because the same shell
+        exports TF_VAR_enable_drift_pubsub. A later run from anywhere else
+        reads neither, writes neither tfvars key, and enable_drift_pubsub falls
+        to its false default -- so the caveat is the whole warning, and the
+        sentence it joins names the export rather than the file as what brings
+        the detector back.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'load_install_env "{destination}"\n'
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+                env={
+                    "ENABLE_DRIFT_DETECTOR": "true",
+                    "TF_VAR_enable_drift_pubsub": "true",
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("it stops the detector now", combined)
+            self.assertIn("this shell's environment", combined)
             self.assertIn("does not record it", combined)
             self.assertIn("from a shell without that export destroys them", combined)
+            self.assertIn("this shell exports", combined)
 
     def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):
         """Empty through resolve_shared_defaults is what keeps this quiet.
@@ -7305,7 +7374,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
                      "resolve_shared_defaults\n"
                      'printf "%s" "$PARAM_ENABLE_DRIFT_DETECTOR"'],
                     capture_output=True, text=True, cwd=str(_REPO_ROOT),
-                    env=get_isolated_test_env(),
+                    env=_env_without_ambient_drift_keys(),
                 ).stdout,
                 "resolve_shared_defaults must leave this one empty",
             )
