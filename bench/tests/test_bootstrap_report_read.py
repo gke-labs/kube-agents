@@ -148,6 +148,20 @@ def test_a_report_left_on_the_sandbox_unclaimed_fails(pods: Path) -> None:
     assert "did not read the report off the sandbox" in result.reason
 
 
+def test_a_dangling_report_symlink_reads_as_a_report_delivery_did_not_take(pods: Path) -> None:
+    (pods / "INVENTORY.md").symlink_to(pods / "gone")
+    result = _verify()
+    assert result.raw == {"claimed": False, "report": True, "delivered": False}
+    assert "did not read the report off the sandbox" in result.reason
+
+
+def test_a_dangling_marker_reads_as_unclaimed(pods: Path) -> None:
+    _plant(pods, "INVENTORY.md")
+    (pods / ".bootstrap_completed").symlink_to(pods / "gone")
+    result = _verify()
+    assert result.raw == {"claimed": False, "report": True, "delivered": False}
+
+
 def test_no_report_at_all_fails_as_nothing_to_deliver(pods: Path) -> None:
     result = _verify()
     assert result.status == "fail"

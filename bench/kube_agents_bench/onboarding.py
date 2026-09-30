@@ -34,7 +34,7 @@ import logging
 import os
 import shlex
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any, Literal
 
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
@@ -204,21 +204,28 @@ def read_items(shell: Callable[[str, float], str], timeout: float) -> tuple[Item
     return "present", reply[marker + len(ITEMS_PRESENT) :].lstrip("\n"), ""
 
 
-def files_command(paths: list[str]) -> str:
-    """The ``sh -c`` line that prints ``present`` or ``absent`` and the path, per path."""
-    quoted = " ".join(shlex.quote(p) for p in paths)
-    return (
-        f'for f in {quoted}; do if [ -e "$f" ]; then echo "{FILE_PRESENT} $f"; '
-        f'else echo "{FILE_ABSENT} $f"; fi; done; echo {FILES_READ}'
-    )
+def files_command(paths: list[str], links: Collection[str] = ()) -> str:
+    """The ``sh -c`` line that prints ``present`` or ``absent`` and the path, per path.
+
+    A path in ``links`` is also present as a dangling symlink.
+    """
+    tests = []
+    for path in paths:
+        quoted = shlex.quote(path)
+        exists = f"[ -e {quoted} ] || [ -L {quoted} ]" if path in links else f"[ -e {quoted} ]"
+        tests.append(f'if {exists}; then echo "{FILE_PRESENT}" {quoted}; else echo "{FILE_ABSENT}" {quoted}; fi')
+    return "; ".join([*tests, f"echo {FILES_READ}"])
 
 
-def read_files(shell: Callable[[str, float], str], paths: list[str], timeout: float) -> dict[str, bool] | None:
+def read_files(
+    shell: Callable[[str, float], str], paths: list[str], timeout: float, links: Collection[str] = ()
+) -> dict[str, bool] | None:
     """Which of ``paths`` exist where ``shell`` runs, or ``None`` if the read failed.
 
-    A reply missing the closing sentinel, or a path, is a failed read.
+    A path in ``links`` that is a dangling symlink exists. A reply missing the
+    closing sentinel, or a path, is a failed read.
     """
-    lines = shell(files_command(paths), timeout).splitlines()
+    lines = shell(files_command(paths, links), timeout).splitlines()
     if not lines or lines[-1].strip() != FILES_READ:
         return None
     seen: dict[str, bool] = {}

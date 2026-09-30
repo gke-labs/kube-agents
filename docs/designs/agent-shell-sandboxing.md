@@ -1234,11 +1234,10 @@ narrowed by anything.
 as well, named in 59 files across `agents/`, and the alternative was a sandbox path that
 no existing SOP, skill or model-written script would resolve. The cost is one path naming
 two different directories on two different volumes, and one rule that follows from it:
-**no handoff may assume write-here-read-there.** Nothing is copied between them at runtime, so a
-script that writes `/opt/data/x` in the agent pod and reads
+**no handoff may assume write-here-read-there.** Only what the sentences below name crosses between
+them, so a script that writes `/opt/data/x` in the agent pod and reads
 `/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
-the path itself looking wrong. What does cross goes sandbox-to-gateway and is read by
-name. A file a finished card names in `artifacts` is copied for the length of its
+the path itself looking wrong. What crosses sandbox-to-gateway is read by name. A file a finished card names in `artifacts` is copied for the length of its
 delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
 built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once

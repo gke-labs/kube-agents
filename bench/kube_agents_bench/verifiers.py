@@ -2617,15 +2617,18 @@ class BootstrapReportReadVerifier(_OnboardingPollVerifier):
         # the job never occupies; a sandbox read that matches the one before the
         # agent-pod read shows the sandbox did not change while the agent pod was read.
         files = [onboarding.REPORT_FILE, onboarding.DELIVERED_FILE]
+        # The delivery job fails on a dangling report symlink, so it is a report here; a
+        # dangling marker stays unclaimed, since the job can neither stat it nor claim over it.
+        links = [onboarding.REPORT_FILE]
         unreadable = f"{onboarding.sandbox_pod()} could not be read (kubectl exec failed or the command did not run)"
-        sandbox = onboarding.read_files(onboarding.sandbox_shell, files, read_timeout)
+        sandbox = onboarding.read_files(onboarding.sandbox_shell, files, read_timeout, links)
         if sandbox is None:
             return "error", unreadable, None
         for _ in range(_REPORT_READ_ATTEMPTS):
             agent = onboarding.read_files(onboarding.agent_shell, [onboarding.COMPLETED_MARKER], read_timeout)
             if agent is None:
                 return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
-            before, sandbox = sandbox, onboarding.read_files(onboarding.sandbox_shell, files, read_timeout)
+            before, sandbox = sandbox, onboarding.read_files(onboarding.sandbox_shell, files, read_timeout, links)
             if sandbox is None:
                 return "error", unreadable, None
             if sandbox == before:
