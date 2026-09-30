@@ -63,6 +63,7 @@ CHECK_WARM_CACHE = "warm_cache"
 CHECK_GKE_AND_STATE = "gke_and_state"
 CHECK_SEEDED_FLEET = "seeded_fleet_fixtures"
 CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
+CHECK_GITOPS_DECLARATION = "gitops_declaration"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
@@ -80,6 +81,7 @@ CHECK_IDS = (
     CHECK_GKE_AND_STATE,
     CHECK_SEEDED_FLEET,
     CHECK_GITHUB_REPO_AND_APP,
+    CHECK_GITOPS_DECLARATION,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
@@ -100,6 +102,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GKE_AND_STATE: "GKE Clusters & Terraform State",
     CHECK_SEEDED_FLEET: "Seeded Fleet Fixtures",
     CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
+    CHECK_GITOPS_DECLARATION: "GitOps Declared-Intent Note",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
@@ -108,7 +111,7 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
 # The checks that read GCP, and so need a gcloud credential before they run:
 # every check but the mapping, which reads the checkout and the remote ref,
 # and the GitHub check, whose reads are all `gh`.
@@ -273,10 +276,33 @@ GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # The declared-intent note provisioning seeds after the first commit
 # (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
 # obtainability-declared-intent-no-finding case fails on a project whose
-# repository lacks it. The content is not repeated here: the repair the
-# verifier prints points at the script's copy.
+# repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
 GITOPS_INTENT_NOTE_MESSAGE = "Declare notification-relay's missing PodDisruptionBudget as intended"
+# The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
+# verifier prints is self-contained and the check can read the file back
+# against it; a test pins the two copies to each other.
+GITOPS_INTENT_NOTE_CONTENT = """---
+type: decision
+title: notification-relay runs without a PodDisruptionBudget on purpose
+declares:
+  - check: no-pdb
+    namespace: seeded-intent
+    object: Deployment/notification-relay
+---
+
+`notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
+it is a stateless relay whose clients retry, and a budget would only slow node drains. The
+obtainability audit lists this posture under Declared intent rather than as a finding."""
+# The lines the audit's parser reads (audit_report.py parse_declarations): the
+# check, the namespace and the object of the one declaration. A file that has
+# the path but not these declares nothing, and the case fails on that project
+# with the verifier green -- which is why presence alone is not the check.
+GITOPS_INTENT_NOTE_DECLARES = (
+    "check: no-pdb",
+    "namespace: seeded-intent",
+    "object: Deployment/notification-relay",
+)
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -2268,37 +2294,69 @@ def gitops_seed_command(repo_slug: str) -> str:
     )
 
 
-def gitops_note_seed_command(repo_slug: str) -> str:
-    """The `gh api` call that puts the declared-intent note into a GitOps repository."""
+def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
+    """The `gh api` call that writes the declared-intent note, replacing it when `sha` names the copy there.
+
+    Self-contained on purpose: the note's text is inline, so the command works in
+    an operator's shell, where the provisioning script's variable does not exist.
+    """
+    replace = f"-f sha={sha} " if sha else ""
     return (
         f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH} "
-        f"-f message=\"{GITOPS_INTENT_NOTE_MESSAGE}\" "
-        f"-f content=\"$(printf '%s\\n' \"$GITOPS_INTENT_NOTE_CONTENT\" | base64 | tr -d '\\n')\" "
-        f"(GITOPS_INTENT_NOTE_CONTENT is the value in scripts/provision_ci_pool_project.sh)"
+        f"-f message=\"{GITOPS_INTENT_NOTE_MESSAGE}\" {replace}"
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_INTENT_NOTE_CONTENT}' | base64 | tr -d '\\n')\""
     )
 
 
 def check_gitops_declaration(project_id: str) -> CheckResult:
-    """Verify the GitOps repository carries the declared-intent note.
+    """Verify the GitOps repository carries the declared-intent note, with the declaration in it.
 
     Provisioning seeds it for a new project, and the provisioning script is not
     re-run on a registered one, so a project registered before the note existed
-    fails here until someone runs the printed command. A read that fails for a
-    reason other than 404 is unverified, not absent.
+    fails here until someone runs the printed command. The body is read back,
+    not just the path: a file without the `declares:` lines declares nothing,
+    and the case then fails on the project with this check green. A read that
+    fails for a reason other than 404 is unverified, not absent, as every other
+    read in this script is; a 404 names both of its readings, because gh
+    answers it for a private repository this token cannot see as well as for a
+    file that is not there.
     """
-    name = "GitOps Declared-Intent Note"
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
     repo_slug = f"gke-agentic/{project_id}-infra"
-    rc, _out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
-    if rc == 0:
-        return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH}")
-    if _GITHUB_NOT_FOUND.search(err or ""):
+    rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
+    if rc != 0:
+        if _GITHUB_NOT_FOUND.search(err or ""):
+            return CheckResult(
+                name,
+                False,
+                f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, or this token cannot read the repository "
+                f"(gh answers 404 to both; the repository check above says which). If the repository is "
+                f"readable, obtainability-declared-intent-no-finding fails on this project until the note "
+                f"is seeded: {gitops_note_seed_command(repo_slug)}",
+            )
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")],
+            read=False,
+        )
+    try:
+        payload = _load_json(out)
+        body = base64.b64decode(payload.get("content") or "").decode("utf-8")
+        sha = str(payload.get("sha") or "")
+    except Exception as exc:
+        return CheckResult(name, False, f"Could not parse the contents of {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {exc}")
+    missing = [line for line in GITOPS_INTENT_NOTE_DECLARES if line not in body]
+    if not body.startswith("---\n") or missing:
         return CheckResult(
             name,
             False,
-            f"{repo_slug} has no {GITOPS_INTENT_NOTE_PATH}, so obtainability-declared-intent-no-finding "
-            f"fails on this project. Seed it: {gitops_note_seed_command(repo_slug)}",
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} but it does not declare no-pdb for "
+            f"Deployment/notification-relay in seeded-intent (frontmatter lacks: {', '.join(missing) or 'the --- opening'}), "
+            f"so the audit reads no declaration from it. Replace it: {gitops_note_seed_command(repo_slug, sha)}",
         )
-    return CheckResult(name, False, f"Could not read {GITOPS_INTENT_NOTE_PATH} in {repo_slug}: {(err or '').strip()}")
+    return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration")
 
 
 def check_github_repo_and_app(
@@ -3290,6 +3348,7 @@ def run_checks(
     run(CHECK_GKE_AND_STATE, lambda: check_gke_and_state(project_id))
     run(CHECK_SEEDED_FLEET, lambda: check_seeded_fleet_fixtures(project_id))
     run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
+    run(CHECK_GITOPS_DECLARATION, lambda: check_gitops_declaration(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))

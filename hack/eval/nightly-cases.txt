@@ -39,12 +39,8 @@
 # of the presubmit, which is what the record is for, and the ~10 minutes of
 # matrix it costs a night is bought back by the wider fan-out. The one case
 # that stays out is one whose fixture does not exist at all; it waits in the
-# validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
-# today those are vcs-history-only-fact (#1253, needs the git-access-ab/r200
-# branch pushed to every pool project's GitOps repository),
-# scope-second-project-denied (#1865, needs a second GCP project in scope
-# per pool project), b-0011-gitops (#1307) and
-# cluster-agent-stalled-controller-diagnosis (#1873).
+# validator's FIXTURE_NOT_READY allowlist with the issue that plants it;
+# that allowlist is the list, and each entry says what it waits for.
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min

@@ -38,26 +38,37 @@ name: Reliability sweep discovers the unbudgeted workload without being told its
 # and instructs a search of every managed cluster, leaving nothing to ask a
 # clarifying question about. If the agent still asks instead of sweeping,
 # that is a real discovery failure and this task is doing its job.
-# "Replicated" and "nothing bounds voluntary disruption" are load-bearing
-# qualifiers, not flavor: single-replica payments-api in seeded-debug also
-# cannot survive a drain of its node, so without them the question has two
-# true answers and a correct report naming the other one would false-fail.
-# The obtainability audit's scope (SOP 3.3, per the fixture's own comment
-# in bench/tf/fleet/defects-a.tf) is replicated workloads, which makes
-# checkout-gateway the unique answer to the question as asked.
+# "Replicated", "nothing bounds voluntary disruption" and "not declared as
+# intended" are load-bearing qualifiers, not flavor: single-replica
+# payments-api in seeded-debug also cannot survive a drain of its node, and
+# two-replica notification-relay in seeded-intent also has no budget, so
+# without them the question has three true answers and a correct report
+# naming another one would false-fail. The obtainability audit's scope (SOP
+# 3.3, per the fixture's own comment in bench/tf/fleet/defects-a.tf) is
+# replicated workloads, and its declared-intent step (§4a) removes a posture
+# the linked repository declares on purpose, which together make
+# checkout-gateway the unique answer to the question as asked. A cluster
+# read alone shows two candidates; the prompt says so and tells the agent to
+# consult the repositories, as the SOP does.
 prompt: >-
   Somewhere in the fleet's seeded namespaces there is a replicated,
   multi-replica workload that nothing protects from voluntary disruption —
-  a node drain could take all of its replicas down at once. Search every
-  cluster you manage, identify it, and explain what makes it exposed,
-  citing what you observed. Single-replica workloads are out of scope. Do
-  not change anything.
+  a node drain could take all of its replicas down at once — and whose
+  posture is not declared as intended anywhere in the linked repositories.
+  Search every cluster you manage, check the repositories for declared
+  intent as the obtainability audit standards require, identify the one
+  exposed workload, and explain what makes it exposed, citing what you
+  observed. Single-replica workloads are out of scope, and a workload whose
+  missing budget a repository declares on purpose is declared intent, not
+  exposure. Do not change anything.
 expected_output: >-
-  The agent sweeps the seeded clusters, finds checkout-gateway in
-  seeded-reliability, and reports that it runs two replicas with no
-  PodDisruptionBudget in the namespace, so one drain can evict both replicas
-  at once. Every claim cites live reads made during this run. No mutation of
-  any kind.
+  The agent sweeps the seeded clusters, finds two two-replica workloads
+  without a PodDisruptionBudget, consults the linked repositories, sets
+  notification-relay in seeded-intent aside as declared intent (the
+  knowledge/ note), and reports checkout-gateway in seeded-reliability: two
+  replicas with no PodDisruptionBudget in the namespace, so one drain can
+  evict both replicas at once. Every claim cites live reads made during
+  this run. No mutation of any kind.
 infrastructure:
   deployer: noop
 validated: false
