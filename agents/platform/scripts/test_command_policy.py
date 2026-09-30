@@ -6,9 +6,11 @@ from pathlib import Path
 from command_policy import (
     evaluate,
     GCLOUD_READ_COMMANDS,
+    _GCLOUD_FILE_WRITE_FLAGS,
     _GCLOUD_IDENTITY_FLAGS,
     _IMPERSONATION_FLAGS,
     _KUBECTL_FILE_WRITE_FLAGS,
+    _KUBECTL_IDENTITY_FLAGS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -1896,30 +1898,37 @@ class RefusalsSayTheBoundaryIsFinal(unittest.TestCase):
                 self.assertIn(self.FLAG_PHRASE, decision.message)
                 self.assertNotIn(self.ACTION_PHRASE, decision.message)
 
+    # Every flag refusal, with the set its rule refuses. A rule whose message
+    # names a subset closes the gap with a catch-all phrase; the phrase is
+    # listed here so the test knows which names may be left out and which may
+    # not, and a flag added to a set fails until its message names it or the
+    # message carries the catch-all.
+    FLAG_RULE_SETS = (
+        (["kubectl", "get", "pods", "--as-uid", "1000"], _IMPERSONATION_FLAGS, None),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "get", "pods"], {"--kuberc"}, None),
+        (["kubectl", "get", "pods", "--client-key=/k"], _KUBECTL_IDENTITY_FLAGS,
+         "and the other credential flags"),
+        (["kubectl", "get", "pods", "--output-directory=/tmp/x"], _KUBECTL_FILE_WRITE_FLAGS, None),
+        (["gcloud", "--flags-file=/workspace/f.yaml", "info"], {"--flags-file"}, None),
+        (["gcloud", "info", "--credential-file-override=/k.json"], _GCLOUD_IDENTITY_FLAGS,
+         "and the other identity flags"),
+        (["gcloud", "info", "--log-http-log-file=/tmp/l"], _GCLOUD_FILE_WRITE_FLAGS, None),
+    )
+
     def test_a_flag_refusal_names_every_flag_its_rule_refuses(self):
-        # The notice says "retried without the flag", so the message must name
-        # the flag the caller passed. A refusal that names a subset of its
-        # rule's set leaves "the flag" without an antecedent for the rest; the
-        # name lists are derived from the sets so a flag added to a set fails
-        # here until the message names it. The kubectl identity set is wider
-        # than its message and closes the gap with "and the other credential
-        # flags"; the gcloud identity message uses the same catch-all, so it
-        # is held to the three it names plus that phrase.
-        for argv, flags, catch_all in (
-            (["kubectl", "get", "pods", "--as-uid", "1000"], _IMPERSONATION_FLAGS, None),
-            (["kubectl", "get", "pods", "--output-directory=/tmp/x"],
-             _KUBECTL_FILE_WRITE_FLAGS, None),
-            (["gcloud", "info", "--credential-file-override=/k.json"],
-             {"--access-token-file", "--configuration", "--account"},
-             "and the other identity flags"),
-        ):
+        # The notice says "retried without the flag", so the message must let
+        # the caller identify the flag it passed: every flag in the rule's set
+        # is named as a whole word (so `--as` is not satisfied by `--as-uid`),
+        # or the message carries the rule's catch-all phrase.
+        for argv, flags, catch_all in self.FLAG_RULE_SETS:
             with self.subTest(argv=argv):
                 message = evaluate(argv).message
-                for flag in sorted(flags):
-                    self.assertIn(flag, message)
-                if catch_all:
+                named = {f for f in flags if re.search(rf"(?<![\w-]){re.escape(f)}(?![\w-])", message)}
+                if catch_all is None:
+                    self.assertEqual(set(flags), named, f"unnamed: {sorted(set(flags) - named)}")
+                else:
                     self.assertIn(catch_all, message)
-                    self.assertTrue(_GCLOUD_IDENTITY_FLAGS > set(flags))
+                    self.assertTrue(named, "a catch-all is not a substitute for naming none")
 
     def test_refusals_a_respelling_answers_do_not_claim_a_boundary(self):
         # Re-running with a spelling the policy accepts is the legitimate

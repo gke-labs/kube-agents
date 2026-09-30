@@ -1235,10 +1235,10 @@ def evaluate(argv: list[str]) -> Decision:
                 allowed=False,
                 rule_id="gcp.file-write-forbidden",
                 message=(
-                    "This flag writes a file inside the credential proxy's own "
-                    "container, not the agent workspace. Drop it; where the "
-                    "command offers the same content on standard output, "
-                    "redirect that instead. "
+                    "--output-path and --log-http-log-file write a file inside "
+                    "the credential proxy's own container, not the agent "
+                    "workspace. Drop the flag; where the command offers the same "
+                    "content on standard output, redirect that instead. "
                     + _FLAG_BOUNDARY_NOTICE
                 ),
                 offending_flag=write_flag,
