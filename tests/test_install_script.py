@@ -6992,9 +6992,12 @@ class DomainScopedFlagsTest(unittest.TestCase):
         deleted is how a warning gets discounted.
 
         The guard reads the line out of the file. load_install_env is called
-        anyway because main() calls it first and its `set -a` puts the same
-        value in the environment: the real call order is the one where the two
-        sources agree, and the test below is the one where they do not.
+        here anyway because the real run reaches the guard with the same value
+        already in the environment — bootstrap_install_env sources install.env
+        at startup, and the interactive path reloads it with load_install_env
+        before opening the panel, both under `set -a`. So this is the call
+        order where the two sources agree, and the test below is the one where
+        they do not.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -7081,6 +7084,13 @@ class DomainScopedFlagsTest(unittest.TestCase):
     # a reassignment further down, `declare` and `readonly`, a continued line,
     # and two keys off one `export`.
     #
+    # AL stays here although an install.env spelled that way never finishes a
+    # run: `main` exports the resolved value of every key it owns, and the
+    # export fails on a readonly name. This table is about the reader agreeing
+    # with bash, not about what the front door will run, so the row is right
+    # where the recorded-spellings list next to
+    # test_a_spelling_only_bash_sees_still_counts_as_recorded leaves it out.
+    #
     # AS is the one only *this* shell can answer. install.defaults.env is
     # sourced without `set -a`, so DEFAULT_* are unexported, and a reader that
     # evaluates the file in a `bash -c` child reads AS empty where both live
@@ -7165,6 +7175,14 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     f'for k in {" ".join(keys)}; do',
                     f'  printf "READER\\t%s\\t[%s]\\n" "$k" "$(recorded_install_env_value \'{env_file}\' "$k")"',
                     "done",
+                    # Unset first, as the reader does inside its subshell, so
+                    # that an exported P or R in the shell running pytest
+                    # cannot answer for a row whose whole point is that it
+                    # assigns nothing. Without this the yardstick reads the
+                    # ambient environment and the row fails against a reader
+                    # that was right. Nothing here is readonly yet: AL becomes
+                    # so only when the next line sources the file.
+                    f'unset {" ".join(keys)}',
                     # load_install_env, not a top-level `source`. The scope is
                     # part of the answer: `declare -x AK=true` is a global at
                     # the top level of a script and a local inside a function,
@@ -7371,8 +7389,9 @@ class DomainScopedFlagsTest(unittest.TestCase):
     def test_turning_it_off_over_an_exported_value_is_still_a_reversal(self):
         """A silent file is not the same as nobody asking for the detector.
 
-        install.sh line 412 seeds PARAM_ENABLE_DRIFT_DETECTOR from an exported
-        ENABLE_DRIFT_DETECTOR, which is the documented route that predates the
+        install.sh seeds PARAM_ENABLE_DRIFT_DETECTOR from an exported
+        ENABLE_DRIFT_DETECTOR (`PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"`,
+        with the rest of the PARAM defaults), which is the documented route that predates the
         flag, so an operator can have provisioned the ingress from a shell
         export with nothing in install.env to show for it. Typing `=false` over
         that is the reversal this guard exists to announce and the worst one it
@@ -7553,14 +7572,26 @@ class DomainScopedFlagsTest(unittest.TestCase):
         the destroyed-ingress consequence for a reversal the next run cannot
         perform — it re-reads the same line.
 
-        `declare -x` is deliberately not in the list: it assigns a local inside
-        the function both live readers source from, so the file really does not
-        record it, and the reader agreeing with the pattern there is correct
-        rather than lucky.
+        Two spellings are deliberately not in the list, for opposite reasons.
+        `declare -x` assigns a local inside the function both live readers
+        source from, so the file really does not record it, and the reader
+        agreeing with the pattern there is correct rather than lucky.
+        `readonly` does record it — it makes a global, and the parity table's
+        AL row pins the reader reading it back — but a file spelled that way
+        never reaches this guard: `main` exports the resolved value later
+        (`export ENABLE_DRIFT_DETECTOR=...`), which fails on a readonly name
+        and, under `set -e`, aborts the run. That is true of every key the
+        install exports, ENABLE_PUBSUB_PLATFORM included, so it is a property
+        of install.env rather than of this flag — but certifying the spelling
+        here would say the front door accepts a file it stops on.
+
+        Nothing is warned about and the value is read back as `true`, which is
+        the second half of the claim: a reader that found the line and mis-read
+        the value would clear the presence assertion alone.
         """
         for line in (
             "export TF_VAR_enable_drift_pubsub=true ENABLE_DRIFT_DETECTOR=true",
-            "readonly ENABLE_DRIFT_DETECTOR=true",
+            ": ${ENABLE_DRIFT_DETECTOR:=true}",
             "  ENABLE_DRIFT_DETECTOR=true",
         ):
             with self.subTest(line=line):
@@ -7569,13 +7600,16 @@ class DomainScopedFlagsTest(unittest.TestCase):
                     destination.write_text(line + "\n")
                     proc = self._parse(
                         "--enable-drift-detector=true",
-                        f'bootstrap_install_env_file "{destination}" v1.2.3',
+                        f'bootstrap_install_env_file "{destination}" v1.2.3\n'
+                        f"printf 'VALUE=[%s]\\n' "
+                        f"\"$(recorded_install_env_value '{destination}' ENABLE_DRIFT_DETECTOR)\"",
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
                     self.assertNotIn(
                         "records no ENABLE_DRIFT_DETECTOR",
                         proc.stdout + proc.stderr,
                     )
+                    self.assertIn("VALUE=[true]", proc.stdout, proc.stdout + proc.stderr)
 
     def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
         """Nothing is overridden, so there is nothing to lose by omitting it.

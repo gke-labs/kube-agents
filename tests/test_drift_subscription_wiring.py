@@ -27,7 +27,10 @@ another document:
     `enable_drift_detector` set without `enable_drift_pubsub` renders no
     `driftDetector` block at all, so the apply succeeds, provisions nothing,
     starts nothing, and leaves a variable that did nothing as the only
-    evidence.
+    evidence. The precondition tests `local.drift_detector_requested` rather
+    than the flag, because `extra_helm_values` reaches the same leaf: Helm
+    deep-merges it over the computed document, so a caller can turn the
+    detector on there and land the first failure above instead of this one.
   - the composition's three defaults equal the module's, and the detector's
     `defaultSubscriptionName` equals the subscription's, so an install that
     never sets a name gets the resource the detector looks for. docs/README.md
@@ -101,11 +104,28 @@ CHART_DRIFT_BLOCK_RE = re.compile(
     r"\}\s*\}\s*:\s*\{\}",
     re.S,
 )
-# The precondition that refuses the consumer without the ingress. Read as one
-# line of HCL rather than by planning: Terraform is not a dependency here.
+# The precondition that refuses the consumer without the ingress, and the local
+# it tests. Read as HCL text rather than by planning: Terraform is not a
+# dependency here.
+#
+# Both doors to the field have to be in that local. extra_helm_values is a
+# second values document Helm deep-merges over the one the composition
+# computes, and its own description names the harness knobs as what it is for,
+# so the same leaf set there starts the detector without
+# enable_drift_detector ever being read. A precondition naming the flag alone
+# accepts that apply, and what it renders is the failure the detector's README
+# calls silent: a pull against a subscription that was never created, retried
+# for the life of a pod that stays Ready.
+REQUESTED_LOCAL = "drift_detector_requested"
 PRECONDITION_RE = re.compile(
-    r"condition\s*=\s*!var\." + DETECTOR_FLAG_VARIABLE + r"\s*\|\|\s*var\." + FLAG_VARIABLE + r"\s*$",
+    r"condition\s*=\s*!local\." + REQUESTED_LOCAL + r"\s*\|\|\s*var\." + FLAG_VARIABLE + r"\s*$",
     re.M,
+)
+REQUESTED_LOCAL_RE = re.compile(
+    REQUESTED_LOCAL + r"\s*=\s*\(\s*"
+    r"var\." + DETECTOR_FLAG_VARIABLE + r"\s*\|\|\s*"
+    r"try\(tobool\(var\.extra_helm_values\." + r"\.".join(DRIFT_VALUE_PREFIX) + r"\.enabled\)\s*,\s*false\)",
+    re.S,
 )
 
 
@@ -171,7 +191,14 @@ class OneNameReachesBothConsumersTest(unittest.TestCase):
         single(
             PRECONDITION_RE,
             self.main,
-            f"precondition refusing {DETECTOR_FLAG_VARIABLE} without {FLAG_VARIABLE}",
+            f"precondition refusing the detector without {FLAG_VARIABLE}",
+        )
+
+    def test_the_refusal_covers_the_values_document_a_caller_can_pass(self):
+        single(
+            REQUESTED_LOCAL_RE,
+            self.main,
+            f"local.{REQUESTED_LOCAL} reading both enable_drift_detector and the extra_helm_values leaf",
         )
 
     def test_chart_exposes_the_value_paths_the_composition_writes(self):

@@ -388,16 +388,16 @@ class InstallerCommonTest(unittest.TestCase):
     # ── the drift keys: written only when on, and both together ─────────────
 
     def _drift_tfvars(self, **env):
-        """write_tfvars_from_state under these keys, returning the file's text."""
-        with tempfile.TemporaryDirectory() as out_dir:
-            dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", **env},
-                describe_stub=_autopilot_describe_stub(),
-            )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            return dest.read_text()
+        """_tfvars under these keys, with a credential and an existing cluster.
+
+        API_SERVER_KEY because the generator refuses to write without one, and
+        the Autopilot describe stub because the default says the cluster does
+        not exist, which writes a different file.
+        """
+        return self._tfvars(
+            {"API_SERVER_KEY": "k", **env},
+            describe_stub=_autopilot_describe_stub(),
+        )
 
     def test_tfvars_writes_both_drift_keys_when_the_detector_is_on(self):
         """The ingress and the consumer travel together, on every truthy
@@ -1106,15 +1106,18 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("1.27.4-gke.800", proc.stderr)
 
-    def _tfvars(self, env):
+    def _tfvars(self, env, **run_kwargs):
         """Generate a terraform.tfvars and return its text.
 
         The generator writes `<dest>.tmp` and renames it into place, so the
         destination has to be a real path in a writable directory.
+
+        `run_kwargs` reach `_run`, for a caller that needs a different stub
+        than the defaults — `_drift_tfvars` wants an Autopilot cluster.
         """
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, **run_kwargs)
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             return dest.read_text()
 

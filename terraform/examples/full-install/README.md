@@ -729,8 +729,13 @@ carrying `enabled` is written only when the ingress is on, so the failure that
 precondition catches is quieter than the Ready-forever detector the CRD
 field's description warns about: an apply that succeeds, renders no
 `driftDetector` block, provisions nothing, starts nothing, and leaves a
-variable that did nothing as the only evidence. A second precondition refuses
-`enable_drift_detector` when `project_id` is the project number rather than
+variable that did nothing as the only evidence. Both preconditions test
+`local.drift_detector_requested` rather than the variable, because
+`extra_helm_values` reaches the same field: Helm deep-merges it over the values
+computed here, so `platformAgent.harness.driftDetector.enabled = true` set
+there would otherwise pass the apply and produce the Ready-forever detector
+itself, pulling a subscription that was never created. A second precondition
+refuses the detector when `project_id` is the project number rather than
 the project ID, which the rest of the composition accepts and the operator
 does not (`driftDetectorEnabled` in
 [`k8s-operator`](../../../k8s-operator/internal/controller/platformagent_manifests.go)

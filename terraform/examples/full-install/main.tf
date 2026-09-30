@@ -171,6 +171,24 @@ locals {
       image = { repository = "${local.third_party_registry}/cert-manager-startupapicheck" }
     }
   })]
+
+  # Whether the CR this composition renders will say the drift detector is on,
+  # by either door that reaches the field. extra_helm_values is a second values
+  # document Helm deep-merges over the computed one (helm_release.kube_agents
+  # below), and its own description names the harness knobs as what it is for,
+  # so platformAgent.harness.driftDetector.enabled set there starts the detector
+  # without enable_drift_detector ever being read. The preconditions below are
+  # about what the detector will then do, not about which variable asked for it,
+  # so they test this rather than the flag.
+  #
+  # tobool inside the try, not outside: a leaf the type cannot hold ("yes", 1)
+  # then fails the lookup and leaves this false, where an uncaught conversion
+  # would abort the plan with a type error instead of the message the
+  # precondition owes. Such a value reaches the CRD, which rejects it.
+  drift_detector_requested = (
+    var.enable_drift_detector ||
+    try(tobool(var.extra_helm_values.platformAgent.harness.driftDetector.enabled), false)
+  )
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -858,21 +876,27 @@ resource "helm_release" "kube_agents" {
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
     }
 
-    # What this refuses is a variable the composition would otherwise ignore
-    # in silence. driftDetector, enabled included, is written inside the
-    # enable_drift_pubsub ternary above, so with the ingress off the field is
-    # never rendered: the apply succeeds, nothing is provisioned, nothing
-    # starts, and the only evidence is a variable that did nothing. Refused
-    # rather than warned about, unlike check "slack_tokens_present" above,
-    # because a Slack install with no tokens says so in the pod log and this
-    # leaves no trace anywhere.
+    # What this refuses is an install that asks for the detector without the
+    # subscription it reads, which is silent whichever door asked. Through
+    # enable_drift_detector: driftDetector, enabled included, is written inside
+    # the enable_drift_pubsub ternary above, so with the ingress off the field
+    # is never rendered, the apply succeeds, nothing is provisioned, nothing
+    # starts, and the only evidence is a variable that did nothing. Through
+    # extra_helm_values (local.drift_detector_requested above): the field is
+    # rendered, the detector starts, and it retries a pull against a
+    # subscription that was never created for the life of a pod that stays
+    # Ready -- k8s-operator/cmd/drift-detector/README.md says the subscription
+    # is not checked at startup. Refused rather than warned about, unlike
+    # check "slack_tokens_present" above, because a Slack install with no
+    # tokens says so in the pod log and neither of these leaves a trace
+    # anywhere.
     #
     # The ternary is what keeps a driftDetector block out of the CR of an
     # install that never asked for drift detection, and this is what keeps
     # asking for it half-way from being accepted. Neither replaces the other.
     precondition {
-      condition     = !var.enable_drift_detector || var.enable_drift_pubsub
-      error_message = "enable_drift_detector requires enable_drift_pubsub — the detector reads the Pub/Sub subscription that flag provisions, and without it this composition writes no driftDetector block at all, so the variable would do nothing and say nothing. Through the installer, ENABLE_DRIFT_DETECTOR=true sets both."
+      condition     = !local.drift_detector_requested || var.enable_drift_pubsub
+      error_message = "the drift detector requires enable_drift_pubsub, whether it was asked for with enable_drift_detector or with platformAgent.harness.driftDetector.enabled through extra_helm_values: it reads the Pub/Sub subscription that flag provisions. Without it the flag renders no driftDetector block at all and does nothing, and extra_helm_values renders one this composition cannot point at a subscription, leaving the detector pulling one that does not exist with the pod Ready. Neither says anything. Through the installer, ENABLE_DRIFT_DETECTOR=true sets both."
     }
 
     # The operator's own gate, brought forward to the plan. A numeric
@@ -886,8 +910,8 @@ resource "helm_release" "kube_agents" {
     # that retains 31 days and never expires -- and starts no consumer, with a
     # Ready pod and no report to tell anyone.
     precondition {
-      condition     = !var.enable_drift_detector || !can(regex("^[0-9]+$", var.project_id))
-      error_message = "enable_drift_detector requires project_id to be the project ID, not the project number: the detector matches it against each audit record's project_id, which is always the ID, so the operator refuses to start it and the ingress bills for a stream nothing reads."
+      condition     = !local.drift_detector_requested || !can(regex("^[0-9]+$", var.project_id))
+      error_message = "the drift detector requires project_id to be the project ID, not the project number: it matches it against each audit record's project_id, which is always the ID, so the operator refuses to start it and the ingress bills for a stream nothing reads."
     }
   }
 }
