@@ -143,8 +143,8 @@ SESSION_DB_ANCHOR = (
 )
 SESSION_DB_PATCHED = (
     "        for platform, _platform_cfg, home, transport in self._home_channel_transports():\n"
-    "            # kube-agents patch: KAGE_SLACK_UX keeps this warning off Slack (it is\n"
-    "            # logged above); see gateway/slack_boilerplate.py.\n"
+    "            # kube-agents patch: KAGE_SLACK_UX keeps this warning off Slack (its\n"
+    "            # error is logged above); see gateway/slack_boilerplate.py.\n"
     "            if _kage_slack_boilerplate.drop_notice(platform):\n"
     '                logger.info("state.db warning to %s not sent: KAGE_SLACK_UX", platform.value)\n'
     "                continue\n"

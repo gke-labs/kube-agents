@@ -33,8 +33,8 @@ Slack display tier sets ``long_running_notifications`` off, and a stock install
 does not turn it on. Where an operator has, Slack gets Hermes' generic mode (a
 phrase from ``gateway/assets/status_phrases.yaml``, "still on it"), the same as
 ``long_running_notifications: generic`` for Slack alone. It is not dropped in a
-thread: the thread's status line needs the ``assistant:write`` scope and fails
-silently without it, so the heartbeat is the one sign of life that always
+thread: the thread's status line needs a Slack scope the app may not have and
+fails silently without it, so the heartbeat is the one sign of life that always
 arrives. ``off`` stays off.
 
 **The gateway's lifecycle notices.** A restart or shutdown tells the chats it
@@ -55,14 +55,16 @@ through ``SlackAdapter.send``, or ``SlackAdapter.edit_message`` when they
 arrive as a streamed or edited message. Both pass them through
 ``system_text``: each known one is reworded in plain voice, with no emoji, no
 "Gateway" or "agent", no console command, tool name or iteration count, and no
-exception text (that is logged instead). The ``/restart`` and ``/stop``
+exception text (that is logged instead). The background-task update is the
+exception: it keeps the command and its recent output, which is what the user
+asked to see. The ``/restart`` and ``/stop``
 replies come from Hermes' English catalog (``locales/en.yaml``); an install
 set to another language gets upstream's translation. Two go entirely: the
 one-time busy-input hint about Hermes' queue/interrupt setting is not appended
 on Slack (so it is not marked seen either, and another platform still gets
 it), and the session-database warnings with their ``hermes doctor`` commands
 are not broadcast to a Slack home channel; the gateway already logs the
-failure.
+underlying error.
 
 Text this module does not recognise, a later upstream rewording included,
 passes through unchanged; ``verify_slack_boilerplate.py`` renders every reply
@@ -148,7 +150,8 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
     (re.compile(r"(?:Agent still starting|No active agent) — /steer queued for the next turn\."),
      "Got it — I'll pick this up next."),
     (re.compile(r"⚠️ Steer failed: (?P<error>.*)", re.DOTALL),
-     lambda m: _logged("steer failed", m["error"], STEER_FAILED)),
+     # run_busy already logs the exception before replying.
+     lambda m: STEER_FAILED),
     (re.compile(r"⏳ Queued for the next turn(?: \([^\n]*\))?\. I'll respond once the current task finishes\."),
      "Got it — I'll pick this up when I finish the current one."),
     (re.compile(r"⚡ Interrupting current task(?: \([^\n]*\))?\. I'll respond to your message shortly\."),

@@ -948,11 +948,10 @@ class SystemReplyTest(unittest.TestCase):
         self.assertEqual(sent, runtime.AUTH_FAILED)
         self.assertIn("401 key sk-abc", logs.output[0])
 
-    def test_steer_failure_is_logged_not_sent(self):
-        with self.assertLogs("gateway.slack_boilerplate", "WARNING") as logs:
-            sent = self._sent(self.adapter, "⚠️ Steer failed: RuntimeError('queue closed')", FLAG_ON)
+    def test_steer_failure_sends_no_exception_text(self):
+        # Upstream logs the exception itself before replying.
+        sent = self._sent(self.adapter, "⚠️ Steer failed: RuntimeError('queue closed')", FLAG_ON)
         self.assertEqual(sent, runtime.STEER_FAILED)
-        self.assertIn("queue closed", logs.output[0])
 
     def test_restart_reply_drops_the_console_command_and_the_notice_promise(self):
         with mock.patch.dict(os.environ, FLAG_ON):
