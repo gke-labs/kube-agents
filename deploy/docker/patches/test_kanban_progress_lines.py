@@ -986,6 +986,17 @@ class SlackLineTest(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(slack_line(line, HEADER, BOARD, "t_1"), line)
 
+    def test_a_head_after_the_workers_punctuation_is_the_workers_words(self):
+        # A quote, emphasis or dash before the head is the worker's, not a marker.
+        for prefix in ("> ", "*", "— ", "- ", "✔✔ "):
+            line = f"{prefix}{HEADER}Kanban t_1 timed out — retried, now healthy"
+            with self.subTest(prefix=prefix):
+                self.assertEqual(slack_line(line, HEADER, BOARD, "t_1"), line)
+
+    def test_a_marker_with_a_variation_selector_is_a_marker(self):
+        line = f"⏸\ufe0f {HEADER}Kanban t_1 blocked"
+        self.assertEqual(slack_line(line, HEADER, BOARD, "t_1"), "⏸\ufe0f @platform blocked")
+
     def test_no_assignee_drops_the_head_once(self):
         line = f"✔ [{BOARD}] Kanban t_1 done — [{BOARD}] Kanban t_1 was a retry"
         self.assertEqual(

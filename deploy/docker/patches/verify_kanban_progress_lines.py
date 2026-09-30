@@ -95,10 +95,10 @@ GOOGLE_CHAT_ADAPTER = "plugins/platforms/google_chat/adapter.py"
 HEADER = "[default] @platform "
 
 # --- 1. The wiring resolved ---------------------------------------------------
-# Both names arrive in one appended trailer, but they are checked separately:
-# the render branch calls `_progress_note` and the send site calls
-# `_progress_deliver`, so a rename breaks one path while the other keeps working
-# and the build stays green.
+# The names arrive in one appended trailer, but they are checked separately:
+# the render branch calls `_progress_note`, the send site `_progress_deliver`
+# and the skip loop `_progress_silent_event`, so a rename breaks one path while
+# the others keep working and the build stays green.
 print("import wiring:")
 check(
     "the notifier resolved the progress-note import",

@@ -83,6 +83,7 @@ lost message would become a stuttering one.
 from __future__ import annotations
 
 import logging
+import unicodedata
 from typing import Any, Optional, Sequence
 
 try:  # In the image the patches live under the ``gateway`` package.
@@ -161,6 +162,12 @@ MAX_TRACKED = 2048
 #: is how the thread names the specialist; see :func:`slack_line`.
 KANBAN_ID = "Kanban {task_id}"
 BOARD_TAG = "[{board}] "
+
+#: What may come before a head :func:`slack_line` trims: one glyph of this
+#: Unicode category, trailed by at most one variation selector, and a space.
+MARKER_CATEGORY = "So"
+VARIATION_SELECTOR = "\ufe0f"
+MARKER_MAX = 2
 
 #: Kinds upstream claims but has no formatter for, so ``_send_pings`` skips
 #: them before any send. With ``KAGE_SLACK_UX`` on they still move a Slack
@@ -282,6 +289,23 @@ def slack_header(header: str, board: Optional[str]) -> str:
     return header[len(tag):] if tag and header.startswith(tag) else header
 
 
+def _marker(prefix: str) -> bool:
+    """Whether ``prefix`` is nothing, or one upstream marker glyph and a space.
+
+    Upstream's markers are symbols (``✔``, ``✖``, ``⏸``, ``🛑``), a variation
+    selector at most after them; a quote, bullet or dash is the worker's own.
+    """
+    if not prefix:
+        return True
+    glyph, space = prefix[:-1], prefix[-1:]
+    return (
+        space == " "
+        and 0 < len(glyph) <= MARKER_MAX
+        and unicodedata.category(glyph[0]) == MARKER_CATEGORY
+        and all(ch == VARIATION_SELECTOR for ch in glyph[1:])
+    )
+
+
 def slack_line(message: str, header: str, board: Optional[str], task_id: str) -> str:
     """A notifier line with the board tag and ``Kanban <id>`` taken out of its head.
 
@@ -298,7 +322,7 @@ def slack_line(message: str, header: str, board: Optional[str], task_id: str) ->
     first = message.split("\n", 1)[0]
     for head in (f"{header}{card}", f"{tag}{card}"):
         at = first.find(head)
-        if at < 0 or any(ch.isalnum() for ch in first[:at]):
+        if at < 0 or not _marker(first[:at]):
             continue
         rest = message[at + len(head):]
         if agent:
