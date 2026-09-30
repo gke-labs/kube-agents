@@ -65,6 +65,10 @@ SWEEP_KEY_PROJECTS = "projects"
 SWEEP_KEY_FAILED = "failed"
 SWEEP_KEY_LEFT = "left_for_next_run"
 SWEEP_KEY_ENDED_EARLY = "ended_early"
+SWEEP_KEY_SKIPPED = "skipped"
+REPORT_KEY_EXIT = "exit"
+REPORT_EXIT_OK = "ok"
+REPORT_EXIT_FAILED = "failed"
 # Where the runbook sections live, as a link a reader can click.
 RUNBOOK_ROOT = "https://github.com/gke-labs/kube-agents/blob/main/"
 # The scope line every message carries: none of this reaches a user cluster.
@@ -304,8 +308,12 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                     loaded = {REPORT_KEY_ERROR: REPORT_UNREADABLE}
                 reading[KEY_ARTIFACT] = loaded
             elif not _not_found(err):
+                # A failed build's note without its report would stay so, so the
+                # tick is blind on it. A passed build's report is only the
+                # recovery's summary: the reading stands without it.
                 log(f"{WARNING_PREFIX}could not read {periodic.job}'s {build}/{periodic.artifact}: {err.strip()}", file=sys.stderr)
-                return None
+                if not reading[KEY_PASSED]:
+                    return None
         return reading
     return None
 
@@ -380,6 +388,9 @@ def sweep_detail(artifact: dict | None) -> list[str]:
     left = artifact.get(SWEEP_KEY_LEFT)
     if isinstance(left, int) and left > 0:
         lines.append(f"{left} write(s) left for the next run (the run's write budget)")
+    skipped = artifact.get(SWEEP_KEY_SKIPPED)
+    if isinstance(skipped, list) and skipped:
+        lines.append(f"{len(skipped)} project(s) not swept after the run stopped: {', '.join(str(s) for s in skipped)}")
     if artifact.get(SWEEP_KEY_ENDED_EARLY):
         lines.append(f"run ended early: {artifact[SWEEP_KEY_ENDED_EARLY]}")
     elif artifact.get(REPORT_KEY_ERROR):
@@ -405,10 +416,17 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
         closed = artifact.get(SWEEP_KEY_CLOSED)
         if not isinstance(projects, int):
             return None
-        if passed or not failed:
+        exit_name = artifact.get(REPORT_KEY_EXIT)
+        if exit_name not in (None, REPORT_EXIT_OK, REPORT_EXIT_FAILED):
+            # Terminated or crashed: what it managed before that.
+            text = f"{exit_name} after closing {closed or 0} pull request(s) across {projects} project(s)"
+        elif passed or not failed:
             text = f"closed {closed or 0} pull request(s) across {projects} project(s)"
         else:
             text = f"failed in {failed} of {projects} project(s)"
+        skipped = artifact.get(SWEEP_KEY_SKIPPED)
+        if isinstance(skipped, list) and skipped:
+            text += f", {len(skipped)} not swept"
         left = artifact.get(SWEEP_KEY_LEFT)
         if isinstance(left, int) and left > 0:
             text += f", {left} write(s) left for the next run"

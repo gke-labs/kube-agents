@@ -76,6 +76,11 @@ WRITE_PAUSE_SECONDS = 1.0
 WRITE_BUDGET_PER_RUN = 80
 RATE_LIMITED_CODE = 403
 RETRY_AFTER_HEADER = "Retry-After"
+# A 403 is the burst limit only when GitHub says so: a Retry-After, a spent
+# rate-limit budget in the headers, or a body naming a limit. Any other 403 (an
+# archived repository, a protected branch) is that repository's fault, as before.
+RATELIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
+RATE_LIMIT_BODY_MARKERS = ("rate limit", "abuse detection")
 # Without the header, or with one past this, a refused write waits this long
 # once; refused again, the run ends rather than visiting every project during
 # the cooldown.
@@ -183,7 +188,8 @@ class RateLimited(Exception):
 
 class WriteBudget:
     """The run's remaining writes. A close or a delete takes one; when none is
-    left the rest waits for the next run, counted in `left`."""
+    left the rest waits for the next run, counted in `left` as the writes it
+    will need (a pull request left unclosed is two: its close and its delete)."""
 
     def __init__(self, writes=None):
         self.budget = WRITE_BUDGET_PER_RUN if writes is None else writes
@@ -191,12 +197,12 @@ class WriteBudget:
         self.left = 0
         self.exhausted_at = None
 
-    def take(self, repo):
+    def take(self, repo, writes_left_if_not=1):
         if self.remaining <= 0:
             if self.exhausted_at is None:
                 self.exhausted_at = repo
                 print("  write budget for this run (%d) used up at %s; the rest waits for the next run" % (self.budget, repo), file=sys.stderr)
-            self.left += 1
+            self.left += writes_left_if_not
             return False
         self.remaining -= 1
         return True
@@ -405,14 +411,26 @@ def _retry_after(exc):
     return max(0, min(seconds, RETRY_AFTER_MAX_SECONDS))
 
 
+def is_rate_limited(exc):
+    """A 403 that GitHub marks as its burst limit, not a permission."""
+    if exc.code != RATE_LIMITED_CODE:
+        return False
+    headers = getattr(exc, "headers", None) or {}
+    if headers.get(RETRY_AFTER_HEADER) is not None or str(headers.get(RATELIMIT_REMAINING_HEADER, "")).strip() == "0":
+        return True
+    body = boskos_pool.error_body(exc).lower()
+    return any(marker in body for marker in RATE_LIMIT_BODY_MARKERS)
+
+
 def write(method, path, authorization, body=None):
-    """One GitHub write, paced. A 403 is GitHub's burst limit (or a permission,
-    which reads the same): wait what it asks once and try again; refused again,
-    the run ends here rather than visiting every project during the cooldown."""
+    """One GitHub write, paced. A 403 GitHub marks as its burst limit is waited
+    out once, for what it asks, and tried again; refused again, the run ends
+    here rather than visiting every project during the cooldown. Any other
+    error is the caller's, as before."""
     try:
         result = api(method, path, authorization, body)
     except urllib.error.HTTPError as exc:
-        if exc.code != RATE_LIMITED_CODE:
+        if not is_rate_limited(exc):
             raise
         wait = _retry_after(exc)
         print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
@@ -420,7 +438,7 @@ def write(method, path, authorization, body=None):
         try:
             result = api(method, path, authorization, body)
         except urllib.error.HTTPError as again:
-            if again.code != RATE_LIMITED_CODE:
+            if not is_rate_limited(again):
                 raise
             raise RateLimited("GitHub refused %s %s twice (%s)" % (method, path, boskos_pool.describe(again)))
     pause(WRITE_PAUSE_SECONDS)
@@ -451,15 +469,15 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
 
     Returns (closed, deleted, unclosed, undeleted): the counts, the numbers
     that would not close, and the branches that would not delete. With a
-    `budget`, each write takes one from it and a write it cannot pay for is
-    left for the next run; a RateLimited from a write ends the sweep of this
-    repository and is the caller's to end the run on.
+    `budget` (the pool walk's), each write takes one from it and a write it
+    cannot pay for is left for the next run; without one (a hand run of one
+    project) every write is made, paced. A RateLimited from a write ends the
+    sweep of this repository and is the caller's to end the run on.
     """
     closed = 0
     deleted = 0
     unclosed = []
     undeleted = []
-    budget = budget or WriteBudget()
     pulls = open_pulls(repo, authorization)
     still_open = set()
     gone = set()
@@ -475,7 +493,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             closed += 1
             gone.add(ref)
             continue
-        if not budget.take(repo):
+        if budget is not None and not budget.take(repo, writes_left_if_not=2):
             still_open.add(ref)
             continue
         # Each close stands alone. One that fails is reported and the sweep
@@ -499,7 +517,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
         # the pull request open on a head that no longer exists. A branch the
         # budget cannot pay for is a closed pull request's, which the next
         # run's branch pass below deletes.
-        if not budget.take(repo):
+        if budget is not None and not budget.take(repo):
             deferred.add(ref)
             continue
         try:
@@ -523,7 +541,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
         if dry_run:
             deleted += 1
             continue
-        if not budget.take(repo):
+        if budget is not None and not budget.take(repo):
             continue
         try:
             delete_branch(repo, ref, authorization)
@@ -587,11 +605,16 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
     (`ended_early`).
     """
     boskos_reset_stranded(server)
-    closed = {}
-    failures = {}
-    unmapped = []
+    # The run's record is filled as it goes, in the caller's dict when given,
+    # so a report written after a termination or a crash names what was done.
+    report = report if report is not None else {}
+    closed = report.setdefault("closed", {})
+    failures = report.setdefault("failures", {})
+    unmapped = report.setdefault("unmapped", [])
+    skipped = report.setdefault("skipped", [])
+    report.setdefault("left", 0)
+    report.setdefault("ended_early", None)
     budget = WriteBudget()
-    ended_early = []
 
     def visit(name):
         repo = mapping.get(name)
@@ -599,10 +622,11 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             print("skipping %s: maps to no GitOps repository" % name)
             unmapped.append(name)
             return
-        if ended_early:
+        if report["ended_early"]:
             # GitHub's cooldown covers every repository; the project is held
             # and released so the walk still ends, and nothing is asked of it.
-            print("skipping %s: %s" % (name, ended_early[0]))
+            print("skipping %s: %s" % (name, report["ended_early"]))
+            skipped.append(name)
             return
         print("sweeping %s (%s)" % (name, repo))
         try:
@@ -610,7 +634,7 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
         except RateLimited as exc:
             print("  %s: %s" % (name, exc), file=sys.stderr)
             failures[name] = str(exc)
-            ended_early.append(str(exc))
+            report["ended_early"] = str(exc)
         except (
             SweepError,
             urllib.error.HTTPError,
@@ -620,16 +644,18 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
         ) as exc:
             print("  %s: %s" % (name, boskos_pool.describe(exc)), file=sys.stderr)
             failures[name] = boskos_pool.describe(exc)
+        finally:
+            report["left"] = budget.left
 
-    _, release_failures = boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit)
+    # The hold is heartbeated: one repository's sweep can now run for minutes
+    # (paced writes, a Retry-After wait), and the pool's reaper frees a hold
+    # not updated for about five minutes.
+    _, release_failures = boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit, heartbeat=True)
     failures.update(release_failures)
     print(
-        "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped, %d write(s) left for the next run"
-        % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped), budget.left)
+        "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped, %d skipped, %d write(s) left for the next run"
+        % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped), len(skipped), budget.left)
     )
-    if report is not None:
-        report["left"] = budget.left
-        report["ended_early"] = ended_early[0] if ended_early else None
     return closed, failures, unmapped
 
 
@@ -672,7 +698,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, _terminate)
     started = time.time()
-    run = {"closed": {}, "failures": {}, "unmapped": [], "left": 0, "ended_early": None}
+    run = {"closed": {}, "failures": {}, "unmapped": [], "skipped": [], "left": 0, "ended_early": None}
     code = None
     error = None
     try:
@@ -699,9 +725,16 @@ def _run(args, run):
             repo = args.repo or mapping.get(args.project)
             if not repo:
                 raise SweepError("%s maps to no GitOps repository" % args.project)
-            run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
+            # A hand run: paced, but every write is made; there is no next run.
+            try:
+                run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
+            except RateLimited as exc:
+                run["failures"][args.project] = str(exc)
+                run["ended_early"] = str(exc)
+                print("ERROR: %s" % exc, file=sys.stderr)
+                return 1, str(exc)
             return 0, None
-        closed, failures, unmapped = sweep_pool(
+        _, failures, _ = sweep_pool(
             args.boskos_server,
             args.boskos_owner,
             args.app_id,
@@ -710,7 +743,6 @@ def _run(args, run):
             runner=subprocess.run,
             report=run,
         )
-        run["closed"], run["failures"], run["unmapped"] = closed, failures, unmapped
         if failures:
             error = "%d project(s) not fully swept: %s" % (len(failures), ", ".join(sorted(failures)))
             print("ERROR: %s" % error, file=sys.stderr)
@@ -756,6 +788,7 @@ def write_report(path, args, run, code, error, started):
         "closed": sum(run["closed"].values()),
         "failed": len(run["failures"]),
         "unmapped": list(run["unmapped"]),
+        "skipped": list(run.get("skipped") or []),
         "left_for_next_run": run.get("left", 0),
         "outcomes": outcomes,
     }

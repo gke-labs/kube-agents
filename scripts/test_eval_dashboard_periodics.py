@@ -208,6 +208,19 @@ class FetchTest(unittest.TestCase):
             readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=FakeGsutil(objects))
         self.assertEqual(readings[WEEKLY.job]["build"], "0099")
 
+    def test_a_passed_builds_unreadable_report_keeps_the_reading(self):
+        # The report of a passed build is only the recovery's summary: a read
+        # that fails for a reason other than NotFound warns and the reading
+        # stands without it, where a failed build's would blind the tick.
+        root = f"{periodics.LOGS_ROOT}/{WEEKLY.job}"
+        objects = archive(WEEKLY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), {"summary": {"applied": 1}})})
+        denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
+        warnings = []
+        with tempfile.TemporaryDirectory() as tmp:
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(WEEKLY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
+        self.assertEqual((readings[WEEKLY.job]["build"], readings[WEEKLY.job]["artifact"]), ("100", None))
+        self.assertEqual(len(warnings), 1)
+
     def test_a_missing_bucket_is_warned_not_read_as_never_ran(self):
         class NoBucket:
             def __call__(self, cmd, **kwargs):
@@ -348,6 +361,11 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(periodics.run_summary(SWEEP, report, passed=False), "failed in 11 of 11 project(s)")
         drained = {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 30, "ended_early": None, "outcomes": {}}
         self.assertEqual(periodics.run_summary(SWEEP, drained, passed=True), "closed 241 pull request(s) across 12 project(s), 30 write(s) left for the next run")
+        stopped = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "ended_early": "GitHub refused PATCH twice", "skipped": ["kube-agents-evals-3", "kube-agents-evals-4"], "outcomes": {"kube-agents-evals-2": {"error": "GitHub refused PATCH twice"}}}
+        self.assertEqual(periodics.run_summary(SWEEP, stopped, passed=False), "failed in 1 of 1 project(s), 2 not swept")
+        self.assertIn("2 project(s) not swept after the run stopped: kube-agents-evals-3, kube-agents-evals-4", periodics.sweep_detail(stopped))
+        killed = {"exit": "terminated", "projects": 2, "closed": 7, "failed": 0, "left_for_next_run": 0, "outcomes": {}}
+        self.assertEqual(periodics.run_summary(SWEEP, killed, passed=False), "terminated after closing 7 pull request(s) across 2 project(s)")
         self.assertEqual(periodics.sweep_detail(drained), ["30 write(s) left for the next run (the run's write budget)"])
         self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
         self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=True), "nothing to do")
