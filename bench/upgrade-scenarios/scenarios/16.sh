@@ -40,7 +40,8 @@ sleep 30; }
 connect(){ K -n scen exec deploy/client -- wget -qO- --timeout=5 http://server 2>&1 | head -4; }
 calico(){ K -n kube-system get pods -l k8s-app=calico-node -o wide; }
 before(){ ev dataplane enforcement-before G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(networkPolicy,addonsConfig.networkPolicyConfig,networkConfig.datapathProvider)'; ev dataplane connect-before connect
-  ev dataplane enable-addon G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=NetworkPolicy=ENABLED --quiet; wait_ops; ev dataplane enable-enforcement G container clusters update "$CLUSTER" --zone "$ZONE" --enable-network-policy --quiet; wait_ops; sleep 120
+  retry_busy dataplane ev dataplane enable-addon G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=NetworkPolicy=ENABLED --quiet || { note final "precondition not met: the NetworkPolicy add-on was not enabled; stopping before the upgrade"; exit 1; }; wait_ops
+  retry_busy dataplane ev dataplane enable-enforcement G container clusters update "$CLUSTER" --zone "$ZONE" --enable-network-policy --quiet || { note final "precondition not met: policy enforcement was not enabled; stopping before the upgrade"; exit 1; }; wait_ops; sleep 120
   ev dataplane enforcement-configured G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(networkPolicy,addonsConfig.networkPolicyConfig)'; ev dataplane calico-before calico; ev dataplane connect-dormant connect; }
 break_it(){ V=$(newest_patch REGULAR 1.35); upgrade_master "$V"; upgrade_pool work-pool "$V" dataplane:scen:app=server; }
 after(){ sleep 60; ev dataplane nodes K get nodes -o wide; ev dataplane calico-after calico; ev dataplane connect-after connect; }

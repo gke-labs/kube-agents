@@ -94,5 +94,8 @@ hold_19(){ . "$H/scenarios/19.sh"; disable_driver || abort_hold "the PD CSI driv
   { echo "no hold for scenario $NN; holds exist for: $(declare -F | sed -n 's/^declare -f hold_\([0-9]\)/\1/p' | tr '\n' ' ')" >&2; exit 1; }
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"; require_scenario_cluster
+# The hold belongs on scenario NN's own cluster or on one of its lettered re-runs (upg-14b also carries 14c's pool).
+LABEL=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)')
+[[ $LABEL == "$NN"* ]] || { echo "refusing: $CLUSTER was built for scenario '$LABEL', not for $NN or a lettered re-run of it" >&2; exit 1; }
 G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 note hold "re-planting scenario $NN's hazard on $CLUSTER for the Recommender"; "hold_$NN"; note hold "scenario $NN hold done"

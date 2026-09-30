@@ -4,4 +4,3 @@
 .bin/
 logs/
 evidence/recommender/
-__pycache__/

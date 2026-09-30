@@ -10,9 +10,9 @@ INSIGHT_TYPE=google.container.DiagnosisInsight; RECOMMENDER=google.container.Dia
 PROJECT_NUMBER=$(gcloud projects describe "$P" --format='value(projectNumber)') && [ -n "$PROJECT_NUMBER" ] ||
   { echo "cannot read the project number of $P; recommender.json would keep it unscrubbed" >&2; exit 1; }
 STAMP=$(date -u +%Y-%m-%dT%H%MZ); OUT="$H/evidence/recommender/$STAMP"; mkdir -p "$OUT"
-for Z in $ZONES; do
-  gcloud recommender insights list --project "$P" --location "$Z" --insight-type "$INSIGHT_TYPE" --format=json >"$OUT/insights-$Z.json"
-  gcloud recommender recommendations list --project "$P" --location "$Z" --recommender "$RECOMMENDER" --format=json >"$OUT/recommendations-$Z.json"
+for Z in $ZONES; do   # a read that fails stops here: an empty file would otherwise read as a zone with nothing published
+  gcloud recommender insights list --project "$P" --location "$Z" --insight-type "$INSIGHT_TYPE" --format=json >"$OUT/insights-$Z.json" || { echo "insights read failed for $Z; recommender.json left unchanged" >&2; exit 1; }
+  gcloud recommender recommendations list --project "$P" --location "$Z" --recommender "$RECOMMENDER" --format=json >"$OUT/recommendations-$Z.json" || { echo "recommendations read failed for $Z; recommender.json left unchanged" >&2; exit 1; }
 done
 python3 - "$OUT" "$H/recommender.json" "$P" "$PROJECT_NUMBER" <<'PY'
 import glob, json, re, sys, collections

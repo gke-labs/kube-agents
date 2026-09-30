@@ -35,7 +35,7 @@ spec:
 Y
 }
 done_(){ case "$(K -n scen get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null)" in Succeeded|Failed) return 0;; *) return 1;; esac; }
-compat_pod compat-cu124-$TAG $CU12_BASE $CU12_TORCH; compat_pod compat-cu130-$TAG $CU13_BASE $CU13_TORCH
+compat_pod "compat-cu124-$TAG" "$CU12_BASE" "$CU12_TORCH"; compat_pod "compat-cu130-$TAG" "$CU13_BASE" "$CU13_TORCH"
 t=0; while ! { done_ compat-cu124-$TAG && done_ compat-cu130-$TAG; } && [ $t -lt $WAIT ]; do sleep $POLL; t=$((t+POLL)); done
 ev compat $TAG-cu124-init K -n scen logs compat-cu124-$TAG -c copy-compat; ev compat $TAG-cu124 K -n scen logs compat-cu124-$TAG
 ev compat $TAG-cu130-init K -n scen logs compat-cu130-$TAG -c copy-compat; ev compat $TAG-cu130 K -n scen logs compat-cu130-$TAG

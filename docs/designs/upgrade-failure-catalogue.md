@@ -12,8 +12,9 @@ afterwards, and why it is on the list. The checks a scheduled run should perform
 [`upgrade-readiness-checks.md`](upgrade-readiness-checks.md); this catalogue is the list those
 checks are chosen from, and its
 [public incidents](upgrade-readiness-checks.md#upgrades-that-went-wrong-in-public) are the evidence
-cited below. Each entry was also planted on a throwaway GKE cluster and the cluster upgraded; what
-happened, entry by entry, and the scripts that did it are in
+cited below. Each entry except 15 was also planted on a throwaway GKE cluster and the cluster
+upgraded; entry 15's symptom was produced on a cluster already on the new behaviour. What happened,
+entry by entry, and the scripts that did it are in
 [`bench/upgrade-scenarios/README.md`](../../bench/upgrade-scenarios/README.md).
 
 ## For a reader who does not run Kubernetes

@@ -51,5 +51,5 @@ disable_driver(){ local i s; for i in $(seq 1 $DISABLE_TRIES); do
     else note csi "could not read the add-on state after try $i; retrying in ${DISABLE_WAIT}s"; fi; sleep $DISABLE_WAIT; done; return 1; }
 break_it(){ V=$(newest_patch REGULAR 1.35); upgrade_master "$V"; upgrade_pool work-pool "$V" csi:scen:app=pd-user; }
 after(){ sleep 120; ev csi pod-after-upgrade K -n scen get pods -l app=pd-user -o wide; ev csi events-after-upgrade pd_events
-  note csi "fix: enable the PD CSI driver add-on"; ev csi enable-driver G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=GcePersistentDiskCsiDriver=ENABLED --quiet; wait_ops; sleep 180
+  note csi "fix: enable the PD CSI driver add-on"; retry_busy csi ev csi enable-driver G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=GcePersistentDiskCsiDriver=ENABLED --quiet || { note final "the PD CSI driver was not re-enabled; the pod is left Pending"; exit 1; }; wait_ops; sleep 180
   ev csi pod-after-fix K -n scen get pods -l app=pd-user -o wide; ev csi events-after-fix pd_events; }

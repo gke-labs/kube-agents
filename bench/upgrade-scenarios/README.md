@@ -254,18 +254,22 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
    every other scenario writes its manifests inline. If any step of the plant fails, the run stops here, before
    the upgrade, with a "precondition not met" note in the evidence.
-3. Breaks it. Twelve scenarios upgrade the control plane and then a node pool; scenario 13 upgrades only a
-   node pool (a patch inside 1.31). Scenarios 05, 06, 09, 10 and 11 upgrade only the control plane. Scenarios 14 and 15 show the symptom with no upgrade; 14c then asks for
-   the pool upgrade and runs the migration GKE demands. An upgrade command that fails stops the run; one GKE
-   refuses because another operation is running is retried up to five times first.
+3. Breaks it. Thirteen scenarios upgrade the control plane and then a node pool, and 05, 06, 09, 10 and 11
+   upgrade only the control plane. Scenarios 14 and 15 show the symptom with no upgrade. Of the variants, 13b
+   upgrades only a node pool (a patch inside 1.31), 14c upgrades the control plane, asks for the pool upgrade
+   and runs the migration GKE demands, and the holds upgrade nothing. A cluster change that fails stops the run;
+   one GKE refuses because another operation is running is retried up to five times first. The refusals 10, 10b
+   and 14c ask for on purpose are the experiment, and are recorded instead.
 4. Records the after-state.
 
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code
 and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. The
-availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly. A re-run on the same
-cluster skips a node pool or maintenance exclusion already in place and adds new files beside the checked-in
-ones; commit only a file the table or the notes above cite, after replacing the project
-ID and number and any public IP address.
+availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly, and scenario 11's own probes
+`zonal-api-1s.txt` and `zonal-probe.txt`. After a pool upgrade, `upgrade.txt` also carries the operation's final
+status and status message, which is where a stockout shows while the operation reads DONE. A re-run on the same
+cluster skips a node pool or maintenance exclusion already in place, and appends to the checked-in evidence
+files, each record under its own timestamp; commit only what the table or the notes above cite, after replacing
+the project ID and number and any public IP address.
 Redirect the console to `logs/<track>.log` if you want it; `logs/` is gitignored.
 
 Verdicts were judged by hand from those files. Each one then went to an independent reviewer told to refute it,
@@ -282,8 +286,10 @@ The Recommender side has two parts:
 
 - **Holds.** `hold.sh NN` (and the `06h`, `08h` and `16h` scenarios) keep a hazard planted in its **before**
   state, with no upgrade. GKE's Recommender looks at a cluster as it is at refresh time, and a cluster that has
-  already broken and moved on shows it nothing to warn about. `hold.sh` refuses a scenario it has no hold for,
-  and stops with a note in the evidence when a pool, manifest or add-on change it needs does not take.
+  already broken and moved on shows it nothing to warn about. `hold.sh` refuses a scenario it has no hold for
+  and a cluster built for another scenario (its `scenario` label must be `NN` or a lettered re-run such as
+  `14b`), and stops with a note in the evidence when a pool, manifest or add-on change it needs does not take.
+  A held scenario stops the same way when GKE does not add its maintenance exclusion.
 - **The read.** `check-recommender.sh` reads every `google.container.DiagnosisInsight` insight and every
   `google.container.DiagnosisRecommender` recommendation in each zone. It saves the raw JSON under
   `evidence/recommender/<stamp>/`, and writes `recommender.json`, which maps each insight and recommendation to

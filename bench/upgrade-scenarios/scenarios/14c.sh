@@ -6,7 +6,7 @@
 CHANNEL=REGULAR; START=1.34; POOL_FLAGS=""
 V1_POOL=v1-pool; LEGACY_IMAGE=eclipse-temurin:11.0.15_10-jdk; JVM_LIMIT=256Mi
 plant(){ printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V1\n' >"$EVID/cgroup-v1.yaml"; printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V2\n' >"$EVID/cgroup-v2.yaml"
-  G container node-pools describe "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cgroup v1-pool G container node-pools create "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=role=v1 --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet
+  pool_exists "$V1_POOL" || ev cgroup v1-pool G container node-pools create "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=role=v1 --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet
   K -n scen create configmap fill --from-literal=Fill.java='import java.util.*; public class Fill { public static void main(String[] a) throws Exception { System.out.println("max=" + Runtime.getRuntime().maxMemory()); List<byte[]> l = new ArrayList<>(); try { while (true) l.add(new byte[1<<23]); } catch (OutOfMemoryError e) { System.out.println("OOM caught"); } Thread.sleep(Long.MAX_VALUE); } }' --dry-run=client -o yaml | K -n scen apply -f - >/dev/null
   K -n scen apply -f - <<Y
 apiVersion: apps/v1
@@ -37,9 +37,12 @@ break_it(){ local V; V=$(newest_patch REGULAR 1.35)
   note cgroup "attempt the node upgrade of the cgroup v1 pool to $V"
   ev cgroup pool-upgrade G container clusters upgrade "$CLUSTER" --node-pool "$V1_POOL" --cluster-version "$V" --zone "$ZONE" --quiet
   wait_ops; ev cgroup after-upgrade-attempt G container node-pools describe "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --format='value(version,config.effectiveCgroupMode)'
-  if G container node-pools describe "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --format='value(config.effectiveCgroupMode)' | grep -q V1; then
+  # Key off the describe's exit status, not its text: a failed describe prints nothing, which would read as "not V1".
+  local mode; mode=$(G container node-pools describe "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --format='value(config.effectiveCgroupMode)') ||
+    { note cgroup "could not read the pool's cgroup mode; stopping"; exit 1; }
+  if [[ $mode == *V1* ]]; then
     note cgroup "pool still cgroup v1: run the migration GKE asks for"
-    ev cgroup migrate G container node-pools update "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --system-config-from-file "$EVID/cgroup-v2.yaml" --quiet
+    retry_busy cgroup ev cgroup migrate G container node-pools update "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --system-config-from-file "$EVID/cgroup-v2.yaml" --quiet || exit 1
     wait_ops; fi
   sleep 180; }
 after(){ jvm_state after; ev cgroup after-events K -n scen get events --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp -o custom-columns='T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message'; }
