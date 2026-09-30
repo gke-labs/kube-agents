@@ -25,13 +25,14 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #:
 #: The template fixes the shape: one lowercase line, a hand-off verb, the
 #: target, a period. A model capitalises a sentence's first letter out of
-#: habit, so that one letter may be either case. ``_is_progress_ack`` strips a line only when every word
-#: of it fits that shape and keeps it otherwise, because a kept ack is text a
-#: reviewer reads in the transcript while a stripped answer is gone. The
-#: verb comes from ``_ACK_VERBS`` ("Checking the logs showed a crash." is an
-#: answer by its finite verb, not its capital); a closing period or ellipsis is optional; the target
-#: runs to ``_ACK_MAX_TARGET_WORDS`` words. Past the verb, a word belongs to
-#: the target when it is:
+#: habit, so that one letter may be either case. ``_is_progress_ack`` strips
+#: a line only when every word of it fits that shape and keeps it otherwise,
+#: because a kept ack is text a reviewer reads in the transcript while a
+#: stripped answer is gone. The verb comes from ``_ACK_VERBS`` ("Checking the
+#: logs showed a crash." is an answer by its finite verb, not its capital); a
+#: closing period or ellipsis is optional; the target runs to
+#: ``_ACK_MAX_TARGET_WORDS`` words. Past the verb, a word belongs to the
+#: target when it is:
 #:
 #: - a name: a word holding one of ``_ACK_NAME_CHARACTERS`` or wrapped in
 #:   backticks ("checkout-gateway", "us-central1", "app=web");
@@ -40,10 +41,13 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #:   at the logs.", "checking all the nodes.");
 #: - a naming participle from ``_ACK_NAMING_PARTICIPLES`` and the one word it
 #:   names ("checking pods labeled app=web.");
-#: - an "-ed" word after a determiner or preposition from
-#:   ``_ACK_ADJECTIVE_CUES`` ("reviewing the failed rollout."),
-#:   or straight after the verb when a plain word follows it ("reviewing
-#:   failed rollouts in prod-a.");
+#: - an "-ed" word before a noun, after a determiner or preposition from
+#:   ``_ACK_ADJECTIVE_CUES`` ("reviewing the failed rollout."), or straight
+#:   after the verb when a plain word follows it and the word opens "un-" or
+#:   the target runs on to a name or a preposition ("auditing unused node
+#:   pools.", "reviewing failed rollouts in prod-a.", "checking pinned
+#:   versions across the fleet."); a line ending on the noun reads as a verb
+#:   and its object ("restarting cleared alerts.");
 #: - any other plain word, in a run of at most ``_ACK_MAX_PLAIN_RUN`` of
 #:   them, that is not a verdict or a verb from ``_ACK_FINDING_VERBS``; a
 #:   plain word straight after a name counts only when one of
@@ -51,16 +55,21 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #:   rollout." is a target; "upgrading prod-a blocks on quota." and "checking
 #:   quota in us-central1 hit limits." are not);
 #: - after a clause opener straight after the verb, anything ("checking why
-#:   the rollout failed.").
+#:   the rollout failed."), except an opener that is also a determiner:
+#:   "checking that cluster found 3 stale nodes." is read word by word.
 #:
 #: Anything else keeps the line: a comma, semicolon, colon outside a link,
 #: dash, question or exclamation mark ("checking the rollout, it's stuck."); a contraction of a
 #: pronoun ("checking it's stuck."); a past tense elsewhere ("restarting
-#: fixed checkout-gateway.", "provisioning failed when quota ran out."); a
-#: determiner after a plain word ("restarting the pod cleared it."). The one
-#: shape it cannot tell apart is a verb outside the lists inside a short run
-#: of plain words: "scaling staging broke." has the words of "auditing
-#: version skew." and is stripped, pinned in ``test_known_misreads_are_pinned``.
+#: fixed checkout-gateway.", "restarting all failed.", "provisioning failed
+#: when quota ran out."); a
+#: determiner after a plain word ("restarting the pod cleared it."). Three
+#: shapes have an ack's words and are stripped, pinned in
+#: ``test_known_misreads_are_pinned``: a verb outside the lists inside a short
+#: run of plain words ("scaling staging broke." reads as "auditing version
+#: skew."), a past tense before a target that runs on ("restarting cleared
+#: alerts in prod-a."), and a second clause after an opener ("checking
+#: whether the rollout failed is done.").
 #:
 #: ``_DELEGATION_ACK`` is the receipt that template replaced, still sent by an
 #: install on an older image:
@@ -133,6 +142,9 @@ _ACK_CLAUSE_OPENERS = frozenset(
         "that",
     }
 )
+#: Openers that are also determiners ("checking that cluster found 3 stale
+#: nodes."), so straight after the verb they open no clause of their own.
+_ACK_DETERMINER_OPENERS = frozenset({"what", "which", "that"})
 #: Words that make a following "-ed" word an adjective in the target.
 _ACK_ADJECTIVE_CUES = frozenset(
     {
@@ -152,6 +164,9 @@ _ACK_AFTER_FINITE = frozenset(
         "without",
     }
 )
+#: An "-ed" word with this prefix is an adjective, not a finite past tense
+#: ("auditing unused node pools.").
+_ACK_ADJECTIVE_PREFIX = "un"
 #: Adverbs ending "-ly" follow a finite past tense ("upgrading failed
 #: silently.").
 _ACK_ADVERB_SUFFIX = "ly"
@@ -354,7 +369,7 @@ def _is_progress_ack(sentence: str) -> bool:
         _bare(word.replace(_ACK_CURLY_APOSTROPHE, "'")).casefold()
         for word in words
     ]
-    if bare[1] in _ACK_CLAUSE_OPENERS:
+    if bare[1] in _ACK_CLAUSE_OPENERS - _ACK_DETERMINER_OPENERS:
         return True
     run = 0
     introduced = True
@@ -385,14 +400,24 @@ def _is_progress_ack(sentence: str) -> bool:
         if word in _ACK_VERDICTS or word in _ACK_FINDING_VERBS or word in _ACK_CLAUSE_OPENERS:
             return False
         if _is_past_tense(word):
-            adjective = previous in _ACK_ADJECTIVE_CUES or (
-                index == 1
-                and bool(following)
-                and not names[index + 1]
+            takes_noun = (
+                bool(following)
                 and following not in _ACK_AFTER_FINITE
                 and following not in _ACK_OBJECTS
                 and following not in _ACK_CLAUSE_OPENERS
                 and not following.endswith(_ACK_ADVERB_SUFFIX)
+            )
+            adjective = takes_noun and (
+                previous in _ACK_ADJECTIVE_CUES
+                or (
+                    index == 1
+                    and not names[index + 1]
+                    and (
+                        word.startswith(_ACK_ADJECTIVE_PREFIX)
+                        or any(names[index + 2 :])
+                        or any(later in _ACK_ADJECTIVE_CUES for later in bare[index + 2 :])
+                    )
+                )
             )
             if not adjective:
                 return False

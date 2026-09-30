@@ -123,6 +123,7 @@ def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
         "creating a staging cluster named foo.",
         "checking pods labeled app=web.",
         "reviewing the cluster called prod-a.",
+        "restarting all failed pods in prod-a.",
     ):
         assert substantive_output({"output": ack}) == "", ack
         assert substantive_output({"output": f"{ack}\n\n{REPORT}"}) == REPORT, ack
@@ -134,6 +135,12 @@ def test_a_line_off_the_template_is_kept_even_when_it_is_an_ack():
     for line in (
         "CHECKING checkout-gateway.",
         "checking seeded-a, seeded-b and seeded-c.",
+        # An opener that is also a determiner is read word by word, so the
+        # clause after it keeps the line.
+        "checking what changed in prod-a.",
+        # A past tense before a bare noun with no name after it is read as a
+        # verb and its object ("restarting cleared alerts.").
+        "reviewing failed rollouts.",
     ):
         assert substantive_output({"output": line}) == line, line
 
@@ -206,6 +213,17 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "rolling back fixed checkout-gateway.",
         "checking quota in us-central1 hit limits.",
         "checking pods in prod-a restart constantly.",
+        "restarting cleared alerts.",
+        "upgrading fixed skew.",
+        "patching removed cves.",
+        "draining evicted pods.",
+        "scaling added capacity.",
+        "restarting all failed.",
+        "restarting some failed.",
+        "upgrading each failed.",
+        "checking that cluster found 3 stale nodes.",
+        "reviewing that rollout shows 4 restarts.",
+        "checking which pods were evicted is done.",
     ):
         assert substantive_output({"output": report}) == report, report
 
@@ -222,10 +240,19 @@ def test_a_question_keeps_what_it_asks_about():
 
 
 def test_known_misreads_are_pinned():
-    # A verb outside the lists inside a short run of plain words has the
-    # words of "auditing version skew across the fleet." and nothing else to
-    # tell it apart. A change that fixes it flips the assertion here.
-    for answer in ("scaling staging broke.",):
+    # Each has the words of an ack in the template's shape and nothing else
+    # to tell it apart. A change that fixes one flips its assertion here.
+    for answer in (
+        # A verb outside the lists inside a short run of plain words, like
+        # "auditing version skew across the fleet.".
+        "scaling staging broke.",
+        # A past tense straight after the verb, before a target that runs on,
+        # like "reviewing failed rollouts in prod-a.".
+        "restarting cleared alerts in prod-a.",
+        # A second clause after an opener, which is read no further, like
+        # "checking why checkout-gateway is restarting.".
+        "checking whether the rollout failed is done.",
+    ):
         assert substantive_output({"output": answer}) == "", answer
 
 
