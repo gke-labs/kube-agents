@@ -452,12 +452,8 @@ class OpenCardsQueryTest(unittest.TestCase):
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
         self.assertEqual(sorted(r[0] for r in rows), ["a", "b"])
 
-    def test_reads_every_live_board_once(self):
-        # Two boards share a database, as a board listed twice would: one read
-        # under the first slug. A third board has its own database.
-        paths = {"default": "/k/default.db", "alias": "/k/default.db", "b2": "/k/b2.db"}
-        rows = {"/k/default.db": [("t_a",)], "/k/b2.db": [("t_b",), ("t_c",)]}
-        reads = []
+    def _fake_hermes(self, paths, rows, reads, broken=()):
+        """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
 
         class Conn:
             def __init__(self, path):
@@ -470,19 +466,51 @@ class OpenCardsQueryTest(unittest.TestCase):
             def close(self):
                 pass
 
+        def connect(board=None):
+            if board in broken:
+                raise RuntimeError("database is locked")
+            return Conn(paths[board])
+
         kb = SimpleNamespace(
             DEFAULT_BOARD="default",
             list_boards=lambda include_archived: [{"slug": s, "db_path": p} for s, p in paths.items()],
             kanban_db_path=lambda slug: Path(paths[slug]),
         )
-        connect = SimpleNamespace(connect=lambda board=None: Conn(paths[board]))
-        hermes = SimpleNamespace(kanban_db=kb, kanban_db_connect=connect)
-        modules = {"hermes_cli": hermes, "hermes_cli.kanban_db": kb, "hermes_cli.kanban_db_connect": connect}
-        with mock.patch.dict(sys.modules, modules):
+        connector = SimpleNamespace(connect=connect)
+        hermes = SimpleNamespace(kanban_db=kb, kanban_db_connect=connector)
+        return {"hermes_cli": hermes, "hermes_cli.kanban_db": kb, "hermes_cli.kanban_db_connect": connector}
+
+    def _databases(self, *names):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return [str((tmp / name).resolve()) for name in names]
+
+    def test_reads_every_live_board_once(self):
+        # Two boards share a database, as a board listed twice would: one read
+        # under the first slug. A third board has its own database.
+        default, b2 = self._databases("default.db", "b2.db")
+        Path(default).touch()
+        Path(b2).touch()
+        paths = {"default": default, "alias": default, "b2": b2}
+        rows = {default: [("t_a",)], b2: [("t_b",), ("t_c",)]}
+        reads = []
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, reads)):
             found = runtime._query_open_cards("C1", "111.000")
         self.assertEqual(found, {("default", "t_a"), ("b2", "t_b"), ("b2", "t_c")})
-        self.assertEqual([path for path, _ in reads], ["/k/default.db", "/k/b2.db"])
+        self.assertEqual([path for path, _ in reads], [default, b2])
         self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
+
+    def test_an_unreadable_or_missing_board_skips_only_itself(self):
+        good, bad, absent = self._databases("good.db", "bad.db", "absent.db")
+        Path(good).touch()
+        Path(bad).touch()
+        paths = {"default": good, "b2": bad, "b3": absent}
+        reads = []
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a",)]}, reads, broken={"b2"})):
+            found = runtime._query_open_cards("C1", "111.000")
+        self.assertEqual(found, {("default", "t_a")})
+        # b3 has no database: never connected to, so never created.
+        self.assertEqual([path for path, _ in reads], [good])
 
     def test_read_failure_is_none(self):
         with mock.patch.object(runtime, "_query_open_cards", side_effect=RuntimeError("locked")):

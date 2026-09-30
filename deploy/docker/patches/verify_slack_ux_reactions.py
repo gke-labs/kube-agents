@@ -191,7 +191,8 @@ def _check_members(tree: ast.Module) -> None:
 
 def check_board_read(module, root: Path) -> None:
     """Run the runtime's kanban query against real boards built with ``hermes_cli``."""
-    if str(root) not in sys.path:
+    added = str(root) not in sys.path
+    if added:
         sys.path.insert(0, str(root))
     saved = {name: os.environ.get(name) for name in (KANBAN_HOME_ENV, *KANBAN_UNSET_ENV)}
     home = Path(tempfile.mkdtemp())
@@ -235,6 +236,8 @@ def check_board_read(module, root: Path) -> None:
             else:
                 os.environ[name] = value
         shutil.rmtree(home, ignore_errors=True)
+        if added:
+            sys.path.remove(str(root))
 
 
 class _StubAdapter:

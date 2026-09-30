@@ -160,7 +160,9 @@ def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
 
     Boards are walked as the notifier walks them: one read per database, under
     the slug the notifier stamps on that database's deliveries. So a card read
-    here and the card a terminal event names compare equal.
+    here and the card a terminal event names compare equal. A board with no
+    database yet is skipped rather than created, and a board that cannot be
+    read is skipped with the rest still read, as the notifier skips it.
     """
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect
@@ -177,11 +179,17 @@ def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
         if resolved in seen:
             continue
         seen.add(resolved)
-        conn = kanban_db_connect.connect(board=slug)
+        if not resolved.startswith("slug:") and not Path(resolved).exists():
+            continue
         try:
-            rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
-        finally:
-            conn.close()
+            conn = kanban_db_connect.connect(board=slug)
+            try:
+                rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001 — one bad board does not blank the others
+            logger.debug("slack_ux_reactions: kanban board %s unreadable: %s", slug, exc)
+            continue
         cards.update((slug, row[0]) for row in rows)
     return frozenset(cards)
 
@@ -234,9 +242,13 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
         waiting = set(new) - set(_finished)
         failed = any(_finished.get(card, False) for card in new)
         if waiting:
-            asks = _deferred.get((chat_id, thread_id), [])
-            ask = _Ask(ts, team_id, waiting, failed)
-            _remember(_deferred, (chat_id, thread_id), [*asks, ask][-DEFERRED_PER_THREAD:], DEFERRED_MAX)
+            asks = [*_deferred.get((chat_id, thread_id), []), _Ask(ts, team_id, waiting, failed)]
+            if len(asks) > DEFERRED_PER_THREAD:
+                logger.debug(
+                    "slack_ux_reactions: %s/%s has %d asks waiting; dropping the oldest, which will not settle",
+                    chat_id, thread_id, len(asks) - DEFERRED_PER_THREAD,
+                )
+            _remember(_deferred, (chat_id, thread_id), asks[-DEFERRED_PER_THREAD:], DEFERRED_MAX)
             return
         if failed:
             settle = _presenter.SETTLE_FAILED
