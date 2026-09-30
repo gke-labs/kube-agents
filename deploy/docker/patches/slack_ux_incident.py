@@ -98,11 +98,11 @@ LINKS_LINE = re.compile(r"^[^\w\n]*🔗")
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
 #: word, so ``Not Recommended: Option A`` is not one.
-RECOMMENDED = re.compile(r"^[^\w\n]*Recommended:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
+RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
-#: A code fence line; nothing between two is a heading, a bullet or markup.
-FENCE = re.compile(r"^\s*(```|~~~)")
+#: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 #: How many edited alerts this process remembers.
 EDITED_MAX = 512
 
@@ -115,15 +115,30 @@ def enabled() -> bool:
     return _presenter is not None and _presenter.enabled()
 
 
+def _next_fence(line: str, fence: str | None) -> str | None:
+    """The fence open after ``line``, given the one open before it.
+
+    As in CommonMark, only a line of the opener's character, at least as long, closes it, and an
+    unclosed fence runs to the end.
+    """
+    match = FENCE.match(line)
+    if not match:
+        return fence
+    mark = match.group(1)
+    if fence is None:
+        return mark
+    closes = mark[0] == fence[0] and len(mark) >= len(fence) and not line.strip().strip(mark[0])
+    return None if closes else fence
+
+
 def _sections(report: str) -> list[tuple[str, str]]:
     """``(heading, body)`` for each markdown heading in ``report``, in order."""
     out: list[tuple[str, str]] = []
     heading, body = None, []
-    fenced = False
+    fence = None
     for line in report.split("\n"):
-        if FENCE.match(line):
-            fenced = not fenced
-        match = None if fenced else HEADING.match(line)
+        was, fence = fence, _next_fence(line, fence)
+        match = None if (was or fence) else HEADING.match(line)
         if match:
             if heading is not None:
                 out.append((heading, "\n".join(body).strip()))
@@ -141,11 +156,10 @@ def _section(sections: list[tuple[str, str]], name: re.Pattern) -> str:
 
 def _unfenced(text: str) -> list[str]:
     """The lines of ``text`` outside code fences, fence lines dropped."""
-    out, fenced = [], False
+    out, fence = [], None
     for line in text.split("\n"):
-        if FENCE.match(line):
-            fenced = not fenced
-        elif not fenced:
+        was, fence = fence, _next_fence(line, fence)
+        if was is None and fence is None:
             out.append(line)
     return out
 
@@ -175,7 +189,8 @@ def parse_triage(report: str) -> dict | None:
             seen.add(letter)
             label = OPTION_LABEL.format(letter=letter, title=_presenter._plain(option.group(2)))
             choices.append((label, bool(recommended) and recommended.group(1) == letter))
-    if not set(OPTION_NAMED.findall(what_to_do)) <= seen:
+    # Fenced lines count here: a fence the parse misreads must not hide an option from the guard.
+    if not set(OPTION_NAMED.findall(rest)) <= seen:
         # A button row missing an option the report offers would misstate it.
         return None
     if not choices:

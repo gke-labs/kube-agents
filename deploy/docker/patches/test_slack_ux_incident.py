@@ -295,6 +295,20 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.parse_triage(report)
         self.assertEqual([label for label, _url in triage["links"]], ["GKE Workloads", "Cloud Logs"])
 
+    def test_emphasis_closed_before_the_colon_is_still_the_recommendation(self):
+        report = REPORT.replace("**Recommended: Option B**", "**Recommended**: Option B")
+        self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
+
+    def test_an_unclosed_fence_between_options_keeps_the_reply(self):
+        report = REPORT.replace("- **Option B", "```\nkubectl rollout undo deploy/payments-api\n- **Option B")
+        self.assertIsNone(runtime.parse_triage(report))
+
+    def test_a_longer_fence_is_closed_only_by_one_as_long(self):
+        report = REPORT.replace("- **Option B", "````\n```\n````\n- **Option B")
+        triage = runtime.parse_triage(report)
+        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual(len(triage["links"]), 2)
+
     def test_two_what_to_do_sections_keep_the_reply(self):
         second = "\n## What to do (cluster B)\n\n- **Option C (Drain the node):** moves the pods.\n"
         self.assertIsNone(runtime.parse_triage(REPORT + second))

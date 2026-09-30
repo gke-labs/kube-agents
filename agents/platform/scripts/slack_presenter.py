@@ -134,13 +134,20 @@ CODE_FENCES = ("```", "~~~")
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
 MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
-MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+#: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
+MD_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
+#: ``*italic*`` and ``_italic_``; a ``*`` inside a word (``2*3``) or unpaired (``*.tmp``) is text.
+MD_ITALIC = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
+#: Inline code.
+MD_CODE = re.compile(r"`([^`\n]+)`")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 #: A candidate sentence end: punctuation, then space, then anything but a
 #: lowercase letter ("in ns. prod" runs on).
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[^\sa-z])")
 #: A text ending in one of these abbreviations has not ended its sentence.
-ABBREVIATION_END = re.compile(r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf)\.$", re.IGNORECASE)
+ABBREVIATION_END = re.compile(
+    r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|no|min|max|fig)\.$", re.IGNORECASE
+)
 
 
 def enabled() -> bool:
@@ -210,7 +217,8 @@ def _plain(markdown: str) -> str:
     text = LIST_MARKER.sub("", text)
     text = MD_LINK.sub(r"\1", text)
     text = MD_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
-    return text.replace("*", "").replace("`", "").strip()
+    text = MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
+    return MD_CODE.sub(r"\1", text).strip()
 
 
 def _clip(text: str, limit: int) -> str:

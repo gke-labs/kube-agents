@@ -136,6 +136,18 @@ class SplitAnswerTest(unittest.TestCase):
         ):
             self.assertEqual(sp.split_answer(line), (line, []))
 
+    def test_a_headline_is_not_cut_after_etc(self):
+        headline, _body = sp.split_answer("Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.")
+        self.assertEqual(headline, "Deployments, StatefulSets, etc. All fail readiness.")
+
+    def test_plain_keeps_a_literal_star_and_drops_markup(self):
+        self.assertEqual(sp._plain("Scale replicas 2*3 → 6"), "Scale replicas 2*3 → 6")
+        self.assertEqual(sp._plain("Delete *.tmp under /var/cache"), "Delete *.tmp under /var/cache")
+        self.assertEqual(sp._plain("**Bold**, *italic*, _also_ and `code`"), "Bold, italic, also and code")
+        self.assertEqual(
+            sp._plain("see [logs](https://x/query=(k8s_container)) now"), "see logs now"
+        )
+
     def test_a_numbered_line_is_not_cut_at_its_number(self):
         headline, body = sp.split_answer("1. Checkout is crashlooping on OOM. It hit 256Mi.")
         self.assertEqual(headline, "Checkout is crashlooping on OOM.")
