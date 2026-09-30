@@ -50,6 +50,7 @@ _AUDIT_REPORT_SYMBOLS = (
     "_declaration_key",
     "DECLARATION_CLUSTER_FIELD",
     "read_intent_paths",
+    "_under_prefixes",
     "INTENT_FILE",
 )
 # The contents API answers `encoding: "none"` with an empty `content` for a
@@ -57,6 +58,16 @@ _AUDIT_REPORT_SYMBOLS = (
 # whole, and the audit reads the file whole from its clone.
 GITHUB_CONTENT_ENCODING_NONE = "none"
 GITHUB_RAW_MEDIA_TYPE = "application/vnd.github.raw+json"
+# What one read of a repository path settles. A refusal or a transient is
+# classified before `404` is matched, because run_cmd's timeout text embeds
+# the command line, and so the project id, which `\b404\b` matches in a
+# project named `...-404`.
+GITHUB_PATH_PRESENT = "present"
+GITHUB_PATH_ABSENT = "absent"
+GITHUB_PATH_UNREAD = "unread"
+# The contents API's `type` for a symlink at the last component of a path. The
+# audit's walk follows none, so a prefix that is one names nothing to it.
+GITHUB_CONTENT_TYPE_SYMLINK = "symlink"
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
 GITOPS_REPO_ORG = "gke-agentic"
 GITOPS_REPO_SUFFIX = "-infra"
@@ -2428,6 +2439,36 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     )
 
 
+def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[str, str]:
+    """Read one path of the GitOps repository: (GITHUB_PATH_*, the body, or the reason it was not read).
+
+    `raw` asks for the file's bytes; without it the contents API's JSON
+    object (or list, for a directory) comes back, which is what a probe for a
+    prefix's existence needs, `type` included.
+    """
+    cmd = ["gh", "api"]
+    if raw:
+        cmd += ["-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}"]
+    rc, out, err = run_cmd(cmd + [f"repos/{repo_slug}/contents/{path}"])
+    if rc == 0:
+        return GITHUB_PATH_PRESENT, out
+    reason = _unread_reason(err or "")
+    if reason is not None:
+        return GITHUB_PATH_UNREAD, reason
+    if _GITHUB_NOT_FOUND.search(err or ""):
+        return GITHUB_PATH_ABSENT, ""
+    return GITHUB_PATH_UNREAD, (err or "").strip()
+
+
+def _names_nothing_to_the_audit(contents_json: str) -> bool:
+    """Whether a present prefix is a symlink at its last component, which the audit's walk never enters."""
+    try:
+        payload = _load_json(contents_json)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get("type") == GITHUB_CONTENT_TYPE_SYMLINK
+
+
 def check_gitops_declaration(project_id: str) -> CheckResult:
     """Verify the GitOps repository carries the declared-intent note, with the declaration in it.
 
@@ -2522,22 +2563,25 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     # names, when the repository has one; a note outside that bound is never
     # read, and a check that parsed it in isolation would pass a project the
     # case fails on. The bound is read with the audit's own reader, over a
-    # copy of the one file, so its rules (a bad path discards the bound, the
-    # whole tree is searched then) are the audit's.
-    rc, intent_out, err = run_cmd(["gh", "api", "-H", f"Accept: {GITHUB_RAW_MEDIA_TYPE}", f"repos/{repo_slug}/contents/{audit.INTENT_FILE}"])
-    if rc != 0 and not _GITHUB_NOT_FOUND.search(err or ""):
+    # copy of the one file, and membership is decided by the audit's own
+    # `_under_prefixes`; what the copy cannot answer, whether each prefix
+    # names anything at this commit, is read from the repository below.
+    state, intent_out = _gitops_path_state(repo_slug, audit.INTENT_FILE, raw=True)
+    if state == GITHUB_PATH_UNREAD:
         return CheckResult(
             name,
             True,
             "Not checked",
-            warnings=[Unread(f"Not checked: {audit.INTENT_FILE} in {repo_slug} could not be read, so whether it bounds the search away from the note is unknown: {(err or '').strip()}")],
+            warnings=[Unread(f"Not checked: {audit.INTENT_FILE} in {repo_slug} could not be read, so whether it bounds the search away from the note is unknown: {intent_out}")],
             read=False,
         )
-    if rc == 0:
-        import contextlib
-        import io
-        import tempfile
+    if state == GITHUB_PATH_ABSENT:
+        return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
+    import contextlib
+    import io
+    import tempfile
 
+    try:
         with tempfile.TemporaryDirectory() as tmp:
             tree = Path(tmp)
             intent_file = tree / audit.INTENT_FILE
@@ -2545,16 +2589,49 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
             intent_file.write_text(intent_out, encoding="utf-8")
             with contextlib.redirect_stderr(io.StringIO()):
                 prefixes = audit.read_intent_paths(tree, repo_slug)
-        if prefixes and not any(GITOPS_INTENT_NOTE_PATH.startswith(p.rstrip("/") + "/") for p in prefixes):
+    except Exception as exc:
+        # PyYAML's safe constructors raise outside the set the reader
+        # catches (`paths: !!bool maybe` is a KeyError); the audit stops on
+        # the same file, so the case fails on this project until it is fixed.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but the audit's reader stops on its "
+            f"{audit.INTENT_FILE} ({type(exc).__name__}: {exc}), and so does the audit; fix that file.",
+        )
+    if not prefixes or audit._under_prefixes(GITOPS_INTENT_NOTE_PATH, prefixes):
+        return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
+    # The audit applies a bound only when every prefix names something at
+    # this commit (its `_unmatched_prefixes`); one that names nothing, or is
+    # a symlink, discards the bound and the whole tree is searched, note
+    # included. Each prefix is read once. A symlink at an earlier component
+    # of a prefix is not seen from here: the audit would discard that bound
+    # and this check fails the project, the one way the two still differ.
+    for prefix in prefixes:
+        state, out = _gitops_path_state(repo_slug, prefix)
+        if state == GITHUB_PATH_UNREAD:
             return CheckResult(
                 name,
-                False,
-                f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
-                f"the audit's search to {', '.join(prefixes)}, so the audit never reads the note and "
-                f"obtainability-declared-intent-no-finding fails on this project. Add `knowledge/` to that file's "
-                f"`paths`, or move the note under one of them.",
+                True,
+                "Not checked",
+                warnings=[Unread(f"Not checked: `{prefix}` from {audit.INTENT_FILE} in {repo_slug} could not be read, so whether the audit applies that bound is unknown: {out}")],
+                read=False,
             )
-    return CheckResult(name, True, f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, where the audit reads it")
+        if state == GITHUB_PATH_ABSENT or _names_nothing_to_the_audit(out):
+            return CheckResult(
+                name,
+                True,
+                f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration; its {audit.INTENT_FILE} names `{prefix}`, "
+                f"which the repository lacks at this commit, so the audit discards the bound and searches the whole tree, note included",
+            )
+    return CheckResult(
+        name,
+        False,
+        f"{repo_slug} carries {GITOPS_INTENT_NOTE_PATH} with the declaration, but its {audit.INTENT_FILE} bounds "
+        f"the audit's search to {', '.join(prefixes)}, every one of which exists, so the audit never reads the note and "
+        f"obtainability-declared-intent-no-finding fails on this project. Add `knowledge/` to that file's "
+        f"`paths`, or move the note under one of them.",
+    )
 
 
 def check_github_repo_and_app(

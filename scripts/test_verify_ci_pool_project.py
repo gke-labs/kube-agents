@@ -1470,18 +1470,81 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         # The second read is the intent file, whose 404 means the whole tree is searched.
         self.assertIn("/contents/.kube-agents/intent.yaml", " ".join(run.call_args_list[1].args[0]))
 
+    _PREFIX_PRESENT = _ok('[{"name": "main.tf", "type": "file"}]')
+
     def test_an_intent_file_that_leaves_the_note_outside_its_paths_fails(self):
         # The audit reads notes only under the intent file's paths; a note the
-        # verifier can fetch by path is one the audit never reads then.
+        # verifier can fetch by path is one the audit never reads then. Its
+        # membership rule is the audit's `_under_prefixes`, so a prefix that
+        # IS the note's path admits it. The failing shape reads its one
+        # prefix back (present); the passing shapes never need to.
         good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
-        for paths, expected_pass in (("paths: [provisioning/]\n", False), ("paths: [knowledge/]\n", True), ("paths: [knowledge]\n", True), ("not: yaml: [\n", True)):
+        shapes = (
+            ("paths: [provisioning/]\n", False),
+            ("paths: [knowledge/]\n", True),
+            ("paths: [knowledge]\n", True),
+            ("paths: [knowledge/notification-relay-no-pdb.md]\n", True),
+            ("not: yaml: [\n", True),
+        )
+        for paths, expected_pass in shapes:
             with self.subTest(paths), mock.patch.object(checker, "run_cmd") as run:
-                run.side_effect = [_ok(self._contents(good)), _ok(paths)]
+                run.side_effect = [_ok(self._contents(good)), _ok(paths), self._PREFIX_PRESENT]
                 result = checker.check_gitops_declaration("kube-agents-evals-3")
                 self.assertEqual(expected_pass, result.passed, (paths, result.message))
                 if not expected_pass:
                     self.assertIn("bounds the audit's search to provisioning", result.message)
                     self.assertNotIn("-f sha=", result.message)
+                    self.assertEqual(3, run.call_count)
+                else:
+                    self.assertEqual(2, run.call_count)
+
+    def test_a_bound_whose_prefix_names_nothing_is_discarded_as_the_audit_discards_it(self):
+        # The audit applies a bound only when every prefix names something at
+        # the commit; a stale one sends it to the whole tree, note included.
+        # A symlink at the last component counts as nothing, as the walk never
+        # enters one. An unreadable prefix leaves the verdict unknown.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT + "\n"
+        two = "paths: [provisioning/, ops/]\n"
+        cases = {
+            "absent": ([_fail("gh: Not Found (HTTP 404)")], True, "discards the bound"),
+            "symlink": ([_ok('{"type": "symlink", "target": "../elsewhere"}')], True, "discards the bound"),
+            "second absent": ([self._PREFIX_PRESENT, _fail("gh: Not Found (HTTP 404)")], True, "names `ops`"),
+            "both present": ([self._PREFIX_PRESENT, self._PREFIX_PRESENT], False, "every one of which exists"),
+            "unread": ([_fail("gh: HTTP 502")], True, "Not checked"),
+            "timeout naming a -404- project": ([_fail("timed out after 30s: gh api repos/gke-agentic/kube-agents-evals-404-infra/contents/provisioning/")], True, "Not checked"),
+        }
+        for label, (probes, expected_pass, phrase) in cases.items():
+            with self.subTest(label), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_ok(self._contents(good)), _ok(two)] + probes
+                result = checker.check_gitops_declaration("kube-agents-evals-404" if "404" in label else "kube-agents-evals-3")
+                self.assertEqual(expected_pass, result.passed, (label, result.message))
+                self.assertIn(phrase, result.message)
+                if phrase == "Not checked":
+                    self.assertFalse(result.read)
+                    self.assertIn("`provisioning`", result.warnings[0])
+
+    def test_an_intent_read_that_times_out_on_a_404_project_is_unverified_not_absent(self):
+        # The same `\b404\b`-in-the-command-line trap as the note read, on
+        # the bound's read: a timeout must not read as "no intent file".
+        err = "timed out after 30s: gh api -H Accept: application/vnd.github.raw+json repos/gke-agentic/kube-agents-evals-404-infra/contents/.kube-agents/intent.yaml"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _fail(err)]
+            result = checker.check_gitops_declaration("kube-agents-evals-404")
+        self.assertTrue(result.passed)
+        self.assertEqual("Not checked", result.message)
+        self.assertFalse(result.read)
+        self.assertIn("intent.yaml", result.warnings[0])
+
+    def test_an_intent_file_the_reader_raises_on_fails_without_a_traceback(self):
+        # PyYAML's safe constructors raise KeyError on `!!bool maybe`, outside
+        # the set read_intent_paths catches; the audit stops on the same file.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(checker.GITOPS_INTENT_NOTE_CONTENT + "\n")), _ok("paths: !!bool maybe\n")]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("KeyError", result.message)
+        self.assertIn("intent.yaml", result.message)
+        self.assertNotIn("-f sha=", result.message)
 
     def test_an_unreadable_intent_file_is_unverified(self):
         with mock.patch.object(checker, "run_cmd") as run:
