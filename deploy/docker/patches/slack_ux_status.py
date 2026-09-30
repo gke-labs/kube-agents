@@ -25,24 +25,29 @@ rather than 30 a minute. Each open and close is logged at info. The legacy
 free text and is left to upstream.
 
 **The session title.** Upstream titles only DM threads. With the flag on, a
-channel thread's first ask becomes its session title, set once, right after
-the first ``processing``: ``agents.sessions.rename`` refuses a thread with no
-session yet. A follow-up ask in the thread keeps the title.
+channel thread's first ask becomes its session title, set right after a
+``processing`` lands: ``agents.sessions.rename`` refuses a thread with no
+session yet. A refused rename keeps the ask for the next ``processing`` sent;
+once the title is set, a follow-up ask in the thread keeps it.
 
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
 notes into one message per card. With the flag on, a Slack thread instead gets
 one message holding a plan with a row per card, edited in place with
 ``chat.update`` as notes arrive. A heartbeat creates a card's row; a terminal
 event settles an existing row (``complete``, ``error``, or ``pending`` for a
-card waiting on the user; ``unblocked`` sets it running again; ``archived``
-removes it) and never creates one, so a card that finished
-without a note adds no plan above its report. The plan holds the thread's
-session status: ``processing`` while a row runs, ``suspended`` while rows wait
-on the user and none runs, and a Planning Agent turn ending in the thread does
-not close it under either. Once no row is running or waiting, the session is
-closed and the plan is forgotten here, and the thread's next card starts a new
-plan. The plan has no Stop button yet: ``/stop`` interrupts only the Planning
-Agent's turn, and the cards would run on.
+card waiting on the user) and never creates one, so a card that finished
+without a note adds no plan above its report. Two kinds upstream never posts
+reach the plan through ``kanban_progress_lines.silent_event``:
+``unblocked`` sets a waiting row running again, and ``archived`` removes a
+running or waiting row, deleting the plan message when it was the last. The
+plan holds the thread's session status: ``processing`` while a row runs,
+``suspended`` while rows wait on the user and none runs, and a Planning Agent
+turn ending in the thread does not close it under either. Once no row is
+running or waiting, the session is closed and the plan is forgotten here, and
+the thread's next card starts a new plan. A plan with no note or settled row
+for :data:`PLAN_HOLD_SECONDS` closes the session itself; its next note opens
+it again. The plan has no Stop button yet: ``/stop`` interrupts only the
+Planning Agent's turn, and the cards would run on.
 
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
 message was deleted), the thread drops to the rolling line until the plan's
@@ -53,6 +58,7 @@ note starts a new one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -84,11 +90,11 @@ PLATFORM = "slack"
 #: status can go if one ever does, at one call a minute instead of thirty.
 SESSION_REFRESH_SECONDS = 60.0
 
-#: How long a plan with no new note or settled row keeps a Planning Agent
-#: turn's clear from closing the session. A card whose terminal event never
-#: reaches the thread (a restart, a dropped subscription) leaves its row
-#: running for good; this stops that row holding Working… forever, while
-#: covering a card's silent stretches, since noteless heartbeats reach no one.
+#: How long a plan with no new note or settled row holds the session open
+#: before closing it. A card whose terminal event never reaches the thread (a
+#: dropped subscription, a lost event) leaves its row running for good; this
+#: stops that row holding Working… forever, while covering a card's silent
+#: stretches, since noteless heartbeats reach no one.
 PLAN_HOLD_SECONDS = 1800.0
 
 #: ``fail_label`` for the adapter's status setter when the plan sets it.
@@ -96,6 +102,9 @@ PLAN_STATUS_LABEL = "plan"
 
 #: The notifier kind for a card archived by hand: its row leaves the plan.
 ARCHIVED_KIND = "archived"
+
+#: The notifier kind for a card the user unblocked: its waiting row runs again.
+UNBLOCKED_KIND = "unblocked"
 
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
@@ -119,17 +128,17 @@ class _Row:
 
 
 class _Plan:
-    __slots__ = ("fallback", "rows", "session", "team_id", "touched", "ts")
+    __slots__ = ("fallback", "lapse", "rows", "team_id", "touched", "ts")
 
     def __init__(self, team_id: str) -> None:
         self.ts = ""
         self.team_id = team_id
         self.rows: OrderedDict[str, _Row] = OrderedDict()
         self.fallback = False
-        #: The session status this plan last asked for, ``""`` before the first.
-        self.session = ""
         #: ``time.monotonic()`` at the last note or settled row.
         self.touched = time.monotonic()
+        #: The timer that closes the session after :data:`PLAN_HOLD_SECONDS`.
+        self.lapse: asyncio.TimerHandle | None = None
 
 
 #: ``(channel, thread) -> (status sent, when)``. No team: a kanban
@@ -142,6 +151,8 @@ _asks: OrderedDict[tuple, str] = OrderedDict()
 _titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> _Plan``.
 _plans: OrderedDict[tuple, _Plan] = OrderedDict()
+#: Lapse tasks in flight, held so the loop does not drop them mid-run.
+_lapsing: set = set()
 
 
 def enabled() -> bool:
@@ -215,18 +226,19 @@ async def set_thread_status(
     if not sent or sent[0] != wanted:
         logger.info("slack_ux_status: session %s in %s/%s", wanted, chat_id, thread_ts)
     _remember(_sessions, key, (wanted, now), SESSIONS_MAX)
-    if wanted != _status.SESSION_PROCESSING:
+    if wanted != _status.SESSION_PROCESSING or key not in _asks:
         return
-    ask = _asks.pop((str(chat_id), str(thread_ts)), None)
-    title = _status.session_title(ask)
-    if not title:
-        return
-    try:
-        await title_method(client)(channel_id=chat_id, thread_ts=thread_ts, title=title)
-    except Exception as exc:  # noqa: BLE001 — a title is cosmetic
-        logger.debug("[Slack] agents.sessions.rename failed: %s", exc)
-        return
-    _remember(_titles, (str(chat_id), str(thread_ts)), title, ASKS_MAX)
+    title = _status.session_title(_asks[key])
+    if title:
+        try:
+            await title_method(client)(channel_id=chat_id, thread_ts=thread_ts, title=title)
+        except Exception as exc:  # noqa: BLE001 — a title is cosmetic
+            # The ask stays, so the next processing sent retries it and a
+            # follow-up ask does not take its place.
+            logger.debug("[Slack] agents.sessions.rename failed: %s", exc)
+            return
+        _remember(_titles, key, title, ASKS_MAX)
+    _asks.pop(key, None)
 
 
 # --- the plan --------------------------------------------------------------
@@ -242,7 +254,7 @@ def _plan_session(chat_id: str, thread_ts: str) -> str:
     A plan untouched for :data:`PLAN_HOLD_SECONDS` holds nothing.
     """
     plan = _plans.get((chat_id, thread_ts))
-    if plan is None or time.monotonic() - plan.touched > PLAN_HOLD_SECONDS:
+    if plan is None or time.monotonic() - plan.touched >= PLAN_HOLD_SECONDS:
         return ""
     if _status.running(plan.rows.values()):
         return _status.SESSION_PROCESSING
@@ -280,21 +292,21 @@ async def _render(adapter: Any, key: tuple, plan: _Plan) -> bool:
 
 
 async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
-    """Send the session status the plan now holds, when it differs from the last it sent.
+    """Send the session status the plan now holds, through the adapter's setter.
 
     A row running opens the session; nothing running clears it, which
     :func:`set_thread_status` turns into ``suspended`` while a row still waits
-    and the legacy thread status shows as cleared.
+    and the legacy thread status shows as cleared. Sent on every note and
+    settle: :func:`set_thread_status` skips an unchanged status against what
+    Slack last accepted, so a refused one is retried and one a Planning Agent
+    turn changed is restored. The legacy setter has no such check and costs a
+    call per note, beside the note's own edit.
     """
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts) if _plans.get(key) is plan else ""
-    wanted = wanted or _status.SESSION_CLOSED
-    if wanted == plan.session:
-        return
     setter = getattr(adapter, "_set_thread_status", None)
     if setter is None:
         return
-    plan.session = wanted
     phrase = ""
     if wanted == _status.SESSION_PROCESSING:
         # Hermes's own phrase: the Agent Sessions path maps it to ``processing``,
@@ -305,6 +317,52 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
         await setter(chat_id, plan.team_id, thread_ts, phrase, PLAN_STATUS_LABEL)
     except Exception as exc:  # noqa: BLE001 — cosmetic
         logger.debug("slack_ux_status: setting the plan's session status failed: %s", exc)
+
+
+def _arm(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """(Re)start the plan's lapse timer; with no running loop there is nothing to close later."""
+    _disarm(plan)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    plan.lapse = loop.call_later(PLAN_HOLD_SECONDS, _start_lapse, adapter, key, plan)
+
+
+def _disarm(plan: _Plan) -> None:
+    if plan.lapse is not None:
+        plan.lapse.cancel()
+        plan.lapse = None
+
+
+def _start_lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
+    plan.lapse = None
+    task = asyncio.ensure_future(_lapse(adapter, key, plan))
+    _lapsing.add(task)
+    task.add_done_callback(_lapsing.discard)
+
+
+async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """Close the session of a plan nothing has touched for :data:`PLAN_HOLD_SECONDS`.
+
+    The plan stays: a late note puts its row back and opens the session again.
+    """
+    if _plans.get(key) is not plan or time.monotonic() - plan.touched < PLAN_HOLD_SECONDS:
+        return
+    logger.info(
+        "slack_ux_status: the plan in %s/%s had no news for %ss; closing its session",
+        key[0], key[1], int(PLAN_HOLD_SECONDS),
+    )
+    await _session(adapter, key, plan)
+
+
+async def _unpost(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """Delete the plan message once its last row is archived; a failure leaves it as it was."""
+    try:
+        client = adapter._get_client(key[0], team_id=plan.team_id or None)
+        await client.chat_delete(channel=key[0], ts=plan.ts)
+    except Exception as exc:  # noqa: BLE001 — cosmetic
+        logger.debug("slack_ux_status: deleting the emptied plan in %s/%s failed: %s", key[0], key[1], exc)
 
 
 def _settled(plan: _Plan) -> bool:
@@ -345,6 +403,7 @@ async def deliver_row(
         row.lines, row.status, row.last_event_id = previous
         return False
     plan.touched = time.monotonic()
+    _arm(adapter, key, plan)
     await _session(adapter, key, plan)
     return True
 
@@ -358,17 +417,30 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
     status = _status.task_status(kind)
     if row is None or (status is None and kind != ARCHIVED_KIND):
         return
+    live = (_status.TASK_RUNNING, _status.TASK_PENDING)
+    if (kind == UNBLOCKED_KIND and row.status != _status.TASK_PENDING) or (
+        kind == ARCHIVED_KIND and row.status not in live
+    ):
+        # A replay, or a card archived after it finished: its row stands.
+        return
     if status is None:
         # Archived by hand: nothing will settle the row, so it leaves the plan.
         del plan.rows[card]
     else:
         row.status = status
     plan.touched = time.monotonic()
-    if plan.ts and not plan.fallback and plan.rows:
-        await _render(adapter, key, plan)
+    if plan.ts and not plan.fallback:
+        if plan.rows:
+            await _render(adapter, key, plan)
+        else:
+            await _unpost(adapter, key, plan)
     # A plan that fell back is still forgotten once its rows settle, so the
     # thread's next card tries a plan again.
-    if _settled(plan) and _plans.get(key) is plan:
-        _plans.pop(key, None)
+    if _settled(plan):
+        _disarm(plan)
+        if _plans.get(key) is plan:
+            _plans.pop(key, None)
+    else:
+        _arm(adapter, key, plan)
     if plan.ts:
         await _session(adapter, key, plan)

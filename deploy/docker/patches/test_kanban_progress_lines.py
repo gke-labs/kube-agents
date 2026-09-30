@@ -30,6 +30,7 @@ from kanban_progress_lines import (
     progress_note,
     render,
     rolling_line,
+    silent_event,
     slack_line,
     sub_key,
     tracked_messages,
@@ -159,6 +160,13 @@ def _send_method(coroutine: bool) -> str:
     )
 
 
+# The loop that skips an event with no message, where the silent-kind hook goes.
+_PINGS_HEAD = (
+    "\n    async def _send_pings(self):\n"
+    "        for ev in self.events:\n"
+)
+
+
 def _notifier_source(coroutine: bool, kinds: str = _KINDS_ASSIGN) -> str:
     """A stand-in kanban_watchers_notifier.py carrying every site at its real shape.
 
@@ -176,6 +184,8 @@ def _notifier_source(coroutine: bool, kinds: str = _KINDS_ASSIGN) -> str:
         + applier.HEADER_ANCHOR
         + _send_method(coroutine)
         + applier.SEND_ANCHOR
+        + _PINGS_HEAD
+        + applier.SILENT_ANCHOR
     )
 
 
@@ -225,6 +235,11 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("_send_res = await _progress_deliver(", patched)
         self.assertIn("self.runner, adapter, sub, ev.kind, ev, msg, metadata,", patched)
         self.assertNotIn("_send_res = await adapter.send(", patched)
+        # A skipped event reaches the silent-kind hook, and is still skipped.
+        self.assertIn(
+            "                await _progress_silent_event(self, ev)\n                continue\n", patched,
+        )
+        self.assertIn("from gateway.kanban_progress_lines import silent_event as _progress_silent_event", patched)
         self.assertIn(
             "A one-line progress update",
             (root / applier.SCHEMAS_RELATIVE).read_text(),
@@ -275,6 +290,14 @@ class ApplierTest(unittest.TestCase):
             applier.apply(root)
         self.assertIn("found 0", str(caught.exception))
         self.assertIn("notifier send", str(caught.exception))
+
+    def test_a_drifted_skip_fails_the_build(self):
+        root = self._tree()
+        path = root / applier.NOTIFIER_RELATIVE
+        path.write_text(path.read_text().replace("if msg is None:", "if not msg:"))
+        with self.assertRaises(SystemExit) as caught:
+            applier.apply(root)
+        self.assertIn("silent-kind skip", str(caught.exception))
 
     def test_a_missing_last_formatter_fails_the_build(self):
         root = self._tree()
@@ -954,6 +977,21 @@ class SlackLineTest(unittest.TestCase):
     def test_a_line_without_the_head_is_unchanged(self):
         self.assertEqual(slack_line("Both pods are up.", HEADER, BOARD, "t_1"), "Both pods are up.")
 
+    def test_a_head_quoted_in_the_handoff_is_the_workers_words(self):
+        # completion_text already dropped the head: what is left is the handoff alone.
+        for line in (
+            f"Retried after {HEADER}Kanban t_1 timed out.",
+            f"Both pods are up.\n{HEADER}Kanban t_1 done — earlier run",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(slack_line(line, HEADER, BOARD, "t_1"), line)
+
+    def test_no_assignee_drops_the_head_once(self):
+        line = f"✔ [{BOARD}] Kanban t_1 done — [{BOARD}] Kanban t_1 was a retry"
+        self.assertEqual(
+            slack_line(line, f"[{BOARD}] ", BOARD, "t_1"), f"✔ done — [{BOARD}] Kanban t_1 was a retry",
+        )
+
 
 class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
     """KAGE_SLACK_UX on a Slack card: notes go on the thread's plan, not a rolling message.
@@ -1035,6 +1073,27 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
     async def test_other_platforms_never_reach_the_plan(self):
         await self._run(_Adapter(), SUB)
         self.assertEqual((self.rows, self.settled), ([], []))
+
+    async def test_a_silent_kind_moves_the_plan_row(self):
+        # archived and unblocked format to None upstream, so deliver() never sees them.
+        for kind in ("archived", "unblocked"):
+            await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind=kind))
+        self.assertEqual(self.settled, [("t_e0c1", "archived"), ("t_e0c1", "unblocked")])
+
+    async def test_other_silent_events_and_platforms_do_not(self):
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="heartbeat"))
+        await silent_event(SimpleNamespace(sub=SUB, adapter=_Adapter()), SimpleNamespace(kind="archived"))
+        self.flag = False
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="archived"))
+        self.assertEqual(self.settled, [])
+
+    async def test_a_silent_event_never_raises(self):
+        async def boom(adapter, sub, kind):
+            raise RuntimeError("slack down")
+
+        sys.modules["gateway.slack_ux_status"].settle_row = boom
+        await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="archived"))
+        await silent_event(SimpleNamespace(), SimpleNamespace(kind="archived"))
 
     async def test_flag_off_posts_exactly_what_it_did_before(self):
         self.flag = False

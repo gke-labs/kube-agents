@@ -162,6 +162,11 @@ MAX_TRACKED = 2048
 KANBAN_ID = "Kanban {task_id}"
 BOARD_TAG = "[{board}] "
 
+#: Kinds upstream claims but has no formatter for, so ``_send_pings`` skips
+#: them before any send. With ``KAGE_SLACK_UX`` on they still move a Slack
+#: card's row in the thread's plan; see :func:`silent_event`.
+SILENT_PLAN_KINDS = ("archived", "unblocked")
+
 #: Attribute the map hangs off on the watcher instance. Same lazily-initialised
 #: pattern as upstream's ``_kanban_sub_fail_counts``.
 _ATTR = "_kanban_progress_messages"
@@ -283,17 +288,22 @@ def slack_line(message: str, header: str, board: Optional[str], task_id: str) ->
     Upstream heads a line ``{board_tag}{@assignee }Kanban <id>``, or for
     ``changes_requested`` ``{board_tag}Kanban <id>``; either becomes the
     ``@assignee`` alone, and a line with no assignee loses the head entirely.
-    The first occurrence only: the head opens the line, and the worker's
-    handoff below it is its own words.
+    Only a head that opens the line, after nothing but its marker, is trimmed:
+    a completion message whose head ``completion_text`` already dropped is
+    the worker's handoff alone, and a head quoted in it is the worker's words.
     """
     tag = BOARD_TAG.format(board=board) if board else ""
     card = KANBAN_ID.format(task_id=task_id)
     agent = slack_header(header, board).strip()
+    first = message.split("\n", 1)[0]
     for head in (f"{header}{card}", f"{tag}{card}"):
-        if head in message:
-            if agent:
-                return message.replace(head, agent, 1)
-            return message.replace(f"{head} ", "", 1).replace(head, "", 1)
+        at = first.find(head)
+        if at < 0 or any(ch.isalnum() for ch in first[:at]):
+            continue
+        rest = message[at + len(head):]
+        if agent:
+            return message[:at] + agent + rest
+        return message[:at] + (rest[1:] if rest.startswith(" ") else rest)
     return message
 
 
@@ -385,6 +395,30 @@ async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str) -> Non
         await plan.settle_row(adapter, sub, kind)
     except Exception as exc:  # noqa: BLE001 — cosmetic, like the rolling settle
         logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
+
+
+async def silent_event(notification: Any, ev: Any) -> None:
+    """Move a Slack card's plan row on a kind upstream keeps silent.
+
+    Called by ``_send_pings`` for an event whose ``format_event`` returned
+    ``None``, before it skips the event. :func:`deliver` never sees these, so
+    without this a card archived by hand would hold its row running, and the
+    thread's Working…, and an unblocked card would stay waiting on you until
+    its next note. Only :data:`SILENT_PLAN_KINDS`, only with ``KAGE_SLACK_UX``
+    on for a Slack card, and never raises: it runs inside the send loop.
+    """
+    try:
+        kind = str(getattr(ev, "kind", "") or "")
+        if kind not in SILENT_PLAN_KINDS:
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        plan = _slack_plan(_slack_quiet(sub))
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the plan
+        logger.debug("kanban progress: reading a silent event failed: %s", exc)
+        return
+    if plan is not None and adapter is not None:
+        await _settle_plan_row(plan, adapter, sub, kind)
 
 
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:

@@ -246,6 +246,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
     grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'await _progress_silent_event(self, ev)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.runner, adapter, sub, ev.kind, ev, msg, metadata,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.progress_header = f"{self.board_tag}{tag}"' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers_notifier.py && \

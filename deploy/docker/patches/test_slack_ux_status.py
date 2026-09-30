@@ -123,6 +123,9 @@ class _Client:
     async def chat_update(self, **kw):
         return await self._record("update", kw["blocks"])
 
+    async def chat_delete(self, **kw):
+        return await self._record("delete", kw["ts"])
+
 
 class _Root:
     """A throwaway Hermes root holding the fixture adapter and the runtime module."""
@@ -384,6 +387,20 @@ class SessionTest(_RuntimeCase):
         self._status(adapter, PHRASE)
         self.assertNotIn((CHANNEL, THREAD), runtime._titles)
 
+    def test_a_refused_rename_keeps_the_first_ask_for_the_next_session(self):
+        adapter = _Adapter(_Client(fail={"rename"}))
+        runtime.note_ask(CHANNEL, THREAD, "why is payments slow?")
+        self._status(adapter, PHRASE)
+        self._status(adapter, "")
+        runtime.note_ask(CHANNEL, THREAD, "and checkout?")
+        adapter.client.fail.clear()
+        self._status(adapter, PHRASE)
+        self.assertEqual(
+            [v for n, v in adapter.calls if n == "rename"], ["why is payments slow?", "why is payments slow?"],
+        )
+        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is payments slow?")
+        self.assertNotIn((CHANNEL, THREAD), runtime._asks)
+
     def test_flag_off_keeps_no_ask(self):
         env = _flag("")
         self.addCleanup(env.stop)
@@ -549,15 +566,38 @@ class PlanTest(_RuntimeCase):
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
-    def test_archiving_the_last_running_card_closes_the_session(self):
+    def test_archiving_the_last_running_card_removes_the_plan_and_closes(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
-        updates = len([n for n, _v in adapter.calls if n == "update"])
         _run(runtime.settle_row(adapter, _sub(), "archived"))
-        # The last rendering stays; there is no empty plan to show.
-        self.assertEqual(len([n for n, _v in adapter.calls if n == "update"]), updates)
+        # No row is left to show, and a stale "running" row would contradict the closed session.
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus", "delete", "setStatus"])
+        self.assertEqual(adapter.calls[2], ("delete", PLAN_TS))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_a_refused_delete_still_closes(self):
+        adapter = _Adapter(_Client(fail={"delete"}))
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "archived"))
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_a_card_archived_after_it_finished_keeps_its_row(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "a", task="t_a")
+        self._note(adapter, 2, "b", task="t_b")
+        _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
+        calls = len(adapter.calls)
+        _run(runtime.settle_row(adapter, _sub("t_a"), "archived"))
+        self.assertEqual(len(adapter.calls), calls)
+        self.assertEqual(list(runtime._plans[(CHANNEL, THREAD)].rows), ["t_a", "t_b"])
+
+    def test_an_unblocked_replay_leaves_a_running_row(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        self.assertEqual(self._kinds(adapter), ["post", "setStatus"])
 
     def test_the_plan_and_the_turn_share_the_session_entry(self):
         # The subscription carries no team; the Planning Agent's turn does.
@@ -582,7 +622,7 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
 
     def test_a_stale_plan_stops_holding_the_session(self):
-        # A card archived mid-run never settles its row.
+        # A card whose terminal event never reaches the thread never settles its row.
         adapter = _Adapter()
         with mock.patch.object(runtime.time, "monotonic", return_value=1000.0):
             self._note(adapter, 1, "reading logs")
@@ -590,6 +630,50 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime.time, "monotonic", return_value=later):
             _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+    def test_a_note_after_the_lapse_opens_the_session_again(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime.time, "monotonic", return_value=1000.0):
+            self._note(adapter, 1, "reading logs")
+        later = 1000.0 + runtime.PLAN_HOLD_SECONDS + 1
+        with mock.patch.object(runtime.time, "monotonic", return_value=later):
+            _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn"))
+            self._note(adapter, 2, "still reading")
+        self.assertEqual(
+            [v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed", "processing"],
+        )
+
+    def test_a_refused_plan_status_is_retried_on_the_next_note(self):
+        adapter = _Adapter(_Client(fail={"setStatus"}))
+        self._note(adapter, 1, "reading logs")
+        adapter.client.fail.clear()
+        self._note(adapter, 2, "reading metrics")
+        self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing", "processing"])
+
+    def test_a_quiet_plan_closes_the_session_itself(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "reading logs")
+            await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "reading logs")
+            await runtime.settle_row(adapter, _sub("t_b"), "completed")
+            # Each touch re-arms the timer, so only one lapse fires.
+            await asyncio.sleep(0.2)
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+        self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed"])
+        self.assertIn((CHANNEL, THREAD), runtime._plans, "a late note can still reach the plan")
+
+    def test_a_plan_that_settles_leaves_no_timer(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs")
+            await runtime.settle_row(adapter, _sub(), "completed")
+            await asyncio.sleep(0.2)
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+        self.assertEqual([v for n, v in adapter.calls if n == "setStatus"], ["processing", "closed"])
 
     def test_a_turn_ending_without_a_plan_still_closes(self):
         adapter = _Adapter()

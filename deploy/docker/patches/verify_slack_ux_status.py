@@ -36,6 +36,9 @@ RUNTIME = "gateway/slack_ux_status.py"
 FLAG_ENV = "KAGE_SLACK_UX"
 
 SETTER = "_set_thread_status"
+#: ``_set_thread_status``'s positional parameters, in the order this module's
+#: ``_session`` passes them: a reorder upstream would send the thread as the team.
+SETTER_POSITIONAL = ("self", "chat_id", "team_id", "thread_ts", "status", "fail_label")
 BUILDER = "_build_message_event"
 GUARD_ALIAS = "_kage_slack_status"
 GUARD_TARGET = "set_thread_status"
@@ -110,6 +113,9 @@ def check_adapter(root: Path) -> None:
     setter = defs.get(SETTER)
     if setter is None:
         raise _fail(f"{ADAPTER} has no async def {SETTER}()")
+    positional = tuple(a.arg for a in setter.args.posonlyargs + setter.args.args)
+    if positional != SETTER_POSITIONAL:
+        raise _fail(f"{SETTER}() is not ({', '.join(SETTER_POSITIONAL)}): {positional}")
     body = setter.body
     if len(body) < 3 or not _is_guard(body[1]):
         raise _fail(f"{SETTER}() does not open with the {FLAG_ENV} guard after its docstring")

@@ -4256,8 +4256,10 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// one message and its own failure report.
 	//
 	// KAGE_SLACK_UX switches the Slack gateway between code paths already in
-	// the image: which reaction goes on an ask and when it settles, and how
-	// much of a delegated card's delivery posts in the thread. It is compared
+	// the image: which reaction goes on an ask and when it settles, how much
+	// of a delegated card's delivery posts in the thread, whether a thread's
+	// cards show as one plan message, and the session status and title Slack
+	// shows on the thread. It is compared
 	// against `FLAG_ON_VALUES` in `slack_presenter.py`; any other value is off,
 	// the image default. It names no path, URL, credential or image, and no
 	// value of it reaches anything but how the gateway presents messages in

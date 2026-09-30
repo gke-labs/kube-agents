@@ -77,6 +77,7 @@ from gateway.kanban_progress_lines import (  # noqa: E402
     ROLLING_KINDS,
     STOPPED,
     deliver,
+    silent_event,
     progress_note,
     render,
     rolling_line,
@@ -115,6 +116,11 @@ check(
     "something else is bound to the name the notifier calls",
 )
 check(
+    "the notifier resolved the silent-kind import",
+    getattr(notifier, "_progress_silent_event", None) is silent_event,
+    "the skip hook would raise NameError inside the send loop's try",
+)
+check(
     "heartbeat is claimed",
     "heartbeat" in notifier.TERMINAL_KINDS,
     "an unclaimed kind never reaches the formatter",
@@ -131,13 +137,13 @@ check(
 )
 check(
     "the trailer is applied exactly once",
-    NOTIFIER_SOURCE.count("from gateway.kanban_progress_lines import") == 2
+    NOTIFIER_SOURCE.count("from gateway.kanban_progress_lines import") == 3
     and NOTIFIER_SOURCE.count("import deliver as _progress_deliver") == 1,
     "a duplicated trailer means the applier ran twice over one tree",
 )
 
 # --- 2. The send site ---------------------------------------------------------
-# One call site is the whole reason this patch is three anchors and not thirty.
+# One call site is the whole reason this patch is four anchors and not thirty.
 # If upstream grows a second `adapter.send` inside the notifier's delivery, the
 # events leaving through it bypass the rolling message entirely.
 print("send site:")
@@ -172,6 +178,13 @@ check(
     "the failure check still reads the helper's return value",
     0 <= _deliver_at < _check_at,
     "the send-failure accounting is what makes delivery at-least-once",
+)
+_silent_at = NOTIFIER_SOURCE.find("await _progress_silent_event(self, ev)")
+check(
+    "a skipped event reaches the silent-kind hook once, before the skip",
+    NOTIFIER_SOURCE.count("await _progress_silent_event(self, ev)") == 1
+    and NOTIFIER_SOURCE[_silent_at:].split("\n", 2)[1].strip() == "continue",
+    "an archived or unblocked card would never move its plan row",
 )
 check(
     "the heartbeat formatter still builds the first rendering",
