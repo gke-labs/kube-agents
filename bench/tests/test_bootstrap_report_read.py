@@ -203,6 +203,26 @@ def test_the_claim_is_waited_for(pods: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert result.status == "pass", result.reason
 
 
+def test_a_delivery_between_the_two_reads_is_not_read_as_a_rename_without_a_claim(
+    pods: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plant(pods, "INVENTORY.md")
+    reads: list[str] = []
+
+    def delivers_after_the_first_read(script: str, timeout: float) -> str:
+        out = _local_shell(script, timeout)
+        if not reads:
+            _plant(pods, ".bootstrap_completed")
+            (pods / "INVENTORY.md").rename(pods / "INVENTORY.delivered.md")
+        reads.append(script)
+        return out
+
+    monkeypatch.setattr(onboarding, "agent_shell", delivers_after_the_first_read)
+    monkeypatch.setattr(onboarding, "sandbox_shell", delivers_after_the_first_read)
+    result = _verify()
+    assert "holds INVENTORY.delivered.md but there is no" not in result.reason, result.reason
+
+
 # --- registration and the stack --------------------------------------------
 
 

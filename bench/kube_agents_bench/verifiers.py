@@ -2609,14 +2609,17 @@ class BootstrapReportReadVerifier(_OnboardingPollVerifier):
     type: Literal["bootstrap_report_read"]
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
-        agent = onboarding.read_files(onboarding.agent_shell, [onboarding.COMPLETED_MARKER], read_timeout)
-        if agent is None:
-            return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
+        # The sandbox first: the job claims on the agent pod before it renames on the
+        # sandbox, so the other order can see the rename without the claim, a state
+        # the job never occupies.
         sandbox = onboarding.read_files(
             onboarding.sandbox_shell, [onboarding.REPORT_FILE, onboarding.DELIVERED_FILE], read_timeout
         )
         if sandbox is None:
             return "error", f"{onboarding.sandbox_pod()} could not be read (kubectl exec failed or the command did not run)", None
+        agent = onboarding.read_files(onboarding.agent_shell, [onboarding.COMPLETED_MARKER], read_timeout)
+        if agent is None:
+            return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
         claimed = agent[onboarding.COMPLETED_MARKER]
         report = sandbox[onboarding.REPORT_FILE]
         delivered = sandbox[onboarding.DELIVERED_FILE]
