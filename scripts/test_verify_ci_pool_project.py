@@ -1498,6 +1498,23 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIsInstance(result.warnings[0], checker.Unread)
         self.assertFalse(result.read)
 
+    def test_gh_transport_failures_are_unverified_not_failed(self):
+        # gh's DNS/connection failures are not in gcloud's vocabulary; a network
+        # blip during a pool sweep must read as unverified, not as a failed project.
+        errs = (
+            "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+            'Get "https://api.github.com/repos/gke-agentic/kube-agents-evals-3-infra/contents/knowledge/notification-relay-no-pdb.md": dial tcp 140.82.112.5:443: connect: connection refused',
+            'Get "https://api.github.com/...": dial tcp 140.82.112.5:443: i/o timeout',
+            "net/http: TLS handshake timeout",
+        )
+        for err in errs:
+            with self.subTest(err[:40]), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = [_fail(err)]
+                result = checker.check_gitops_declaration("kube-agents-evals-3")
+                self.assertTrue(result.passed, err)
+                self.assertEqual("Not checked", result.message)
+                self.assertIsInstance(result.warnings[0], checker.Unread)
+
     def test_a_read_that_failed_for_another_reason_fails_the_check(self):
         # `gh api .../contents/<path>` on a repository with no commits answers
         # 409, which is neither a denial nor a transient: the sibling reads
@@ -1553,7 +1570,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "no declares": "has no `declares` list",
             "other object": "no declares item is check no-pdb",
             "strings but no structure": "not valid YAML",
-            "empty cluster": "was skipped by the audit's parser",
+            "empty cluster": "the parser skipped every item",
             "another cluster": "name cluster seeded-b",
             "unquoted impossible date": "not valid YAML (ValueError)",
             "null declares": "has no `declares` list",

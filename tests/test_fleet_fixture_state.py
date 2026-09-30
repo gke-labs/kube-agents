@@ -442,8 +442,8 @@ class PassTest(_Harness):
     def test_drift_is_recorded_only_at_the_deadline(self):
         world = _healthy_world()
         world["kubectl"]["pod?app=payments-api"] = _pods(_pod(restarts=0, last_reason=None, phase="Pending"))
-        # Long enough for a second pass on a slow machine (a pass is eight
-        # roles through two stub interpreters), short enough not to matter.
+        # Long enough for a second pass on a slow machine (a pass is every
+        # role through two stub interpreters), short enough not to matter.
         done = self.run_script(world, "--wait", "4", "--interval", "0.1")
         assert done.returncode == 0
         assert set(self.drift_files()) == {"crashloop-workload"}

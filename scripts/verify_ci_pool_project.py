@@ -45,6 +45,7 @@ _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
 # the AttributeError named) and never a verdict on a repository's note.
 _AUDIT_REPORT_SYMBOLS = (
     "parse_declarations",
+    "explain_empty_declarations",
     "split_frontmatter",
     "audit_declarable_checks",
     "_declaration_key",
@@ -768,6 +769,14 @@ _UNREAD_PATTERNS = (
     # resource named readtimeout is still an absence.
     re.compile(
         r"\bgcloud crashed\b|Temporary failure in name resolution|Name or service not known|Connection reset by peer|Unable to find the server at",
+        re.I,
+    ),
+    # gh's own words for the same transport failures -- it never got an answer
+    # from api.github.com -- and the raw Go network errors it prints for a
+    # refused connection, a socket timeout or a TLS handshake that never
+    # completed. None of these is a resource's name.
+    re.compile(
+        r"error connecting to api\.github\.com|check your internet connection|githubstatus\.com|dial tcp .*(?:connection refused|i/o timeout)|net/http: TLS handshake timeout",
         re.I,
     ),
 )
@@ -2378,12 +2387,10 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     `apply_declarations` files clustered items under their cluster and the
     rest fleet-wide, and a finding falls through to a fleet-wide entry, so a
     note is good when ANY matching item is fleet-wide, whatever else it lists.
-    A note the parser reads nothing from is diagnosed here with the parser's
-    own `split_frontmatter`, because for the common misshapes (no frontmatter,
-    unclosed, no `type`, no `declares`) the parser is silent by design.
+    A note the parser reads nothing from is explained by the parser itself
+    (`explain_empty_declarations`, the same ladder `parse_declarations`
+    walks), so the reason printed cannot drift from the verdict.
     """
-    import yaml
-
     if audit is None:
         audit = _load_audit_report()
     # The audit's own policy for which slugs a note may justify, not a local
@@ -2392,25 +2399,14 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     declarable = audit.audit_declarable_checks(GITOPS_INTENT_NOTE_AUDIT)
     entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
     if not entries:
-        front_text = audit.split_frontmatter(body)
-        if front_text is None:
-            return "it has no frontmatter: the first line must be `---` and a `---` or `...` line must close it"
-        try:
-            front = yaml.safe_load(front_text)
-        except (yaml.YAMLError, ValueError, RecursionError) as exc:
-            return f"its frontmatter is not valid YAML ({type(exc).__name__})"
-        if not isinstance(front, dict) or audit.OKF_TYPE_KEY not in front:
-            return f"its frontmatter has no `{audit.OKF_TYPE_KEY}`, so it is not an OKF note"
-        declares = front.get(audit.DECLARES_KEY)
-        if declares is None:
-            return f"its frontmatter has no `{audit.DECLARES_KEY}` list"
-        if isinstance(declares, list) and not declares:
-            return f"its `{audit.DECLARES_KEY}` list is empty"
-        if not isinstance(declares, list):
-            return f"its `{audit.DECLARES_KEY}` is not a list (the audit's parser logs one WARNING and reads nothing)"
-        return (
-            f"every `{audit.DECLARES_KEY}` item was skipped by the audit's parser "
-            "(it logged a WARNING per item above saying why)"
+        # The reason is the parser's own (`explain_empty_declarations` walks
+        # the ladder `parse_declarations` walks); None means the note had
+        # items and the parser skipped every one, logging a WARNING each.
+        reason = audit.explain_empty_declarations(body)
+        return reason or (
+            f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
+            f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']} "
+            "(the parser skipped every item; its WARNING lines above say why)"
         )
     wanted = audit._declaration_key(GITOPS_INTENT_NOTE_DECLARATION, with_cluster=False)
     matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
@@ -2444,22 +2440,20 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DECLARATION]
     repo_slug = _gitops_repo_slug(project_id)
-    details: List[str] = []
-    warnings: List[str] = []
     rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/contents/{GITOPS_INTENT_NOTE_PATH}"])
     if rc != 0:
         # A refusal or a transient is classified first: run_cmd's timeout text
         # embeds the command line, and so the project id, which `\b404\b`
         # would match in a project named `...-404`.
-        if _unread_reason(err or "") is not None:
-            _record_unreadable(
-                err or "",
-                absent="",
-                unchecked=f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} could not be read",
-                details=details,
-                warnings=warnings,
+        reason = _unread_reason(err or "")
+        if reason is not None:
+            return CheckResult(
+                name,
+                True,
+                "Not checked",
+                warnings=[Unread(f"Not checked: {GITOPS_INTENT_NOTE_PATH} in {repo_slug} could not be read: {reason}")],
+                read=False,
             )
-            return CheckResult(name, True, "Not checked", warnings=warnings, read=False)
         if _GITHUB_NOT_FOUND.search(err or ""):
             return CheckResult(
                 name,
