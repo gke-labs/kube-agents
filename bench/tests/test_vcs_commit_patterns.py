@@ -2,8 +2,9 @@
 
 The worker_commands verifier runs ``re.search`` on each one-line command
 summary, so these pin the task file's two patterns against summaries in that
-shape: the variable forms the skills used to teach, and the literal-path and
-quoted-message forms a passing worker writes.
+shape: the variable forms the skills used to teach, and commands a passing
+worker writes that only look like them: literal paths, quoted messages, test
+expressions and another tool's `exec` subcommand.
 """
 
 from __future__ import annotations
@@ -54,11 +55,16 @@ def test_the_variable_forms_are_flagged():
         "cd ws if ! $G diff --quiet then $G commit -m x fi",
         "cd ws if ! $G diff --quiet then echo x fi",
         "$G --no-pager log",
+        "! nohup $G push",
+        "while ! env $G push; do :; done",
+        "if ! time $G push; then :; fi",
+        "cd ws if ! command $G diff",
+        "cd ws if x then nohup $G push fi",
     ):
         assert _flagged(command), command
 
 
-def test_the_literal_and_quoted_forms_are_not_flagged():
+def test_a_command_that_runs_no_variable_is_not_flagged():
     for command in (
         "/opt/vcs/libexec/git add x",
         "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
@@ -77,6 +83,12 @@ def test_the_literal_and_quoted_forms_are_not_flagged():
         'kubectl exec -it "$POD" -n ns -- bash',
         "docker exec $C -it sh",
     ):
+        assert not _flagged(command), command
+
+
+def test_a_wrapper_named_as_another_tools_subcommand_is_not_read_as_one():
+    for wrapper in ("xargs", "exec", "env", "nohup", "command"):
+        command = f'kubectl {wrapper} "$POD" -n ns'
         assert not _flagged(command), command
 
 

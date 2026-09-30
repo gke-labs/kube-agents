@@ -21,14 +21,13 @@ SKILL_MD = (
 # A variable run as the program: at the start of a line or a code span, after
 # a shell join, as in `cd <workspace> && $G add`, or inside `$(`, and after a
 # shell keyword or a wrapper that runs the next word as a program (`xargs $G add`).
-# A `!` may end that run but takes no options.
+# A `!` may sit in that run but takes no options.
 PREFIX = (
     r"(^|`|&&?|;|\||\$\()\s*"
-    r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*)*"
-    r"(!\s+)?"
+    r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*|!\s+)*"
 )
-# A variable followed by a comparison or a closing bracket is a test's operand
-# (`[[ -n "$A" && ! "$B" == x ]]`), not a program.
+# A variable followed by `=`, `==`, `!=`, `]` or a comparison option such as
+# `-gt` is a test's operand (`[[ -n "$A" && ! "$B" == x ]]`), not a program.
 NOT_A_TEST_OPERAND = r"(?![=!]?=|\]|-(eq|ne|gt|ge|lt|le|nt|ot|ef)\b)\S"
 VARIABLE_PROGRAM_RE = re.compile(
     PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?\s+" + NOT_A_TEST_OPERAND, re.MULTILINE
@@ -66,6 +65,8 @@ class SkillCommandsTest(unittest.TestCase):
             "SHA=`$G rev-parse HEAD`",
             "if ! $G diff --quiet; then $G commit -m x; fi",
             "test -f x && ! $G diff --quiet",
+            "! time $G add <path>",
+            "$FIND -newer <ref>",
             "find . -name '*.yaml' | xargs $G add",
             "find . -print0 | xargs -0 $G add",
             "${G} add <path>",
@@ -83,6 +84,12 @@ class SkillCommandsTest(unittest.TestCase):
             'V="$HERMES_HOME"/skills/version-control/scripts/vcs.py',
             'python3 "$V" proposal list --repo <owner>/<repo>',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
+        ):
+            with self.subTest(command):
+                self.assertFalse(any(pattern.search(command) for pattern in PATTERNS))
+
+    def test_a_test_operand_is_not_caught(self):
+        for command in (
             '[[ -n "$A" && ! "$N" -gt 0 ]]',
             '[[ -n "$A" && "$B" == x ]]',
             '[[ -n "$A" || "$B" != x ]]',
