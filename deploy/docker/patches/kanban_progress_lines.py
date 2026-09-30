@@ -259,6 +259,27 @@ def _remember(
         tracked.pop(next(iter(tracked)), None)
 
 
+async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[str]) -> None:
+    """With ``KAGE_SLACK_UX`` on, settle the Slack ask this card's thread is waiting on.
+
+    Best-effort, for the reason the terminal path below settles its rolling
+    message best-effort: a cosmetic failure must not reach the notifier's
+    ``except``. With the flag off this returns before touching anything. See
+    ``gateway/slack_ux_reactions.py``.
+    """
+    try:
+        from gateway import slack_ux_reactions
+    except ImportError:
+        return
+    try:
+        if slack_ux_reactions.enabled():
+            await slack_ux_reactions.settle_delegated(adapter, sub, kind, board)
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on a reaction
+        logger.debug(
+            "kanban progress: settle reaction for %s failed: %s", sub.get("task_id"), exc,
+        )
+
+
 async def deliver(
     watcher: Any,
     adapter: Any,
@@ -268,6 +289,7 @@ async def deliver(
     message: str,
     metadata: Optional[dict],
     header: str,
+    board: Optional[str] = None,
 ) -> Any:
     """Deliver one notifier event, rolling progress into a single message.
 
@@ -278,9 +300,11 @@ async def deliver(
 
     Terminal events are unchanged from the caller's point of view — a new
     message, with the artifact upload and failure accounting that follow it
-    untouched. The only thing added on that path is settling the rolling
-    message first, and that is best-effort: a failed cosmetic edit must not
-    reach the notifier's ``except``, where it would rewind the cursor and count
+    untouched. Two things are added on that path, both best-effort: settling
+    the rolling message first, and, once the terminal message has posted,
+    the ``KAGE_SLACK_UX`` settle reaction on the ask
+    (``slack_ux_reactions.settle_delegated``). Neither may reach the notifier's
+    ``except``, where a failed cosmetic call would rewind the cursor and count
     against the subscription's send-failure budget.
     """
     chat_id = sub["chat_id"]
@@ -303,7 +327,14 @@ async def deliver(
                     "for %s: %s", sub.get("task_id"), exc,
                 )
         tracked.pop(key, None)
-        return await adapter.send(chat_id, message, metadata=metadata)
+        result = await adapter.send(chat_id, message, metadata=metadata)
+        # A failed post raises in the notifier, which rewinds its claim so the
+        # next tick posts again, and that post settles. After the notifier's
+        # MAX_SEND_FAILURES it drops the subscription instead, and the ask
+        # keeps its arrival reaction alone.
+        if getattr(result, "success", True) is not False:
+            await _settle_reaction(adapter, sub, kind, board)
+        return result
 
     line = rolling_line(kind, getattr(ev, "payload", None)) or message
     if entry and event_id and event_id <= entry["last_event_id"]:
