@@ -51,6 +51,7 @@ _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _BODY_RE = re.compile(r"card_body_b64 = base64encode\(<<-EOB\n(.*?)\n\s*EOB\n", re.S)
 _CREATE_RE = re.compile(r"^card=\"\$\(agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
 _RUN_STATE_RE = re.compile(r"^run_state\(\) \{\n  agent_py [^\n]*<<'PY'\n(.*?)\nPY\n", re.S | re.M)
+_READ_STATE_RE = re.compile(r"^read_state\(\) \{\n  agent_py [^\n]*<<'PY'[^\n]*\n(.*?)\nPY\n", re.S | re.M)
 _EOP_RE = r"{}\s*=\s*<<-EOP\n(.*?)\n\s*EOP\n"
 _PLANT_BLOCK = 0
 _DESTROY_BLOCK = 1
@@ -622,6 +623,12 @@ def save_jobs(jobs):
     json.dump({"jobs": jobs}, open(_FILE, "w"))
 
 
+# `is_job_runnable` in the pinned Hermes: `pause_job` sets all three, and a pod
+# start re-enables the job but leaves the other two.
+def is_job_runnable(job):
+    return bool(job.get("enabled", True)) and not (job.get("state") == "paused" or job.get("paused_at"))
+
+
 def compute_next_run(schedule, last_run_at=None):
     return "next:" + schedule["expr"]
 
@@ -664,10 +671,6 @@ class ArmDisarmTest(unittest.TestCase):
         }
         self._arm = _in_pod("arm_py", values)
         self._disarm = _in_pod("disarm_py", values)
-        state = re.search(r"read_state\(\) \{\n\s*agent_py <<'PY' \|\| true\n(.*?)\n\s*PY\n", _MODULE.read_text(), re.S)
-        self._read_state = re.sub(
-            r"\$\{([^}]*)\}", lambda m: values[m.group(1).strip()], textwrap.dedent(state.group(1)) + "\n"
-        )
         self._jobs([_SCAN, _DELIVERY])
 
     def _jobs(self, jobs=None):
@@ -684,8 +687,9 @@ class ArmDisarmTest(unittest.TestCase):
     def test_arm_refuses_a_missing_paused_or_bound_job_and_changes_nothing(self):
         for jobs, message in (
             ([_SCAN], "bootstrap-inventory-delivery are not in the cron store"),
-            ([_SCAN, {**_DELIVERY, "enabled": False}], "bootstrap-inventory-delivery are paused"),
-            ([{**_SCAN, "enabled": False}, _DELIVERY], "bootstrap-inventory-scan are paused"),
+            ([_SCAN, {**_DELIVERY, "enabled": False}], "bootstrap-inventory-delivery is paused"),
+            ([_SCAN, {**_DELIVERY, "state": "paused"}], "bootstrap-inventory-delivery is paused"),
+            ([_SCAN, {**_DELIVERY, "paused_at": "t0"}], "bootstrap-inventory-delivery is paused"),
             ([_SCAN, {**_DELIVERY, "deliver": "origin"}], "delivers to 'origin', not local"),
         ):
             with self.subTest(message=message):
@@ -695,16 +699,29 @@ class ArmDisarmTest(unittest.TestCase):
                 self.assertIn(message, out.stderr)
                 self.assertEqual(sorted(p.name for p in self._home.iterdir()), ["cron"])
 
-    def test_step_1_reads_a_paused_job_as_paused(self):
+    def test_step_1_reads_a_paused_delivery_job_as_paused(self):
+        # A paused scan job does not matter: with `.bootstrap_scan_filed`
+        # present, its every run skips.
         (self._home / ".bootstrap_scan_filed").touch()
+        rendered = _render(
+            _PLANT_BLOCK,
+            {
+                **_INTERPOLATIONS,
+                "local.home": str(self._home),
+                "local.state_file": str(self._home / ".bench-onboarding-jobs.json"),
+            },
+        )
+        read_state = _READ_STATE_RE.search(rendered).group(1) + "\n"
         for jobs, answer in (
             ([_SCAN, _DELIVERY], "clear"),
+            ([{**_SCAN, "enabled": False}, _DELIVERY], "clear"),
             ([_SCAN, {**_DELIVERY, "enabled": False}], "paused"),
-            ([{**_SCAN, "enabled": False}, _DELIVERY], "paused"),
+            ([_SCAN, {**_DELIVERY, "state": "paused"}], "paused"),
+            ([_SCAN, {**_DELIVERY, "paused_at": "t0"}], "paused"),
         ):
             with self.subTest(answer=answer, jobs=jobs):
                 self._jobs(jobs)
-                out = self._py(self._read_state)
+                out = self._py(read_state)
                 self.assertEqual((out.returncode, out.stdout.strip()), (0, answer), out.stderr)
 
     def test_arm_records_the_jobs_then_touches_the_marker_once(self):

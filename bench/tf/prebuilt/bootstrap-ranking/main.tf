@@ -29,7 +29,7 @@
 #
 # It refuses an install where a person has connected (`.user_aligned`),
 # onboarding already delivered (`.bootstrap_completed`), either onboarding
-# cron job is gone or paused, or the delivery job sends anywhere but `local`:
+# cron job is gone, the delivery job is paused, or it sends anywhere but `local`:
 # the ranked report this produces is the one onboarding delivers, and arming
 # delivery with a chat bound would post it there. It also refuses one whose
 # gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
@@ -115,16 +115,15 @@ locals {
   settle_poll = 2
   arm_py      = <<-EOP
     import json, os, sys
-    from cron.jobs import load_jobs
+    from cron.jobs import is_job_runnable, load_jobs
 
     ids = ("${local.scan_job}", "${local.delivery_job}")
     jobs = {j.get("id"): j for j in load_jobs()}
     missing = [i for i in ids if i not in jobs]
     if missing:
         sys.exit("onboarding job(s) %s are not in the cron store" % ", ".join(missing))
-    paused = [i for i in ids if not jobs[i].get("enabled", True)]
-    if paused:
-        sys.exit("onboarding job(s) %s are paused" % ", ".join(paused))
+    if not is_job_runnable(jobs[ids[1]]):
+        sys.exit("%s is paused" % ids[1])
     deliver = jobs[ids[1]].get("deliver")
     if deliver != "local":
         sys.exit("%s delivers to %r, not local" % (ids[1], deliver))
@@ -331,7 +330,7 @@ resource "null_resource" "ranking" {
       read_state() {
         agent_py <<'PY' || true
       import os
-      from cron.jobs import load_jobs
+      from cron.jobs import is_job_runnable, load_jobs
       home = "${local.home}"
       jobs = {j.get("id"): j for j in load_jobs()}
       if os.path.exists("${local.state_file}"):
@@ -344,7 +343,7 @@ resource "null_resource" "ranking" {
           print("unfiled")
       elif "${local.scan_job}" not in jobs or "${local.delivery_job}" not in jobs:
           print("nojobs")
-      elif not all(jobs[i].get("enabled", True) for i in ("${local.scan_job}", "${local.delivery_job}")):
+      elif not is_job_runnable(jobs["${local.delivery_job}"]):
           print("paused")
       elif jobs["${local.delivery_job}"].get("deliver") != "local":
           print("bound")
@@ -376,7 +375,7 @@ resource "null_resource" "ranking" {
           echo "ERROR: ${local.scan_job} or ${local.delivery_job} is not in the cron store on ${var.host_cluster_name}, so nothing would deliver the report this case grades." >&2
           exit 1 ;;
         paused)
-          echo "ERROR: ${local.scan_job} or ${local.delivery_job} is paused (\"enabled\": false in ${local.home}/cron/jobs.json) on ${var.host_cluster_name}, so the delivery this case grades would never run. The agent pod's next start re-enables it." >&2
+          echo "ERROR: ${local.delivery_job} is paused on ${var.host_cluster_name}, so the delivery this case grades would never run. Resume it with '${local.hermes} cron resume ${local.delivery_job}' in the agent container." >&2
           exit 1 ;;
         bound)
           echo "ERROR: ${local.delivery_job} on ${var.host_cluster_name} delivers to a chat, not local. Arming it would post the planted report there as the real onboarding one." >&2
