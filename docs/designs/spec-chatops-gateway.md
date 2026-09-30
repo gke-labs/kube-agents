@@ -635,11 +635,12 @@ not be silent about it.
   took the cancel turn itself runs the never-started heal first, which releases the record
   while the submission is still on the in subject, and the bridge's durable consumer delivers
   from the start of the stream, so a bridge that binds later within retention would run the
-  stale prompt. On today's bridge the cancel does not prevent that spawn: the consumer delivers
-  serially, an idle worker spawns the stale prompt before the cancel is dispatched, and the
-  cancel kills it inside the kill grace with a `canceled-by-request` terminal;
-  `canceled-before-start` is what a task still queued behind the cap gets. A pre-spawn look-ahead
-  for a trailing cancel is bridge work, not the door's.
+  stale prompt. The bridge honours that cancel before it spawns: its worker replays the task's
+  `in` subject and answers a cancel it finds there with `canceled-before-start` and no spawn,
+  the terminal a task still queued behind the cap gets too; a cancel that lands after that read
+  kills the run inside the kill grace with a `canceled-by-request` terminal. That look-ahead is
+  the bridge's work, not the door's
+  ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Lifecycle, steering, cancel").
 
 All five adapter operations are implemented rather than a subset the session manager has to
 special-case. The session key is `inject:<key>`, `Kind` is `dm`, `Roster` is the requester alone
@@ -737,10 +738,18 @@ that treated the three alike is what this value exists to stop.
    loopback bind is not reachable from it either. The token is what any caller that does reach
    the listener still has to hold.
 
-**What it also settles.** The gateway refuses to start without a backend, which makes it
-crash-loop on any install with neither a Discord token nor a Chat relay - so a `mode: next`
-install never reads Ready and nothing can rollout-gate on it. An eval install with this door
-armed has an ingress the guard accepts, by the decision recorded above, and starts.
+**What it also settles.** The gateway refuses to start without a backend. It used to be
+rendered regardless, so any install with neither a Discord token nor a Chat relay carried a
+gateway Deployment that crash-looped forever and nothing could rollout-gate on. The operator
+now asks first: a `mode: next` install with no chat backend - no `discord-bot` Secret in the
+namespace and no door armed - gets no gateway Deployment at all, its `Ready` counts the rest
+of the stack (NATS, the auth callout, the provisioning Job's first completion, the sandbox, the
+broker, today's gateway), and an `A2AGateway` condition (`status: False`, `Reason: NoChatBackend`) names what
+would render it. The rule is creation-only, like the callout ordering gate: a gateway that
+exists keeps reconciling whatever happened to its backend, because deleting it would take
+every session pod that hangs off its UID. An eval install with this door armed has an ingress
+the guard accepts, by the decision recorded above, and the render counts the door as a backend
+for the same reason.
 
 ## The Google Chat adapter (added 9/5)
 

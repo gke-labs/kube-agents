@@ -1,0 +1,152 @@
+{
+  "branch": {
+    "kanban_worker_children": [
+      [
+        "t_0fa00dd8",
+        "t_60319ae1",
+        1790608098
+      ],
+      [
+        "t_be38b384",
+        "t_60319ae1",
+        1790608098
+      ],
+      [
+        "t_88b454c0",
+        "t_60319ae1",
+        1790608099
+      ],
+      [
+        "t_f2f3cc97",
+        "t_60319ae1",
+        1790608099
+      ],
+      [
+        "t_649b4a12",
+        "t_60319ae1",
+        1790608653
+      ]
+    ],
+    "sweep": "t_60319ae1",
+    "task_links": [
+      [
+        "t_60319ae1",
+        "t_649b4a12"
+      ]
+    ],
+    "tasks": [
+      {
+        "assignee": "cluster-example-project-agent-harness-dev-cluster--1d9f820d",
+        "created_at": 1790608098,
+        "created_by": "platform",
+        "id": "t_0fa00dd8",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-agent-harness-dev-cluster--1d9f820d",
+        "status": "archived",
+        "title": "Report cluster inventory: agent-harness-dev-cluster"
+      },
+      {
+        "assignee": "platform",
+        "created_at": 1790608075,
+        "created_by": "user",
+        "id": "t_60319ae1",
+        "idempotency_key": "bootstrap-inventory-scan",
+        "status": "archived",
+        "title": "First-time environment discovery: write the onboarding inventory report"
+      },
+      {
+        "assignee": "platform",
+        "created_at": 1790608653,
+        "created_by": "platform",
+        "id": "t_649b4a12",
+        "idempotency_key": "bootstrap-inventory-prioritize",
+        "status": "archived",
+        "title": "Prioritize and rank fleet inventory audit findings"
+      },
+      {
+        "assignee": "cluster-example-project-platform-agent-host-us-east4",
+        "created_at": 1790608099,
+        "created_by": "platform",
+        "id": "t_88b454c0",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-platform-agent-host-us-east4",
+        "status": "archived",
+        "title": "Report cluster inventory: platform-agent-host"
+      },
+      {
+        "assignee": "cluster-example-project-cc-triage-test-cluster-us--66162cf2",
+        "created_at": 1790608098,
+        "created_by": "platform",
+        "id": "t_be38b384",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-cc-triage-test-cluster-us--66162cf2",
+        "status": "archived",
+        "title": "Report cluster inventory: cc-triage-test-cluster"
+      },
+      {
+        "assignee": "cluster-example-project-support-eval-cluster-us-central1-a",
+        "created_at": 1790608099,
+        "created_by": "platform",
+        "id": "t_f2f3cc97",
+        "idempotency_key": "bootstrap-inventory-cluster-cluster-example-project-support-eval-cluster-us-central1-a",
+        "status": "archived",
+        "title": "Report cluster inventory: support-eval-cluster"
+      }
+    ]
+  },
+  "main": {
+    "kanban_worker_children": [
+      [
+        "t_5a36e78f",
+        "t_2ef5e022",
+        1790607674
+      ]
+    ],
+    "sweep": "t_2ef5e022",
+    "task_links": [
+      [
+        "t_2ef5e022",
+        "t_5a36e78f"
+      ]
+    ],
+    "tasks": [
+      {
+        "assignee": "platform",
+        "created_at": 1790607336,
+        "created_by": "user",
+        "id": "t_2ef5e022",
+        "idempotency_key": "bootstrap-inventory-scan",
+        "status": "archived",
+        "title": "First-time environment discovery: write the onboarding inventory report"
+      },
+      {
+        "assignee": "platform",
+        "created_at": 1790607674,
+        "created_by": "platform",
+        "id": "t_5a36e78f",
+        "idempotency_key": "bootstrap-inventory-prioritize",
+        "status": "archived",
+        "title": "Prioritize findings for onboarded clusters"
+      }
+    ]
+  },
+  "roster": {
+    "cluster-example-project-agent-harness-dev-cluster--1d9f820d": {
+      "cluster": "agent-harness-dev-cluster",
+      "location": "us-central1",
+      "project": "example-project"
+    },
+    "cluster-example-project-cc-triage-test-cluster-us--66162cf2": {
+      "cluster": "cc-triage-test-cluster",
+      "location": "us-central1-a",
+      "project": "example-project"
+    },
+    "cluster-example-project-platform-agent-host-us-east4": {
+      "cluster": "platform-agent-host",
+      "location": "us-east4",
+      "project": "example-project"
+    },
+    "cluster-example-project-support-eval-cluster-us-central1-a": {
+      "cluster": "support-eval-cluster",
+      "location": "us-central1-a",
+      "project": "example-project"
+    }
+  }
+}

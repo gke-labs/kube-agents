@@ -179,6 +179,22 @@ class ApplySubstitutionsTest(unittest.TestCase):
         self.assertFalse(sync.apply_substitutions(str(d), "gke-manifest-generation"))
         self.assertEqual(self._read(d).count(sync.GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET), 1)
 
+    def test_applies_manifest_generation_developer_knowledge_substitution(self):
+        d = self._skill_dir(
+            body="        retrieve official GKE documentation:\n"
+            + sync.GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET
+            + "\n"
+        )
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        text = self._read(d)
+        self.assertNotIn("This is the preferred tool", text)
+        self.assertNotIn("`get_document`", text)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET, text)
+        self.assertIn("Do not call **`answer_query`**", text)
+        # Second call must be a no-op (replacement already present).
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        self.assertEqual(self._read(d).count(sync.GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET), 1)
+
     def test_repo_manifest_generation_skill_carries_every_substitution(self):
         # The in-tree mirror is rmtree'd and re-copied from upstream on every sync, so every local
         # divergence has to be a registered pair, and the file has to already read as a fresh sync

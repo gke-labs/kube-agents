@@ -107,12 +107,32 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run.
-One key ignores the environment: the front doors clear a shell-exported `NAMESPACE`
-before reading the file, because kubectl tooling exports that name and the value now
-reaches the Helm release's namespace. The file and `--agent-namespace` are the two
-routes in. The dev tooling's `load_state` clears it the same way.
+One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
+`uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
+tooling exports that name and the value now reaches the Helm release's namespace. The file
+and `--agent-namespace` are the two routes in (`common.sh`'s `load_state` clears it the
+same way). `upgrade.sh` and `uninstall.sh` also clear shell-exported `PROJECT_ID`,
+`CLUSTER_NAME`, and `REGION` before reading `install.env`, so ambient GCP exports in the
+caller's shell cannot steer a Day-2 run at a different cluster or be mistaken for keys
+recorded in `install.env` — pass `--gcp-project-id`, `--gke-cluster-name`, and `--gcp-region`
+when `install.env` omits them (or when tearing down a pre-`install.env` install); when both
+a flag and `install.env` name a coordinate and disagree, `upgrade.sh` and `uninstall.sh`
+refuse rather than mixing two installs' settings.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
+
+Which file that is, for a front door that has to go and find one: `KUBE_AGENTS_INSTALL_ENV`
+first, then the checkout the run's own sources came from, then the working directory,
+and last — when `install.sh`, `upgrade.sh`, or `uninstall.sh` runs from outside a
+checkout (such as the release-pinned one-liner, which has no checkout of its own) — the install
+checkout in `$HOME/kube-agents`. A checkout run of any of the three front doors never falls
+through to `$HOME/kube-agents`, and on a piped run `$HOME/kube-agents` is last rather than first
+so that a workstation managing two installs acts on the one whose directory the operator is
+standing in, not whichever one that shared checkout belongs to. The one additional gate on
+`uninstall.sh` is `--source-ref`: because that handover exists to tear down an older release
+(and pre-`0.4.0` installs wrote no `install.env`), a file found only at
+`$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
+`--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
 `install.sh` reads it and does not rewrite it. It creates one at the end of a first
 install, when there is nothing there, and never touches it again; the Day-2 menu's
@@ -136,17 +156,36 @@ That precedence has a sharp edge on an install that already exists. A key missin
 into `terraform.tfvars`, and `upgrade.sh --upgrade-mode=full` then plans the destruction of
 whatever the default does not mention. `ENABLE_GVISOR` absent destroys the gVisor node pool
 on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that key, not to
-`install.defaults.env`'s `true`); `MEMORY` absent destroys the Hindsight API and its Postgres;
+`install.defaults.env`'s `true`); `MEMORY` absent falls back to `file` unless
+`write_tfvars_from_state` finds a live Hindsight deployment (`hindsight-postgresql` or
+`hindsight-api`) on the target cluster, in which case `kube_agents_memory` is preserved
+(`--memory=file` or `MEMORY=file` is required to tear it down);
 `ENABLE_GKE_BACKUP_PLAN` absent destroys the backup plan; `ENABLE_STOCKOUT_INVESTIGATOR`
 absent destroys the stockout log sink, its alerts topic and subscription, and their IAM
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
 composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
-and drops the custom roles.
+and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` absent
+renders an empty list for it in the scope block, which revokes the read roles in every project,
+folder or organisation it named and retires those projects' Cluster Agent profiles over the
+reconcile's next two clean runs.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
 configuration first and real drift second.
+
+`MEMORY` is the only one of the keys above that the generator goes and asks the cluster
+about, because it is the only one whose default deletes data rather than infrastructure
+Terraform can build again. That probe has three outcomes, not two. Found and confirmed
+absent behave as above; the third is "could not ask" — no `kubectl`, a context pointing at
+another cluster, an expired credential, a timeout — and there `install.sh` and `upgrade.sh`
+stop and say so rather than read silence as "no Hindsight here". Answer the question
+instead: record `MEMORY=hindsight|file|off` in `install.env` (`install.sh` also takes
+`--memory=`, and `MEMORY=…` in the environment answers for one run), or restore access to
+the cluster and re-run. The recording is named first because `upgrade.sh` has no `--memory`
+flag and would answer it with `Unknown parameter`. `uninstall.sh` does not stop, because a
+teardown removes the store either way and an install has to keep a working way to remove
+itself.
 
 Loading the input first is also what fixes non-interactive re-runs (#1060). Every
 `PARAM_X="${VAR:-}"` seed already knew how to inherit from the environment; giving it a
@@ -181,6 +220,109 @@ instead, and later runs recover them from the live `platform-agent-secrets` Secr
 when kubectl's current context is this install's cluster). `API_SERVER_KEY` is generated
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
+
+### Projects, folders and organisations in scope
+
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
+`SCOPE_EXCLUDE_CLUSTERS` are the `PlatformAgent`'s `spec.scope`, declared once and reaching both
+halves of the install from the same value: the generator renders them as the composition's `scope`
+object, the IAM module binds the read roles in every project named and the read roles plus
+`roles/cloudasset.viewer` on every folder and organisation named, and the chart renders the same
+object into the CR. The lists are space- or comma-separated like every other list key; a folder or
+organisation is its bare numeric ID, and an entry that is not one stops the run before
+`terraform.tfvars` is written; an excluded project may be a shell-style glob; an excluded cluster
+is `project/location/cluster`, and an entry that does not split into three parts stops the run the
+same way. The patterns, caps and repeats the CRD enforces are checked by the module's variable
+validation, which fails the plan before any binding. A folder or organisation also adds
+`cloudasset.googleapis.com` to the APIs the composition enables in the host project, because the
+reconcile resolves a container's members through it; an install that names explicit projects
+alone never enables it.
+
+The block is written on every run, empty lists included: an emptied `projects` list is the
+declaration that drops projects, and a missing block would declare nothing, so removing a
+project from `SCOPE_PROJECTS` and running `upgrade.sh --upgrade-mode=full` is how a project
+leaves the scope. A file that lacks the keys declares an empty scope, like every absent key
+(the list above). Only full mode applies the keys; `harness` and `operator` retags re-render
+the release's recorded values and change nothing about the scope. `upgrade.sh`, `uninstall.sh`
+and the Day-2 menu read the keys from `install.env` alone (`load_install_env` drops a value
+inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
+`install.env` exists); `install.sh` also takes the `--scope-*` flags, and on a first install
+the environment, and records them, and an empty `--scope-*=` is refused. A malformed
+`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` entry stops every front door but
+`uninstall.sh`, retags included, until the line is fixed; there is no bypass.
+
+Before a full apply the front doors read the live `PlatformAgent` through the install's own
+kubeconfig context and refuse when it carries a scope that neither the release record nor the
+keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
+context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
+and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
+`installer_common.sh`; `upgrade.sh --plan` warns instead). The `sharedVpcHosts` and
+`metricsScopes` selectors have no key yet and are reported, never weighed. An `install.sh` re-run
+and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
+every front door rather than being pruned by a served schema that predates the field.
+
+When a folder or organisation is declared, a second check runs before every apply, first install
+included (`check_scope_container_access`): that `cloudasset.googleapis.com` is enabled in the
+host project or no enforced organisation policy (`constraints/gcp.restrictServiceUsage`, the
+legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
+denies it, read through gcloud's active account, and that the identity Terraform applies with
+holds `resourcemanager.folders.setIamPolicy` on each folder and
+`resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
+Manager's `testIamPermissions` with a token minted for the credentials the google provider will
+read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
+`GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything
+else is the key's JSON, the provider's own rule), else the Application Default Credentials, which
+read `GOOGLE_APPLICATION_CREDENTIALS` first, each impersonating `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`
+when it is set. The messages name that identity, so a refusal points at the
+principal that will apply rather than at whatever ADC the workstation holds, and a credential
+variable's value is never printed. The token reaches `curl` on its stdin and an inline key
+reaches `gcloud` through a file that exists only for the mint and is removed on any exit of it,
+a signal included. Every container is probed and every failure named before the run
+refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
+apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
+first check guards against. `upgrade.sh --plan`, `install.sh --generate-only` and the interactive
+`g` answer warn instead of refusing, the first because it applies nothing and the other two
+because the apply they hand to `lifecycle.sh` may run as an identity other than the one at the
+keyboard; an interactive run is checked at the `(Y/n/g)` prompt, where its route is known, so a
+`Y` refuses before anything is applied. The retag modes and `install.sh --dry-run` do not run it.
+Declaring an organisation prints a warning on every run that reaches the check: the binding
+reaches every project in it. gcloud's own credential overrides are kept out of every gcloud call
+the check makes: the `CLOUDSDK_AUTH_*` variables are cleared for the mint and for the property
+read that guards it, and a set `auth/impersonate_service_account` or `auth/access_token_file`
+property in the active configuration file, which the provider does not read, makes the probe
+undecided with the property named, unless `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` overrides the
+first explicitly.
+
+An install that declared a folder or organisation on the `PlatformAgent` by hand before the
+installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade
+like any hand edit, and the lines it prints include `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS`.
+Recording them hands the container's bindings to Terraform, which creates them with the applying
+credentials, so those credentials need `setIamPolicy` on the container even where an
+administrator made the hand grant; the alternatives are to obtain it for the identity that
+applies, or to take the container off the `PlatformAgent`, which retires its members over the
+reconcile's next two clean runs, and manage those projects through `SCOPE_PROJECTS` instead.
+
+The bindings live in projects, folders and organisations the applying identity has to be able to
+set IAM policy in. A scoped project or container that is deleted, or whose owner revokes that
+permission, fails the refresh or destroy of its bindings on every later plan, full upgrade and
+uninstall. Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` and forget
+its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
+against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
+`module.kube_agents_iam.google_folder_iam_member.scope_roles` or
+`module.kube_agents_iam.google_organization_iam_member.scope_roles`, keyed `<id>/<role>`):
+
+```bash
+cd terraform/examples/full-install
+terraform state list | grep 'scope_roles\["<id>/' | while IFS= read -r address; do
+  terraform state rm "$address"
+done
+```
+
+The grants left in the unreachable project are orphaned, not revoked. A `custom` permission set
+made of custom IAM roles cannot declare a scope: a custom IAM role is never carried into scoped
+projects (only the six predefined read roles in `scope.tf`'s allowlist are, those of them the host
+project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
+`roles/container.clusterViewer` or `roles/container.viewer`.
 
 ### Cluster adoption and component toggles
 
@@ -219,26 +361,22 @@ pre-existing clusters (testing environments only).
 
 ### The predecessor: `vars.sh`
 
-`k8s-operator/scripts/vars.sh` was the generated state file `install.env` replaces. No
-front door writes one any more. Every reader still accepts one so that an install
-predating the change keeps working with no action from its owner: each loads `vars.sh`
-first and `install.env` over the top, so the input wins. `install.sh` additionally
-migrates — it reads a legacy `vars.sh` and warns, and a full run that has no `install.env`
-yet writes those values into one on the way out, after which the old file can be deleted.
-A run that already has an `install.env` does not: `bootstrap_install_env_file` treats an
-existing file as the operator's, so the legacy values are loaded for that run and recorded
-nowhere. Delete `vars.sh` only once `install.env` carries what you need from it.
+`k8s-operator/scripts/vars.sh` was the generated state file `install.env` replaced in 0.4.0.
+No front door or Python helper reads, writes, or inspects it any more; `install.env` is the
+sole install configuration input, and pre-0.4.0 checkouts without `install.env` are not
+supported.
 
-One writer is left, and it is not an install one. The dev tooling under `scripts/dev/`
-records whether it created the throwaway Artifact Registry (`DEV_ARTIFACT_REGISTRY_CREATED`)
-through `save_var`, which lands in `scripts/installer/vars.sh` beside these helpers. That
-file is developer scratch state, git-ignored, and holds nothing an install is configured
-from; deleting it costs at most one redundant registry check.
+One separate file of the same name remains, and it is not an install configuration: the
+dev tooling under `scripts/dev/` records whether it created the throwaway Artifact Registry
+(`DEV_ARTIFACT_REGISTRY_CREATED`) through `save_var`, which lands in
+`scripts/installer/vars.sh` beside these helpers. That file is developer scratch state,
+git-ignored, and holds nothing an install is configured from; deleting it costs at most one
+redundant registry check.
 
 Both Python readers — `scripts/live_test_lease.py` and `admin_console/project_config.py`
-— match an allowlist of assignments with a regex and never source either file, because
-both hold credentials. They accept `K=V` and `export K=V` alike, since `install.env` is a
-dotenv and `vars.sh` was generated with `printf %q`.
+— match an allowlist of assignments in `install.env` with a regex and never source it,
+because it holds credentials. They accept `K=V` and `export K=V` alike, since `install.env`
+is a hand-authored dotenv and a hand may well write `export`.
 
 ## File directory
 
@@ -259,7 +397,7 @@ dotenv and `vars.sh` was generated with `printf %q`.
   (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
   registry and third-party-image resolution, cluster connection helpers. Sources
   `installer_common.sh`, so nothing is defined twice.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. Kept out of `common.sh` and free of its helpers so `hack/ci-env.sh`, `scripts/release/common.sh`, `upgrade.sh`, and the staging-workload scripts can source the one predicate without also taking on the state file. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /

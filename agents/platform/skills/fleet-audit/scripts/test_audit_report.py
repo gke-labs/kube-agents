@@ -15,12 +15,15 @@ import copy
 import importlib.util
 import io
 import json
+import fcntl
 import os
+import stat
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import dataclass
@@ -183,25 +186,36 @@ NUMBER_WORDS = {
             "eighteen",
             "nineteen",
             "twenty",
+            "twenty-one",
+            "twenty-two",
+            "twenty-three",
         )
     )
 }
 
 
 def _outside_fences(lines):
-    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
+    """Yield `(1-indexed line number, text)` for non-blank lines outside fences.
 
     Every heading scan below has to skip fenced blocks. A `### ` inside one is
     a shell comment or a JSON fragment, and counting it as a section heading
     shifts every span derived afterwards — silently, in the direction that
     makes a stale citation look correct.
+
+    The fences are read by `strip_fenced_blocks`, so the grammar is the one
+    the harness uses on issue bodies (CommonMark: a run of three or more
+    backticks or tildes indented at most three spaces, closed by a run of the
+    same character at least as long). A toggle on "```" is not that grammar:
+    it reads the inner fence of a four-backtick block as a closer and a
+    four-space-indented run as a delimiter, and either exposes a `### ` the
+    scan then counts. The function blanks fenced lines in place, so line
+    numbers survive; blank lines are dropped here, which no heading scan
+    notices. `scripts/generate_sop_geography.py` carries the same rule,
+    standard-library only, and its tests hold it to these cases.
     """
-    fenced = False
-    for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
+    stripped = audit_report.strip_fenced_blocks("\n".join(lines)).split("\n")
+    for number, line in enumerate(stripped, start=1):
+        if line:
             yield number, line
 
 
@@ -586,6 +600,11 @@ class BaseTestCase(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
+        # Many tests run `start` more than once against one scratch directory
+        # and never `finish`; the in-flight note would refuse the second. The
+        # tests about the note itself put the real check back.
+        self.real_claim_in_flight = audit_report.claim_in_flight
+        self.patch_attr("claim_in_flight", lambda *a, **k: None)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -1179,6 +1198,71 @@ class TestValidation(unittest.TestCase):
         doc["findings"] = {"nope": True}
         with self.assertRaisesRegex(audit_report.ValidationError, "findings:"):
             audit_report.validate_findings(doc, AUDIT)
+
+    def test_a_project_target_outside_scope_is_accepted(self):
+        # The cost SOP files an unattributable disk under `project/<id>`,
+        # which no scope entry ever spells.
+        doc = make_doc(findings=[make_finding(cluster="project/acme-prod")])
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_bare_name_of_a_qualified_scope_entry_is_rejected_with_the_entry(self):
+        # A collector's qualified scope beside its `Cluster/<bare>` objects:
+        # stripping the prefix off `object` gives the bare name, whose id no
+        # collector-held candidate shares, so every finding reported twice.
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+            findings=[make_finding(cluster="prod-us-east")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_name_matches_its_entry_as_the_id_would(self):
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+            findings=[make_finding(cluster="Prod-US-East")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_name_two_qualified_entries_share_is_rejected_naming_both(self):
+        # Two regions' `prod`: which one is not the validator's guess, but
+        # either way the bare spelling is a second id for the finding.
+        doc = make_doc(
+            clusters=[
+                {"name": "acme-prod/us-east1/prod", "location": "us-east1", "project": "acme-prod"},
+                {"name": "acme-dr/us-west1/prod", "location": "us-west1", "project": "acme-dr"},
+            ],
+            findings=[make_finding(cluster="prod")],
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("'acme-dr/us-west1/prod' and 'acme-prod/us-east1/prod'", str(exc.exception))
+
+    def test_a_qualified_entry_whose_fields_are_respelled_still_arms_the_guard(self):
+        # The manifest cross-check reads `name` alone, so the entry stands for
+        # the cluster whatever its `project` and `location` fields say.
+        for location, project in (("US-EAST1", "acme-prod"), ("us-east1", "acme")):
+            with self.subTest(location=location, project=project):
+                qualified = "acme-prod/us-east1-b/prod"
+                doc = make_doc(
+                    clusters=[{"name": qualified, "location": location, "project": project}],
+                    findings=[make_finding(cluster="prod")],
+                )
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn(repr(qualified), str(exc.exception))
+
+    def test_a_bare_project_id_beside_a_project_target_is_accepted(self):
+        # `project/<id>` is not a qualified cluster, so its tail is no cluster name.
+        doc = make_doc(
+            clusters=[{"name": "project/acme-prod", "location": "global", "project": "acme-prod"}],
+            findings=[make_finding(cluster="acme-prod")],
+        )
+        audit_report.validate_findings(doc, AUDIT)
 
     def test_skipped_entry_needs_a_reason(self):
         doc = make_doc(skipped=[{"cluster": "dr-west"}])
@@ -1818,6 +1902,7 @@ class TestAuditCatalogue(unittest.TestCase):
             {
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
+                "stall-watch",
                 "kanban-workspace-gc",
                 "kanban-board-health",
                 "findings-morning-nudge",
@@ -2358,7 +2443,7 @@ class TestAuditCatalogue(unittest.TestCase):
         span = re.compile(r"are section (\d+), lines (\d+)-(\d+)")
         # "Its eleven checks are section 2" / "Its nineteen facets are section
         # 4" — the noun differs by stream, the count must not.
-        counted = re.compile(r"\bIts ([a-z]+) \w+ are section\b")
+        counted = re.compile(r"\bIts ([a-z-]+) \w+ are section\b")
         # A `#### ` check heading names its slugs in a trailing parenthesis;
         # same anchoring as test_check_rosters_match_the_sops, and same reason.
         trailing = re.compile(r"\((((?:`[^`]+`)(?:,\s*)?)+)\)\s*$")
@@ -2602,14 +2687,12 @@ class TestAuditCatalogue(unittest.TestCase):
                 "privileged-container",
                 "host-namespace",
                 "hostpath-mount",
-                "legacy-metadata",
             ],
-            "security-patch-orchestrator": [
-                "pool-skew",
-                "no-autoupgrade",
-                "no-autorepair",
-                "stale-image-type",
-            ],
+            # security-patch-orchestrator is absent on purpose: its collector
+            # runs all four node-pool checks on Autopilot rather than declaring
+            # them inapplicable, and test_patch_readiness.py's
+            # `test_autopilot_runs_all_four_and_declares_nothing_inapplicable`
+            # guards that in code.
             "stockout-prevention": [
                 "single-zone-nodepool",
             ],
@@ -3619,6 +3702,15 @@ class TestResolvedBecauseValidation(unittest.TestCase):
             "not in scope.clusters",
         )
 
+    def test_the_bare_name_of_a_qualified_entry_names_the_entry(self):
+        qualified = "acme-prod/us-east1/prod-us-east"
+        doc = make_doc(
+            findings=[],
+            clusters=[{"name": qualified, "location": "us-east1", "project": "acme-prod"}],
+        )
+        doc["resolved_because"] = [resolved_entry()]
+        self.rejects(doc, "resolved_because[0].cluster", f"Did you mean {qualified!r}")
+
     def test_a_short_reason_is_rejected(self):
         self.rejects(
             self.doc(resolved_entry(reason="gone")),
@@ -3874,6 +3966,288 @@ class TestStart(HarnessTestCase):
         # Autopilot fleet came from.
         self.assertIn("checks_not_applicable", contract)
         self.assertIn("reason", contract)
+
+    def test_a_second_start_is_refused_while_the_stream_is_in_flight(self):
+        """One stream, one run at a time, whoever started it (#1876).
+
+        Every path `start` scrubs is keyed by audit id on a volume every
+        session shares. The scheduler's lock keeps two ticks apart; a run
+        started from a session holds no lock, so `start` itself has to refuse
+        the second caller, or the tick landing mid-sweep wipes the first run's
+        state and both `finish` calls rewrite one ledger.
+        """
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("is in flight since", self.err)
+        self.assertIn("wait for its `finish` or report it", self.err)
+        # Labelled as a refused `start`, not a rejected document: every SOP
+        # reads `FINDINGS REJECTED` as "fix the file and re-run", and there
+        # is no file here.
+        self.assertIn("START REFUSED:", self.err)
+        self.assertNotIn("FINDINGS REJECTED", self.err)
+        # The refusal is addressed to the worker, and a worker has two
+        # options. The first wording offered an override "if you know it is
+        # dead"; on 2026-09-23 a refused session passed it 42 seconds later
+        # over a run that was alive. The flag is gone from the CLI, and the
+        # message carries nothing that reads as a hint that a way past
+        # exists.
+        self.assertNotIn("takeover", self.err.lower())
+        self.assertNotIn("override", self.err.lower())
+        # Nor does the message hand the worker a liveness test or a file.
+        # The second wording printed the note's pid, which is `start`'s own
+        # and always exited; that evening (build 2102875230451011584, rep 1)
+        # a refused worker ran `ps` on it, read the run as dead, and took
+        # over its own run. The note is a lease, not a process: no pid in
+        # the note, none in the refusal, no path either, and the message
+        # says so. (The pid is pinned by the word, not the number: the log
+        # prefix and the refusal both carry timestamps a small pid would
+        # match by accident.)
+        self.assertNotIn("pid", self.err.lower())
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertNotIn(str(note.parent), self.err)
+        self.assertIn("a lease on the stream, not a process", self.err)
+        self.assertEqual(set(json.loads(note.read_text())), {"audit", "started_at"})
+        # Refused means refused: the other run's note is still there.
+        self.assertTrue(note.is_file())
+        # There is no flag past the guard. The CLI had `--takeover` until
+        # 2026-09-24; both observation runs of #1876 saw a refused worker
+        # pass it within a minute over its own live run, and the sandbox
+        # shell cannot tell a worker from an operator, so the lever left the
+        # script. Releasing the stream early is an operator's action on the
+        # volume, documented in the cron README and not here.
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                audit_report.build_parser().parse_args(
+                    ["start", "--audit", AUDIT, "--takeover"]
+                )
+        self.assertNotIn("takeover", audit_report.build_parser().format_help().lower())
+        note.unlink()
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+
+    def test_a_half_written_note_is_a_claim_not_an_absence(self):
+        # A note that exists but does not parse (debris from a crash, an
+        # older shape, a hand edit) is a claim until its mtime ages out; a
+        # reader that took "does not parse" for "no note" would let two runs
+        # through on it.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("")
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("is in flight since", self.err)
+        self.assertEqual(note.read_text(), "")
+        # Once that note is older than the TTL it is debris like any other.
+        stale = time.time() - audit_report.INFLIGHT_TTL_SECONDS - 1
+        os.utime(note, (stale, stale))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_claims_for_one_stream_are_serialized(self):
+        # The stale-note path reads, unlinks and writes; by path, not by
+        # inode. Two `start`s inside that window would each remove the
+        # other's fresh note, so the whole claim runs under a lock.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        held = os.open(f"{note}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        claimed = threading.Event()
+        rival = threading.Thread(
+            target=lambda: (audit_report.claim_in_flight(AUDIT), claimed.set())
+        )
+        rival.start()
+        self.assertFalse(claimed.wait(0.3), "the rival claimed while the lock was held")
+        self.assertFalse(note.is_file())
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+        self.assertTrue(claimed.wait(5))
+        rival.join()
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_failed_finish_frees_the_stream_and_a_dry_run_does_not(self):
+        # Eight of nine SOPs loop `start --repo A; finish --repo A; start
+        # --repo B` on a multi-repo install. A `finish` that died on a `gh`
+        # call must not leave B refused for two hours; a `--dry-run` is a
+        # preview mid-run and changes nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=("--dry-run",)), 0, self.err)
+        self.assertTrue(note.is_file())
+        # Exit 2 is "fix the document and re-run `finish`" in every SOP: the
+        # run is still in flight while the worker edits, and a tick landing
+        # in that window must not scrub the document about to be resubmitted.
+        self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
+        self.assertIn("scope.clusters", self.err)
+        self.assertTrue(note.is_file())
+        self.harness.failures = {"issue create": 1}
+        self.assertEqual(self.run_finish(make_doc()), 1, self.err)
+        self.assertFalse(note.is_file())
+
+    def test_a_guard_that_cannot_be_taken_refuses_rather_than_running_unguarded(self):
+        # The guard exists so `start` never scrubs a run in flight. A lock it
+        # cannot open is a `start` that cannot know, so it exits 2 and touches
+        # nothing: not the other run's note, and not its state.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        theirs = json.dumps({"audit": AUDIT, "started_at": time.time()})
+        note.write_text(theirs)
+        real_open = os.open
+
+        def refuse_lock(path, flags, *rest):
+            # The lock itself cannot be opened (a directory in its place, a
+            # volume mounted read-only, a mode nobody can pass); everything
+            # else opens as usual.
+            if str(path).endswith(".lock"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, *rest)
+
+        with patch.object(audit_report.os, "open", side_effect=refuse_lock):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+        self.assertIn("in-flight guard", self.err)
+        self.assertIn("Permission denied", self.err)
+        # The error, not the path: a path in a refusal reads as a file to
+        # remove.
+        self.assertNotIn(str(note.parent), self.err)
+        self.assertEqual(note.read_text(), theirs)
+        self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
+
+    def test_a_clean_finish_releases_the_stream_too(self):
+        # The zero-finding run is the ordinary nightly outcome; it leaves by
+        # the close branch, which must free the stream like the publish one.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assertTrue(self.harness.matching("issue", "close", "42"))
+        self.assertFalse(note.is_file())
+
+    def test_finish_releases_the_stream_and_a_stale_note_is_forgotten(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        self.assertTrue(note.is_file())
+        # A crash without `finish` must not block tomorrow's tick: the note
+        # is believed for INFLIGHT_TTL_SECONDS and no longer.
+        stale = json.loads(note.read_text())
+        stale["started_at"] -= audit_report.INFLIGHT_TTL_SECONDS + 1
+        note.write_text(json.dumps(stale))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertTrue(note.is_file())
+        audit_report.release_in_flight(AUDIT)
+        self.assertFalse(note.is_file())
+        # And `finish` is what releases it on the happy path.
+        Path(audit_report.inflight_path_for(AUDIT)).write_text(
+            json.dumps({"audit": AUDIT, "started_at": time.time()})
+        )
+        rc = self.run_finish(make_doc())
+        self.assertEqual(rc, 0, self.err)
+        self.assertFalse(note.is_file())
+
+    def test_a_note_write_that_fails_leaves_no_phantom_claim(self):
+        # `write_text` opens O_TRUNC and then writes. A write that fails on
+        # the shared volume (ENOSPC, EDQUOT, EIO) must not leave an empty
+        # note with a fresh mtime: `_in_flight_since` would honour it from
+        # the mtime and refuse every `start` of the stream, the scheduled
+        # tick's included, for two hours with no run behind it. The note is
+        # staged beside and moved into place, so a failure leaves nothing.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        with patch.object(
+            audit_report.os, "replace",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+        self.assertIn("could not record the in-flight note", self.err)
+        self.assertIn("No space left on device", self.err)
+        self.assertFalse(note.exists(), "an empty note is a two-hour phantom claim")
+        self.assertFalse(Path(f"{note}.tmp").exists())
+        self.assertFalse(Path(audit_report.run_record_path_for(AUDIT)).exists())
+        # Nothing to release, so the retry is not refused.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+
+    def test_a_lock_file_left_by_another_uid_does_not_refuse_the_stream(self):
+        # The lock file beside the note is created once and never removed.
+        # The sandbox container starts as root and a hand-run `start` over
+        # `kubectl exec` lands there, while the tick and every session run
+        # as uid 1000: a root-owned 0644 lock opened O_RDWR gave uid 1000
+        # EACCES on every later `start`, before the TTL was read, for good.
+        # flock needs no writable descriptor, so the lock opens read-only;
+        # a lock nobody can write must not refuse anyone.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        lock = Path(f"{note}.lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.touch()
+        lock.chmod(0o444)
+        real_open = os.open
+        seen = []
+
+        def read_only_open(path, flags, *rest):
+            if str(path).endswith(".lock"):
+                seen.append(flags & os.O_ACCMODE)
+            return real_open(path, flags, *rest)
+
+        # Root ignores mode bits, so the flags are checked as well as the
+        # outcome: the lock must be opened read-only.
+        with patch.object(audit_report.os, "open", side_effect=read_only_open):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(seen, [os.O_RDONLY])
+        self.assertNotIn("START REFUSED", self.err)
+        self.assertEqual(json.loads(note.read_text())["audit"], AUDIT)
+        # And the guard still holds behind that lock.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_lock_created_under_a_restrictive_umask_still_opens_for_everyone(self):
+        # 0o644 is what `start` asks for; the kernel narrows it by the
+        # creator's umask. A root hand-run `start` under umask 077 (a common
+        # hardened shell profile) left a 0600 root:root lock, and since the
+        # lock has no TTL and is never removed, every later uid-1000 `start`
+        # of the stream failed the open for good. The umask is cleared for
+        # the create, and put back.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue list": self.issue_list()}
+        note = Path(audit_report.inflight_path_for(AUDIT))
+        lock = Path(f"{note}.lock")
+        self.assertFalse(lock.exists())
+        previous = os.umask(0o077)
+        self.addCleanup(os.umask, previous)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertNotIn("START REFUSED", self.err)
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o644)
+        # The process's own umask is restored after the create.
+        restored = os.umask(0o077)
+        self.assertEqual(restored, 0o077)
+        # And the guard still holds behind that lock.
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertIn("START REFUSED:", self.err)
+
+    def test_a_start_that_fails_frees_the_stream_for_the_retry(self):
+        # The note means a run is under way. A `start` that raised left none
+        # behind, so the operator's retry must not be refused for it.
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.failures = {"issue list": 1}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
+        self.assertFalse(Path(audit_report.inflight_path_for(AUDIT)).is_file())
+        self.harness.failures = {}
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
 
     def test_start_hands_over_the_findings_the_ledger_carries(self):
         # The worker cannot write `resolved_because` for a finding it was
@@ -7073,9 +7447,59 @@ class TestRenderBudget(BaseTestCase):
         # Every recorded id is genuinely in the body, and the first id that is
         # not recorded is genuinely absent — otherwise the next run reads a
         # truncated finding as resolved and announces a fix that never happened.
+        # The complete-list block is the one place a cut id may appear, and
+        # nothing joins against it.
+        prose = re.sub(r"(?m)^<!-- audit-findings-all: .*-->$", "", body)
         for fid in recorded:
-            self.assertIn(fid, body)
-        self.assertNotIn(ordered[len(recorded)], body)
+            self.assertIn(fid, prose)
+        self.assertNotIn(ordered[len(recorded)], prose)
+
+    def test_a_truncated_body_lists_every_finding_in_the_complete_block(self):
+        # A grader asking "was this filed?" has no other source once the body
+        # cuts a finding for space; the delta still joins on the rendered set.
+        findings = bulk_findings(250)
+        body = self.render(make_doc(findings=findings))
+        (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
+        self.assertEqual(sorted(json.loads(payload)), sorted(f["id"] for f in findings))
+        self.assertLess(len(audit_report.parse_delta_block(body)), len(findings))
+        self.assertLessEqual(len(body), GITHUB_BODY_LIMIT)
+
+    def test_an_untruncated_body_carries_no_complete_block(self):
+        body = self.render(make_doc(findings=bulk_findings(3)))
+        self.assertNotIn("audit-findings-all", body)
+
+    def test_the_complete_block_never_cuts_a_body_that_fits_without_it(self):
+        # Charged up front, the block truncated bodies of 36 and 37 findings
+        # that rendered whole without it. Sweep the boundary: wherever the
+        # body fits with the block stubbed out, it must fit, block-free, as is.
+        # Real ids run ~70 characters; `f-0000` would make the block too small
+        # to move the boundary at all.
+        prefix = "service-selects-nothing.acme/us-east1/fleet-member.payments.orders-api"
+        crossed = False
+        for n in range(20, 80):
+            doc = make_doc(findings=bulk_findings(n, prefix=prefix))
+            with patch.object(audit_report, "all_findings_block", return_value=""):
+                without = self.render(doc)
+            if len(audit_report.parse_delta_block(without)) < n:
+                crossed = True
+                continue
+            self.assertEqual(self.render(doc), without, n)
+        self.assertTrue(crossed, "the sweep never reached a truncated body")
+
+    def test_the_complete_block_carries_the_held_ids(self):
+        # A grader reads it in place of the delta block, which carries them.
+        held = audit_report.held_row_from_id("service-selects-nothing.seeded-c.ns.orders")
+        body = audit_report.render_issue_body(
+            make_doc(findings=bulk_findings(250)), generated_at=NOW, audit_id=AUDIT, held=[held]
+        ).body
+        (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
+        self.assertIn(held["id"], json.loads(payload))
+        self.assertIn(held["id"], audit_report.parse_delta_block(body))
+
+    def test_a_complete_list_over_the_cap_is_left_out(self):
+        ids = [f"f-{i:05d}-" + "x" * 80 for i in range(400)]
+        self.assertEqual(audit_report.all_findings_block(ids), "")
+        self.assertTrue(audit_report.all_findings_block(ids[:10]))
 
     def test_criticals_survive_a_flood_of_minor_findings(self):
         findings = bulk_findings(5, severity="critical", prefix="crit") + bulk_findings(
@@ -10053,6 +10477,33 @@ class TestFenceScanning(unittest.TestCase):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
 
 
+class TestOutsideFences(unittest.TestCase):
+    """The heading scans' fence rule is the harness's, not a toggle on ```."""
+
+    def numbers(self, text):
+        return [n for n, _ in _outside_fences(text.split("\n"))]
+
+    def test_a_heading_inside_a_fence_is_not_outside(self):
+        self.assertEqual([5], self.numbers("```bash\n### 2. comment\n```\n\n### 2. Checks"))
+
+    def test_a_shorter_run_inside_a_longer_fence_does_not_close_it(self):
+        # The shape inventory.md uses: a ```` block wrapping a ``` one. A
+        # toggle closes at the inner fence and counts the heading on line 3.
+        self.assertEqual([6], self.numbers("````\n```\n### 9. inner\n```\n````\n### 1. real"))
+
+    def test_a_tilde_fence_is_a_fence(self):
+        self.assertEqual([4], self.numbers("~~~\n### 9. inner\n~~~\n### 1. real"))
+
+    def test_a_four_space_indented_run_does_not_close_a_block(self):
+        self.assertEqual([5], self.numbers("```\n    ```\n### 9. inner\n```\n### 1. real"))
+
+    def test_three_spaces_of_indent_is_still_a_fence(self):
+        self.assertEqual([4], self.numbers("   ```\n### 9. inner\n   ```\n### 1. real"))
+
+    def test_an_unterminated_fence_runs_to_the_end(self):
+        self.assertEqual([1], self.numbers("### 1. real\n```\n### 9. inner\n"))
+
+
 class TestBlockQuoteScanning(unittest.TestCase):
     def strip(self, text):
         return audit_report.strip_block_quotes(text)
@@ -10345,7 +10796,8 @@ class TestCoverageGaps(unittest.TestCase):
         )
         self.assertEqual(len(gaps), 1)
         self.assertIn("prod-us-east", gaps[0])
-        self.assertIn("9 of 11 applicable checks did not run", gaps[0])
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"{roster - 2} of {roster} applicable checks did not run", gaps[0])
         self.assertIn("netpol-missing", gaps[0])
 
     def test_a_cluster_reports_one_gap_line_not_two(self):
@@ -10368,7 +10820,8 @@ class TestCoverageGaps(unittest.TestCase):
             )
         )
         self.assertEqual(len(gaps), 1)
-        self.assertIn("1 of 11 applicable checks did not run", gaps[0])
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"1 of {roster} applicable checks did not run", gaps[0])
         self.assertIn("Autopilot", gaps[0])
 
 
@@ -10521,7 +10974,8 @@ class TestChecksRun(unittest.TestCase):
             make_doc(findings=[], clusters=[self._cluster()]), generated_at=NOW
         )
         self.assertIn("| Checks |", body)
-        self.assertIn("11/11", body)
+        roster = len(audit_report.audit_checks(AUDIT))
+        self.assertIn(f"{roster}/{roster}", body)
         self.assertNotIn("⚠", body)
 
     def test_an_incomplete_cluster_is_flagged_in_the_scope_table(self):
@@ -10532,7 +10986,7 @@ class TestChecksRun(unittest.TestCase):
             ),
             generated_at=NOW,
         )
-        self.assertIn("1/11 ⚠", body)
+        self.assertIn(f"1/{len(audit_report.audit_checks(AUDIT))} ⚠", body)
 
     def test_every_stream_requires_its_own_roster(self):
         """A compliance check named by the cost audit is still a typo."""
@@ -11849,17 +12303,92 @@ class TestDispatchAndHandover(unittest.TestCase):
         self.assertIn("profile-cron-tick", bullet)
 
     def test_an_on_demand_run_triggers_the_schedule_rather_than_re_enacting_it(self):
-        """On demand means trigger the job, never run the audit inline.
+        """On demand means trigger the job, never run several audits inline.
 
         `hermes cron run` marks the job due and the next tick runs it in its
         own process; `cronjob(action='run')` falls back to executing it inside
         the calling session — which is the one turn budget five audits used to
         share — wherever the runtime cannot take a detached result.
+
+        Since #1887 a card that delegates exactly one stream per its SOP is
+        run by that worker through `start … finish`; the bullet carries the
+        guard that run relies on (#1876): `start` refuses while a run of the
+        stream is in flight, and the worker is told what the refusal means.
         """
         bullet = self.bullet("trigger the schedule, do not re-enact it")
         self.assertIn("hermes cron run", bullet)
         self.assertIn("HERMES_HOME=/opt/data/profiles/platform", bullet)
         self.assertIn("cronjob(action='run')", bullet)
+        # The absolute that #1887's skill section contradicted is gone: one
+        # delegated stream is the worker's to run; several never are.
+        self.assertNotIn("Never do the audit in the session", bullet)
+        self.assertIn("Never do more than one audit in the session", bullet)
+        self.assertIn("exactly one audit stream", bullet)
+        self.assertIn("audit_report.py start", bullet)
+        # The overlap guard is the script's in-flight note, not a ledger the
+        # in-session run never appears in; the worker is told what the
+        # refusal means and what to do (wait or report). The override is not
+        # named where the worker reads: a refused rep on 2026-09-23 passed
+        # `--takeover` 42 s after being told it was "not for you".
+        self.assertIn("refuses while a run of that stream is in flight", bullet)
+        self.assertIn("START REFUSED", bullet)
+        self.assertNotIn("--takeover", bullet)
+        # The note does not know sessions, so a worker's own second `start`
+        # is refused like a rival's (run 2, rep 1 of #1876's observation did
+        # exactly that). "Stop" then abandons a live run and leaves the note
+        # for two hours; the carve-out says continue that run to `finish`.
+        self.assertIn("already succeeded in this session", bullet)
+        self.assertIn("do not run `start` again", bullet)
+        # The carve-out is bounded by what released the lease, not by any
+        # `finish` having run: exit 0 and exit 1 release, exit 2 keeps the
+        # note (a rejected document is still the run in flight), so after an
+        # exit-2 `finish` the next step is `finish` again and not `start`.
+        self.assertIn("has released the lease since", bullet)
+        self.assertIn("stop and report the sweep as partial", bullet)
+        self.assertIn("run `finish` again, never `start`", bullet)
+
+    def test_the_skill_allows_one_stream_in_session_with_its_gaps_declared(self):
+        """The skill's copy of the guard sits on top of #1887's section.
+
+        #1887 tells a delegated worker to run one stream directly through the
+        two-command lifecycle. That run holds no scheduler lock, so the
+        section carries the in-flight guard (#1876): what `start` refuses,
+        what the refusal means, the one carve-out and its bound, and what the
+        note spans.
+        """
+        text = self.read("skills/fleet-audit/SKILL.md")
+        section = text.split("## Running a stream on demand", 1)[1].split("\n## ", 1)[0]
+        # #1887's two forms are still the frame.
+        self.assertIn("Run the audit directly", section)
+        self.assertIn("audit_report.py finish", section)
+        self.assertIn("2026-08-03", section)
+        self.assertIn("cronjob(action='run')", section)
+        # The guard bullet in form 1: refusal, label, no override, carve-out
+        # and its bound on what released the lease.
+        form_one = section.split("### 1.", 1)[1].split("### 2.", 1)[0]
+        self.assertIn("`start` refuses", form_one)
+        self.assertIn("START REFUSED", form_one)
+        self.assertIn("already succeeded in this session", form_one)
+        self.assertIn("do not run `start` again", form_one)
+        self.assertIn("has released the lease since", form_one)
+        self.assertIn("stop and report the sweep as partial", form_one)
+        self.assertIn("run `finish` again, never `start`", form_one)
+        # No override is named anywhere in the file: the CLI flag is gone
+        # (2026-09-24), and the operator's release lives in the cron README,
+        # which the worker does not read. The guard paragraph promises what
+        # the TTL delivers (a dead run costs at most the ticks inside two
+        # hours), not "never", and says what the lease spans: one pair, so a
+        # multi-repo loop reclaims per repository and a mid-loop refusal is
+        # a partial run, not "already running".
+        self.assertNotIn("takeover", text.lower())
+        self.assertNotIn("never blocks", section)
+        self.assertIn("at most the ticks", section)
+        self.assertIn("operator's action", section)
+        self.assertIn("one `start`-`finish` pair", section)
+        self.assertIn("taken between repositories", section)
+        # The exit-code paragraph tells a `START REFUSED` apart from a
+        # rejected document: there is nothing to fix and nothing to re-run.
+        self.assertIn("One exit 2 is not a document to fix", text)
 
     def test_the_worker_protocol_requires_the_url_in_the_summary(self):
         section = self.read("SOUL.md").split("## 1.")[0]
@@ -12646,6 +13175,26 @@ class TestCrossCheckManifest(unittest.TestCase):
 
     def test_a_check_the_manifest_verified_passes(self):
         audit_report.cross_check_manifest(self.doc(["no-requests"]), self.manifest())
+
+    def test_an_unevaluated_check_may_not_be_declared_not_applicable(self):
+        manifest = self.manifest(checks_unevaluated=[{"check": "kcc-object-wedged", "reason": "Undetermined: timed out"}])
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
+        doc["scope"]["clusters"][0]["checks_not_applicable"] = [
+            {"check": "kcc-object-wedged", "reason": "Config Connector is not installed on this cluster"}
+        ]
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(doc, manifest)
+        self.assertIn("checks_unevaluated", str(ctx.exception))
+
+    def test_an_unevaluated_check_requires_limitations(self):
+        manifest = self.manifest(checks_unevaluated=[{"check": "kcc-object-wedged", "reason": "Undetermined: timed out"}])
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.cross_check_manifest(self.doc(["no-requests"]), manifest)
+        self.assertIn("limitations", str(ctx.exception))
+        doc = self.doc(["no-requests"])
+        doc["scope"]["clusters"][0]["limitations"] = "kcc-object-wedged: the Config Connector read timed out"
+        audit_report.cross_check_manifest(doc, manifest)
 
     def test_a_check_the_manifest_never_ran_is_rejected(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
@@ -15977,6 +16526,142 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("STILL FLAGGED:", self.err)
         self.assertNotIn("UNACCOUNTED:", self.err)
 
+    def test_a_clean_run_across_the_qualifying_rename_is_held_not_closed(self):
+        """The previous ledger named clusters bare, under the scheme before the
+        collector qualified them. Its rows re-spell through the Scope table, so
+        a clean document over a candidate the collector still emits is held;
+        matched on the bare spelling, nothing was held and the ledger closed."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        # Without a manifest the unaccounted-findings rule holds it the same way.
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_a_cluster_past_the_scope_table_is_qualified_from_this_run(self):
+        """`_render_scope` stops at `MAX_SCOPE_ROWS`, so on a larger fleet the
+        previous body has `Where:` lines naming clusters with no Scope row.
+        This run's own clusters qualify those, and the clean run is held."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        self.assertNotIn("prod-us-east", audit_report._scope_qualified_names(previous_body))
+        self.replay_ledger(previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        doc = make_doc(
+            findings=[],
+            clusters=[
+                {"name": qualified[0], "location": "us-east1", "project": "acme-prod"},
+                {"name": qualified[1], "location": "europe-west1", "project": "acme-stage"},
+            ],
+        )
+        manifest = _full_manifest(
+            names=qualified,
+            candidates=[self.netpol_candidate(cluster=qualified[0])],
+            command=self.NETPOL_COMMAND,
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["unaccounted"], [derived_id(cluster=qualified[0])])
+        self.replay_ledger(previous_body)
+        rc = self.run_finish(doc)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["unaccounted"], [derived_id(cluster=qualified[0])])
+
+    def test_the_manifest_path_holds_a_finding_past_the_scope_table(self):
+        """`collector_held_entries` carries the held entry itself; the finish
+        payload above would read `HELD` from the unaccounted rule alone. A name
+        two manifest clusters could own is spelled as the one the collector
+        flags, and held on the first by id when it flags both: holding neither
+        closed the ledger over a finding the collector still reported."""
+        previous_body = published_body(make_doc(), generated_at=NOW).replace(
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->",
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME - 1} -->",
+        )
+        previous_body = re.sub(r"(?m)^\| `prod-us-east` \|.*\n", "", previous_body)
+        qualified = ("acme-prod/us-east1/prod-us-east", "acme-stage/europe-west1/stage-eu")
+        held = audit_report.collector_held_entries(
+            _full_manifest(names=qualified, candidates=[self.netpol_candidate(cluster=qualified[0])]),
+            make_doc(findings=[]),
+            exclude=set(),
+            previous_body=previous_body,
+        )
+        self.assertEqual([entry["id"] for entry in held], [derived_id(cluster=qualified[0])])
+        ambiguous = (qualified[0], "acme-stage/us-east1/prod-us-east")
+        for flagged in ((qualified[0],), (ambiguous[1],), ambiguous):
+            with self.subTest(flagged=flagged):
+                held = audit_report.collector_held_entries(
+                    _full_manifest(
+                        names=ambiguous,
+                        candidates=[self.netpol_candidate(cluster=name) for name in flagged],
+                    ),
+                    make_doc(findings=[]),
+                    exclude=set(),
+                    previous_body=previous_body,
+                )
+                self.assertEqual(
+                    [entry["id"] for entry in held],
+                    [min(derived_id(cluster=name) for name in flagged)],
+                )
+
+    def test_this_runs_clusters_qualify_only_names_the_table_does_not_list(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+        )
+        clusters = [
+            "acme-prod/us-east1/web",
+            "acme-prod/us-east1/api",
+            "acme-prod/us-east1/db",
+            "acme-stage/us-east1/db",
+            "unqualified",
+        ]
+        self.assertEqual(
+            audit_report._scope_qualified_names(body, clusters), {"api": "acme-prod/us-east1/api"}
+        )
+
+    def test_a_name_audited_at_two_locations_is_not_qualified(self):
+        body = (
+            "| `web` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `web` | europe-west1 | `acme-prod` | 10/10 |\n"
+            "| `api` | us-east1 | `acme-prod` | 10/10 |\n"
+            "| `acme-prod/us-east1/db` | us-east1 | `acme-prod` | 10/10 |\n"
+        )
+        self.assertEqual(
+            audit_report._scope_qualified_names(body), {"api": "acme-prod/us-east1/api"}
+        )
+
     def test_a_clean_run_the_collector_agrees_with_closes(self):
         doc = self.clean_over_previous_ledger()
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
@@ -16159,10 +16844,14 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     a renderer that reorders a section -- each fails here, naming the byte.
 
     One deviation is deliberate and is recorded in the transcripts rather than
-    excused: `ID_SCHEME` went from 2 to 3 because the drift collector now
-    qualifies cluster names, and the stamp is global, so every stream's bodies
-    carry the new number. That is the whole of the change here -- five lines,
-    one per body -- and this class is what proves it.
+    excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
+    qualifying cluster names, from 3 to 4 when the patch-readiness
+    collector did the same, and from 4 to 5 when `collect.py` did it for three
+    more streams, and the stamp is global, so every stream's bodies
+    carry the current number. That is the whole of the change here -- five
+    lines, one per body -- and this class is what proves it. The compliance
+    roster growing from eleven checks to sixteen is recorded the same way: the
+    Scope table's `n/n` column and the unrun-check prose count the roster.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

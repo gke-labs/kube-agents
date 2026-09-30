@@ -17,7 +17,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.check_iac_parity import (
     EXCLUDED_NETPOL_MANIFESTS,
-    HOUSE_SHAPE_EXCEPT,
     LINK_LOCAL_CIDR,
     REPO_ROOT,
     REQUIRED_DNS_LITERAL,
@@ -33,11 +32,18 @@ from scripts.check_iac_parity import (
     check_network_policy_file,
     discover_dns_network_policies,
     governs_egress,
-    is_house_shape,
     load_network_policies,
     main,
     sanitize_helm_template,
     validate_exclusions,
+)
+
+
+# An except list that also excludes carrier-grade NAT and link-local space, the
+# shape the operator-generated external egress policy uses. Excepting
+# 169.254.0.0/16 is what makes the link-local resolver literals mandatory.
+LINK_LOCAL_EXCEPT: frozenset[str] = frozenset(
+    {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"}
 )
 
 
@@ -55,25 +61,6 @@ class CheckIacParityProductionTest(unittest.TestCase):
             rules_checked,
             len(STATIC_NETWORK_POLICIES),
             f"Expected at least {len(STATIC_NETWORK_POLICIES)} DNS rules checked, got {rules_checked}",
-        )
-
-    def test_core_egress_satisfies_house_shape(self):
-        """Verify that deploy/kustomize/platform/networkpolicy-core-egress.yaml satisfies the 5-entry house shape (#747 B5)."""
-        manifest_path = REPO_ROOT / "deploy/kustomize/platform/networkpolicy-core-egress.yaml"
-        policies = load_network_policies(manifest_path)
-        self.assertTrue(len(policies) > 0)
-        found_house_shape = False
-        for pol in policies:
-            for rule in (pol.get("spec") or {}).get("egress") or []:
-                for peer in rule.get("to") or []:
-                    ip_block = peer.get("ipBlock") if isinstance(peer, dict) else None
-                    if isinstance(ip_block, dict) and ip_block.get("cidr") == REQUIRED_WILDCARD_CIDR:
-                        except_list = ip_block.get("except") or []
-                        if is_house_shape(except_list):
-                            found_house_shape = True
-        self.assertTrue(
-            found_house_shape,
-            "deploy/kustomize/platform/networkpolicy-core-egress.yaml must satisfy the 5-entry house shape",
         )
 
     def test_discovery_matches_roster_exactly(self):
@@ -446,7 +433,7 @@ spec:
         self.assertEqual(rules, 1)
         self.assertTrue(any("10.0.0.0/8" in err for err in errors))
 
-    def test_house_shape_except_passes(self):
+    def test_link_local_except_with_resolver_literals_passes(self):
         manifest = f"""apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -468,13 +455,12 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-{chr(10).join(f"              - {cidr}" for cidr in sorted(HOUSE_SHAPE_EXCEPT))}
+{chr(10).join(f"              - {cidr}" for cidr in sorted(LINK_LOCAL_EXCEPT))}
 """
         p = self._write_manifest("netpol.yaml", manifest)
         rules, errors = check_network_policy_file(p, self.root)
         self.assertEqual(rules, 1)
         self.assertEqual(errors, [])
-        self.assertTrue(is_house_shape(HOUSE_SHAPE_EXCEPT))
 
     def test_string_port_representation_supported(self):
         manifest = """apiVersion: networking.k8s.io/v1
@@ -555,8 +541,8 @@ spec:
         self.assertEqual(rules, 1)
         self.assertTrue(any("missing required protocol(s): ['TCP']" in err for err in errors))
 
-    def test_house_shape_missing_cloud_dns_literal_fails(self):
-        """Verify that house shape (excepting 169.254.0.0/16) missing Cloud DNS literal fails (#1169)."""
+    def test_link_local_except_missing_cloud_dns_literal_fails(self):
+        """Verify that an except list excluding 169.254.0.0/16 without the Cloud DNS literal fails (#1169)."""
         manifest = f"""apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -576,7 +562,7 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-{chr(10).join(f"              - {cidr}" for cidr in sorted(HOUSE_SHAPE_EXCEPT))}
+{chr(10).join(f"              - {cidr}" for cidr in sorted(LINK_LOCAL_EXCEPT))}
 """
         p = self._write_manifest("netpol.yaml", manifest)
         rules, errors = check_network_policy_file(p, self.root)
@@ -589,8 +575,8 @@ spec:
             )
         )
 
-    def test_house_shape_missing_node_local_dns_literal_fails(self):
-        """Verify that house shape (excepting 169.254.0.0/16) missing NodeLocal DNSCache literal fails."""
+    def test_link_local_except_missing_node_local_dns_literal_fails(self):
+        """Verify that an except list excluding 169.254.0.0/16 without the NodeLocal DNSCache literal fails."""
         manifest = f"""apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -610,7 +596,7 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-{chr(10).join(f"              - {cidr}" for cidr in sorted(HOUSE_SHAPE_EXCEPT))}
+{chr(10).join(f"              - {cidr}" for cidr in sorted(LINK_LOCAL_EXCEPT))}
 """
         p = self._write_manifest("netpol.yaml", manifest)
         rules, errors = check_network_policy_file(p, self.root)
@@ -1313,7 +1299,7 @@ spec:
       to:
         - ipBlock:
             cidr: 10.96.0.10/32
-        {{- if .Values.useHouseShape }}
+        {{- if .Values.exceptLinkLocal }}
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
@@ -1551,7 +1537,9 @@ spec:
         with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
             rc = main(["-v"])
         self.assertEqual(rc, 0)
-        self.assertIn("All 8 static policy copies passed", buf_out.getvalue())
+        self.assertIn(
+            f"All {len(STATIC_NETWORK_POLICIES)} static policy copies passed", buf_out.getvalue()
+        )
 
     def test_main_failure(self):
         manifest = """apiVersion: networking.k8s.io/v1

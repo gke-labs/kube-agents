@@ -27,9 +27,9 @@ object on stdout.
 - **Changing a repository.** Use **submit-suggestion** (a pull request against
   the GitOps repo) or **fleet-audit** (fixes for its own findings). This skill
   opens read-only workspaces and the broker refuses to commit from one.
-- **Reading a file the GitOps workflow already handed you.** `fleet-audit` and
-  `submit-suggestion` give you a workspace or a handle of their own; use theirs
-  rather than opening a second view of the same repository.
+- **Reading a file the GitOps workflow already handed you.** `fleet-audit` gives
+  you a leased clone and `submit-suggestion` `prepare` gives you the copy it
+  cloned; read theirs rather than opening a second view of the same repository.
 
 ## Two shapes, and which to pick
 
@@ -55,7 +55,9 @@ python3 ./skills/inspect-repository/scripts/inspect_repository.py close --handle
 ```
 
 The handle survives between turns; the shell does not. Keep it, and **close it
-when you are done** — an open handle holds a clone on the broker's volume.
+when you are done** — an open handle holds a clone on the broker's volume. The
+broker reclaims a handle nothing has used for 30 minutes, so `no such workspace`
+after a long pause means open again, not that the repository is gone.
 `open` also prints `sha`, the commit the workspace was cloned at; a report
 that has to say which commit it read (the fleet-audit declared-intent record
 names each repository as `owner/name@sha`) takes it from there, since there

@@ -27,7 +27,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 - [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) — Gemini-only default. Uses `GEMINI_API_KEY`.
 - [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription) — proxies to a personal ChatGPT subscription via OAuth device flow. Useful for demos where you don't want a per-token cost.
 
-To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
+To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `inference-gateway`.
 
 ### Setting the default model
 
@@ -108,11 +108,11 @@ Nothing here is provider-specific. Non-Anthropic backends drop the markers in th
 
 ### Redaction at the gateway
 
-Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs. `litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`, and the hook rewrites `messages[].content` (strings and `text` parts), embeddings `input` and completion `prompt` before LiteLLM calls the provider. The rendered default config does not change while the value is off.
+Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs. `litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`, and the hook rewrites `messages[].content` (strings and `text` parts), each assistant message's `tool_calls[].function.arguments` (parsed, so a key name such as `password` counts as it does in a mapping), embeddings `input` and completion `prompt` before LiteLLM calls the provider. The rendered default config does not change while the value is off.
 
 Three layers run, in this order:
 
-1. **The built-in credential patterns**, always on: GCP API keys and OAuth tokens, PEM private keys, bearer and basic auth values, GitHub, OpenAI and Slack tokens, JWTs, secret-shaped key/value pairs, Kubernetes Secret `data:` blocks, and e-mail addresses other than service-account principals. These are masked (`[REDACTED_SECRET]`, `[REDACTED_PRIVATE_KEY]`, `[REDACTED_EMAIL]`).
+1. **The built-in credential patterns**, always on: GCP API keys and OAuth tokens, PEM private keys, bearer and basic auth values, GitHub, OpenAI, Anthropic and Slack tokens, AWS access key IDs, JWTs, the password in a URL (`scheme://user:password@host`, unless it holds `,`, `;`, a quote or an unencoded `/`, `?` or `#`), secret-shaped key/value pairs (a block scalar's lines included), container env entries whose name is secret-shaped (in YAML and in JSON), Kubernetes Secret `data:` blocks and the `data`/`stringData` objects of JSON that holds a Secret, and e-mail addresses other than service-account principals. These are masked (`[REDACTED_SECRET]`, `[REDACTED_PRIVATE_KEY]`, `[REDACTED_EMAIL]`). A `true`, `false`, `null` or `none` value, or an env reference such as `$(DB_PASSWORD)`, is left as it is under a secret-shaped name, so `automountServiceAccountToken: false` still reads as a boolean. JSON held inside a JSON string, such as the `kubectl.kubernetes.io/last-applied-configuration` annotation in `kubectl get -o json`, is decoded and redacted the same way.
 2. **IP literals**, IPv4 and IPv6, under `litellm.redaction.ip`. `action: pseudonym` (the default) replaces each with `[ip:<12 hex>]`; `mask` replaces each with `[REDACTED_IP]`; `"off"` leaves them alone, and it has to be quoted because YAML reads the bare word as a boolean, which the render refuses. `allowCidrs` lists the networks the model must still see, such as `127.0.0.0/8` or a service range.
 3. **Operator rules** under `litellm.redaction.rules`, each a `name` (a letter or digit, then letters, digits, `_`, `.`, `-`), exactly one of `literal` (an exact string) or `pattern` (a Python regular expression), both non-empty, and an `action` of `mask` (default) or `pseudonym` (`[<name>:<12 hex>]`). A mask marker is the name upper-cased with punctuation folded to `_`, so the `cluster-name` rule below masks as `[REDACTED_CLUSTER_NAME]`.
 
@@ -196,7 +196,7 @@ Deploy it with `make -C k8s-operator deploy-inference-replay` — it is a develo
 
 ## What the agent doesn't care about
 
-The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `litellm` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `litellm` Service is repointed at the replay proxy and the original LiteLLM pods are re-exposed through a new `litellm-gateway` Service that the proxy forwards cache misses to. That means:
+The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the LLM provider. Provider selection is entirely at the LiteLLM / vLLM layer — the agent always talks to the `inference-gateway` Service, and the install decides what that Service resolves to. When the replay proxy is deployed, the `inference-gateway` Service is repointed at the replay proxy and the original gateway pods are re-exposed through a new `inference-gateway-upstream` Service that the proxy forwards cache misses to. That means:
 
 - Swapping Gemini for Anthropic is a LiteLLM `ConfigMap` change.
 - So is [prompt caching](#prompt-caching) — the breakpoints are injected gateway-side, because only the gateway knows which model they are for.
@@ -206,5 +206,5 @@ The Platform Agent's config (`agents/platform/config.yaml`) doesn't mention the 
 ## Where to go next
 
 - [Reference → Examples](/kube-agents/reference/examples/) — the inference example bundles walked through.
-- [Deploy → Kustomize](/kube-agents/deploy/kustomize/) — what the LiteLLM Deployment looks like on disk.
+- [Deploy → Network policies and Service](/kube-agents/deploy/kustomize/#kustomize-for-operator-integrations) — where the LiteLLM Deployment's dev copy lives on disk.
 - [Concepts → Observability](/kube-agents/concepts/observability/) — LLM telemetry export.

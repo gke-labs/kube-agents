@@ -142,6 +142,16 @@ agents/platform/skills/*/references/*.md
   agents/platform/skills/gke-upgrades/references/runbook-template.md
   agents/platform/skills/gke-upgrades/references/troubleshooting.md
 
+bench/tasks/*/evidence/*/integrity-sweep-adjudication.md
+  bench/tasks/b-0011-gitops/evidence/run_20260918_181403_840299/integrity-sweep-adjudication.md
+  bench/tasks/b-0011-gitops/evidence/run_20260918_210713_821053/integrity-sweep-adjudication.md
+  bench/tasks/b-0022b-gitops/evidence/run_20260918_185657_889776/integrity-sweep-adjudication.md
+
+bench/tasks/*/evidence/*/integrity-sweep.md
+  bench/tasks/b-0011-gitops/evidence/run_20260918_181403_840299/integrity-sweep.md
+  bench/tasks/b-0011-gitops/evidence/run_20260918_210713_821053/integrity-sweep.md
+  bench/tasks/b-0022b-gitops/evidence/run_20260918_185657_889776/integrity-sweep.md
+
 examples/gitops-repo/*/**
   examples/gitops-repo/.github/branch-protection.md
   examples/gitops-repo/.github/workflows/README.md

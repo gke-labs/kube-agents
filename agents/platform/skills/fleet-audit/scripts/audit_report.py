@@ -50,6 +50,7 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -59,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
@@ -162,6 +164,11 @@ AUDITS: dict[str, AuditSpec] = {
             "legacy-metadata",
             "public-control-plane",
             "podsecurity-gaps",
+            "kcc-object-wedged",
+            "image-floating-tag",
+            "unbound-sa-automount",
+            "lb-world-open",
+            "anonymous-rbac-binding",
         ),
     ),
     "security-patch-orchestrator": AuditSpec(
@@ -195,6 +202,18 @@ AUDITS: dict[str, AuditSpec] = {
             "probes-readiness",
             "probes-liveness",
             "single-replica",
+            "schedule-never-succeeds",
+            "rollout-drops-traffic",
+            "strategy-causes-downtime",
+            "cronjob-runs-overlap",
+            "service-selects-nothing",
+            "service-port-unresolved",
+            "liveness-preempts-readiness",
+            "spread-not-achieved",
+            "prestop-outlives-grace",
+            "rwo-claim-contended",
+            "hpa-floors-at-one",
+            "pdb-overlapping",
         ),
         # §4a of the SOP: the four checks that judge a posture rather than a
         # fault, and so the only four a repository declaration may keep off the
@@ -449,7 +468,20 @@ DELTA_RE = re.compile(
 # stream pays one run of withheld `resolved` for a rename in this one; a
 # per-stream stamp would be the alternative, and it is a bigger change than
 # the single run it would save.
-ID_SCHEME = 3
+#
+# 4: the security-patch-orchestrator collector (`patch_readiness.py`) makes the
+# same rename for its stream, for the same reason, so every patch finding is
+# re-spelled on its first run under the collector and scheme 3's ledgers and
+# remediation pull requests cannot be joined against it.
+#
+# 5: `collect.py` makes the same rename for the obtainability, compliance and
+# ai-security streams, which until then published the bare names their
+# documents wrote.
+ID_SCHEME = 5
+# Joins a qualified cluster name's `<project>/<location>/<name>` segments.
+QUALIFIED_TARGET_SEPARATOR = "/"
+# `<project>/<location>/<name>`: the segments of a qualified cluster name.
+QUALIFIED_CLUSTER_SEGMENTS = 3
 ID_SCHEME_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-id-scheme:[ \t]*(\d+)[ \t]*-->[ \t]*$", re.M
 )
@@ -489,6 +521,12 @@ HELD_IDS_RE = re.compile(rf"<!--[ \t]*{HELD_IDS_COMMENT}:[ \t]*(\[.*?\])[ \t]*--
 HELD_CHECK_LINE_RE = re.compile(
     r"^- \*\*Check:\*\* `([^`\n]*)` — the collector ran `([^`\n]*)` there", re.M
 )
+# One audited row of a previous body's Scope table: cluster, location, project.
+# Read back only to qualify a bare cluster name when a scheme bump re-spells
+# the rows (`_scope_qualified_names`).
+# The location cell is the one written without a code span, which is what
+# tells this row from the evidence appendix's `cluster | check | command` rows.
+SCOPE_ROW_RE = re.compile(r"^\| `([^`\n]+)` \| ([^|`\n]+?) \| `([^`\n]+)` \|", re.M)
 WHERE_LINE_RE = re.compile(
     r"^- \*\*Where:\*\* `([^`\n]*)`"
     r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
@@ -610,6 +648,11 @@ MAX_IDENT_CHARS = 320
 # between a stream that publishes and one that 422s every morning forever.
 MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
+# Ceiling on the `audit-findings-all` block a truncated ledger carries. It is
+# charged against the findings when the body is truncated anyway, so it is
+# bounded to a slice of the budget: past this a fleet keeps its findings and
+# loses the complete list.
+ALL_FINDINGS_BLOCK_CAP = 12_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -858,6 +901,15 @@ WRITE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 class ValidationError(ValueError):
     """A findings.json (or audit id) that the harness refuses to publish."""
+
+
+class StartRefused(ValidationError):
+    """`start` did not run: the stream's in-flight guard held, or could not be taken.
+
+    A subclass so `main` can label it apart from a rejected document. Both
+    exit 2, but every SOP reads `FINDINGS REJECTED` as "fix the file and
+    re-run", and a refused `start` has no file to fix.
+    """
 
 
 class BodyTooLargeError(ValidationError):
@@ -1402,10 +1454,10 @@ def checks_na(cluster: object) -> list[str]:
     """The check slugs a `scope.clusters` entry declares inapplicable.
 
     A check that *cannot* apply to a cluster is not a check that failed to run,
-    and the difference decides whether the stream can ever close. Node-pool
-    checks against an Autopilot cluster are the standing example: Google owns
-    the node pools, so there is nothing there to inspect and never will be.
-    Counted as gaps they made every Autopilot cluster permanently `⚠`, which
+    and the difference decides whether the stream can ever close. Workload
+    checks for shapes Autopilot admission rejects (privileged containers,
+    hostPath volumes) are the standing example: nothing there can match, and
+    never will. Counted as gaps they made every Autopilot cluster permanently `⚠`, which
     pinned `resolved` at 0, stopped every stale remediation pull request from
     closing, and left a ledger that could not retire no matter how healthy the
     fleet got.
@@ -1437,6 +1489,194 @@ def run_record_path_for(audit_id: str) -> str:
 def declarations_path_for(audit_id: str) -> str:
     """Where `start` files the declarations it found for `finish` to join."""
     return f"{SCRATCH_DIR}/declarations_{audit_id}.json"
+
+
+def inflight_path_for(audit_id: str) -> str:
+    """Where `start` leaves the note that a run of this stream is under way."""
+    return f"{SCRATCH_DIR}/inflight_{audit_id}.json"
+
+
+# How long an in-flight note is believed. A full audit takes 600-1300 s; a
+# run that died without `finish` is forgotten after this, so a dead run costs
+# the stream at most the ticks that fall inside the next two hours. Releasing
+# it sooner is an operator's action from outside the session, described in
+# agents/platform/cron/README.md; the CLI has no flag for it on purpose.
+INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+
+
+def _in_flight_since(path: Path) -> float | None:
+    """`started_at` of the note at `path`, or `None` when it is gone.
+
+    A note that exists but does not parse -- another `start` created it a
+    moment ago and has not written it yet -- counts from its mtime: an
+    unreadable note is a claim, not an absence.
+
+    The note is a lease on the stream, not a process. It names the stream
+    and the time and nothing else on purpose: the first shape carried
+    `start`'s pid, and `start` exits as soon as it has written the run
+    record, so that pid was always dead by the time anyone read it. On
+    2026-09-23 (build 2102875230451011584, rep 1) a refused worker read the
+    note, ran `ps` against that pid, took "not running" for "the run is
+    over" and passed the `--takeover` flag the CLI then had over its own
+    live run. Nothing in the note can tell a reader whether the run is
+    alive, because the run is a worker's session or a scheduled tick on
+    another pod; only its `finish` or the TTL ends the lease.
+    """
+    try:
+        note = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        note = None
+    started = note.get("started_at") if isinstance(note, dict) else None
+    if isinstance(started, (int, float)):
+        return float(started)
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def claim_in_flight(audit_id: str) -> None:
+    """Refuse a second `start` while a run of this stream is under way.
+
+    Every path `start` scrubs — the run record, the declarations, the
+    findings document, the workspace — is keyed by audit id alone, on one
+    volume every session's shell shares. The scheduler's per-job lock keeps
+    two ticks apart, but a run started from a session (the on-demand
+    interim, #1876) holds no such lock, so without this a tick landing
+    mid-sweep, or a second card for the same stream, wiped the first run's
+    state out from under it and both `finish` calls rewrote one ledger.
+
+    The read, the decision and the write happen under an exclusive lock on
+    a sibling file (flock; every session's shell runs on the one sandbox
+    pod, against the one volume), so two `start`s racing for one stream
+    cannot both pass, and a stale or taken-over note is replaced by exactly
+    one of them: the other reads the fresh note and is refused.
+
+    The guard fails closed. A lock that cannot be opened or taken, or a note
+    that cannot be written, is a `start` that cannot know whether a run is in
+    flight, and the thing it would do next is scrub that run's state; it
+    exits 2 instead and says why. Nothing else in `start` runs on a volume
+    that refuses these, so failing open would buy no run that failing closed
+    loses, and a `start` refused here wrote nothing, so it has nothing to
+    release.
+
+    What the guard is and is not. It keeps two well-behaved runs of one
+    stream apart, and it hands a refused worker nothing to act on: no
+    override flag (the CLI had `--takeover` until 2026-09-24, and both
+    observation runs of #1876 saw a refused worker pass it within a minute
+    over its own live run), no pid to test, no path to remove; the refusal
+    text names only the stream and the time. It is not a permission
+    boundary: the worker's shell is the same shell an operator would use
+    on the same volume (docs/designs/agent-shell-sandboxing.md), so a
+    worker set on removing a file it was never told about is outside what
+    a script can stop. Releasing a stream before the TTL is an operator's
+    action, described in agents/platform/cron/README.md and nowhere the
+    worker reads.
+
+    The lease spans one `start`-`finish` pair, not a loop. Eight of the nine
+    SOPs run a stream repository by repository (`start --repo A; finish
+    --repo A; start --repo B`), and each `finish` releases, so between two
+    repositories the stream is unclaimed and a rival `start` can take it;
+    the loop's next `start` is then refused. A refusal mid-loop means the
+    stream was taken between repositories: the run stops there and reports
+    itself partial with the remaining repositories named as not audited.
+    Holding the lease across the loop needs `finish` to know it is not the
+    last repository, which is the run identity that is out of scope here.
+    """
+    path = Path(inflight_path_for(audit_id))
+    # The guard-failure messages name the error and not the path: a path in
+    # a refusal reads as a file to remove.
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Read-only on purpose: flock(2) needs no writable descriptor, and
+        # the lock file is never removed, so one created by another uid (a
+        # hand-run `start` over `kubectl exec` lands as root; the tick and
+        # every session run as uid 1000) must still open for everyone after.
+        # O_RDWR made such a lock refuse the stream for good, before the TTL
+        # was ever read. The mode is a request the creating process's umask
+        # narrows: under 077 or 027 (hardened operator shells) that root-run
+        # `start` left a 0600 root:root lock that no uid-1000 `start` could
+        # open, and unlike the note the lock has no TTL and nothing removes
+        # it. The umask is cleared for this one call so the lock is 0644
+        # whoever creates it.
+        mask = os.umask(0)
+        try:
+            lock = os.open(f"{path}.lock", os.O_RDONLY | os.O_CREAT, 0o644)
+        finally:
+            os.umask(mask)
+    except OSError as exc:
+        raise StartRefused(
+            f"could not take the in-flight guard for {audit_id} "
+            f"({exc.strerror or type(exc).__name__}); refusing to start rather "
+            f"than scrub a run that may be in flight. Report it."
+        ) from exc
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = _in_flight_since(path)
+        if started is not None and time.time() - started < INFLIGHT_TTL_SECONDS:
+            when = datetime.fromtimestamp(started, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            # Addressed to the worker that was refused: wait or report, and
+            # no third option. The first wording offered `--takeover` "if you
+            # know it is dead", and on 2026-09-23 a refused session took that
+            # as its cue and passed the flag 42 seconds later over a run that
+            # was alive. The second wording dropped the offer but printed the
+            # note's pid, and that evening a refused session ran `ps` on it,
+            # read `start`'s long-exited process as a dead run, and took over
+            # its own. The flag is gone; the refusal names the stream and the
+            # time and nothing that reads as a check or a thing to remove.
+            raise StartRefused(
+                f"a run of {audit_id} is in flight since {when}; wait for its "
+                f"`finish` or report it. A second `start` would scrub its run "
+                f"record, workspace and findings document. The note is a lease "
+                f"on the stream, not a process on this pod: nothing you can run "
+                f"here shows whether that run is alive, and this refusal is not "
+                f"a check to work around."
+            )
+        # Written beside and moved into place, so the note either holds a
+        # complete claim or is untouched. A plain write opens with O_TRUNC
+        # first, and a write that then fails (ENOSPC, EDQUOT, EIO on the
+        # shared volume) would leave an empty note with a fresh mtime, which
+        # `_in_flight_since` honours as a claim for the next two hours with
+        # no run behind it.
+        staged = Path(f"{path}.tmp")
+        try:
+            staged.write_text(
+                json.dumps({"audit": audit_id, "started_at": time.time()}),
+                encoding="utf-8",
+            )
+            os.replace(staged, path)
+        except OSError:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise StartRefused(
+            f"could not record the in-flight note for {audit_id} "
+            f"({exc.strerror or type(exc).__name__}); refusing to start rather "
+            f"than run unguarded against a run in flight. Report it."
+        ) from exc
+    finally:
+        os.close(lock)  # closing the descriptor drops the lock
+
+
+def release_in_flight(audit_id: str) -> None:
+    """`finish` is over, one way or the other: the stream is free for its next run.
+
+    Unconditional on purpose, and that is a known limit: `start` and `finish`
+    are separate processes, and every state they share is keyed by audit id,
+    so a `finish` cannot tell its own run's note from one a later `start`
+    wrote after an operator's release or the two-hour expiry. A run that
+    outlives that release and then finishes publishes over the later run's
+    record already; removing the later run's note is the smaller part of
+    that shape, and the fix for both is the same one: a run identity that
+    travels from `start` through the findings document to `finish`, which
+    is a change to the SOP contract and not made here.
+    """
+    Path(inflight_path_for(audit_id)).unlink(missing_ok=True)
 
 
 def base_branch() -> str:
@@ -1847,6 +2087,27 @@ def parse_id_scheme(body: str | None) -> int:
         return 0
 
 
+def _qualified_scope_entries(
+    cluster: str, audited_names: set[str], qualified_by_leaf: dict[str, list[str]]
+) -> list[str]:
+    """The qualified scope entries a bare cluster name could stand for.
+
+    A collector qualifies names as `<project>/<location>/<name>` while its
+    candidates' `object` still reads `Cluster/<name>`, so the bare name is the
+    easy misspelling. `qualified_by_leaf` keys each such entry by its name's
+    id segment, so `Prod` finds `acme/us-east1/prod` as the id would."""
+    if cluster in audited_names:
+        return []
+    return sorted(qualified_by_leaf.get(_id_segment(cluster), []))
+
+
+def _scope_spelling_hint(
+    cluster: str, audited_names: set[str], qualified_by_leaf: dict[str, list[str]]
+) -> str:
+    entries = _qualified_scope_entries(cluster, audited_names, qualified_by_leaf)
+    return f" Did you mean {' or '.join(map(repr, entries))}?" if entries else ""
+
+
 def validate_findings(data: object, audit_id: str) -> dict:
     """Validate a findings document. Raises ValidationError naming index + field."""
     validate_audit_id(audit_id)
@@ -1882,6 +2143,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
     # claim to have performed, or excused itself from, a check that is not one.
     finding_check_set = audit_finding_checks(audit_id)
     audited_names: set[str] = set()
+    qualified_by_leaf: dict[str, list[str]] = {}
     for i, cluster in enumerate(clusters):
         if not isinstance(cluster, dict):
             raise ValidationError(f"scope.clusters[{i}]: expected an object")
@@ -1889,7 +2151,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
             _require_str(
                 cluster.get(field), f"scope.clusters[{i}].{field}", allow_empty=False
             )
-        # A finding names its cluster by bare name, and so does every lookup
+        # A finding names its cluster by this name, and so does every lookup
         # that resolves one back to this table. Two same-named clusters in two
         # projects make that name ambiguous, and the ambiguity is already
         # load-bearing today: `coverage_gaps` and the scope table resolve by
@@ -1903,12 +2165,19 @@ def validate_findings(data: object, audit_id: str) -> dict:
         if name in audited_names:
             raise ValidationError(
                 f"scope.clusters[{i}].name: duplicate cluster {name!r}. Findings "
-                "reference a cluster by bare name, so two clusters sharing one "
+                "reference a cluster by this name, so two clusters sharing one "
                 "name cannot be told apart — their findings would merge into a "
                 "single identity and the ledger would under-report. Audit the "
                 "projects in separate runs."
             )
         audited_names.add(name)
+        # By the name's shape, as `_scope_qualified_names` reads it: the
+        # manifest cross-check matches on `name` alone, so an entry whose
+        # `project` or `location` field is spelled differently still stands for
+        # this cluster. `project/<id>` has one separator and stays out.
+        if name.count(QUALIFIED_TARGET_SEPARATOR) == QUALIFIED_CLUSTER_SEGMENTS - 1:
+            leaf = name.rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
+            qualified_by_leaf.setdefault(_id_segment(leaf), []).append(name)
         # Optional, but non-empty when present: "I read this cluster fine, but
         # some checks did not run or do not apply" is a different claim from
         # "I could not read this cluster", and conflating the two produces
@@ -1987,12 +2256,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
 
         # Checks that cannot apply here, each with the reason it cannot. These
         # come *out* of the denominator rather than counting against coverage:
-        # an Autopilot cluster has no node pools to inspect, so a node-pool
-        # check that "did not run" there did not fail to run — there was
-        # nothing to run it against. Treating the two as one thing is what left
-        # every Autopilot cluster at `6/10 ⚠` forever, and a permanently
-        # partial stream can never close its ledger, never report a finding as
-        # resolved, and never close a stale remediation pull request.
+        # a check with nothing to run against did not fail to run. Treating
+        # the two as one thing is what left every Autopilot cluster at `6/10 ⚠`
+        # forever, back when its node-pool checks were counted as not run, and
+        # a permanently partial stream can never close its ledger, never report
+        # a finding as resolved, and never close a stale remediation pull
+        # request.
         na_entries = cluster.get("checks_not_applicable")
         if na_entries is not None:
             if not isinstance(na_entries, list):
@@ -2107,6 +2376,21 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "scope.skipped, so this run claims it could not read it — a finding "
                 "against it is a contradiction. Move the cluster to scope.clusters "
                 "(with a limitations note) or drop the finding"
+            )
+        # Only the bare form of a qualified entry. A finding may name a target
+        # scope does not list -- the cost stream files unattributable disks
+        # under `project/<id>` -- but not a second spelling of one it does,
+        # which derives a second id for the same finding.
+        qualified = _qualified_scope_entries(
+            str(finding["cluster"]), audited_names, qualified_by_leaf
+        )
+        if qualified:
+            raise ValidationError(
+                f"findings[{i}].cluster: {finding['cluster']!r} is the bare "
+                f"name of {' and '.join(map(repr, qualified))} in scope.clusters. "
+                "Write the qualified name of the cluster the finding is on: the "
+                "cluster is part of the finding's id, so the bare name files "
+                "this finding as a new one beside the collector's candidate"
             )
         # namespace may legitimately be empty for cluster-scoped objects.
         _require_str(finding.get("namespace", ""), f"findings[{i}].namespace")
@@ -2285,7 +2569,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
             if cluster not in audited_names:
                 raise ValidationError(
                     f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
-                    "finding can only be confirmed gone on a cluster this run read"
+                    "finding can only be confirmed gone on a cluster this run read."
+                    + _scope_spelling_hint(cluster, audited_names, qualified_by_leaf)
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
             _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
@@ -2380,7 +2665,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 raise ValidationError(
                     f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
                     "declaration justifies a posture this run observed, so the "
-                    "cluster it was observed on must be one this run read"
+                    "cluster it was observed on must be one this run read."
+                    + _scope_spelling_hint(cluster, audited_names, qualified_by_leaf)
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
             _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
@@ -2898,6 +3184,36 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             for entry in manifest_cluster.get("checks_not_applicable") or []
             if isinstance(entry, dict)
         }
+        # A check whose own read failed did not run and is not inapplicable,
+        # so it may sit in neither list; it belongs in `limitations`, which
+        # makes the run partial and keeps every finding it filed here open.
+        # Declared not applicable instead, it would leave the denominator and
+        # a clean document would resolve those findings over a read that never
+        # happened.
+        collector_unevaluated = {
+            str(entry.get("check"))
+            for entry in manifest_cluster.get("checks_unevaluated") or []
+            if isinstance(entry, dict)
+        }
+        misfiled = sorted(collector_unevaluated & (set(claimed) | set(checks_na(cluster))))
+        if misfiled:
+            raise ValidationError(
+                f"scope.clusters: {name!r} reports {', '.join(repr(s) for s in misfiled)} "
+                f"as run or not applicable, but the collector manifest for {audit_id} "
+                f"lists them in checks_unevaluated on {name!r}: the read each check "
+                "depends on failed, so it neither ran nor was found inapplicable. "
+                "Leave them out of checks_run and checks_not_applicable and name "
+                "them in this target's `limitations`."
+            )
+        if collector_unevaluated and not str(cluster.get("limitations", "")).strip():
+            raise ValidationError(
+                f"scope.clusters: {name!r} has no `limitations`, but the collector "
+                f"manifest for {audit_id} lists "
+                f"{', '.join(repr(s) for s in sorted(collector_unevaluated))} in "
+                f"checks_unevaluated on {name!r}. Name each one and the read that "
+                "failed in `limitations`, so the run reports the gap instead of "
+                "publishing over it."
+            )
         for slug in claimed:
             if slug not in ok_checks:
                 raise ValidationError(
@@ -3196,9 +3512,12 @@ def collector_held_entries(
         held_ids = sorted(flagged)
         titles: dict[str, str] = {}
     else:
-        marker_ids, _ = previous_marker_ids(previous_body)
+        # Every audited cluster, not only those with candidates: a bare name
+        # is qualified only when one cluster this run knows could own it.
+        clusters = {str(entry.get("name") or "") for entry in _manifest_clusters(manifest)}
+        marker_ids, _ = previous_marker_ids(previous_body, flagged, clusters)
         held_ids = [fid for fid in marker_ids if fid in flagged]
-        respelled = _respelled_rows(previous_body)
+        respelled = _respelled_rows(previous_body, flagged, clusters)
         # Titles from the rows that recorded a location, not from every
         # heading. `held_row_from_id` renders a heading too -- "<id> (carried
         # by id; location not recorded on the previous ledger)" -- and it is a
@@ -4159,6 +4478,23 @@ def delta_block(ids: list[str]) -> str:
     )
 
 
+def all_findings_block(ids: list[str]) -> str:
+    """Every id the delta block would carry uncut, for a body that could not render them all.
+
+    The document's findings and the collector-held ids both, so a grader that
+    reads this block in place of the delta block loses neither half.
+
+    Machine-read by graders and never by `finish`: the delta still joins
+    against `audit-findings`, the rendered set, for the reason `compute_delta`
+    gives. What this adds is the one fact a truncated body otherwise loses --
+    that a finding cut for space was filed at all. Empty when the list would
+    exceed `ALL_FINDINGS_BLOCK_CAP`.
+    """
+    payload = json.dumps(sorted(set(ids)), separators=(",", ":"))
+    block = f"<!-- audit-findings-all: {payload} -->"
+    return block if len(block) <= ALL_FINDINGS_BLOCK_CAP else ""
+
+
 def parse_delta_block(body: str | None) -> list[str]:
     """Read the finding ids out of a previous issue body ([] when absent/unparseable)."""
     body = normalise_newlines(body)
@@ -4360,7 +4696,44 @@ def parse_held_ids(body: str | None) -> list[str]:
     return kept
 
 
-def _respelled_rows(body: str | None) -> dict[str, str]:
+def _scope_spellings(body: str, clusters: Iterable[str] = ()) -> dict[str, set[str]]:
+    """{bare cluster name: every `<project>/<location>/<name>` it could stand for}.
+
+    Schemes 3 to 5 moved a stream's cluster names from bare to qualified, so a
+    `Where:` line written before the move names a cluster no collector
+    candidate spells that way any more. The Scope row beside it has the
+    project and location that qualify it; a name audited at two locations has
+    two, and which row a finding belonged to is not recorded.
+
+    The table stops at `MAX_SCOPE_ROWS`, so on a larger fleet a `Where:` line
+    can name a cluster with no row. `clusters` -- the qualified names this run
+    knows, from its manifest or its document -- spells those names instead.
+    """
+    sep = QUALIFIED_TARGET_SEPARATOR
+    seen: dict[str, set[str]] = {}
+    for name, location, project in SCOPE_ROW_RE.findall(body):
+        if sep not in name:
+            seen.setdefault(name, set()).add(sep.join((project, location.strip(), name)))
+    current: dict[str, set[str]] = {}
+    for qualified in clusters:
+        name = qualified.rsplit(sep, 1)[-1]
+        if qualified.count(sep) == QUALIFIED_CLUSTER_SEGMENTS - 1 and name not in seen:
+            current.setdefault(name, set()).add(qualified)
+    return seen | current
+
+
+def _scope_qualified_names(body: str, clusters: Iterable[str] = ()) -> dict[str, str]:
+    """{bare cluster name: `<project>/<location>/<name>`}, for the names `_scope_spellings`
+    spells one way. With nothing else to choose by, guessing between two
+    spellings would hold the wrong cluster's finding, so a shared name is left out."""
+    return {name: next(iter(q)) for name, q in _scope_spellings(body, clusters).items() if len(q) == 1}
+
+
+def _respelled_rows(
+    body: str | None,
+    flagged: set[str] | frozenset[str] = frozenset(),
+    clusters: Iterable[str] = (),
+) -> dict[str, str]:
     """{id as the previous body spelled it: id under the current scheme}, per rendered row.
 
     A row's `Where:` line and the check in its id are the fields identity is
@@ -4368,21 +4741,49 @@ def _respelled_rows(body: str | None) -> dict[str, str]:
     harness runs — which is what a marker cannot be. The check slug is read
     off the id: `_shorten_id` never touches it, and `unaccounted_previous_findings`
     already relies on the same.
+
+    Under another scheme a row naming a bare cluster is also spelled with the
+    name qualified from the body's Scope table (`_scope_spellings`), and that
+    spelling wins when the collector's `flagged` ids carry it and not the bare
+    one. Schemes 3 to 5 moved a stream's clusters from bare to qualified
+    names; matched on the bare spelling alone, its first run under the
+    collector held nothing, and a clean document closed the ledger over
+    findings the collector still flagged. A name two clusters share is
+    spelled as the one the collector flags. When it flags both, the first
+    by id is held: either keeps the ledger open over a finding the collector
+    does report, where holding neither closed it.
     """
-    return {
-        raw: published_id(
-            {
-                "check": raw.split(".", 1)[0],
-                "cluster": where["cluster"],
-                "namespace": where["namespace"],
-                "object": where["object"],
-            }
-        )
-        for raw, where in parse_finding_locations(body).items()
-    }
+    stale = parse_id_scheme(body) != ID_SCHEME
+    spellings = _scope_spellings(normalise_newlines(body), clusters) if stale and flagged else {}
+    out: dict[str, str] = {}
+    for raw, where in parse_finding_locations(body).items():
+        identity = {
+            "check": raw.split(".", 1)[0],
+            "cluster": where["cluster"],
+            "namespace": where["namespace"],
+            "object": where["object"],
+        }
+        fid = published_id(identity)
+        if fid not in flagged:
+            renamed = sorted(
+                respelled
+                for respelled in (
+                    published_id({**identity, "cluster": name})
+                    for name in spellings.get(where["cluster"], ())
+                )
+                if respelled in flagged
+            )
+            if renamed:
+                fid = renamed[0]
+        out[raw] = fid
+    return out
 
 
-def previous_marker_ids(body: str | None) -> tuple[list[str], int]:
+def previous_marker_ids(
+    body: str | None,
+    flagged: set[str] | frozenset[str] = frozenset(),
+    clusters: Iterable[str] = (),
+) -> tuple[list[str], int]:
     """The previous marker's ids under the current scheme, and the residual.
 
     Under the current scheme the marker is read as it stands. Under another,
@@ -4391,11 +4792,13 @@ def previous_marker_ids(body: str | None) -> tuple[list[str], int]:
     marker id, dropping out of the bump run's marker and leaving the ledger
     unannounced; held ids with no row — the note and empty tiers write none —
     are the residual, which the caller reports and which the bump loses.
+    `flagged` picks between a row's bare and qualified spellings
+    (`_respelled_rows`), qualifying names past the Scope table from `clusters`.
     """
     marker = parse_delta_block(body)
     if not marker or parse_id_scheme(body) == ID_SCHEME:
         return marker, 0
-    respelled = _respelled_rows(body)
+    respelled = _respelled_rows(body, flagged, clusters)
     # The residual is counted over the held list, not the whole marker: a
     # rendered finding with no row is main's cost of a bump, not a hold lost.
     return [respelled[fid] for fid in marker if fid in respelled], sum(
@@ -4512,8 +4915,21 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     for cluster in (data.get("scope") or {}).get("clusters") or []:
         if isinstance(cluster, dict):
             clusters_by_key.setdefault(_id_segment(str(cluster.get("name", ""))), cluster)
+    # A body from before a stream qualified its cluster names names them bare;
+    # the Scope table qualifies them, as `_respelled_rows` does.
+    stale = parse_id_scheme(previous_body) != ID_SCHEME
+    scope_names = [str(cluster.get("name", "")) for cluster in clusters_by_key.values()]
+    qualified = _scope_qualified_names(normalise_newlines(previous_body), scope_names) if stale else {}
     held: list[dict] = []
     for fid, where in previous.items():
+        renamed = qualified.get(where["cluster"])
+        if (
+            renamed
+            and _id_segment(where["cluster"]) not in clusters_by_key
+            and _id_segment(renamed) in clusters_by_key
+        ):
+            where = {**where, "cluster": renamed}
+            fid = published_id({"check": fid.split(".", 1)[0], **where})
         # `_shorten_id` never touches the leading segment, so the check slug
         # survives shortening; the other three are read verbatim off the body
         # rather than off the id, which may have been clipped.
@@ -6280,7 +6696,7 @@ def _render_findings(
 
 
 def _render_footer(
-    audit_id: str, generated_at: datetime, rendered_ids: list[str]
+    audit_id: str, generated_at: datetime, rendered_ids: list[str], all_block: str = ""
 ) -> list[str]:
     return [
         "",
@@ -6291,6 +6707,7 @@ def _render_footer(
         "live fleet; every one carries the exact command it was derived from.",
         "",
         delta_block(rendered_ids),
+        *([all_block] if all_block else []),
         "",
     ]
 
@@ -6845,6 +7262,13 @@ def render_issue_body(
     # select_rendered_findings. The held *rows* are not charged here — they
     # are measured after the findings, below, so they can never displace one.
     overhead = len("\n".join(fixed + declared_section + withheld_section))
+    # The complete id list — the document's findings and the held ids, the
+    # delta block's two halves at full width — rides only a truncated body,
+    # and which findings are cut is not known until they are selected. So
+    # select once without it and, only when that cut something, again with it
+    # charged: charging it up front cut findings from a body that would
+    # otherwise have rendered them all, to make room for a list of the cut.
+    all_block = all_findings_block(finding_ids(findings) + held_ids)
     overhead += len("\n".join(_render_footer(audit_id, generated_at, held_ids)))
     # And the held span's smallest form, so the list the next run carries
     # from is never the thing the findings squeeze out.
@@ -6855,19 +7279,28 @@ def render_issue_body(
         # part of any single finding's charged cost.
         overhead += index_overhead(findings, states, pr_urls)
 
-    findings_lines, omitted = _render_findings(
-        findings,
-        max(BODY_BUDGET - overhead, 0),
-        states=states,
-        pr_urls=pr_urls,
-        gaps=gaps,
-    )
+    def select(extra: int) -> tuple[list[str], list[dict]]:
+        return _render_findings(
+            findings,
+            max(BODY_BUDGET - overhead - extra, 0),
+            states=states,
+            pr_urls=pr_urls,
+            gaps=gaps,
+        )
+
+    findings_lines, omitted = select(0)
+    if omitted and all_block:
+        findings_lines, omitted = select(len("\n" + all_block))
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
     # The held ids ride the block after the rendered ones: that is what makes
     # the next run's `previous_ids` remember them.
-    footer = _render_footer(audit_id, generated_at, rendered_ids + held_ids)
+    # The complete list rides only a truncated body; an untruncated one
+    # already names every finding in the block above.
+    footer = _render_footer(
+        audit_id, generated_at, rendered_ids + held_ids, all_block if omitted else ""
+    )
     # The held rows come out of whatever the document's findings left, ahead
     # of the evidence appendix and never ahead of a finding: full rows, then
     # identity lines alone, then a one-line note, then the span and its id
@@ -9483,7 +9916,19 @@ def unsearched_intent_entries(
 
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    claim_in_flight(audit_id)
+    try:
+        _start(args, audit_id)
+    except BaseException:
+        # A `start` that raised left no run in flight, so the retry must not
+        # be refused for its own failure. The refusal above sits outside this
+        # block on purpose: a caller refused for another run's note must not
+        # remove that note on its way out.
+        release_in_flight(audit_id)
+        raise
 
+
+def _start(args: argparse.Namespace, audit_id: str) -> None:
     # Yesterday's run record goes first, before anything below can fail. Every
     # step from here to the write can raise, and a `start` that died between
     # them would otherwise leave the previous run's repository list for a
@@ -10379,6 +10824,33 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
+    if getattr(args, "dry_run", False):
+        # A preview taken mid-run: the run is still in flight and keeps its note.
+        _finish(args, audit_id)
+        return
+    try:
+        _finish(args, audit_id)
+    except ValidationError:
+        # The validator rejected the document and nothing was published. Every
+        # SOP's next step is "fix the findings file and re-run `finish`", so
+        # the run is still in flight while the worker edits, and the note has
+        # to hold: a tick landing in that window would otherwise pass `start`
+        # and unlink the very document about to be resubmitted.
+        raise
+    except BaseException:
+        # A `finish` that died on a `gh` call or anything else is over; the
+        # retry loads the document afresh, and the SOP's next `start --repo B`
+        # is not refused for two hours by an attempt that already died. The
+        # cost, accepted: a rival `start` landing before the retry scrubs the
+        # document the retry needs. Holding the note instead would refuse the
+        # loop's next repository and the tick for two hours, since the note
+        # cannot tell whose it is; run identity decides this and is not here.
+        release_in_flight(audit_id)
+        raise
+    release_in_flight(audit_id)
+
+
+def _finish(args: argparse.Namespace, audit_id: str) -> None:
     data = load_findings(args.findings_file, audit_id)
     # The collector's side of the run, when there is one. Both flags are
     # optional: a stream whose SOP has no collector yet publishes on the
@@ -11615,6 +12087,11 @@ def main(argv: list[str] | None = None) -> int:
             handle_remediate(args)
         else:
             handle_finish(args)
+    except StartRefused as exc:
+        # Exit 2 like a rejected document, labelled apart from one: there
+        # is no document here to fix and re-run.
+        log(f"START REFUSED: {exc}")
+        return 2
     except ValidationError as exc:
         log(f"FINDINGS REJECTED: {exc}")
         return 2

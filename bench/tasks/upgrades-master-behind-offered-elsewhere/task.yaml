@@ -1,0 +1,98 @@
+# Domain: upgrades (security-patch-orchestrator SOP). Journey: the upgrade
+# audit grades a lagging control plane by what GKE still serves at its
+# location, not by one channel's roster.
+#
+# The version-laggard cluster (seeded-b) is enrolled in REGULAR and held a
+# minor behind it by a NO_MINOR_UPGRADES exclusion. Its version has left
+# REGULAR's `validVersions[]` but is still offered at the location --
+# `validMasterVersions[]` carries it, and so does RAPID's roster (measured on
+# 2026-09-23). §3.1(a) is "offered by no route at this location" and is
+# critical; a version one channel dropped while another still serves it is
+# (b), major. Graded by hand, the SOP read "absent from B.validVersions[]" as
+# (a) and filed seeded-b as critical with an impact saying it "receives no
+# further patches", which the server config contradicts. The collector
+# (`patch_readiness.py`) computes the route check once, in code.
+#
+# Fixture drift: if GKE stops serving the held version at the location, (a)
+# becomes the correct grade and this case fails a correct run. The failure
+# reason names the severity, so it reads as drift rather than a regression.
+# The other direction is quieter: on a night seeded-b's patch is back on
+# REGULAR's roster, hand grading and the collector both read (b), and the
+# case passes without exercising the route check.
+#
+# The prompt names the SOP's file, as the weekly cron job does. Asked for an
+# "upgrade and patch readiness audit" by name alone, the worker also picks the
+# fleet-upgrade-verification skill, which publishes no ledger; once it has,
+# recall of that run makes the next one likelier to do the same.
+#
+# Isolation class: cluster-read-only, GitOps-repo write -- `start` clones the
+# eval project's throwaway GitOps repository and `finish` rewrites the
+# ledger, exactly as upgrade-readiness-lagging-cluster describes.
+id: upgrades-master-behind-offered-elsewhere
+name: Upgrade audit grades a version another route still serves as major, not critical
+prompt: >-
+  Run the GKE upgrade and patch readiness audit. Read the SOP at
+  'governance/security_patch_orchestrator_sop.md' in your profile home and
+  follow it.
+expected_output: >-
+  The ledger files a master-behind finding against the lagging cluster at
+  major severity: its control-plane version has left its REGULAR channel's
+  roster but is still offered at its location, so the cluster is behind its
+  channel rather than outside the supported window. Its master-behind
+  finding is not graded critical.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+fixtures:
+  - version-laggard
+
+verification_spec:
+  - name: a-master-behind-finding-was-filed-against-the-lagging-cluster
+    role: objective
+    # assert: the ledger is written once, at `finish`, before the run ends.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: security-patch-orchestrator
+      # finding_ids, because the body's scope table names every cluster on
+      # every run. Two phrases rather than "master-behind.seeded-b": the id
+      # carries the qualified `<project>/<location>/seeded-b`, so the bare
+      # name never directly follows the slug.
+      scope: finding_ids
+      required_phrases: ["master-behind", "seeded-b"]
+  - name: the-lagging-cluster-is-graded-major-not-critical
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: security-patch-orchestrator
+      # The findings table renders each row as
+      # "| [`<id>`](#user-content-finding-<id>) | <severity> | ...", and every
+      # id on the lagging cluster's own object ends "cluster-<name>", so
+      # "seeded-b) | <severity>" is that cluster's cluster-scoped findings'
+      # severity cell. Node-pool findings end in the pool name and never
+      # match. Of the checks the fixture trips, only master-behind can be
+      # major there; the collector files no-notifications at minor.
+      # The table is the only place the body puts a severity beside an id,
+      # and it stops at MAX_DELTA_ROWS (50) rows, criticals first, then majors
+      # by qualified cluster name. The measured runs published 26 findings on
+      # 13 clusters; a project carrying enough extra clusters to push this row
+      # past 50 fails the required phrase with "_…and N more below_" in the
+      # table, which is the row cut off, not the grade wrong.
+      required_phrases: ["seeded-b) | major"]
+      forbidden_phrases: ["seeded-b) | critical"]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: security-patch-orchestrator
+      # The SOP has no vulnerability feed and forbids naming CVEs.
+      forbidden_phrases: ["CVE-"]

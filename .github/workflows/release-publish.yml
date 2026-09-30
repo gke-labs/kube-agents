@@ -32,15 +32,19 @@ on:
           - dry-run
           - evaluate
       explicit_release_version:
-        description: "Explicit release version override (e.g. 0.2.0). If omitted, automatically calculated via Conventional Commits."
+        description: "Explicit release version override (e.g. 0.2.0). If omitted, automatically calculated via Conventional Commits. With release_line it must stay on that line; on main it may not name a patch of a line that has its own branch."
         required: false
         type: string
       target_commit:
-        description: "Target commit SHA. If omitted, automatically resolved from the newest commit carrying a 'staging_<ts>_<sha>' tag."
+        description: "Target commit SHA. If omitted, automatically resolved from the newest commit carrying a 'staging_<ts>_<sha>' tag. Refused alongside release_line."
+        required: false
+        type: string
+      release_line:
+        description: "Cut a patch from a release line, e.g. 0.8: the candidate is the head of release/0.8 and must carry an rc_*_validated tag. Leave empty to release from main."
         required: false
         type: string
       skip_staging_validation:
-        description: "Emergency override: bypass the staging promotion gate (the full nightly E2E matrix)."
+        description: "Emergency override: bypass the validation gate (the staging promotion for a release from main; the rc_*_validated tag for a release line)."
         required: false
         type: boolean
         default: false
@@ -110,6 +114,7 @@ jobs:
           # and a gate that picks its own are two different requests, and the
           # publish job below prefers the input. See the script.
           TARGET_COMMIT: ${{ inputs.target_commit }}
+          RELEASE_LINE: ${{ inputs.release_line }}
         run: ./scripts/release/decide_release_gate.sh
 
   publish-release:
@@ -163,6 +168,9 @@ jobs:
           # wrong.
           TARGET_COMMIT: ${{ inputs.target_commit || needs.evaluate-schedule.outputs.release_commit }}
           SKIP_STAGING_VALIDATION: ${{ inputs.skip_staging_validation }}
+          # A release line names its own candidate and base; the scripts refuse
+          # a target commit beside it.
+          RELEASE_LINE: ${{ inputs.release_line }}
         run: ./scripts/release/calculate_next_version.sh
 
       - name: Verify Release Eligibility
@@ -172,6 +180,7 @@ jobs:
           RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
           SKIP_STAGING_VALIDATION: ${{ inputs.skip_staging_validation }}
           EMERGENCY_OVERRIDE_REASON: ${{ inputs.emergency_override_reason }}
+          RELEASE_LINE: ${{ inputs.release_line }}
           GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/verify_release_eligibility.sh
 

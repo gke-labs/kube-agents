@@ -9,8 +9,8 @@
 # cause. The Cluster Agent runs this first (see cluster SOUL.md §6); on FAILED it
 # blocks the card with the reason below (kanban_block kind="needs_input").
 #
-# Deploys to /opt/data/scripts/cluster_preflight.sh via the same path as
-# kanban_notify_propagate.py (agents/platform/scripts -> /opt/defaults/scripts ->
+# Deploys to /opt/data/scripts/cluster_preflight.sh via the same path as the
+# other shared scripts (agents/platform/scripts -> /opt/defaults/scripts ->
 # /opt/data/scripts), so it reaches existing cluster profiles on image roll.
 #
 # The checks answer "am I about to investigate the cluster I was scoped to?", in

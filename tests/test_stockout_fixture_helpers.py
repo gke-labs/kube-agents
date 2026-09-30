@@ -67,11 +67,9 @@ def _pytest_stub() -> types.ModuleType:
     """A stand-in for pytest, which no unit-test job installs.
 
     `tests/test_*.py` is collected by python-tests.yml, which installs
-    requirements-test.txt, and by agent-startup-test.yml, which installs only pyyaml and
-    says in a comment that the tests use stdlib unittest so they run "without adding a test
-    framework to the repo". pytest lives in tests/e2e/requirements.txt and nothing else
-    installs it, so importing the module under test for real reds both jobs on every PR
-    that touches this directory.
+    requirements-test.txt and not pytest: pytest lives in tests/e2e/requirements.txt and
+    nothing else installs it, so importing the module under test for real reds that job
+    on every PR that touches this directory.
 
     The module touches four attributes: `fixture` and `mark.parametrize` at import time,
     and `fail` and `skip` when a helper rejects something. A fifth added later raises

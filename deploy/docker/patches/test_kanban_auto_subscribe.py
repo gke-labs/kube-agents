@@ -21,7 +21,7 @@ from kanban_auto_subscribe import (
 
 # The real table shape from hermes_cli/kanban_db.py SCHEMA_SQL — including the
 # two columns (chat_type, delivery_metadata) that are deliberately NOT copied,
-# matching both upstream _inherit_notify_subs and the manual propagate script.
+# matching upstream _inherit_notify_subs.
 SUBS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     task_id       TEXT NOT NULL,
@@ -181,7 +181,7 @@ class InheritSubscriptionsTest(unittest.TestCase):
 
     def test_only_the_documented_columns_are_copied(self):
         # chat_type / delivery_metadata stay NULL — the same set upstream's
-        # _inherit_notify_subs and the manual propagate script copy.
+        # _inherit_notify_subs copies.
         self.assertEqual(
             COPY_COLUMNS,
             ("platform", "chat_id", "thread_id", "user_id", "notifier_profile"),

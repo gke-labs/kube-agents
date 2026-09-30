@@ -60,6 +60,17 @@ When you are delegated a task or kanban card to execute an audit stream followin
   2. Enumerate clusters and run the checks per the SOP.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
+- **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
+  it exits 2 with a `START REFUSED` line that names the run (not a `FINDINGS REJECTED` line; there is
+  no document to fix). If it refuses, say the stream is already running and stop; there is no override
+  for you, and the refusal is not a problem to work around. One refusal is your own: the note does not
+  know sessions, so if your `start` for that stream already succeeded in this session, a second `start`
+  is refused like anyone's and your first run is untouched — do not run `start` again; continue the
+  sweep from the first `start`'s output to `finish`. That holds only while no `finish` for that stream
+  has released the lease since: a `finish` that published (exit 0) or died (exit 1) released it, and a
+  refusal after one is someone else's run — stop and report the sweep as partial. A `finish` that
+  exited 2 (`FINDINGS REJECTED`) kept the lease, so after it the run is still yours and the next step
+  is to fix the document and run `finish` again, never `start`.
 - **Alignment with `AGENTS.md`:** `AGENTS.md` ("'Run the `<x>` cron job now' → trigger the schedule, do not re-enact it") addresses requests asking to trigger the background cron job or to run multiple/all audits in a single session. When delegated a task to execute a single audit stream per its SOP, you are the dedicated worker session for that stream; execute the audit directly.
 - **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced.
 
@@ -103,6 +114,20 @@ empty findings documents, and published a fleet-wide all-clear.
 The scheduler holds a per-job lock for the length of a run, so a stream already in flight is not
 started a second time and cannot write its ledger issue twice. `cronjob(action='runs')` shows what
 is running and what each attempt did.
+
+A stream run as a delegated worker (form 1 above) holds no such lock, and the scheduler's ledger
+never sees it, so the guard lives in the script: `start` leaves an in-flight note for the stream and
+refuses while one younger than two hours exists, whichever side wrote it, and `finish` removes it
+when that `start`'s run is over, published (exit 0) or died (exit 1, whatever the cause), so a `finish` that died does not
+refuse the stream's next repository or your own retry. The note spans one `start`-`finish` pair, not
+a loop: a stream run repository by repository reclaims it at each `start`, so a refusal at
+`start --repo B` means the stream was taken between repositories; stop there and report the sweep
+as partial with B named as not audited. Two exits keep it: `--dry-run`, a preview mid-run, and exit
+2, a rejected document you are about to fix and resubmit, which is still the run in flight. If
+`start` cannot take the guard at all it exits 2 too, rather than run unguarded, also as
+`START REFUSED`. A run that died before `finish` is forgotten after those two hours, so a dead run
+costs the stream at most the ticks that fall inside them; releasing it sooner is an operator's action
+from outside the session.
 
 **Each run reports on itself. Your own answer is a roll-up, not a copy.** When triggering cron jobs, answer with one line per
 stream — the stream, and that it is queued for the next tick (or that the on-demand trigger is unavailable). The reports arrive through each run's
@@ -161,9 +186,9 @@ branch. It prints exactly one JSON line:
   "pending_remediation_requests": ["netpol-missing-payments"],
   "carried": [
     {
-      "id": "cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding",
+      "id": "cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding",
       "check": "cluster-admin-binding",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "namespace": "",
       "object": "ClusterRoleBinding/debug-binding",
       "title": "ClusterRoleBinding debug-binding grants cluster-admin to a non-system subject"
@@ -330,7 +355,15 @@ A stream with a collector runs it before Step 2's inspection, not after: the SOP
 and the path to write its manifest to, the manifest's `commands` are that cluster's `checks_run`
 and its `candidates` are the findings the collector vouches for, and Step 3 passes the same file as
 `--manifest-file`. Today that is the drift stream — `governance/fleet_consistency_drift_sop.md` §4
-says how to read its manifest and what is still yours to write.
+says how to read its manifest and what is still yours to write — the upgrade and patch readiness
+stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
+streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
+(`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
+§3).
+The compliance collector may also give a cluster `checks_unevaluated`, `{check, reason}` for a check
+whose own read failed: it did not run and is not inapplicable, so it goes in neither `checks_run`
+nor `checks_not_applicable` but in that cluster's `limitations`, which keeps the run partial and
+leaves open every finding that check filed there. `finish` rejects the slug anywhere else.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
@@ -352,7 +385,7 @@ absent on every other run:
   — the existing ledger was rewritten.
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
-- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"]}`
+- `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.acme-prod-us-east1-prod-us-east._.clusterrolebinding-debug-binding"]}`
   — zero findings, but the ledger was **not** closed: it carried findings whose checks this run's own
   `checks_run` says ran again, and the document neither reports nor explains them. Not a clean
   result; report it as [The clean run](#the-clean-run) says.
@@ -374,7 +407,9 @@ this run's `start` opened reaches exit 2 too: the collector writes to a fixed pa
 scrubbed between runs, so a run whose collector never ran finds the previous one's manifest sitting
 there, and cross-checking against a week-old reading of the fleet is worse than cross-checking
 against nothing. Re-run the collector. Exit 1 is fatal and means
-something else broke.
+something else broke. One exit 2 is not a document to fix: a `START REFUSED` line from `start` means
+the stream's in-flight guard held (see "Running a stream on demand"); there is nothing to edit and
+nothing to re-run until that run's `finish`.
 
 ### Partial coverage
 
@@ -420,7 +455,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
   "scope": {
     "clusters": [
       {
-        "name": "prod-us-east",
+        "name": "acme-prod/us-east1/prod-us-east",
         "location": "us-east1",
         "project": "acme-prod",
         "checks_run": [
@@ -439,7 +474,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
         ]
       },
       {
-        "name": "prod-autopilot",
+        "name": "acme-prod/us-central1/prod-autopilot",
         "location": "us-central1",
         "project": "acme-prod",
         "checks_run": [
@@ -454,12 +489,16 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
         ],
         "checks_not_applicable": [
           {
-            "check": "legacy-metadata",
-            "reason": "GKE Autopilot: no user-managed node pools to carry a metadata setting."
+            "check": "privileged-container",
+            "reason": "GKE Autopilot: admission rejects privileged: true and the SYS_ADMIN capability for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one."
+          },
+          {
+            "check": "host-namespace",
+            "reason": "GKE Autopilot: admission rejects hostPID/hostIPC/hostNetwork for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one."
           },
           {
             "check": "hostpath-mount",
-            "reason": "GKE Autopilot: hostPath volumes are rejected by the admission webhook."
+            "reason": "GKE Autopilot: admission rejects write-mode hostPath for in-scope workloads and allows read access under /var/log alone, and this cluster carries no WorkloadAllowlist that would exempt one."
           }
         ],
         "limitations": "RBAC denied `list clusterrolebindings`; check 2.4 did not run."
@@ -472,7 +511,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
       "id": "netpol-missing-payments",
       "severity": "critical",
       "title": "payments namespace has no NetworkPolicy",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "namespace": "payments",
       "object": "Namespace/payments",
       "evidence": {
@@ -495,7 +534,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
   "declared": [
     {
       "check": "no-hpa",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "namespace": "payments",
       "object": "Deployment/api",
       "title": "api is pinned at three replicas by Terraform",
@@ -547,7 +586,7 @@ field, and publishes nothing:
   - **`check`** — the same slugs `checks_run` uses. An unknown slug, a duplicate, or a slug that
     also appears in this cluster's `checks_run` is rejected: a check either ran or could not.
   - **`reason`** — why the check _cannot_ apply here, naming the property of the cluster that rules
-    it out ("GKE Autopilot: no user-managed node pools to carry a metadata setting"). Anything
+    it out ("GKE Autopilot: admission rejects privileged: true for in-scope workloads, and this cluster carries no WorkloadAllowlist that would exempt one"). Anything
     under sixteen characters is rejected, which is enough to stop "N/A" and "n/a — autopilot".
 
   These checks leave the coverage denominator instead of counting as missing, so a cluster that ran
@@ -566,7 +605,7 @@ field, and publishes nothing:
   "resolved_because": [
     {
       "check": "cluster-admin-binding",
-      "cluster": "prod-us-east",
+      "cluster": "acme-prod/us-east1/prod-us-east",
       "object": "ClusterRoleBinding/debug-binding",
       "reason": "kubectl get clusterrolebinding debug-binding returned NotFound; the binding was deleted on 2026-09-16."
     }
@@ -657,7 +696,11 @@ field, and publishes nothing:
 Nothing goes in both, and nothing in `scope.skipped` may appear in a finding. The validator enforces
 both halves. This matters because the alternative produces **false all-clears**: put an Autopilot
 cluster in `scope.skipped` because one node-level check cannot apply there, and every real finding
-on a cluster you did audit gets suppressed along with it.
+on a cluster you did audit gets suppressed along with it. It also refuses a finding whose `cluster`
+is the bare name of a `scope.clusters` entry spelled `<project>/<location>/<name>` (`prod` beside
+`acme/us-east1/prod`, or beside two such entries): the cluster is part of the finding's id, so the
+bare spelling files a second copy of the finding. Any other `cluster` outside `scope.clusters`,
+such as a `project/<id>` target, is not checked against it.
 
 `limitations` is optional, and non-empty when present. The rendered scope table grows a
 `limitations` column only when at least one cluster carries one.

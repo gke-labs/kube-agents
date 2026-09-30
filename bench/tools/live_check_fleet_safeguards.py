@@ -13,7 +13,7 @@ re-implementing what it does, because a mirror of the verifier's logic
 validates the mirror.
 
 Usage:
-    hack/fleet-kubeconfigs.sh                       # writes <role>.kubeconfig
+    FLEET_ALLOW_RUNNER_CREDENTIAL=1 hack/fleet-kubeconfigs.sh   # writes <role>.kubeconfig on your own credential
     export BENCH_FLEET_KUBECONFIG_DIR=<that dir>
     cd bench
     uv run python tools/live_check_fleet_safeguards.py [task.yaml ...]

@@ -100,6 +100,25 @@ class ResolveRcTargetTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), self.shas[_NEWEST_RC])
         self.assertIn(_NEWEST_RC, result.stderr)
 
+    def test_a_newer_candidate_on_a_release_line_is_not_the_default(self):
+        """The eval grades main's candidates; a line's rc_ tag must not answer for them.
+
+        rc_ tags share one namespace and sort by timestamp, so the first one cut
+        on `release/<X.Y>` would otherwise be the newest of all and the eval fired
+        by main's evalcand_ tag would measure the line commit instead.
+        """
+        self.git("switch", "-c", "release/0.2")
+        (pathlib.Path(self.repo) / "backport.txt").write_text("fix")
+        self.git("add", "-A")
+        self.git("commit", "-m", "fix: backport")
+        line_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("tag", "rc_2612311200_" + line_sha[:7])
+        self.git("switch", "main")
+
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), self.shas[_NEWEST_RC])
+
     def test_a_marker_is_reported_and_does_not_change_the_target(self):
         """The `_validated` marker sits beside the candidate tag on the same
         commit, so the filter that drops markers from the candidate list must

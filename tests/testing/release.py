@@ -43,6 +43,8 @@ MOCK_OLDER_STAGING_TAG = "staging_2608310217_9f8e7d6"
 MOCK_HANDMADE_STAGING_TAG = "staging_hotfix"
 MOCK_TARGET_RELEASE_VERSION = "0.2.0"
 MOCK_TARGET_RELEASE_TAG = "0.2.0"
+MOCK_TARGET_RELEASE_LINE = "0.2"
+MOCK_LINE_PATCH_RELEASE_TAG = "0.2.1"
 MOCK_EXPLICIT_RELEASE_VERSION_NEXT = "0.3.0"
 MOCK_RELEASE_BUNDLE_VERSION = "0.3.0"
 MOCK_RELEASE_BUNDLE_TAG = "0.3.0"
@@ -172,6 +174,8 @@ def create_mock_ghcr_curl_binary(
     log_file=None,
     manifest_status=0,
     token_response=MOCK_GHCR_TOKEN_RESPONSE,
+    manifest_http_status=None,
+    token_exit=0,
 ):
     """Creates a mock curl answering common.sh's anonymous GHCR probe.
 
@@ -181,7 +185,16 @@ def create_mock_ghcr_curl_binary(
     request that omits those media types. A mock that answered any argument
     list would leave that header untested — deleting it from common.sh is a
     change that breaks every real probe and no fake one.
+
+    `manifest_status` is the exit code of the boolean probe's `curl -f` call
+    (1 for a missing image). `ghcr_image_status` asks with `-w '%{http_code}'`
+    instead; that call prints `manifest_http_status` (defaulting to 200 when
+    `manifest_status` is 0 and 404 otherwise) and exits 0, and `token_exit`
+    makes the token call fail, which is how a registry that cannot be asked is
+    staged.
     """
+    if manifest_http_status is None:
+        manifest_http_status = 200 if manifest_status == 0 else 404
     bin_path = pathlib.Path(bin_dir)
     bin_path.mkdir(parents=True, exist_ok=True)
     curl_path = bin_path / "curl"
@@ -191,7 +204,9 @@ def create_mock_ghcr_curl_binary(
         f"""#!/bin/sh
 echo "mock curl: $*" >> "{log_path}"
 case "$*" in
-  *'/token?scope=repository:'*':pull'*) printf '%s' '{token_response}'; exit 0 ;;
+  *'/token?scope=repository:'*':pull'*)
+    if [ {token_exit} -ne 0 ]; then exit {token_exit}; fi
+    printf '%s' '{token_response}'; exit 0 ;;
 esac
 for required in '/v2/' '/manifests/' 'Authorization: Bearer ' \\
   'Accept: application/vnd.oci.image.index.v1+json'; do
@@ -203,6 +218,9 @@ for required in '/v2/' '/manifests/' 'Authorization: Bearer ' \\
       ;;
   esac
 done
+case "$*" in
+  *'%{{http_code}}'*) printf '%s' '{manifest_http_status}'; exit 0 ;;
+esac
 exit {manifest_status}
 """
     )

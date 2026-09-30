@@ -63,6 +63,16 @@ import credential_proxy  # noqa: E402
 # the two copies never shadow each other inside one interpreter.
 GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
 
+# The published site's content tree. A directory rather than a file, so it is
+# not a Source: D2's assertion is about every page, and a registry would need
+# editing for each page added. site_pages() below answers for the empty set
+# instead, and one page under it is registered so the self-check names the
+# tree the day it moves.
+SITE_CONTENT_DIR = "docs/site/src/content/docs"
+# .mdx too: the site's index, the GKE quickstart and four section indexes are
+# MDX, and an escape hatch documented there is documented.
+SITE_PAGE_SUFFIXES = (".md", ".mdx")
+
 
 @dataclass(frozen=True)
 class Source:
@@ -368,7 +378,26 @@ SOURCES: dict[str, Source] = {
             'A2ABusTokenAudience = "',
             "func A2ACredentialSecretNames(",
             "func BusCredentialRoutes(",
+            # D2 reads the same file for the read-only switch: the env
+            # denylist it cuts out before scanning, the switch's own entry in
+            # it, and the struct a CRD-level boolean would be declared in.
+            # The declaration and the map key rather than the bare name,
+            # which two doc comments also spell -- so a guard keyed on the
+            # name alone was answered by prose after the block was deleted.
+            # The key up to its colon and no further: gofmt pads between the
+            # colon and the value to align a run of entries, so the spacing
+            # after it belongs to whichever neighbour is longest.
+            "var SensitiveEnvVars = map[string]struct{}{",
+            '"CREDENTIAL_PROXY_ENFORCE_READ_ONLY":',
+            "type SecuritySpec struct {",
         ),
+    ),
+    # The CRD's root type, D2's third surface. A field offered on
+    # PlatformAgentSpec itself rather than on one of the embedded specs lands
+    # here and nowhere in common_types.go.
+    "operator_platformagent_api": Source(
+        "k8s-operator/api/v1alpha1/platformagent_types.go",
+        ("type PlatformAgentSpec struct {", "type PlatformAgent struct {"),
     ),
     "a2a_bus_credentials": Source(
         "a2a/lib/credentials.go",
@@ -384,7 +413,14 @@ SOURCES: dict[str, Source] = {
         ("UPSTREAM_REPO", "--depth"),
     ),
     "tags_env": Source("tags.env", ("HERMES_AGENT_TAG",)),
-    "chart_values": Source("charts/kube-agents/values.yaml", ("repository:",)),
+    # `repository:` is C4's read. The platformAgent block is D2's: it is
+    # where a chart value for the read-only switch would be offered, and the
+    # block moving to a sub-chart left the file present, the switch absent
+    # and the test green.
+    "chart_values": Source(
+        "charts/kube-agents/values.yaml",
+        ("repository:", "\nplatformAgent:\n"),
+    ),
     # --- the write plane --------------------------------------------------
     "codeowners_example": Source(
         "examples/gitops-repo/CODEOWNERS.example",
@@ -393,6 +429,14 @@ SOURCES: dict[str, Source] = {
     "autopush_agent_workflow": Source(
         ".github/workflows/autopush-deploy.yml",
         ("workflow_run", "head_branch"),
+    ),
+    # --- the published site ----------------------------------------------
+    # The page AGENTS.md names as the home of what the agent may and may not
+    # do. D2 requires it to be among the pages site_pages() finds, which is
+    # what ties an unregistered directory walk to a registered file.
+    "site_security_reference": Source(
+        f"{SITE_CONTENT_DIR}/reference/security-and-iam.md",
+        ("## What the agent can and cannot do",),
     ),
 }
 
@@ -431,6 +475,25 @@ def text(name: str) -> str:
     if not content.strip():
         raise ValueError(f"registered conformance source is empty: {path}")
     return content
+
+
+def site_pages() -> list[Path]:
+    """Every page of the published site, which is never legitimately empty.
+
+    Raises rather than returning [] for the reason text() does: an assertion
+    that no page names something is true of no pages. D2 walked this tree
+    behind an `if docs.is_dir():` with no else, so a restructure would have
+    skipped the customer-facing half of the assertion without a word.
+    """
+    root = REPO_ROOT / SITE_CONTENT_DIR
+    if not root.is_dir():
+        raise AssertionError(f"the site content tree is missing: {root}")
+    pages = sorted(
+        page for suffix in SITE_PAGE_SUFFIXES for page in root.rglob(f"*{suffix}")
+    )
+    if not pages:
+        raise AssertionError(f"no {SITE_PAGE_SUFFIXES} page under {root}; the site is empty")
+    return pages
 
 
 _HELM_DIRECTIVE = re.compile(r"^\s*\{\{-?.*-?\}\}\s*$")

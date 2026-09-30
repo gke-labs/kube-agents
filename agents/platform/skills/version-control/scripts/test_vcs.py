@@ -42,6 +42,7 @@ sys.path.insert(
 )
 
 import vcs  # noqa: E402
+import vcs_client  # noqa: E402
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "Test",
@@ -170,7 +171,7 @@ class VcsTestCase(unittest.TestCase):
             ("LOCAL_GIT", REAL_GIT),
             ("call", self.broker),
         ):
-            patch = mock.patch.object(vcs, attribute, value)
+            patch = mock.patch.object(vcs_client, attribute, value)
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -186,7 +187,7 @@ class VcsTestCase(unittest.TestCase):
         return answer
 
     def tree(self) -> Path:
-        return Path(vcs.all_sessions()[0]["path"])
+        return Path(vcs_client.all_sessions()[0]["path"])
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,46 @@ class CloneTest(VcsTestCase):
         self.assertEqual(answer["remotes"], [])
         self.assertEqual(git(Path(answer["path"]), "remote").stdout.strip(), "")
 
+    def test_the_agent_can_commit_in_the_copy_with_no_identity_of_its_own(self):
+        """SKILL Step 2 has the agent run the sandbox git directly, not this module.
+
+        That git reads no global or system config -- the image has neither --
+        and `local_git` passes `user.name` and `user.email` as `-c` flags,
+        which covers only what this module itself runs. So the pair is written
+        into the copy at clone time, and this runs git the way the agent's
+        shell does: no `GIT_AUTHOR_*`, no config files.
+
+        The defect wears two faces and this is red for both. Without the
+        repository-local pair, git falls back to the account: on a developer
+        machine that succeeds and records somebody's personal name on an
+        automation's commit, and on the sandbox image it does not succeed at
+        all -- `useradd --create-home ... --uid 1000 agent` passes no
+        `--comment`, so the GECOS is empty and git refuses with "empty ident
+        name" after the "Please tell me who you are" hint. The Dockerfile's own
+        commit guard passes `-c user.name=g -c user.email=g@x` for that reason.
+        Asserting on the author covers both; asserting on the exit code would
+        pass on the machine this suite usually runs on.
+        """
+        answer = self.clone()
+        tree = Path(answer["path"])
+        (tree / "inventory/clusters.yaml").write_text("replicas: 4\n")
+        bare = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(self.root / "no-home"),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+        for verb in (("add", "inventory/clusters.yaml"), ("commit", "-m", "by hand")):
+            done = subprocess.run(
+                [REAL_GIT, *verb], cwd=str(tree), capture_output=True, text=True, env=bare
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+        who = subprocess.run(
+            [REAL_GIT, "log", "-1", "--format=%an <%ae>"],
+            cwd=str(tree), capture_output=True, text=True, env=bare,
+        )
+        self.assertEqual(who.stdout.strip(), f"{vcs_client.AUTHOR_NAME} <{vcs_client.AUTHOR_EMAIL}>")
+
     def test_the_executable_bit_survives_the_bundle(self):
         answer = self.clone()
         self.assertTrue(os.access(Path(answer["path"]) / "rotate-keys.sh", os.X_OK))
@@ -222,7 +263,7 @@ class CloneTest(VcsTestCase):
         first = self.clone()
         second = self.clone()
         self.assertEqual(first["path"], second["path"])
-        self.assertEqual(len(vcs.all_sessions()), 1)
+        self.assertEqual(len(vcs_client.all_sessions()), 1)
 
     def test_a_second_clone_refuses_to_discard_work(self):
         # It used to replace the tree silently, so a commit made here and never
@@ -241,7 +282,7 @@ class CloneTest(VcsTestCase):
         second = self.clone("--force")
         self.assertEqual(first["path"], second["path"])
         self.assertFalse((Path(second["path"]) / "stale.txt").exists())
-        self.assertEqual(len(vcs.all_sessions()), 1)
+        self.assertEqual(len(vcs_client.all_sessions()), 1)
 
     def test_the_bundle_file_is_not_left_behind(self):
         self.clone()
@@ -263,7 +304,7 @@ class CloneTest(VcsTestCase):
 
     def test_the_base_revision_is_what_the_broker_handed_out(self):
         self.clone()
-        self.assertEqual(vcs.all_sessions()[0]["baseRevision"], self.origin_head)
+        self.assertEqual(vcs_client.all_sessions()[0]["baseRevision"], self.origin_head)
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +451,28 @@ class WriteTest(VcsTestCase):
         self.assertEqual(code, 1)
         self.assertIn("nothing to record", answer["error"])
 
+    def test_commit_with_no_paths_refuses_rather_than_sweeping_an_untracked_file(self):
+        """`add --all` is what the skill forbids the agent to type by hand.
+
+        The working copy is also where scratch output lands, so the untracked
+        file is as likely to be a log as a manifest. Refusing names it; the
+        alternatives are publishing it or dropping it, both silently.
+        """
+        self.change("inventory/clusters.yaml", "replicas: 9\n")
+        self.change("debug.log", "noise\n")
+        code, answer = self.run_vcs("commit", "-m", "everything")
+        self.assertEqual(code, 1)
+        self.assertIn("debug.log", answer["error"])
+
+    def test_commit_with_no_paths_records_tracked_changes_including_deletions(self):
+        self.change("inventory/clusters.yaml", "replicas: 9\n")
+        (self.tree() / "README.md").unlink()
+        code, answer = self.run_vcs("commit", "-m", "tracked only")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(
+            sorted(answer["files"]), ["README.md", "inventory/clusters.yaml"]
+        )
+
     def test_commit_takes_named_paths_only(self):
         self.change("inventory/clusters.yaml", "replicas: 9\n")
         self.change("untouched.txt", "leave me\n")
@@ -447,6 +510,27 @@ class WriteTest(VcsTestCase):
         self.assertIn("cloned from", answer["error"])
         self.assertNotIn("publish", [name for name, _ in self.broker.calls])
 
+    def test_publish_advance_is_the_one_way_onto_the_cloned_branch(self):
+        """The flag has to reach `client.publish`, or the refusal above is a wall.
+
+        A copy taken *of* a proposal branch in order to add to it is the one
+        reason to publish the branch it came down on, and `--advance` is the
+        whole of how a caller says so. Accepted by the parser and dropped on
+        the way through, the second round of every review is refused with
+        advice that does not work.
+        """
+        self.change("inventory/clusters.yaml", "replicas: 5\n")
+        self.run_vcs("commit", "-m", "another round on the proposal branch")
+        code, answer = self.run_vcs("publish", "--target", "release", "--advance")
+        self.assertEqual(code, 0, answer)
+        payload = self.broker.payload("publish")
+        self.assertTrue(payload["advance"])
+        self.assertEqual((payload["branch"], payload["target"]), ("main", "release"))
+        # Absent, it is false rather than missing: the broker reads it either way.
+        self.assertFalse(
+            vcs.build_parser().parse_args(["publish", "--target", "release"]).advance
+        )
+
     def test_publish_tells_the_broker_which_branch_the_copy_was_cloned_from(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("inventory/clusters.yaml", "replicas: 5\n")
@@ -458,12 +542,12 @@ class WriteTest(VcsTestCase):
     def test_publish_advances_the_base_so_a_second_one_sends_only_the_rest(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("a.txt", "a\n")
-        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("commit", "a.txt", "-m", "a")
         self.run_vcs("publish")
-        first_base = vcs.all_sessions()[0]["published"]["fix/replicas"]
+        first_base = vcs_client.all_sessions()[0]["published"]["fix/replicas"]
         self.assertNotEqual(first_base, self.origin_head)
         self.change("b.txt", "b\n")
-        self.run_vcs("commit", "-m", "b")
+        self.run_vcs("commit", "b.txt", "-m", "b")
         code, answer = self.run_vcs("publish")
         self.assertEqual(code, 0)
         self.assertEqual(answer["revisions"], 1)
@@ -476,13 +560,13 @@ class WriteTest(VcsTestCase):
         # check reads as a rewritten target and refuses.
         self.run_vcs("branch", "fix/one")
         self.change("a.txt", "a\n")
-        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("commit", "a.txt", "-m", "a")
         self.run_vcs("publish")
-        first_tip = vcs.all_sessions()[0]["published"]["fix/one"]
+        first_tip = vcs_client.all_sessions()[0]["published"]["fix/one"]
 
         self.run_vcs("branch", "fix/two")
         self.change("b.txt", "b\n")
-        self.run_vcs("commit", "-m", "b")
+        self.run_vcs("commit", "b.txt", "-m", "b")
         code, answer = self.run_vcs("publish")
         self.assertEqual(code, 0, answer)
         payload = self.broker.payload("publish")
@@ -490,7 +574,7 @@ class WriteTest(VcsTestCase):
         self.assertEqual(payload["baseRevision"], self.origin_head)
         self.assertNotEqual(payload["baseRevision"], first_tip)
         # And the first branch keeps its own answer.
-        self.assertEqual(vcs.all_sessions()[0]["published"]["fix/one"], first_tip)
+        self.assertEqual(vcs_client.all_sessions()[0]["published"]["fix/one"], first_tip)
 
     def test_publish_refuses_when_there_is_nothing_new(self):
         code, answer = self.run_vcs("publish")
@@ -501,14 +585,14 @@ class WriteTest(VcsTestCase):
     def test_publish_leaves_no_bundle_behind_even_when_the_broker_refuses(self):
         self.run_vcs("branch", "fix/replicas")
         self.change("a.txt", "a\n")
-        self.run_vcs("commit", "-m", "a")
+        self.run_vcs("commit", "a.txt", "-m", "a")
         self.broker.fail["publish"] = "main has moved on the remote"
         code, answer = self.run_vcs("publish")
         self.assertEqual(code, 1)
         self.assertIn("moved on", answer["error"])
         self.assertEqual([p.name for p in self.root.glob("*.bundle")], [])
         # And the base is not advanced by a publish that did not happen.
-        self.assertEqual(vcs.all_sessions()[0]["baseRevision"], self.origin_head)
+        self.assertEqual(vcs_client.all_sessions()[0]["baseRevision"], self.origin_head)
 
     def test_discard_removes_the_copy_and_its_session(self):
         path = self.tree()
@@ -516,9 +600,34 @@ class WriteTest(VcsTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(answer["removed"], str(path))
         self.assertFalse(path.exists())
-        self.assertEqual(vcs.all_sessions(), [])
+        self.assertEqual(vcs_client.all_sessions(), [])
         # Nothing is released on the credential side because nothing was held.
         self.assertEqual(self.broker.calls, [])
+
+    def test_discard_names_which_copy_when_the_repository_is_cloned_twice(self):
+        """`--branch` is the only way to say it, and a discarded copy cannot be stood in.
+
+        The read verbs can be run from inside the copy they are about. This one
+        removes the directory, so the caller is standing somewhere else by
+        definition -- and with two copies of one repository and no name, there
+        is nothing to resolve on.
+        """
+        git(self.origin, "branch", "release", "main")
+        first = self.clone("--branch", "main")
+        second = self.clone("--branch", "release")
+        self.assertNotEqual(first["path"], second["path"])
+
+        code, answer = self.run_vcs("discard")
+        self.assertEqual(code, 1)
+        self.assertIn("several working copies are here", answer["error"])
+
+        code, answer = self.run_vcs("discard", "--branch", "release")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(answer["removed"], second["path"])
+        self.assertFalse(Path(second["path"]).exists())
+        # And only that one.
+        self.assertTrue(Path(first["path"]).exists())
+        self.assertEqual([s["branch"] for s in vcs_client.all_sessions()], ["main"])
 
 
 # ---------------------------------------------------------------------------
@@ -552,9 +661,9 @@ class SessionTest(VcsTestCase):
 
     def test_two_copies_and_no_repo_asks_which(self):
         self.clone()
-        second = dict(vcs.all_sessions()[0])
+        second = dict(vcs_client.all_sessions()[0])
         second.update({"repo": "acme/other", "spec": "acme/other"})
-        vcs.save_session(second)
+        vcs_client.save_session(second)
         code, answer = self.run_vcs("log")
         self.assertEqual(code, 1)
         self.assertIn("--repo", answer["error"])
@@ -621,6 +730,49 @@ class CollaborationTest(VcsTestCase):
         self.assertTrue(payload["diff"])
         self.assertEqual(payload["limit"], 5)
 
+    def test_the_two_listings_read_to_the_end_take_a_page(self):
+        code, _ = self.run_vcs("proposal", "list", "--page", "2")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("proposal-list")["page"], 2)
+        code, _ = self.run_vcs("proposal", "commits", "7", "--page", "3")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-commits")
+        self.assertEqual((payload["number"], payload["page"]), (7, 3))
+        # Absent, it is not sent as a null: the first page is the default.
+        code, _ = self.run_vcs("proposal", "commits", "7")
+        self.assertEqual(code, 0)
+        self.assertNotIn("page", self.broker.payload("proposal-commits"))
+
+    def test_proposal_list_can_ask_about_one_branch(self):
+        """`--source`/`--target` reached the parser and not the payload once.
+
+        The broker filters at the forge, so a flag the command line accepts
+        and drops is a listing of every open proposal presented as the answer
+        about one branch -- which `submit-suggestion` reads to decide whether
+        a second round has somewhere to go.
+        """
+        code, _ = self.run_vcs(
+            "proposal", "list", "--source", "fix/replicas", "--target", "release"
+        )
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-list")
+        self.assertEqual((payload["source"], payload["target"]), ("fix/replicas", "release"))
+        # Absent, neither is sent: an unfiltered listing is the default.
+        code, _ = self.run_vcs("proposal", "list")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-list")
+        self.assertNotIn("source", payload)
+        self.assertNotIn("target", payload)
+
+    def test_identity_says_when_the_login_is_an_automations(self):
+        code, _ = self.run_vcs("identity", "--login", "renovate", "--bot")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("identity")
+        self.assertEqual((payload["login"], payload["bot"]), ("renovate", True))
+        code, _ = self.run_vcs("identity", "--login", "renovate")
+        self.assertEqual(code, 0)
+        self.assertNotIn("bot", self.broker.payload("identity"))
+
     def test_issue_list_carries_state_and_labels(self):
         code, _ = self.run_vcs(
             "issue", "list", "--state", "closed", "--labels", "bug", "p1"
@@ -630,6 +782,16 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(payload["state"], "closed")
         self.assertEqual(payload["labels"], ["bug", "p1"])
 
+    def test_issue_list_carries_the_labels_to_skip(self):
+        code, _ = self.run_vcs(
+            "issue", "list", "--without-labels", "status:in-progress", "agent:ignore"
+        )
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("issue-list")
+        self.assertEqual(
+            payload["excludeLabels"], ["status:in-progress", "agent:ignore"]
+        )
+
     def test_issue_create_and_comment(self):
         code, _ = self.run_vcs("issue", "create", "--title", "Drift", "--body", "why")
         self.assertEqual(code, 0)
@@ -637,6 +799,30 @@ class CollaborationTest(VcsTestCase):
         code, _ = self.run_vcs("issue", "comment", "12", "--body", "fixed by #13")
         self.assertEqual(code, 0)
         self.assertEqual(self.broker.payload("issue-comment")["number"], 12)
+
+    def test_the_migration_verbs_reach_the_broker_with_their_payloads(self):
+        code, _ = self.run_vcs("proposal", "update", "7", "--title", "t2", "--add-label", "a", "--remove-label", "b")
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("proposal-update")
+        self.assertEqual((payload["number"], payload["title"], payload["labelsAdd"], payload["labelsRemove"]), (7, "t2", ["a"], ["b"]))
+        self.assertNotIn("body", payload)
+        code, _ = self.run_vcs("proposal", "close", "7")
+        self.assertEqual(self.broker.payload("proposal-close")["number"], 7)
+        code, _ = self.run_vcs("proposal", "commits", "7", "-n", "3")
+        self.assertEqual(self.broker.payload("proposal-commits")["limit"], 3)
+        code, _ = self.run_vcs("proposal", "ack", "7", "--comment-id", "55", "--kind", "review_comment")
+        self.assertEqual(self.broker.payload("proposal-acknowledge")["comment"], {"id": 55, "kind": "review_comment"})
+        code, _ = self.run_vcs("issue", "edit", "12", "--body", "more")
+        self.assertEqual(self.broker.payload("issue-update")["body"], "more")
+        code, _ = self.run_vcs("issue", "close", "12", "--reason", "not-planned")
+        self.assertEqual(self.broker.payload("issue-close")["reason"], "not-planned")
+        code, _ = self.run_vcs("issue", "list", "--query", "drift")
+        self.assertEqual(self.broker.payload("issue-list")["query"], "drift")
+        code, _ = self.run_vcs("label", "ensure", "status:in-progress", "--color", "fbca04")
+        self.assertEqual(self.broker.payload("label-ensure")["name"], "status:in-progress")
+        code, _ = self.run_vcs("whoami", "--login", "someone")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("identity")["login"], "someone")
 
     def test_the_repository_is_the_only_thing_resolved_locally(self):
         # Which forge this is, what it calls a proposal, and how to reach its
@@ -670,39 +856,73 @@ class BrokerCallTest(unittest.TestCase):
     def test_without_an_endpoint_the_error_says_where_this_runs(self):
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("shell sandbox", str(caught.exception))
 
     def test_a_broker_without_the_routes_is_named_as_an_old_image(self):
+        # The shape an old credential-proxy actually answers with: a 404 with
+        # no code of its own, either from the route lookup or from the generic
+        # handler on an image older than the `/v1/vcs/` namespace. This test
+        # asserted the `VCS_UNAVAILABLE` arm instead, which `build_vcs_broker`
+        # says a running broker never takes -- so the message it pinned
+        # ("older than this skill") described a path the code did not reach,
+        # and the skew it was written for was reported as `BROKER_UNREACHABLE`.
+        #
         # There is no switch, so the refusal must not read like one. "Turned
         # off" would send whoever hit it looking for a configuration field that
         # does not exist.
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client,
+            vcs_client.credential_proxy_client,
             "vcs_call",
-            side_effect=vcs.credential_proxy_client.WorkspaceUnavailable(
+            side_effect=vcs_client.credential_proxy_client.WorkspaceRequestError(
+                404, {"status": "not_found"}
+            ),
+        ):
+            with self.assertRaises(vcs.VcsError) as caught:
+                vcs_client.call("clone", {})
+        self.assertIn("older than this skill", str(caught.exception))
+        self.assertNotIn("turned off", str(caught.exception))
+        # Coded, because every consumer reports a codeless refusal as
+        # `BROKER_UNREACHABLE` -- and this broker answered.
+        self.assertEqual(caught.exception.code, "BROKER_ROUTE_UNSUPPORTED")
+
+    def test_version_control_unbuilt_says_to_report_it_rather_than_roll(self):
+        """`VCS_UNAVAILABLE` keeps an arm, and stops claiming to be the skew.
+
+        `build_vcs_broker` is "Always built; there is no switch", so a broker
+        serving requests cannot send this. It is still not a broker that is
+        down, so it keeps the code -- but telling an operator to roll an image
+        forward would send them after a version skew that is not what happened.
+        """
+        with mock.patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
+        ), mock.patch.object(
+            vcs_client.credential_proxy_client,
+            "vcs_call",
+            side_effect=vcs_client.credential_proxy_client.WorkspaceUnavailable(
                 "VCS_UNAVAILABLE"
             ),
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
-        self.assertIn("older than this skill", str(caught.exception))
-        self.assertNotIn("turned off", str(caught.exception))
+                vcs_client.call("clone", {})
+        self.assertEqual(caught.exception.code, "BROKER_ROUTE_UNSUPPORTED")
+        self.assertIn("report it", str(caught.exception))
+        self.assertNotIn("older than this skill", str(caught.exception))
 
     def test_a_request_error_surfaces_the_broker_s_own_wording(self):
-        error = vcs.credential_proxy_client.WorkspaceRequestError(
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "publish failed",
             payload={"error": "fix/x has diverged", "code": "BRANCH_DIVERGED", "detail": "at 1234abcd"},
         )
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("publish", {})
+                vcs_client.call("publish", {})
         self.assertEqual(str(caught.exception), "fix/x has diverged")
         # Review finding: the code and detail SKILL.md tells the agent to act on
         # were stripped here. They travel, and main() prints them.
@@ -713,16 +933,16 @@ class BrokerCallTest(unittest.TestCase):
         )
 
     def test_main_prints_the_refusal_code_when_the_broker_sent_one(self):
-        error = vcs.credential_proxy_client.WorkspaceRequestError(
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "refused", payload={"error": "main is the remote's default branch.", "code": "PROTECTED_BRANCH"}
         )
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            vcs, "ROOT", Path(tmp)
+            vcs_client, "ROOT", Path(tmp)
         ), mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ), redirect_stdout(out):
             code = vcs.main(["capabilities", "acme/infra"])
         self.assertEqual(code, 1)
@@ -737,31 +957,31 @@ class BrokerCallTest(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("could not be reached", str(caught.exception))
 
     def test_a_missing_token_is_a_json_error_not_a_traceback(self):
-        error = vcs.credential_proxy_client.TokenUnavailable("token file is empty")
+        error = vcs_client.credential_proxy_client.TokenUnavailable("token file is empty")
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=error
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("credential is not readable", str(caught.exception))
 
     def test_a_non_json_answer_is_a_json_error_not_a_traceback(self):
         with mock.patch.dict(
             os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8080"}
         ), mock.patch.object(
-            vcs.credential_proxy_client, "vcs_call", side_effect=ValueError("x")
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=ValueError("x")
         ):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.call("clone", {})
+                vcs_client.call("clone", {})
         self.assertIn("not JSON", str(caught.exception))
 
 class SkillTextTest(unittest.TestCase):
@@ -777,9 +997,9 @@ class SkillTextTest(unittest.TestCase):
 
 class LocalGitTest(VcsTestCase):
     def test_a_missing_local_git_names_the_fallback(self):
-        with mock.patch.object(vcs, "LOCAL_GIT", str(self.root / "no-such-git")):
+        with mock.patch.object(vcs_client, "LOCAL_GIT", str(self.root / "no-such-git")):
             with self.assertRaises(vcs.VcsError) as caught:
-                vcs.local_git(self.root, "status")
+                vcs_client.local_git(self.root, "status")
         self.assertIn("inspect-repository", str(caught.exception))
 
     def test_hooks_are_pointed_at_an_empty_directory(self):
@@ -794,13 +1014,18 @@ class LocalGitTest(VcsTestCase):
         (hooks / "post-commit").write_text(f"#!/bin/sh\ntouch {marker}\n")
         os.chmod(hooks / "post-commit", 0o755)
         (tree / "x.txt").write_text("x\n")
-        self.run_vcs("commit", "-m", "with a hook present")
+        # Named, and the exit code checked. `commit` with no paths refuses a
+        # working copy holding an untracked file, so the pathless form would
+        # never reach `git commit` here and the assertion below would hold
+        # whatever `core.hooksPath` said.
+        code, answer = self.run_vcs("commit", "x.txt", "-m", "with a hook present")
+        self.assertEqual(code, 0, answer)
         self.assertFalse(marker.exists())
 
     def test_the_copy_inherits_no_user_configuration(self):
         self.clone()
-        done = vcs.local_git(self.tree(), "config", "--get", "user.email")
-        self.assertEqual(done.stdout.strip(), vcs.AUTHOR_EMAIL)
+        done = vcs_client.local_git(self.tree(), "config", "--get", "user.email")
+        self.assertEqual(done.stdout.strip(), vcs_client.AUTHOR_EMAIL)
 
 
 # ---------------------------------------------------------------------------
@@ -817,18 +1042,25 @@ class AbstractionTest(unittest.TestCase):
     """
 
     source = Path(vcs.__file__).read_text()
+    client_source = Path(vcs_client.__file__).read_text()
 
     def test_no_forge_client_is_invoked(self):
         for binary in ("gh", "glab", "hub", "tea"):
             with self.subTest(binary=binary):
-                self.assertNotIn(f'"{binary}"', self.source)
-                self.assertNotIn(f"'{binary}'", self.source)
+                for source in (self.source, self.client_source):
+                    self.assertNotIn(f'"{binary}"', source)
+                    self.assertNotIn(f"'{binary}'", source)
 
     def test_no_forge_host_appears_outside_an_example(self):
         # `github.com` may appear in the help text as something a caller types.
         # It may not appear anywhere a URL is composed, which is what the
         # broker's allowlist decides.
-        body = self.source.split("# ---- the broker")[1]
+        # Both halves: the client after its module docstring (which names a
+        # host as something a caller types), and the front after its imports.
+        body = (
+            self.client_source.split("# ---- the broker")[1]
+            + self.source.split("import argparse", 1)[1]
+        )
         for line in body.splitlines():
             if FORGE_HOST_RE.search(line):
                 self.assertTrue(
@@ -837,19 +1069,44 @@ class AbstractionTest(unittest.TestCase):
                 )
 
     def test_the_only_network_client_is_the_broker(self):
+        # Both halves. The talking moved into `vcs_client`, so a check that
+        # read only the front would now be inspecting the file that no longer
+        # reaches anything.
         for module in ("requests", "urllib.request", "http.client", "socket"):
-            with self.subTest(module=module):
-                self.assertNotIn(f"import {module}", self.source)
+            for source in (self.source, self.client_source):
+                with self.subTest(module=module):
+                    self.assertNotIn(f"import {module}", source)
 
     def test_every_verb_the_broker_serves_has_a_command(self):
+        """Read off the broker's own route table rather than a list kept here.
+
+        The hand-kept list this replaces had gone stale in exactly the way a
+        hand-kept list does: `label-ensure` and `identity` were being served
+        and did have commands, and the test that says "every verb" said nothing
+        about either. Deriving the names means a verb added to the broker with
+        no command fails here on the day it is added.
+
+        `route_table` is built from a broker instance only to name its bound
+        methods, so a stand-in that answers every attribute is enough.
+        """
+        import vcs_broker  # local: the broker is the other side of the proxy
+
         parser = vcs.build_parser()
-        actions = [
-            action
-            for action in parser._subparsers._group_actions[0].choices  # noqa: SLF001
-        ]
+        commands = parser._subparsers._group_actions[0].choices  # noqa: SLF001
+        for verb in vcs_broker.route_table(mock.Mock()):
+            # `proposal-create` is `proposal create`: the hyphen is the space.
+            command, _, action = verb.partition("-")
+            with self.subTest(verb=verb):
+                self.assertIn(command, commands)
+                if not action:
+                    continue
+                under = commands[command]._subparsers  # noqa: SLF001
+                self.assertIsNotNone(under, f"`{command}` takes no action")
+                self.assertIn(action, under._group_actions[0].choices)  # noqa: SLF001
+
+        # And the local verbs, which no broker route covers because they never
+        # leave the container.
         for verb in (
-            "capabilities",
-            "clone",
             "log",
             "show",
             "diff",
@@ -859,13 +1116,10 @@ class AbstractionTest(unittest.TestCase):
             "status",
             "branch",
             "commit",
-            "publish",
             "discard",
-            "proposal",
-            "issue",
         ):
             with self.subTest(verb=verb):
-                self.assertIn(verb, actions)
+                self.assertIn(verb, commands)
 
     def test_the_familiar_spelling_is_an_alias_of_the_concept(self):
         parser = vcs.build_parser()
@@ -890,6 +1144,9 @@ class AbstractionTest(unittest.TestCase):
             with self.subTest(alias=f"{family} open"):
                 self.assertIn("open", actions)
                 self.assertIs(actions["open"], actions["create"])
+            with self.subTest(alias=f"{family} edit"):
+                self.assertIs(actions["edit"], actions["update"])
+        self.assertIs(choices["whoami"], choices["identity"])
 
 
 if __name__ == "__main__":

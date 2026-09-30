@@ -133,13 +133,50 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # Who may mint a token AS the reader. Defaults to the pool's Prow runner, which
 # is what closes the write path -- see variables.tf for why the default lives
 # there rather than in the caller. A project with no entry still gets the
-# account; its runs just fall back to the runner's own credential with a loud
-# warning from fleet-kubeconfigs.sh, rather than failing to read the fleet.
+# account, but fleet-kubeconfigs.sh refuses to read the fleet on the runner's
+# own credential, so a run that leases it stops at its fleet step.
 resource "google_service_account_iam_member" "fleet_reader_token_creators" {
   for_each           = toset(var.fleet_reader_token_creators)
   service_account_id = google_service_account.fleet_reader.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = each.value
+}
+
+# ---------------------------------------------------------------------------
+# The pool-state scan's read on the project (#1967).
+#
+# The CI health bot's other hourly scan runs scripts/verify_ci_pool_project.py's
+# read-only checks against every pool project as the bot itself, so it needs
+# project-level read here: the project and its IAM policy, the service
+# accounts' policies, the service listing, the cluster listing, the
+# repository, the key and its policy, the state bucket's metadata. These
+# roles cover every read those checks make on the project; none writes. The
+# warm-cache repository's policy in the Prow project stays unread. They live in this
+# stack, beside the reader's token-creator grant, because this is the one
+# stack every pool project applies: a project provisioned after this landed
+# gets the grant with no separate step, and one applied before it is one
+# re-apply, or the loop in docs/ci-health.md ("The pool-state scan").
+locals {
+  # Kept equal to POOL_STATE_READER_ROLES in scripts/verify_ci_pool_project.py
+  # by scripts/test_verify_ci_pool_project.py.
+  pool_state_reader_roles = [
+    "roles/iam.securityReviewer",
+    "roles/container.clusterViewer",
+    "roles/artifactregistry.reader",
+    "roles/cloudkms.viewer",
+    "roles/storage.bucketViewer",
+  ]
+  pool_state_reader_grants = {
+    for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
+    "${pair[0]} ${pair[1]}" => { member = pair[0], role = pair[1] }
+  }
+}
+
+resource "google_project_iam_member" "pool_state_readers" {
+  for_each = local.pool_state_reader_grants
+  project  = var.project_id
+  role     = each.value.role
+  member   = each.value.member
 }
 
 # seeded-b is held one minor version behind whatever the REGULAR channel
@@ -405,14 +442,14 @@ resource "google_container_node_pool" "pinned_inference_pool" {
 
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
-# upgrade SOP's master-behind check keys every branch off the cluster's
+# upgrade SOP's master-behind check grades (b) and (c) off the cluster's
 # channel entry in get-server-config: branch (b), the one this defect
 # exists to trip, is minor(currentMasterVersion) < minor(channel
 # defaultVersion), severity major. A channel-less cluster has no channels[]
-# entry, so (b)/(c) cannot evaluate, and branch (a) -- version absent from
-# validMasterVersions -- is false by construction here because the pin is
-# drawn from that very list. The earlier UNSPECIFIED design hid the defect
-# from the audit it was planted for.
+# entry, so (b)/(c) cannot evaluate; the earlier UNSPECIFIED design hid the
+# defect from the audit it was planted for. Branch (a) -- version offered by
+# no channel and absent from validMasterVersions -- stays false while the
+# pin, drawn from that very list, remains in it.
 #
 # What holds the lag under a channel: the maintenance exclusion below, at
 # scope NO_MINOR_UPGRADES. Each re-apply stamps a fresh window from now

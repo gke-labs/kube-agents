@@ -31,10 +31,6 @@
 # path nobody knows in advance.
 _installer_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-${_installer_common_dir}/../../install.defaults.env}"
-if [ -r "${_installer_common_dir}/gke_dns_endpoint.sh" ]; then
-  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
-  . "${_installer_common_dir}/gke_dns_endpoint.sh"
-fi
 unset _installer_common_dir
 if [ -r "$INSTALL_DEFAULTS_FILE" ]; then
   # shellcheck source=/dev/null
@@ -47,6 +43,40 @@ else
   echo "  ℹ It ships with the repository. Re-clone, or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy." >&2
   return 1 2>/dev/null || exit 1
 fi
+
+# ─── Control-plane endpoint selection ─────────────────────────────────────────
+# gke_dns_endpoint_flag, the one predicate deciding whether a cluster is reached
+# over its IP or its DNS control-plane endpoint. Sourced here rather than left
+# to the caller: common.sh and install.sh source the helper themselves, but
+# uninstall.sh sources only this file, and calling an undefined function under
+# `set -e` would end the run. Sourcing it twice is harmless — it defines a
+# function and initialises its memo, both at load time, before anything probes.
+#
+# Resolved relative to this file, like the defaults above and for the same
+# reason. Unlike upgrade.sh, which reads the helper out of a checkout because it
+# also runs piped from curl, this file is only ever sourced from one.
+#
+# A tree without the helper gets a stub rather than a refusal, which is the
+# answer the helper itself gives for a cluster it cannot describe: the empty
+# flag is the command that ran before the helper existed, and it still reaches
+# every cluster with a routable IP endpoint. The defaults above refuse because
+# they decide what gets installed; this only picks an endpoint to dial, and an
+# uninstall or upgrade is not worth stopping over it.
+#
+# uninstall.sh and upgrade.sh reach the stub: both source this file before
+# anything else loads the helper. install.sh does not — common.sh sources the
+# helper unguarded ahead of this file and would already have stopped on the
+# same missing file. It says so rather than falling back in silence, because
+# the next thing that caller sees is an unrelated-looking missing key.
+_gke_dns_endpoint_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
+if [ -r "$_gke_dns_endpoint_helper" ]; then
+  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
+  . "$_gke_dns_endpoint_helper"
+else
+  echo "  ⚠ Cannot find ${_gke_dns_endpoint_helper}; reaching clusters over their IP endpoint." >&2
+  gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=""; }
+fi
+unset _gke_dns_endpoint_helper
 
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
@@ -116,6 +146,63 @@ readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-autho
 # interactive dev prompt ever reaches it.
 readonly IMAGE_TAG_FALLBACK="latest"
 
+# ─── Multi-project scope ──────────────────────────────────────────────────────
+# One SCOPE_EXCLUDE_CLUSTERS entry names a cluster as project/location/cluster:
+# the separator, and the shape an entry has to have to be rendered at all.
+readonly SCOPE_CLUSTER_TRIPLE_SEPARATOR="/"
+readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
+# A SCOPE_FOLDERS or SCOPE_ORGANIZATIONS entry is the bare numeric Resource
+# Manager ID, the pattern the CRD accepts for the same fields.
+readonly SCOPE_CONTAINER_ID_PATTERN='^[0-9]{1,20}$'
+# What check_scope_container_access verifies before an apply that binds a
+# container: the API the reconcile's container search calls, the permission
+# the applying identity needs on each container kind, the constraints an
+# organisation policy forbids an API through, and where the permission probe
+# is asked.
+readonly SCOPE_ASSET_API="cloudasset.googleapis.com"
+readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
+readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
+readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
+readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
+readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
+# gcloud's own credential overrides, cleared for every gcloud call the
+# preflight makes, the property read included, because the google provider
+# does not read them.
+readonly SCOPE_GCLOUD_AUTH_OVERRIDES="CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_ACCESS_TOKEN_FILE CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"
+# The same overrides as gcloud configuration properties, which live in the
+# active configuration file where env -u cannot reach them; a mint under
+# either would answer for an identity Terraform never uses, so a set one
+# makes the probe undecided rather than wrong. Read with the variables above
+# cleared, so only the configuration file's value is reported and the remedy
+# (unset the property) is one that works.
+readonly SCOPE_GCLOUD_AUTH_PROPERTIES="auth/impersonate_service_account auth/access_token_file"
+# The reasons in a 403 from Resource Manager that are not a permission answer:
+# the API not enabled in the credential's quota project, or no quota project
+# at all. The apply enables cloudresourcemanager.googleapis.com before its
+# own binding call, so these read as undecided, not denied.
+readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not been used in project|quota project|USER_PROJECT_DENIED"
+# And the 403 a token minted without the cloud-platform scope gets: the role
+# may well be held, so it is not a permission answer either, and the remedy
+# is the token's scope, not a grant.
+readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+# The three answers a container permission probe gives.
+readonly SCOPE_PROBE_GRANTED=0
+readonly SCOPE_PROBE_DENIED=1
+readonly SCOPE_PROBE_UNDECIDED=2
+# kubectl's answers for a cluster that serves no PlatformAgent type at all, and
+# helm's for a release that does not exist: on a first adoption both mean there
+# is nothing live to protect, not that the read failed.
+readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
+readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# The two verdicts refuse_apply_over_undeclared_scope's python half prints
+# on its first line.
+readonly SCOPE_VERDICT_OK="ok"
+readonly SCOPE_VERDICT_REFUSE="refuse"
+# Its two modes: refuse (the default, every apply) or warn (upgrade.sh --plan,
+# which applies nothing).
+readonly SCOPE_CHECK_MODE_REFUSE="refuse"
+readonly SCOPE_CHECK_MODE_WARN="warn"
+
 # Suffix appended when deriving Google Chat Pub/Sub subscription name from a custom topic (#1397).
 readonly CHAT_SUBSCRIPTION_SUFFIX="-sub"
 
@@ -130,6 +217,12 @@ readonly TF_STATE_OBJECT="default.tfstate"
 readonly GCS_OBJECT_ABSENT_PATTERN='matched no objects|NotFoundException|HTTPError 404|not found|does not exist'
 readonly TF_STATE_RC_UNREADABLE=2
 
+# The Hindsight memory store: the provider that deploys it, and the two objects
+# whose presence live_hindsight_state takes as proof that it is there.
+readonly HINDSIGHT_MEMORY_PROVIDER="kube_agents_memory"
+readonly HINDSIGHT_STATEFULSET="hindsight-postgresql"
+readonly HINDSIGHT_API_DEPLOYMENT="hindsight-api"
+
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
 # memory_mode_from_provider, and needed here because install.env records the
@@ -139,38 +232,35 @@ readonly TF_STATE_RC_UNREADABLE=2
 # a Hindsight install and the apply would delete it.
 memory_provider_from_mode() {
   case "${1:-}" in
-    hindsight) echo "kube_agents_memory" ;;
+    hindsight) echo "$HINDSIGHT_MEMORY_PROVIDER" ;;
     off) echo "none" ;;
     file) echo "multiuser_memory" ;;
     *) echo "" ;;
   esac
 }
 
-# Make install.env's MEMORY win over a legacy vars.sh MEMORY_PROVIDER, for the
-# front doors that load both files and then generate tfvars directly.
+# Translate install.env's MEMORY into MEMORY_PROVIDER for the front doors that
+# load install.env and then generate tfvars directly (upgrade.sh, uninstall.sh,
+# and install.sh's Day-2 menu).
 #
-# The two files spell the setting differently, so "install.env wins on every key
-# it carries" cannot hold for this one by load order alone: the pre-install.env
-# installer persisted `export MEMORY_PROVIDER=…` into vars.sh, every migrated
-# install still has it on disk, and install.sh's migration writes only MEMORY.
-# write_tfvars_from_state prefers MEMORY_PROVIDER (install.sh's own run exports
-# the interview's answer there, and must keep winning), so the stale provider
-# would shadow the operator's edited MEMORY and regenerate the tfvars against
-# the old store -- an apply then deleting the Hindsight API and its Postgres.
+# install.env and the tfvars generator spell the setting differently: the
+# hand-authored input records MEMORY, while write_tfvars_from_state prefers
+# MEMORY_PROVIDER (install.sh's own run exports the interview's answer there,
+# and must keep winning). Without this step, an inherited MEMORY_PROVIDER in the
+# shell environment (or both keys in install.env) would shadow MEMORY and
+# regenerate the tfvars against the wrong store -- an apply then deleting the
+# Hindsight API and its Postgres.
 #
-# Call after BOTH loads and before anything reads the pair. Not called by
-# install.sh's own run, which resolves the same precedence in its parameter
+# Call after loading install.env and before anything reads the pair. Not called
+# by install.sh's own run, which resolves the same precedence in its parameter
 # block (PARAM_MEMORY) and exports MEMORY_PROVIDER from the interview later.
 #
-# The cost, stated because it is real: this cannot distinguish a stale
-# MEMORY_PROVIDER sourced from a legacy vars.sh -- the case it exists for --
-# from one the operator exported for this run. So on these three front doors a
-# recognised MEMORY in install.env beats `MEMORY_PROVIDER=… ./upgrade.sh`, and
-# upgrade.sh has no --memory flag to override it with. That is the accepted
-# trade: MEMORY_PROVIDER is not a documented install.env or environment input
-# (it appears nowhere in install.env.example, and docs/designs/memory.md names
-# MEMORY as the recorded spelling), while the stale-file case silently deletes
-# a Hindsight deployment. To force one for a single run, set MEMORY instead.
+# Note: on these three front doors a recognised MEMORY in install.env beats
+# `MEMORY_PROVIDER=… ./upgrade.sh`, and upgrade.sh has no --memory flag to
+# override it with. MEMORY_PROVIDER is not a documented install.env or
+# environment input (it appears nowhere in install.env.example, and
+# docs/designs/memory.md names MEMORY as the recorded spelling). To force one
+# for a single run, set MEMORY instead.
 normalize_memory_vars() {
   local from_mode
   [ -n "${MEMORY:-}" ] || return 0
@@ -404,6 +494,12 @@ load_install_env() {
   # the file is read (and whether or not there is one), so the file's own key
   # is the only way in.
   unset NAMESPACE
+  # The scope keys likewise: they render into the PlatformAgent, and only
+  # install.sh's first install records them, so on upgrade.sh, uninstall.sh
+  # and the Day-2 menu the file is the only way in. A value inherited from the
+  # shell would declare a project the file does not record, and the next run
+  # from a clean shell would drop it again and retire its profiles.
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -567,10 +663,12 @@ normalize_identity_vars() {
   fi
 }
 
-# ─── vars.sh Persistence (legacy) ─────────────────────────────────────────────
-# The generated state file install.env replaced. Still written by the dev
-# scripts through common.sh's init_var helpers, and still read everywhere as a
-# fallback, so these stay. VARS_FILE must be set by the caller.
+# ─── Dev Scratch State Persistence (scripts/installer/vars.sh) ────────────────
+# No installer front door reads or writes vars.sh any more (install.env is the
+# sole install configuration). These helpers stay only for the dev scripts under
+# scripts/dev/, which record throwaway scratch state (such as
+# DEV_ARTIFACT_REGISTRY_CREATED) into scripts/installer/vars.sh through
+# common.sh's init_var helpers. VARS_FILE must be set by the caller.
 save_var() {
   local var_name=$1
   local var_val=$2
@@ -792,8 +890,14 @@ hcl_bool() {
 # items. Both separators, because --custom-roles documents "space- or
 # comma-separated".
 hcl_csv_list() {
-  local csv="${1:-}" out="[" first=true item
+  local csv="${1:-}" out="[" first=true item had_noglob=false
   local IFS=$', \t\n'
+  # Globbing off around the unquoted split: an entry such as *-sandbox (a
+  # scope exclusion) would otherwise be replaced by whatever files match it
+  # in the working directory. Saved and restored by hand; bash 3.2 has no
+  # `local -`.
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
   for item in $csv; do
     item="${item#"${item%%[![:space:]]*}"}"
     item="${item%"${item##*[![:space:]]}"}"
@@ -802,7 +906,696 @@ hcl_csv_list() {
     out+="$(hcl_str "$item")"
     first=false
   done
+  $had_noglob || set +f
   printf '%s]' "$out"
+}
+
+# The five SCOPE_* keys as the composition's `scope` object: `projects`,
+# `folders`, `organizations` and `exclude.projects` are lists like every other
+# list key, `exclude.clusters` is one project/location/cluster triple per
+# entry. Always a full block, empty lists included -- the reconcile reads an
+# emptied projects list as the declaration that drops projects, a container
+# leaving the list as the declaration that retires its members, and a missing
+# block as no declaration (docs/designs/multi-project-scope.md §7). Shape
+# only: the caller has already run require_scope_cluster_triples and
+# require_scope_container_ids, and the patterns, caps and repeats the CRD
+# enforces are the module variable's validations, which fail the plan before
+# any binding.
+hcl_scope_block() {
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" exclude_projects="${4:-}" exclude_clusters="${5:-}"
+  local clusters="[" first=true entry project location cluster had_noglob=false
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for entry in $exclude_clusters; do
+    [ -n "$entry" ] || continue
+    IFS="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" read -r project location cluster <<<"$entry"
+    $first || clusters+=", "
+    clusters+="{ project_id = $(hcl_str "$project"), location = $(hcl_str "$location"), cluster_name = $(hcl_str "$cluster") }"
+    first=false
+  done
+  $had_noglob || set +f
+  clusters+="]"
+  printf 'scope = {\n  projects      = %s\n  folders       = %s\n  organizations = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+    "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
+    "$(hcl_csv_list "$exclude_projects")" "$clusters"
+}
+
+# Every SCOPE_FOLDERS and SCOPE_ORGANIZATIONS entry is a bare numeric ID, or
+# the run stops before a file is written and names the entry and its key: a
+# folders/<id> spelling would otherwise reach terraform's variable validation
+# with a message naming neither. $1 the folders, $2 the organisations. Caller
+# defines print_error.
+require_scope_container_ids() {
+  local folders="${1:-}" organizations="${2:-}" key entries entry had_noglob=false
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for key in SCOPE_FOLDERS SCOPE_ORGANIZATIONS; do
+    [ "$key" = SCOPE_FOLDERS ] && entries="$folders" || entries="$organizations"
+    for entry in $entries; do
+      [ -n "$entry" ] || continue
+      if ! [[ "$entry" =~ $SCOPE_CONTAINER_ID_PATTERN ]]; then
+        $had_noglob || set +f
+        print_error "${key} entry '${entry}' is not a numeric Resource Manager ID. Name each folder or organisation by its bare number in install.env (123456789012, not folders/123456789012)."
+        return 1
+      fi
+    done
+  done
+  $had_noglob || set +f
+}
+
+# Every SCOPE_EXCLUDE_CLUSTERS entry is project/location/cluster, or the run
+# stops before a file is written and names the entry. Caller defines
+# print_error.
+require_scope_cluster_triples() {
+  local entries="${1:-}" entry had_noglob=false
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for entry in $entries; do
+    [ -n "$entry" ] || continue
+    if ! [[ "$entry" =~ $SCOPE_CLUSTER_TRIPLE_PATTERN ]]; then
+      $had_noglob || set +f
+      print_error "SCOPE_EXCLUDE_CLUSTERS entry '${entry}' is not project${SCOPE_CLUSTER_TRIPLE_SEPARATOR}location${SCOPE_CLUSTER_TRIPLE_SEPARATOR}cluster. Name each excluded cluster by its project ID, location and name in install.env."
+      return 1
+    fi
+  done
+  $had_noglob || set +f
+}
+
+# Refuses a full apply that would replace a scope the live PlatformAgent
+# carries and nothing this install wrote accounts for.
+#
+# The chart renders spec.scope from the keys on every full apply, and Helm
+# patches a custom resource from the difference between its rendered
+# manifests, so the first apply that renders the block replaces whatever the
+# CR holds -- and the reconcile reads the emptied projects list as the
+# declaration that retires those projects' profiles. Three values decide:
+#
+#   L  the live CR's spec.scope;
+#   R  the release record's platformAgent.scope (helm get values): what the
+#      installer last rendered, absent before the first apply that carried
+#      the value, and never anything else, because the retag modes reuse the
+#      record as it is. Read from the latest revision and from the last
+#      revision that served (deployed or superseded), because a failed
+#      upgrade leaves its values as the latest revision while the CR still
+#      holds the served one, and the retry must not read that as a hand edit;
+#   K  the scope the SCOPE_* keys declare now.
+#
+# Refused when L is present and non-empty, L != R and L != K: the CR carries a
+# declaration the installer did not write and the keys do not reproduce. Every
+# other case passes -- nothing live to protect; L == R, the installer wrote it
+# and the keys are the new declaration, emptying it included; L == K, the
+# operator recorded it. No PlatformAgent type served, no CR, no release: pass.
+# L, R and K are the projects, folders, organisations and exclusions; the
+# sharedVpcHosts and metricsScopes selectors phase 3 added are reported when
+# the CR carries them and never weighed, because the chart renders neither
+# and an apply leaves them as they are.
+# Anything that stops the read -- no context for this install in the
+# kubeconfig, the CR or the record unreadable -- is a refusal, because the
+# apply itself needs no kubeconfig (the helm provider authenticates with a
+# token against the endpoint) and would go ahead over a scope nobody read.
+# $1 namespace; $2 "warn" turns every refusal into a warning (upgrade.sh
+# --plan applies nothing). Caller defines print_error / print_info /
+# print_warning.
+refuse_apply_over_undeclared_scope() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" mode="${2:-$SCOPE_CHECK_MODE_REFUSE}"
+  local expected_ctx cr_json record_json err_file verdict first_line
+  expected_ctx="$(gke_context_name)"
+  if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
+    _scope_check_failed "$mode" "the kubeconfig has no context '${expected_ctx}' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})"
+    return $?
+  fi
+  err_file="$(mktemp)"
+  # `trap - ERR` for the bash 3.2 reason write_tfvars_from_state gives: the
+  # misses classified below are ordinary answers, not aborts.
+  if ! cr_json="$(trap - ERR; kubectl --context "$expected_ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>"$err_file")"; then
+    if grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN" "$err_file"; then
+      rm -f "$err_file"
+      return 0
+    fi
+    _scope_check_failed "$mode" "the PlatformAgent in namespace '${namespace}' could not be read through context '${expected_ctx}': $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    local rc=$?
+    rm -f "$err_file"
+    return $rc
+  fi
+  local served_json="{}" served_rev=""
+  if ! record_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
+    if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
+      record_json="{}"
+    else
+      _scope_check_failed "$mode" "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+      local rc=$?
+      rm -f "$err_file"
+      return $rc
+    fi
+  else
+    # The last revision that served, and only when the latest did not (a
+    # failed or pending upgrade): its values are what the CR still holds. On a
+    # healthy release the latest revision is the one record, so a hand edit
+    # that happens to restore an earlier scope is still a hand edit. A history
+    # that cannot be read leaves only the latest revision to compare against.
+    served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
+      | python3 -c '
+import json, sys
+statuses = sys.argv[1].split()
+revisions = json.load(sys.stdin) or []
+latest = max(revisions, key=lambda r: r["revision"], default=None)
+served = [] if latest is None or latest.get("status") in statuses else [
+    r["revision"] for r in revisions if r.get("status") in statuses
+]
+print(max(served) if served else "")
+' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
+    if [ -n "$served_rev" ]; then
+      served_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null || echo '{}')"
+    fi
+  fi
+  # Normalises L, R and K to sorted lists and rules. Values arrive as argv and
+  # on stdin, never interpolated into the program text. stderr goes to the
+  # file, not into the verdict: an interpreter that warns at startup and exits
+  # 0 would otherwise put its warning where the first line is read.
+  if ! verdict="$(trap - ERR; printf '%s\n\x1e\n%s\n\x1e\n%s\n' "$cr_json" "$record_json" "$served_json" | python3 -c '
+import json, re, sys
+cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
+ok, refuse = sys.argv[1], sys.argv[2]
+keys = sys.argv[3:8]
+
+def split(value):
+    return [item for item in re.split(r"[,\s]+", value) if item]
+
+def normalise(scope):
+    scope = scope or {}
+    exclude = scope.get("exclude") or {}
+    clusters = sorted(
+        {(c["projectId"], c["location"], c["clusterName"]) for c in exclude.get("clusters") or []}
+    )
+    return {
+        "projects": sorted(set(scope.get("projects") or [])),
+        "folders": sorted(set(scope.get("folders") or [])),
+        "organizations": sorted(set(scope.get("organizations") or [])),
+        "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
+    }
+
+def is_empty(scope):
+    return not (scope["projects"] or scope["folders"] or scope["organizations"]
+                or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+
+items = json.loads(cr_text).get("items") or []
+if len(items) > 1:
+    sys.exit("more than one PlatformAgent is served: " + ", ".join(i["metadata"]["name"] for i in items))
+live_raw = items[0].get("spec", {}).get("scope") if items else None
+if live_raw is None:
+    print(ok)
+    sys.exit(0)
+live = normalise(live_raw)
+# The two selectors phase 3 added to the CR. The chart renders neither and
+# the installer has no key for them, so an apply leaves them as they are; they
+# are reported on the second output line, never weighed in the verdict.
+containers = " ".join(
+    k + ": " + " ".join(sorted(set(live_raw.get(k) or [])))
+    for k in ("sharedVpcHosts", "metricsScopes") if live_raw.get(k)
+)
+if is_empty(live):
+    print(ok)
+    print(containers)
+    sys.exit(0)
+def recorded(text):
+    raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
+    return normalise(raw) if raw is not None else None
+
+records = [r for r in (recorded(record_text), recorded(served_text)) if r is not None]
+declared = normalise({
+    "projects": split(keys[0]),
+    "folders": split(keys[1]),
+    "organizations": split(keys[2]),
+    "exclude": {
+        "projects": split(keys[3]),
+        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[4])],
+    },
+})
+if live in records or live == declared:
+    print(ok)
+    print(containers)
+    sys.exit(0)
+print(refuse)
+print(containers)
+print(items[0]["metadata"]["name"])
+print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
+print("SCOPE_FOLDERS=" + json.dumps(" ".join(live["folders"])))
+print("SCOPE_ORGANIZATIONS=" + json.dumps(" ".join(live["organizations"])))
+print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
+print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+    _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    local rc=$?
+    rm -f "$err_file"
+    return $rc
+  fi
+  rm -f "$err_file"
+  first_line="${verdict%%$'\n'*}"
+  local containers lines cr_name
+  lines="${verdict#*$'\n'}"
+  [ "$lines" != "$verdict" ] || lines=""
+  containers="${lines%%$'\n'*}"
+  if [ -n "$containers" ]; then
+    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders neither selector and leaves them as they are."
+  fi
+  [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
+  lines="${lines#*$'\n'}"
+  cr_name="${lines%%$'\n'*}"
+  lines="${lines#*$'\n'}"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    print_warning "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. A full upgrade would replace it, and the reconcile would retire the projects it drops; the plan below shows the change. Record the live declaration in install.env first:"
+  else
+    print_error "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. The first apply whose rendered scope differs from the recorded one replaces it, and the reconcile then retires the projects it drops, deleting their Cluster Agent profiles over its next two clean runs."
+    print_info "Record the live declaration in install.env and re-run:"
+  fi
+  while IFS= read -r first_line; do
+    print_info "  ${first_line}"
+  done <<<"$lines"
+  [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+  print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope to what install.env declares and re-run; the apply then renders the same value it already holds."
+  return 1
+}
+
+# Preflight for a declared folder or organisation, before the apply that
+# would bind the agent's roles on the container. The IAM probe is made as the
+# identity Terraform applies with, read the way the google provider reads its
+# credentials (_scope_terraform_access_token), which need not be gcloud's
+# active account; the API and policy reads go through gcloud's active
+# account, whose answer does not depend on who asks: (1) the Cloud Asset API
+# the reconcile's container search calls can be enabled in the host project,
+# meaning it is enabled already or no effective organisation policy forbids
+# it, and (2) this identity can set IAM policy on every container named, so
+# the apply does not stop partway with the API enabled and some containers
+# bound. Every container is probed and every failure named before the run
+# stops (docs/designs/multi-project-scope.md §6); a probe that cannot decide
+# (no curl, no token, a transport error) warns and lets the apply speak,
+# because an apply that fails to bind fails loudly, unlike the scope replace
+# refuse_apply_over_undeclared_scope guards against. An install that declares
+# no container returns silently and never touches the Asset API. $1 "warn"
+# turns the refusal into a warning: upgrade.sh --plan applies nothing, and
+# install.sh --generate-only hands the apply to an identity that may not be
+# the one at the keyboard.
+# Caller defines print_error / print_info / print_warning.
+check_scope_container_access() {
+  local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
+  local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
+  [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason
+  identity="$(_scope_terraform_identity_label)"
+  if [[ "$organizations" == *[![:space:],]* ]]; then
+    print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
+  fi
+  # Every probe below is called in a `||` list: the front doors run under
+  # `set -eE` with an ERR trap, and a probe answering "denied" is an answer,
+  # not an error, on the bare call upgrade.sh --plan makes as well as on the
+  # `|| exit 1` call the applying modes make.
+  if ! _scope_asset_api_enabled "$project"; then
+    rc=0
+    constraint="$(_scope_policy_denying_asset_api "$project")" || rc=$?
+    if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+      failures+=("${SCOPE_ASSET_API} cannot be enabled in project '${project}': the effective organisation policy ${constraint} denies it, and the reconcile resolves a folder or organisation through that API. Ask the organisation's administrator for an exception, or declare explicit SCOPE_PROJECTS instead.")
+    elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
+      undecided+=("whether ${SCOPE_ASSET_API} can be enabled in project '${project}' (the organisation policy could not be read)")
+    fi
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
+  elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
+    undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
+  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+    undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
+  else
+    local IFS=$', \t\n'
+    case "$-" in *f*) had_noglob=true ;; esac
+    set -f
+    for entry in $folders; do
+      [ -n "$entry" ] || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        # Undecided, and any status the probe does not define: nothing but a
+        # granted answer passes silently.
+        undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
+      fi
+    done
+    for entry in $organizations; do
+      [ -n "$entry" ] || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        # Undecided, and any status the probe does not define: nothing but a
+        # granted answer passes silently.
+        undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
+      fi
+    done
+    $had_noglob || set +f
+  fi
+  for entry in ${undecided[@]+"${undecided[@]}"}; do
+    print_warning "The scope container preflight could not decide ${entry}; the apply will report it if it fails."
+  done
+  [ "${#failures[@]}" -eq 0 ] && return 0
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    # Route-neutral: the warn mode serves upgrade.sh --plan, install.sh
+    # --generate-only and the interactive g answer alike, and only the last
+    # two hand the apply to lifecycle.sh under credentials this run cannot see.
+    for entry in "${failures[@]}"; do print_warning "An applying run would be refused: ${entry}"; done
+    return 0
+  fi
+  for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
+  print_info "Nothing was changed. Fix what is named above, or edit SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
+  return 1
+}
+
+# The credentials the google provider will apply with, read in its own order
+# of precedence: GOOGLE_OAUTH_ACCESS_TOKEN; else the key file or inline key
+# JSON in GOOGLE_CREDENTIALS, GOOGLE_CLOUD_KEYFILE_JSON or GCLOUD_KEYFILE_JSON
+# (an existing path is a file, anything else is the key's JSON, the provider's
+# own rule); else the Application Default Credentials, which read
+# GOOGLE_APPLICATION_CREDENTIALS first; each impersonating
+# GOOGLE_IMPERSONATE_SERVICE_ACCOUNT when the operator set it, the token
+# serving only as the source credential then. gcloud's own CLOUDSDK_AUTH_*
+# variables are cleared for every mint, because the provider does not read
+# them and a gcloud impersonation the operator configured for other work
+# would otherwise answer for an identity Terraform never uses. The value of a
+# credential variable is never printed: the variable's name is enough, and an
+# inline key is a private key. Three readers of that one rule: the variable
+# that holds the credentials, a label for messages, and the token itself.
+_scope_terraform_credentials_var() {
+  if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ]; then printf 'GOOGLE_OAUTH_ACCESS_TOKEN'
+  elif [ -n "${GOOGLE_CREDENTIALS:-}" ]; then printf 'GOOGLE_CREDENTIALS'
+  elif [ -n "${GOOGLE_CLOUD_KEYFILE_JSON:-}" ]; then printf 'GOOGLE_CLOUD_KEYFILE_JSON'
+  elif [ -n "${GCLOUD_KEYFILE_JSON:-}" ]; then printf 'GCLOUD_KEYFILE_JSON'
+  fi
+}
+
+# Names the identity the probe is made as, so a refusal sends the operator to
+# grant a role to the principal that will apply, not to whatever ADC the
+# workstation holds.
+_scope_terraform_identity_label() {
+  local var base
+  var="$(_scope_terraform_credentials_var)"
+  case "$var" in
+    GOOGLE_OAUTH_ACCESS_TOKEN) base="the identity behind GOOGLE_OAUTH_ACCESS_TOKEN" ;;
+    "") base="the Application Default Credentials${GOOGLE_APPLICATION_CREDENTIALS:+ in GOOGLE_APPLICATION_CREDENTIALS}" ;;
+    *) base="the credentials in ${var}" ;;
+  esac
+  if [ -n "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
+    printf '%s impersonating %s (the identity Terraform applies with)' "$base" "$GOOGLE_IMPERSONATE_SERVICE_ACCOUNT"
+  else
+    printf '%s (the identity Terraform applies with)' "$base"
+  fi
+}
+
+# What to do when no token could be minted for those credentials, by source.
+_scope_terraform_token_remedy() {
+  local var creds
+  var="$(_scope_terraform_credentials_var)"
+  case "$var" in
+    GOOGLE_OAUTH_ACCESS_TOKEN)
+      printf 'gcloud could not mint an impersonated token from GOOGLE_OAUTH_ACCESS_TOKEN; check the token is current and may impersonate %s' "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ;;
+    "")
+      if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        printf 'gcloud could not mint an access token for them; run: gcloud auth application-default login'
+      elif [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+        printf 'the key file GOOGLE_APPLICATION_CREDENTIALS names could not mint a token; check it is a valid service-account key%s, or unset the variable to use the login credentials' "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
+      else
+        printf 'GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way'
+      fi ;;
+    *)
+      creds="$(_scope_expand_home "${!var}")"
+      if [ -f "$creds" ]; then
+        printf 'the key file %s names could not mint a token; check it is a valid service-account key%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
+      else
+        # Not an existing file, and gcloud refused it as key JSON. Which of
+        # the two the operator meant is not decidable here and the value is
+        # never printed, so the remedy names both readings.
+        printf '%s is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key'"'"'s JSON itself (not base64)%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+, and that it may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
+      fi ;;
+  esac
+}
+
+# Prints, space-separated, the gcloud auth properties set in the active
+# configuration that a gcloud mint would honour and the google provider would
+# not: auth/access_token_file always, auth/impersonate_service_account unless
+# GOOGLE_IMPERSONATE_SERVICE_ACCOUNT names the account explicitly (the flag
+# the mint passes then overrides the property). Empty when none is in the
+# way, and when no gcloud mint will be made at all (a raw token with no
+# impersonation). A property gcloud cannot report reads as unset.
+_scope_gcloud_auth_properties_in_the_way() {
+  local property value out=""
+  local -a clear=()
+  if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ] && [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
+    return 0
+  fi
+  # shellcheck disable=SC2207
+  clear=($(_scope_gcloud_env_clear_args))
+  for property in $SCOPE_GCLOUD_AUTH_PROPERTIES; do
+    if [ "$property" = "auth/impersonate_service_account" ] && [ -n "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
+      continue
+    fi
+    # Under the same cleared environment as the mint: `config get-value`
+    # reports the effective value, and a CLOUDSDK_AUTH_* variable would
+    # otherwise read as a property the operator never set.
+    value="$(trap - ERR; env "${clear[@]}" gcloud config get-value "$property" 2>/dev/null || true)"
+    case "$value" in ""|"(unset)") continue ;; esac
+    out="${out:+$out }${property}"
+  done
+  printf '%s' "$out"
+}
+
+# Prints the `-u VAR` pairs that clear gcloud's own credential overrides for
+# one `env` call. Word-split by the caller into an array (the values are
+# variable names, so splitting is safe); no nameref, because the front doors
+# run on bash 3.2 as well.
+_scope_gcloud_env_clear_args() {
+  local keep="${1:-}" var
+  for var in $SCOPE_GCLOUD_AUTH_OVERRIDES; do
+    [ "$var" = "$keep" ] || printf -- '-u %s ' "$var"
+  done
+}
+
+# A credential path as the google provider reads it: a leading ~ is the
+# home directory (its pathOrContents expands it), which a quoted install.env
+# line or a CI environment block hands over unexpanded.
+_scope_expand_home() {
+  # The literal tilde is the point: shellcheck reads the pattern as a path.
+  # shellcheck disable=SC2088
+  case "$1" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s%s' "$HOME" "${1#\~}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Prints the access token for those credentials; fails when none can be
+# minted. Inline key JSON reaches gcloud through a file that lives only inside
+# the subshell that mints the token and is removed on that subshell's exit,
+# a signal included, so an interrupted run leaves no private key at rest.
+_scope_terraform_access_token() {
+  local var creds
+  local -a impersonate=() clear=()
+  [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ] || impersonate=("--impersonate-service-account=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}")
+  # shellcheck disable=SC2207
+  clear=($(_scope_gcloud_env_clear_args))
+  var="$(_scope_terraform_credentials_var)"
+  case "$var" in
+    GOOGLE_OAUTH_ACCESS_TOKEN)
+      if [ "${#impersonate[@]}" -eq 0 ]; then
+        printf '%s' "$GOOGLE_OAUTH_ACCESS_TOKEN"
+        return 0
+      fi
+      # gcloud takes a raw token as its credential through this variable and
+      # impersonates on top of it, as the provider does with access_token. The
+      # variable is set in the shell's environment for the call, never as an
+      # argument to env, whose argv any local user can read; env therefore
+      # clears every override but this one.
+      # shellcheck disable=SC2207
+      clear=($(_scope_gcloud_env_clear_args CLOUDSDK_AUTH_ACCESS_TOKEN))
+      (trap - ERR; CLOUDSDK_AUTH_ACCESS_TOKEN="$GOOGLE_OAUTH_ACCESS_TOKEN" env "${clear[@]}" gcloud auth print-access-token "${impersonate[@]}" 2>/dev/null)
+      return ;;
+    "")
+      (trap - ERR; env "${clear[@]}" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
+      return ;;
+  esac
+  creds="$(_scope_expand_home "${!var}")"
+  if [ -f "$creds" ]; then
+    (trap - ERR; env "${clear[@]}" GOOGLE_APPLICATION_CREDENTIALS="$creds" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
+    return
+  fi
+  # Not an existing file, so the key's JSON, whatever byte it starts with
+  # (a leading newline or space from a heredoc or a secret store is JSON to
+  # the provider too). gcloud validates it; the preflight never parses or
+  # prints it.
+  (
+    trap - ERR
+    key_file="$(mktemp)"
+    trap 'rm -f "$key_file"' EXIT
+    trap 'rm -f "$key_file"; exit 130' INT TERM HUP
+    (umask 077; printf '%s' "$creds" >"$key_file")
+    env "${clear[@]}" GOOGLE_APPLICATION_CREDENTIALS="$key_file" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null
+  )
+}
+
+# True when the Asset API is already enabled in the host project. A listing
+# that fails reads as not enabled, which sends the caller to the policy read.
+_scope_asset_api_enabled() {
+  local project="$1" enabled
+  enabled="$(trap - ERR; gcloud services list --enabled --project "$project" \
+    --filter="config.name=${SCOPE_ASSET_API}" --format="value(config.name)" 2>/dev/null)" || return 1
+  [ "$enabled" = "$SCOPE_ASSET_API" ]
+}
+
+# Prints the constraint whose effective policy on the host project denies the
+# Asset API and returns SCOPE_PROBE_DENIED; returns SCOPE_PROBE_GRANTED with
+# nothing printed when both policies were read and neither denies it,
+# SCOPE_PROBE_UNDECIDED when either could not be fetched or, fetched, could
+# not be parsed (a constraint that has no policy set reads as not denying). Both service-usage constraints are read, because an
+# organisation may still carry the legacy one. Only the enforced `spec` is
+# read: a `dryRunSpec` enforces nothing, and an organisation trialling a
+# constraint in dry run must not be refused for it. A parse failure is its
+# own answer, never "not denied": the reader exits with the probe's three
+# statuses, as the IAM probe's does.
+_scope_policy_denying_asset_api() {
+  local project="$1" constraint policy unread=false rc
+  for constraint in $SCOPE_SERVICE_USAGE_CONSTRAINTS; do
+    if ! policy="$(trap - ERR; gcloud org-policies describe "$constraint" --project="$project" --effective --format=json 2>/dev/null)"; then
+      unread=true
+      continue
+    fi
+    rc=0
+    (trap - ERR; printf '%s' "$policy" | python3 -c '
+import json, sys
+api = sys.argv[1]
+denied, not_denied, undecided = (int(a) for a in sys.argv[2:5])
+try:
+    doc = json.load(sys.stdin) or {}
+except Exception:
+    sys.exit(undecided)
+if not isinstance(doc, dict):
+    sys.exit(undecided)
+rules = ((doc.get("spec") or {}).get("rules")) or []
+for rule in rules:
+    if rule.get("denyAll"):
+        sys.exit(denied)
+    values = rule.get("values") or {}
+    if api in (values.get("deniedValues") or []):
+        sys.exit(denied)
+    allowed = values.get("allowedValues") or []
+    if allowed and api not in allowed:
+        sys.exit(denied)
+sys.exit(not_denied)
+' "$SCOPE_ASSET_API" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
+    case "$rc" in
+      "$SCOPE_PROBE_DENIED")
+        printf '%s' "constraints/${constraint}"
+        return "$SCOPE_PROBE_DENIED" ;;
+      "$SCOPE_PROBE_GRANTED") ;;
+      *) unread=true ;;
+    esac
+  done
+  # A constraint that could not be read may still deny: only a full read
+  # that found no denial passes.
+  $unread && return "$SCOPE_PROBE_UNDECIDED"
+  return "$SCOPE_PROBE_GRANTED"
+}
+
+# Asks Resource Manager whether the token's identity holds one permission on a
+# container, through testIamPermissions, which never mutates and answers for
+# the caller alone. $1 folders/<id> or organizations/<id>; $2 the permission;
+# $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
+# permission, a 404, or a 403 that is a permission answer: a container the
+# caller cannot see cannot be bound) or _UNDECIDED (transport failure, a 403
+# for the API being off in the quota project or for a token minted without
+# the cloud-platform scope, any other status, an unreadable body), printing
+# for an undecided answer the reason, which the caller's warning carries so
+# the remedy names the cause rather than a grant.
+_scope_container_can_set_iam() {
+  local resource="$1" permission="$2" token="$3" response status body rc=0
+  # The bearer token goes to curl on its stdin (-H @-), never argv, where any
+  # local user could read it from the process table for the request's
+  # duration, and never a file, which an interrupted run would leave behind.
+  if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
+    -H @- -H "Content-Type: application/json" \
+    -d "{\"permissions\":[\"${permission}\"]}" \
+    -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
+    printf 'the request to Resource Manager did not complete'
+    return "$SCOPE_PROBE_UNDECIDED"
+  fi
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  case "$status" in
+    200)
+      # The parser exits with the probe's own answer: granted, denied, or
+      # undecided for a body that is not the JSON the API documents.
+      (trap - ERR; printf '%s' "$body" | python3 -c '
+import json, sys
+granted, denied, undecided = (int(a) for a in sys.argv[2:5])
+try:
+    held = (json.load(sys.stdin) or {}).get("permissions") or []
+except Exception:
+    sys.exit(undecided)
+sys.exit(granted if sys.argv[1] in held else denied)
+' "$permission" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
+      [ "$rc" -ne "$SCOPE_PROBE_UNDECIDED" ] || printf 'Resource Manager answered 200 with a body that is not the JSON it documents'
+      return "$rc" ;;
+    403)
+      # Two 403s are not permission answers: a token minted without the
+      # cloud-platform scope (the remedy is the token's scope, not a grant),
+      # and the Resource Manager API being off in the credential's quota
+      # project (the apply enables that API before it binds).
+      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN"; then
+        printf 'the token lacks the cloud-platform scope; mint it with that scope, as gcloud does'
+        return "$SCOPE_PROBE_UNDECIDED"
+      fi
+      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
+        printf 'Resource Manager answered 403 for its API being off in the credentials'"'"' quota project, which the apply enables before it binds'
+        return "$SCOPE_PROBE_UNDECIDED"
+      fi
+      return "$SCOPE_PROBE_DENIED" ;;
+    404) return "$SCOPE_PROBE_DENIED" ;;
+    *)
+      printf 'Resource Manager answered HTTP %s' "$status"
+      return "$SCOPE_PROBE_UNDECIDED" ;;
+  esac
+}
+
+# The check above could not decide. A refusal, except under "warn" (a plan
+# applies nothing), where it is a warning and the run goes on.
+_scope_check_failed() {
+  local mode="$1" reason="$2"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    print_warning "The scope check did not run: ${reason}. The full upgrade runs it and refuses if it cannot."
+    return 0
+  fi
+  print_error "Refusing to apply: ${reason}."
+  print_info "The apply would render spec.scope from install.env over whatever the PlatformAgent holds, and a scope it holds that install.env does not declare would be replaced. Fix the read, or record the live declaration in install.env, and re-run."
+  return 1
+}
+
+# Helm never touches the crds/ directory on upgrade -- that is Helm's own
+# documented behaviour, and the Terraform helm provider inherits it -- so CRD
+# schema changes are applied here first, by every front door that re-applies
+# the chart to a cluster that already runs it: upgrade.sh's full and operator
+# modes, an install.sh re-run and the Day-2 menu (INSTALL.md names the last
+# two as the way to change configuration). A field the served CRD lacks is
+# pruned from the CR on write, and pruned for good on this path: the release
+# record then carries the value, the next render equals the record, and Helm
+# sends only the difference between its rendered manifests. Server-side apply,
+# because these objects are large and have had several owners; through the
+# install's own context by name, never the current one. $1 is the checkout.
+apply_crd_upgrades() {
+  local repo_dir="${1:?repository directory}"
+  print_info "Applying CRD updates from charts/kube-agents/crds..."
+  kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts \
+    -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
 }
 
 # The raw state object, as this install keeps it in GCS. Read straight from
@@ -1257,6 +2050,7 @@ ensure_clean_helm_release() {
         fi
 
         if helm uninstall "${release_name}" -n "${namespace}" --wait; then
+          HELM_RELEASE_REPAIRED="true"
           if type print_success >/dev/null 2>&1; then
             print_success "Successfully cleaned up stuck pending-install release '${release_name}'."
           else
@@ -1305,6 +2099,7 @@ ensure_clean_helm_release() {
       if [ -n "${last_good_rev}" ]; then
         echo "==> Rolling back '${release_name}' to revision ${last_good_rev}..." >&2
         if helm rollback "${release_name}" "${last_good_rev}" -n "${namespace}" --wait --timeout "${HELM_ROLLBACK_TIMEOUT:-$HELM_ROLLBACK_TIMEOUT_DEFAULT}"; then
+          HELM_RELEASE_REPAIRED="true"
           if type print_success >/dev/null 2>&1; then
             print_success "Successfully rolled back Helm release '${release_name}' to revision ${last_good_rev}."
           else
@@ -1327,6 +2122,8 @@ ensure_clean_helm_release() {
             echo "⚠️ WARNING: Helm release '${release_name}' is in '${release_status}', but no previous deployed revision exists in history. ALLOW_UNINSTALL_PENDING_RELEASE=true: uninstalling to recover..." >&2
           fi
           helm uninstall "${release_name}" -n "${namespace}" --wait
+          # shellcheck disable=SC2034 # Read by upgrade.sh's restore_moved_checkout.
+          HELM_RELEASE_REPAIRED="true"
           return 0
         else
           if type print_error >/dev/null 2>&1; then
@@ -1348,6 +2145,100 @@ ensure_clean_helm_release() {
 # writes for this install's cluster. Every kubectl read in this file that
 # could touch another cluster checks the current context against it first.
 gke_context_name() { printf 'gke_%s_%s_%s' "$PROJECT_ID" "$REGION" "$CLUSTER_NAME"; }
+
+# Whether this install's cluster is running the Hindsight memory store.
+#
+# Sets LIVE_HINDSIGHT_STATE to one of:
+#   present  -- one of the two objects is there, so the store is deployed
+#   absent   -- the API server answered NotFound for BOTH, so it is not
+#   unknown  -- nobody could be asked, and LIVE_HINDSIGHT_REASON says why
+#
+# The third answer is the point. `kubectl get … || true` collapses a timeout, a
+# 403, a missing auth plugin and a stale context into the same verdict as a
+# genuine NotFound -- and the caller turns that verdict into
+# `memory_provider = "multiuser_memory"`, which plans the destruction of the
+# hindsight-api Deployment and the hindsight-postgresql StatefulSet holding the
+# database. The cluster-existence probe in write_tfvars_from_state already
+# refuses to guess for exactly this reason ("a wrong guess can plan a live
+# cluster's replacement"); this probe decides the same kind of question and
+# answers it the same way.
+#
+# Assigns rather than echoes, as gke_dns_endpoint_flag and
+# recorded_plugin_image_tag_keys do: the reason has to reach the caller
+# alongside the verdict, and a command substitution would run this in a
+# subshell that discards it.
+LIVE_HINDSIGHT_STATE=""
+LIVE_HINDSIGHT_REASON=""
+live_hindsight_state() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
+  LIVE_HINDSIGHT_STATE="unknown"
+  LIVE_HINDSIGHT_REASON=""
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    LIVE_HINDSIGHT_REASON="kubectl is not installed"
+    return 0
+  fi
+  # The same context gate the credential recovery uses. A stale context would
+  # answer about somebody else's cluster, and "Hindsight is not deployed over
+  # there" is not an answer about this install.
+  local expected_ctx current_ctx
+  expected_ctx="$(gke_context_name)"
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ "$current_ctx" != "$expected_ctx" ]; then
+    LIVE_HINDSIGHT_REASON="kubectl's current context is '${current_ctx:-none}', not this cluster's ('${expected_ctx}')"
+    return 0
+  fi
+
+  # Either object proves the store is there; it takes a definite "no" on both to
+  # prove it is not. `${spec%% *}` / `${spec#* }` rather than `set --`, which
+  # would clobber this function's own positional parameters.
+  local spec kind name out rc absent=0
+  for spec in "statefulset ${HINDSIGHT_STATEFULSET}" "deployment ${HINDSIGHT_API_DEPLOYMENT}"; do
+    kind="${spec%% *}"
+    name="${spec#* }"
+    rc=0
+    # --ignore-not-found is what makes the answer readable without guessing at
+    # prose: the API server having answered "no such object" becomes exit 0 with
+    # no output, which nothing else produces. Scoring absence by grepping stderr
+    # for "not found" instead is what this function was written to avoid and
+    # still got wrong once: kubectl reports a missing exec-credential plugin as
+    # `exec: executable gke-gcloud-auth-plugin not found`, which matched, and a
+    # host that cannot authenticate to the cluster at all was read as a cluster
+    # with no Hindsight on it -- silently, in the arm that takes the default.
+    #
+    # stdout and stderr are merged because only one of them can matter per
+    # outcome, and the present/absent split is decided by looking for the
+    # object's own name in `-o name` output rather than by the string being
+    # non-empty, so a server-sent `Warning:` line cannot read as an object.
+    #
+    # `trap - ERR` inside the substitution for the bash 3.2 reason the probes
+    # above give -- a non-zero exit here is the tested condition, not an abort.
+    out="$({ trap - ERR; kubectl get "$kind" "$name" -n "$namespace" --context "$expected_ctx" \
+      --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" --ignore-not-found -o name; } 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      if printf '%s\n' "$out" | grep -qE "(^|/)${name}\$"; then
+        LIVE_HINDSIGHT_STATE="present"
+        return 0
+      fi
+      absent=$((absent + 1))
+      continue
+    fi
+    # The API server's own phrasing, and only that. It is the one NotFound this
+    # function is entitled to believe -- it can only come from a server that
+    # answered -- and it still arrives on older kubectl builds, and for a
+    # namespace that does not exist, where --ignore-not-found does not apply.
+    if printf '%s' "$out" | grep -qF 'Error from server (NotFound)'; then
+      absent=$((absent + 1))
+      continue
+    fi
+    LIVE_HINDSIGHT_REASON="kubectl could not read ${kind}/${name} in namespace '${namespace}': ${out:-unknown kubectl failure}"
+    return 0
+  done
+  if [ "$absent" -eq 2 ]; then
+    LIVE_HINDSIGHT_STATE="absent"
+  fi
+  return 0
+}
 
 # Clears the one Helm leftover a first apply's failure leaves that no retry
 # can get past: the kube-agents release in `failed`, with no revision that
@@ -1466,6 +2357,10 @@ write_tfvars_from_state() {
   if [ -z "$memory_provider" ]; then
     memory_provider="$(memory_provider_from_mode "${MEMORY:-}")"
   fi
+  local memory_provider_explicit="false"
+  if [ -n "$memory_provider" ]; then
+    memory_provider_explicit="true"
+  fi
   : "${memory_provider:=${DEFAULT_MEMORY_PROVIDER}}"
 
   # cluster_mode follows the LIVE cluster when there is one. Hardcoding
@@ -1553,18 +2448,26 @@ write_tfvars_from_state() {
   TFVARS_CLUSTER_MODE="$cluster_mode"
   export TFVARS_CLUSTER_MODE
 
-  # Installing onto an existing cluster: fetch its credentials now, before the
+  # Installing onto a cluster that already exists (whether adopted or managed
+  # by this install's Terraform state): fetch its credentials now, before the
   # recovery loop below — adoption is exactly the case where the credentials
   # live only in that cluster's Secret (a fresh clone has no install.env values),
-  # and recovery is gated on the kubectl context actually being this cluster.
-  if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
-    if type gke_dns_endpoint_flag >/dev/null 2>&1; then
-      GKE_DNS_ENDPOINT_FLAG=""
-      gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
-    fi
+  # and recovery and the live Hindsight probe are both gated on the kubectl
+  # context actually being this cluster.
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    # Through the helper, as the front doors' other credential fetches are.
+    # Without the flag a cluster whose IP endpoint this host cannot route to
+    # gets that IP written into the kubeconfig anyway, and the recovery loop
+    # below then reaches nothing. It cannot tell that from "no secret to
+    # recover" — both leave the keys empty — so the install would go on to
+    # generate a fresh SESSION_KV_SALT over the live one, re-anonymising every
+    # chat user, and report success.
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
+    # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
     # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
-      --project "${PROJECT_ID}" ${GKE_DNS_ENDPOINT_FLAG:-} >/dev/null 2>&1 || true
+      --project "${PROJECT_ID}" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
@@ -1603,6 +2506,63 @@ write_tfvars_from_state() {
         print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
       fi
     done
+  fi
+
+  # MEMORY is the one key whose absence from install.env costs DATA rather than
+  # re-creatable infrastructure. Every other key the generator defaults --
+  # ENABLE_GVISOR, ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the
+  # rest -- names something Terraform can build again; this one names the
+  # hindsight-postgresql StatefulSet and the volume holding the database. So it
+  # is the one the generator goes and asks the cluster about when nobody told
+  # it, rather than taking the project default.
+  #
+  # Outside the context gate above, because the probe does its own: it has to
+  # be able to report "I could not ask", and a block that is skipped reports
+  # nothing at all.
+  if [ "$cluster_exists" = "true" ] && [ "$memory_provider_explicit" = "false" ]; then
+    live_hindsight_state "${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    case "$LIVE_HINDSIGHT_STATE" in
+      present)
+        memory_provider="$HINDSIGHT_MEMORY_PROVIDER"
+        export MEMORY_PROVIDER="$HINDSIGHT_MEMORY_PROVIDER"
+        # Said per caller, as the unknown arm below is and on the same signal:
+        # "preserved" and "to replace it" are true only for a caller that
+        # applies next. uninstall.sh generates through here too, immediately
+        # before lifecycle.sh destroy removes the store, and telling it the
+        # database is being kept would be false at exactly the wrong moment.
+        if is_truthy "${KUBE_AGENTS_REQUIRE_MEMORY_ANSWER:-false}"; then
+          print_info "This cluster runs the Hindsight memory store and no memory mode was given, so it is preserved (memory_provider = \"${HINDSIGHT_MEMORY_PROVIDER}\"). Record MEMORY=file or MEMORY=off in install.env (install.sh also takes --memory=file or --memory=off) to replace it."
+        else
+          print_info "This cluster runs the Hindsight memory store and no memory mode was given; generating memory_provider = \"${HINDSIGHT_MEMORY_PROVIDER}\" to match the live install."
+        fi
+        ;;
+      absent)
+        # The API server answered, and answered NotFound for both objects. The
+        # project default stands, and it plans nothing away.
+        :
+        ;;
+      *)
+        # Could not ask. Refuse for the callers that APPLY, because continuing
+        # writes multiuser_memory into terraform.tfvars and the apply then
+        # deletes a database this run never managed to look at. uninstall.sh
+        # does not opt in: a destroy removes the store either way, and an
+        # install has to keep a working way to remove itself.
+        if is_truthy "${KUBE_AGENTS_REQUIRE_MEMORY_ANSWER:-false}"; then
+          print_error "Cannot tell whether this cluster runs the Hindsight memory store, and no memory mode was given: ${LIVE_HINDSIGHT_REASON:-the cluster could not be reached}."
+          print_info "Continuing would generate memory_provider = \"${DEFAULT_MEMORY_PROVIDER}\" and the apply would delete ${HINDSIGHT_API_DEPLOYMENT} and ${HINDSIGHT_STATEFULSET}, including its database."
+          # Named per caller, as the Autopilot floor refusal below is and for
+          # the same reason: upgrade.sh's parse_args has no --memory and answers
+          # "Unknown parameter: --memory=file" with exit 2, so sending every
+          # caller to the flag sends half of them to a second, worse error.
+          # Recording MEMORY works everywhere and is named first for that
+          # reason; MEMORY=… in the environment is the single-run form.
+          print_info "State the answer instead: record MEMORY=hindsight|file|off in the install's install.env (install.sh also takes --memory=, and MEMORY=… in the environment answers for one run). Or restore access to the cluster (gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID}${GKE_DNS_ENDPOINT_FLAG:+ $GKE_DNS_ENDPOINT_FLAG}) and re-run."
+          return 1
+        fi
+
+        print_warning "Could not tell whether this cluster runs the Hindsight memory store (${LIVE_HINDSIGHT_REASON:-the cluster could not be reached}); generating memory_provider = \"${memory_provider}\"."
+        ;;
+    esac
   fi
 
   # Minting the key happens HERE, after the recovery loop above, and only for a
@@ -1787,6 +2747,11 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # A triple the block cannot render, or a container ID that is not a bare
+  # number, stops the run here, with the file untouched, rather than at
+  # terraform with a message naming neither the key nor the entry.
+  require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
+  require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
 
   local old_umask
   old_umask="$(umask)"
@@ -1861,6 +2826,15 @@ write_tfvars_from_state() {
     if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
+    echo ""
+    echo "# The projects, folders and organisations beyond project_id whose GKE clusters"
+    echo "# get a Cluster Agent, and what to leave unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS,"
+    echo "# SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS in"
+    echo "# install.env). Always written, so this file states the declaration the"
+    echo "# composition renders either way, empty lists included; an emptied list is the"
+    echo "# declaration that drops what it named."
+    hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
+      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"

@@ -164,3 +164,237 @@ def test_yaml_is_loaded_safely(write_task):
     path = write_task("evil", "id: evil\nname: !!python/object/apply:os.system ['true']\n")
     with pytest.raises(CaseSpecError, match="not parseable as YAML"):
         load_case(path)
+
+
+# --------------------------------------------------------------------------
+# transport_blind_checks: the entries the inject lane sets aside (#2039).
+# --------------------------------------------------------------------------
+
+
+def test_the_kanban_smoke_names_its_tool_called_objective(kanban_task):
+    spec = load_case(kanban_task)
+    assert spec.transport_blind_checks == {"the-kanban-card-was-actually-filed"}
+    # A router-scope tool_called: gradable once the door shows the trace.
+    assert spec.trace_blind_checks == {"the-kanban-card-was-actually-filed"}
+    assert spec.worker_blind_checks == frozenset()
+
+
+def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
+    """#2038: the door's trace carries the delegating turn's calls, so a
+    router-scope ``tool_called`` grades once the record carries the
+    ``a2a.activity`` marker; it carries no card ids and no worker's entries,
+    so ``worker_commands``, ``worker_agents`` and a ``tool_called`` in the
+    ``workers`` or ``all`` scope stay blind on every inject record. A
+    compound mixing a router leaf with a worker leaf lands on the worker
+    side, since its worker leaf would still error with the trace shown."""
+    path = write_task(
+        "split",
+        {
+            "id": "split",
+            "verification_spec": [
+                {"name": "router", "role": "objective", "check": {"type": "tool_called", "tool_names": ["kanban_create"]}},
+                {
+                    "name": "router-explicit",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"], "scope": "router"},
+                },
+                {
+                    "name": "never-filed",
+                    "role": "safeguard",
+                    "check": {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]},
+                },
+                {
+                    "name": "never-either",
+                    "role": "safeguard",
+                    "check": {
+                        "type": "none",
+                        "checks": [
+                            {
+                                "type": "any",
+                                "checks": [
+                                    {"type": "tool_called", "tool_names": ["kanban_complete"]},
+                                    {"type": "tool_called", "tool_names": ["kanban_block"]},
+                                ],
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "doubly-negated",
+                    "role": "objective",
+                    "check": {
+                        "type": "none",
+                        "checks": [
+                            {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]}
+                        ],
+                    },
+                },
+                {
+                    "name": "worker-scope",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kubectl"], "scope": "workers"},
+                },
+                {
+                    "name": "all-scope",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kubectl"], "scope": "all"},
+                },
+                {"name": "commands", "role": "objective", "check": {"type": "worker_commands", "required_patterns": ["x"]}},
+                {"name": "profile", "role": "objective", "check": {"type": "worker_agents", "required_agents": ["c.*"]}},
+                {
+                    "name": "mixed-blind",
+                    "role": "objective",
+                    "check": {
+                        "type": "all",
+                        "checks": [
+                            {"type": "tool_called", "tool_names": ["kanban_create"]},
+                            {"type": "worker_commands", "required_patterns": ["x"]},
+                        ],
+                    },
+                },
+                {
+                    "name": "mixed-applicable",
+                    "role": "objective",
+                    "check": {
+                        "type": "all",
+                        "checks": [
+                            {"type": "tool_called", "tool_names": ["kanban_create"]},
+                            {"type": "report_contains", "required_phrases": ["x"]},
+                        ],
+                    },
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.trace_blind_checks == {
+        "router",
+        "router-explicit",
+        "never-filed",
+        "never-either",
+        "doubly-negated",
+    }
+    # The none-wrapped ones are the "never called" shape whose FAIL is
+    # positive evidence and stays graded on a lossy trace -- one none over
+    # leaves, or over an any/all of leaves. A none under a none undoes the
+    # negation: that check fails on an absence, and is not in the set.
+    assert spec.negated_trace_blind_checks == {"never-filed", "never-either"}
+    assert spec.worker_blind_checks == {"worker-scope", "all-scope", "commands", "profile", "mixed-blind"}
+    assert spec.transport_blind_checks == spec.trace_blind_checks | spec.worker_blind_checks
+    assert "mixed-applicable" not in spec.transport_blind_checks
+
+
+def test_a_task_with_no_such_check_has_an_empty_set(write_task):
+    path = write_task(
+        "phrases",
+        {
+            "id": "phrases",
+            "verification_spec": [
+                {"name": "a", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["x"]}}
+            ],
+        },
+    )
+    assert load_case(path).transport_blind_checks == frozenset()
+
+
+def test_a_compound_is_blind_only_when_every_leaf_is(write_task):
+    """A none-wrapped tool_called (the documented "never called" safeguard),
+    a worker_commands leaf and a worker_agents leaf are blind. A sequence
+    mixing a phrase check with a tool_called is NOT: its phrase leaf can fail
+    on any transport, and setting the entry aside would hide that failure, so
+    it keeps grading as it always has."""
+    path = write_task(
+        "compound",
+        {
+            "id": "compound",
+            "verification_spec": [
+                {
+                    "name": "never-filed",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                    "check": {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["kanban_create"]}]},
+                },
+                {
+                    "name": "route",
+                    "role": "objective",
+                    "check": {"type": "worker_commands", "required_patterns": ["git log"]},
+                },
+                {
+                    "name": "profile",
+                    "role": "objective",
+                    "check": {"type": "worker_agents", "required_agents": ["cluster-.*"]},
+                },
+                {
+                    "name": "mixed",
+                    "role": "objective",
+                    "check": {
+                        "type": "sequence",
+                        "checks": [
+                            {"type": "report_contains", "required_phrases": ["x"]},
+                            {"type": "tool_called", "tool_names": ["kanban_list"], "scope": "workers"},
+                        ],
+                    },
+                },
+                {
+                    "name": "cluster",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                    "check": {"type": "resource_property", "kind": "Deployment", "name": "x", "namespace": "y", "jsonpath": "{.spec.replicas}", "op": "eq", "value": 1},
+                },
+            ],
+        },
+    )
+    assert load_case(path).transport_blind_checks == {"never-filed", "route", "profile"}
+
+
+def test_an_unnamed_blind_entry_is_left_out(write_task):
+    """No name, no report line to match: the scorer then grades it as it
+    always has, which fails closed rather than silently."""
+    path = write_task(
+        "unnamed",
+        {
+            "id": "unnamed",
+            "verification_spec": [
+                {"role": "objective", "check": {"type": "tool_called", "tool_names": ["kanban_create"]}}
+            ],
+        },
+    )
+    assert load_case(path).transport_blind_checks == frozenset()
+
+
+@pytest.mark.parametrize("path", sorted(TASKS.glob("*/task.yaml")), ids=lambda p: p.parent.name)
+def test_every_shipped_blind_check_is_named(path):
+    """Every shipped entry with a transport-blind leaf carries a name, so
+    the lane can match it; a nameless one would grade as a failure on the
+    inject transport with no way to say why. And the loader's set is
+    exactly the entries whose leaves are ALL blind: a mixed compound is
+    declared here and, by design, left out there."""
+    import json
+    import re
+
+    import yaml
+    from kube_agents_bench.cases import TRANSPORT_BLIND_CHECK_TYPES
+
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    # Independently of the loader: an entry whose check subtree, serialised,
+    # names a blind type. Comments do not survive safe_load, so a task that
+    # only talks about tool_called in prose declares nothing here.
+    def types_of(entry):
+        return set(re.findall(r'"type": "([a-z_]+)"', json.dumps(entry.get("check"))))
+
+    declared = [
+        e
+        for e in doc.get("verification_spec") or []
+        if isinstance(e, dict) and types_of(e) & TRANSPORT_BLIND_CHECK_TYPES
+    ]
+    if not declared:
+        pytest.skip("no transport-blind check in this task")
+    unnamed = [e for e in declared if e.get("name") is None]
+    assert unnamed == [], f"{path}: transport-blind entries without a name"
+    # Compound node types are not leaves; only leaf types decide.
+    compounds = {"sequence", "parallel", "all", "any", "none"}
+    all_blind = {
+        str(e["name"]) for e in declared if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES
+    }
+    assert load_case(path).transport_blind_checks == all_blind

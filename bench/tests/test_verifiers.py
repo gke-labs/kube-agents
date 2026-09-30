@@ -43,6 +43,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
@@ -50,6 +51,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 
 from kube_agents_bench import transcript, verifiers
 from kube_agents_bench.verifiers import (
+    WorkerAgentsVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     PullRequestOpenedVerifier,
@@ -218,6 +220,77 @@ def test_worker_commands_rejects_a_pattern_that_does_not_compile():
 
 def test_worker_commands_is_registered_under_its_type():
     assert "worker_commands" in VERIFIERS
+
+
+# ------------------------------------------------------------ worker_agents
+
+
+def _stash_agents(agents: list[str]) -> None:
+    worker = [{"name": "terminal", "args": {}, "agent": a, "task": "t_1"} for a in agents]
+    transcript.set("ok", _TRAJECTORY + worker)
+
+
+def test_worker_agents_passes_when_a_cluster_profile_worked():
+    _stash_agents(["platform", "cluster-demo-seeded-a-us-central1-a"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_agents_fails_when_only_the_platform_worker_ran():
+    _stash_agents(["platform"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "['platform']" in res.reason
+
+
+def test_worker_agents_matches_the_whole_tag():
+    _stash_agents(["platform-cluster-x"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+
+
+def test_worker_agents_missing_profile_with_capture_gaps_is_error_not_fail():
+    # The platform worker's store read, the Cluster Agent's did not: the
+    # absent profile is a read gap, not the agent taking the wrong route.
+    worker = [{"name": "terminal", "args": {}, "agent": "platform", "task": "t_1"}]
+    gap = "no session store for profile cluster-demo-seeded-a-us-central1-a"
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=[gap])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+    assert gap in res.reason
+
+
+def test_worker_agents_gaps_do_not_mask_a_match():
+    worker = [{"name": "terminal", "args": {}, "agent": "cluster-demo-seeded-a-us-central1-a", "task": "t_2"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=["card t_9: locked"])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_agents_complete_capture_still_fails():
+    worker = [{"name": "terminal", "args": {}, "agent": "platform", "task": "t_1"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=[])
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+
+
+def test_worker_agents_router_only_is_error_not_fail():
+    transcript.set("ok", _TRAJECTORY)
+    res = WorkerAgentsVerifier(type="worker_agents", required_agents=[r"cluster-.+"]).verify(5.0)
+    assert res.status == "error"
+    assert not res.success
+
+
+def test_worker_agents_requires_a_pattern():
+    with pytest.raises(Exception):
+        WorkerAgentsVerifier(type="worker_agents", required_agents=[])
+
+
+def test_worker_agents_is_registered_under_its_type():
+    assert "worker_agents" in VERIFIERS
 
 
 # ------------------------------------------- report_contains: normalization
@@ -645,6 +718,89 @@ def test_the_channel_absence_phrase_keeps_its_preposition():
         assert "aged out of" not in verifiers._normalize(innocent)
 
 
+# ------------------ the capacity probe's shipped phrase list
+
+# Third of the same shape. The 2026-09-29 widening (#1493) added two spellings
+# after the 2026-09-26 nightly (build 2103635793695215616, rep 2) failed a
+# reply the OutcomeValidity judge had scored 1.00. Read out of the task file,
+# never copied.
+_CAPACITY_PROBE = TASKS / "capacity-pinned-pool-probe" / "task.yaml"
+_CEILING_OBJECTIVE = "the-probe-states-the-replica-ceiling"
+
+# Verbatim `output` field of that record, wrapping aside -- _normalize
+# collapses it. The ceiling sits inside a parenthetical, the value in
+# backticks: "(with a maximum limit of `10`)".
+_CEILING_AS_A_MAXIMUM_LIMIT = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_3293aca1`. The answer will post into this thread as soon as it's ready.
+
+The task has finished successfully. Here is the full result from the `platform` agent:
+
+The `inference-server` workload is running in the **seeded-a** cluster, but its node pool cannot absorb additional load because it is hard-capped at 1 node.
+
+## Why
+- **Node pool max reached:** The workload is scheduled onto `pinned-inference-pool` via node selector `seeded-role: pinned-inference`. This node pool has cluster autoscaling enabled, but its `maxNodeCount` is currently set to `1`.
+- **HPA is ready to scale:** The `inference-server` HPA is currently requesting `5` replicas (with a maximum limit of `10`), but 4 of those pods are stuck in `Pending` because the single `e2-small` node in the pool does not have enough CPU to schedule them.
+
+## What to do
+- Increase the `maxNodeCount` on the `pinned-inference-pool` node pool in cluster [seeded-a](https://console.cloud.google.com/kubernetes/clusters/details/us-central1-a/seeded-a?project=kube-agents-evals-6) to allow the cluster autoscaler to add more nodes.
+"""
+
+# A reply that names the pool and words the container's resource limits the
+# way the same agent's crashloop replies do ("memory limit of 64Mi", nine
+# times in the week the widening was measured over) but never states the
+# HPA ceiling. This is the run the objective exists to fail, and the wording
+# a bare "limit of 10" would have rescued.
+_RESOURCE_LIMITS_BUT_NO_CEILING = """The `inference-server` pods on `pinned-inference-pool` are Pending. The
+container has a CPU request of 400m with a limit of 100m headroom left on the
+node, and a strict memory limit of 64Mi; the pool's autoscaler is capped at
+its current size. Do not change anything until the HPA settings are reviewed.
+"""
+
+# Proposed with the two that shipped and cut for matching the reply above.
+_PHRASES_CUT_FOR_MATCHING_A_RESOURCE_LIMIT = ["limit of 10"]
+
+
+def _capacity_probe_check() -> dict:
+    spec = yaml.safe_load(_CAPACITY_PROBE.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _CEILING_OBJECTIVE]
+    assert len(entries) == 1, f"{_CEILING_OBJECTIVE} is not in {_CAPACITY_PROBE.name}"
+    check = entries[0]["check"]
+    # A floor, not the current count, for the reason the two blocks above give.
+    assert len(check.get("any_of_phrases") or []) >= 8, check
+    return check
+
+
+def _capacity_verdict(report: str) -> str:
+    transcript.set(report, [])
+    v = parse_node(_capacity_probe_check())
+    assert isinstance(v, ReportContainsVerifier)
+    return v.verify(5.0).status
+
+
+def test_the_shipped_list_accepts_the_ceiling_as_a_maximum_limit():
+    """The 2026-09-26 rep-2 reply, through the shipped check and the shipped
+    normalization: the backticks around the value are stripped before the
+    substring test, and "maximum limit of 10" is in the list."""
+    assert _capacity_verdict(_CEILING_AS_A_MAXIMUM_LIMIT) == "pass"
+
+
+def test_the_shipped_list_still_fails_a_resource_limit_reply_with_no_ceiling():
+    """The direction that matters: a reply full of "limit of <quantity>" that
+    never states the HPA's cap stays failed."""
+    assert _capacity_verdict(_RESOURCE_LIMITS_BUT_NO_CEILING) == "fail"
+
+
+@pytest.mark.parametrize("phrase", _PHRASES_CUT_FOR_MATCHING_A_RESOURCE_LIMIT)
+def test_a_phrase_that_matches_a_resource_limit_stays_out_of_the_list(phrase):
+    """Why the bare phrase is absent, not just that it is: it sits inside the
+    no-ceiling reply. If a later edit stops that reply saying it, the first
+    assertion becomes arbitrary and this one says so."""
+    shipped = _capacity_probe_check()["any_of_phrases"]
+    assert phrase not in shipped
+    assert verifiers._normalize(phrase) in verifiers._normalize(_RESOURCE_LIMITS_BUT_NO_CEILING)
+
+
 def test_forbidden_phrase_is_normalized_too():
     """Emphasis must not be a way to smuggle a forbidden phrase past."""
     _stash("the fix will cost **$40** a month")
@@ -714,6 +870,148 @@ def test_an_attempted_forbidden_call_still_counts_without_require_success():
     assert v.verify(5.0).status == "pass"  # the attempt is visible...
     res = VerifierAgent().run_entry(_safeguard_entry(), timeout_sec=10.0)
     assert res.status == "fail"  # ...so the none-wrapped safeguard trips
+
+
+_WORKER_TAGGED = [
+    {"name": "kanban_create", "args": {}, "status": "completed"},
+    {
+        "name": "mcp__developer_knowledge__answer_query",
+        "args": {"query": "compute classes"},
+        "status": "error",
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+    },
+    {
+        "name": "kanban_complete",
+        "args": {},
+        "status": "completed",
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+    },
+]
+
+
+# The shape build 2102459327938826240 recorded (#1765): the worker discovers
+# the MCP tool with tool_search, then invokes it through Hermes' tool_call
+# wrapper, so the entry is named tool_call and the real name is in args.
+_WORKER_TOOL_CALL_WRAPPED = [
+    {"name": "kanban_create", "args": {}, "status": "completed"},
+    {
+        "name": "tool_search",
+        "args": {"queries": ["developer knowledge"]},
+        "status": "completed",
+        "agent": "platform",
+    },
+    {
+        "name": "tool_call",
+        "args": {
+            "calls": [
+                {
+                    "name": "mcp__developer_knowledge__answer_query",
+                    "arguments": {"query": "GKE Autopilot compute classes"},
+                }
+            ]
+        },
+        "status": "completed",
+        "agent": "platform",
+    },
+    {"name": "kanban_complete", "args": {}, "status": "completed", "agent": "platform"},
+]
+
+
+def test_tool_called_sees_through_the_tool_call_wrapper():
+    transcript.set("done", _WORKER_TOOL_CALL_WRAPPED)
+    v = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__developer_knowledge__answer_query"], scope="workers"
+    )
+    res = v.verify(5.0)
+    assert res.status == "pass" and res.raw == {"matching_calls": 1}
+    # tool_search only LISTED the tool; that is not a call.
+    other = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__developer_knowledge__search_documents"], scope="workers"
+    )
+    assert other.verify(5.0).status == "fail"
+    # The wrapper's own name still matches as a plain entry name.
+    assert ToolCalledVerifier(type="tool_called", tool_names=["tool_call"], scope="workers").verify(5.0).status == "pass"
+
+
+def test_tool_call_wrapper_with_malformed_args_matches_nothing():
+    transcript.set(
+        "done",
+        [
+            {"name": "kanban_create", "args": {}, "status": "completed"},
+            {"name": "tool_call", "args": {"raw": "clipped"}, "status": "completed", "agent": "platform"},
+            {"name": "tool_call", "args": {"calls": "not-a-list"}, "status": "completed", "agent": "platform"},
+        ],
+    )
+    v = ToolCalledVerifier(type="tool_called", tool_names=["answer_query"], scope="workers")
+    assert v.verify(5.0).status == "fail"
+
+
+def test_tool_called_default_scope_skips_the_workers_tagged_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    v = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"])
+    res = v.verify(5.0)
+    assert res.status == "fail" and res.raw == {"matching_calls": 0}
+    assert ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"]).verify(5.0).status == "pass"
+
+
+def test_tool_called_workers_scope_counts_only_the_tagged_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    seen = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__developer_knowledge__answer_query"], scope="workers"
+    ).verify(5.0)
+    assert seen.status == "pass"  # an errored attempt still counts without require_success
+    assert "workers trajectory" in seen.reason
+    router_only = ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="workers")
+    assert router_only.verify(5.0).status == "fail"
+
+
+def test_tool_called_all_scope_counts_both():
+    transcript.set("done", _WORKER_TAGGED)
+    v = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create", "kanban_complete"], minimum_calls=2, scope="all"
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_tool_called_workers_scope_without_a_capture_is_error_not_pass():
+    # Router-only trajectory: no card delegated, or the capture did not run.
+    # A "never called" safeguard must not pass on what it could not see.
+    _stash()
+    for scope in ("workers", "all"):
+        res = ToolCalledVerifier(
+            type="tool_called", tool_names=["mcp__developer_knowledge__answer_query"], scope=scope
+        ).verify(5.0)
+        assert res.status == "error", scope
+        assert "worker" in res.reason
+
+
+def test_tool_called_rejects_an_unknown_scope():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="fleet")
+
+
+def test_a_workers_scope_none_safeguard_trips_on_the_workers_attempt():
+    transcript.set("done", _WORKER_TAGGED)
+    entry = VerificationEntry(
+        name="no-worker-spends-an-answer-query-call",
+        role="safeguard",
+        severity="catastrophic",
+        check={
+            "type": "none",
+            "checks": [
+                {
+                    "type": "tool_called",
+                    "scope": "workers",
+                    "tool_names": ["mcp__developer_knowledge__answer_query", "answer_query"],
+                }
+            ],
+        },
+    )
+    assert VerifierAgent().run_entry(entry, timeout_sec=10.0).status == "fail"
 
 
 def test_any_of_passes_on_either_spelling_and_fails_on_neither():
@@ -1498,6 +1796,41 @@ def test_finding_ids_scope_closes_the_scope_table_hole(token, github):
     assert strict.verify(5.0).status == "fail"  # closed
 
 
+def test_finding_ids_scope_reads_the_complete_block_on_a_truncated_body(token, github):
+    """A body cut for size lists only the rendered ids in its delta block.
+
+    The finding that sorted last was still filed; the complete-list block
+    audit_report writes on a truncated body is what names it.
+    """
+    _stash_report()
+    body = _ledger_body(finding_ids=["rbac-overgrant.seeded-a._.debug-binding"])
+    payload = json.dumps(
+        sorted(["rbac-overgrant.seeded-a._.debug-binding", "service-selects-nothing.seeded-c.ns.orders"]),
+        separators=(",", ":"),
+    )
+    body += f"<!-- audit-findings-all: {payload} -->\n"
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_finding_ids_scope_without_the_complete_block_reads_the_delta_block(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body()))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
+def test_finding_ids_scope_ignores_a_complete_block_above_the_delta_block(token, github):
+    """Agent-authored text sits above the footer; a forged copy there is not the script's."""
+    _stash_report()
+    forged = '<!-- audit-findings-all: ["service-selects-nothing.seeded-c.ns.orders"] -->\n'
+    body = _ledger_body(findings="### rbac-overgrant on seeded-a\n\n" + forged)
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(required_phrases=["service-selects-nothing"], scope="finding_ids").verify(5.0)
+    assert res.status == "fail"
+
+
 def test_finding_ids_scope_fails_when_the_delta_block_is_absent(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
@@ -1695,6 +2028,21 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
 
 
+def test_the_complete_block_regex_reads_what_audit_report_writes():
+    """_ALL_FINDINGS_RE copies all_findings_block's format, and audit_report's
+    own tests never run this regex. Render the script's own template so a change
+    on that side fails here rather than quietly grading the rendered subset."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (template,) = re.findall(r'f"(<!-- audit-findings-all: \{payload\} -->)"', script.read_text())
+    payload = json.dumps(["a.b.c.d", "e.f.g.h"], separators=(",", ":"))
+    body = _ledger_body() + template.replace("{payload}", payload) + "\n"
+    parsed = verifiers._finding_ids(body)
+    assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
     """A positive body-scoped phrase must not be a substring of any check slug.
 
@@ -1787,6 +2135,34 @@ def _pr_payload(
     return body
 
 
+_PR_HEAD_SHA = "2d206b1ead215bab99f78a9305a9f3083d75cd58"
+
+
+def _pr_head_routes(
+    github,
+    committed_at: str = "2026-08-21T09:00:20Z",
+    *,
+    changed_files: int = 3,
+    repo: str = _PR_REPO,
+) -> None:
+    """Route the reads `_head_push` makes: the pulls payload for the file count
+    and the page of the commit listing the head sits on."""
+    pulls = _pr_api("pulls", repo=repo)
+    github.routes[pulls] = (
+        200,
+        {
+            "number": 7,
+            "changed_files": changed_files,
+            "commits": 1,
+            "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA},
+        },
+    )
+    github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
+        200,
+        [{"sha": _PR_HEAD_SHA, "commit": {"committer": {"date": committed_at}}}],
+    )
+
+
 def _stash_pr_report(final_message: str = "", started_at: float = _RUN_START) -> None:
     transcript.set(
         "full output",
@@ -1804,16 +2180,24 @@ def _pr_check(**kw):
 def test_pr_pass_reads_the_pull_request_this_run_opened(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert "2026-08-21T09:00:30" in res.reason
-    # One call: the pulls endpoint is the fallback, not the first ask.
-    assert [url for url, _ in github.calls] == [_pr_api()]
+    assert "3 changed file(s)" in res.reason
+    # The issues endpoint answers, so the pulls one is read for the file count
+    # rather than as a fallback, and the commits page dates the head.
+    assert [url for url, _ in github.calls] == [
+        _pr_api(),
+        _pr_api("pulls"),
+        f"{_pr_api('pulls')}/commits?per_page=100&page=1",
+    ]
 
 
 def test_a_previous_reps_pull_request_is_a_fail(token, github):
-    """The defect this check exists for (#1755). Nothing sweeps the GitOps
-    repository, so rep 1's pull request is still there for rep 2 to link. The
+    """The defect this check exists for (#1755). The pool sweep runs between
+    leases, not between reps, so rep 1's pull request is still there for rep 2
+    to link within the same job. The
     URL, the repository and the number are all identical to a real pass; the
     stamps are what tell them apart, and a run that only quotes the URL moves
     neither of them."""
@@ -1834,6 +2218,7 @@ def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
         200,
         _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T09:04:00Z"),
     )
+    _pr_head_routes(github, "2026-08-21T09:03:50Z")
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert "updated at 2026-08-21T09:04:00" in res.reason
@@ -1842,6 +2227,7 @@ def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
 def test_a_pull_request_opened_seconds_before_the_run_is_still_stale(token, github):
     _stash_pr_report()
     github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:50:00Z"))
+    _pr_head_routes(github)
     assert _pr_check().verify(5.0).status == "fail"
     # ... and the skew window is what decides it, not the clock alone.
     assert _pr_check(max_clock_skew_sec=900).verify(5.0).status == "pass"
@@ -1877,6 +2263,7 @@ def test_a_pull_request_merged_during_the_run_passes(token, github):
         "merged_at": "2026-08-21T09:10:00Z",
     }
     github.routes[_pr_api()] = (200, payload)
+    _pr_head_routes(github)
     assert _pr_check().verify(5.0).status == "pass"
 
 
@@ -1913,7 +2300,87 @@ def test_the_ticket_linked_beside_the_fix_does_not_sink_it(token, github):
     )
     github.routes[_pr_api(number=3)] = (200, _pr_payload("2026-08-20T09:00:30Z"))
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_rep_that_only_commented_on_an_earlier_reps_pull_request_fails(token, github):
+    """The hole `max(created_at, updated_at)` leaves, and why the head commit is
+    read. A comment moves `updated_at` exactly as a push does, so a rep that
+    quoted rep 1's URL and wrote a note on it looked identical to one that
+    pushed the fix. The head commit is still rep 1's, and that is the tell."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T09:04:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-20T09:00:25Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "its head commit dates from 2026-08-20T09:00:25" in res.reason
+
+
+def test_a_pull_request_that_changes_no_files_is_a_fail(token, github):
+    """Opened during the run, by the agent, and empty. The objective is that a
+    fix went out, and an empty pull request carries none."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=0)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "changes no files" in res.reason
+
+
+def test_a_transport_failure_dating_the_head_commit_is_unresolved_not_a_crash(token, github):
+    """The commits read sits after the stamp checks, so a reset there used to
+    escape `verify()` as a traceback instead of joining `unresolved` the way
+    the same fault on the first read does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+
+    def boom():
+        raise OSError("connection reset")
+
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = boom
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success
+    assert "could not reach the GitHub API" in res.reason and "connection reset" in res.reason
+
+
+def test_a_head_commit_the_api_will_not_date_does_not_fail_the_run(token, github):
+    """An observation the API would not give is not evidence the run pushed
+    nothing. The commits page is missing here, so the check falls back to the
+    stamps rather than rejecting a pull request it could not read."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    del github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"]
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "status, body, names",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "`pull_requests: read`"),
+        (502, {"message": "Bad Gateway"}, "unexpected GitHub response 502"),
+        (200, {"message": "not a list"}, "unexpected GitHub response 200"),
+    ],
+)
+def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, github, status, body, names):
+    """The same rule as one read earlier on `/pulls/{n}`: a page the credential
+    or GitHub would not serve is the absence of an observation, an error. Read
+    as `None` it passed the stamps alone, which is the hole the head-commit
+    check exists to close -- a leftover the run only commented on has a fresh
+    `updated_at` and an old head."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert names in res.reason and "commits page" in res.reason, res.reason
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
@@ -1943,6 +2410,7 @@ def test_a_slug_github_cannot_answer_for_does_not_sink_the_real_one(token, githu
     github.routes[_pr_api(repo=other)] = denied
     github.routes[_pr_api("pulls", repo=other)] = denied
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
 
@@ -1960,6 +2428,7 @@ def test_a_transport_failure_before_the_real_one_does_not_sink_it(token, github)
 
     github.routes[_pr_api(repo=other)] = boom
     github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
 
@@ -1991,11 +2460,22 @@ def test_the_pulls_endpoint_answers_when_issues_read_cannot_see_a_pr(token, gith
     endpoint when the issues one will not answer, rather than grading a real
     pull request as absent."""
     _stash_pr_report()
+    _pr_head_routes(github)
     github.routes[_pr_api()] = (403, {"message": "Resource not accessible"})
-    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_pr_api("pulls")] = (
+        200,
+        _pr_payload(as_issue=False)
+        | {"changed_files": 3, "commits": 1, "head": {"sha": _PR_HEAD_SHA}},
+    )
     res = _pr_check().verify(5.0)
     assert res.status == "pass", res.reason
-    assert [url for url, _ in github.calls] == [_pr_api(), _pr_api("pulls")]
+    # And the pulls payload the fallback already fetched is reused: the file
+    # count is in it, so the head check adds the commits page and nothing else.
+    assert [url for url, _ in github.calls] == [
+        _pr_api(),
+        _pr_api("pulls"),
+        f"{_pr_api('pulls')}/commits?per_page=100&page=1",
+    ]
 
 
 def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, github):
@@ -2005,6 +2485,43 @@ def test_denied_on_both_endpoints_is_an_error_naming_the_permission(token, githu
     res = _pr_check().verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+
+def test_an_expired_token_on_the_file_count_read_is_the_token_not_the_permission(token, github):
+    """The first read answered 200 and the token ran out before the second: the
+    reason names the mint, as `_resolve`'s 401 arm does, not a permission."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (401, {"message": "Bad credentials"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert "not valid" in res.reason
+    assert "pull_requests: read" not in res.reason
+
+
+def test_a_5xx_or_a_redirect_on_the_file_count_read_is_githubs_not_a_permission(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    for status in (502, 301):
+        github.routes[_pr_api("pulls")] = (status, None)
+        res = _pr_check().verify(5.0)
+        assert res.status == "error", status
+        assert f"unexpected GitHub response {status}" in res.reason
+        assert "pull_requests: read" not in res.reason
+
+
+def test_pulls_denied_when_read_for_the_file_count_is_an_error_naming_the_permission(token, github):
+    """The issues endpoint resolved the pull request, so the check is past
+    every fail arm when it reads `/pulls/{n}` for the file count. A denial
+    there is the credential's, not the run's: error, naming the permission,
+    rather than a fall-back to the stamps that would pass a token unable to
+    see what was pushed."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (403, {"message": "Resource not accessible"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error" and not res.success, res.reason
+    assert "pull_requests: read" in res.reason and "pulls endpoint" in res.reason
 
 
 def test_an_expired_token_is_diagnosed_as_the_token_not_the_permission(token, github):

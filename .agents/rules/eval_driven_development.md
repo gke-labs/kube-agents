@@ -25,7 +25,8 @@ secrets. For cases that read the seeded fleet, whether through `fixtures:` or by
 agent, is expected to have one. A stock install sandboxes the agent, which the harness's
 `kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
 has the ways round that. There is no path around the loop: a pull request that changes agent
-behaviour without eval evidence is not ready for review.
+behaviour without eval evidence is not ready for review; being one change in a stack is not an
+exception, and "What does not count" says why.
 
 ## The loop
 
@@ -53,8 +54,12 @@ still needs the judge even though only the deterministic checks decide.
 
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
-`BENCH_FLEET_KUBECONFIG_DIR` first. Without the fleet the case fails every time with the fleet
-phrases absent, which is broken, not red.
+`BENCH_FLEET_KUBECONFIG_DIR` first. The runner refuses to write kubeconfigs on your own
+credential unless told to: either set `FLEET_ALLOW_RUNNER_CREDENTIAL=1` (a fleet only you
+use), or apply the fleet stack with `user:<you>` added to `fleet_reader_token_creators` and
+set `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` — the default
+grants token-creator to the CI identities only, and `roles/owner` does not include it. Without the fleet the case
+fails every time with the fleet phrases absent, which is broken, not red.
 
 It must fail, and fail for the reason your change addresses. Keep the failing entry from
 `verification_report[]` in the run's `results.json` (its `status` and `reason`) and the line of the
@@ -78,8 +83,9 @@ request, with `owner:` set and a `docs/designs/domains.yaml` slug (or a reviewed
 "Registration"): it runs every night from the night it merges and builds its record; a
 presubmit seat is a later pull request that cites that record — one edit that moves the
 line to `hack/eval/presubmit-cases.txt` and adds the name to `hack/eval/blocking-roster.txt`
-(an `eval-crew` approval; since 2026-09-22 the presubmit runs the blocking roster only, and
-`scripts/test_eval_rosters.py` pins the two files as equal) — never the one that makes the
+(an `eval-crew` approval; since 2026-09-22 the presubmit runs the blocking roster only, plus
+the held-out seat a coverage tracker may take first, `presubmit-cases.txt`'s last section,
+which `scripts/test_eval_rosters.py` pins) — never the one that makes the
 case pass. A case whose fixture does not exist at all is a `FIXTURE_NOT_READY` entry in
 `scripts/validate_bench_cases.py` with its issue instead. A case already registered stays
 where it is. That seat is the admission, earned on the case's record
@@ -126,6 +132,17 @@ is this loop and nothing less:
 - A case run once, or a green you did not see. Three passing runs, observed.
 - A red you did not see. If you cannot run the case before the change, you do not know it tests
   the change.
+- A case deferred to another pull request in a stack, in either direction. The change merges with
+  this pull request, so the case merges with it. "The next one carries it" is a hand-off nobody has
+  accepted, and two bodies that each point at the other leave `main` holding a change no case
+  covers. No form of the hand-off survives: the sibling would have to merge first for the case to
+  reach `main` at all, and once it has, the case is registered there and step 1 is available to you
+  unchanged — run it red against that `main`, implement, green three times. So where the behaviour
+  genuinely cannot be observed until a sibling lands, the answer is merge order rather than a
+  hand-off. Wait for the sibling, then run the loop. Where the dependency runs both ways — neither
+  change observable without the other, so neither can merge first — they are one change and go in
+  one pull request that carries the case. The reviewer's thread stays open until this pull request
+  carries its own red.
 
 ## Finding a case
 

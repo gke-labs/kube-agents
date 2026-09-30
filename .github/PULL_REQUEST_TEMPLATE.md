@@ -28,6 +28,28 @@ file matters.
 
 <!-- Include related issues, PRs, follow-up work, or other background. -->
 
+## Bug Fix: Preventing Recurrence
+
+<!--
+Required when this PR fixes a bug, which includes every `fix` type, scoped or not.
+Otherwise write "Not a bug fix."
+
+- Why it shipped: the test, check, or review step that should have caught the bug, and
+  why it did not.
+- What catches it now: the test, eval case, or check that fails if the bug comes back,
+  and that fails without the fix: seen by you, or on record for an `expected_fail` case
+  this change flips. An existing case counts; name it.
+- Where else it lives: other places the same mistake could be, and whether you checked
+  them or the guard covers them.
+
+If nothing automated can catch it, say why and what stands in for it.
+
+Full contract: AGENTS.md, "Pull Request Hygiene", plus .agents/rules/pre_pr_review.md
+for the mechanics.
+-->
+
+-
+
 ## Testing
 
 <!-- Automated checks: unit tests, builds, `make docs-check`, `prettier --check`. -->

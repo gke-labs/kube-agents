@@ -1,10 +1,13 @@
-# CI-only build of all four images in a single Cloud Build.
+# CI-only build of the four first-party images in a single Cloud Build, plus,
+# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the three A2A images of
+# the next stack and the Hermes bridge sidecar (the `a2a` and `a2a-bridge`
+# steps at the end, no-ops otherwise).
 #
 # Why this exists next to cloudbuild.yaml rather than replacing it: that config
 # builds exactly one --target and is called with a different one by
 # .github/workflows/docker-publish-gcp.yml and
 # scripts/dev/dev_rebuild_agent.sh. Only hack/ci-deploy.sh needs
-# all four at once, so the multi-image shape lives here and the single-target
+# them all at once, so the multi-image shape lives here and the single-target
 # contract those two depend on stays untouched.
 #
 # What this buys, and why one build instead of three submits: the two agent
@@ -162,6 +165,77 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
+  # The next stack's three first-party images (a2a/Dockerfile.gateway,
+  # .authcallout, .worker), built only when hack/ci-deploy.sh runs under
+  # EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
+  # empty defaults the step prints one line and exits, and the `images:` list
+  # below stays the four it was: that list cannot be conditional and an empty
+  # entry fails the build, which is why this step pushes from inside itself.
+  # The operator's defaults for these name a private dev registry (#1557)
+  # that a leased project cannot pull from; the deploy script points the
+  # operator at these builds instead. Context is the a2a/ module root, as each
+  # Dockerfile's header says. One step rather than three: they share the Go
+  # module download layer, which the daemon serves to the second and third.
+  # Nothing here depends on the platform image, so the step starts at once,
+  # like sandbox and operator; the bridge, which does, is the step after.
+  - id: a2a
+    name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    waitFor: ["-"]
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "-c"
+      - |
+        if [ -z "$_A2A_GATEWAY_URI" ]; then
+          echo "A2A images not requested (EVAL_MODE_NEXT unset); skipping"
+          exit 0
+        fi
+        set -e
+        build_and_push() { # <Dockerfile suffix> <image URI>
+          docker build --platform linux/amd64 -t "$$2" -f "a2a/Dockerfile.$$1" a2a
+          docker push "$$2"
+        }
+        build_and_push gateway "$_A2A_GATEWAY_URI"
+        build_and_push authcallout "$_A2A_CALLOUT_URI"
+        build_and_push worker "$_A2A_WORKER_URI"
+
+  # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
+  # flag and the same no-op rule. It is FROM the platform-agent image of THIS
+  # build, by the tag the platform step gave it, never a registry default (the
+  # A2A owner's condition on #1661): the sidecar and the agent container it
+  # shares a pod with have to be one build. Hence the waitFor on platform, and
+  # the inspect below, which fails the build if that tag is not in this daemon
+  # rather than letting the builder resolve it from the registry, where the
+  # same tag from an earlier run of the same commit could stand in. A step of
+  # its own rather than a tail on the a2a step, so the three images above are
+  # not held behind the platform build; it also waits for a2a so its builder
+  # stage finds the Go module download layer already in the daemon. The
+  # `images:` list pushes the platform image once every step is done, so the
+  # bridge's base is in the registry before the deploy pulls either.
+  - id: a2a-bridge
+    name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    waitFor: ["platform", "a2a"]
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "-c"
+      - |
+        if [ -z "$_A2A_BRIDGE_URI" ]; then
+          echo "bridge image not requested (EVAL_MODE_NEXT unset); skipping"
+          exit 0
+        fi
+        set -e
+        if ! docker image inspect "$_PLATFORM_URI" >/dev/null 2>&1; then
+          echo "ERROR: $_PLATFORM_URI is not in this build's daemon; the bridge is built FROM this run's platform image only" >&2
+          exit 1
+        fi
+        docker build --platform linux/amd64 -t "$_A2A_BRIDGE_URI" \
+          --build-arg "PLATFORM_AGENT_IMAGE=$_PLATFORM_URI" \
+          -f a2a/Dockerfile.hermes-bridge a2a
+        docker push "$_A2A_BRIDGE_URI"
+
 # Presubmits push only PR-scoped immutable tags, avoiding cross-PR cache pollution
 # (gke-labs/kube-agents#635).
 images:
@@ -193,3 +267,9 @@ substitutions:
   _HERMES_AGENT_TAG: ""
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
+  # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
+  # sets all four together under EVAL_MODE_NEXT=1.
+  _A2A_GATEWAY_URI: ""
+  _A2A_CALLOUT_URI: ""
+  _A2A_WORKER_URI: ""
+  _A2A_BRIDGE_URI: ""

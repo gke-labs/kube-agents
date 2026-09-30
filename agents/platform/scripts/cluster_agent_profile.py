@@ -131,9 +131,11 @@ def read_cluster_identity(home: Path) -> dict[str, str] | None:
     """Read the ``cluster_identity`` block written into a profile's ``config.yaml``.
 
     Returns the ``{project, cluster, location}`` dict, or ``None`` if the config is
-    missing/unparseable or the block is absent/incomplete. This is the robust,
-    machine-readable inverse of :func:`_inject_cluster_identity` — reconciliation
-    reads it rather than trying to reverse the sanitized/hashed profile name.
+    missing/unparseable or the block is absent/incomplete. Raises if the config
+    cannot be read (permissions, encoding) or parses to something other than a
+    mapping. This is the robust, machine-readable inverse of
+    :func:`_inject_cluster_identity` — reconciliation reads it rather than trying
+    to reverse the sanitized/hashed profile name.
     """
     import yaml  # lazy: keeps the module importable without pyyaml on pure-lookup paths
 

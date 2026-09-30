@@ -246,48 +246,7 @@ else
   unset _install_env_dir
 fi
 
-# The state file install.env replaces. Loaded FIRST so install.env wins on
-# every key it carries, and only from a checkout -- a fresh clone has none.
-# This is the migration: an existing install keeps working with no action from
-# its owner, and the run writes their values into install.env on the way out.
-#
-# Resolved against the same checkout, for the same reason: under
-# `curl … | bash` a script-relative path names the invocation directory, not
-# the clone the migration has to read.
-LEGACY_VARS_FILE=""
-if [ -f "${_state_repo_dir}/k8s-operator/scripts/vars.sh" ]; then
-  LEGACY_VARS_FILE="${_state_repo_dir}/k8s-operator/scripts/vars.sh"
-fi
 unset _state_repo_dir
-
-load_legacy_vars_file() {
-  local file="${1:-}"
-  [ -n "$file" ] && [ -f "$file" ] || return 0
-  if ! bash -n "$file" 2>/dev/null; then
-    print_error "Legacy install state '$file' is not valid shell and could not be loaded."
-    exit 1
-  fi
-  set -a
-  # shellcheck disable=SC1090
-  . "$file"
-  set +a
-  # stderr, like the load message below and for the same reason.
-  print_warning "Loaded legacy install state from ${file}; install.env replaces it." >&2
-  # Telling the operator to delete vars.sh is only safe once its values are
-  # somewhere else, and this function cannot promise that. bootstrap_install_env_file
-  # is the sole writer, it runs near the end of main(), and it returns early
-  # when install.env already exists -- so --help, --menu, --dry-run, any abort,
-  # and every run against a file the operator wrote themselves reach the write
-  # never or as a no-op. An existing install.env is the dangerous case rather
-  # than the safe-looking one: `cp install.env.example install.env` carries no
-  # MEMORY, so discarding vars.sh there loses the only record that the install
-  # runs Hindsight, and the next apply derives multiuser_memory and tears it down.
-  if [ -f "$INSTALL_ENV_FILE" ]; then
-    print_info "${INSTALL_ENV_FILE} already exists and this run will not rewrite it. Copy anything you still need from vars.sh into it before deleting vars.sh." >&2
-  else
-    print_info "Once this run creates ${INSTALL_ENV_FILE}, check it against vars.sh and then delete vars.sh." >&2
-  fi
-}
 
 # Named apart from installer_common.sh's load_install_env, which this file
 # sources later and which upgrade.sh and uninstall.sh use. The two differ on
@@ -316,6 +275,15 @@ bootstrap_install_env() {
     fi
     return 0
   fi
+  # The scope keys render into the PlatformAgent and are recorded only by a
+  # first install, so once this file exists it is the only way in for them,
+  # as load_install_env makes it for upgrade.sh, uninstall.sh and the menu: a
+  # value inherited from the shell would declare a project the file does not
+  # record, applied for this run and dropped again, with its profiles, by the
+  # next run from a clean shell. A first install, which has no file yet, keeps
+  # the environment and records it; a typed --scope-* flag still overrides
+  # for one run and is warned about.
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -381,7 +349,6 @@ wants_help_only() {
 }
 
 if ! wants_help_only "$@"; then
-  load_legacy_vars_file "$LEGACY_VARS_FILE"
   bootstrap_install_env "$INSTALL_ENV_FILE"
 fi
 
@@ -419,6 +386,16 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # helpers are sourced, so no default is spelled twice.
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+# The multi-project scope (spec.scope): empty means the management project
+# alone, so there is no default to resolve.
+PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
+PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
+PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
+PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
+# Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
+# install.env alone and refuses a flag it would otherwise validate and drop.
+SCOPE_FLAG_PASSED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
@@ -459,6 +436,10 @@ memory_mode_from_provider() {
   esac
 }
 PARAM_MEMORY="${MEMORY:-$(memory_mode_from_provider "${MEMORY_PROVIDER:-}")}"
+PARAM_MEMORY_EXPLICIT="false"
+if [ -n "$PARAM_MEMORY" ]; then
+  PARAM_MEMORY_EXPLICIT="true"
+fi
 PARAM_ALLOWED_USERS="${ALLOWED_USERS:-}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
@@ -571,6 +552,18 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
+  --scope-projects=IDS          GCP projects beyond the install's whose GKE clusters get a
+                                Cluster Agent (space- or comma-separated); the agent's
+                                service account is granted the read roles in each
+  --scope-folders=IDS           Numeric GCP folder IDs; every project beneath, at any depth,
+                                is in scope, the read roles and roles/cloudasset.viewer are
+                                bound on the folder, and the Cloud Asset API is enabled
+  --scope-organizations=IDS     Numeric GCP organisation IDs, bound the same way (wide;
+                                prefer folders)
+  --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
+                                unmanaged
+  --scope-exclude-clusters=TRIPLES
+                                Clusters to leave unmanaged, each as project/location/cluster
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -721,6 +714,29 @@ validate_bool_flag_value() {
   fi
 }
 
+# A scope flag given nothing cannot mean "leave the recorded scope alone" (the
+# flag is what overrides the file for one run) and must not mean "drop every
+# project" in silence: applied, an empty --scope-projects= would revoke the
+# scoped projects' roles and retire their profiles while install.env still
+# named them, and the next upgrade would add them back. Refused, like an empty
+# toggle; the file is where a scope is emptied on purpose.
+require_scope_flag_value() {
+  local flag="$1" value="${2:-}" key
+  # A value that is nothing but separators (`,`, a space) renders the same
+  # empty list an empty value does, so it is refused the same way.
+  [[ "$value" == *[![:space:],]* ]] && return 0
+  case "$flag" in
+    --scope-projects) key="SCOPE_PROJECTS" ;;
+    --scope-folders) key="SCOPE_FOLDERS" ;;
+    --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
+    --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
+  esac
+  print_error "${flag}= was given an empty value."
+  print_info "To clear it, set ${key}= (empty) in install.env and re-run; to keep the recorded value, omit the flag."
+  exit 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -750,6 +766,21 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
+      --scope-projects=*)
+        PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
+      --scope-folders=*)
+        PARAM_SCOPE_FOLDERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_FOLDERS"; shift ;;
+      --scope-organizations=*)
+        PARAM_SCOPE_ORGANIZATIONS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_ORGANIZATIONS"; shift ;;
+      --scope-exclude-projects=*)
+        PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
+      --scope-exclude-clusters=*)
+        PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -771,7 +802,24 @@ parse_args() {
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
-      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
+      # Validated for emptiness here, ahead of resolve_shared_defaults.
+      # PARAM_MEMORY is seeded from MEMORY and resolved with
+      # ${PARAM_MEMORY:-$DEFAULT_MEMORY}, so `--memory=` out of a wrapper
+      # expanding an unset variable would arrive at main() as the well-formed
+      # default ("file") WITH PARAM_MEMORY_EXPLICIT="true" -- replacing a
+      # recorded MEMORY=hindsight and telling write_tfvars_from_state not to
+      # probe the live cluster before planning hindsight-postgresql away.
+      --memory=*)
+        PARAM_MEMORY="${1#*=}"
+        if [ -n "$PARAM_MEMORY" ]; then
+          PARAM_MEMORY_EXPLICIT="true"
+        else
+          print_error "--memory= was given an empty value."
+          print_info "Pass --memory=off, --memory=file, or --memory=hindsight, or omit the flag to keep the recorded setting."
+          exit 1
+        fi
+        shift
+        ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --third-party-registry-prefix=*) PARAM_THIRD_PARTY_REGISTRY_PREFIX="${1#*=}"; shift ;;
@@ -1373,7 +1421,9 @@ warn_flag_beats_unrecorded_file_value() {
     print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
   fi
   print_info "$consequence"
-  print_info "Set ${key}=${value} in ${file}, or repeat ${flag} on ${repeat_on}."
+  # %q, because the scope keys are the first list-valued values through here and
+  # a space-separated one printed bare would not paste back as one assignment.
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${flag} on ${repeat_on}."
 }
 
 bootstrap_install_env_file() {
@@ -1396,6 +1446,24 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    # The scope keys: a flag applies its declaration for this run, and the
+    # next full upgrade regenerates from the file, so a project the file does
+    # not name is dropped again, its bindings revoked and its profiles retired.
+    local scope_key scope_flag scope_value
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+      case "$scope_key" in
+        SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
+        SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
+        SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
+        SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
+        *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
+      esac
+      warn_flag_beats_unrecorded_file_value "$destination" "$scope_key" "$scope_flag" \
+        "$scope_value" \
+        "A later run without it regenerates the scope from the file: a project, folder or organisation the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
+        false \
+        "every later install.sh run"
+    done
     return 0
   fi
   if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -1447,6 +1515,15 @@ bootstrap_install_env_file() {
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_CUSTOM_ROLES "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   fi
+  # Recorded even when empty: the generator renders the scope block from these
+  # on every run, and a later upgrade.sh that finds no line renders the same
+  # empty block, so the presence of the keys is what tells an operator where
+  # a project is declared.
+  write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_FOLDERS "${SCOPE_FOLDERS:-}"
+  write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
@@ -1748,9 +1825,6 @@ source_provisioning_helpers() {
     exit 1
   fi
   SCRIPT_DIR="${repo_dir}/scripts/installer"
-  # The legacy state file, still at its original address: an install made
-  # before the move has one there and nowhere else.
-  VARS_FILE="${repo_dir}/k8s-operator/scripts/vars.sh"
   # shellcheck source=/dev/null
   source "$helper_script"
   # gke_dns_endpoint_flag, for the credentials fetch before the health checks.
@@ -2384,8 +2458,22 @@ print_generate_only_handoff() {
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""
   echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  # On an existing install only: first apply the chart's CRDs through the install's own context,"
+  echo -e "  # never the current one. Neither Helm nor lifecycle.sh upgrades them, and a field the served"
+  echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
+  echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
+  echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
+  echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
+  echo -e "  # SCOPE_ORGANIZATIONS and the two exclusions) is replaced by this apply, and the reconcile"
+  echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
+  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
+    echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
+    echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
+    echo -e "  # on the container, and a warning above, if any, says what this identity could not."
+  fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
@@ -3449,39 +3537,28 @@ run_menu_system() {
 
   local repo_dir
   repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
   local helper_script="${repo_dir}/scripts/installer/installer_common.sh"
 
   if [ ! -f "$helper_script" ]; then
     print_error "Cannot find installer helpers at $helper_script."
     exit 1
   fi
-  export VARS_FILE="$vars_file"
   # shellcheck disable=SC1090
   source "$helper_script"
 
-  if [ -f "$vars_file" ]; then
-    # shellcheck disable=SC1090
-    if ! source "$vars_file"; then
-      print_error "Configuration state is invalid and could not be loaded: $vars_file"
-      exit 1
-    fi
-  fi
-  # install.env was already loaded at startup, but sourcing vars.sh just now put
-  # the derived state back over the top of it. Re-apply the input so the
-  # hand-authored file is what the panel opens on, whichever order the two
-  # files disagree in.
+  # install.env is already loaded at startup; re-apply it here so the panel
+  # always opens on the operator's own input, whatever the sourced helpers
+  # left in the environment.
   load_install_env "$INSTALL_ENV_FILE" || true
   # That reload unsets NAMESPACE on its way in, for the reason
   # bootstrap_install_env does -- so --agent-namespace, which main() applied
   # before dispatching here, has to be applied again or the panel opens on the
   # default namespace and its Save & Apply writes tfvars for that one.
   apply_agent_namespace_override
-  # ...and the same for the memory setting, which the two files spell
-  # differently (install.env MEMORY, legacy vars.sh MEMORY_PROVIDER) so load
-  # order alone cannot make the input win. Save & Apply generates tfvars
-  # directly, without passing through the parameter block that resolves this
-  # pair on install.sh's own run.
+  # ...and the memory setting needs normalizing, because install.env spells it
+  # MEMORY while the provisioner reads MEMORY_PROVIDER. Save & Apply generates
+  # tfvars directly, without passing through the parameter block that resolves
+  # this pair on install.sh's own run.
   normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
@@ -3516,11 +3593,11 @@ run_menu_system() {
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
-  # already exists and its Save & Apply re-applies what it displays, so a
-  # vars.sh with no ENABLE_GVISOR has to read as the standard runtime — that is
-  # what such a cluster is actually running. Defaulting on here would show
-  # "gVisor Sandbox" for an unsandboxed install and then provision a node pool
-  # nobody asked for on the next apply.
+  # already exists and its Save & Apply re-applies what it displays, so an
+  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
+  # that is what such a cluster is actually running. Defaulting on here would
+  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
+  # pool nobody asked for on the next apply.
   local enable_gvisor="${ENABLE_GVISOR:-false}"
   # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
   # the panel has to read as what an unconfigured install is running. Flipping
@@ -3714,10 +3791,32 @@ run_menu_system() {
         #
         # No re-source: save_env_var exports as it writes, so the environment
         # write_tfvars_from_state reads is already current.
-        write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        #
+        # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER, because run_lifecycle_apply below
+        # is a full apply. This panel is the front door most likely to reach the
+        # generator with no memory answer at all -- normalize_memory_vars returns
+        # immediately when install.env carries no MEMORY line, and --menu is
+        # dispatched before the prerequisite check, so kubectl may not even be
+        # usable -- and an operator reaches it to change a model provider, not to
+        # decide the fate of a database.
+        KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+          write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
+        # The menu edits no scope key, so the keys are the recorded ones; this
+        # still refuses a re-apply over a scope the CR gained by hand since.
+        # The menu establishes no kubeconfig context of its own, so fetch one
+        # first, as main() does before its summary; the check refuses if the
+        # fetch did not land.
+        GKE_DNS_ENDPOINT_FLAG=""
+        gke_dns_endpoint_flag "$cluster_name" "$REGION" "$PROJECT_ID" || true
+        # shellcheck disable=SC2086
+        gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
+          --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+        refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        check_scope_container_access || exit 1
+        apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
@@ -3786,6 +3885,13 @@ main() {
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    # The menu reloads install.env and reads the scope keys from it alone; a
+    # flag here would be validated and then dropped without a word.
+    if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
+      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      exit 1
+    fi
     run_menu_system
     exit 0
   fi
@@ -3854,7 +3960,7 @@ main() {
   # tooling; gke-gcloud-auth-plugin allows kubectl to authenticate to GKE.
   # Everything is checked up front rather than discovered halfway through with
   # the cluster already created.
-  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin; do
+  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
@@ -4622,10 +4728,15 @@ main() {
   permission_set=$(printf '%s' "$permission_set" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   # require_supported_permission_set (installer_common.sh) is the one home for
   # the accepted vocabulary and for the explanation the removed admin bundle
-  # gets -- a PLATFORM_AGENT_PERMISSION_SET inherited from a vars.sh or a CI
+  # gets -- a PLATFORM_AGENT_PERMISSION_SET carried in install.env or a CI
   # environment variable written before the removal lands here.
   require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
+  local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
+  local scope_folders="${PARAM_SCOPE_FOLDERS:-}"
+  local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
+  local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
+  local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
   # This rule is also written in init_var_platform_agent_permission_set
   # (scripts/installer/common.sh), which has no caller left in the repository
   # -- the numbered provision scripts that used to invoke it went with #797. So
@@ -4783,6 +4894,7 @@ main() {
       hindsight) memory_choice="2" ;;
       off) memory_choice="3" ;;
     esac
+    local memory_seed_choice="$memory_choice"
     case "$memory_choice" in
       2) mem_tag_hind=" (Default)" ;;
       3) mem_tag_off=" (Default)" ;;
@@ -4802,6 +4914,32 @@ main() {
       2) memory_mode="hindsight" ;;
       3) memory_mode="off" ;;
     esac
+    # Not unconditional, which is what it used to be. When nothing stated a
+    # memory mode, resolve_shared_defaults has already put DEFAULT_MEMORY
+    # (`file`) into PARAM_MEMORY, so the seed above is 1 and the "(Default)" tag
+    # sits on the file store because of a project-wide default, not because this
+    # install chose it. prompt_menu returns that same 1 for a bare enter, so
+    # marking it explicit turns "the operator said nothing" into "the operator
+    # chose file" -- and that skips live_hindsight_state in the generator, which
+    # is the whole of what stands between a Hindsight install whose install.env
+    # predates the MEMORY key and an apply that deletes hindsight-postgresql and
+    # its database. That is the population the retirement of vars.sh created:
+    # before it, a pre-0.4.0 checkout seeded this prompt on option 2 from the
+    # MEMORY_PROVIDER that file carried, so enter kept Hindsight.
+    #
+    # Moving off the seeded option is a statement, and so is an install.env or
+    # --memory that set PARAM_MEMORY_EXPLICIT before the interview. What is left
+    # -- accepting the seed when nothing seeded it -- is deliberately read as
+    # "no answer" and handed to the probe. A typed "1" is indistinguishable from
+    # enter here (prompt_menu returns the number either way), so it is read the
+    # same: on a cluster running Hindsight the generator then preserves it and
+    # says so, and the pre-flight summary shows the store the apply will keep
+    # before anything is applied. Losing an argument with the operator that way
+    # costs one re-run with --memory=file; losing it the other way costs the
+    # database.
+    if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
+      PARAM_MEMORY_EXPLICIT="true"
+    fi
   fi
 
   # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
@@ -4821,7 +4959,7 @@ main() {
   # alongside whichever provider is chosen — two competing stores in front of one
   # agent. Every provider here replaces it rather than supplementing it. Nothing
   # about memory keys off this flag, so an upgrade cannot read a false left in an
-  # old vars.sh as "this install wanted no memory".
+  # old install.env as "this install wanted no memory".
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
@@ -4832,14 +4970,16 @@ main() {
   # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
+  # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither
+  # install.env nor --memory), leave MEMORY_PROVIDER empty when calling
+  # write_tfvars_from_state so the generator can preserve a live Hindsight
+  # deployment on an existing cluster before falling back to multiuser_memory.
   local memory_enabled="false"
-  # memory_provider_from_mode (installer_common.sh) owns the mode → provider
-  # table; upgrade.sh and the Day-2 menu resolve the same pair through it, and a
-  # second copy here is how the three drift. It returns empty for a mode it does
-  # not recognise, which is what the fallback covers.
-  local memory_provider
-  memory_provider="$(memory_provider_from_mode "$memory_mode")"
-  [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  local memory_provider=""
+  if [ "$PARAM_MEMORY_EXPLICIT" = "true" ]; then
+    memory_provider="$(memory_provider_from_mode "$memory_mode")"
+    [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  fi
 
   print_step "10. Resolving Install Configuration"
   local registry_prefix="${PARAM_REGISTRY_PREFIX%/}"
@@ -4924,6 +5064,11 @@ main() {
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
+  export SCOPE_PROJECTS="$scope_projects"
+  export SCOPE_FOLDERS="$scope_folders"
+  export SCOPE_ORGANIZATIONS="$scope_organizations"
+  export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
+  export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
   # One release of overlap: the agent runtime and the chart still speak
@@ -4958,8 +5103,31 @@ main() {
   # install.sh is the one front door allowed to mint an API_SERVER_KEY, and only
   # after the generator has tried the live Secret. upgrade.sh and uninstall.sh
   # leave this unset so an unfindable key stays an error for them.
+  #
+  # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER: "could not tell whether the cluster runs
+  # Hindsight" has to stop this run rather than fall through to multiuser_memory
+  # and let an apply delete the database. Unconditional, including under
+  # --dry-run and --generate-only, because both of those write this same
+  # tfvars_file in the real composition directory and --generate-only exists
+  # precisely to hand it to `lifecycle.sh apply` -- so a guess here is applied
+  # either way, just later and by someone who did not see the run that made it.
+  # That is why this does not take the warn-under---dry-run shape the coordinate
+  # checks use: those refuse before writing anything.
+  #
+  # Only reachable when nothing stated a memory mode -- PARAM_MEMORY_EXPLICIT is
+  # false, which left MEMORY_PROVIDER empty above -- and never on a cluster that
+  # does not exist yet. uninstall.sh deliberately does not opt in.
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
+  if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then
+    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"
+    export MEMORY_PROVIDER="$memory_provider"
+    if [ "$memory_provider" = "kube_agents_memory" ]; then
+      memory_mode="hindsight"
+      PARAM_MEMORY="hindsight"
+    fi
+  fi
   # After the generator, because its Secret-recovery loop is the thing that can
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
@@ -4970,6 +5138,40 @@ main() {
   # service account the apply would 409 on is something to know before
   # answering "proceed", and it costs a describe per account. Read-only.
   check_service_account_ownership || exit 1
+  # For the same reason, and only for a run that will apply: the apply renders
+  # spec.scope from the keys over the live PlatformAgent, and a scope it
+  # carries that neither the release record nor the keys account for is
+  # refused here, before the operator confirms, the App key is imported or an
+  # adopted cluster is changed, rather than replaced. The context is fetched
+  # here because the generator fetches one only for an adoption; a fetch that
+  # does not land is the check's own refusal. A first install has no cluster
+  # yet and skips this.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
+      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  fi
+  # A declared folder or organisation is bound by the apply with this
+  # identity, in the container itself, and turns on the Asset API in the host
+  # project; both are checked before anything is applied, first install
+  # included, so a container this identity cannot bind or an organisation
+  # policy that forbids the API stops the run rather than failing it partway.
+  # The mode follows the route: a run that will apply is refused, a run that
+  # hands the apply to lifecycle.sh only warns, because that apply often runs
+  # later as a CI or platform identity and the credentials probed here are the
+  # ones at the keyboard. Here the route is known for --generate-only and -y;
+  # an interactive run learns it at the (Y/n/g) prompt below and is checked
+  # there, so the g answer is the same choice as the flag.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      check_scope_container_access || exit 1
+    fi
+  fi
 
   # Prompt for opt-ins on existing cluster mutations before the summary
   # checkpoint -- and before install.env is written, so an answer given here
@@ -5121,9 +5323,14 @@ main() {
     prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
     case "$confirm_choice" in
       [Yy])
+        # The apply is chosen: the container preflight refuses here, before
+        # step 12 writes anything, as it does above the summary for -y.
+        check_scope_container_access || exit 1
         ;;
       [Gg])
+        # The handoff is chosen: the same check only warns, as for the flag.
         PARAM_GENERATE_ONLY="true"
+        check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
         print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
@@ -5189,18 +5396,17 @@ main() {
   # Terraform, which never recorded it, plans a create. Whenever the cluster
   # is already there -- adopted, or created by this state on the attempt that
   # died -- and only for a release no revision of which ever served. The
-  # generator fetched credentials on the adoption path alone, so fetch them
-  # here for the other; the check itself refuses to look at any other context.
+  # context is the one fetched before the step-11 summary for the scope check
+  # (with the DNS-endpoint flag step 13 passes, since without it the fetch
+  # fails on a DNS-endpoint-only cluster and the context gate below does not
+  # match); the check itself refuses to look at any other context.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
-    # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
-    # a DNS-endpoint-only cluster, the context gate below does not match, and
-    # the check skips exactly the retry it exists for.
-    GKE_DNS_ENDPOINT_FLAG=""
-    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
-      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+    # A re-run is how INSTALL.md says to change configuration, and Helm never
+    # upgrades CRDs, so the schema is applied here as upgrade.sh applies it
+    # before its own apply; a field the served CRD lacked would otherwise be
+    # pruned from the CR, and stay pruned.
+    apply_crd_upgrades "$repo_dir"
   fi
 
   local provisioning_log

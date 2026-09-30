@@ -279,7 +279,10 @@ class ReadStoreTest(unittest.TestCase):
             objects[url_of(f"case-{i}", name)] = json.dumps({"case": f"case-{i}", "recorded_at": f"2026-09-{1 + i % 9:02d}T05:00:{i % 60:02d}Z", "key": {}, "runs": 1, "passes": 1}) + "\n"
         gsutil = FakeGsutil(objects)
         doc = read(gsutil)
-        self.assertEqual([len(c) - 2 for c in gsutil.cats], [100, 100, 50])
+        # The chunks are read on a thread pool, so the fake records them in the
+        # order the threads finished, not the order they were submitted; the
+        # sizes are what the test pins, not which finished first.
+        self.assertEqual(sorted(len(c) - 2 for c in gsutil.cats), [50, 100, 100])
         self.assertEqual(len(doc["records"]), 250)
 
 

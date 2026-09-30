@@ -61,7 +61,9 @@ What this does *not* check is that a cron prompt's citation of its SOP's
 line geography still matches the SOP. That is covered by
 ``test_cron_prompts_cite_the_real_sop_geography`` in
 ``agents/platform/skills/fleet-audit/scripts/test_audit_report.py``, which
-re-derives the numbers from the SOP itself.
+re-derives the numbers from the SOP itself, and by
+``scripts/generate_sop_geography.py --check`` under ``make docs-check``,
+which is the script that rewrites them.
 
 Findings print to stderr as ``path:line: [rule] message``, and under GitHub
 Actions each one is also emitted as an ``::error`` annotation so it lands on the
@@ -768,7 +770,8 @@ def check_cron_assets() -> list[Finding]:
 
     Whether a prompt's line-count citation still matches its SOP is verified
     by `test_cron_prompts_cite_the_real_sop_geography` in the fleet-audit
-    suite, which re-derives the numbers from the SOP itself. This only asks the
+    suite and by `scripts/generate_sop_geography.py --check`, both of which
+    re-derive the numbers from the SOP itself. This only asks the
     cheaper question that test does not ask of every roster: does the file
     exist at all.
     """

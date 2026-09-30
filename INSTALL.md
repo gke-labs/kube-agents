@@ -20,6 +20,7 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
    - [Generate-Only Mode (Recommended for Existing Infrastructure)](#generate-only-mode-recommended-for-existing-infrastructure)
    - [Non-Interactive & AI Agent Execution Mode](#non-interactive--ai-agent-execution-mode)
+     - [AI-Assisted Installation](#ai-assisted-installation)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
 5. [The Shell Sandbox](#the-shell-sandbox)
@@ -31,8 +32,9 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
 7. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-8. [Teardown & Cleanup](#teardown--cleanup)
-9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+8. [Upgrading](#upgrading)
+9. [Teardown & Cleanup](#teardown--cleanup)
+10. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -172,6 +174,88 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 _Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
 
+#### AI-Assisted Installation
+
+To hand the install to an AI coding assistant, give it this prompt. It needs no checkout of this
+repository:
+
+```text
+Install the latest official release of kube-agents (github.com/gke-labs/kube-agents) into my GCP project.
+Follow INSTALL.md from that release tag — do not invent installer URLs, namespaces, or model names.
+First inspect my gcloud project and existing GKE clusters and confirm the target, cluster, model provider,
+and credential with me. Run install.sh with --dry-run and show me its printed summary before you change anything.
+Only run the real install after I say yes.
+```
+
+An assistant working in a checkout of this repository also picks up the
+[`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill from `.agents/skills/`
+(`.claude/skills/` links to it), which covers the same install; the steps below apply either way.
+
+An agent given that prompt, or reading this file on its own, follows these steps:
+
+1. Resolve the latest stable release tag from
+   [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) and substitute it for
+   `<RELEASE_VERSION>` below.
+2. Read the operator's environment and confirm the target with them before going further —
+   project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic` or `openai`), and
+   where the model credential comes from:
+
+   ```bash
+   gcloud config get-value project
+   gcloud container clusters list --project="YOUR_GCP_PROJECT_ID"
+   ```
+
+3. Run the dry run with the confirmed values from a directory that is not a kube-agents checkout
+   and holds no `install.env`; the installer would load one found there in place of
+   `$HOME/kube-agents/install.env`. Run from a checkout, the installer uses that checkout's
+   sources, and a real run refuses one that
+   is not at `<RELEASE_VERSION>`; do not pass `--allow-unverified-source` to get past that. Run from
+   elsewhere, it clones to, or reuses, `$HOME/kube-agents` (see Install Sources under
+   [Method 0](#method-0-zero-friction-one-liner-installation-fastest)), and a real run refuses a
+   clone there with uncommitted changes. A dry run regenerates `terraform.tfvars` in that clone, so
+   back it up first if it belongs to a live deployment. If `$HOME/kube-agents/install.env` exists,
+   it records an earlier install, and the installer loads it before any flag: its chat, Slack,
+   GitOps, memory and key settings carry into this one, and the pre-flight summary does not show
+   all of them. Ask the operator whether this install is that same deployment. If it is not, have
+   them move the file aside (for example to `install.env.<old-cluster>`) before the dry run, so the
+   new install records its own; the moved file still serves the old deployment through
+   `KUBE_AGENTS_INSTALL_ENV`. For `gemini`, `openai` or `anthropic`, have
+   the operator export `GEMINI_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in the shell before
+   starting, so the key stays out of the command line and the agent's transcript; `vertex_ai` needs
+   no key, and `gemini` can instead read one from the Secret Manager secret
+   `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. Without a key, the
+   installer only warns, and the agent it installs cannot call a model.
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+     --dry-run \
+     --non-interactive \
+     --gcp-project-id="YOUR_GCP_PROJECT_ID" \
+     --gke-cluster-name="YOUR_CLUSTER_NAME" \
+     --gcp-region="YOUR_CLUSTER_LOCATION" \
+     --model-provider="YOUR_MODEL_PROVIDER"
+   ```
+
+   Show the operator the dry run's printed summary and warnings, not only the `status` in
+   `/tmp/kube-agents-install-report.json`: the report says `DRY_RUN_SUCCESS` even when a real run
+   will be refused. On an existing cluster, the summary's `Existing Cluster Mutations (Adoption)`
+   block lists every change the install makes to it, and marks `Refused` each one that needs a
+   consent flag.
+
+4. On an existing cluster, add the flag each `Refused` line names (`--migrate-node-pools`,
+   `--enable-network-policy` or `--accept-no-network-policy`) once the operator has agreed to it,
+   and dry-run again until none remain. The same block lists changes that need no flag but cannot
+   be reverted or add cost, such as enabling Workload Identity or CMEK, or creating the gVisor node
+   pool; name each one to the operator too. Only after the operator approves, run the same command
+   without `--dry-run`. A real run that still ends in a `REFUSED_*` status is a new question for
+   the operator, not something to work around.
+
+A flag left out does not always take the shipped default. A flag wins over an `install.env` from an
+earlier run, which wins over an exported variable — including an exported API key — which wins over
+`install.defaults.env`; see
+[`scripts/installer/README.md`](scripts/installer/README.md#the-install-configuration-installenv).
+
 ---
 
 ## Architecture & Overview
@@ -202,6 +286,7 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                              | **All Methods**                                  |
 | **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
+| **`python3`**                   | `3.x`                                           | `python3 --version`                | The installer's state readers, its pre-apply scope check, and `upgrade.sh`'s re-tag values filter use it.                                                                                                              | **Methods 0 & 1**                                |
 | **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                  | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                                                                                                                     | **All Methods**                                  |
 | **`gcloud beta` component**     | Standard                                        | `gcloud beta --help`               | Required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`).                             | **Optional (CMEK / Backup Plan lifecycle)**      |
 | **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`               | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                                                                                                                   | **Method 2 only**                                |
@@ -800,7 +885,17 @@ kubectl get platformagents -A
 
 ## Method 3: Local Development & Fast Iteration
 
-For developer testing on a workstation against a local cluster (e.g., Kind) or fast remote iteration against a GKE cluster:
+### kind
+
+`hack/kind-up.sh` builds the images from the checkout, creates a kind cluster, installs the chart
+with LiteLLM routed to the Gemini API (`GEMINI_API_KEY`), and prints the command that runs a bench
+case against it. It sets `harness.location: kind` on the `PlatformAgent`, which the operator reads
+as "no GKE cluster": the credential proxy uses the cluster it runs in and no `GKE_*` variables are
+set. Most of the evals depend on GKE or GCP and cannot run there. `--delete` removes the cluster.
+
+### The operator against a cluster you already have
+
+For fast iteration on the operator itself, against a GKE cluster or the kind cluster above:
 
 1. **Set your active Kubernetes context**:
    ```bash
@@ -820,6 +915,27 @@ For developer testing on a workstation against a local cluster (e.g., Kind) or f
    ```bash
    make dev-rebuild-agent ARGS="platform"
    ```
+
+## Upgrading
+
+To move a configured `kube-agents` installation to a newer release, run the `upgrade.sh` published
+for that release. It carries its own version, so the run names no image tag, and it reuses the
+install checkout — and the `install.env` in it — that `install.sh` left in `$HOME/kube-agents`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/upgrade.sh | bash -s -- \
+  --non-interactive \
+  --gcp-project-id="<PROJECT_ID>" \
+  --gke-cluster-name="<CLUSTER_NAME>" \
+  --gcp-region="<REGION>"
+```
+
+From a checkout, run `./upgrade.sh` with the same flags. An unpacked release bundle carries sources
+and no configuration, so copy the install's `install.env` into it first, or point
+`KUBE_AGENTS_INSTALL_ENV` at one. `--image-tag` overrides the version the script carries and exists
+for development and CI/CD testing; `--plan` reports what a full upgrade would change without
+changing anything. The upgrade modes, the previews, and the refusals are in
+[the Upgrade page](docs/site/src/content/docs/install/upgrade.md).
 
 ## Teardown & Cleanup
 

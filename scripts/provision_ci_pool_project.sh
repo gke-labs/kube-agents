@@ -30,10 +30,25 @@ APP_ID="4675512"
 # different one here would only mis-address the warning in step 1.4.
 LEDGER_APP_ID="4739812"
 LEDGER_INSTALLATION_ID="157029058"
+# The identity the pool's pull-request sweep runs as (hack/ci_sweep_agent_pulls.py,
+# a Prow periodic on main). Step 4 grants it signer on this project's copy of
+# the App key, which is the whole reach it has here.
+PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, two
+# Prow periodics on main). The IAM step before 1.3 grants it what re-applying
+# bench/tf/fleet needs on the project; step 2 grants it the state bucket.
+FLEET_RECONCILER_SA="serviceAccount:seeded-fleet-reconciler@kube-agents-prow.iam.gserviceaccount.com"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
 ALLOW_UNMAPPED="false"
+# The first commit a GitOps repository needs before anything can open a branch
+# in it; the reasoning sits with the same three values in
+# scripts/verify_ci_pool_project.py, which prints this call as the repair and
+# whose tests pin the two copies equal.
+readonly GITOPS_SEED_FILE="README.md"
+readonly GITOPS_SEED_MESSAGE="Initial commit"
+readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -188,11 +203,12 @@ if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/d
   echo "   and add the same pair to _EXPECTED_MAPPING in tests/test_ci_gitops_repo.py." >&2
   if [ "${ALLOW_UNMAPPED}" != "true" ]; then
     echo "   Refusing to provision: an unmapped project fails every lease at" >&2
-    echo "   gitops_repo_for_project()'s refusal, and Step 5 would fail anyway." >&2
+    echo "   gitops_repo_for_project()'s refusal, Step 5's verification would fail anyway," >&2
+    echo "   and the pull-request sweep skips an unmapped project." >&2
     echo "   Land the mapping first, or re-run with --allow-unmapped." >&2
     exit 1
   fi
-  echo "   --allow-unmapped set: continuing. Step 5 will still report this as a failure."
+  echo "   --allow-unmapped set: continuing. Step 5 will still report this as a failure, and the pull-request sweep will skip this project."
 else
   echo "✓ Mapped to ${GITOPS_REPO} in hack/ci-deploy.sh"
 fi
@@ -303,6 +319,23 @@ for role in \
   done
 done
 
+# compute.viewer: the GKE provider lists each node pool's instance group
+# managers on refresh, which no other role here carries (seen live 2026-09-28).
+echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
+for role in \
+  roles/compute.storageAdmin \
+  roles/compute.viewer \
+  roles/container.admin \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/resourcemanager.projectIamAdmin \
+  roles/serviceusage.serviceUsageConsumer; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="${FLEET_RECONCILER_SA}" \
+    --role="${role}" \
+    --quiet >/dev/null
+done
+
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────
 echo -e "\n==> [Step 1.3] Creating Regional Docker Artifact Registry & Cleanup Policy..."
 if ! gcloud artifacts repositories describe kube-agents --location="${REGION}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
@@ -358,6 +391,21 @@ if ! gh repo view "${GITOPS_REPO}" >/dev/null 2>&1; then
   gh repo create "${GITOPS_REPO}" --private --description="GitOps eval repository for ${PROJECT_ID}"
 fi
 
+# `defaultBranchRef` is null until the repository has a commit; the five
+# projects onboarded in late September sat like that for days, failing every
+# remediation repetition that leased them. A read that fails is not "empty":
+# seeding on it would write blind, so it stops the step instead.
+if ! GITOPS_DEFAULT_BRANCH="$(gh repo view "${GITOPS_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')"; then
+  echo "ERROR: could not read the default branch of ${GITOPS_REPO}; not seeding it blind." >&2
+  exit 1
+fi
+if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
+  echo "Seeding ${GITOPS_REPO} with its first commit (the repository has no branches)..."
+  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_SEED_FILE}" \
+    -f message="${GITOPS_SEED_MESSAGE}" \
+    -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
+fi
+
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then
   INST_ID="$(echo "${INST_JSON}" | jq -r .id)"
@@ -382,7 +430,7 @@ fi
 # bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
 # step 5's Ledger Read Credential check fails the project until it is done.
 echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
-echo "  That edit widens which repositories a minted token can read issues from:"
+echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
@@ -401,6 +449,25 @@ if ! gcloud storage buckets describe "gs://${STATE_BUCKET}" >/dev/null 2>&1; the
     --uniform-bucket-level-access
   gcloud storage buckets update "gs://${STATE_BUCKET}" --versioning
 fi
+# The reconciler reads and writes the fleet's state here, beside the host
+# cluster's, which carries the install's secrets: list on the bucket (`tofu
+# init` lists it, which a grant conditioned on the object name does not cover)
+# and objectAdmin under the seeded-fleet/ prefix only. The prefix keeps tofu's
+# reads off the other state; the identity's project IAM admin above could
+# widen it, so the fence is that only main-only jobs run as this account.
+# --condition=None on the unconditioned grant: once the conditioned one below
+# exists, gcloud refuses an unconditioned add in non-interactive mode without
+# it, and this script is re-run.
+gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+  --member="${FLEET_RECONCILER_SA}" \
+  --role=roles/storage.legacyBucketReader \
+  --condition=None \
+  --quiet >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://${STATE_BUCKET}" \
+  --member="${FLEET_RECONCILER_SA}" \
+  --role=roles/storage.objectAdmin \
+  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${STATE_BUCKET}/objects/seeded-fleet/\"),title=seeded-fleet-state,description=the seeded fleet state prefix only" \
+  --quiet >/dev/null
 
 if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
   echo -e "\n==> [Step 2.1] Provisioning Host GKE Cluster (${HOST_CLUSTER_NAME}) with remote state..."
@@ -555,6 +622,19 @@ elif [ "${SKIP_PEM_IMPORT:-false}" != "true" ]; then
   echo "Cloud KMS key 'github-token-minter-key' is in PENDING_IMPORT state."
   echo "You MUST run 'minty tools import-pk' to enable version 1 before setting EVAL_GITHUB_APP_ID in Prow."
 fi
+
+# The sweep signs the same App's JWT with this project's copy of the key. The
+# presubmit's runner is not granted it; it does hold project IAM admin for the
+# deploy, so this is where the line is drawn, not a fence GitHub enforces. On
+# a project already registered, run this one command by hand rather than the
+# script (docs/ci-pool-projects.md, sections 5.5 and 8).
+echo "Granting the pull-request sweeper signer rights on github-token-minter-key..."
+gcloud kms keys add-iam-policy-binding github-token-minter-key \
+  --project="${PROJECT_ID}" --location="${REGION}" \
+  --keyring="github-token-minter-keyring" \
+  --member="${PULL_SWEEP_SA}" \
+  --role=roles/cloudkms.signerVerifier \
+  --quiet >/dev/null
 
 # ─── Step 5: Automated Pre-Flight Verification ────────────────────────────────
 echo -e "\n==> [Step 5/5] Running Pre-Flight Verification..."

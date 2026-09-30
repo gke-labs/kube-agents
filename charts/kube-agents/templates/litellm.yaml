@@ -344,10 +344,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  # The agent's baked default model endpoint is
-  # http://litellm.<namespace>.svc.cluster.local/v1 — the name must stay
-  # "litellm".
-  name: litellm
+  # Agents reach the model endpoint at
+  # http://inference-gateway.<namespace>.svc.cluster.local/v1 — the name must
+  # stay "inference-gateway".
+  name: inference-gateway
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: litellm

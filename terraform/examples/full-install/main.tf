@@ -14,12 +14,20 @@ locals {
     "gkebackup.googleapis.com",
     "developerknowledge.googleapis.com",
   ]
-  pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
+  pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator || var.enable_drift_pubsub) ? [
     "pubsub.googleapis.com",
   ] : []
   chat_apis = var.enable_google_chat ? [
     "chat.googleapis.com",
     "gsuiteaddons.googleapis.com",
+  ] : []
+  # Only when a folder or organisation is declared: the reconcile resolves a
+  # container's members with one Cloud Asset Inventory search, and an install
+  # that names explicit projects alone never calls the API and must not fail
+  # under an organisation policy that forbids it
+  # (docs/designs/multi-project-scope.md §4).
+  scope_apis = length(var.scope.folders) + length(var.scope.organizations) > 0 ? [
+    "cloudasset.googleapis.com",
   ] : []
 
   use_vertex     = var.model_provider == "vertex_ai"
@@ -45,7 +53,7 @@ locals {
   github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
   github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
 
-  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis))
+  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis))
 
   # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
   # paths hand the agent the same authority. Kubernetes RBAC is read-only
@@ -260,6 +268,7 @@ module "kube_agents_iam" {
   namespace          = var.namespace
   project_roles      = local.agent_project_roles
   scoped_clusters    = var.scoped_clusters
+  scope              = var.scope
   service_account_id = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
@@ -340,6 +349,30 @@ module "chat_pubsub" {
   agent_service_account_email = module.kube_agents_iam.service_account_email
   topic_name                  = var.chat_topic_name
   subscription_name           = var.chat_subscription_name
+
+  depends_on = [google_project_service.required]
+}
+
+# The drift detector's audit-log ingress: Log Router sink, drift-audit topic
+# and pull subscription, and the sink-writer and detector IAM. The three names
+# are composition variables, as the stockout trio's are, because lifecycle.sh
+# adopts them by name and a second install in the project has to be able to
+# name its own; the module's defaults decide the rest (retention, backoff, and
+# the cluster scope, every GKE cluster in the project). The consumer,
+# k8s-operator/cmd/drift-detector, ships in the images and starts in the
+# gateway pod when the PlatformAgent sets spec.harness.driftDetector.enabled;
+# this flag provisions its input and passes the subscription's name into that
+# block (the harness values below), and leaves enabling the detector to
+# extra_helm_values (docs/designs/drift-detection.md).
+module "drift_pubsub" {
+  source = "../../modules/drift-pubsub"
+  count  = var.enable_drift_pubsub ? 1 : 0
+
+  project_id                     = var.project_id
+  detector_service_account_email = module.kube_agents_iam.service_account_email
+  topic_name                     = var.drift_pubsub_topic
+  subscription_name              = var.drift_pubsub_subscription
+  sink_name                      = var.drift_pubsub_sink
 
   depends_on = [google_project_service.required]
 }
@@ -566,21 +599,37 @@ resource "helm_release" "kube_agents" {
       annotations = module.gke_cluster.network_policy_enforced ? {} : {
         "kubeagents.x-k8s.io/network-policy-enforcement" = "absent-accepted"
       }
-      harness = {
-        clusterName = module.gke_cluster.cluster_name
-        location    = module.gke_cluster.cluster_location
-        projectId   = var.project_id
-        # null leaves a field out of the CR so the CRD default applies — the
-        # chart's compactFields drops nulls and empty strings.
-        hermes = {
-          dashboardEnabled = var.hermes_dashboard_enabled
-        }
-        memory = {
-          enabled            = var.memory_enabled
-          provider           = var.memory_provider
-          userProfileEnabled = var.user_profile_enabled
-        }
-      }
+      harness = merge(
+        {
+          clusterName = module.gke_cluster.cluster_name
+          location    = module.gke_cluster.cluster_location
+          projectId   = var.project_id
+          # null leaves a field out of the CR so the CRD default applies — the
+          # chart's compactFields drops nulls and empty strings.
+          hermes = {
+            dashboardEnabled = var.hermes_dashboard_enabled
+          }
+          memory = {
+            enabled            = var.memory_enabled
+            provider           = var.memory_provider
+            userProfileEnabled = var.user_profile_enabled
+          }
+        },
+        # The subscription the drift detector pulls from, so a renamed
+        # drift_pubsub_subscription is the one it reads: the detector's own
+        # default is the module's default name and nothing else would carry a
+        # rename to it. Only when the module exists -- the chart renders a
+        # driftDetector block into the CR as soon as one field is set, and an
+        # install that never asked for drift detection should not carry one
+        # (the chart's platform-agent-cr.yaml says why). Whether the detector
+        # starts is spec.harness.driftDetector.enabled, which this composition
+        # does not set; extra_helm_values reaches it.
+        var.enable_drift_pubsub ? {
+          driftDetector = {
+            subscription = module.drift_pubsub[0].subscription_name
+          }
+        } : {}
+      )
       deployment = {
         image = {
           tag = var.image_tag
@@ -617,6 +666,28 @@ resource "helm_release" "kube_agents" {
             serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
           }
         ]
+      }
+      # The same object the IAM module bound above, so the CR declares no
+      # project the module did not also bind. Always rendered, empty lists
+      # included: the reconcile reads a present block with an empty projects
+      # list as the declaration that drops projects, and an absent block as no
+      # declaration at all (docs/designs/multi-project-scope.md §7), so
+      # removing the last scoped project here has to reach the CR as an
+      # emptied block, never as a missing one.
+      scope = {
+        projects      = var.scope.projects
+        folders       = var.scope.folders
+        organizations = var.scope.organizations
+        exclude = {
+          projects = var.scope.exclude.projects
+          clusters = [
+            for cluster in var.scope.exclude.clusters : {
+              projectId   = cluster.project_id
+              location    = cluster.location
+              clusterName = cluster.cluster_name
+            }
+          ]
+        }
       }
       credentials = {
         create = true
@@ -721,8 +792,12 @@ resource "helm_release" "kube_agents" {
   # cert_manager is listed even when enable_cert_manager is false — depends_on to
   # a resource with count = 0 is satisfied immediately, so it costs nothing in
   # that case and is the ordering guarantee in the case that matters.
+  # module.kube_agents_iam, so the scope's per-project bindings exist before
+  # the CR that declares those projects is written; the values above already
+  # depend on the module's service account, not on its bindings.
   depends_on = [
     module.gke_cluster,
+    module.kube_agents_iam,
     google_project_service.vertex_ai,
     google_project_iam_member.litellm_vertex_user,
     helm_release.cert_manager,

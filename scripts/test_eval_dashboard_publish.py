@@ -52,6 +52,7 @@ def run_hook(
     timeout_s: str = "",
     rc_commit_sha: str = "",
     path_prepend: str = "",
+    mode_next: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -67,6 +68,7 @@ def run_hook(
         f'export JOB_TYPE="{job_type}"',
         f'export PULL_NUMBER="{pull_number}"',
         f'export RC_COMMIT_SHA="{rc_commit_sha}"',
+        f'export EVAL_MODE_NEXT="{mode_next}"',
         # Always pinned: the suite itself runs under Prow, where a real
         # $ARTIFACTS is set, and the hook copies its log there.
         f'export ARTIFACTS="{artifacts}"',
@@ -199,6 +201,29 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     rc_commit_sha="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe",
                 )
                 self.assert_skipped_once(result, code, "RC_COMMIT_SHA=")
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            self.assertEqual(list(dash.glob("*.ran")), [])
+
+    def test_a_next_mode_run_never_publishes(self):
+        """The next lane's periodic is also a periodic with no PULL_NUMBER and
+        no RC_COMMIT_SHA. It measures the next stack, which the dashboard has
+        no lane for, so publishing from one would file a next run as main's
+        today history. Mirrors the baseline recorder's fourth condition."""
+        marker = (
+            "import pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    job_type="periodic",
+                    mode_next="1",
+                )
+                self.assert_skipped_once(result, code, "EVAL_MODE_NEXT=1")
             dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
             self.assertEqual(list(dash.glob("*.ran")), [])
 

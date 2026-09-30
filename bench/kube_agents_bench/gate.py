@@ -67,9 +67,9 @@ import json
 import os
 import re
 import sys
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
@@ -92,6 +92,8 @@ from kube_agents_bench.scoring import (
     DEFAULT_JUDGED_MARGIN,
     DEFAULT_JUDGED_METRICS,
     MISSING,
+    NOT_APPLICABLE_PHRASE,
+    REP_OUTCOME_NOT_APPLICABLE,
     SUITE_OUTCOME_GREEN,
     SUITE_OUTCOME_NOT_EVALUATED,
     SUITE_OUTCOME_RED,
@@ -110,6 +112,12 @@ _DEFAULT_BASELINE_DIR = "baselines"
 #: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
 #: verdict. 0 green and 1 red are the literals they have always been.
 SUITE_EXIT_NOT_EVALUATED = 2
+
+#: The build-log word for a case the inject lane could not grade (rung
+#: NOT_GRADED_ON_TRANSPORT): every objective check set aside as not
+#: applicable on the record's transport. Beside PASSED, FAILED, UNSTABLE and
+#: RESOURCE_PREPARATION_FAILED, and distinct from all four on purpose.
+LABEL_NOT_GRADED_ON_TRANSPORT = "NOT_GRADED_ON_TRANSPORT"
 
 #: The verdict headline per outcome, the first thing the markdown says.
 SUITE_HEADLINES = {
@@ -287,10 +295,18 @@ def _label(case: dict[str, Any]) -> str:
     nothing, which is the sort of quiet lie that gets a gate switched off.
 
     FAILED and RESOURCE_PREPARATION_FAILED keep their historical spellings:
-    people and scripts grep build logs for both.
+    people and scripts grep build logs for both. NOT_GRADED_ON_TRANSPORT is
+    the inject lane's fifth word (#2039): the case ran and was read, and
+    every objective check it declares was set aside as not applicable on
+    that transport, so neither PASSED, UNSTABLE nor the infrastructure word
+    is true of it. The dashboard's collector does not know the word yet
+    (#2008); a line it cannot parse is left out rather than misread.
     """
-    if int(case.get("rung") or Rung.GREEN) == int(Rung.INFRA):
+    rung = int(case.get("rung") or Rung.GREEN)
+    if rung == int(Rung.INFRA):
         return "RESOURCE_PREPARATION_FAILED"
+    if rung == int(Rung.NOT_GRADED_ON_TRANSPORT):
+        return LABEL_NOT_GRADED_ON_TRANSPORT
     if case.get("blocking"):
         return "FAILED"
     scored = int(case.get("scored") or 0)
@@ -486,15 +502,28 @@ def _markdown(
         # The banner says what to do, because the headline alone invites the
         # wrong action: a pull request author who sees a red job debugs the
         # change, and there is nothing in this run about the change to debug.
-        named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
-        lines += [
-            "> **NOT EVALUATED — rerun when the environment is healthy.** "
-            f"{named}: every repetition was excluded as infrastructure, so this "
-            "run evaluated nothing about the case and cannot certify green. "
-            "This is not a finding against the change under test: do not debug "
-            "the change for it; rerun once the eval environment is healthy.",
-            "",
-        ]
+        if verdict.not_evaluated:
+            named = ", ".join(f"`{case_id}`" for case_id in verdict.not_evaluated)
+            banner = (
+                "> **NOT EVALUATED — rerun when the environment is healthy.** "
+                f"{named}: every repetition was excluded as infrastructure, so this "
+                "run evaluated nothing about the case and cannot certify green. "
+                "This is not a finding against the change under test: do not debug "
+                "the change for it; rerun once the eval environment is healthy."
+            )
+        else:
+            # Nothing was lost: every case the run had was set aside by the
+            # inject lane (#2039), so there is no environment to wait on and
+            # no change to debug -- the lane's roster is what to look at.
+            named = ", ".join(f"`{case_id}`" for case_id in verdict.not_graded)
+            banner = (
+                "> **NOT EVALUATED — nothing on this transport could be graded.** "
+                f"{named}: every objective check is not applicable on this "
+                "transport, so this run graded nothing and cannot certify green. "
+                "This is not a finding against the change under test and not "
+                "an environment failure: the lane's roster is what to fix."
+            )
+        lines += [banner, ""]
     if verdict.pass_rate is not None:
         rate = f"{verdict.pass_rate:.1%}"
         if verdict.baseline_rate is not None:
@@ -569,10 +598,19 @@ def _baseline_rate(
 
     Returns None when no admitted case has any evidence, which makes the
     aggregate advisory and says so.
+
+    A case the inject lane could not grade (rung NOT_GRADED_ON_TRANSPORT,
+    #2039) is out of the pull request's side already -- its ``scored`` is 0
+    -- and is left out of main's side here for the same reason: the version
+    key carries no transport, so main's api-lane evidence for it would be
+    pooled against a run that graded nothing of it, moving the comparison
+    for nothing.
     """
     passes = runs = 0
     for case in cases:
         if not case.get("admitted"):
+            continue
+        if int(case.get("rung") or Rung.GREEN) == int(Rung.NOT_GRADED_ON_TRANSPORT):
             continue
         raw_key = case.get("version_key")
         if not isinstance(raw_key, dict):
@@ -728,6 +766,25 @@ def _record_for_case(
         return f"{case_id}: no version key on this run, so nothing to file it under"
 
     reps = [r for r in (case.get("reps") or []) if isinstance(r, dict)]
+    # A repetition the inject lane touched (#2039) is not this store's
+    # evidence -- whether it was set aside whole (outcome `not_applicable`)
+    # or graded with one of its checks set aside (a `pass` or `fail` whose
+    # `not_applicable_checks` is non-empty, the captured agent-kanban-smoke
+    # shape). The record is main's api-lane record, filed at a version key
+    # that carries no transport; a 3/3 line graded on half the case's
+    # objectives would sit beside it as if comparable, and admission reads
+    # it. BaselineRecord has no column that could carry the outcome without
+    # dropping it. Skip the case, saying so.
+    set_aside = sum(
+        1
+        for r in reps
+        if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE or r.get("not_applicable_checks")
+    )
+    if set_aside:
+        return (
+            f"{case_id}: {set_aside} of {len(reps)} repetition(s) {NOT_APPLICABLE_PHRASE} "
+            "(whole, or one of its checks); not recorded, the store holds api-lane evidence only"
+        )
     scored = [r for r in reps if r.get("outcome") in ("pass", "fail")]
     if not scored:
         return (

@@ -4,11 +4,10 @@ name: Conformance
 # per invariant in the F10 requirements set, or a written reason the invariant
 # cannot be tested yet.
 #
-# **No paths filter, on purpose.** The filtered Python jobs here --
-# agent-startup-test.yml, and k8s-operator-test.yml on the Go side -- gate on
-# dorny/paths-filter, and for those it is the right trade: they assert
-# properties of one directory. (python-tests.yml is already unfiltered, and
-# says so.) This suite asserts properties of the repository — the Dockerfile's
+# **No paths filter, on purpose.** The filtered jobs here, k8s-operator-test.yml
+# and a2a-test.yml on the Go side, gate on dorny/paths-filter, and for them that
+# is the right trade: each asserts properties of one directory. (python-tests.yml is already
+# unfiltered, and says so.) This suite asserts properties of the repository — the Dockerfile's
 # build gate, the rendered operator manifests, the workflows in this directory,
 # the chart's RBAC, the upstream skill sync — so the filter
 # that covered it would be "almost everything", and the failure mode of getting
@@ -47,7 +46,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version-file: ".agent-python-version"
 
       # PyYAML only. The suite reads rendered manifests and chart templates as
       # object sets rather than grepping them, and a regex over YAML is how an

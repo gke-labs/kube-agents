@@ -10,12 +10,13 @@ import datetime
 import json
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -153,6 +154,7 @@ class InstallerCommonTest(unittest.TestCase):
         kms_versions="",
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
+        gcloud_extra_cases="",
         get_credentials_stub=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
@@ -161,6 +163,10 @@ class InstallerCommonTest(unittest.TestCase):
         `gcloud_exit` for `storage cat` calls on the state object;
         `clusters describe` runs `describe_stub` (default: exit 1, meaning
         the cluster does not exist).
+
+        `gcloud_extra_cases` is spliced in ahead of those arms, for a caller
+        that needs to answer a subcommand none of them match — `get-credentials`
+        and its `--help` probe, which fall through to the state read otherwise.
         """
         # A failing `storage cat` with no stderr of its own reads as "absent":
         # that is what every pre-existing caller meant by gcloud_exit=1, and
@@ -185,6 +191,7 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
+                f"{gcloud_extra_cases}"
                 f"  *\"clusters describe\"*) {describe_stub} ;;\n"
                 f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
@@ -194,6 +201,7 @@ class InstallerCommonTest(unittest.TestCase):
                 f"[ -f '{state_file}' ] && cat '{state_file}'\n"
                 f"exit {gcloud_exit}\n"
             )
+
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
             # Hermetic kubectl: the generator recovers credentials from the
             # live Secret when it can, and a developer's real kube context
@@ -206,6 +214,10 @@ class InstallerCommonTest(unittest.TestCase):
                     "PROJECT_ID": "test-project",
                     "CLUSTER_NAME": "test-cluster",
                     "REGION": "us-central1",
+                    # The generator reads both as ${VAR:-}, so empty is unset;
+                    # a developer's exported memory mode must not steer a test.
+                    "MEMORY": "",
+                    "MEMORY_PROVIDER": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -543,6 +555,23 @@ class InstallerCommonTest(unittest.TestCase):
                 env={"NAMESPACE": "stray-from-kubectl-tooling"},
             )
             self.assertIn("NS=from-the-file", proc.stdout, proc.stderr)
+
+    def test_load_install_env_drops_a_shell_exported_scope(self):
+        # The keys render into the PlatformAgent and only install.sh's first
+        # install records them, so on upgrade.sh, uninstall.sh and the menu the
+        # file is the only way in; an inherited value would declare a project
+        # the next clean-shell run drops again.
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
+                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
+            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
 
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
@@ -956,7 +985,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('agent_runtime_class        = ""', content)
 
     def test_tfvars_unset_gvisor_skips_the_autopilot_floor(self):
-        # uninstall.sh treats vars.sh as optional -- the documented
+        # uninstall.sh treats install.env as optional -- the documented
         # `curl ... | bash` teardown runs from a fresh clone that has none --
         # and calls this bare under `set -e` before lifecycle.sh destroy. If an
         # unset ENABLE_GVISOR defaulted on, the floor check would abort the
@@ -1021,6 +1050,297 @@ class InstallerCommonTest(unittest.TestCase):
             'memory_provider          = "multiuser_memory"',
             self._tfvars(env={"API_SERVER_KEY": "k"}),
         )
+
+    # `kubectl get … --ignore-not-found -o name` prints the object's own
+    # name when it is there and nothing at all when the API server says it
+    # is not, which is how the probe tells the two apart. Exiting 0 in
+    # silence, as this stub used to, is the *absent* answer.
+    _HINDSIGHT_KUBECTL = (
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+        '  *"get statefulset hindsight-postgresql"*"--context gke_test-project_us-central1_test-cluster"*)\n'
+        '    echo "statefulset.apps/hindsight-postgresql"; exit 0 ;;\n'
+        "esac\n"
+        "exit 1\n"
+    )
+
+    def test_memory_provider_preserves_live_hindsight_on_existing_cluster_when_unspecified(self):
+        """When neither MEMORY nor MEMORY_PROVIDER is set (e.g., a non-interactive
+        re-install without install.env or --memory), write_tfvars_from_state probes
+        the live cluster and preserves kube_agents_memory if Hindsight is deployed,
+        while still respecting an explicit MEMORY=file override."""
+        hindsight_kubectl = self._HINDSIGHT_KUBECTL
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? provider=${{MEMORY_PROVIDER:-}}"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=hindsight_kubectl,
+            )
+            self.assertIn("rc=0 provider=kube_agents_memory", proc.stdout, proc.stderr)
+            self.assertIn('memory_provider          = "kube_agents_memory"', dest.read_text())
+
+            # An explicit MEMORY=file (--memory=file or install.env) still wins.
+            proc_explicit = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? provider=${{MEMORY_PROVIDER:-}}"',
+                env={"API_SERVER_KEY": "k", "MEMORY": "file"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=hindsight_kubectl,
+            )
+            self.assertIn("rc=0", proc_explicit.stdout, proc_explicit.stderr)
+            self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_found_hindsight_is_called_preserved_only_to_a_caller_that_applies(self):
+        """The found arm is said per caller, as the could-not-ask arm is.
+
+        install.sh and upgrade.sh opt in and apply next, so "preserved … to
+        replace it" is true for them. uninstall.sh does not opt in and runs
+        lifecycle.sh destroy straight after generating, so telling it the
+        database is kept would be false; it gets the same provider with a
+        statement that holds for a teardown too.
+        """
+        for label, extra_env, expected, forbidden in (
+            ("applier", {"KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"}, "so it is preserved", None),
+            ("teardown", {}, "to match the live install", "preserved"),
+        ):
+            with self.subTest(caller=label), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    'print_info() { echo "INFO: $*" >&2; }; '
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={"API_SERVER_KEY": "k", **extra_env},
+                    describe_stub="printf 'True\\n'; exit 0",
+                    kubectl_script=self._HINDSIGHT_KUBECTL,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn('memory_provider          = "kube_agents_memory"', dest.read_text())
+                self.assertIn("This cluster runs the Hindsight memory store", proc.stderr)
+                self.assertIn(expected, proc.stderr)
+                if forbidden:
+                    self.assertNotIn(forbidden, proc.stderr)
+
+    # ── the live Hindsight probe: found / confirmed absent / could not ask ───
+    #
+    # The third outcome is the point of these. Reading "could not ask" as
+    # "not deployed" writes memory_provider = "multiuser_memory" and the apply
+    # deletes hindsight-postgresql and the volume holding the database.
+
+    # What gke_context_name() builds from _run's exported coordinates.
+    _THIS_CLUSTERS_CONTEXT = "gke_test-project_us-central1_test-cluster"
+
+    def _kubectl_that_cannot_answer(self):
+        """kubectl is pointed at this cluster but its reads fail for a reason
+        that is not NotFound — the shape of an expired credential, a 403, a
+        missing auth plugin, or an API server that times out."""
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+            "esac\n"
+            'echo "Unable to connect to the server: dial tcp 10.0.0.2:443: i/o timeout" >&2\n'
+            "exit 1\n"
+        )
+
+    def _kubectl_that_says_not_found(self):
+        """kubectl is pointed at this cluster and the API server answers
+        NotFound for both objects — a real, trustworthy absence."""
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+            "esac\n"
+            'echo "Error from server (NotFound): the server could not find the requested resource" >&2\n'
+            "exit 1\n"
+        )
+
+    def test_memory_probe_refuses_an_applying_caller_when_the_cluster_cannot_be_asked(self):
+        """A kubectl failure that is not NotFound must stop install.sh and
+        upgrade.sh rather than default to multiuser_memory."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_info() { echo "INFO: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=self._kubectl_that_cannot_answer(),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("Cannot tell whether this cluster runs the Hindsight", proc.stderr)
+            # The reason reaches the operator, not just the verdict.
+            self.assertIn("i/o timeout", proc.stderr)
+            # The remedy has to work for whoever hit it: upgrade.sh has no
+            # --memory flag, so recording MEMORY is what gets named first.
+            self.assertIn("MEMORY=hindsight|file|off", proc.stderr)
+            # And nothing was written: a refusal that leaves tfvars behind is a
+            # refusal the next run reads as configuration.
+            self.assertFalse(dest.exists(), proc.stderr)
+
+    def test_memory_probe_warns_rather_than_refuses_for_a_caller_that_did_not_opt_in(self):
+        """uninstall.sh does not opt in: a destroy removes the store either
+        way, and an install has to keep a working way to remove itself."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=self._kubectl_that_cannot_answer(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not tell whether this cluster runs the Hindsight", proc.stderr)
+            self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_memory_probe_takes_a_definite_no_on_both_objects_as_a_real_absence(self):
+        """The one answer that does mean "no Hindsight here" still defaults,
+        and does it quietly — otherwise every ordinary install warns.
+
+        Two shapes, because --ignore-not-found changed which one is common: a
+        current kubectl exits 0 and prints nothing, while the API server's own
+        "Error from server (NotFound)" still arrives from older builds and for
+        a namespace that does not exist, where --ignore-not-found does not
+        apply. Both are the server having answered; neither may warn."""
+        shapes = {
+            "silent under --ignore-not-found": (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+                "esac\n"
+                "exit 0\n"
+            ),
+            "Error from server (NotFound)": self._kubectl_that_says_not_found(),
+        }
+        for shape, kubectl_script in shapes.items():
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    'print_warning() { echo "WARN: $*" >&2; }; '
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                    describe_stub="printf 'True\\n'; exit 0",
+                    kubectl_script=kubectl_script,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("Hindsight", proc.stderr)
+                self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_memory_probe_is_not_fooled_by_a_failure_that_merely_says_not_found(self):
+        """The regression this probe exists for. A workstation without the GKE
+        auth plugin fails with "executable gke-gcloud-auth-plugin not found" —
+        no API server was reached at all, but a substring match for "not found"
+        scores the whole cluster as having no Hindsight and the apply deletes
+        the database. Only the API server's own "Error from server (NotFound)"
+        is an absence."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            no_auth_plugin = (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"current-context"*) echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+                "esac\n"
+                'echo "Unable to connect to the server: getting credentials: exec: '
+                'executable gke-gcloud-auth-plugin not found" >&2\n'
+                "exit 1\n"
+            )
+            proc = self._run(
+                'print_info() { echo "INFO: $*" >&2; }; '
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                describe_stub="printf 'True\\n'; exit 0",
+                kubectl_script=no_auth_plugin,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("Cannot tell whether this cluster runs the Hindsight", proc.stderr)
+            self.assertIn("gke-gcloud-auth-plugin", proc.stderr)
+            self.assertFalse(dest.exists(), proc.stderr)
+
+    def test_memory_probe_does_not_run_at_all_for_a_cluster_that_does_not_exist(self):
+        """A first install has nothing to preserve, and must not be stopped by
+        a question about a cluster that is not there yet."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                kubectl_script=self._kubectl_that_cannot_answer(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('memory_provider          = "multiuser_memory"', dest.read_text())
+
+    def test_memory_probe_fetches_credentials_for_a_terraform_managed_cluster(self):
+        """The `get-credentials` gate in write_tfvars_from_state is `cluster_exists = "true"`,
+        not `create_cluster = "false"`.
+
+        On a Terraform-managed cluster (`gcloud_stdout=MANAGED_CLUSTER_STATE`,
+        so `create_cluster = "true"` and `cluster_exists = "true"`), an
+        adoption-only gate (`create_cluster = "false"`) skips `get-credentials`
+        and leaves `live_hindsight_state` without a kubeconfig context for the
+        cluster it needs to probe. Here `kubectl config current-context` only
+        reports the cluster's context after `gcloud container clusters
+        get-credentials` has actually run.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            cred_marker = pathlib.Path(out_dir) / "credentials.fetched"
+            extra_cases = (
+                f'  *"get-credentials --help"*) exit 0 ;;\n'
+                f'  *"get-credentials"*) : > "{cred_marker}"; exit 0 ;;\n'
+            )
+            kubectl_requiring_get_credentials = (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"current-context"*) [ -f "{cred_marker}" ] && echo "{self._THIS_CLUSTERS_CONTEXT}"; exit 0 ;;\n'
+                '  *"statefulset hindsight-postgresql"*) echo "statefulset.apps/hindsight-postgresql"; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            )
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER": "true"},
+                gcloud_stdout=MANAGED_CLUSTER_STATE,
+                describe_stub="printf 'True\\n'; exit 0",
+                gcloud_extra_cases=extra_cases,
+                kubectl_script=kubectl_requiring_get_credentials,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertTrue(cred_marker.exists(), "get-credentials was not called for a Terraform-managed cluster")
+            tfvars = dest.read_text()
+            self.assertIn("create_cluster             = true", tfvars)
+            self.assertIn('memory_provider          = "kube_agents_memory"', tfvars)
+
+    def test_the_generators_credentials_fetch_asks_for_the_dns_endpoint(self):
+        """Without --dns-endpoint the fetch fails on a DNS-endpoint-only
+        cluster, the context gate misses, and every check that gate protects is
+        skipped against a cluster `terraform apply` reaches fine."""
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            recorded = pathlib.Path(out_dir) / "get-credentials.args"
+            # A gcloud that supports the flag, and a cluster publishing a DNS
+            # endpoint that accepts external traffic. `describe` answers on the
+            # --format it is given, as the real one does.
+            extra_cases = (
+                f'  *"get-credentials --help"*) echo "  --dns-endpoint"; exit 0 ;;\n'
+                f'  *"get-credentials"*) printf \'%s\\n\' "$*" >> "{recorded}"; exit 0 ;;\n'
+            )
+            describe_stub = (
+                'case "$*" in\n'
+                "  *dnsEndpointConfig*) printf 'gke-abc.us-central1.gke.goog\\tTrue\\n'; exit 0 ;;\n"
+                "esac\n"
+                "printf 'True\\n'; exit 0"
+            )
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "MEMORY": "file"},
+                describe_stub=describe_stub,
+                gcloud_extra_cases=extra_cases,
+                kubectl_script=self._kubectl_that_says_not_found(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertTrue(recorded.exists(), f"get-credentials never ran: {proc.stderr}")
+            self.assertIn("--dns-endpoint", recorded.read_text())
 
     def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
         # The abort's remedy has to work for whoever hit it. --enable-gvisor=false is
@@ -1120,6 +1440,74 @@ class InstallerCommonTest(unittest.TestCase):
             # SESSION_KV_* recover too: an adoption re-install must keep the
             # live salt or every chat identity re-pseudonymises.
             self.assertIn('session_kv_salt    = "recovered-key"', content)
+
+    # ── the adoption fetch: which control-plane endpoint it writes ───────────
+
+    def _run_adoption_fetch(self, dns_endpoint, allow_external, supports_flag=True):
+        """Drive write_tfvars_from_state down the adoption path.
+
+        Returns the recorded `gcloud container clusters get-credentials`
+        invocation. create_cluster is false only when the cluster is already
+        there, so the existence probe has to succeed; the helper's own describe
+        asks for the dnsEndpointConfig fields and is answered from the same arm.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "fetch.args"
+            describe_stub = (
+                'if [[ "$*" == *dnsEndpointConfig* ]]; then '
+                f"printf '{dns_endpoint}\\t{allow_external}\\n'; exit 0; fi\n"
+                'case "$*" in\n'
+                "  *currentMasterVersion*) printf '1.30.1-gke.100\\n' ;;\n"
+                "  *) printf 'True\\n' ;;\n"
+                "esac\n"
+                "exit 0"
+            )
+            # An older gcloud has no --dns-endpoint at all, and the helper is
+            # meant to notice that from the help text before offering the flag.
+            help_text = "--dns-endpoint" if supports_flag else "--internal-ip"
+            extra = (
+                f"  *\"get-credentials --help\"*) printf -- '{help_text}\\n'; exit 0 ;;\n"
+                f"  *get-credentials*) printf '%s\\n' \"$*\" >> '{record}'; exit 0 ;;\n"
+            )
+            with tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env={"API_SERVER_KEY": "k"},
+                    describe_stub=describe_stub,
+                    gcloud_extra_cases=extra,
+                )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            return record.read_text() if record.exists() else ""
+
+    def test_the_helper_is_in_scope_for_a_caller_that_sources_only_this_file(self):
+        # uninstall.sh sources installer_common.sh and nothing else, so the
+        # predicate has to come with the file. Left to the caller, the fetch
+        # below would be an undefined function and `set -e` would end the run.
+        proc = self._run('echo "kind=$(type -t gke_dns_endpoint_flag)"')
+        self.assertIn("kind=function", proc.stdout, proc.stderr)
+
+    def test_the_adoption_fetch_uses_the_dns_endpoint_when_one_accepts_traffic(self):
+        # The whole point of the call: on a cluster whose IP endpoint this host
+        # cannot route to, the IP kubeconfig makes every secret read below time
+        # out, and the generator cannot tell that from "nothing to recover" --
+        # so it mints a new SESSION_KV_SALT over the live one.
+        args = self._run_adoption_fetch("gke-abc.us-central1.gke.goog", "True")
+        self.assertIn("--dns-endpoint", args)
+
+    def test_the_adoption_fetch_leaves_an_ordinary_cluster_on_its_ip_endpoint(self):
+        # gcloud rejects the flag on a cluster with no externally reachable DNS
+        # endpoint, so passing it blind would break the clusters that work.
+        for dns_endpoint, allow_external, supports_flag, why in (
+            ("gke-abc.us-central1.gke.goog", "False", True, "external traffic is off"),
+            ("", "True", True, "no DNS endpoint is published"),
+            ("gke-abc.us-central1.gke.goog", "True", False, "this gcloud has no such flag"),
+        ):
+            with self.subTest(why=why):
+                args = self._run_adoption_fetch(dns_endpoint, allow_external, supports_flag)
+                self.assertNotIn("--dns-endpoint", args)
+                # Still fetched, just over the IP endpoint as before.
+                self.assertIn("get-credentials test-cluster", args)
 
     def test_tfvars_omits_credentials_when_persist_secrets_off(self):
         with tempfile.TemporaryDirectory() as out_dir:
@@ -1591,16 +1979,17 @@ class InstallDefaultsFileTest(unittest.TestCase):
 
 
 class NormalizeMemoryVarsTest(unittest.TestCase):
-    """install.env's MEMORY must beat a migrated vars.sh's MEMORY_PROVIDER.
+    """install.env's MEMORY must beat an inherited MEMORY_PROVIDER.
 
-    The two files spell the setting differently, so the load order that gives
-    install.env the last word on every other key cannot do it for this one. The
-    pre-install.env installer wrote `export MEMORY_PROVIDER=...` into vars.sh
-    and every migrated install still has it; install.sh's migration writes only
-    MEMORY. write_tfvars_from_state prefers MEMORY_PROVIDER, so without the
-    normalizer the stale provider won and an upgrade regenerated the tfvars
-    against the old store -- the apply then deleting the Hindsight API and its
-    Postgres. #1060 item 5, on the front doors install.sh does not cover.
+    The input and the generator spell the setting differently, so the load
+    order that gives install.env the last word on every other key cannot do it
+    for this one. MEMORY_PROVIDER still reaches a run from the environment --
+    a CI job, a dev shell that sourced scripts/installer/vars.sh, or an
+    install.env that carries both -- and write_tfvars_from_state prefers it, so
+    without the normalizer the inherited provider wins and an upgrade
+    regenerates the tfvars against the wrong store, the apply then deleting the
+    Hindsight API and its Postgres. #1060 item 5, on the front doors install.sh
+    does not cover.
     """
 
     _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -1616,8 +2005,8 @@ class NormalizeMemoryVarsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout.strip()
 
-    def test_the_install_env_mode_overrides_a_legacy_provider(self):
-        """A legacy vars.sh says the file store, the operator's install.env says
+    def test_the_install_env_mode_overrides_an_inherited_provider(self):
+        """The environment says the file store, the operator's install.env says
         Hindsight, and the generated provider must be Hindsight's."""
         self.assertEqual(
             "P=kube_agents_memory",
@@ -1637,8 +2026,8 @@ class NormalizeMemoryVarsTest(unittest.TestCase):
                 )
 
     def test_nothing_recorded_leaves_the_provider_alone(self):
-        """An install that never carried MEMORY -- a vars.sh-only install that
-        has not been migrated yet -- must keep the provider it has."""
+        """An install whose configuration never carried MEMORY must keep the
+        provider it was given."""
         self.assertEqual(
             "P=kube_agents_memory",
             self._normalize('MEMORY_PROVIDER=kube_agents_memory'),
@@ -1653,21 +2042,29 @@ class NormalizeMemoryVarsTest(unittest.TestCase):
             self._normalize('MEMORY_PROVIDER=kube_agents_memory\nMEMORY=hindsigt'),
         )
 
-    def test_the_front_doors_that_load_both_files_call_it(self):
-        """upgrade.sh, uninstall.sh and install.sh's Day-2 menu each source a
-        legacy vars.sh and then load install.env over it, and each generates
+    def test_the_front_doors_that_generate_tfvars_call_it(self):
+        """upgrade.sh, uninstall.sh and install.sh's Day-2 menu each load
+        install.env into an environment they did not clear, and each generates
         tfvars without passing through install.sh's parameter block. A caller
-        that loads both and skips the normalizer has the defect back."""
+        that skips the normalizer has the defect back."""
         for name in ("upgrade.sh", "uninstall.sh", "install.sh"):
             with self.subTest(name=name):
                 self.assertIn(
                     "normalize_memory_vars",
                     (_REPO_ROOT / name).read_text(),
-                    f"{name} loads vars.sh and install.env; it must normalize the pair",
+                    f"{name} generates tfvars outside install.sh's parameter "
+                    "block; it must normalize MEMORY against MEMORY_PROVIDER",
                 )
 
 
 class HelmReleaseSelfHealingTest(unittest.TestCase):
+    # Appended to an ensure_clean_helm_release call: reports the flag
+    # upgrade.sh's restore_moved_checkout reads to say "after repairing the
+    # pending Helm release" instead of "Nothing was applied", and keeps the
+    # function's own exit code. test_upgrade_script.py sets the flag by hand to
+    # pin that reader; these pin the writer, at each arm that repairs.
+    _REPORT_REPAIRED = '; rc=$?; echo "REPAIRED=[${HELM_RELEASE_REPAIRED:-}]"; exit "$rc"'
+
     def _run_helm_test(self, script, helm_script, env_overrides=None, extra_bins=None):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -1707,9 +2104,13 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             'echo "unexpected helm call: $*" >&2\n'
             'exit 1\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("Rolling back", proc.stderr)
+        self.assertIn("REPAIRED=[]", proc.stdout, proc.stderr)
 
     def test_missing_release_does_not_fire_err_trap(self):
         # A first install onto an existing cluster: `helm status` exits 1
@@ -1870,10 +2271,15 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             '  *) echo "unexpected helm call: $*" >&2; exit 1 ;;\n'
             'esac\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("Automatic uninstall is blocked", proc.stderr)
         self.assertNotIn("UNINSTALL EXECUTED", proc.stderr)
+        # A refusal repaired nothing, and must not claim to have.
+        self.assertIn("REPAIRED=[]", proc.stdout, proc.stderr)
 
     def test_pending_install_uninstalls_when_opted_in(self):
         helm_script = (
@@ -1885,12 +2291,13 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             'esac\n'
         )
         proc = self._run_helm_test(
-            'ensure_clean_helm_release kube-agents kubeagents-system',
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
             helm_script,
             env_overrides={"ALLOW_UNINSTALL_PENDING_RELEASE": "true"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Successfully cleaned up stuck pending-install release", proc.stderr)
+        self.assertIn("REPAIRED=[true]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_recovers_to_last_good_revision(self):
         helm_script = (
@@ -1902,9 +2309,13 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             '  *) echo "unexpected helm call: $*" >&2; exit 1 ;;\n'
             'esac\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Rolling back 'kube-agents' to revision 2", proc.stderr)
+        self.assertIn("REPAIRED=[true]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_without_prior_good_revision_refuses_uninstall_by_default(self):
         helm_script = (
@@ -1916,10 +2327,15 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             '  *) echo "unexpected helm call: $*" >&2; exit 1 ;;\n'
             'esac\n'
         )
-        proc = self._run_helm_test('ensure_clean_helm_release kube-agents kubeagents-system', helm_script)
+        proc = self._run_helm_test(
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
+            helm_script,
+        )
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("Automatic uninstall is blocked", proc.stderr)
         self.assertNotIn("UNINSTALL EXECUTED", proc.stderr)
+        # A refusal repaired nothing, and must not claim to have.
+        self.assertIn("REPAIRED=[]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_without_prior_good_revision_uninstalls_when_opted_in(self):
         helm_script = (
@@ -1932,11 +2348,12 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
             'esac\n'
         )
         proc = self._run_helm_test(
-            'ensure_clean_helm_release kube-agents kubeagents-system',
+            'ensure_clean_helm_release kube-agents kubeagents-system' + self._REPORT_REPAIRED,
             helm_script,
             env_overrides={"ALLOW_UNINSTALL_PENDING_RELEASE": "true"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REPAIRED=[true]", proc.stdout, proc.stderr)
 
     def test_pending_upgrade_in_flight_waits_and_succeeds_when_deployed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2145,6 +2562,70 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
 
+class MissingEndpointHelperTest(unittest.TestCase):
+    """The fallback for a tree with no gke_dns_endpoint.sh beside this file.
+
+    Nothing else reaches it. Every other test here sources the checkout's own
+    installer_common.sh, where the helper is always its neighbour, so they all
+    take the branch that sources it for real. The arm below is the one an
+    incomplete checkout takes, and the two ways it can break are both silent
+    until then: a slip in its syntax stops the source at load time, and a stub
+    that does not define the function leaves every caller with an undefined
+    command.
+    """
+
+    def _source_without_helper(self, probe):
+        """Source a copy of installer_common.sh with no helper beside it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            installer_dir = root / "scripts" / "installer"
+            installer_dir.mkdir(parents=True)
+            copied = installer_dir / "installer_common.sh"
+            shutil.copy(_INSTALLER_COMMON, copied)
+            # Two levels up, where the file looks for them. The defaults are
+            # copied because their absence is a hard failure by design -- this
+            # test is about the helper's absence alone.
+            shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+            # gke_dns_endpoint.sh is deliberately NOT created beside the copy.
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            body = f'set -u\n{_PRINT_STUBS}\nsource "{copied}"\n{probe}'
+            return subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(root),
+            )
+
+    def test_a_tree_without_the_helper_still_defines_the_predicate(self):
+        # uninstall.sh calls this unconditionally. Were the stub missing or the
+        # arm broken, the call would be an undefined command and `set -e` would
+        # end a teardown over which endpoint to dial.
+        proc = self._source_without_helper('echo "kind=$(type -t gke_dns_endpoint_flag)"')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("kind=function", proc.stdout, proc.stderr)
+
+    def test_the_stub_leaves_the_flag_empty_so_the_fetch_is_unchanged(self):
+        # The empty flag is the command that ran before the helper existed, and
+        # it still reaches every cluster with a routable IP endpoint. A stub
+        # that left a stale value in place would splice it into get-credentials.
+        proc = self._source_without_helper(
+            'GKE_DNS_ENDPOINT_FLAG=--stale\n'
+            'gke_dns_endpoint_flag some-cluster us-central1 some-project\n'
+            'echo "flag=[${GKE_DNS_ENDPOINT_FLAG}]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("flag=[]", proc.stdout, proc.stderr)
+
+    def test_it_says_so_rather_than_falling_back_in_silence(self):
+        # uninstall.sh and upgrade.sh are the front doors that reach this; the
+        # next thing their operator sees is an unrelated-looking missing key.
+        proc = self._source_without_helper("true")
+        self.assertIn("gke_dns_endpoint.sh", proc.stderr)
+        self.assertIn("IP endpoint", proc.stderr)
+
+
 class ToleratedProbesClearErrTrapTest(unittest.TestCase):
     """The library's tolerated probes clear the inherited ERR trap inside their $(...).
 
@@ -2166,7 +2647,13 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
         (_INSTALLER_COMMON, 'status_json="$(trap - ERR; helm status ', 1),
         (_INSTALLER_COMMON, 'history_json="$(trap - ERR; helm history ', 2),
         (_INSTALLER_COMMON, 'last_good_rev="$(trap - ERR; printf ', 1),
+        (_INSTALLER_COMMON, 'out="$({ trap - ERR; kubectl get ', 1),
         (_GKE_DNS_ENDPOINT, 'described=$(trap - ERR; gcloud container clusters describe ', 1),
+        (_INSTALLER_COMMON, 'cr_json="$(trap - ERR; kubectl --context ', 1),
+        (_INSTALLER_COMMON, 'record_json="$(trap - ERR; helm get values ', 1),
+        (_INSTALLER_COMMON, 'served_rev="$(trap - ERR; helm history ', 1),
+        (_INSTALLER_COMMON, 'served_json="$(trap - ERR; helm get values ', 1),
+        (_INSTALLER_COMMON, 'verdict="$(trap - ERR; printf ', 1),
     )
 
     def test_each_tolerated_probe_clears_the_trap_inside_its_substitution(self):
@@ -2177,6 +2664,778 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
             with self.subTest(file=path.name, probe=unguarded.strip()):
                 self.assertEqual(source.count(guarded), count, f"{path.name}: {guarded!r}")
                 self.assertNotIn(unguarded, source, f"{path.name}: a probe lost its `trap - ERR`")
+
+
+class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
+    """The five SCOPE_* keys become the composition's `scope` object.
+
+    Always a full block, empty lists included: the reconcile reads an emptied
+    projects list as the declaration that drops projects and a missing block as
+    no declaration (docs/designs/multi-project-scope.md §7), so the generator
+    never omits it. Only the shape of an excluded cluster is checked here; the
+    CRD's patterns, caps and repeats are the module variable's validations.
+    """
+
+    # The generator harness, borrowed rather than inherited: subclassing the
+    # concrete test class would run its whole suite a second time.
+    _run = InstallerCommonTest._run
+    _tfvars = InstallerCommonTest._tfvars
+
+    EMPTY_BLOCK = (
+        "scope = {\n"
+        "  projects      = []\n"
+        "  folders       = []\n"
+        "  organizations = []\n"
+        "  exclude = {\n"
+        "    projects = []\n"
+        "    clusters = []\n"
+        "  }\n"
+        "}\n"
+    )
+
+    def _scope_env(self, **keys):
+        env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+               "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+        env.update(keys)
+        return env
+
+    def test_an_install_with_no_scope_key_renders_an_empty_present_block(self):
+        content = self._tfvars(self._scope_env())
+        self.assertIn(self.EMPTY_BLOCK, content)
+
+    def test_the_keys_are_carried_verbatim_into_the_block(self):
+        content = self._tfvars(self._scope_env(
+            SCOPE_PROJECTS="payments-prod, payments-staging",
+            SCOPE_FOLDERS="123456789012 210987654321",
+            SCOPE_ORGANIZATIONS="987654321098",
+            SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
+            SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
+        ))
+        self.assertIn(
+            "scope = {\n"
+            '  projects      = ["payments-prod", "payments-staging"]\n'
+            '  folders       = ["123456789012", "210987654321"]\n'
+            '  organizations = ["987654321098"]\n'
+            "  exclude = {\n"
+            '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
+            '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
+            '{ project_id = "p2", location = "us-east1-b", cluster_name = "c2" }]\n'
+            "  }\n"
+            "}\n",
+            content,
+        )
+
+    def test_a_glob_is_never_expanded_against_the_working_directory(self):
+        # hcl_csv_list splits an unquoted string; with globbing on, *-sandbox
+        # beside a file named team-a-sandbox renders the file name.
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as out_dir:
+            for name in ("team-a-sandbox", "team-b-sandbox"):
+                (pathlib.Path(cwd) / name).write_text("")
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'cd "{cwd}" && write_tfvars_from_state "{dest}"; echo "rc=$?"; '
+                'case "$-" in *f*) echo "noglob-left-on" ;; *) echo "noglob-restored" ;; esac',
+                env=self._scope_env(SCOPE_EXCLUDE_PROJECTS="*-sandbox", SCOPE_PROJECTS="*-sandbox"),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("noglob-restored", proc.stdout)
+            content = dest.read_text()
+            self.assertIn('projects = ["*-sandbox"]', content)
+            self.assertNotIn("team-a-sandbox", content)
+
+    def test_a_malformed_cluster_entry_is_refused_before_the_file_is_written(self):
+        for bad in ("payments-staging/us-central1", "a/b/c/", "a//c", "/b/c", "a/b/c/d"):
+            with self.subTest(entry=bad), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=self._scope_env(SCOPE_EXCLUDE_CLUSTERS=f"a-good/us-central1/one, {bad}"),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(f"SCOPE_EXCLUDE_CLUSTERS entry '{bad}' is not project/location/cluster",
+                              proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists(), "no tfvars is written for an entry the block cannot render")
+                self.assertFalse((pathlib.Path(out_dir) / "terraform.tfvars.tmp").exists())
+
+    def test_a_container_id_that_is_not_a_bare_number_is_refused_before_the_file_is_written(self):
+        # A folders/<id> spelling would otherwise reach terraform's variable
+        # validation with a message naming neither the key nor the entry.
+        for key, bad in (("SCOPE_FOLDERS", "folders/123456789012"), ("SCOPE_ORGANIZATIONS", "organizations/1"),
+                         ("SCOPE_FOLDERS", "my-folder"), ("SCOPE_ORGANIZATIONS", "123456789012345678901")):
+            with self.subTest(key=key, entry=bad), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=self._scope_env(**{key: f"123456789012, {bad}"}),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(f"{key} entry '{bad}' is not a numeric Resource Manager ID", proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists())
+
+
+_LIVE_SCOPE_CR = (
+    '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p3-project","p2-project"],'
+    '"exclude":{"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}]}'
+)
+_LIVE_SCOPE_LINES = (
+    'SCOPE_PROJECTS="p2-project p3-project"',
+    'SCOPE_FOLDERS=""',
+    'SCOPE_ORGANIZATIONS=""',
+    'SCOPE_EXCLUDE_PROJECTS=""',
+    'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
+)
+
+
+class PreApplyScopeCheckTest(unittest.TestCase):
+    """refuse_apply_over_undeclared_scope: L (live CR), R (release record),
+    K (the keys). Refused only when L is present and non-empty and matches
+    neither R nor K; every read that cannot decide fails closed, except under
+    "warn", where a plan applies nothing.
+    """
+
+    def _run(self, cr, record, keys=None, mode="", context_present=True, served=None, latest_failed=True,
+             python_noise=False):
+        """cr / record: a JSON string the stub prints, or one of the failure
+        spellings: 'notype', 'norelease', 'err'. served: the values of the
+        previous revision; with latest_failed the history reads deployed then
+        failed, otherwise superseded then deployed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            ctx_rc = 0 if context_present else 1
+            cr_case = {
+                "notype": 'echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1',
+                "err": 'echo "Unable to connect to the server: dial tcp: i/o timeout" >&2; exit 1',
+            }.get(cr, f"printf '%s\\n' '{cr}'; exit 0")
+            record_case = {
+                "norelease": 'echo "Error: release: not found" >&2; exit 1',
+                "err": 'echo "Error: Kubernetes cluster unreachable" >&2; exit 1',
+            }.get(record, f"printf '%s\\n' '{record}'; exit 0")
+            (bin_dir / "kubectl").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"config get-contexts"*) exit {ctx_rc} ;;\n'
+                f'  *"get platformagents"*) {cr_case} ;;\n'
+                "esac\nexit 1\n"
+            )
+            if served is None:
+                history = '[{"revision": 3, "status": "deployed"}]'
+                served_case = "exit 1"
+            else:
+                history = ('[{"revision": 3, "status": "deployed"}, {"revision": 4, "status": "failed"}]'
+                           if latest_failed else
+                           '[{"revision": 3, "status": "superseded"}, {"revision": 4, "status": "deployed"}]')
+                served_case = f"printf '%s\\n' '{served}'; exit 0"
+            (bin_dir / "helm").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"get values"*"--revision 3"*) {served_case} ;;\n'
+                f'  *"get values"*) {record_case} ;;\n'
+                f"  *\"history\"*) printf '%s\\n' '{history}'; exit 0 ;;\n"
+                "esac\nexit 1\n"
+            )
+            if python_noise:
+                # An interpreter that writes to stderr and exits 0: PYTHONWARNINGS,
+                # -X dev, a half-installed prefix. The verdict must not read it.
+                real = shutil.which("python3")
+                (bin_dir / "python3").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'echo "warning: stderr noise from the interpreter" >&2\n'
+                    f'exec "{real}" "$@"\n'
+                )
+            for stub in ("kubectl", "helm") + (("python3",) if python_noise else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
+                   "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+            env.update(keys or {})
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'refuse_apply_over_undeclared_scope kubeagents-system {mode}; echo "rc=$?"\n'
+            )
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)),
+                                  cwd=str(_REPO_ROOT))
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_nothing_live_to_protect_passes_silently(self):
+        for label, cr in (
+            ("no PlatformAgent type served", "notype"),
+            ("no PlatformAgent", '{"items":[]}'),
+            ("a CR without a scope block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{}}]}'),
+            ("a present but empty block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{}}}]}'),
+        ):
+            with self.subTest(case=label):
+                proc = self._run(cr, "norelease")
+                self._assert_rc(proc, 0)
+                self.assertNotIn("WARN", proc.stdout)
+                self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_hand_declared_scope_with_no_record_and_no_keys_is_refused_with_the_lines(self):
+        proc = self._run(_LIVE_SCOPE_CR, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn("declares a scope this install did not write and install.env does not carry", proc.stdout)
+        self.assertIn("retires the projects it drops", proc.stdout)
+        for line in _LIVE_SCOPE_LINES:
+            with self.subTest(line=line):
+                self.assertIn(f"INFO:   {line}", proc.stdout)
+        self.assertIn("edit the PlatformAgent", proc.stdout)
+
+    def test_keys_that_carry_the_live_scope_pass_whatever_their_spelling(self):
+        # Order, separators and repeats are spelling: every list is compared
+        # as a set, the cluster triples included (the CR's list is a map keyed
+        # on the triple, so it never repeats; a repeated triple in install.env
+        # is Terraform's distinct validation to refuse, with its own message).
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", keys={
+            "SCOPE_PROJECTS": "p3-project,p2-project p2-project",
+            "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1, p2-project/us-central1/c1",
+        })
+        self._assert_rc(proc, 0)
+
+    def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
+        # L == R: the record shows the installer rendered it; the keys are the
+        # new declaration, and dropping the last project needs no override.
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        for keys in ({}, {"SCOPE_PROJECTS": "p2-project"}, {"SCOPE_PROJECTS": "p2-project p3-project p4-project"}):
+            with self.subTest(keys=keys):
+                self._assert_rc(self._run(_LIVE_SCOPE_CR, record, keys=keys), 0)
+
+    def test_a_failed_upgrades_values_do_not_make_the_served_scope_a_hand_edit(self):
+        # Revision 4 failed with projects [p2]; the CR still holds revision 3's
+        # [p2, p3]. The retry with the same keys must pass, not tell the operator
+        # to record a scope the installer itself wrote.
+        latest = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        served = ('{"platformAgent":{"scope":{"projects":["p3-project","p2-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"}, served=served)
+        self._assert_rc(proc, 0)
+        # And without a served revision that matches, the same shape is refused.
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"}, served=latest)
+        self._assert_rc(proc, 1)
+
+    def test_a_previous_revisions_scope_is_not_a_record_once_the_latest_served(self):
+        # Revision 3 (superseded) rendered [p2, p3]; revision 4 (deployed)
+        # rendered [p2] and the CR held it, until a hand edit put p3 back. The
+        # latest revision served, so it is the one record: the hand edit is
+        # refused, not read as the installer's own earlier declaration.
+        latest = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        previous = ('{"platformAgent":{"scope":{"projects":["p3-project","p2-project"],"exclude":{"projects":[],'
+                    '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"},
+                         served=previous, latest_failed=False)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
+
+    def test_a_hand_declared_container_is_protected_like_a_project(self):
+        # The chart renders folders and organizations now, so an apply over a
+        # CR that carries one the record and the keys do not is the same
+        # silent replace as for a project: refused, with the two lines that
+        # reproduce it, and passed once the keys carry it.
+        only_containers = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"folders":["123456789012"],'
+                           '"organizations":["987654321098"]}}}]}')
+        proc = self._run(only_containers, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_FOLDERS="123456789012"', proc.stdout)
+        self.assertIn('INFO:   SCOPE_ORGANIZATIONS="987654321098"', proc.stdout)
+        proc = self._run(only_containers, "norelease",
+                         keys={"SCOPE_FOLDERS": "123456789012", "SCOPE_ORGANIZATIONS": "987654321098"})
+        self._assert_rc(proc, 0)
+        # A record that carries the folder makes the keys the new declaration,
+        # dropping it included.
+        record = ('{"platformAgent":{"scope":{"projects":[],"folders":["123456789012"],"organizations":["987654321098"],'
+                  '"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_containers, record), 0)
+        # And a record from before the chart rendered the lists (no folders
+        # key) does not account for a folder the CR carries.
+        older = '{"platformAgent":{"scope":{"projects":[],"exclude":{"projects":[],"clusters":[]}}}}'
+        self._assert_rc(self._run(only_containers, older), 1)
+
+    def test_selectors_on_the_live_cr_are_reported_and_never_weighed(self):
+        # sharedVpcHosts and metricsScopes (phase 3) have no installer key and
+        # the chart renders neither, so an apply leaves them alone: a CR
+        # carrying only selectors passes with a note, and a refused mixed edit
+        # still prints the lines it can reproduce plus the note.
+        only_selectors = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"sharedVpcHosts":["shared-net-host"],'
+                          '"metricsScopes":["observability-hub"]}}}]}')
+        proc = self._run(only_selectors, "norelease")
+        self._assert_rc(proc, 0)
+        self.assertIn("also declares sharedVpcHosts: shared-net-host metricsScopes: observability-hub, which the installer has no key for yet", proc.stdout)
+        mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
+                 '"sharedVpcHosts":["shared-net-host"]}}}]}')
+        proc = self._run(mixed, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
+        self.assertIn("also declares sharedVpcHosts: shared-net-host, which the installer has no key for yet", proc.stdout)
+
+    def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
+        # L != R (p3-project and the exclusion were added by hand) and L != K.
+        record = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        proc = self._run(_LIVE_SCOPE_CR, record, keys={"SCOPE_PROJECTS": "p2-project"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
+
+    def test_a_hand_set_exclusion_alone_is_protected(self):
+        cr = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"exclude":{"projects":["*-sandbox"]}}}}]}')
+        proc = self._run(cr, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_EXCLUDE_PROJECTS="*-sandbox"', proc.stdout)
+
+    def test_warn_mode_speaks_and_passes(self):
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", mode="warn")
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The PlatformAgent 'platform-agent'", proc.stdout)
+        self.assertIn("the plan below shows the change", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_missing_context_refuses_and_names_the_fetch(self):
+        # The apply needs no kubeconfig (the helm provider authenticates with a
+        # token against the endpoint), so a check that could not read must
+        # stop the run rather than let the apply proceed over a scope nobody read.
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", context_present=False)
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the kubeconfig has no context 'gke_test-project_us-central1_test-cluster'", proc.stdout)
+        self.assertIn("gcloud container clusters get-credentials test-cluster --location us-central1 --project test-project", proc.stdout)
+
+    def test_a_missing_context_only_warns_under_a_plan(self):
+        proc = self._run(_LIVE_SCOPE_CR, "norelease", mode="warn", context_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope check did not run: the kubeconfig has no context", proc.stdout)
+
+    def test_interpreter_noise_on_stderr_does_not_become_a_refusal(self):
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, record, python_noise=True)
+        self._assert_rc(proc, 0)
+        self.assertNotIn("declares a scope", proc.stdout)
+        # And a genuine failure still carries the interpreter's message.
+        two = '{"items":[{"metadata":{"name":"a"},"spec":{"scope":{"projects":["p2-project"]}}},{"metadata":{"name":"b"},"spec":{}}]}'
+        proc = self._run(two, "norelease", python_noise=True)
+        self._assert_rc(proc, 1)
+        self.assertIn("more than one PlatformAgent is served", proc.stdout)
+
+    def test_a_read_that_cannot_decide_fails_closed_unless_warning(self):
+        for label, cr, record in (
+            ("the CR", "err", "norelease"),
+            ("the record", _LIVE_SCOPE_CR, "err"),
+            ("two PlatformAgents",
+             '{"items":[{"metadata":{"name":"a"},"spec":{"scope":{"projects":["p2-project"]}}},{"metadata":{"name":"b"},"spec":{}}]}',
+             "norelease"),
+        ):
+            with self.subTest(case=label):
+                proc = self._run(cr, record)
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply:", proc.stdout)
+                proc = self._run(cr, record, mode="warn")
+                self._assert_rc(proc, 0)
+                self.assertIn("WARN: The scope check did not run:", proc.stdout)
+
+
+# Every variable the preflight's token minting, or the gcloud that does it,
+# reads from the environment; blanked in the test environment and set per case.
+_GOOGLE_CREDENTIAL_VARIABLES = (
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_OAUTH_ACCESS_TOKEN", "GOOGLE_CREDENTIALS",
+    "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON", "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
+)
+
+
+class ScopeContainerPreflightTest(unittest.TestCase):
+    """check_scope_container_access: silent with no container; with one, the
+    Asset API must be enabled in the host project or no effective policy may
+    deny it, and the applying identity must hold setIamPolicy on every
+    container, asked through testIamPermissions. Every failure is named
+    before the refusal; a probe that cannot decide warns and lets the apply
+    speak; "warn" turns the refusal into a warning."""
+
+    def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False):
+        """probe: a dict from resource ("folders/1") to what curl answers:
+        "granted", "denied", "forbidden", "service-disabled", "missing",
+        "garbage", "down". The stubs record what they saw in a log the test
+        folds into proc.stderr: the bearer curl read from its stdin (-H @-),
+        the impersonation flag gcloud saw, the first bytes of a key file it
+        was pointed at, and any CLOUDSDK_AUTH_* override that reached it."""
+        probe = probe or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            policy_json = "<not json>" if policy_garbage else json.dumps(policy or {"spec": {"rules": []}})
+            services = "cloudasset.googleapis.com" if api_enabled else ""
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"services list"*) printf "%s\\n" "{services}"; exit 0 ;;\n'
+                + ('  *"org-policies describe"*) echo "ERROR: PERMISSION_DENIED" >&2; exit 1 ;;\n' if policy_error else
+                   f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
+                # Terraform's credentials, not gcloud's active account: the stub
+                # answers the ADC form and refuses the plain one.
+                + ('  *"application-default print-access-token"*) [ -z "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}${CLOUDSDK_AUTH_ACCESS_TOKEN:-}${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-}${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ] || echo "CLOUDSDK-LEAKED" >>"$SCOPE_PROBE_LOG"; [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] || echo "KEYFILE-BYTES:$(head -c 12 "$GOOGLE_APPLICATION_CREDENTIALS" | tr -d "\\n")" >>"$SCOPE_PROBE_LOG"; echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
+                   '  *"application-default print-access-token"*) exit 1 ;;\n')
+                # The raw-token form: only right with a source token in
+                # CLOUDSDK_AUTH_ACCESS_TOKEN and the impersonation flag.
+                + '  *"auth print-access-token"*"--impersonate-service-account="*) echo "imp-from-${CLOUDSDK_AUTH_ACCESS_TOKEN:-none}"; echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG"; exit 0 ;;\n'
+                + '  *"auth print-access-token"*) echo "wrong-identity"; exit 0 ;;\n'
+                + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
+                # gcloud configuration properties: `config get-value` reports the
+                # effective value, so a CLOUDSDK_AUTH_* variable wins over the
+                # configuration file, as in the real binary; the file's value is
+                # set per case through STUB_PROPERTY_*.
+                + '  *"config get-value auth/impersonate_service_account"*) echo "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-${STUB_PROPERTY_IMPERSONATE:-}}"; exit 0 ;;\n'
+                + '  *"config get-value auth/access_token_file"*) echo "${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-${STUB_PROPERTY_TOKEN_FILE:-}}"; exit 0 ;;\n'
+                "esac\nexit 1\n"
+            )
+            if curl_present:
+                cases = []
+                for resource, answer in probe.items():
+                    body, status = {
+                        "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
+                        "denied": ("{}", 200),
+                        "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
+                        "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
+                        "scope-insufficient": ('{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}', 403),
+                        "missing": ('{"error":{"code":404}}', 404),
+                        "garbage": ("<html>", 200),
+                        "down": ("", None),
+                    }[answer]
+                    if status is None:
+                        cases.append(f'  *"/{resource}:testIamPermissions"*) exit 7 ;;')
+                    else:
+                        cases.append(f"  *\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
+                # Records the bearer read from the header file, and refuses a
+                # token on argv, before answering.
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
+            # env is an external binary whose argv any local user can read: the
+            # stub records what it was handed, then hands over to the real one.
+            (bin_dir / "env").write_text(
+                "#!/usr/bin/env bash\n"
+                'echo "ENV-ARGV:$*" >>"$SCOPE_PROBE_LOG"\n'
+                'exec /usr/bin/env "$@"\n'
+            )
+            for stub in ("gcloud", "env") + (("curl",) if curl_present else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            # The library discards the stubs' stderr, so what they saw is
+            # recorded in a file the test reads back into proc.stderr.
+            probe_log = pathlib.Path(tmp) / "probe.log"
+            probe_log.write_text("")
+            # Hermetic: the library and the gcloud stub read the provider's and
+            # gcloud's credential variables straight from the environment, so a
+            # developer's shell must not reach them; each case sets its own.
+            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_PROBE_LOG": str(probe_log)}
+            env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
+            env.update(keys or {})
+            env.update(env_extra or {})
+            # strict: the front doors' shell options and ERR trap, under which
+            # upgrade.sh --plan calls the check bare (no `|| exit 1`), so a probe
+            # answering "denied" must not read as an error.
+            call = (f'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; check_scope_container_access {mode}; echo "rc=$?"\n'
+                    if strict else f'check_scope_container_access {mode}; echo "rc=$?"\n')
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                + call
+            )
+            # For a curl-absent run PATH is the stubs plus a minimal toolbox
+            # (bash, coreutils, python3), so the real curl is not found behind it.
+            isolated = get_isolated_test_env(overrides=env, bin_dir=str(bin_dir))
+            if not curl_present:
+                tools = create_minimal_tools_bin(pathlib.Path(tmp) / "tools")
+                (tools / "python3").symlink_to(shutil.which("python3"))
+                isolated["PATH"] = f"{bin_dir}:{tools}"
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=isolated, cwd=str(_REPO_ROOT))
+            proc.stderr += probe_log.read_text()
+            return proc
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_no_container_is_silent_and_touches_nothing(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, api_enabled=False, policy_error=True, token=False)
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+
+    def test_a_bindable_folder_with_the_api_enabled_passes_silently(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_every_unbindable_container_is_named_before_the_refusal(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111, 222222222222", "SCOPE_ORGANIZATIONS": "333333333333"},
+                         probe={"folders/111111111111": "denied", "folders/222222222222": "granted",
+                                "organizations/333333333333": "missing"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111 (resourcemanager.folders.setIamPolicy)", proc.stdout)
+        self.assertIn("for that identity, or drop it from SCOPE_FOLDERS", proc.stdout)
+        self.assertIn("cannot set IAM policy on organizations/333333333333 (resourcemanager.organizations.setIamPolicy)", proc.stdout)
+        self.assertNotIn("folders/222222222222 (", proc.stdout)
+        self.assertIn("INFO: Nothing was changed.", proc.stdout)
+        # An organisation is always warned about, bindable or not.
+        self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_the_probe_uses_the_credentials_the_provider_would(self):
+        # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
+        # through gcloud's flag; a key file or inline key JSON in
+        # GOOGLE_CREDENTIALS through GOOGLE_APPLICATION_CREDENTIALS; and the
+        # token reaches curl on its stdin, never argv and never a file.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        probe = {"folders/123456789012": "granted"}
+        proc = self._run(keys=base, probe=probe)
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertRegex(proc.stderr, r"IMPERSONATED:.*tf@p\.iam\.gserviceaccount\.com")
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        # gcloud's own overrides in the operator's shell reach neither the mint
+        # nor the property read that guards it: the provider does not read
+        # them, and `config get-value` would otherwise report them as a
+        # property the operator never set.
+        for var in ("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+                    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"):
+            with self.subTest(var=var):
+                proc = self._run(keys=base, probe=probe, env_extra={var: "other@p.iam.gserviceaccount.com"})
+                self._assert_rc(proc, 0)
+                self.assertIn("BEARER:tok\n", proc.stderr)
+                self.assertNotIn("CLOUDSDK-LEAKED", proc.stderr)
+                self.assertNotIn("active configuration sets", proc.stdout)
+        # A raw token plus impersonation: the token is the source credential
+        # and the probe is made as the impersonated account, as the provider
+        # does, never as the raw token's identity.
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env",
+                                                            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertIn("BEARER:imp-from-from-env\n", proc.stderr)
+        self.assertNotIn("BEARER:from-env\n", proc.stderr)
+        # The source token reaches gcloud through the environment, never on
+        # env's argv, which any local user can read.
+        self.assertIn("ENV-ARGV:", proc.stderr)
+        for line in proc.stderr.splitlines():
+            if line.startswith("ENV-ARGV:"):
+                self.assertNotIn("from-env", line)
+                self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN=", line)
+        # A tilde path is a key file to the provider (its pathOrContents
+        # expands the home directory), so it is one here too.
+        with tempfile.TemporaryDirectory() as home:
+            (pathlib.Path(home) / "sa.json").write_text("{}")
+            proc = self._run(keys=base, probe=probe, env_extra={"HOME": home, "GOOGLE_CREDENTIALS": "~/sa.json"})
+            self._assert_rc(proc, 0)
+            self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
+            self.assertIn("KEYFILE-BYTES:{}", proc.stderr)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+            key.write("{}")
+        self.addCleanup(pathlib.Path(key.name).unlink)
+        for var in ("GOOGLE_CREDENTIALS", "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON"):
+            for creds in (key.name, '{"type":"service_account"}', '\n  {"type":"service_account"}', "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50In0="):
+                with self.subTest(var=var, creds=creds[:12]):
+                    proc = self._run(keys=base, probe=probe, env_extra={var: creds})
+                    self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
+                    self._assert_rc(proc, 0)
+                    # An inline value reaches gcloud byte for byte, whatever it
+                    # starts with: the provider's rule is "an existing path,
+                    # else JSON", never the first byte.
+                    if creds != key.name:
+                        self.assertIn("KEYFILE-BYTES:" + creds[:12].replace("\n", ""), proc.stderr)
+        # The bearer reaches curl on stdin, never through a file or argv.
+        self.assertNotIn("BEARER-FROM-FILE", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+
+    def test_a_refusal_names_the_identity_it_probed(self):
+        # A denied probe under a key file sends the operator to that key's
+        # account, not to their ADC principal; the remedy for a token that
+        # could not be minted names the source that failed.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        denied = {"folders/123456789012": "denied"}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+            key.write("{}")
+        self.addCleanup(pathlib.Path(key.name).unlink)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_CREDENTIALS": '{"type":"service_account"}'})
+        self._assert_rc(proc, 1)
+        self.assertIn("the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "t",
+                                                              "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertIn("the identity behind GOOGLE_OAUTH_ACCESS_TOKEN impersonating tf@p.iam.gserviceaccount.com (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
+        # A path that does not exist: gcloud is handed it as key JSON (the
+        # provider's rule), mints nothing, and the remedy names the variable
+        # and says the file is missing, without printing the value.
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CREDENTIALS": "/nonexistent/key.json"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope container preflight could not decide whether the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_CREDENTIALS is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+        self.assertNotIn("/nonexistent/key.json", proc.stdout)
+        self.assertNotIn("application-default login", proc.stdout)
+        # A key that gcloud refuses: the remedy names the key, not ADC, and
+        # never prints it, whatever byte the key starts with.
+        for creds in ('{"type":"service_account"}', '\n{"type":"service_account","private_key":"SECRET-BYTES"}', "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50In0="):
+            with self.subTest(creds=creds[:10]):
+                proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CLOUD_KEYFILE_JSON": creds})
+                self.assertIn("(GOOGLE_CLOUD_KEYFILE_JSON is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+                self.assertNotIn("SECRET-BYTES", proc.stdout + proc.stderr)
+                self.assertNotIn("eyJ0eXBl", proc.stdout)
+        # ADC, no token: the ADC remedy; with GOOGLE_APPLICATION_CREDENTIALS
+        # set, the remedy and the label name that variable instead, because
+        # the login the plain remedy suggests writes a file the variable
+        # overrides.
+        proc = self._run(keys=base, probe=denied, token=False)
+        self.assertIn("run: gcloud auth application-default login", proc.stdout)
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": "/nonexistent/adc.json"})
+        self.assertIn("whether the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way)", proc.stdout)
+        self.assertNotIn("application-default login", proc.stdout)
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
+        self.assertIn("(the key file GOOGLE_APPLICATION_CREDENTIALS names could not mint a token; check it is a valid service-account key, or unset the variable to use the login credentials)", proc.stdout)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
+        self._assert_rc(proc, 1)
+        self.assertIn("the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
+
+    def test_a_gcloud_impersonation_property_makes_the_probe_undecided(self):
+        # gcloud config set auth/impersonate_service_account lives in the
+        # active configuration, out of env -u's reach, and a mint under it
+        # answers for an identity Terraform never uses: undecided, naming the
+        # property, unless GOOGLE_IMPERSONATE_SERVICE_ACCOUNT overrides it
+        # explicitly or no gcloud mint is made at all.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        probe = {"folders/123456789012": "granted"}
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com"})
+        self._assert_rc(proc, 0)
+        self.assertIn("gcloud's active configuration sets auth/impersonate_service_account, which its token mint honours and Terraform does not", proc.stdout)
+        self.assertNotIn("BEARER:", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_TOKEN_FILE": "/tmp/t"})
+        self.assertIn("sets auth/access_token_file,", proc.stdout)
+        # Both set: both named.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "x@p.iam.gserviceaccount.com", "STUB_PROPERTY_TOKEN_FILE": "/tmp/t"})
+        self.assertIn("sets auth/impersonate_service_account auth/access_token_file,", proc.stdout)
+        # An explicit GOOGLE_IMPERSONATE_SERVICE_ACCOUNT overrides the impersonation property: the probe runs.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com",
+                                                            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self._assert_rc(proc, 0)
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("active configuration sets", proc.stdout)
+        # A raw token with no impersonation makes no gcloud mint: the property is irrelevant.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com",
+                                                            "GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+        self.assertNotIn("active configuration sets", proc.stdout)
+
+    def test_a_403_for_a_disabled_api_is_undecided_not_denied(self):
+        # Resource Manager answers 403 with reason SERVICE_DISABLED when its
+        # API is off in the credential's quota project; the apply enables it
+        # before binding, so this is not a permission answer, and the warning
+        # says why.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "service-disabled"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/123456789012 (Resource Manager answered 403 for its API being off in the credentials' quota project, which the apply enables before it binds)", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_403_for_an_insufficiently_scoped_token_names_the_scope_not_a_grant(self):
+        # A raw token minted without cloud-platform gets 403
+        # ACCESS_TOKEN_SCOPE_INSUFFICIENT; the role may be held, so the
+        # remedy is the token's scope, never "ask for folderIamAdmin".
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "scope-insufficient"},
+                         env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "narrow"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether the identity behind GOOGLE_OAUTH_ACCESS_TOKEN (the identity Terraform applies with) can set IAM policy on folders/123456789012 (the token lacks the cloud-platform scope; mint it with that scope, as gcloud does)", proc.stdout)
+        self.assertNotIn("folderIamAdmin", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        # The other undecided answers carry their reason too.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222"},
+                         probe={"folders/111111111111": "down", "folders/222222222222": "garbage"})
+        self.assertIn("folders/111111111111 (the request to Resource Manager did not complete)", proc.stdout)
+        self.assertIn("folders/222222222222 (Resource Manager answered 200 with a body that is not the JSON it documents)", proc.stdout)
+
+    def test_a_403_is_a_refusal_and_a_transport_failure_is_a_warning(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222 333333333333"},
+                         probe={"folders/111111111111": "forbidden", "folders/222222222222": "down",
+                                "folders/333333333333": "garbage"})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("WARN: The scope container preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/222222222222", proc.stdout)
+        self.assertIn("can set IAM policy on folders/333333333333", proc.stdout)
+
+    def test_a_policy_that_denies_the_api_is_named_when_the_api_is_off(self):
+        for label, policy in (
+            ("deniedValues", {"spec": {"rules": [{"values": {"deniedValues": ["cloudasset.googleapis.com"]}}]}}),
+            ("allowedValues without it", {"spec": {"rules": [{"values": {"allowedValues": ["container.googleapis.com"]}}]}}),
+            ("denyAll", {"spec": {"rules": [{"denyAll": True}]}}),
+        ):
+            with self.subTest(policy=label):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False, policy=policy,
+                                 probe={"folders/123456789012": "granted"})
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: cloudasset.googleapis.com cannot be enabled in project 'test-project': the effective organisation policy constraints/gcp.restrictServiceUsage denies it", proc.stdout)
+        # The API already on: the policy is never consulted.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=True,
+                         policy={"spec": {"rules": [{"denyAll": True}]}}, probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        # The API off and no policy denying it: fine, the apply enables it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                         policy={"spec": {"rules": [{"values": {"allowedValues": ["cloudasset.googleapis.com"]}}]}},
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        # A dry-run policy enforces nothing: an organisation trialling the
+        # constraint must not be refused for it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                         policy={"dryRunSpec": {"rules": [{"denyAll": True}]}},
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("denies it", proc.stdout)
+
+    def test_an_unreadable_policy_warns_and_lets_the_apply_speak(self):
+        # Unreadable two ways: gcloud fails, or gcloud exits 0 with a body the
+        # reader cannot parse. Neither is "not denied"; both warn, like the
+        # IAM probe's undocumented body does.
+        for kwargs in ({"policy_error": True}, {"policy_garbage": True}):
+            with self.subTest(**kwargs):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                                 probe={"folders/123456789012": "granted"}, **kwargs)
+                self._assert_rc(proc, 0)
+                self.assertIn("WARN: The scope container preflight could not decide whether cloudasset.googleapis.com can be enabled in project 'test-project'", proc.stdout)
+                self.assertNotIn("ERROR", proc.stdout)
+
+    def test_no_token_or_no_curl_warns_about_the_containers_and_passes(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, token=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("gcloud could not mint an access token for them; run: gcloud auth application-default login", proc.stdout)
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, curl_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("curl is not installed", proc.stdout)
+
+    def test_a_denied_probe_is_an_answer_under_the_front_doors_strict_shell(self):
+        # upgrade.sh --plan calls the check bare under set -eE with an ERR
+        # trap; a probe that answers denied, or a policy read that says the
+        # API is forbidden, must reach the warning rather than abort the run.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222"}, mode="warn", strict=True,
+                         api_enabled=False, policy={"spec": {"rules": [{"denyAll": True}]}},
+                         probe={"folders/111111111111": "denied", "folders/222222222222": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
+        self.assertIn("WARN: An applying run would be refused: cloudasset.googleapis.com cannot be enabled", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("can set IAM policy on folders/222222222222", proc.stdout)
+        # And a clean run under the same options is silent.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111"}, strict=True, probe={"folders/111111111111": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+
+    def test_warn_mode_names_the_failures_and_passes(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, mode="warn", probe={"folders/123456789012": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
 
 
 if __name__ == "__main__":
