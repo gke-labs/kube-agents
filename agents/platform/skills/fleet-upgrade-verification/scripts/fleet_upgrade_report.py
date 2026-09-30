@@ -15,7 +15,8 @@ since that run, and flags an unchanged, behind member as `stalled` while a rollo
 active (another member moved, or `--rollout-in-progress` was passed).
 
 With `--readiness`, each member is also graded on whether it can take the upgrade to its
-target: drain-blocking PodDisruptionBudgets (read with one `kubectl get` per member after
+target: drain-blocking PodDisruptionBudgets and fail-closed admission webhooks with no
+ready backend (read with one `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane. The rules live in
@@ -208,7 +209,7 @@ VERSION_PAIR_SEPARATOR = " / "
 # workspace, which is why the default is not /tmp. `--kubeconfig-dir` overrides it.
 KUBECTL = "kubectl"
 KUBECTL_TIMEOUT_SECONDS = 60
-KUBECTL_RESOURCES = "pdb,deploy,statefulset"
+KUBECTL_RESOURCES = "pdb,deploy,statefulset,validatingwebhookconfigurations,mutatingwebhookconfigurations,endpointslices"
 KUBECONFIG_ENV = "KUBECONFIG"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
@@ -232,6 +233,7 @@ READINESS_COLUMNS = (
     "location",
     "readiness",
     "drain-blocking PDBs",
+    "fail-closed webhooks",
     "maintenance",
     "node-pool skew",
     "note",
@@ -593,13 +595,14 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     pools = [{"name": p["name"], "version": p["version"], "parsed": parse_version(p["version"])} for p in member["node_pools"]]
     autopilot = bool((cluster.get("autopilot") or {}).get("enabled"))
     pdbs = None if items is None else readiness.grade_pdbs(*readiness.split_items(items))
+    webhooks = None if items is None else readiness.grade_webhooks(*readiness.split_webhook_items(items))
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
-    status = readiness.readiness_status(pdbs, maintenance, skew, target is not None)
+    status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None)
 
     notes = []
     if read_error:
-        notes.append("cluster read failed; PDBs not graded")
+        notes.append("cluster read failed; PDBs and webhooks not graded")
     if target is None:
         notes.append("no target; exclusion scope and skew not graded")
     if pdbs:
@@ -609,6 +612,8 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
             notes.append(f"{pdbs['orphan']} orphan PDB(s) matching no workload skipped")
         if pdbs["unmatched"]:
             notes.append(f"{pdbs['unmatched']} PDB(s) cover pods of no Deployment or StatefulSet; not graded")
+    if webhooks and webhooks["url_backends"]:
+        notes.append(f"{webhooks['url_backends']} fail-closed webhook(s) with a URL backend; not graded")
     if maintenance["undecided_exclusions"]:
         notes.append(f"exclusion(s) not evaluated: {readiness.LIST_SEPARATOR.join(maintenance['undecided_exclusions'])}")
     if maintenance["window"]["state"] == readiness.WINDOW_NOT_EVALUATED:
@@ -625,6 +630,7 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
         "read_error": read_error,
         "autopilot": autopilot,
         "pdbs": pdbs,
+        "webhooks": webhooks,
         "maintenance": maintenance,
         "skew": skew,
         "note": NOTE_SEPARATOR.join(notes),
@@ -735,6 +741,14 @@ def _pdb_cell(r: dict) -> str:
     return NOTE_SEPARATOR.join(readiness.describe_finding(f) for f in r["pdbs"]["blocking"])
 
 
+def _webhook_cell(r: dict) -> str:
+    if r["webhooks"] is None:
+        return READINESS_READ_FAILED_CELL
+    if not r["webhooks"]["blocking"]:
+        return READINESS_NONE_CELL
+    return NOTE_SEPARATOR.join(readiness.describe_webhook_finding(f) for f in r["webhooks"]["blocking"])
+
+
 def _maintenance_cell(r: dict) -> str:
     parts = []
     for e in r["maintenance"]["exclusions"]:
@@ -780,14 +794,14 @@ def render_readiness(report: dict) -> str:
     ]
     for m in report["members"]:
         r = m["readiness"]
-        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
+        row = (m["project"], m["cluster"], m["location"], r["status"], _pdb_cell(r), _webhook_cell(r), _maintenance_cell(r), _skew_cell(r), r["note"])
         lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
     summary = report["readiness"]["summary"]
     lines.append("")
     lines.append(
         f"Readiness at {report['readiness']['evaluated_at']}: "
         + ", ".join(f"{summary[s]} {s}" for s in readiness.READINESS_ORDER)
-        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB or skew any upgrade."
+        + "; a maintenance exclusion holds back GKE's automatic upgrades only, a drain-blocking PDB, a fail-closed webhook without a backend, or skew any upgrade."
     )
     return "\n".join(lines)
 
