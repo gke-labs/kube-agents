@@ -1139,7 +1139,7 @@ class ScopeTest(HomesMixin):
                 # Honours the timeout the way gcloud's would: sleeps no longer than it.
                 time.sleep(min(1.5, timeout if timeout is not None else 1.5))
             return [], rec.OUTCOME_OK
-        baseline = threading.active_count()
+        before = set(threading.enumerate())
         start = time.monotonic()
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
@@ -1153,7 +1153,8 @@ class ScopeTest(HomesMixin):
         # by more than the grace: the interpreter joins the pool's threads at exit.
         self.assertLessEqual(cuts["slow"], 1.0)
         time.sleep(1.2)
-        self.assertEqual(threading.active_count(), baseline)
+        # Threads, not a count: an earlier test's pool worker can still be exiting when this starts.
+        self.assertEqual([t for t in threading.enumerate() if t not in before], [])
 
     # ---- phase 2: folders and organisations through Cloud Asset Inventory ----
 
