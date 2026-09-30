@@ -34,17 +34,19 @@ With the flag on:
   after opening them still settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
-  or ❌ if any gave up. A fan-out settles once, when all of it has. Cards are
-  read from every live board, as the notifier reads them, and known by board
-  and id.
+  or ❌ if any gave up. A fan-out settles once, when all of it has. Only a
+  finish reported while the turn runs, or after it, counts for its ask. Cards
+  are read from every live board, as the notifier reads them, and known by
+  board and id.
 
 The deferred asks live in this process only (the notifier runs in the gateway
 process too). A gateway restart between the turn and the settle loses the
 settle, and the ask keeps its arrival reaction alone; nothing is ever put on a
 message this process did not see arrive.
 
-Fail-soft throughout: a kanban read or a reaction that fails is logged at
-debug and the turn carries on, as upstream's ``_react`` already does.
+Fail-soft throughout: a kanban read that fails, on any board, settles the ask
+at once as a direct answer, and a reaction that fails is logged at debug and
+the turn carries on, as upstream's ``_react`` already does.
 """
 
 from __future__ import annotations
@@ -90,14 +92,11 @@ OPEN_CARDS_SQL = (
 #: gateway import. ``cancelled`` is absent: an interrupted turn settles nothing.
 OUTCOME_SETTLES = {"success": "done", "failure": "failed"}
 
-#: Bounds on the in-process maps, oldest evicted first. A turn's start snapshot
-#: is dropped at its completion; a deferred ask at its final settle. The caps
-#: only matter for events that never complete. ``FINISHED_MAX`` bounds the
-#: cards remembered as finished, which only needs to outlast one turn's
-#: completion.
+#: Bounds on the in-process maps, oldest evicted first. A turn in flight is
+#: dropped at its completion; a deferred ask at its final settle. The caps only
+#: matter for events that never complete.
 STARTED_MAX = 512
 DEFERRED_MAX = 512
-FINISHED_MAX = 512
 #: Asks one thread can have waiting at once, oldest dropped first: a thread
 #: whose cards never finish would otherwise grow its list on every ask.
 DEFERRED_PER_THREAD = 32
@@ -110,10 +109,24 @@ UNRESOLVED_PREFIX = "slug:"
 BLOCKED = "blocked"
 
 
-class _Ask:
-    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``.
+class _Turn:
+    """A turn in flight: its thread, the thread's open cards when it started,
+    and the cards that finished while it ran, each with whether it failed.
 
+    Only finishes seen during the turn count, so nothing a card did before this
+    turn, or after an earlier one, decides this ask.
     """
+
+    __slots__ = ("before", "finished", "key")
+
+    def __init__(self, key: tuple, before: dict | None) -> None:
+        self.key = key
+        self.before = before
+        self.finished: dict[tuple[str, str], bool] = {}
+
+
+class _Ask:
+    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``."""
 
     __slots__ = ("cards", "failed", "team_id", "ts")
 
@@ -124,13 +137,8 @@ class _Ask:
         self.failed = failed
 
 
-_started: OrderedDict[Any, dict | None] = OrderedDict()
+_started: OrderedDict[Any, _Turn] = OrderedDict()
 _deferred: OrderedDict[tuple, list[_Ask]] = OrderedDict()
-#: Cards the notifier has reported finished, as ``(board, id)``, and whether each
-#: failed. A card can finish between the turn's board read and the moment its
-#: ask is deferred; the turn checks here so it never waits on a card that has
-#: already settled.
-_finished: OrderedDict[tuple[str, str], bool] = OrderedDict()
 _warned_missing = False
 
 
@@ -155,29 +163,25 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
         store.popitem(last=False)
 
 
-def _live_boards(kb: Any) -> list[dict]:
-    """Every live board, listed as the kanban notifier lists them."""
-    try:
-        return kb.list_boards(include_archived=False)
-    except Exception:  # noqa: BLE001 — the notifier falls back to the default board too
-        return [kb.read_board_metadata(kb.DEFAULT_BOARD)]
-
-
 def _query_open_cards(chat_id: str, thread_id: str) -> dict:
     """Every open card subscribed to this thread, on every live board, as ``{(board, id): status}``.
 
     Boards are walked as the notifier walks them: one read per database, under
     the slug the notifier stamps on that database's deliveries. So a card read
     here and the card a terminal event names compare equal. A board with no
-    database yet is skipped rather than created, and a board that cannot be
-    read is skipped with the rest still read, as the notifier skips it.
+    database yet holds no cards and is skipped rather than created.
+
+    Any other failure raises, where the notifier would skip the board: a turn
+    compares two reads, and a board missing from one of them would make its
+    cards look opened or finished by the turn. A failed read settles the ask
+    at once instead.
     """
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect
 
     cards: dict[tuple[str, str], str] = {}
     seen: set[str] = set()
-    for meta in _live_boards(kb):
+    for meta in kb.list_boards(include_archived=False):
         slug = meta.get("slug") or kb.DEFAULT_BOARD
         path = meta.get("db_path")
         try:
@@ -189,15 +193,11 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
         seen.add(resolved)
         if not resolved.startswith(UNRESOLVED_PREFIX) and not Path(resolved).exists():
             continue
+        conn = kanban_db_connect.connect(board=slug)
         try:
-            conn = kanban_db_connect.connect(board=slug)
-            try:
-                rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
-            finally:
-                conn.close()
-        except Exception as exc:  # noqa: BLE001 — one bad board does not blank the others
-            logger.debug("slack_ux_reactions: kanban board %s unreadable: %s", slug, exc)
-            continue
+            rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
+        finally:
+            conn.close()
         cards.update(((slug, row[0]), row[1]) for row in rows)
     return cards
 
@@ -216,12 +216,19 @@ def _where(event: Any) -> tuple[str | None, str]:
     return getattr(source, "chat_id", None), str(getattr(source, "thread_id", "") or "")
 
 
-def _own_cards(before: dict, after: dict) -> set:
-    """The cards this turn is waiting on: opened during it, or resumed from ``blocked``."""
-    return {
+def _own_cards(before: dict, after: dict, finished: dict) -> set:
+    """The cards this turn answers for: opened during it, or resumed from ``blocked``.
+
+    A card open at the end counts if it was not open at the start, or has left
+    ``blocked`` since. A card that finished during the turn counts if it was
+    not open at the start, or was blocked then: a blocked card only runs, and
+    so only finishes, once something resumes it.
+    """
+    opened = {
         card for card, status in after.items()
         if card not in before or (before[card] == BLOCKED and status != BLOCKED)
     }
+    return opened | {card for card in finished if before.get(card, BLOCKED) == BLOCKED}
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
@@ -237,13 +244,8 @@ async def on_processing_start(adapter: Any, event: Any) -> None:
     await adapter._react(chat_id, ts, emoji, team_id, remove=False)
     # After the reaction, so the read never delays it; the model has not
     # created a card yet, since the turn has not reached its first tool call.
-    before = await open_cards(chat_id, thread_id)
-    # A card open now has not finished since it last did: a gave-up card sits
-    # at blocked. Forget that finish, so a retry this turn waits on the card
-    # again; a finish reported during the turn is recorded afresh.
-    for card in before or ():
-        _finished.pop(card, None)
-    _remember(_started, marker, before, STARTED_MAX)
+    # Finishes are recorded from here on, after the read, so none can predate it.
+    _remember(_started, marker, _Turn((chat_id, thread_id), await open_cards(chat_id, thread_id)), STARTED_MAX)
 
 
 async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None:
@@ -253,18 +255,22 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
         return
     ts, team_id, marker = target
     adapter._reacting_message_ids.discard(marker)
-    before = _started.pop(marker, None)
     chat_id, thread_id = _where(event)
     settle = OUTCOME_SETTLES.get(str(getattr(outcome, "value", outcome)))
     if not chat_id or settle is None:
+        _started.pop(marker, None)
         return
     after = await open_cards(chat_id, thread_id)
-    new = _own_cards(before, after) if before is not None and after is not None else set()
+    # Still in flight across the read, so a card finishing during it is seen;
+    # nothing below awaits before the ask is deferred.
+    turn = _started.pop(marker, None)
+    before = turn.before if turn is not None else None
+    new = _own_cards(before, after, turn.finished) if before is not None and after is not None else set()
     if new:
-        waiting = set(new) - set(_finished)
+        waiting = new - set(turn.finished)
         # The turn's own failure carries into the deferred settle: cards that
         # later complete do not undo an ask whose turn raised.
-        failed = settle == _presenter.SETTLE_FAILED or any(_finished.get(card, False) for card in new)
+        failed = settle == _presenter.SETTLE_FAILED or any(turn.finished.get(card, False) for card in new)
         if waiting:
             asks = [*_deferred.get((chat_id, thread_id), []), _Ask(ts, team_id, waiting, failed)]
             if len(asks) > DEFERRED_PER_THREAD:
@@ -297,7 +303,9 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     key = (sub.get("chat_id"), str(sub.get("thread_id") or ""))
     provisional = settle in _presenter.PROVISIONAL_SETTLES
     if not provisional:
-        _remember(_finished, card, settle == _presenter.SETTLE_FAILED, FINISHED_MAX)
+        for turn in _started.values():
+            if turn.key == key:
+                turn.finished[card] = settle == _presenter.SETTLE_FAILED
     asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
     if not asks or not hasattr(adapter, "_react"):
         return

@@ -55,11 +55,12 @@ IMPORT_NAME = "slack_ux_reactions"
 UPSTREAM_HELPER = "_react"
 TARGET_HELPER = "_reacting_target"
 TRACKED_SET = "_reacting_message_ids"
-#: ``_react``'s positional parameters after ``self``, and its keyword-only one.
-REACT_POSITIONAL = 4
+#: ``_react``'s positional parameters after ``self``, in the order the runtime
+#: passes them, and its keyword-only one.
+REACT_POSITIONAL = ("channel", "timestamp", "emoji", "team_id")
 REACT_KEYWORD = "remove"
-#: ``_reacting_target``'s return, ``(ts, team_id, marker)``.
-TARGET_ARITY = 3
+#: ``_reacting_target``'s return, in the order the runtime unpacks it.
+TARGET_RETURN = ("ts", "team_id", "marker")
 
 #: Environment the board check pins, as the sibling kanban verifiers do.
 KANBAN_HOME_ENV = "HERMES_KANBAN_HOME"
@@ -160,10 +161,10 @@ def _check_members(tree: ast.Module) -> None:
     react = _method(tree, UPSTREAM_HELPER)
     if not isinstance(react, ast.AsyncFunctionDef):
         raise _fail(f"{UPSTREAM_HELPER}() is no longer async")
-    positional = react.args.posonlyargs + react.args.args
-    if len(positional) != REACT_POSITIONAL + 1 or [a.arg for a in react.args.kwonlyargs] != [REACT_KEYWORD]:
+    positional = tuple(a.arg for a in react.args.posonlyargs + react.args.args)
+    if positional[1:] != REACT_POSITIONAL or [a.arg for a in react.args.kwonlyargs] != [REACT_KEYWORD]:
         raise _fail(
-            f"{UPSTREAM_HELPER}() is not (self, channel, ts, emoji, team_id, *, {REACT_KEYWORD})"
+            f"{UPSTREAM_HELPER}() is not (self, {', '.join(REACT_POSITIONAL)}, *, {REACT_KEYWORD}): {positional}"
         )
     target = _method(tree, TARGET_HELPER)
     if isinstance(target, ast.AsyncFunctionDef) or len(target.args.args) != 2:
@@ -173,8 +174,11 @@ def _check_members(tree: ast.Module) -> None:
         for node in ast.walk(target)
         if isinstance(node, ast.Return) and node.value is not None
     ]
-    if not any(isinstance(r, ast.Tuple) and len(r.elts) == TARGET_ARITY for r in returns):
-        raise _fail(f"{TARGET_HELPER}() no longer returns (ts, team_id, marker)")
+    names = [
+        tuple(e.id if isinstance(e, ast.Name) else None for e in r.elts) for r in returns if isinstance(r, ast.Tuple)
+    ]
+    if TARGET_RETURN not in names:
+        raise _fail(f"{TARGET_HELPER}() no longer returns ({', '.join(TARGET_RETURN)}): {names}")
     as_set = False
     for node in ast.walk(tree):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
