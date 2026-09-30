@@ -7461,7 +7461,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
             self.assertIn("it stops the detector now", combined)
             self.assertIn("keeps the Log Router sink", combined)
             self.assertIn("this shell's environment", combined)
-            self.assertNotIn("does not record it", combined)
+            self.assertNotIn("records neither key as on", combined)
             self.assertNotIn("destroys them", combined)
 
     def test_the_caveat_lands_when_the_shell_is_holding_up_both_halves(self):
@@ -7469,11 +7469,22 @@ class DomainScopedFlagsTest(unittest.TestCase):
 
         Nothing in install.env: the detector is on because this shell exports
         ENABLE_DRIFT_DETECTOR, and the ingress stands because the same shell
-        exports TF_VAR_enable_drift_pubsub. A later run from anywhere else
-        reads neither, writes neither tfvars key, and enable_drift_pubsub falls
-        to its false default -- so the caveat is the whole warning, and the
-        sentence it joins names the export rather than the file as what brings
-        the detector back.
+        exports TF_VAR_enable_drift_pubsub. A later run from a shell with
+        neither reads neither, writes neither tfvars key, and
+        enable_drift_pubsub falls to its false default -- so the caveat is the
+        whole warning, and the sentence it joins names the export rather than
+        the file as what brings the detector back.
+
+        Both exports, which is the assertion this test exists for. A later run
+        that drops only TF_VAR_enable_drift_pubsub and keeps
+        ENABLE_DRIFT_DETECTOR=true seeds PARAM_ENABLE_DRIFT_DETECTOR, and
+        write_tfvars_from_state writes `enable_drift_pubsub = true` from it
+        (test_tfvars_writes_both_drift_keys_when_the_detector_is_on in
+        tests/test_installer_common.py) -- the trio is provisioned, not
+        destroyed. A caveat naming the TF_VAR_ export alone would promise that
+        operator a loss they do not take, and contradict its own next clause,
+        which tells them a later run re-reads the export and starts the
+        detector again.
         """
         with tempfile.TemporaryDirectory() as tmp:
             destination = pathlib.Path(tmp) / "existing.env"
@@ -7491,8 +7502,18 @@ class DomainScopedFlagsTest(unittest.TestCase):
             combined = proc.stdout + proc.stderr
             self.assertIn("it stops the detector now", combined)
             self.assertIn("this shell's environment", combined)
-            self.assertIn("does not record it", combined)
-            self.assertIn("from a shell without that export destroys them", combined)
+            self.assertIn("records neither key as on", combined)
+            self.assertIn(
+                "keeping either ENABLE_DRIFT_DETECTOR or "
+                "TF_VAR_enable_drift_pubsub keeps them",
+                combined,
+            )
+            self.assertIn("from a shell exporting neither destroys them", combined)
+            # The wording this replaced, pinned as absent: it named the TF_VAR_
+            # export alone and so told an operator whose later shell keeps
+            # ENABLE_DRIFT_DETECTOR that their audit records go, which is the
+            # opposite of what that run does.
+            self.assertNotIn("from a shell without that export", combined)
             self.assertIn("this shell exports", combined)
 
     def test_an_unchosen_drift_detector_key_stays_empty_and_says_nothing(self):

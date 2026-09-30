@@ -1815,10 +1815,23 @@ bootstrap_install_env_file() {
       # which provisions the ingress -- so the trio stands whether or not the
       # export came along, and the caveat would contradict the sentence it is
       # spliced into, which says in the next breath that a later run starts the
-      # detector again. A recorded `false`, or no line at all, leaves the export
+      # detector again. A recorded `false`, or no line at all, leaves the shell
       # as the only thing holding the trio up, and then it is the whole warning.
+      #
+      # Both exports, not the TF_VAR_ one alone. Reaching here means
+      # drift_detector_turning_off was set on a file that records no detector,
+      # which by the test above means SHELL_ENABLE_DRIFT_DETECTOR is on -- so
+      # every operator who sees this sentence is exporting both, and either one
+      # alone keeps the trio standing. TF_VAR_enable_drift_pubsub because
+      # Terraform reads it straight out of the environment; ENABLE_DRIFT_DETECTOR
+      # because write_tfvars_from_state writes `enable_drift_pubsub = true` from
+      # it, which test_tfvars_writes_both_drift_keys_when_the_detector_is_on in
+      # tests/test_installer_common.py pins. Naming one export promises
+      # destruction to a shell that kept the other, and contradicts the clause
+      # this is spliced in front of, which says a later run re-reads the export
+      # this shell holds and starts the detector again.
       if ! is_truthy "${drift_detector_recorded:-false}"; then
-        drift_ingress_caveat=" ${destination} does not record it, so the first run from a shell without that export destroys them along with the audit records retained there."
+        drift_ingress_caveat=" ${destination} records neither key as on, so they stand on this shell's exports: keeping either ENABLE_DRIFT_DETECTOR or TF_VAR_enable_drift_pubsub keeps them, and the first run from a shell exporting neither destroys them along with the audit records retained there."
       fi
     fi
     if [ -n "$drift_detector_turning_off" ]; then
