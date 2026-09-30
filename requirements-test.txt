@@ -1,8 +1,9 @@
 # The third-party imports the modules under `make test-python` actually need.
 # The admin console keeps its application and test dependencies in its own
 # requirements file; the remaining packages below are what the agent scripts
-# import at module scope, so without them the test modules that import those
-# scripts fail to load at all. Everything else in the suite is stdlib unittest.
+# and the image build's checks import at module scope, so without them the test
+# modules that import those scripts fail to load at all. Everything else in the
+# suite is stdlib unittest.
 #
 # This file is the single source of truth for the list. Every installer reads
 # it -- `make test-python-deps` locally and, in CI, both sweep jobs of
@@ -65,6 +66,11 @@ mcp>=2.2.0
 
 python-dotenv
 pyyaml
+
+# deploy/docker/check_skill_commands.py parses SKILL.md with markdown-it-py.
+# The image build runs it under /opt/hermes/.venv, which gets the package from
+# hermes-agent through rich; nothing above pulls it in.
+markdown-it-py
 
 # `make coverage`, which the CI `test` job runs. coverage runs the unittest suite
 # under measurement; diff-cover reads the resulting coverage.xml plus the

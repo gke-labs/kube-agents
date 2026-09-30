@@ -45,6 +45,10 @@ run fails the build rather than passing every command.
 A finding that cannot be fixed in the skill text yet goes in
 ``KNOWN_FINDINGS`` with its reason. An entry that no longer matches a refused
 command fails the check too, so the list cannot outlive what it excuses.
+
+A shell block whose raw text and parsed Markdown disagree, such as a fence left
+unclosed inside a list item, fails the check as well: its commands cannot be
+read, and ``KNOWN_FINDINGS`` cannot excuse it. The fix is in the Markdown.
 """
 
 from __future__ import annotations
@@ -65,6 +69,8 @@ import urllib.request
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+
+from markdown_it import MarkdownIt
 
 SKILL_FILE_NAME = "SKILL.md"
 SHELL_LANGUAGES = frozenset({"bash", "sh", "shell", "zsh"})
@@ -102,10 +108,13 @@ COMMENT_PREFIX = "#"
 LINE_CONTINUATION = "\\"
 UNCLOSED_QUOTE_ERROR = "No closing quotation"
 PLACEHOLDER_FILL = "_"
-BACKTICK = "`"
 TIRITH_HOME_PREFIX = "skill-commands-tirith-"
+MARKDOWN_PRESET = "commonmark"
+FENCE_TOKEN = "fence"
+BACKTICK = "`"
 
-FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+# A fence opening a line, after any block-quote and list markers.
+OPENER_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-*+]|\d+[.)])[ \t]))*[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 LANG_RE = re.compile(r"[A-Za-z0-9_+-]*")
 PLACEHOLDER_RE = re.compile(r"(?<!<)<(?P<name>[A-Za-z_][\w.:/-]*(?: [\w.:/-]+)*)>")
 PLACEHOLDER_UNSAFE_RE = re.compile(r"[^\w./-]")
@@ -148,6 +157,16 @@ class ScannerUnavailable(RuntimeError):
     """Tirith did not give a real verdict, so no result can be trusted."""
 
 
+class UnreadableFence(ValueError):
+    """A shell block that reads differently as raw text than as parsed Markdown."""
+
+    def __init__(self, line: int, reason: str, path: str = ""):
+        super().__init__(f"{path}:{line}: {reason}")
+        self.line = line
+        self.reason = reason
+        self.path = path
+
+
 @dataclass(frozen=True)
 class Command:
     path: str
@@ -173,36 +192,69 @@ class Finding:
 def code_blocks(text: str) -> Iterator[tuple[int, str, list[str]]]:
     """Yield ``(line of the first body line, language, body lines)`` per fenced block.
 
-    The opening fence's indentation is removed from the body, so a block nested
-    in a list item reads as it would at the margin.
+    A CommonMark parser finds the blocks, so a fence in a list item or a block
+    quote reads as it renders, with its container's indentation and ``>``
+    markers removed from the body. An agent reads the raw file instead, so a
+    shell block the two read differently raises ``UnreadableFence`` rather than
+    going unscanned: a line that opens one where the parser finds no fence, or
+    one the parser ends before its own closing fence.
     """
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        match = FENCE_RE.match(lines[i])
-        i += 1
-        if not match:
-            continue
-        indent, fence, info = match.group("indent", "fence", "info")
-        # CommonMark: a backtick fence's info string holds no backtick, so
-        # ```ls``` on one line is inline code.
-        if fence.startswith(BACKTICK) and BACKTICK in info:
-            continue
-        lang = LANG_RE.match(info.strip()).group()
-        first_line = i + 1
-        body = []
-        while i < len(lines) and not _closes(lines[i], fence):
-            line = lines[i]
-            body.append(line[len(indent):] if line.startswith(indent) else line.lstrip())
-            i += 1
-        i += 1
-        yield first_line, lang.lower(), body
+    # The trailing newline ends the last content line of an unclosed fence
+    # too, so every body line is counted.
+    fences = [t for t in MarkdownIt(MARKDOWN_PRESET).parse(text + "\n") if t.type == FENCE_TOKEN]
+    starts = {token.map[0] for token in fences}
+    problems = [
+        (index + 1, "this line opens a shell block, but Markdown parses no code block here")
+        for index, line in enumerate(text.split("\n"))
+        if (fence := _shell_opener(line)) and index not in starts
+        and not _nested(fence, index, fences)
+    ]
+    blocks = []
+    for token in fences:
+        lang = _language(token.info)
+        opening_line = token.map[0] + 1
+        body = token.content.split("\n")[:-1]
+        if lang in SHELL_LANGUAGES and not _closed(token):
+            problems.append((opening_line, "this shell block ends before a closing fence of its own"))
+        blocks.append((opening_line + 1, lang, body))
+    if problems:
+        raise UnreadableFence(*min(problems))
+    yield from blocks
 
 
-def _closes(line: str, fence: str) -> bool:
-    """Whether ``line`` closes ``fence``: the same character, at least as many."""
-    stripped = line.strip()
-    return stripped.startswith(fence) and not stripped.strip(fence[0])
+def _language(info: str) -> str:
+    return LANG_RE.match(info.strip()).group().lower()
+
+
+def _shell_opener(line: str) -> str | None:
+    """The fence that opens ``line`` if a reader would take it for a shell block."""
+    match = OPENER_RE.match(line)
+    if not match:
+        return None
+    fence, info = match.group("fence", "info")
+    # CommonMark: a backtick fence's info string holds no backtick, so
+    # ```ls``` on one line is inline code.
+    if fence.startswith(BACKTICK) and BACKTICK in info:
+        return None
+    return fence if _language(info) in SHELL_LANGUAGES else None
+
+
+def _closed(token) -> bool:
+    """Whether the parser ended a fence at a closing fence of its own."""
+    return token.map[0] + token.content.count("\n") + 1 < token.map[1]
+
+
+def _nested(fence: str, index: int, fences: list) -> bool:
+    """Whether line ``index`` is in the body of a closed block ``fence`` could not close.
+
+    That is a deliberate example, as in a longer or tilde fence around one.
+    """
+    return any(
+        t.map[0] < index < t.map[1]
+        and _closed(t)
+        and (t.markup[0] != fence[0] or len(t.markup) > len(fence))
+        for t in fences
+    )
 
 
 def _has_unclosed_quote(text: str) -> bool:
@@ -277,7 +329,11 @@ def skill_commands(repo_dir: str, skills_dir: Path) -> list[Command]:
     commands = []
     for skill_file in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
-        for first_line, lang, body in code_blocks(skill_file.read_text(encoding="utf-8")):
+        try:
+            blocks = list(code_blocks(skill_file.read_text(encoding="utf-8")))
+        except UnreadableFence as exc:
+            raise UnreadableFence(exc.line, exc.reason, path) from None
+        for first_line, lang, body in blocks:
             if lang in SHELL_LANGUAGES:
                 commands.extend(
                     Command(path, line, text) for line, text in split_commands(body, first_line)
@@ -387,11 +443,20 @@ def main(argv: list[str] | None = None) -> int:
         help=f"a Tirith binary to use instead of downloading {TIRITH_VERSION}",
     )
     args = parser.parse_args(argv)
-    commands = [
-        command
-        for repo_dir, skills_dir in args.trees
-        for command in skill_commands(repo_dir, skills_dir)
-    ]
+    try:
+        commands = [
+            command
+            for repo_dir, skills_dir in args.trees
+            for command in skill_commands(repo_dir, skills_dir)
+        ]
+    except UnreadableFence as exc:
+        print(
+            f"{exc}. An agent reads this block as shell commands, but the check cannot find "
+            "them. Close each fence at the indentation it opened with, indent a heredoc body "
+            "with its block, and leave a blank line between an HTML tag and a fence.",
+            file=sys.stderr,
+        )
+        return 1
 
     with tempfile.TemporaryDirectory(prefix=TIRITH_HOME_PREFIX) as home:
         try:

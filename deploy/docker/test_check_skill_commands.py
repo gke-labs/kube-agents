@@ -68,8 +68,51 @@ class CodeBlocksTest(unittest.TestCase):
     def test_backticks_on_one_line_are_inline_code(self):
         self.assertEqual([(3, "bash", ["ls"])], list(check.code_blocks("```x```\n```bash\nls\n```\n")))
 
-    def test_an_unclosed_fence_runs_to_the_end(self):
-        self.assertEqual([["ls", "pwd"]], [b for _, _, b in check.code_blocks("```sh\nls\npwd\n")])
+    def test_punctuation_after_the_language_is_not_part_of_it(self):
+        text = "```bash:run.sh\nls\n```\n```bash{1,3}\npwd\n```\n"
+        self.assertEqual(["bash", "bash"], [lang for _, lang, _ in check.code_blocks(text)])
+
+    def test_an_unclosed_fence_runs_to_the_end_unless_it_is_shell(self):
+        self.assertEqual([["ls", "pwd"]], [b for _, _, b in check.code_blocks("```\nls\npwd")])
+        for text in ("```sh\nls\npwd\n", "```sh\nls\npwd"):
+            with self.assertRaises(check.UnreadableFence) as caught:
+                list(check.code_blocks(text))
+            self.assertEqual(1, caught.exception.line)
+
+    def test_a_heredoc_body_at_the_margin_of_a_list_item_is_refused(self):
+        text = (
+            "1. Apply\n\n   ```bash\n   cat > cm.yaml <<EOF\napiVersion: v1\nEOF\n"
+            "   kubectl apply -f cm.yaml\n   ```\n2. Commit\n\n   ```bash\n   $G add cm.yaml\n   ```\n"
+        )
+        with self.assertRaises(check.UnreadableFence) as caught:
+            list(check.code_blocks(text))
+        self.assertEqual(3, caught.exception.line)
+
+    def test_a_shell_opener_markdown_parses_otherwise_is_refused(self):
+        cases = {
+            "indented code": ("text\n\n    ```bash\n    ls\n    ```\n", 3),
+            "html block": ("<details>\n```bash\nls\n```\n</details>\n", 2),
+            "a same-length fence's body": ("```markdown\n```bash\nls\n```\n", 2),
+            "an unclosed tilde fence's body": ("~~~yaml\na: b\n    ~~~\n\n```bash\nls\n```\n", 5),
+            "an unclosed longer fence's body": ("````yaml\na: b\n\n```bash\nls\n```\n", 4),
+        }
+        for name, (text, line) in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(check.UnreadableFence) as caught:
+                    list(check.code_blocks(text))
+                self.assertEqual(line, caught.exception.line)
+
+    def test_a_fence_in_a_block_quote_loses_its_markers(self):
+        text = "> ```bash\n> $G add f\n> ```\n\n```sh\nls\n```\n"
+        self.assertEqual(
+            [(2, "bash", ["$G add f"]), (6, "sh", ["ls"])], list(check.code_blocks(text))
+        )
+
+    def test_a_fence_on_a_list_marker_line_is_read(self):
+        text = "- ```bash\n  $G add f\n  ```\n\n```sh\nls\n```\n"
+        self.assertEqual(
+            [(2, "bash", ["$G add f"]), (6, "sh", ["ls"])], list(check.code_blocks(text))
+        )
 
 
 class SplitCommandsTest(unittest.TestCase):
@@ -135,6 +178,16 @@ class SkillCommandsTest(unittest.TestCase):
             ],
             got,
         )
+
+    def test_an_unreadable_fence_names_the_repository_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text("intro\n```bash\nls\n")
+            with self.assertRaises(check.UnreadableFence) as caught:
+                check.skill_commands("agents/platform/skills", Path(tmp))
+        self.assertEqual("agents/platform/skills/demo/SKILL.md", caught.exception.path)
+        self.assertEqual(2, caught.exception.line)
 
 
 class ScanTest(unittest.TestCase):
