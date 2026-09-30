@@ -1169,8 +1169,8 @@ try:
     )
     _sent, _wakes = _held_run(True, [RuntimeError("profile gone"), RuntimeError("again"), None])
     check(
-        "flag on: a failure whose wake raises posts its line exactly once",
-        len(_sent) == 1 and "t_held" in _sent[0] and _wakes == 3,
+        "flag on: a failure whose wake raises posts its line exactly once, without the card id",
+        len(_sent) == 1 and "gave up" in _sent[0] and "t_held" not in _sent[0] and _wakes == 3,
         f"sent {_sent!r}, woke {_wakes}",
     )
     _sent_off, _ = _held_run(False, [None])
