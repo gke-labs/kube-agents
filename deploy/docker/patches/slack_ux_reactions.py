@@ -30,8 +30,11 @@ With the flag on:
   cancelled turn adds nothing.
 * A turn that put new cards on the board, subscribed to this thread, defers
   its settle to those cards, and only those: a card already open when the ask
-  arrived is not its to wait on, unless the turn resumed it from ``blocked``
-  (answering its question, or retrying it after it gave up). A turn that failed
+  arrived is not its to wait on, even one unblocked while the turn ran.
+  Hermes records no actor on an unblock, so it may be the CLI's or another
+  turn's; that card's own ask carries its outcome. Nor is a new card spawned
+  from one it did not open: it inherited the thread's subscription from that
+  card, so it may be that card's worker's. A turn that failed
   after opening them still settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
@@ -81,11 +84,14 @@ PLATFORM = "slack"
 DEFAULT_BOARD = "default"
 
 #: Cards subscribed to one Slack thread that have not reached a final status,
-#: with that status and the id of the card's latest ``unblocked`` event (0 for
-#: none). ``blocked`` counts as open: it waits on the user and will run on.
+#: with that status, the card's parents comma-joined, and the card that created
+#: it: Hermes copies either one's subscriptions onto the new card. ``blocked``
+#: counts as open: it waits on the user and will run on.
 OPEN_CARDS_SQL = (
     "SELECT s.task_id, t.status, "
-    "(SELECT COALESCE(MAX(e.id), 0) FROM task_events e WHERE e.task_id = s.task_id AND e.kind = 'unblocked') "
+    "(SELECT group_concat(l.parent_id, ',') FROM task_links l WHERE l.child_id = s.task_id), "
+    "(SELECT json_extract(e.payload, '$.creator_task_id') FROM task_events e "
+    "WHERE e.task_id = s.task_id AND e.kind = 'created') "
     "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"
@@ -107,10 +113,6 @@ DEFERRED_PER_THREAD = 32
 #: The notifier's dedup key for a board whose database path does not resolve.
 UNRESOLVED_PREFIX = "slug:"
 
-#: A card waiting on the user, or parked after giving up. A turn that unblocks
-#: one of its thread's cards resumed it.
-BLOCKED = "blocked"
-
 #: Statuses a card runs from, or waits to be picked up in. A card that paused
 #: during a turn but sits in one of these at its end was resumed within it.
 RESUMED_STATUSES = frozenset({"todo", "ready", "scheduled", "running"})
@@ -120,9 +122,8 @@ class _Card(NamedTuple):
     """An open card as one board read saw it."""
 
     status: str
-    #: The id of its latest ``unblocked`` event: a higher one at the end of a
-    #: turn than at the start means the card was resumed during the turn.
-    resumes: int = 0
+    #: Ids of the cards on its board it was spawned from: its parents and its creator.
+    lineage: frozenset = frozenset()
 
 
 class _Turn:
@@ -145,7 +146,7 @@ class _Turn:
 
 
 class _Ask:
-    """A Slack ask whose settle waits on the cards its turn opened or resumed, as ``(board, id)``."""
+    """A Slack ask whose settle waits on the cards its turn opened, as ``(board, id)``."""
 
     __slots__ = ("cards", "failed", "team_id", "ts")
 
@@ -217,7 +218,7 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
             rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
         finally:
             conn.close()
-        cards.update(((slug, row[0]), _Card(row[1], row[2])) for row in rows)
+        cards.update(((slug, row[0]), _Card(row[1], frozenset(filter(None, (*(row[2] or "").split(","), row[3]))))) for row in rows)
     return cards
 
 
@@ -236,25 +237,27 @@ def _where(event: Any) -> tuple[str | None, str]:
 
 
 def _own_cards(before: dict, after: dict, finished: dict) -> set:
-    """The cards this turn answers for: opened during it, or resumed from ``blocked``.
+    """The cards this turn answers for: open at its end, or finished during it, and not open at its start.
 
-    A card open at the end, or finished during the turn, counts if it was not
-    open at the start. One blocked at the start counts if it was unblocked
-    since: its unblock cursor moved, or it is no longer blocked, or it finished
-    and is closed, which a blocked card only does once resumed. A card still
-    blocked with no new unblock is not the turn's, even if a ``gave_up`` it
-    reached before the turn started is only reported during it.
+    A card open at the start is never the turn's, even one unblocked while it
+    ran: Hermes's ``unblocked`` event names no actor, so the turn cannot show
+    the unblock was its own rather than the CLI's or another turn's. Nor is a
+    new card spawned from any card the turn did not open, such as a follow-up
+    an earlier ask's worker creates: only cards whose whole lineage the turn
+    opened count, so a fan-in over its own cards does. A card that opened and
+    closed within the turn was never read, so its lineage is unknown and it
+    counts.
     """
     opened = {card for card in (*after, *finished) if card not in before}
-    for card, was in before.items():
-        if was.status != BLOCKED:
-            continue
-        now = after.get(card)
-        if now is None and card in finished or now is not None and (
-            now.resumes > was.resumes or now.status != BLOCKED
-        ):
-            opened.add(card)
-    return opened
+    while True:
+        kept = {
+            (board, task) for board, task in opened
+            if (board, task) not in after
+            or after[(board, task)].lineage <= {t for b, t in opened if b == board}
+        }
+        if kept == opened:
+            return opened
+        opened = kept
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:

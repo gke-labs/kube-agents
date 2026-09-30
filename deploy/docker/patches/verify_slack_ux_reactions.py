@@ -21,6 +21,8 @@ Three things are checked:
    made with the built tree's ``hermes_cli``: an open card subscribed to the
    thread on the default board and on a second board is found, and a finished
    card, a card in another thread and a card for another platform are not.
+   A card spawned from one of them is found through the subscription Hermes
+   copies onto it, with its parent and creator as its lineage.
 3. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it is inert; flag on, an ask gets the arrival reaction for
    its kind, a direct answer settles at once, a delegated one waits for the
@@ -219,7 +221,6 @@ def check_board_read(module, root: Path) -> None:
 
         def card(
             board: str, title: str, thread: str = THREAD, platform: str = "slack", done: bool = False,
-            resumed: bool = False,
         ) -> tuple[str, str]:
             conn = kc.connect(board=board)
             try:
@@ -229,16 +230,21 @@ def check_board_read(module, root: Path) -> None:
                     kb.complete_task(conn, task, result="verified")
                 elif thread == THREAD and platform == "slack":
                     expected.add((board, task))
-                if resumed:
-                    for step in (kb.block_task, kb.unblock_task):
-                        if not step(conn, task):
-                            raise _fail(f"hermes_cli.kanban_db.{step.__name__} refused a fresh card")
             finally:
                 conn.close()
             return board, task
 
-        fresh = card(kb.DEFAULT_BOARD, "open on default")
-        resumed = card(kb.DEFAULT_BOARD, "blocked and unblocked", resumed=True)
+        _, fresh = card(kb.DEFAULT_BOARD, "open on default")
+        _, creator = card(kb.DEFAULT_BOARD, "creator")
+        conn = kc.connect(board=kb.DEFAULT_BOARD)
+        try:
+            # No subscription of its own: Hermes copies its parent's and creator's.
+            child = kb.create_task(
+                conn, title="spawned", assignee="platform", parents=(fresh,), creator_task_id=creator,
+            )
+        finally:
+            conn.close()
+        expected.add((kb.DEFAULT_BOARD, child))
         card(SECOND_BOARD, "open on the second board")
         card(kb.DEFAULT_BOARD, "finished", done=True)
         card(kb.DEFAULT_BOARD, "another thread", thread=OTHER_THREAD)
@@ -249,10 +255,9 @@ def check_board_read(module, root: Path) -> None:
         found = set(read)
         if found != expected:
             raise _fail(f"the kanban read found {sorted(found)!r}, expected {sorted(expected)!r}")
-        # A resume is read from the card's unblock events, since its status
-        # can be blocked again by the end of the turn that resumed it.
-        if read[fresh].resumes or not read[resumed].resumes:
-            raise _fail(f"the kanban read does not see an unblock: {read[fresh]!r}, {read[resumed]!r}")
+        lineage = read[(kb.DEFAULT_BOARD, child)].lineage
+        if lineage != {fresh, creator} or read[(kb.DEFAULT_BOARD, fresh)].lineage:
+            raise _fail(f"the kanban read does not see a card's parent and creator: {lineage!r}")
     finally:
         for name, value in saved.items():
             if value is None:
