@@ -46,11 +46,8 @@ _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
 _AUDIT_REPORT_SYMBOLS = (
     "parse_declarations",
     "explain_empty_declarations",
-    "split_frontmatter",
     "audit_declarable_checks",
     "_declaration_key",
-    "OKF_TYPE_KEY",
-    "DECLARES_KEY",
     "DECLARATION_CLUSTER_FIELD",
 )
 # The GitOps repository a pool project owns, by convention of hack/ci-deploy.sh.
