@@ -427,7 +427,7 @@ that talks to the API without retrying fails for those minutes.
 - Before: the cluster is zonal. Whether its clients retry is not readable from the cluster, so the check reports the exposure and the operator answers the rest.
 - Where to look: the GKE API for the cluster's location type.
 - After: API errors or timeouts while the replica is replaced, GitOps out of sync. The
-  reproduction linked above polled a zonal cluster's API every two to four seconds through its
+  [reproduction](../../bench/upgrade-scenarios/README.md) polled a zonal cluster's API every two to four seconds through its
   control-plane upgrade and saw no failed read or write, so the gap can be shorter than a poll
   interval.
 - Mitigate before: a regional cluster for anything automation depends on, and retries with backoff in the clients that cannot tolerate a few minutes of 5xx.
@@ -471,7 +471,7 @@ tolerated, which is the runtime change a node pool upgrade can carry.
 - Mitigate after: the same changes, under pressure; a completed node pool can be downgraded in place while GKE still offers the previous version.
 - Read today: the security-patch orchestrator flags a pool whose `config.imageType` the location no longer offers or that names a pre-containerd variant; CRI clients, image schemas and containerd configuration are unread.
 - GKE recommender: `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` and `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, the two transitions GKE has flagged on real clusters; `DEPRECATION_K8S_1_24_DOCKERSHIM` is the historical one.
-- Why it is on the list: GKE's Linux nodes move to containerd 2.0 at 1.33 and Windows Server nodes at 1.35 ([containerd 2 migration](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/migrate-containerd-2)), and GKE's two containerd insights exist because both breaks happened on real clusters. The reproduction linked above saw a patch upgrade inside 1.31 move a node from containerd 1.7.34 to 2.0.10 and break a `v1alpha2` client, so the before-signal is the containerd version the target node image ships, not the minor.
+- Why it is on the list: GKE's Linux nodes move to containerd 2.0 at 1.33 and Windows Server nodes at 1.35 ([containerd 2 migration](https://docs.cloud.google.com/kubernetes-engine/docs/deprecations/migrate-containerd-2)), and GKE's two containerd insights exist because both breaks happened on real clusters. The [reproduction](../../bench/upgrade-scenarios/README.md) saw a patch upgrade inside 1.31 move a node from containerd 1.7.34 to 2.0.10 and break a `v1alpha2` client, so the before-signal is the containerd version the target node image ships, not the minor.
 
 ### 14. cgroup v2 under a runtime that cannot read it
 
@@ -575,7 +575,7 @@ older driver, stops working once the node's driver is newer than those libraries
 - Read today: nothing.
 - GKE recommender: none.
 - Why it is on the list: frequent on accelerator pools; no public incident verified. The
-  reproduction linked above saw the second direction: the 1.34 node image moved the driver from
+  [reproduction](../../bench/upgrade-scenarios/README.md) saw the second direction: the 1.34 node image moved the driver from
   R535 to R580 and both pods carrying forward-compatibility libraries failed with `Error 803`.
 
 ### 19. In-tree volumes lose their CSI path
@@ -590,7 +590,7 @@ is the same.
   `gcePersistentDiskCsiDriverConfig` add-on is disabled; StorageClasses naming a provisioner that
   no longer exists.
 - Where to look: the GKE API for the `gcePersistentDiskCsiDriverConfig` add-on; the Kubernetes API for PersistentVolume specs and StorageClass provisioners.
-- After: attach errors, pods stuck `ContainerCreating`, or, as the reproduction linked above saw,
+- After: attach errors, pods stuck `ContainerCreating`, or, as the [reproduction](../../bench/upgrade-scenarios/README.md) saw,
   a replacement pod `Pending` with `didn't match PersistentVolume's node affinity`.
 - Mitigate before: enable the PD CSI driver add-on and move StorageClasses to `pd.csi.storage.gke.io`.
 - Mitigate after: enable the add-on; the volumes attach.

@@ -2,9 +2,10 @@
 
 ## In plain terms
 
-When these runs were made, the upgrade failure catalogue listed twenty ways a GKE version upgrade can take an application down. For each one we built a throwaway cluster, planted the problem, ran the upgrade, and recorded what happened. For
-scenario 15, only the symptom was produced, without an upgrade. Each
-verdict was then handed to a separate reviewer whose job was to prove it wrong.
+When these runs were made, the upgrade failure catalogue listed twenty ways a GKE version upgrade can take an
+application down. For each one we built a throwaway cluster, planted the problem, ran the upgrade, and
+recorded what happened. For scenario 15, only the symptom was produced, without an upgrade. Each verdict was
+then handed to a separate reviewer whose job was to prove it wrong.
 
 Thirteen of the twenty failures happened for real. In four of those, the failure came about in a different way
 than the catalogue describes, because GKE takes its own path. For example, GKE refuses one upgrade and demands a
