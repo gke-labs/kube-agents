@@ -6,10 +6,11 @@ The fixtures carry upstream's call sites verbatim (v2026.9.14) inside trimmed
 stand-ins for the patched files: the cron wrapper and the per-target send
 lanes, the heartbeat's mode read, the notice send, the lifecycle notices, the
 home-channel startup and session-database loops, the busy acks with their
-onboarding hint, the Slack adapter's send, and the system replies the verifier
-reads out of source. The tests apply the patch, exec the patched and unpatched
-fixtures, and compare what each sends: with the flag off, or for any platform
-but Slack, the two must be identical.
+onboarding hint, the mid-turn slash-command and ``/steer`` replies, the
+``/restart`` and ``/stop`` catalog entries, the Slack adapter's send, and the
+system replies the verifier reads out of source. The tests apply the patch,
+exec the patched and unpatched fixtures, and compare what each sends: with the
+flag off, or for any platform but Slack, the two must be identical.
 """
 
 import asyncio
@@ -254,6 +255,27 @@ class GatewayBusyMixin:
             message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
         await self._send_busy_reply(event, adapter, message)
 
+    async def _dispatch_busy_slash_command(self, name):
+        return (
+            f"⏳ Agent is running — `/{name}` can't run "
+            f"mid-turn. Wait for the current response or `/stop` first."
+        )
+
+    async def _busy_steer_command(self, running_agent, steer_text):
+        def _queue_fallback(reply: str) -> str:
+            return reply
+
+        if running_agent is None:
+            return _queue_fallback("Agent still starting — /steer queued for the next turn.")
+        if not running_agent:
+            return _queue_fallback("No active agent — /steer queued for the next turn.")
+        try:
+            running_agent.steer(steer_text)
+        except Exception as exc:
+            return f"⚠️ Steer failed: {exc}"
+        preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
+        return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
+
     def _compose_busy_ack_message(self, event, status_parts, *, is_queue_mode):
         is_steer_mode = is_redirect_mode = demoted_for_subagents = demoted_for_compression = False
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
@@ -288,6 +310,36 @@ class GatewayBusyMixin:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
         return message
 '''
+
+SLASH_COMMANDS = '''\
+"""Fixture standing in for the /restart and /stop replies in gateway/slash_commands.py."""
+from agent.i18n import t
+
+
+def _stop(pending):
+    return t("gateway.stop.stopped_pending") if pending else t("gateway.stop.stopped")
+
+
+def _restart(count, in_progress):
+    if in_progress:
+        return t("gateway.draining", count=count) if count else t("gateway.restart.in_progress")
+    return t("gateway.restart.restarting")
+'''
+
+LOCALES_EN = """\
+gateway:
+  draining:         "⏳ Draining {count} active agent(s) before restart..."
+  goal_cleared:     "✓ Goal cleared."
+
+  restart:
+    in_progress:           "⏳ Gateway restart already in progress..."
+    restarting:            "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+
+  stop:
+    stopped_pending:       "⚡ Stopped. The agent hadn't started yet — you can continue this session."
+    stopped:               "⚡ Stopped. You can continue this session."
+    no_active:             "No active task to stop."
+"""
 
 ONBOARDING = '''\
 """Fixture standing in for agent/onboarding.py."""
@@ -421,7 +473,9 @@ class SlackAdapter:
 FIXTURES = {
     applier.DELIVERY: DELIVERY,
     applier.RUN_TURN: RUN_TURN,
-    applier.RUN_SHUTDOWN: RUN_SHUTDOWN,
+    verifier.RUN_SHUTDOWN: RUN_SHUTDOWN,
+    verifier.SLASH_COMMANDS: SLASH_COMMANDS,
+    verifier.LOCALES: LOCALES_EN,
     applier.RUN_NOTIFICATIONS: RUN_NOTIFICATIONS,
     applier.RUN_BUSY: RUN_BUSY,
     applier.SLACK_ADAPTER: SLACK_ADAPTER,
@@ -510,10 +564,11 @@ class ApplierTest(unittest.TestCase):
     def test_applies_once(self):
         applier.apply(self.root.dir)
         for relative in (
-            applier.DELIVERY, applier.RUN_TURN, applier.RUN_SHUTDOWN, applier.RUN_NOTIFICATIONS,
-            applier.RUN_BUSY, applier.SLACK_ADAPTER,
+            applier.DELIVERY, applier.RUN_TURN, applier.RUN_NOTIFICATIONS, applier.RUN_BUSY, applier.SLACK_ADAPTER,
         ):
             self.assertIn(applier.BUILD_MARKER, (self.root.dir / relative).read_text())
+        # The interrupting notices are reworded in SlackAdapter.send; the shutdown module is untouched.
+        self.assertEqual((self.root.dir / verifier.RUN_SHUTDOWN).read_text(), RUN_SHUTDOWN)
         with self.assertRaises(SystemExit):
             applier.apply(self.root.dir)
 
@@ -537,7 +592,7 @@ class ApplierTest(unittest.TestCase):
 
     def test_verifier_refuses_a_reworded_upstream_notice(self):
         applier.apply(self.root.dir)
-        path = self.root.dir / applier.RUN_SHUTDOWN
+        path = self.root.dir / verifier.RUN_SHUTDOWN
         path.write_text(path.read_text().replace("Gateway shutting down", "Gateway stopping"))
         with self.assertRaises(SystemExit) as caught:
             verifier.main(self.root.dir)
@@ -569,7 +624,10 @@ class ApplierTest(unittest.TestCase):
         for relative, old, new in (
             (verifier.RUN_INBOUND, "please resend shortly", "please retry"),
             (verifier.RUN, "Please wait a moment", "Please hold on"),
-            (applier.RUN_BUSY, "after the next tool call", "at the next tool call"),
+            (applier.RUN_BUSY, "after the next tool call.", "at the next tool call."),
+            (applier.RUN_BUSY, "can't run ", "cannot run "),
+            (verifier.LOCALES, "within 60 seconds", "within a minute"),
+            (verifier.LOCALES, "You can continue", "You may continue"),
         ):
             with self.subTest(relative=relative):
                 path = self.root.dir / relative
@@ -597,6 +655,14 @@ class ApplierTest(unittest.TestCase):
                 self.assertIn(expected, str(caught.exception))
                 path.write_text(patched)
         verifier.main(self.root.dir)
+
+    def test_verifier_refuses_a_catalog_key_no_longer_looked_up(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / verifier.SLASH_COMMANDS
+        path.write_text(path.read_text().replace('"gateway.restart.restarting"', '"gateway.restart.begin"'))
+        with self.assertRaises(SystemExit) as caught:
+            verifier.main(self.root.dir)
+        self.assertIn("no longer looks up gateway.restart.restarting", str(caught.exception))
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
@@ -665,28 +731,25 @@ class HeartbeatTest(unittest.TestCase):
                     for metadata in (None, {"thread_id": "1.2"}, {"reply_to_message_id": "1.2"}):
                         with self.subTest(platform=platform, mode=mode, env=env, metadata=metadata):
                             expected = self._mode(self.upstream, platform, mode, env, metadata)
-                            if platform == "slack" and env is FLAG_ON and mode != "off":
-                                threaded = bool(metadata and metadata.get("thread_id"))
-                                expected = None if threaded else "generic"
+                            if platform == "slack" and env is FLAG_ON and mode == "raw":
+                                expected = "generic"
                             self.assertEqual(self._mode(self.patched, platform, mode, env, metadata), expected)
 
-    def test_slack_under_a_status_line_posts_no_heartbeat(self):
-        with mock.patch.dict(os.environ, FLAG_ON):
-            slack = SimpleNamespace(platform=SimpleNamespace(value="slack"))
-            self.assertEqual(runtime.long_running_mode(slack, "raw", {"thread_id": "1.2"}), "off")
-            self.assertEqual(runtime.long_running_mode(slack, "generic", {"thread_id": "1.2"}), "off")
-            self.assertEqual(runtime.long_running_mode(slack, "raw", {"thread_id": ""}), "generic")
+    def test_slack_keeps_a_generic_heartbeat_in_a_thread(self):
+        # The thread's status line can fail silently (no assistant:write), so the heartbeat stays.
+        self.assertEqual(self._mode(self.patched, "slack", "raw", FLAG_ON, {"thread_id": "1.2"}), "generic")
 
 
 class NoticeTest(unittest.TestCase):
     def setUp(self):
         self.root = _Root()
         self.addCleanup(self.root.cleanup)
-        self.upstream_shutdown = self.root.load(applier.RUN_SHUTDOWN, "upstream")["GatewayShutdownMixin"]
         self.upstream_ns = self.root.load(applier.RUN_NOTIFICATIONS, "upstream")
         self.upstream_notes = self.upstream_ns["GatewayNotificationsMixin"]
+        self.upstream_slack = self.root.load(applier.SLACK_ADAPTER, "upstream")["SlackAdapter"]
         applier.apply(self.root.dir)
-        self.shutdown = self.root.load(applier.RUN_SHUTDOWN, "patched")["GatewayShutdownMixin"]
+        self.shutdown = self.root.load(verifier.RUN_SHUTDOWN, "patched")["GatewayShutdownMixin"]
+        self.slack = self.root.load(applier.SLACK_ADAPTER, "patched")["SlackAdapter"]
         self.notes_ns = self.root.load(applier.RUN_NOTIFICATIONS, "patched")
         self.notes = self.notes_ns["GatewayNotificationsMixin"]
 
@@ -695,14 +758,14 @@ class NoticeTest(unittest.TestCase):
         out = []
         for restart in (False, True):
             owner = SimpleNamespace(_restart_requested=restart)
-            out.append(_run(self.upstream_shutdown._notify_active_sessions_of_shutdown(owner)))
-            out.append(_run(self.upstream_shutdown._notify_interrupted_cron_jobs(owner, {"name": "inventory"}, "j1")))
+            out.append(_run(self.shutdown._notify_active_sessions_of_shutdown(owner)))
+            out.append(_run(self.shutdown._notify_interrupted_cron_jobs(owner, {"name": "inventory"}, "j1")))
         return out
 
-    def _send_notice(self, cls, platform, msg, env):
-        adapter = _Adapter()
+    def _send_notice(self, adapter, platform, msg, env):
+        """What ``adapter`` is handed when the shutdown path sends ``msg``."""
         with mock.patch.dict(os.environ, env):
-            _run(cls._send_notice_logged(adapter, "C1", msg, platform, "fail %s %s %s"))
+            _run(self.shutdown._send_notice_logged(adapter, "C1", msg, platform, "fail %s %s %s"))
         return adapter.sent[0]
 
     def _restarted(self, namespace, platform, env):
@@ -733,10 +796,12 @@ class NoticeTest(unittest.TestCase):
         for platform, env in (("slack", {"KAGE_SLACK_UX": ""}), ("google_chat", FLAG_ON), ("telegram", FLAG_ON)):
             for notice in self._notices():
                 with self.subTest(platform=platform, notice=notice):
-                    self.assertEqual(
-                        self._send_notice(self.shutdown, platform, notice, env),
-                        self._send_notice(self.upstream_shutdown, platform, notice, env),
-                    )
+                    self.assertEqual(self._send_notice(_Adapter(), platform, notice, env), notice)
+                    if platform == "slack":
+                        self.assertEqual(
+                            self._send_notice(self.slack(), platform, notice, env),
+                            self._send_notice(self.upstream_slack(), platform, notice, env),
+                        )
             with self.subTest(platform=platform, notice="restarted"):
                 self.assertEqual(
                     self._restarted(self.notes_ns, platform, env), self._restarted(self.upstream_ns, platform, env)
@@ -749,7 +814,7 @@ class NoticeTest(unittest.TestCase):
                     )
 
     def test_flag_on_slack_rewords_the_interrupting_notices(self):
-        texts = [self._send_notice(self.shutdown, "slack", n, FLAG_ON) for n in self._notices()]
+        texts = [self._send_notice(self.slack(), "slack", n, FLAG_ON) for n in self._notices()]
         for text in texts:
             with self.subTest(text=text):
                 self.assertNotIn("Gateway", text)
@@ -795,8 +860,7 @@ class NoticeTest(unittest.TestCase):
 
     def test_unknown_text_passes_through(self):
         with mock.patch.dict(os.environ, FLAG_ON):
-            self.assertEqual(runtime.notice_text("slack", "⚠️ Something new"), "⚠️ Something new")
-            self.assertEqual(runtime.notice_text("slack", None), None)
+            self.assertEqual(runtime.system_text("⚠️ Something new"), "⚠️ Something new")
 
 
 class SystemReplyTest(unittest.TestCase):
@@ -808,7 +872,7 @@ class SystemReplyTest(unittest.TestCase):
         self.upstream_adapter = self.root.load(applier.SLACK_ADAPTER, "upstream")["SlackAdapter"]
         applier.apply(self.root.dir)
         self.adapter = self.root.load(applier.SLACK_ADAPTER, "patched")["SlackAdapter"]
-        self.replies = verifier.check_system(self.root.dir)
+        self.replies = verifier.check_system(self.root.dir) + verifier.check_locale(self.root.dir)
 
     def _sent(self, cls, content, env):
         adapter = cls()
@@ -859,12 +923,19 @@ class SystemReplyTest(unittest.TestCase):
                 "I'm finishing some maintenance — try again in a minute.",
                 "Still working on your last message — send this again once I've answered.",
                 "Stopped.",
+                "I'll restart as soon as the work in progress finishes.",
+                "I'm already restarting — give me a minute.",
+                "Restarting now. Send me a message in a minute or two.",
+                runtime.STOPPED,
+                "I'm in the middle of something — try `/model` again once I've answered.",
+                "Got it — I'll pick this up next.",
+                runtime.STEER_FAILED,
                 "Still running `make build`.",
                 "Still running `make build`.\n\nRecent output:\n```\nstep 3/9\n```",
                 "Still running.",
                 "Still running.\n\nRecent output:\n```\nstep 3/9\n```",
                 "I can't reach the model right now (authentication failed).",
-                "I can't help with that one as asked — try rephrasing?",
+                "The model provider turned that request down. Try rephrasing it, or ask whoever runs me to check the logs.",
                 "I'm being rate-limited. Give me a minute and try again.",
                 "I can't reach the model right now. Try again in a minute.",
                 "Something went wrong on my side. Try again?",
@@ -876,6 +947,18 @@ class SystemReplyTest(unittest.TestCase):
             sent = self._sent(self.adapter, "⚠️ Provider authentication failed: 401 key sk-abc", FLAG_ON)
         self.assertEqual(sent, runtime.AUTH_FAILED)
         self.assertIn("401 key sk-abc", logs.output[0])
+
+    def test_steer_failure_is_logged_not_sent(self):
+        with self.assertLogs("gateway.slack_boilerplate", "WARNING") as logs:
+            sent = self._sent(self.adapter, "⚠️ Steer failed: RuntimeError('queue closed')", FLAG_ON)
+        self.assertEqual(sent, runtime.STEER_FAILED)
+        self.assertIn("queue closed", logs.output[0])
+
+    def test_restart_reply_drops_the_console_command_and_the_notice_promise(self):
+        with mock.patch.dict(os.environ, FLAG_ON):
+            text = runtime.system_text(verifier.check_locale(self.root.dir)[2])
+        self.assertNotIn("console", text)
+        self.assertNotIn("notified", text)
 
     def test_model_text_and_unknown_replies_pass_through(self):
         for text in (REPORT, "⏩ Steered into current run. Your message arrives sooner.",
@@ -956,7 +1039,7 @@ class RuntimeTest(unittest.TestCase):
             slack = SimpleNamespace(platform=SimpleNamespace(value="slack"))
             self.assertEqual(runtime.long_running_mode(slack, "raw"), "generic")
             self.assertEqual(runtime.long_running_mode(slack, "generic"), "generic")
-            self.assertEqual(runtime.long_running_mode(slack, "off", {"thread_id": "1.2"}), "off")
+            self.assertEqual(runtime.long_running_mode(slack, "off"), "off")
             self.assertEqual(runtime.long_running_mode(SimpleNamespace(platform="SLACK"), "raw"), "generic")
             self.assertEqual(runtime.long_running_mode(SimpleNamespace(), "raw"), "raw")
 

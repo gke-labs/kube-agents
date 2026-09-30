@@ -2,7 +2,7 @@
 """Wire gateway/slack_boilerplate.py into the cron delivery, the heartbeat and the notices.
 
 Run by ``deploy/docker/Dockerfile`` against the Hermes tree, after
-``slack_boilerplate.py`` has been copied to ``gateway/``. Six files:
+``slack_boilerplate.py`` has been copied to ``gateway/``. Five files:
 
 ``cron/scheduler_delivery.py``: ``_deliver_result`` imports the module beside
 its own ``BasePlatformAdapter`` import, and each target's two send lanes take
@@ -11,11 +11,7 @@ Imported in the function, as that function already imports ``gateway``: a
 module-level import would run while ``cron.scheduler`` is still loading.
 
 ``gateway/run_turn.py``: the heartbeat's display mode passes through
-``long_running_mode``, with the turn's status metadata, straight after it is
-read, so the ``off`` check below it sees the result.
-
-``gateway/run_shutdown.py``: ``_send_notice_logged``, which sends both the
-shutdown notice and the interrupted-cron-job notice, sends ``notice_text(...)``.
+``long_running_mode`` straight after it is read.
 
 ``gateway/run_notifications.py``: the post-restart notice returns before its
 send when ``drop_notice`` says so (the ``finally`` still unlinks the marker),
@@ -30,8 +26,10 @@ Slack.
 
 ``plugins/platforms/slack/adapter.py``: ``SlackAdapter.send`` passes its
 content through ``system_text`` once the DM target is resolved, the one place
-every busy ack, drain refusal, background-task update and provider error
-reply passes on the way to Slack, and ``SlackAdapter.edit_message`` does the
+every busy ack, drain refusal, slash-command reply, background-task update,
+provider error reply and interrupting notice (``run_shutdown``'s
+``_send_notice_logged``) passes on the way to Slack, and
+``SlackAdapter.edit_message`` does the
 same once its outbound check passes, for a reply that arrives as a streamed or
 edited message. Runs after
 ``apply_slack_ux_reactions.py``, which leaves ``send`` alone.
@@ -106,21 +104,9 @@ HEARTBEAT_ANCHOR = (
     " default=True, allow_generic=True)\n"
 )
 HEARTBEAT_PATCHED = HEARTBEAT_ANCHOR + (
-    "        # kube-agents patch: KAGE_SLACK_UX drops the heartbeat under Slack's status\n"
-    "        # line and makes it generic elsewhere on Slack; see\n"
-    "        # gateway/slack_boilerplate.py. Off, the mode is unchanged.\n"
-    "        _long_running_mode = _kage_slack_boilerplate.long_running_mode(\n"
-    "            turn_ctx.source, _long_running_mode, turn_ctx._status_thread_metadata)\n"
-)
-
-RUN_SHUTDOWN = "gateway/run_shutdown.py"
-
-SHUTDOWN_SEND_ANCHOR = "            result = await adapter.send(chat_id, msg, **kw)\n"
-SHUTDOWN_SEND_PATCHED = (
-    "            # kube-agents patch: KAGE_SLACK_UX rewords the notice on Slack; see\n"
-    "            # gateway/slack_boilerplate.py. Off, this is msg.\n"
-    "            result = await adapter.send(\n"
-    "                chat_id, _kage_slack_boilerplate.notice_text(platform_str, msg), **kw)\n"
+    "        # kube-agents patch: KAGE_SLACK_UX makes the heartbeat generic on Slack;\n"
+    "        # see gateway/slack_boilerplate.py. Off, the mode is unchanged.\n"
+    "        _long_running_mode = _kage_slack_boilerplate.long_running_mode(turn_ctx.source, _long_running_mode)\n"
 )
 
 RUN_NOTIFICATIONS = "gateway/run_notifications.py"
@@ -216,11 +202,6 @@ def apply(root: Path) -> None:
     run_turn.substitute(HEARTBEAT_ANCHOR, HEARTBEAT_PATCHED, label="heartbeat display mode")
     run_turn.append(GATEWAY_IMPORT)
 
-    run_shutdown = patchlib.Patch(root, RUN_SHUTDOWN, prefix=PREFIX)
-    run_shutdown.refuse_if_patched(BUILD_MARKER)
-    run_shutdown.substitute(SHUTDOWN_SEND_ANCHOR, SHUTDOWN_SEND_PATCHED, label="_send_notice_logged send")
-    run_shutdown.append(GATEWAY_IMPORT)
-
     run_notifications = patchlib.Patch(root, RUN_NOTIFICATIONS, prefix=PREFIX)
     run_notifications.refuse_if_patched(BUILD_MARKER)
     run_notifications.substitute(RESTARTED_ANCHOR, RESTARTED_PATCHED, label="post-restart notice")
@@ -241,7 +222,6 @@ def apply(root: Path) -> None:
 
     delivery.commit("2 anchors")
     run_turn.commit("1 anchor, 1 import")
-    run_shutdown.commit("1 anchor, 1 import")
     run_notifications.commit("3 anchors, 1 import")
     run_busy.commit("1 anchor, 1 import")
     slack_adapter.commit("2 anchors, 1 import")

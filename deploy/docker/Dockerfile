@@ -739,11 +739,11 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
 # Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
 # boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
-# that routes on it, keep it), the opt-in heartbeat (dropped under the status
-# line, generic elsewhere), the back-online notices, session-database
-# warnings and busy-input hint (not sent), and the restarting/shutdown notices
-# and other system replies (reworded, in SlackAdapter.send). See
-# deploy/docker/patches/slack_boilerplate.py.
+# that routes on it, keep it), the opt-in heartbeat's tool trace (generic
+# phrase instead), the back-online notices, session-database warnings and
+# busy-input hint (not sent), and the restart/shutdown notices, slash-command
+# replies and other system replies (reworded in SlackAdapter.send and
+# edit_message). See deploy/docker/patches/slack_boilerplate.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \

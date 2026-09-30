@@ -11,8 +11,9 @@ Four things are checked:
    ``cron_delivery_text`` over the unwrapped ``content`` and the wrapped
    ``cleaned_delivery_content``, and the wrapper itself is still built, so
    every other target keeps it. The heartbeat mode is passed through
-   ``long_running_mode`` directly after it is read. The interrupting notice
-   send goes through ``notice_text``. The post-restart send and the
+   ``long_running_mode`` directly after it is read. The interrupting notices
+   still go out as ``adapter.send(chat_id, msg)``, which on Slack is the
+   hooked ``SlackAdapter.send``. The post-restart send and the
    home-channel startup send each sit behind a ``drop_notice`` guard that
    returns or continues first, and ``_send_home_channel_message``, which the
    session-database warnings share, carries no guard; their own loop does. The
@@ -20,16 +21,19 @@ Four things are checked:
    ``SlackAdapter.send`` and ``SlackAdapter.edit_message`` pass their content
    through ``system_text``, after the DM target and the outbound check.
 2. The notices themselves. Each interrupting notice is read out of the patched
-   source, rendered, and handed to the runtime: on Slack with the flag on it
-   must come back reworded. ``notice_text`` passes text it does not recognise
+   source, rendered, and handed to ``system_text``: with the flag on it must
+   come back reworded. ``system_text`` passes text it does not recognise
    through unchanged, so an upstream rewording would otherwise put Hermes'
    wording back on Slack with nothing failing.
 3. The other system replies, rendered from the patched source the same way:
-   the busy acks, the drain and restart refusals, the force-stop reply, the
-   background-task update and every provider error reply. With the
-   flag on, ``system_text`` must reword every one, with no emoji, "Gateway",
-   "gateway", "agent", ``/stop`` or exception text left; ``system_text`` passes unrecognised text
-   through, so this is what catches an upstream rewording.
+   the busy acks, the drain and restart refusals, the mid-turn slash-command
+   and ``/steer`` replies, the force-stop reply, the background-task update and
+   every provider error reply, plus the ``/restart`` and ``/stop`` replies read
+   out of ``locales/en.yaml`` (each key must still be looked up in
+   ``gateway/slash_commands.py``). With the flag on, ``system_text`` must
+   reword every one, with no emoji, "Gateway", "gateway", "agent", "Hermes",
+   ``/stop`` or exception text left; this is what catches an upstream
+   rewording.
 4. The runtime module, loaded by path: on Slack with the flag on,
    ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
    off, and for any platform other than Slack, every helper returns its input
@@ -62,6 +66,7 @@ HEARTBEAT_MODE = "_long_running_mode"
 
 RUN_SHUTDOWN = "gateway/run_shutdown.py"
 NOTICE_SEND_FN = "_send_notice_logged"
+NOTICE_SEND_ARGS = ["chat_id", "msg"]
 SHUTDOWN_FN = "_notify_active_sessions_of_shutdown"
 CRON_INTERRUPT_FN = "_notify_interrupted_cron_jobs"
 
@@ -70,8 +75,6 @@ RESTARTED_PREFIX = "♻ Gateway restarted"
 RESTART_FN = "_send_restart_notification"
 HOME_CHANNEL_FN = "_send_home_channel_message"
 STARTUP_FN = "_send_home_channel_startup_notifications"
-STATUS_METADATA = "turn_ctx._status_thread_metadata"
-THREAD_METADATA = {"thread_id": "1700000000.000100"}
 
 SESSION_DB_FN = "_send_session_db_warning_notifications"
 
@@ -86,6 +89,21 @@ BUSY_HEADS = (
 BUSY_DEMOTED_TAIL = "_BUSY_DEMOTED_TAIL"
 BUSY_DETAILS = ("", " (3 min elapsed, running: terminal)")
 DRAIN_FN = "_send_busy_drain_notice"
+
+#: What the mid-turn slash-command and /steer replies interpolate.
+BUSY_ENV = {"name": "model", "preview": "check the ingress too"}
+
+#: Hermes' English catalog, where the /restart and /stop replies live, the
+#: module that looks each key up, and the arguments each is formatted with.
+LOCALES = "locales/en.yaml"
+SLASH_COMMANDS = "gateway/slash_commands.py"
+LOCALE_REPLIES = {
+    "gateway.draining": {"count": 2},
+    "gateway.restart.in_progress": {},
+    "gateway.restart.restarting": {},
+    "gateway.stop.stopped": {},
+    "gateway.stop.stopped_pending": {},
+}
 
 RUN_INBOUND = "gateway/run_inbound.py"
 RUN_TURN_RUNNER = "gateway/run_turn_runner.py"
@@ -107,6 +125,11 @@ SLACK_METHODS = {"send": "self._dm_target(", "edit_message": "return blocked"}
 #: rendered for each of CRON_ACTIONS.
 SYSTEM_LITERALS = (
     (RUN_BUSY, "⏳ Gateway", 2),
+    (RUN_BUSY, "⏳ Agent is running", 1),
+    (RUN_BUSY, "⏩ Steer queued", 1),
+    (RUN_BUSY, "Agent still starting — /steer", 1),
+    (RUN_BUSY, "No active agent — /steer", 1),
+    (RUN_BUSY, "⚠️ Steer failed", 1),
     (RUN_INBOUND, "⏳ Gateway", 3),
     (RUN_INBOUND, "⏳ This agent is draining", 1),
     (RUN_INBOUND, "⏳ Another turn is still running", 1),
@@ -119,7 +142,9 @@ SYSTEM_LITERALS = (
     (RUN, "⚠️ The model provider failed after retries", 1),
 )
 #: Left on a reworded reply, any of these means the rewording missed.
-SYSTEM_LEFTOVERS = ("⏳", "⚡", "⚠️", "⏱️", "⏩", "↪", "/stop", "Gateway", "agent", "gateway", AUTH_ERROR)
+SYSTEM_LEFTOVERS = (
+    "⏳", "⚡", "⚠️", "⏱️", "⏩", "↪", "♻", "/stop", "Gateway", "agent", "gateway", "Hermes", "hermes", AUTH_ERROR,
+)
 
 #: Stands in for the names the interrupted-cron-job notice interpolates.
 CRON_JOB_NAME = "inventory"
@@ -210,7 +235,7 @@ def check_heartbeat(root: Path) -> None:
                 isinstance(second, ast.Assign)
                 and _names(second.targets) == [HEARTBEAT_MODE]
                 and _is_helper(second.value, "long_running_mode")
-                and _names(second.value.args) == ["turn_ctx.source", HEARTBEAT_MODE, STATUS_METADATA]
+                and _names(second.value.args) == ["turn_ctx.source", HEARTBEAT_MODE]
             ):
                 return
             raise _fail(f"{HEARTBEAT_FN}() does not pass its mode through long_running_mode next")
@@ -242,16 +267,13 @@ def check_notices(root: Path) -> list[str]:
     notices: list[str] = []
 
     tree = _tree(root, RUN_SHUTDOWN)
-    if not _binds_alias(tree):
-        raise _fail(f"{RUN_SHUTDOWN} does not import gateway.slack_boilerplate as {ALIAS}")
     send = _function(tree, NOTICE_SEND_FN, RUN_SHUTDOWN)
     if not any(
         isinstance(node, ast.Call) and ast.unparse(node.func) == "adapter.send"
-        and len(node.args) == 2 and _is_helper(node.args[1], "notice_text")
-        and _names(node.args[1].args) == ["platform_str", "msg"]
+        and _names(node.args) == NOTICE_SEND_ARGS
         for node in ast.walk(send)
     ):
-        raise _fail(f"{NOTICE_SEND_FN}() does not send notice_text(platform_str, msg)")
+        raise _fail(f"{NOTICE_SEND_FN}() no longer sends the notice as adapter.send(chat_id, msg)")
     for value in _strings(_function(tree, SHUTDOWN_FN, RUN_SHUTDOWN), "msg"):
         notices.append(ast.literal_eval(value))
     if len(notices) != 2:
@@ -318,7 +340,7 @@ def check_system(root: Path) -> list[str]:
             raise _fail(f"{relative} has {len(nodes)} replies starting {prefix!r}, expected {expected}")
         for node, action in itertools.product(nodes, CRON_ACTIONS):
             self = SimpleNamespace(_status_action_gerund=lambda action=action: action)
-            replies.append(_render(node, relative, {"self": self, "exc": AUTH_ERROR}))
+            replies.append(_render(node, relative, {"self": self, "exc": AUTH_ERROR, **BUSY_ENV}))
 
     tree = _tree(root, RUN_BUSY)
     if not _binds_alias(tree):
@@ -392,6 +414,31 @@ def check_system(root: Path) -> list[str]:
     return replies
 
 
+def check_locale(root: Path) -> list[str]:
+    """Return the /restart and /stop replies rendered from Hermes' English catalog."""
+    import yaml
+
+    path = root / LOCALES
+    if not path.is_file():
+        raise _fail(f"{path} does not exist")
+    catalog = yaml.safe_load(path.read_text()) or {}
+    looked_up = {
+        node.value for node in ast.walk(_tree(root, SLASH_COMMANDS))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    replies = []
+    for key, kwargs in LOCALE_REPLIES.items():
+        value = catalog
+        for part in key.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        if not isinstance(value, str):
+            raise _fail(f"{LOCALES} has no {key}")
+        if key not in looked_up:
+            raise _fail(f"{SLASH_COMMANDS} no longer looks up {key}")
+        replies.append(value.format(**kwargs))
+    return replies
+
+
 def _load_runtime(root: Path):
     path = root / RUNTIME
     if not path.is_file():
@@ -425,22 +472,19 @@ def drive(module, notices: list[str], replies: list[str]) -> None:
             text = module.cron_delivery_text(target(platform), REPORT, WRAPPED, extract_media)
             if text != (REPORT if reworded else WRAPPED):
                 raise _fail(f"cron_delivery_text for {platform} with the flag {'on' if on else 'off'}: {text!r}")
-            mode = module.long_running_mode(source(platform), "raw", None)
+            mode = module.long_running_mode(source(platform), "raw")
             if mode != ("generic" if reworded else "raw"):
                 raise _fail(f"long_running_mode for {platform} with the flag {'on' if on else 'off'}: {mode!r}")
-            mode = module.long_running_mode(source(platform), "raw", THREAD_METADATA)
-            if mode != ("off" if reworded else "raw"):
-                raise _fail(f"long_running_mode under a status line for {platform}: {mode!r}")
-            if module.long_running_mode(source(platform), "off", None) != "off":
+            if module.long_running_mode(source(platform), "off") != "off":
                 raise _fail(f"long_running_mode turned an off heartbeat on for {platform}")
             if module.drop_notice(platform) != reworded:
                 raise _fail(f"drop_notice for {platform} with the flag {'on' if on else 'off'}")
-            for notice in notices:
-                out = module.notice_text(platform, notice)
-                if reworded and (out == notice or "Gateway" in out or "Hermes" in out):
-                    raise _fail(f"notice_text left the Slack notice {notice!r} as {out!r}")
-                if not reworded and out != notice:
-                    raise _fail(f"notice_text changed {notice!r} for {platform} with the flag {'on' if on else 'off'}")
+        for notice in notices:
+            out = module.system_text(notice)
+            if on and (out == notice or any(word in out for word in SYSTEM_LEFTOVERS)):
+                raise _fail(f"system_text left the Slack notice {notice!r} as {out!r}")
+            if not on and out is not notice:
+                raise _fail(f"system_text changed the notice {notice!r} with the flag off")
         for reply in replies:
             out = module.system_text(reply)
             if on and (out == reply or any(word in out for word in SYSTEM_LEFTOVERS)):
@@ -454,11 +498,11 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     check_delivery(root)
     check_heartbeat(root)
     notices = check_notices(root)
-    replies = check_system(root)
+    replies = check_system(root) + check_locale(root)
     drive(_load_runtime(root), notices, replies)
     print(
         "slack_boilerplate verify: Slack cron targets send the unwrapped report, the heartbeat "
-        f"drops under the status line and goes generic elsewhere on Slack, {len(notices)} interrupting "
+        f"goes generic on Slack, {len(notices)} interrupting "
         f"notices and {len(replies)} system replies reworded, and both back-online notices, the "
         "session-database warnings and the busy-input hint kept off Slack; "
         "flag off and every other platform unchanged"
