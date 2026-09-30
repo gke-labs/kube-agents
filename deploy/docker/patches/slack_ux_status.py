@@ -57,11 +57,12 @@ user, which holds ``suspended`` until that card moves: waiting is not a lost
 event. Its cards' later events still update their rows on it, and a card
 answered there runs on it again: it becomes the thread's plan once more, or,
 beside a newer plan, holds ``processing`` for another hold. Past
-:data:`LAPSED_PER_THREAD` a thread drops set-aside plans with no card waiting
-first. A plan evicted at :data:`PLANS_MAX`, current or set aside, has its
-session sent again on the way out, since nothing else would. Past ``slack_status.ROWS_MAX`` rows the oldest settled rows leave the
-plan first, so the cap hides a live card only when more than that many are
-live. The plan has no Stop button yet: ``/stop`` interrupts only the
+:data:`LAPSED_PER_THREAD` a thread drops a set-aside plan that is quiet and
+has no card waiting first. A plan evicted at :data:`PLANS_MAX`, current or set
+aside, has its session sent again on the way out, since nothing else would.
+Past ``slack_status.ROWS_MAX`` rows the oldest settled rows leave the plan
+first, so the cap hides a live card only when more than that many are live.
+The plan has no Stop button yet: ``/stop`` interrupts only the
 Planning Agent's turn, and the cards would run on.
 
 Fallback: when posting or editing the plan fails (Slack refuses the blocks, the
@@ -110,10 +111,11 @@ PLATFORM = "slack"
 SESSION_REFRESH_SECONDS = 60.0
 
 #: How long a plan with no new note or settled row stands before it is set
-#: aside, closing the session unless a card waits on the user. A card whose terminal event never reaches the thread (a
-#: dropped subscription, a lost event) leaves its row running for good; this
-#: stops that row holding Working… forever, while covering a card's silent
-#: stretches, since noteless heartbeats reach no one.
+#: aside, closing the session unless a card waits on the user. A card whose
+#: terminal event never reaches the thread (a dropped subscription, a lost
+#: event) leaves its row running for good; this stops that row holding Working…
+#: forever, while covering a card's silent stretches, since noteless heartbeats
+#: reach no one.
 PLAN_HOLD_SECONDS = 1800.0
 
 #: ``fail_label`` for the adapter's status setter when the plan sets it.
@@ -131,8 +133,9 @@ UNBLOCKED_KIND = "unblocked"
 SESSIONS_MAX = 512
 ASKS_MAX = 512
 PLANS_MAX = 256
-#: Set-aside plans kept per thread, oldest dropped first; one dropped stops
-#: settling its rows and holding ``suspended``. ``_lapsed`` itself is capped
+#: Set-aside plans kept per thread. :func:`_set_aside` drops the oldest quiet
+#: one with no card waiting first; one dropped stops settling its rows and
+#: holding ``suspended``. ``_lapsed`` itself is capped
 #: at :data:`PLANS_MAX` threads.
 LAPSED_PER_THREAD = 4
 
@@ -442,14 +445,19 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
     """Add a lapsed plan to :data:`_lapsed`, within both bounds.
 
     Past :data:`LAPSED_PER_THREAD` the oldest plan with no card waiting goes
-    first, so a wait keeps its ``suspended`` while quiet cards come and go. A
+    first, quiet ones before one answered within the hold, so a wait keeps its
+    ``suspended`` and an answered card its ``processing`` while quiet cards
+    come and go. A
     thread evicted at :data:`PLANS_MAX` has its session sent again, as
     :func:`_keep` does, so a wait that can no longer settle does not stay
     ``suspended``.
     """
     plans = [*_lapsed.get(key, ()), plan]
     while len(plans) > LAPSED_PER_THREAD:
-        dropped = next((old for old in plans if not _waiting(old)), plans[0])
+        now = time.monotonic()
+        idle = [old for old in plans if not _waiting(old)]
+        quiet = [old for old in idle if now - old.touched >= PLAN_HOLD_SECONDS]
+        dropped = (quiet or idle or plans)[0]
         _disarm(dropped)
         plans.remove(dropped)
     _lapsed[key] = plans
@@ -458,7 +466,9 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
         old_key, evicted = _lapsed.popitem(last=False)
         for old in evicted:
             _disarm(old)
-        logger.info("slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key)
+        logger.info(
+            "slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key,
+        )
         await _session(adapter, old_key, evicted[-1])
 
 
@@ -550,7 +560,8 @@ async def _settle_lapsed(
         resumed.touched = time.monotonic()
         _arm(adapter, key, resumed)
         if key not in _plans and _lapsed.get(key) is plans:
-            plans.remove(resumed)
+            # Replaced, not edited: another settle may be iterating the old list.
+            plans = _lapsed[key] = [old for old in plans if old is not resumed]
             await _keep(adapter, key, resumed)
     if changed is not None and _lapsed.get(key) is plans:
         left = [old for old in plans if _held(old)]

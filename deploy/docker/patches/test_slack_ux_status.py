@@ -843,6 +843,69 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
 
+    def test_a_card_answered_beside_a_newer_plan_ends_on_its_own_timer(self):
+        # The answered plan is armed well after the newer plan, so the newer
+        # plan's lapse is not what ends its processing.
+        hold = 0.2
+
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")
+            await runtime.settle_row(adapter, _sub("t_w"), "blocked")
+            await asyncio.sleep(hold * 2)
+            await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "reading logs")
+            await runtime.settle_row(adapter, _sub("t_b"), "blocked")
+            await asyncio.sleep(hold * 0.6)
+            await runtime.settle_row(adapter, _sub("t_w"), "unblocked")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+            await asyncio.sleep(hold * 0.6)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "processing"), "the newer plan lapsed")
+            await asyncio.sleep(hold * 1.5)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", hold):
+            _run(scenario(adapter))
+
+    def test_a_rolling_card_answered_after_the_lapse_resumes_its_plan(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "a")
+            adapter.client.fail.add("update")
+            self.assertFalse(await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "b"))
+            adapter.client.fail.clear()
+            await runtime.settle_row(adapter, _sub("t_a"), "completed")
+            await runtime.settle_row(adapter, _sub("t_b"), "blocked")
+            await asyncio.sleep(0.2)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+            await runtime.settle_row(adapter, _sub("t_b"), "unblocked")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+            self.assertIn((CHANNEL, THREAD), runtime._plans)
+            await asyncio.sleep(0.2)
+            self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+
+    def test_the_per_thread_cap_drops_a_quiet_plan_before_an_answered_one(self):
+        async def scenario(adapter):
+            answered, quiet, newest = runtime._Plan(TEAM), runtime._Plan(TEAM), runtime._Plan(TEAM)
+            for plan, card in ((answered, "t_r"), (quiet, "t_q"), (newest, "t_n")):
+                plan.ts = PLAN_TS
+                plan.rows[card] = runtime._Row(card, card)
+                plan.rows[card].status = slack_status.TASK_RUNNING
+            quiet.touched -= 10
+            newest.touched -= 10
+            runtime._lapsed[(CHANNEL, THREAD)] = [answered, quiet]
+            await runtime._set_aside(adapter, (CHANNEL, THREAD), newest)
+            return answered, newest
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 1.0), mock.patch.object(
+            runtime, "LAPSED_PER_THREAD", 2,
+        ):
+            answered, newest = _run(scenario(adapter))
+        self.assertEqual(runtime._lapsed[(CHANNEL, THREAD)], [answered, newest])
+
     def test_the_per_thread_cap_drops_a_quiet_plan_before_a_waiting_one(self):
         async def scenario(adapter):
             await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")
