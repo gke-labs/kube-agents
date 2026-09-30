@@ -573,6 +573,10 @@ body {
 .dashboard {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  /* Rows take their content height and the dashboard scrolls. With the
+   * default auto rows a short body squeezes the sessions panel first: it
+   * scrolls sideways, so its minimum height in the grid is zero. */
+  grid-auto-rows: max-content;
   gap: 8px;
   padding: 8px 10px;
   overflow: auto;
