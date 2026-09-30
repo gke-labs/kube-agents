@@ -7,7 +7,8 @@ DEFAULT_POOL_MACHINE=e2-small; NODE_DISK_GB=32; PLANT_SETTLE=60   # the default 
 set -u; NN=${1:?scenario number, two digits}; TRACK=$NN; CLUSTER=${CLUSTER:-upg-$NN}
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"; . "$H/scenarios/$NN.sh"
-START_VERSION=$(newest_patch "$CHANNEL" "$START"); note cluster "scenario $NN on $CLUSTER: $CHANNEL $START_VERSION"
+START_VERSION=$(newest_patch "$CHANNEL" "$START") || { note final "precondition not met: $CHANNEL offers no $START patch in $ZONE (the scenario's start minor has left the channel, or the version read failed); nothing created"; exit 1; }
+note cluster "scenario $NN on $CLUSTER: $CHANNEL $START_VERSION"
 G container clusters describe "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=$SCENARIO_LABEL,scenario=$NN --quiet ${CREATE_FLAGS:-}
 require_scenario_cluster
 # And the scenario's own cluster: the label run.sh set at creation must be NN, or share NN's number as the base a lettered

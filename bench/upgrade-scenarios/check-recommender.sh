@@ -39,7 +39,7 @@ for kind, pattern, subkey, targets in (("insight", "insights-*.json", "insightSu
             prev = seen[c].get(key)
             if not prev or r.get("lastRefreshTime", "") > prev["lastRefreshTime"]:
                 seen[c][key] = {"kind": kind, "subtype": r.get(subkey, "?"), "lastRefreshTime": r.get("lastRefreshTime", ""),
-                                "state": r.get("stateInfo", {}).get("state", ""), "description": scrub(r.get("description", "")[:200]),
+                                "state": r.get("stateInfo", {}).get("state", ""), "description": scrub(r.get("description", ""))[:200],   # scrub the whole text, then cut: a cut identifier would escape the scrub
                                 "name": scrub(r.get("name", ""))}
 zones = sorted(re.sub(r"^insights-|\.json$", "", f.rsplit("/", 1)[-1]) for f in glob.glob(f"{out_dir}/insights-*.json"))
 result = {"read_at": out_dir.rsplit("/", 1)[-1], "newest_refresh": newest, "raw": out_dir.split("/evidence/", 1)[-1], "zones": zones,

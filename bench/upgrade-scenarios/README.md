@@ -249,7 +249,8 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 
 `run.sh NN` does the following:
 
-1. Creates the cluster at the minor the scenario needs, stops unless the cluster carries the campaign's label and
+1. Creates the cluster at the minor the scenario needs (a minor the channel no longer offers stops the run before
+   anything is created, and an upgrade step whose target version cannot be read stops the same way), stops unless the cluster carries the campaign's label and
    was built for this scenario (its `scenario` label is `NN`, or a base a lettered re-run extends, and never a hold
    cluster of another run), and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;

@@ -1,0 +1,1 @@
+## 2026-09-30T19:27:02Z [final/note] precondition not met: no version to move to (NO-PATCH-OFFERED-REGULAR-1.31: the minor is no longer offered on the channel, or the version read failed); stopping

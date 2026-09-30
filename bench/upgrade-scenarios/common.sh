@@ -19,7 +19,15 @@ ev(){ local sc=$1 st=$2; shift 2; local f="$EVID/$sc.txt"; ( echo; echo "## $(ts
 note(){ local sc=$1; shift; echo "## $(ts) [$sc/note] $*" | tee -a "$EVID/$sc.txt"; }
 K(){ kubectl --context "$CTX" --request-timeout=30s "$@"; }
 G(){ gcloud "$@" --project "$PROJECT"; }
-newest_patch(){ G container get-server-config --location "$ZONE" --format=json | python3 -c "import json,sys;d=json.load(sys.stdin);ch=[c for c in d['channels'] if c['channel']=='$1'][0];print([v for v in ch['validVersions'] if v.startswith('$2.')][0])"; }
+# newest_patch <channel> <minor>: the newest patch of that minor the channel offers in this zone. When none is offered (the
+# minor has left the channel) or the read fails, it prints a marker no GKE call accepts and returns 1: a caller that tests
+# it stops with its own note, and one that does not still fails at the API instead of running at the channel default
+# with an empty --cluster-version.
+NO_PATCH_MARKER=NO-PATCH-OFFERED
+newest_patch(){ local v; v=$(G container get-server-config --location "$ZONE" --format=json 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);ch=[c for c in d['channels'] if c['channel']=='$1'][0];print([v for v in ch['validVersions'] if v.startswith('$2.')][0])" 2>/dev/null) && [ -n "$v" ] && { echo "$v"; return 0; }
+  echo "$NO_PATCH_MARKER-$1-$2"; return 1; }
+# require_version <version>: stop before a cluster change when the version came back as the marker above or empty.
+require_version(){ case "$1" in ""|"$NO_PATCH_MARKER"*) note final "precondition not met: no version to move to ($1: the minor is no longer offered on the channel, or the version read failed); stopping"; exit 1;; esac; }
 # ops_running prints the operations running on the cluster, or the word "unknown" when the list itself failed (a 429, an
 # expired token), so no caller reads a failed read as an idle cluster: wait_ops keeps waiting through it, and after
 # LIST_FAILURES_MAX failed reads in a row it stops the run rather than guess.
@@ -58,8 +66,8 @@ MASTER_UPGRADE_TIMEOUT=10800   # seconds; gcloud's own default for a blocking up
 # of recording a change that never happened.
 retry_busy(){ local sc=$1 i; shift; for i in $(seq 1 $BUSY_RETRIES); do wait_ops; "$@" && return 0
   tail -4 "$EVID/$sc.txt" | grep -q "incompatible operation" || { note "$sc" "the command failed (see $sc.txt); stopping"; return 1; }; note "$sc" "refused while another operation ran; retry $i"; sleep $BUSY_WAIT; done; note "$sc" "gave up after $BUSY_RETRIES refusals; the command did not run"; return 1; }
-upgrade_master(){ local v=$1 stop="$KCFG_DIR/$CLUSTER.$TRACK.master-done"; rm -f "$stop"; note upgrade "master -> $v"; poll_api zonal-api "$stop" & local p=$!; retry_busy upgrade ev upgrade "master-$v" G container clusters upgrade "$CLUSTER" --master --cluster-version "$v" --zone "$ZONE" --quiet --timeout "$MASTER_UPGRADE_TIMEOUT"; local rc=$?; touch "$stop"; wait $p; rm -f "$stop"; [ $rc -eq 0 ] || exit 1; wait_ops; ev upgrade "master-$v-version" G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; }
-upgrade_pool(){ local pool=$1 v=$2 stop="$KCFG_DIR/$CLUSTER.$TRACK.pool-done"; shift 2; rm -f "$stop"; note upgrade "pool $pool -> $v"; for sc_ns_sel in "$@"; do IFS=: read -r sc ns sel <<<"$sc_ns_sel"; poll_avail "$sc" "$ns" "$sel" "$stop" & done; retry_busy upgrade ev upgrade "pool-$pool-$v" G container clusters upgrade "$CLUSTER" --node-pool "$pool" --cluster-version "$v" --zone "$ZONE" --quiet --async || { touch "$stop"; wait; rm -f "$stop"; exit 1; }; sleep 20; wait_ops; touch "$stop"; wait; rm -f "$stop"
+upgrade_master(){ local v=$1 stop="$KCFG_DIR/$CLUSTER.$TRACK.master-done"; require_version "$v"; rm -f "$stop"; note upgrade "master -> $v"; poll_api zonal-api "$stop" & local p=$!; retry_busy upgrade ev upgrade "master-$v" G container clusters upgrade "$CLUSTER" --master --cluster-version "$v" --zone "$ZONE" --quiet --timeout "$MASTER_UPGRADE_TIMEOUT"; local rc=$?; touch "$stop"; wait $p; rm -f "$stop"; [ $rc -eq 0 ] || exit 1; wait_ops; ev upgrade "master-$v-version" G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; }
+upgrade_pool(){ local pool=$1 v=$2 stop="$KCFG_DIR/$CLUSTER.$TRACK.pool-done"; shift 2; require_version "$v"; rm -f "$stop"; note upgrade "pool $pool -> $v"; for sc_ns_sel in "$@"; do IFS=: read -r sc ns sel <<<"$sc_ns_sel"; poll_avail "$sc" "$ns" "$sel" "$stop" & done; retry_busy upgrade ev upgrade "pool-$pool-$v" G container clusters upgrade "$CLUSTER" --node-pool "$pool" --cluster-version "$v" --zone "$ZONE" --quiet --async || { touch "$stop"; wait; rm -f "$stop"; exit 1; }; sleep 20; wait_ops; touch "$stop"; wait; rm -f "$stop"
   # The operation's own verdict: GKE reports DONE with the error in statusMessage when a node could not be recreated (a stockout), so the pool can be short a node while the upgrade reads finished.
   ev upgrade "pool-$pool-$v-operation" G container operations list --zone "$ZONE" --filter="targetLink~clusters/$CLUSTER/nodePools/$pool AND operationType=UPGRADE_NODES" --sort-by=~startTime --limit 1 --format='value(status,startTime,endTime,statusMessage)'
   ev upgrade "pool-$pool-$v-nodes" K get nodes -o wide; }
