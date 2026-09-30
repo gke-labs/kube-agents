@@ -35,6 +35,20 @@ UPSTREAM = '''\
 import re
 
 
+def _flag_getter(key):
+    def getter(self):
+        return False
+
+    return getter
+
+
+def _channel_set_getter(key):
+    def getter(self):
+        return set()
+
+    return getter
+
+
 class App:
     def __init__(self):
         self.listeners = []
@@ -73,8 +87,8 @@ class SlackAdapter:
     async def _handle_slack_message(self, event, payload=None):
         return None
 
-    _slack_disable_dms = staticmethod(lambda: False)
-    _slack_allowed_channels = staticmethod(set)
+    _slack_disable_dms = _flag_getter("disable_dms")
+    _slack_allowed_channels = _channel_set_getter("allowed_channels")
 
     def _register_bolt_handlers(self) -> None:
         """Wire every Bolt listener onto ``self._app``; must run before Socket Mode starts."""
@@ -175,6 +189,14 @@ class ApplierTest(unittest.TestCase):
             ("body, action, kind, *", "body, action, source, kind, *", "_begin_interaction takes"),
             (returns, returns.replace("channel_id, user_name", "user_name, channel_id"), "returns"),
             (returns, returns + ", None", "returns"),
+            ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, *, team=None)",
+             "_get_client no longer accepts"),
+            ("def _handle_slack_message(self, event, payload=None)",
+             "def _handle_slack_message(self, event, payload)", "_handle_slack_message no longer accepts"),
+            ('_slack_disable_dms = _flag_getter("disable_dms")', "_slack_disable_dms = property(bool)",
+             "_slack_disable_dms is no longer a method"),
+            ("    def getter(self):\n        return False", "    def getter(self, extra):\n        return False",
+             "_slack_disable_dms no longer accepts"),
         ):
             with self.subTest(named=named, new=new):
                 self.assertEqual(patched.count(old), 1, old)

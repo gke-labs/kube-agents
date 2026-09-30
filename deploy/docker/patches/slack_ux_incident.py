@@ -156,9 +156,12 @@ def parse_triage(report: str) -> dict | None:
     ``choices`` are ``(label, recommended)`` pairs in the report's order.
     """
     sections = _sections(report)
-    if sum(bool(WHAT_TO_DO.search(heading)) for heading, _body in sections) > 1:
+    starts = [i for i, (heading, _body) in enumerate(sections) if WHAT_TO_DO.search(heading)]
+    if len(starts) > 1:
         # Buttons from one section under a fold showing both would misstate the report.
         return None
+    # A stray `#` line can cut "What to do" short; options named after the cut still count.
+    rest = "\n".join(body for _heading, body in sections[starts[0]:]) if starts else ""
     # A fenced block may quote the option shape; only prose lines count.
     lines = _unfenced(_section(sections, WHAT_TO_DO))
     what_to_do = "\n".join(lines)
@@ -172,7 +175,7 @@ def parse_triage(report: str) -> dict | None:
             seen.add(letter)
             label = OPTION_LABEL.format(letter=letter, title=_presenter._plain(option.group(2)))
             choices.append((label, bool(recommended) and recommended.group(1) == letter))
-    if not set(OPTION_NAMED.findall(what_to_do)) <= seen:
+    if not set(OPTION_NAMED.findall("\n".join(_unfenced(rest)))) <= seen:
         # A button row missing an option the report offers would misstate it.
         return None
     if not choices:

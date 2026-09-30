@@ -277,6 +277,12 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.parse_triage(report)
         self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
 
+    def test_a_stray_heading_between_options_keeps_the_reply(self):
+        for cut in ("# undo it with kubectl rollout undo\n", "````\n```\n# undo\n```\n````\n"):
+            with self.subTest(cut=cut):
+                report = REPORT.replace("- **Option B", cut + "- **Option B")
+                self.assertIsNone(runtime.parse_triage(report))
+
     def test_two_what_to_do_sections_keep_the_reply(self):
         second = "\n## What to do (cluster B)\n\n- **Option C (Drain the node):** moves the pods.\n"
         self.assertIsNone(runtime.parse_triage(REPORT + second))

@@ -55,6 +55,13 @@ BEGIN_INTERACTION = "_begin_interaction"
 BEGIN_POSITIONAL = ("self", "ack", "body", "action", "kind")
 #: What ``_begin_interaction`` returns, unpacked positionally by ``answer()``.
 BEGIN_RETURNS = ("team_id", "action_id", "value", "message", "msg_ts", "channel_id", "user_name", "user_id")
+#: How ``slack_ux_clicks`` calls the other members: positional arguments after ``self``, and keywords.
+CALL_SHAPES = {
+    "_slack_allowed_channels": (0, ()),
+    "_slack_disable_dms": (0, ()),
+    "_get_client": (1, ("team_id",)),
+    "_handle_slack_message": (1, ()),
+}
 
 CHANNEL = "C0KAGE"
 TEAM = "T0KAGE"
@@ -120,8 +127,38 @@ def _members(cls: ast.ClassDef) -> dict[str, ast.AST]:
     return found
 
 
+def _method_args(tree: ast.Module, member: ast.AST) -> ast.arguments | None:
+    """The arguments of a method, or of the function a module-level factory returns for it."""
+    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return member.args
+    if not (isinstance(member, ast.Assign) and isinstance(member.value, ast.Call)
+            and isinstance(member.value.func, ast.Name)):
+        return None
+    factory = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == member.value.func.id), None
+    )
+    if factory is None:
+        return None
+    nested = {n.name: n for n in factory.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    returned = [n.value.id for n in factory.body if isinstance(n, ast.Return) and isinstance(n.value, ast.Name)]
+    return nested[returned[0]].args if len(returned) == 1 and returned[0] in nested else None
+
+
+def _accepts(args: ast.arguments, positional: int, keywords: tuple[str, ...]) -> bool:
+    """Whether a method with ``args`` accepts ``self`` plus the given call."""
+    params = [a.arg for a in [*args.posonlyargs, *args.args]][1:]
+    required = len(params) - len(args.defaults)
+    if positional < required or (positional > len(params) and args.vararg is None):
+        return False
+    named = set(params[positional:]) | {a.arg for a in args.kwonlyargs}
+    if args.kwarg is None and not set(keywords) <= named:
+        return False
+    required_kw = {a.arg for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is None}
+    return required_kw <= set(keywords)
+
+
 def check_members(tree: ast.Module) -> None:
-    """The adapter members the runtime calls exist, and ``_begin_interaction`` has its shape."""
+    """The adapter members the runtime calls exist and accept its calls, and ``_begin_interaction`` has its shape."""
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == ADAPTER_CLASS]
     if len(classes) != 1:
         raise _fail(f"{ADAPTER} has {len(classes)} class {ADAPTER_CLASS}, expected 1")
@@ -129,6 +166,15 @@ def check_members(tree: ast.Module) -> None:
     missing = [name for name in RUNTIME_MEMBERS if name not in members]
     if missing:
         raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which slack_ux_clicks calls")
+    for name, (positional, keywords) in CALL_SHAPES.items():
+        args = _method_args(tree, members[name])
+        if args is None:
+            raise _fail(f"{ADAPTER_CLASS}.{name} is no longer a method slack_ux_clicks can call")
+        if not _accepts(args, positional, keywords):
+            raise _fail(
+                f"{ADAPTER_CLASS}.{name} no longer accepts {positional} positional argument(s)"
+                f" and {keywords!r}, as slack_ux_clicks calls it"
+            )
     begin = members[BEGIN_INTERACTION]
     if not isinstance(begin, (ast.FunctionDef, ast.AsyncFunctionDef)):
         raise _fail(f"{ADAPTER_CLASS}.{BEGIN_INTERACTION} is no longer a method")
