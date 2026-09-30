@@ -91,7 +91,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 1. Create `agents/platform/skills/<your-skill>/SKILL.md` — or `agents/cluster/skills/<your-skill>/SKILL.md` if it is a read-only, single-cluster runtime-debugging procedure that belongs to the Cluster Agents.
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
-3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions. The image build passes each of the skill's `bash`, `sh`, `shell` and `zsh` blocks, whole, to the Tirith command scanner the agent itself runs under, and fails on any block holding a command it would refuse: call a program by its literal path, never through a shell variable. A block too long for the scanner to finish analysing fails the same way, so split a long block. It also fails on a shell block whose Markdown does not parse as one, such as a fence left unclosed inside a list item, since it cannot read that block.
+3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions. The image build passes each `bash`, `sh`, `shell` and `zsh` block in the skill's `SKILL.md`, whole, to the Tirith command scanner the agent itself runs under, and fails on any block holding a command it would refuse: call a program by its literal path, never through a shell variable. A block too long for the scanner to finish analysing fails the same way, so split a long block. It also fails on a shell block whose Markdown does not parse as one, such as a fence left unclosed inside a list item, since it cannot read that block. It does not read the files under `references/`.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.
 5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure. (The DM lands at the Planning Agent front door; the skill itself loads in the delegated Platform Agent worker.)
 6. If the skill should also run on schedule, add an entry to `agents/platform/cron/jobs.json` — see [Adding a watchdog](/kube-agents/concepts/autonomous-watchdogs/#adding-a-watchdog).
@@ -118,7 +118,7 @@ Reproducible and immutable: the skill ships inside the container.
    docker push my-registry/kube-agents/platform-agent:v1.1.0
    ```
 
-   The build fails if a shell command in the copied skill is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
+   The build fails if a shell command in the copied skill's `SKILL.md` is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
 
 3. Point the `PlatformAgent` CR at the new image and apply it:
 
