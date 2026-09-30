@@ -172,10 +172,15 @@ verification_spec:
       # keyword or a wrapper such as `xargs` may come between the two
       # (`if $G diff`, `| xargs $G add`), and either may also follow a space,
       # since the joined lines have no `;` between them: an `if` block's
-      # `then`, or a second line that starts with `time`.
+      # `then`, or a second line that starts with `time`. A `!` may end that
+      # run (`if ! $G diff`) but takes no flags and never follows a space
+      # alone, since there it is more often a test's negation,
+      # `[ ! "$N" -gt 0 ]`.
       # What follows it is a listed git subcommand, `submit_suggestion.py`'s
       # `prepare` or `submit`, or a flag (`$G -C dir`): any word would also
       # match a variable inside a quoted message, `"done; ${SHA} pushed"`.
+      # A test's comparison operator is not a flag, so
+      # `[[ -n "$A" && ! "$N" -gt 0 ]]` is not read as a program.
       # The second is the assignment, which is how a multi-line call's
       # `G=...` then `$G add` shows up once its lines are joined; capturing
       # git's output, `SHA=$(/opt/vcs/libexec/git rev-parse HEAD)`, is not one.
@@ -187,13 +192,14 @@ verification_spec:
       # argument or an assignment (`xargs -n 1 $G add`, `env A=b $G add`). The
       # patterns show whether this case's worker hit the refusal. What keeps
       # the skills from teaching the variable form again is the image build's
-      # check_skill_commands.py, which runs their shell blocks through Tirith,
-      # and for inline code tests/test_skill_inline_commands.py and the
-      # stockout plugin's test_skill_commands.py. Those read the skill's own
+      # check_skill_commands.py, which runs the shell blocks of their SKILL.md
+      # files through Tirith, and for inline code
+      # tests/test_skill_inline_commands.py and the stockout plugin's
+      # test_skill_commands.py. Those read the skill's own
       # text, so they see a chain's later commands, but their patterns miss
       # the same unlisted wrappers and wrapper arguments.
       forbidden_patterns:
-        - '((^|[;&|]|\$\()\s*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)*|\s((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)+)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
+        - '((^|[;&|]|\$\()\s*((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*)*(!\s+)?|\s((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*)+(!\s+)?)"?\$\{?[A-Za-z_]\w*\}?"?\s+(-{1,2}(?!(eq|ne|gt|ge|lt|le|nt|ot|ef)\b)[A-Za-z]|(add|am|apply|bisect|blame|branch|cat-file|checkout|cherry-pick|clean|clone|commit|config|describe|diff|diff-tree|fetch|for-each-ref|format-patch|gc|grep|init|log|ls-files|ls-remote|ls-tree|merge|merge-base|mv|notes|pull|push|rebase|reflog|remote|reset|restore|rev-list|rev-parse|revert|rm|show|show-ref|stash|status|submodule|switch|symbolic-ref|tag|update-ref|worktree|prepare|submit)\b)'
         - '(^|[\s;&|(])[A-Za-z_]\w*=(?!"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*(/opt/vcs/libexec/git|submit_suggestion\.py)\b'
   - name: the-pull-request-is-real-and-this-runs
     role: objective

@@ -48,6 +48,12 @@ def test_the_variable_forms_are_flagged():
         "find . -print0 | xargs -0 $G add",
         "cd ws if /opt/vcs/libexec/git diff --quiet then $G commit -m x fi",
         "cd ws time $G add f",
+        "! $G diff --quiet",
+        "test -f x && ! $G diff --quiet",
+        "while ! $G push; do sleep 1; done",
+        "cd ws if ! $G diff --quiet then $G commit -m x fi",
+        "cd ws if ! $G diff --quiet then echo x fi",
+        "$G --no-pager log",
     ):
         assert _flagged(command), command
 
@@ -62,5 +68,16 @@ def test_the_literal_and_quoted_forms_are_not_flagged():
         'cd "$WS" grep foo',
         'for f in $FILES; do echo "$f"; done',
         'if /opt/vcs/libexec/git diff --quiet; then echo "then ${SHA} done"; fi',
+        'if [ ! -d "$WS" -o -f "$WS" ]; then echo x; fi',
+        '[ ! "$N" -gt 0 ]',
+        'test ! -e "$P" -a -d "$D"',
+        '[[ -n "$A" && ! "$N" -gt 0 ]]',
+        "if [[ $A == x || ! $B -ge 3 ]]; then :; fi",
     ):
+        assert not _flagged(command), command
+
+
+def test_a_test_comparison_operator_is_not_read_as_a_flag():
+    for operator in ("eq", "ne", "gt", "ge", "lt", "le", "nt", "ot", "ef"):
+        command = f'[[ -n "$A" && ! "$N" -{operator} x ]]'
         assert not _flagged(command), command
