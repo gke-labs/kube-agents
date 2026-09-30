@@ -144,9 +144,9 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
 
 
 def read_cluster_identity(home: Path) -> dict[str, str] | None:
-    """Read the ``cluster_identity`` block written into a profile's ``config.yaml``.
+    """Read the ``cluster_identity`` block stamped in ``config.yaml``.
 
-    Returns the ``{project, cluster, location}`` dict, or ``None`` if the config is
+    Returns ``{"project": ..., "cluster": ..., "location": ...}``, or None if
     missing/unparseable or the block is absent/incomplete. Raises if the config
     cannot be read (permissions, encoding) or parses to something other than a
     mapping. This is the robust, machine-readable inverse of
@@ -157,11 +157,8 @@ def read_cluster_identity(home: Path) -> dict[str, str] | None:
 
     config_path = home / "config.yaml"
     try:
-        raw = config_path.read_text(encoding="utf-8")
-        data = yaml.safe_load(raw) or {}
-    except (OSError, yaml.YAMLError, UnicodeDecodeError):
-        return None
-    if not isinstance(data, dict):
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (FileNotFoundError, yaml.YAMLError):
         return None
     identity = data.get("cluster_identity")
     if not isinstance(identity, dict):

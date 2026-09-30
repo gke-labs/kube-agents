@@ -703,14 +703,16 @@ class ListReadyProfilesTest(unittest.TestCase):
         # 1. Nonexistent directory
         self.assertIsNone(cap.read_cluster_identity(self.tmp / "nonexistent"))
 
-        # 2. Scalar and list YAML
+        # 2. Scalar and list YAML raise AttributeError per docstring specification
         p1 = self.tmp / "p1"
         p1.mkdir()
         (p1 / "config.yaml").write_text("scalar_value\n", encoding="utf-8")
-        self.assertIsNone(cap.read_cluster_identity(p1))
+        with self.assertRaises(AttributeError):
+            cap.read_cluster_identity(p1)
 
         (p1 / "config.yaml").write_text("[item1, item2]\n", encoding="utf-8")
-        self.assertIsNone(cap.read_cluster_identity(p1))
+        with self.assertRaises(AttributeError):
+            cap.read_cluster_identity(p1)
 
         # 3. Non-dict cluster_identity
         (p1 / "config.yaml").write_text("cluster_identity: 12345\n", encoding="utf-8")
@@ -733,17 +735,19 @@ class ListReadyProfilesTest(unittest.TestCase):
             {"project": "p", "cluster": "c", "location": "l"},
         )
 
-        # 7. Non-UTF-8 bytes (UnicodeDecodeError)
+        # 7. Non-UTF-8 bytes raises UnicodeDecodeError
         p_bin = self.tmp / "p_bin"
         p_bin.mkdir()
         (p_bin / "config.yaml").write_bytes(b"\xff\xfe")
-        self.assertIsNone(cap.read_cluster_identity(p_bin))
+        with self.assertRaises(UnicodeDecodeError):
+            cap.read_cluster_identity(p_bin)
 
-        # 8. Directory config.yaml (IsADirectoryError / OSError)
+        # 8. Directory config.yaml raises OSError
         p_dir = self.tmp / "p_dir"
         p_dir.mkdir()
         (p_dir / "config.yaml").mkdir()
-        self.assertIsNone(cap.read_cluster_identity(p_dir))
+        with self.assertRaises(OSError):
+            cap.read_cluster_identity(p_dir)
 
 
 
@@ -851,16 +855,26 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         self.assertIsNotNone(no_stubbed, "missing no-stubbed-profile-scripts check")
         assert no_stubbed is not None
         forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
-        self.assertIn("cluster_agent_profile\\.py", forbidden)
-        self.assertIn("kanban_notify_propagate\\.py", forbidden)
+        self.assertTrue(
+            any("cluster_agent_profile" in p for p in forbidden),
+            "cluster_agent_profile pattern must be present",
+        )
+        self.assertTrue(
+            any("kanban_notify_propagate" in p for p in forbidden),
+            "kanban_notify_propagate pattern must be present",
+        )
         kubectl_pats = [p for p in forbidden if "kubectl" in p]
         self.assertEqual(kubectl_pats, [], "kubectl should not be in no-stubbed-profile-scripts")
 
         matching_commands = [
             "python3 /opt/data/scripts/cluster_agent_profile.py list",
             "cluster_agent_profile.py name --cluster foo",
+            "cd /opt/data/scripts && python3 -m cluster_agent_profile list",
+            'python3 -c "import cluster_agent_profile"',
             "kanban_notify_propagate.py",
             "/opt/data/scripts/kanban_notify_propagate.py",
+            "python3 -m kanban_notify_propagate",
+            'python3 -c "import kanban_notify_propagate"',
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
