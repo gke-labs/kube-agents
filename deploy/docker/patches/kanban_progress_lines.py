@@ -49,9 +49,9 @@ message via ``adapter.edit_message`` (Google Chat ``messages.patch``), which
 updates the thread without re-notifying. When the card reaches a terminal state
 the rolling message is settled — the ``⏳`` becomes ``✓`` or ``⏹`` — and the
 result posts as a message of its own, which is the one that should ping. With
-``KAGE_SLACK_UX`` on, a Slack card settles to its last line only, and a failure
-the creator's wake will explain is held for the wake step rather than posted;
-see :func:`deliver`.
+``KAGE_SLACK_UX`` on, a Slack card settles to its last line only, a failure
+the creator's wake will explain is held for the wake step rather than posted,
+and no line carries the board tag or ``Kanban <id>``; see :func:`deliver`.
 
 Three properties of the surrounding code make this nearly free:
 
@@ -155,6 +155,12 @@ MAX_RENDER = 3500
 #: reaches a terminal state, so a healthy gateway holds one per in-flight card
 #: and never approaches this. It bounds a board whose cards never terminate.
 MAX_TRACKED = 2048
+
+#: Upstream's card id in a notifier head, ``{board_tag}{@assignee }Kanban <id>``.
+#: With ``KAGE_SLACK_UX`` on, a Slack line keeps only the ``@assignee``, which
+#: is how the thread names the specialist; see :func:`slack_line`.
+KANBAN_ID = "Kanban {task_id}"
+BOARD_TAG = "[{board}] "
 
 #: Attribute the map hangs off on the watcher instance. Same lazily-initialised
 #: pattern as upstream's ``_kanban_sub_fail_counts``.
@@ -263,6 +269,46 @@ def _remember(
         # that its next note starts a new message — the restart behaviour, on
         # one card.
         tracked.pop(next(iter(tracked)), None)
+
+
+def slack_header(header: str, board: Optional[str]) -> str:
+    """The progress header without its board tag: ``"@assignee "``, or ``""``."""
+    tag = BOARD_TAG.format(board=board) if board else ""
+    return header[len(tag):] if tag and header.startswith(tag) else header
+
+
+def slack_line(message: str, header: str, board: Optional[str], task_id: str) -> str:
+    """A notifier line with the board tag and ``Kanban <id>`` taken out of its head.
+
+    Upstream heads a line ``{board_tag}{@assignee }Kanban <id>``, or for
+    ``changes_requested`` ``{board_tag}Kanban <id>``; either becomes the
+    ``@assignee`` alone, and a line with no assignee loses the head entirely.
+    The first occurrence only: the head opens the line, and the worker's
+    handoff below it is its own words.
+    """
+    tag = BOARD_TAG.format(board=board) if board else ""
+    card = KANBAN_ID.format(task_id=task_id)
+    agent = slack_header(header, board).strip()
+    for head in (f"{header}{card}", f"{tag}{card}"):
+        if head in message:
+            if agent:
+                return message.replace(head, agent, 1)
+            return message.replace(f"{head} ", "", 1).replace(head, "", 1)
+    return message
+
+
+def _slack_heads(
+    quiet: Any, sub: dict, header: str, board: Optional[str], message: str,
+) -> tuple:
+    """``(header, message)`` as a ``KAGE_SLACK_UX`` Slack line shows them, else unchanged."""
+    if quiet is None:
+        return header, message
+    try:
+        task_id = str(sub.get("task_id") or "")
+        return slack_header(header, board), slack_line(message, header, board, task_id)
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: trimming the head for %s failed: %s", sub.get("task_id"), exc)
+        return header, message
 
 
 async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[str]) -> None:
@@ -404,16 +450,19 @@ async def deliver(
     of ``gateway/kanban_notifier.py``. And the card's progress goes on its row
     in the thread's plan rather than in a rolling message of its own, with the
     rolling message as the fallback when the plan cannot be posted; ``title``
-    is the card's, for the row. See ``gateway/slack_ux_status.py``.
+    is the card's, for the row. See ``gateway/slack_ux_status.py``. Every line
+    it posts, holds or edits keeps the ``@assignee`` and drops the board tag
+    and ``Kanban <id>`` (:func:`slack_line`).
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
     key = sub_key(sub)
     entry = tracked.get(key)
     event_id = int(getattr(ev, "id", 0) or 0)
+    quiet = _slack_quiet(sub)
+    header, message = _slack_heads(quiet, sub, header, board, message)
 
     if kind not in ROLLING_KINDS:
-        quiet = _slack_quiet(sub)
         plan = _slack_plan(quiet)
         if plan is not None:
             await _settle_plan_row(plan, adapter, sub, kind)
@@ -441,7 +490,7 @@ async def deliver(
         return result
 
     line = rolling_line(kind, getattr(ev, "payload", None)) or message
-    plan = _slack_plan(_slack_quiet(sub))
+    plan = _slack_plan(quiet)
     if plan is not None and await _plan_row(plan, adapter, sub, event_id, title, line):
         return None
     if entry and event_id and event_id <= entry["last_event_id"]:
