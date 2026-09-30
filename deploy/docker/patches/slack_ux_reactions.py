@@ -29,7 +29,8 @@ With the flag on:
   cancelled turn adds nothing.
 * A turn that put new cards on the board, subscribed to this thread, defers
   its settle to those cards, and only those: a card already open when the ask
-  arrived is not its to wait on. The kanban notifier calls
+  arrived is not its to wait on. A turn that failed after opening them still
+  settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
   or ❌ if any gave up. A fan-out settles once, when all of it has. Cards are
@@ -98,6 +99,9 @@ FINISHED_MAX = 512
 #: Asks one thread can have waiting at once, oldest dropped first: a thread
 #: whose cards never finish would otherwise grow its list on every ask.
 DEFERRED_PER_THREAD = 32
+
+#: The notifier's dedup key for a board whose database path does not resolve.
+UNRESOLVED_PREFIX = "slug:"
 
 
 class _Ask:
@@ -175,11 +179,11 @@ def _query_open_cards(chat_id: str, thread_id: str) -> frozenset:
         try:
             resolved = str(Path(path).expanduser().resolve()) if path else str(kb.kanban_db_path(slug).resolve())
         except Exception:  # noqa: BLE001 — as the notifier: key an unresolvable board by slug
-            resolved = f"slug:{slug}"
+            resolved = f"{UNRESOLVED_PREFIX}{slug}"
         if resolved in seen:
             continue
         seen.add(resolved)
-        if not resolved.startswith("slug:") and not Path(resolved).exists():
+        if not resolved.startswith(UNRESOLVED_PREFIX) and not Path(resolved).exists():
             continue
         try:
             conn = kanban_db_connect.connect(board=slug)
@@ -240,7 +244,9 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
     if before is not None and after is not None and after - before:
         new = after - before
         waiting = set(new) - set(_finished)
-        failed = any(_finished.get(card, False) for card in new)
+        # The turn's own failure carries into the deferred settle: cards that
+        # later complete do not undo an ask whose turn raised.
+        failed = settle == _presenter.SETTLE_FAILED or any(_finished.get(card, False) for card in new)
         if waiting:
             asks = [*_deferred.get((chat_id, thread_id), []), _Ask(ts, team_id, waiting, failed)]
             if len(asks) > DEFERRED_PER_THREAD:

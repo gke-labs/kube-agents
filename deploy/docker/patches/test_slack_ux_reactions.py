@@ -347,6 +347,12 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         self.assertEqual(len(adapter.calls), 3)
 
+    def test_a_failed_turn_that_delegated_settles_failed(self):
+        adapter = self._turn("fix it", frozenset(), _cards("t_a"), "failure")
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls[-1], ("x", False))
+
     def test_delegated_failure(self):
         adapter = self._turn("fix it", frozenset(), _cards("t_a"))
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))

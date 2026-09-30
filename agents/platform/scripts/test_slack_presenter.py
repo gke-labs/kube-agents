@@ -1,4 +1,4 @@
-"""Unit tests for slack_presenter — answer layout, buttons and reactions.
+"""Unit tests for slack_presenter — the reactions an ask gets.
 
 Run: python3 -m pytest agents/platform/scripts/test_slack_presenter.py
 """
