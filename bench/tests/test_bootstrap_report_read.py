@@ -203,24 +203,39 @@ def test_the_claim_is_waited_for(pods: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert result.status == "pass", result.reason
 
 
-def test_a_delivery_between_the_two_reads_is_not_read_as_a_rename_without_a_claim(
-    pods: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("after", [1, 2], ids=["before-the-agent-read", "after-the-agent-read"])
+@pytest.mark.parametrize("planted", [("INVENTORY.md",), ()], ids=["report-then-delivered", "written-and-delivered"])
+def test_a_delivery_between_the_reads_reads_as_the_delivered_state(
+    pods: Path, monkeypatch: pytest.MonkeyPatch, planted: tuple[str, ...], after: int
 ) -> None:
-    _plant(pods, "INVENTORY.md")
+    _plant(pods, *planted)
     reads: list[str] = []
 
-    def delivers_after_the_first_read(script: str, timeout: float) -> str:
+    def delivers_after_a_read(script: str, timeout: float) -> str:
         out = _local_shell(script, timeout)
-        if not reads:
-            _plant(pods, ".bootstrap_completed")
-            (pods / "INVENTORY.md").rename(pods / "INVENTORY.delivered.md")
         reads.append(script)
+        if len(reads) == after:
+            (pods / "INVENTORY.md").unlink(missing_ok=True)
+            _plant(pods, ".bootstrap_completed", "INVENTORY.delivered.md")
         return out
 
-    monkeypatch.setattr(onboarding, "agent_shell", delivers_after_the_first_read)
-    monkeypatch.setattr(onboarding, "sandbox_shell", delivers_after_the_first_read)
+    monkeypatch.setattr(onboarding, "agent_shell", delivers_after_a_read)
+    monkeypatch.setattr(onboarding, "sandbox_shell", delivers_after_a_read)
     result = _verify()
-    assert "holds INVENTORY.delivered.md but there is no" not in result.reason, result.reason
+    assert (result.status, result.raw) == ("pass", {"claimed": True, "report": False, "delivered": True}), result.reason
+
+
+def test_a_sandbox_that_fails_its_second_read_is_an_error(pods: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list[str] = []
+
+    def answers_once(script: str, timeout: float) -> str:
+        reads.append(script)
+        return _local_shell(script, timeout) if len(reads) == 1 else ""
+
+    monkeypatch.setattr(onboarding, "sandbox_shell", answers_once)
+    result = _verify()
+    assert result.status == "error"
+    assert onboarding.sandbox_pod() in result.reason
 
 
 # --- registration and the stack --------------------------------------------
