@@ -1145,8 +1145,10 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("forbidden", b["read_error"])
         self.assertIsNone(b["webhooks"])
         self.assertEqual(len([c for c in fake.calls if c[:1] == ["kubectl"]]), 4)
-        # One credentials failure is one error row, not one per read.
+        # One credentials failure is one error row, not one per read, and the note names credentials, not kubectl.
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-b"])
+        self.assertIn("credentials for the cluster could not be fetched", b["note"])
+        self.assertNotIn("read failed", b["note"])
 
     def test_webhook_read_failure_leaves_the_pdb_rule_graded(self):
         fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_webhook_read=["robot-host"])

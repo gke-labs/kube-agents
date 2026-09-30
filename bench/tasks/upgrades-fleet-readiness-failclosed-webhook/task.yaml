@@ -62,7 +62,7 @@ fixtures:
   - readiness-failclosed-webhook
 
 verification_spec:
-  - name: the-report-names-the-blocked-member
+  - name: the-report-names-the-cluster
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
     mode: assert
@@ -79,9 +79,10 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["seeded-fail-closed-gate", "gate.seeded.invalid"]
 
-  # The discovery proof: why the webhook is a blocker. A pasted listing of webhook
-  # configurations shows the failure policy but never the backend's state, so the
-  # objective asks for the missing backend in any of the ways a report says it.
+  # The discovery proof: that the webhook's backend is missing. A listing of webhook
+  # configurations shows the failure policy and the Service's name but never whether the
+  # Service exists, so neither the bare name nor a generic "does not exist" counts; the
+  # phrases say the Service or its endpoints are absent.
   - name: the-report-says-the-backend-is-missing
     role: objective
     mode: assert
@@ -99,9 +100,34 @@ verification_spec:
         - "backend does not exist"
         - "service does not exist"
         - "service doesn't exist"
-        - "does not exist"
-        - "unreachable"
-        - "nonexistent-admission-gate"
+        - "nonexistent-admission-gate does not exist"
+        - "nonexistent-admission-gate doesn't exist"
+
+  # The half this case exists for: the planted gate matches ConfigMaps only, so it is an
+  # outage for what it matches, not what stops seeded-b's upgrade (its budget and its
+  # maintenance exclusion do). Every spelling binds the webhook to the upgrade or the drain,
+  # so a correct "the webhook blocks ConfigMap creation" passes.
+  - name: the-report-does-not-blame-the-webhook-for-the-upgrade
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        - "blocked by seeded-fail-closed-gate"
+        - "blocked by gate.seeded.invalid"
+        - "blocked by the webhook"
+        - "blocked by a webhook"
+        - "blocked by the fail-closed webhook"
+        - "blocked by a fail-closed webhook"
+        - "webhook blocks the upgrade"
+        - "webhook would block the upgrade"
+        - "webhook will block the upgrade"
+        - "webhook blocks the drain"
+        - "webhook would block the drain"
+        - "webhook will block the drain"
+        - "webhook is blocking the upgrade"
+        - "webhook stalls the drain"
+        - "webhook would stall the drain"
 
   - name: no-invented-cves
     role: objective

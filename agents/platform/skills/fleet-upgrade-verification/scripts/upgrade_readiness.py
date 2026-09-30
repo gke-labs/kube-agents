@@ -19,9 +19,9 @@ check yet and is stated here:
   a different major, blocks the control-plane upgrade until the pool moves;
 - a fail-closed admission webhook whose backend the API server cannot reach (no Service,
   no Service port for the webhook's port, or no ready endpoint behind that port), graded
-  on its rules: one that can match what a node upgrade needs (creating the replacement
-  pods, the eviction call, the node's own create and update, the kubelet's lease) breaks
-  the upgrade; one that matches none of those is a current outage for what it does match
+  on its rules: one that can match what a node upgrade needs (the replacement pods'
+  create, binding and status, the old pods' deletion, the eviction, the nodes' create,
+  cordon, status and deletion, the kubelet's lease) breaks the upgrade; one that matches none of those is a current outage for what it does match
   and is reported, not graded.
 """
 
@@ -150,10 +150,12 @@ DEFAULT_WEBHOOK_PORT = 443
 BACKEND_NO_SERVICE = "Service {service} does not exist"
 BACKEND_NO_PORT = "Service {service} has no port {port}"
 BACKEND_NO_ENDPOINTS = "Service {service} has no ready endpoints on port {port}"
-# What a node upgrade needs admitted, as (API group, resource, operation, scope): the
-# replacement pods, the eviction the drain issues, the new node registering and the old
-# one being cordoned, and the kubelet's heartbeat lease. A rule that can match any of these
-# puts the webhook in the upgrade's path. `namespaceSelector`, `objectSelector` and
+# What a node upgrade needs admitted, as (API group, resource, operation, scope). For the
+# pods: the replacement created, bound by the scheduler (`pods/binding`), its status written
+# by the kubelet (`pods/status`), and the old pod deleted once it terminates. The eviction the
+# drain issues. For the nodes: the new one registering and reporting status, the old one
+# cordoned and then deleted. The kubelet's heartbeat lease, created and renewed. A rule that
+# can match any of these puts the webhook in the upgrade's path. `namespaceSelector`, `objectSelector` and
 # `matchConditions` are not evaluated: a webhook they narrow is still reported as able to
 # match, which errs toward naming it.
 SCOPE_NAMESPACED = "Namespaced"
@@ -163,9 +165,15 @@ WILDCARD = "*"
 ALL_RESOURCES_AND_SUBRESOURCES = "*/*"
 UPGRADE_PATH_TARGETS = (
     ("", "pods", "CREATE", SCOPE_NAMESPACED),
+    ("", "pods/binding", "CREATE", SCOPE_NAMESPACED),
+    ("", "pods/status", "UPDATE", SCOPE_NAMESPACED),
+    ("", "pods", "DELETE", SCOPE_NAMESPACED),
     ("", "pods/eviction", "CREATE", SCOPE_NAMESPACED),
     ("", "nodes", "CREATE", SCOPE_CLUSTER),
     ("", "nodes", "UPDATE", SCOPE_CLUSTER),
+    ("", "nodes/status", "UPDATE", SCOPE_CLUSTER),
+    ("", "nodes", "DELETE", SCOPE_CLUSTER),
+    ("coordination.k8s.io", "leases", "CREATE", SCOPE_NAMESPACED),
     ("coordination.k8s.io", "leases", "UPDATE", SCOPE_NAMESPACED),
 )
 UPGRADE_PATH_LABEL = "{operation} {resource}"
@@ -655,8 +663,8 @@ def _named(items: list[dict], namespace: str, name: str) -> dict | None:
     return None
 
 
-def backend_problem(service_ref: dict, services: list[dict], slices: list[dict]) -> tuple[str | None, int]:
-    """(why the API server cannot reach this webhook's Service, ready endpoints), or (None, n).
+def backend_problem(service_ref: dict, services: list[dict], slices: list[dict]) -> str | None:
+    """Why the API server cannot reach this webhook's Service, or None when it can.
 
     The Service must exist and carry a port equal to the webhook's port; the ready count is
     over the endpoints of the Service's EndpointSlices whose port has that Service port's
@@ -666,10 +674,10 @@ def backend_problem(service_ref: dict, services: list[dict], slices: list[dict])
     port = service_ref.get("port") or DEFAULT_WEBHOOK_PORT
     service = _named(services, namespace, name)
     if service is None:
-        return BACKEND_NO_SERVICE.format(service=label), 0
+        return BACKEND_NO_SERVICE.format(service=label)
     service_ports = [p for p in (service.get("spec") or {}).get("ports") or [] if isinstance(p, dict) and p.get("port") == port]
     if not service_ports:
-        return BACKEND_NO_PORT.format(service=label, port=port), 0
+        return BACKEND_NO_PORT.format(service=label, port=port)
     port_name = service_ports[0].get("name") or ""
     ready = 0
     for slice_ in slices:
@@ -682,8 +690,8 @@ def backend_problem(service_ref: dict, services: list[dict], slices: list[dict])
             if isinstance(endpoint, dict) and (endpoint.get("conditions") or {}).get("ready") is not False:
                 ready += 1
     if not ready:
-        return BACKEND_NO_ENDPOINTS.format(service=label, port=port), 0
-    return None, ready
+        return BACKEND_NO_ENDPOINTS.format(service=label, port=port)
+    return None
 
 
 def _resource_matches(spec: str, target: str) -> bool:
@@ -747,7 +755,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 result["url_backends"] += 1
                 continue
             result["evaluated"] += 1
-            reason, ready = backend_problem(service_ref, services, slices)
+            reason = backend_problem(service_ref, services, slices)
             if reason is None:
                 continue
             matches = upgrade_path_matches(hook)
@@ -758,7 +766,6 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 "name": hook.get("name", ""),
                 "service": WEBHOOK_SERVICE_FORMAT.format(namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")),
                 "reason": reason,
-                "ready_endpoints": ready,
                 "upgrade_path": matches,
             }
             result["blocking" if matches else "outage"].append(finding)
