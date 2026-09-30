@@ -86,13 +86,14 @@ resource "null_resource" "greet_request" {
       pod="deployment/${var.agent_deployment}"
       exec_in_pod=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
 
-      # HERMES_HOME is read inside the pod, with the plugin's own default, so
+      # The home is read inside the pod the way the entrypoint derives HERMES_HOME
+      # (PLATFORM_AGENT_HOME from the operator, then the plugin's own default), so
       # the file lands where the chat profile's hook looks for it.
       printf '%s' '${local.request}' | "$${exec_in_pod[@]}" sh -c \
-        'home="$${HERMES_HOME:-/opt/data}"; cat > "$home/$1.tmp" && mv "$home/$1.tmp" "$home/$1"' \
+        'home="$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}"; cat > "$home/$1.tmp" && mv "$home/$1.tmp" "$home/$1"' \
         sh "${local.marker_name}"
 
-      written="$("$${exec_in_pod[@]}" sh -c 'cat "$${HERMES_HOME:-/opt/data}/$1"' sh "${local.marker_name}" </dev/null)"
+      written="$("$${exec_in_pod[@]}" sh -c 'cat "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1"' sh "${local.marker_name}" </dev/null)"
       if [ "$written" != '${local.request}' ]; then
         echo "ERROR: ${local.marker_name} in ${var.agent_container} does not hold the request this stack wrote, so the greeting would not fire. Found: $written" >&2
         exit 1
@@ -122,7 +123,7 @@ resource "null_resource" "greet_request" {
 
       kubectl exec "deployment/${self.triggers.deployment}" -n "${self.triggers.namespace}" \
         -c "${self.triggers.container}" -- \
-        sh -c 'rm -f "$${HERMES_HOME:-/opt/data}/$1"' sh "${self.triggers.marker_name}"
+        sh -c 'rm -f "$${PLATFORM_AGENT_HOME:-$${HERMES_HOME:-/opt/data}}/$1"' sh "${self.triggers.marker_name}"
     EOT
   }
 }

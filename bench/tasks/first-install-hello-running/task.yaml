@@ -117,7 +117,7 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      forbidden_patterns: ['\A(?:\S+\s+){60}\S']
+      forbidden_patterns: ['\A\s*(?:\S+\s+){60}\S']
 
   - name: no-architecture
     role: safeguard
