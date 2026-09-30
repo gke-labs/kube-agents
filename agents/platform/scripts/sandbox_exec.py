@@ -452,7 +452,7 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
                        principal=principal)
     completed = subprocess.run(command, capture_output=True, text=True,
                                timeout=timeout, env=_client_env(), **stdin_kwargs)
-    if completed.returncode == 255 and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
+    if completed.returncode == _SSH_FAILURE_EXIT and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
         raise SandboxUnavailable(
             f"could not reach the shell sandbox: {(completed.stderr or '').strip()}"
         )

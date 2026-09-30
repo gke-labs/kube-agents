@@ -108,13 +108,11 @@ def _data_dir() -> Path:
 
 
 def _awaiting_delivery(data_dir: Path) -> bool:
-    """True when a human is present and the report has not been delivered yet.
+    """True when a human is present; main() has already returned on a delivered report.
 
-    Both markers live on this pod, so this costs two stats; it runs before the
+    The marker lives on this pod, so this costs one stat; it runs before the
     report read, which may cross into the sandbox.
     """
-    if (data_dir / ".bootstrap_completed").exists():
-        return False
     return (data_dir / ".user_aligned").exists()
 
 

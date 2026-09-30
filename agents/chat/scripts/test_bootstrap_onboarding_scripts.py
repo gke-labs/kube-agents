@@ -79,12 +79,6 @@ class DeliveryDecisionTest(unittest.TestCase):
         (self.d / ALIGNED).touch()
         self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
 
-    def test_not_awaiting_when_already_completed(self):
-        (self.d / INVENTORY).write_text("x")
-        (self.d / ALIGNED).touch()
-        (self.d / COMPLETED).touch()
-        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
-
 
 class DeliveryMainTest(unittest.TestCase):
     def setUp(self):
