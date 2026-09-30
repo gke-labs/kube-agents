@@ -22,14 +22,21 @@ SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/p
 
 # A variable run as the program at the start of a span, after a shell join or
 # inside `$(`, and after a shell keyword or a wrapper that runs the next word
-# as a program (`if $G diff`, `xargs $G add`).
+# as a program (`if $G diff`, `xargs $G add`). A `!` may end that run but
+# takes no options.
 PREFIX = (
     r"(^|`|&&?|;|\||\$\()\s*"
-    r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command|!)\s+(-\S+\s+)*)*"
+    r"((if|then|else|elif|do|while|until|time|xargs|exec|env|nohup|command)\s+(-\S+\s+)*)*"
+    r"(!\s+)?"
 )
+# A variable followed by a comparison or a closing bracket is a test's operand
+# (`[[ -n "$A" && ! "$B" == x ]]`), not a program.
+NOT_A_TEST_OPERAND = r"(?![=!]?=|\]|-(eq|ne|gt|ge|lt|le|nt|ot|ef)\b)\S"
 # The patterns agentplugins/gke-stockout-investigator/tests/test_skill_commands.py
 # applies to that plugin's skill.
-VARIABLE_PROGRAM_RE = re.compile(PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?\s+\S", re.MULTILINE)
+VARIABLE_PROGRAM_RE = re.compile(
+    PREFIX + r"\"?\$\{?[A-Za-z_]\w*\}?\"?\s+" + NOT_A_TEST_OPERAND, re.MULTILINE
+)
 PROGRAM_ASSIGNMENT_RE = re.compile(
     r"\b[A-Za-z_]\w*=(?!\"?(\$\(|`)/opt/vcs/libexec/git[\s)`])\S*"
     r"(/opt/vcs/libexec/git|submit_suggestion\.py)\b"
@@ -95,6 +102,8 @@ class SkillInlineCommandsTest(unittest.TestCase):
             '"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             'cd "$WS" && "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py poll',
             "if ! $G diff --quiet; then $G commit -m x; fi",
+            "test -f x && ! $G diff --quiet",
+            "$G -C <dir> status",
             "find . -name '*.yaml' | xargs $G add",
             "SHA=$($G rev-parse HEAD)",
             "SHA=`$G rev-parse HEAD`",
@@ -115,6 +124,19 @@ class SkillInlineCommandsTest(unittest.TestCase):
             'python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
             'for f in $FILES; do echo "$f"; done',
+        ):
+            with self.subTest(span):
+                self.assertFalse(refused(span))
+
+    def test_a_test_operand_is_not_caught(self):
+        for span in (
+            '[[ -n "$A" && ! "$N" -gt 0 ]]',
+            '[[ -n "$A" && "$B" == x ]]',
+            '[[ -n "$A" || "$B" != x ]]',
+            '[[ -n "$A" && "$B" = x ]]',
+            '[[ -n "$A" && ! "$B" ]]',
+            '[[ -n "$A" && ! -f "$X" ]]',
+            'test -n "$A" && ! -d "$WS" -o "$X" y',
         ):
             with self.subTest(span):
                 self.assertFalse(refused(span))
