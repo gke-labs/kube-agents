@@ -113,6 +113,10 @@ def test_an_ack_that_drifts_from_the_template_still_scores_as_no_answer():
         "checking evicted pods on node-3.",
         "auditing unused node pools.",
         "checking pinned versions across the fleet.",
+        "checking the fleet's seed.",
+        "checking node-pool-red.",
+        "looking at the logs in prod-a.",
+        "checking all the nodes in prod-a.",
     ):
         assert substantive_output({"output": ack}) == "", ack
         assert substantive_output({"output": f"{ack}\n\n{REPORT}"}) == REPORT, ack
@@ -155,8 +159,35 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "Running 3 replicas in prod-a.",
         "provisioning failed again.",
         "scaling completed successfully.",
+        "restarting fixed it.",
+        "restarting cleared the backlog.",
+        "upgrading fixed the skew.",
+        "patching resolved them.",
+        "upgrading failed silently.",
+        "deploying succeeded without errors.",
+        "upgrading needs a maintenance window.",
+        "restarting requires approval.",
+        "draining evicts the pdb-protected pods.",
+        "rolling back restores the previous image.",
+        "scaling costs about $40 a day.",
+        "checking the rollout, replicas never became ready.",
+        "looking at the logs, oom kills every minute.",
+        "checking the events, pods crashloop on startup.",
+        "draining node-3 in prod-a — confirm?",
+        "Deleting prod-a?",
     ):
         assert substantive_output({"output": report}) == report, report
+
+
+def test_a_question_keeps_what_it_asks_about():
+    assert (
+        substantive_output({"output": "Draining node-3 in prod-a? Confirm."})
+        == "Draining node-3 in prod-a? Confirm."
+    )
+    assert (
+        substantive_output({"output": "deleting cluster A. Confirm?"})
+        == "deleting cluster A. Confirm?"
+    )
 
 
 def test_a_long_gerund_sentence_is_an_answer():

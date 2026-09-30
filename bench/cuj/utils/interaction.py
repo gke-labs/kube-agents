@@ -34,23 +34,33 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled", "timed_out"}
 #: target does not:
 #:
 #: - before any clause opener, a verdict ("looking very good."), a finite
-#:   verb from ``_ACK_FINDING_VERBS`` ("restarting the pod took 3 minutes.")
-#:   or a past tense ("restarting the pod cleared it."); after a clause
-#:   opener all three are part of the target ("checking why the rollout
-#:   failed.");
+#:   verb from ``_ACK_FINDING_VERBS`` ("restarting the pod took 3 minutes.",
+#:   "restarting requires approval.") or a past tense ("restarting the pod
+#:   cleared it."); after a clause opener all three are part of the target
+#:   ("checking why the rollout failed.");
+#: - an object after a verb: a determiner or pronoun from ``_ACK_OBJECTS``
+#:   that does not follow the hand-off verb, a preposition, a particle or a
+#:   conjunction ("restarting fixed it.", "draining evicts the pods."), where
+#:   a target's own determiner follows one of those ("looking at the logs.");
 #: - an ``-ed`` word is read as an adjective in the target, not a past tense,
 #:   after a determiner or preposition ("reviewing the failed rollout.",
 #:   "looking for orphaned disks.") or straight after the verb when a noun
 #:   follows it ("reviewing failed rollouts in prod-a.", while "provisioning
-#:   failed again." is an answer);
+#:   failed again." and "upgrading failed silently." are answers). A word
+#:   ending "-eed" or holding a hyphen or digit is a noun or a name, not a
+#:   past tense ("checking the fleet's seed.", "checking node-pool-red.");
 #: - a label and a value, bold or not: "Running pods: 12.";
-#: - a clause after a comma, opening with a subject or a number or carrying a
-#:   past tense: "looking at the events, nothing stands out." (a
-#:   comma-separated list of targets is still a hand-off).
+#: - a clause after the last comma that opens with a subject, holds a number
+#:   or a past tense, or runs to ``_ACK_MIN_CLAUSE_WORDS`` words without a
+#:   list joiner: "looking at the events, nothing stands out.", "checking the
+#:   rollout, replicas never became ready." (a comma-separated list of
+#:   targets, "checking seeded-a, seeded-b and seeded-c.", is a hand-off);
+#: - a closing question mark or exclamation mark: "draining node-3 in
+#:   prod-a — confirm?" asks the user something, and a hand-off does not.
 #:
 #: It is a heuristic over free text: an answer that opens with a hand-off
-#: verb and carries none of these (an unlisted irregular verb, say) is still
-#: read as a hand-off.
+#: verb and carries none of these (a present-tense verb outside the lists,
+#: followed by a bare noun, say) is still read as a hand-off.
 #:
 #: ``_DELEGATION_ACK`` is the receipt that template replaced, still sent by an
 #: install on an older image:
@@ -111,7 +121,10 @@ _ACK_FINDING_VERBS = frozenset(
         "had", "will", "won't", "can", "can't", "cannot", "could", "couldn't",
         "should", "would", "did", "didn't", "does", "doesn't", "gave", "gives",
         "got", "gets", "took", "takes", "brought", "brings", "went", "came",
-        "made", "helps",
+        "made", "helps", "became", "becomes", "needs", "requires", "costs",
+        "causes", "fixes", "breaks", "fails", "works", "succeeds", "remains",
+        "stays", "means", "lacks", "uses", "restores", "evicts", "kills",
+        "crashes", "exceeds", "hits",
     }
 )
 _ACK_CLAUSE_OPENERS = frozenset(
@@ -136,8 +149,32 @@ _ACK_AFTER_FINITE = frozenset(
         "on", "in", "at", "for", "with", "after", "because", "due", "to", "from",
         "again", "twice", "overnight", "earlier", "today", "yesterday",
         "successfully", "cleanly", "back", "up", "down", "out", "and", "but",
+        "without",
     }
 )
+#: Adverbs ending "-ly" follow a finite past tense ("upgrading failed
+#: silently.").
+_ACK_ADVERB_SUFFIX = "ly"
+#: Determiners and pronouns that open an object. After the hand-off verb or
+#: one of ``_ACK_OBJECT_LEADS`` they belong to the target; after any other
+#: word, that word is a verb taking them.
+_ACK_OBJECTS = frozenset(
+    {
+        "the", "a", "an", "it", "them", "this", "these", "those", "my", "your",
+        "our", "its", "their", "every", "each", "everything", "nothing",
+        "something",
+    }
+)
+_ACK_OBJECT_LEADS = _ACK_ADJECTIVE_CUES | {
+    "and", "or", "but", "back", "up", "down", "out", "off", "through",
+}
+#: Words that join the items of a list, so a clause after the last comma
+#: holding one is the list's tail rather than a sentence of its own.
+_ACK_LIST_JOINERS = frozenset({"and", "or", "&"})
+_ACK_MIN_CLAUSE_WORDS = 3
+_ACK_QUESTION_MARKS = ("?", "!")
+_ACK_NOUN_SUFFIX = "eed"
+_ACK_NAME_CHARACTERS = "-0123456789"
 #: Words that open a clause after a comma, where a list would name a target.
 _ACK_CLAUSE_SUBJECTS = frozenset(
     {
@@ -278,13 +315,26 @@ def tool_operations(
     ]
 
 
+def _is_past_tense(word: str) -> bool:
+    return (
+        word.endswith(_ACK_PAST_TENSE)
+        and not word.endswith(_ACK_NOUN_SUFFIX)
+        and not any(character in word for character in _ACK_NAME_CHARACTERS)
+    )
+
+
 def _is_adjective(bare: list[str], index: int) -> bool:
     """Whether the "-ed" word at ``index`` modifies a noun in the target."""
 
     if bare[index - 1] in _ACK_ADJECTIVE_CUES:
         return True
     following = bare[index + 1] if index + 1 < len(bare) else ""
-    return index == 1 and bool(following) and following not in _ACK_AFTER_FINITE
+    return (
+        index == 1
+        and bool(following)
+        and following not in _ACK_AFTER_FINITE
+        and not following.endswith(_ACK_ADVERB_SUFFIX)
+    )
 
 
 def _is_progress_ack(sentence: str) -> bool:
@@ -293,6 +343,8 @@ def _is_progress_ack(sentence: str) -> bool:
 
     text = sentence.strip()
     if "\n" in text:
+        return False
+    if text.rstrip(_ACK_WORD_WRAPPING).endswith(_ACK_QUESTION_MARKS):
         return False
     body = _ACK_CLOSING.sub("", text)
     words = body.split()
@@ -314,7 +366,13 @@ def _is_progress_ack(sentence: str) -> bool:
             break
         if word in _ACK_VERDICTS or word in _ACK_FINDING_VERBS:
             return False
-        if word.endswith(_ACK_PAST_TENSE) and not _is_adjective(bare, index):
+        if _is_past_tense(word) and not _is_adjective(bare, index):
+            return False
+        if (
+            word in _ACK_OBJECTS
+            and index > 1
+            and bare[index - 1] not in _ACK_OBJECT_LEADS
+        ):
             return False
     if "," in body:
         after = [
@@ -323,8 +381,10 @@ def _is_progress_ack(sentence: str) -> bool:
         ]
         if after and after[0] in _ACK_CLAUSE_SUBJECTS:
             return False
-        if any(
-            word.endswith(_ACK_PAST_TENSE) or word[:1].isdigit() for word in after
+        if any(_is_past_tense(word) or word[:1].isdigit() for word in after):
+            return False
+        if len(after) >= _ACK_MIN_CLAUSE_WORDS and not _ACK_LIST_JOINERS & set(
+            after
         ):
             return False
     return True
@@ -349,8 +409,14 @@ def substantive_output(interaction: dict[str, Any]) -> str:
             continue
         sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
         remainder = [sentence for sentence in sentences if sentence.strip()]
+        # A hand-off-shaped line before a question is what the question asks
+        # about: "deleting cluster A. Confirm?" keeps the target.
+        asks = bool(remainder) and remainder[-1].rstrip(
+            _ACK_WORD_WRAPPING
+        ).endswith(_ACK_QUESTION_MARKS)
         while remainder and (
-            _DELEGATION_ACK.search(remainder[0]) or _is_progress_ack(remainder[0])
+            _DELEGATION_ACK.search(remainder[0])
+            or (not asks and _is_progress_ack(remainder[0]))
         ):
             remainder.pop(0)
         if remainder:

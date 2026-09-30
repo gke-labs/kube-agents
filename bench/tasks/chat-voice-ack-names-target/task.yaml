@@ -79,16 +79,16 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*\bt_?[0-9a-f]{6,}\b'
-        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*delegated to'
-        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*will post'
+        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*\bt_?[0-9a-f]{6,}\b'
+        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*delegated to'
+        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*will post'
   - name: no-apology-or-sign-off-in-the-ack
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A\s*+(?:[^\n]*\S[^\n]*\n)*?[^\n]*(?:sorry|apolog|let me know)'
+        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*(?:sorry|apolog|let me know)'
   - name: the-ack-opens-without-preamble
     role: objective
     mode: assert
