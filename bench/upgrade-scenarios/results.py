@@ -23,7 +23,7 @@ SCENARIOS = {
      ["upg-01", "gemma-gpu", "gemma-gpu-upgraded"], ["PDB_UNPERMISSIVE"]),
  2: ("No spare capacity for the displaced pods", "reproduced", "02/capacity-availability.txt",
      "2026-09-29T14:45:24Z /Pending/", ["upg-02b"], []),
- 3: ("Every replica on one node", "reproduced", "03/placement.txt", "samples=44 zero_serving=18", ["upg-03b"], []),
+ 3: ("Every replica in one zone or on one node", "reproduced", "03/placement.txt", "samples=44 zero_serving=18", ["upg-03b"], []),
  4: ("Data on the node is gone", "reproduced", "04/node-data.txt", "Tue Sep 29 15:17:26 UTC 2026", ["upg-04b"], []),
  5: ("Maintenance window too short, or an exclusion ends mid-roll", "partial", "05/window.txt",
      "1.35.8-gke.1380000\thold-minor={'endTime': '2026-10-02T13:49:59Z', 'maintenanceExclusionOptions': {'scope': 'NO_MINOR_UPGRADES'}",
@@ -40,7 +40,7 @@ SCENARIOS = {
  10: ("Add-on and client skew", "partial", "10b/skew.txt",
       "gke-upg-10-work-pool-6fb8c002-0fdz      Ready    <none>   47m     v1.31.14-gke.2759000", ["upg-10"], ["CLUSTER_VERSION_SKEW_UNSUPPORTED"]),
  11: ("The control plane is unreachable for minutes on a zonal cluster", "not reproduced", "11b/zonal.txt", "read_down=0", ["upg-11b"], []),
- 12: ("A node label or taint is removed", "reproduced (GKE form)", "12/label.txt",
+ 12: ("A node label is removed", "reproduced (GKE form)", "12/label.txt",
       "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector.", ["upg-12b"], []),
  13: ("The container runtime changes", "reproduced", "13b/runtime.txt",
      "unknown service runtime.v1alpha2.RuntimeService", ["upg-13b"], ["DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API", "DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES"]),
@@ -94,12 +94,14 @@ def main():
     for c in ours:
         items = rec.get("clusters", {}).get(c, [])
         every.append(f"| `{c}` | {', '.join(sorted({i['subtype'] for i in items})) or 'none'} | {max((i['lastRefreshTime'] for i in items), default='')} |")
+    if errors:
+        for e in errors: print("ERROR", e, file=sys.stderr)
+        return 1
     table = "\n".join([summary, "", *rows, *every])
     path = f"{H}/{DOC}"; doc = open(path).read()
     doc = re.sub(re.escape(BEGIN) + ".*?" + re.escape(END), lambda _: f"{BEGIN}\n{table}\n{END}", doc, flags=re.S)
     open(path, "w").write(doc); print(summary)
     with open(f"{H}/{CSV_FILE}", "w", newline="") as f:
         w = csv.writer(f, lineterminator="\n"); w.writerow(CSV_HEADER); w.writerows(csv_rows)
-    for e in errors: print("WARNING", e, file=sys.stderr)
-    return 1 if errors else 0
+    return 0
 if __name__ == "__main__": sys.exit(main())

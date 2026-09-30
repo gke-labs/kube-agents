@@ -23,6 +23,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).
 - `hack/` — `run-gitops-pilot.sh`, the laptop driver for the `b-0011-gitops` and `b-0022b-gitops` cases (`TASK` picks one; optional devops-bench pin with the case rendered to `mode: hold`, result-row model, agent base branch, tokens, stack and harness env, cleanup; `GITOPS_REPO` and `AGENT_STATE_RESET` for an isolated run); `gitops-run-repo.sh`, one GitOps repository per run (create, mint check, archive); `gitops-audit.py`, the isolation counts of a run record; `gitops-compare.py`, two run records side by side.
+- `upgrade-scenarios/` — a manual harness, run by hand against a GCP project of your own, that planted each failure in [`docs/designs/upgrade-failure-catalogue.md`](../docs/designs/upgrade-failure-catalogue.md) on a throwaway GKE cluster and upgraded it; the results table, one quoted evidence file per scenario, and the scripts. No CI job runs it. See [upgrade-scenarios/README.md](upgrade-scenarios/README.md).
 - `tools/` — operator-run scripts that are neither tasks nor tests. `live_check_fleet_safeguards.py` drives every `fleet_resource_property` check in the cluster-debugging cases against a live cluster, through the real verifier, without running an agent.
 
 To add a task or plug in a different agent, see
