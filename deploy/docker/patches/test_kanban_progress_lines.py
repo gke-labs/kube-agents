@@ -1102,7 +1102,7 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tracked_messages(watcher), {})
 
     async def test_a_status_move_reaches_the_plan_as_a_move(self):
-        move = SimpleNamespace(id=1, kind="status", payload={"status": "ready"})
+        move = SimpleNamespace(id=1, kind="status", payload={"status": " ready "})
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "status", move, "🔄", None, HEADER)
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "heartbeat", _beat(2, "note"), "note", None, HEADER)
         self.assertEqual(self.moves, ["ready", None])

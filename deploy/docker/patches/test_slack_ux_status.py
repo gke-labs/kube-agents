@@ -563,25 +563,40 @@ class PlanTest(_RuntimeCase):
         self.assertTrue(self._move(adapter, 1, "ready"))
         self.assertEqual((adapter.calls, runtime._plans), ([], {}))
 
-    def test_a_move_joins_the_trail_and_leaves_a_waiting_row_waiting(self):
+    def test_a_move_joins_the_trail_and_leaves_a_settled_row_settled(self):
         adapter = _Adapter()
-        self._note(adapter, 1, "reading logs")
-        _run(runtime.settle_row(adapter, _sub(), "blocked"))
-        self.assertTrue(self._move(adapter, 2, "ready"))
-        self.assertEqual(self._sent(adapter)[-1], "suspended")
+        self._note(adapter, 1, "reading logs", task="t_a")
+        self._note(adapter, 2, "reading metrics", task="t_b")
+        _run(runtime.settle_row(adapter, _sub("t_a"), "completed"))
+        self.assertTrue(self._move(adapter, 3, "ready", task="t_a"))
         task = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"][0]
-        self.assertEqual(task["status"], "pending")
+        self.assertEqual(task["status"], "complete")
         steps = task["details"]["elements"][0]["elements"]
         self.assertEqual([step["elements"][0]["text"] for step in steps], ["✓ reading logs", "✓ → ready"])
 
-    def test_a_move_to_done_settles_the_row_and_closes(self):
+    def test_a_move_into_review_waits_on_the_user(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
-        self.assertTrue(self._move(adapter, 2, "done"))
+        self.assertTrue(self._move(adapter, 2, "review"))
         tasks = [v for n, v in adapter.calls if n == "update"][-1][0]["tasks"]
-        self.assertEqual([t["status"] for t in tasks], ["complete"])
-        self.assertEqual(adapter.calls[-1], ("setStatus", "closed"))
-        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+        self.assertEqual([t["status"] for t in tasks], ["pending"])
+        self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+
+    def test_a_move_for_a_card_rolling_on_a_set_aside_plan_goes_to_its_rolling_message(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub("t_a"), 1, "check payments", "a")
+            adapter.client.fail.add("update")
+            self.assertFalse(await runtime.deliver_row(adapter, _sub("t_b"), 2, "check checkout", "b"))
+            adapter.client.fail.clear()
+            await asyncio.sleep(0.2)
+            self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+            self.assertFalse(
+                await runtime.deliver_row(adapter, _sub("t_b"), 3, "check checkout", "→ ready", "ready"),
+            )
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
 
     def test_an_archived_card_shows_as_failed_with_a_note(self):
         adapter = _Adapter()

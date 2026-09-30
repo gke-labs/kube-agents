@@ -132,8 +132,11 @@ UNBLOCKED_KIND = "unblocked"
 #: A dashboard move (a ``status`` event) to one of these columns settles the
 #: card's row as the event kind it maps to would. A move to any other column
 #: leaves the row's status alone: the dashboard cannot set ``running``, so a
-#: move never means the card runs.
-MOVE_KINDS = {"done": "completed", "blocked": "blocked", "review": "review_requested"}
+#: move never means the card runs. Upstream writes the event only for a drag
+#: to ready, todo or triage, which a card resuming into review lands as
+#: ``review``; a drag to done or blocked posts its own ``completed`` or
+#: ``blocked`` event instead.
+MOVE_KINDS = {"review": "review_requested"}
 
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
@@ -615,8 +618,8 @@ async def _deliver_move(
     """Put a dashboard move on the card's row, settling it per :data:`MOVE_KINDS`.
 
     A move opens no row: one for a card with no row on the current plan is
-    taken and dropped, unless the card rolls on a fallen-back plan, where its
-    rolling message takes it.
+    taken and dropped, unless the plan fell back or the card rolls on a plan
+    set aside, where the card's rolling message takes it.
     """
     plan = _plans.get(key)
     row = plan.rows.get(card) if plan is not None and not plan.fallback else None
@@ -632,7 +635,8 @@ async def _deliver_move(
     elif row is not None and not await _render(adapter, key, plan):
         row.lines, row.last_event_id = previous
         return False
-    return row is not None or plan is None or card not in plan.rolling
+    rolls = any(card in old.rolling for old in _lapsed.get(key, ()))
+    return row is not None or not (rolls or (plan is not None and plan.fallback))
 
 
 async def deliver_row(
