@@ -55,9 +55,9 @@ run fails the build rather than passing every block.
 A finding that cannot be fixed in the skill text yet goes in
 ``KNOWN_FINDINGS`` with the rules Tirith cites and its reason, keyed on the
 whole block, so an edit anywhere in that block, or a rule a Tirith release adds
-to it, brings it back for review. An entry that no longer
-matches a refused block fails the check too, so the list cannot outlive what it
-excuses.
+to it, brings it back for review. An entry under a tree the run reads that no
+longer matches a refused block fails the check too, so the list cannot outlive
+what it excuses.
 
 A shell block whose raw text and parsed Markdown disagree, such as a fence left
 unclosed inside a list item, fails the check as well: its commands cannot be
@@ -345,13 +345,16 @@ def scan_blocks(blocks: Iterable[Block], scan: Scan) -> list[Finding]:
 
 
 def triage(
-    findings: Iterable[Finding], known: dict[tuple[str, str], tuple[frozenset[str], str]]
+    findings: Iterable[Finding],
+    known: dict[tuple[str, str], tuple[frozenset[str], str]],
+    repo_dirs: Iterable[str],
 ) -> tuple[list[Finding], list[tuple[str, str]]]:
     """Split into findings ``known`` does not excuse and entries that excuse nothing.
 
     An entry excuses its block only while Tirith cites exactly the rules it
     lists: the key is the whole block, so a new rule on another of its lines
-    would otherwise pass unseen.
+    would otherwise pass unseen. Only an entry under one of ``repo_dirs`` can be
+    stale, since a run that did not read a tree cannot say its blocks pass.
     """
     findings = list(findings)
     refused = {finding.block.key for finding in findings}
@@ -359,7 +362,8 @@ def triage(
         finding for finding in findings
         if finding.block.key not in known or set(finding.rules) != known[finding.block.key][0]
     ]
-    stale = sorted(key for key in known if key not in refused)
+    read = tuple(f"{repo_dir}/" for repo_dir in repo_dirs)
+    stale = sorted(key for key in known if key[0].startswith(read) and key not in refused)
     return new, stale
 
 
@@ -494,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SKILL COMMAND CHECK COULD NOT RUN: {exc}", file=sys.stderr)
             return 1
 
-    new, stale = triage(findings, KNOWN_FINDINGS)
+    new, stale = triage(findings, KNOWN_FINDINGS, [repo_dir for repo_dir, _ in args.trees])
     for finding in new:
         block = finding.block
         print(

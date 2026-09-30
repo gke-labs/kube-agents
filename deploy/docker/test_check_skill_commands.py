@@ -15,6 +15,7 @@ import io
 import sys
 import tarfile
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -259,16 +260,49 @@ class TriageTest(unittest.TestCase):
         new_block = check.Block("a/SKILL.md", 4, "known\nnew")
         findings = [check.Finding(known_block, "warn", ("r",)), check.Finding(new_block, "block", ("r",))]
         known = {known_block.key: (frozenset({"r"}), "reason"), ("a/SKILL.md", "gone"): (frozenset({"r"}), "reason")}
-        new, stale = check.triage(findings, known)
+        new, stale = check.triage(findings, known, ["a"])
         self.assertEqual([findings[1]], new)
         self.assertEqual([("a/SKILL.md", "gone")], stale)
 
     def test_a_known_block_citing_another_rule_is_new(self):
         block = check.Block("a/SKILL.md", 1, "known")
         finding = check.Finding(block, "block", ("r", "added"))
-        new, stale = check.triage([finding], {block.key: (frozenset({"r"}), "reason")})
+        new, stale = check.triage([finding], {block.key: (frozenset({"r"}), "reason")}, ["a"])
         self.assertEqual([finding], new)
         self.assertEqual([], stale)
+
+    def test_only_an_entry_under_a_tree_the_run_read_is_stale(self):
+        known = {
+            (path, "gone"): (frozenset({"r"}), "reason")
+            for path in ("a/SKILL.md", "ab/SKILL.md", "b/x/SKILL.md")
+        }
+        new, stale = check.triage([], known, ["a", "c"])
+        self.assertEqual([], new)
+        self.assertEqual([("a/SKILL.md", "gone")], stale)
+
+    def test_main_judges_staleness_against_the_trees_it_was_given(self):
+        known = {
+            (f"{tree}/demo/SKILL.md", "gone"): (frozenset({"r"}), "reason")
+            for tree in ("agents/platform/skills", "agents/cluster/skills")
+        }
+        scanner = types.ModuleType("tools.tirith_security")
+        scanner.check_command_security = lambda text: verdict(
+            "block" if text == check.PROBE_REFUSED else "allow"
+        )
+        modules = {"tools": types.ModuleType("tools"), "tools.tirith_security": scanner}
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text("```bash\nls\n```\n")
+            with mock.patch.dict(sys.modules, modules), \
+                    mock.patch.dict(check.os.environ), \
+                    mock.patch.object(check, "KNOWN_FINDINGS", known), \
+                    mock.patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertEqual(
+                    1, check.main([f"agents/platform/skills={tmp}", "--tirith-bin", "tirith"])
+                )
+        self.assertIn("('agents/platform/skills/demo/SKILL.md', 'gone')", err.getvalue())
+        self.assertNotIn("agents/cluster/skills", err.getvalue())
 
 
 class KnownFindingsTest(unittest.TestCase):

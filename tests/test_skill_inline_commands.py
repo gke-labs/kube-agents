@@ -97,7 +97,12 @@ class SkillInlineCommandsTest(unittest.TestCase):
             "if ! $G diff --quiet; then $G commit -m x; fi",
             "find . -name '*.yaml' | xargs $G add",
             "SHA=$($G rev-parse HEAD)",
+            "SHA=`$G rev-parse HEAD`",
             'cd "$WS" & $G add <path>',
+            'cd "$WS"; $G add <path>',
+            "find . -print0 | xargs -0 $G add",
+            "${G} add <path>",
+            'S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py',
         ):
             with self.subTest(span):
                 self.assertTrue(refused(span))

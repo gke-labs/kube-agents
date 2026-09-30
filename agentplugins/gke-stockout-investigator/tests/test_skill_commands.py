@@ -54,9 +54,16 @@ class SkillCommandsTest(unittest.TestCase):
             "$G add <path>",
             "cd <workspace> && $G add <path>",
             "cd <workspace> & $G add <path>",
+            "cd <workspace>; $G add <path>",
             "SHA=$($G rev-parse HEAD)",
+            "SHA=`$G rev-parse HEAD`",
+            "if ! $G diff --quiet; then $G commit -m x; fi",
             "find . -name '*.yaml' | xargs $G add",
+            "find . -print0 | xargs -0 $G add",
+            "${G} add <path>",
+            '"$S" prepare --repo <owner>/<repo>',
             "export G=/opt/vcs/libexec/git",
+            'S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py',
             '"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \\',
         ):
             with self.subTest(command):
