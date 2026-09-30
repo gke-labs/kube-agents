@@ -2415,8 +2415,28 @@ class DeliverEndToEndTest(unittest.TestCase):
         with self.assertLogs("gateway.run", level="WARNING") as logs:
             delivery.tick()
         self.assertEqual([m for _, m, _ in delivery.adapter.sent], ["✖ card completed"])
-        self.assertIn("dropping the held gave_up line", "\n".join(logs.output))
+        self.assertIn("not posting the held gave_up line", "\n".join(logs.output))
         self.assertFalse(getattr(delivery.runner, HELD_ATTR, None))
+
+    def test_flag_on_a_move_to_done_also_drops_the_held_line(self):
+        delivery, _ = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        delivery.events.append(_Ev(8, "status", {"status": "done"}))
+        delivery.wake_outcomes.append(RuntimeError("profile gone"))
+        with self.assertLogs("gateway.run", level="WARNING") as logs:
+            delivery.tick()
+        self.assertNotIn("✖ card gave_up", [m for _, m, _ in delivery.adapter.sent])
+        self.assertIn("not posting the held gave_up line", "\n".join(logs.output))
+
+    def test_flag_on_a_recovery_before_an_admitted_wake_logs_no_untold(self):
+        # The retry's wake is admitted and tells the failure: the drop must not
+        # claim it went untold.
+        delivery, _ = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
+        delivery.events.append(_Ev(8, "completed"))
+        delivery.wake_outcomes.append(None)
+        with self.assertLogs("gateway.run", level="WARNING") as logs:
+            delivery.tick()
+        self.assertEqual([m for _, m, _ in delivery.adapter.sent], ["✖ card completed"])
+        self.assertNotIn("untold", "\n".join(logs.output))
 
     def test_flag_on_a_review_handoff_also_drops_the_held_line(self):
         delivery, _ = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)

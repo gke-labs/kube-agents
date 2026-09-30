@@ -1606,8 +1606,9 @@ def drop_superseded(runner: object, sub: dict, event_id: int) -> None:
         for eid in stale:
             kind = pending.pop(eid)[0]
             logger.warning(
-                "kanban notifier: dropping the held %s line for %s untold; the card "
-                "recovered (event %d) before its wake settled",
+                "kanban notifier: not posting the held %s line for %s; the card "
+                "recovered (event %d) before its wake settled, so only that wake, "
+                "if admitted, tells the failure",
                 kind, sub.get("task_id"), int(event_id),
             )
         if stale and not pending:

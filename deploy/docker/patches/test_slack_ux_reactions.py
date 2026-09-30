@@ -208,6 +208,20 @@ class ApplierTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             verifier.check_adapter(self.root.dir)
 
+    def test_verifier_reads_the_methods_off_the_adapter_class(self):
+        # A same-shaped _react defined above the adapter must not mask a
+        # reordered one on the adapter itself.
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        patched = path.read_text()
+        signature = "async def _react(self, channel, timestamp, emoji, team_id, *, remove):"
+        drifted = patched.replace(signature, "async def _react(self, timestamp, channel, emoji, team_id, *, remove):")
+        mixin = f"class Mixin:\n    {signature}\n        return True\n\n\nclass SlackAdapter"
+        drifted = drifted.replace("class SlackAdapter", mixin, 1)
+        path.write_text(drifted)
+        with self.assertRaises(SystemExit):
+            verifier.check_adapter(self.root.dir)
+
     def test_verifier_refuses_unpatched_tree(self):
         with self.assertRaises(SystemExit):
             verifier.main(self.root.dir)
