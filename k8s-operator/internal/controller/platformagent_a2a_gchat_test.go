@@ -356,3 +356,41 @@ func TestTheBrokerFenceAdmitsTheGatewayWhenArmed(t *testing.T) {
 		}
 	}
 }
+
+// TestTheLegacyChatConsumerIsNotRenderedUnderNext: the Hermes google_chat
+// platform, its relay env on the gateway container and its pins in the
+// managed .env all go with the mode. Under today they are exactly what main
+// renders; under skew they come back, because renderMode fails closed.
+func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
+	legacyNames := []string{"GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME", "GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS"}
+	for _, tc := range []struct {
+		name   string
+		agent  *agentv1alpha1.PlatformAgent
+		legacy bool
+	}{
+		{"today with chat", gchatTestAgent("", true), true},
+		{"skew with chat", gchatTestAgent("later", true), true},
+		{"next with chat", gchatTestAgent("next", true), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
+			env := gchatEnv(*brokerContainerNamed(pod.Spec.Containers, "platform-agent"))
+			managed := renderManagedEnv(tc.agent)
+			config := renderConfigYAML(tc.agent, nil)
+			for _, name := range legacyNames {
+				_, inEnv := env[name]
+				inManaged := strings.Contains(managed, name+"=")
+				if inEnv != tc.legacy {
+					t.Errorf("%s in the gateway container env = %v, want %v", name, inEnv, tc.legacy)
+				}
+				if inManaged != tc.legacy {
+					t.Errorf("%s in the managed .env = %v, want %v", name, inManaged, tc.legacy)
+				}
+			}
+			enabled := strings.Contains(config, "google_chat:\n    enabled: true")
+			if enabled != tc.legacy {
+				t.Errorf("platforms.google_chat.enabled rendered %v, want %v; config:\n%s", enabled, tc.legacy, config)
+			}
+		})
+	}
+}

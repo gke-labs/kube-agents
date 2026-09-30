@@ -635,7 +635,11 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// records where it started rather than testing `lines` for emptiness.
 	platformStart := len(lines)
 
-	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+	// legacyChatConsumer rather than the enabled flag: under next the A2A
+	// gateway takes Chat and the Hermes platform is off, so its pins would
+	// pin a platform that does not run. The two predicates are complements;
+	// see a2aChatArmed.
+	if gchat := integration.GoogleChat; legacyChatConsumer(agent) {
 		add("GOOGLE_CHAT_RELAY_URL", credentialProxyBaseURL(agent))
 		add("GOOGLE_CHAT_PROJECT_ID", gchat.ProjectID)
 		add("GOOGLE_CHAT_SUBSCRIPTION_NAME", fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName))
@@ -1868,13 +1872,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
-			if gchat.Enabled != nil {
-				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
-				if *gchat.Enabled {
-					// Rebrand the Google Chat "thinking" marker card from the
-					// upstream default ("Hermes is thinking…") to our product name.
-					cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
-				}
+			// The platform is on only while Hermes is the Chat consumer;
+			// under next the A2A gateway is, and this platform would pull
+			// the same subscription beside it.
+			cfg.Platforms.GoogleChat.Enabled = legacyChatConsumer(agent)
+			if cfg.Platforms.GoogleChat.Enabled {
+				// Rebrand the Google Chat "thinking" marker card from the
+				// upstream default ("Hermes is thinking…") to our product name.
+				cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
 			}
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
@@ -2637,7 +2642,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
-		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+		// The legacy relay env; under next the A2A gateway carries Chat
+		// instead, see a2aChatArmed.
+		if gchat := integration.GoogleChat; legacyChatConsumer(agent) {
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "GOOGLE_CHAT_RELAY_URL",
