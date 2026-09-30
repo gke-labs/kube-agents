@@ -1378,9 +1378,9 @@ write_secret_env_var() {
 # exactly the flagged value earns "records no K".
 #
 # One evaluation for all of them, because the file is shell and a line may run
-# a command: `GEMINI_API_KEY=$(gcloud secrets versions access ...)` is a
-# network round-trip per evaluation, and the interview guard alone asks about
-# twenty-two keys. Answers stay cached until the file argument changes. A
+# a command: a key whose value is a command substitution fetching a secret is
+# a network round-trip per evaluation, and the interview guard alone asks
+# about twenty-two keys. Answers stay cached until the file changes. A
 # caller reading through a command substitution primes the cache in a subshell
 # that then exits, so the callers that read several keys prime here first, in
 # their own shell, and their reads land warm.

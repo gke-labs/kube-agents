@@ -5524,8 +5524,10 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         source = _INSTALL_SH.read_text()
         body = source.split("warn_unrecorded_interview_answers() {")[1]
         # The key list itself, not the comment above it that names these two as
-        # the examples of what to leave out.
-        keys = body.split("for key in ")[1].split("; do")[0]
+        # the examples of what to leave out. The list is an array so that the
+        # cache priming and the loop read one copy of it, so this reads the
+        # array literal rather than the `for` line.
+        keys = body.split("local interview_keys=(")[1].split(")")[0]
         self.assertIn("MEMORY", keys, "sanity: the list was located")
         self.assertNotIn("ENABLE_GKE_BACKUP_PLAN", keys)
         self.assertNotIn("GVISOR_POOL_NAME", keys)
