@@ -90,7 +90,7 @@ An alert goes to **one** of them, not both: it opens a thread that the triage tu
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
-With `KAGE_SLACK_UX` on, Slack gets a headline built from the open ledger issue: the finding and critical counts, the two most severe findings, the report's own line, and a link to the issue. A clean run closes its ledger, so it is posted like an issue that cannot be read: the report's own line in bold with the link. The full report is also posted as a reply in the headline's thread when it is longer than one line or the headline could not show all of its line, and a reply there is answered with the full report in context.
+With `KAGE_SLACK_UX` on, Slack gets a headline built from the open ledger issue: the finding and critical counts, the two most severe findings, the report's own line, and a link to the issue. A clean run closes its ledger, so it is posted like an issue that cannot be read: the report's own line in bold with the link. So is a run with no findings that left the ledger open because it could not check everything, since the issue still shows the last run's counts. The full report is also posted as a reply in the headline's thread when it is longer than one line or the headline could not show all of its line, and a reply there is answered with the full report in context.
 
 ## First-run onboarding
 

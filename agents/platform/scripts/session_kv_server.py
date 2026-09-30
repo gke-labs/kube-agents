@@ -2489,7 +2489,8 @@ def _fetch_ledger_issue(ref: slack_audit_report.LedgerRef) -> dict | None:
         import forge
 
         executor = ThreadPoolExecutor(max_workers=1)
-        call = executor.submit(forge.call, "issue-view", {"number": ref.number}, ref.repo)
+        # A read, so it takes forge's one transient retry; the timeout below bounds both attempts.
+        call = executor.submit(forge.call, "issue-view", {"number": ref.number}, ref.repo, retry_transient=True)
         issue = call.result(timeout=AUDIT_LEDGER_FETCH_TIMEOUT_S).get("issue")
     except Exception as exc:
         logger.warning(f"Audit headline: could not read {ref.url}: {exc!r}")

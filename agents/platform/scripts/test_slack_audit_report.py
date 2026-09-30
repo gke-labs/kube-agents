@@ -142,6 +142,57 @@ class HeadlineFromIssueTest(unittest.TestCase):
     def test_more_new_findings_than_the_ledger_lists_does_not_parse(self):
         self.assertIsNone(sar.headline_from_issue(ISSUE, REF, "8 new — x"))
 
+    def test_the_new_count_comes_from_the_ledger_line(self):
+        report = f"seeded-a: 3 new node pools without Workload Identity\n{REPORT}"
+        first = sar.headline_from_issue(ISSUE, REF, report).splitlines()[0]
+        self.assertTrue(first.endswith(" 2 are new since the last run."), first)
+
+    def test_new_counts_by_severity_state_no_single_number(self):
+        report = f"Cost audit: 1 new critical, 2 new major, 1 resolved — {LEDGER}"
+        first = sar.headline_from_issue(ISSUE, REF, report).splitlines()[0]
+        self.assertEqual(first, "**Security & RBAC Posture audit: 7 findings, 2 critical.**")
+
+    def test_a_zero_finding_run_over_an_open_ledger_does_not_parse(self):
+        # A partial or held run with nothing found leaves the ledger open over last run's title.
+        for line in (
+            "Security & RBAC posture audit: 0 findings, coverage incomplete (2 gaps)",
+            "Security & RBAC posture audit: no findings; 1 carried finding unaccounted",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(sar.headline_from_issue(ISSUE, REF, f"{line} — {LEDGER}"))
+
+    def test_a_new_findings_count_is_not_a_total(self):
+        report = f"Upgrade & patch readiness: 3 new findings (1 critical), 2 resolved — {LEDGER}"
+        self.assertIsNotNone(sar.headline_from_issue(ISSUE, REF, report))
+
+    def test_a_matching_total_parses(self):
+        self.assertIsNotNone(sar.headline_from_issue(ISSUE, REF, f"Audit: 7 findings, 2 new — {LEDGER}"))
+
+    def test_held_rows_are_not_findings(self):
+        body = (
+            "### Critical (1)\n\n"
+            + finding("seeded-c: a ClusterRole grants `*` on secrets", "rbac-2")
+            + "\n<!-- audit-held:begin -->\n## Held by the collector\n\n"
+            + finding("seeded-a: held from an earlier run", "held-1")
+            + "<!-- audit-held:end -->\n"
+        )
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 1 finding (1 critical)", body=body)
+        headline = sar.headline_from_issue(issue, REF)
+        self.assertNotIn("held from an earlier run", headline)
+        self.assertEqual(headline.count(":red_circle:"), 1)
+
+    def test_a_crlf_body_keeps_its_rows(self):
+        crlf = dict(ISSUE, body=BODY.replace("\n", "\r\n"))
+        self.assertEqual(sar.headline_from_issue(crlf, REF, REPORT), sar.headline_from_issue(ISSUE, REF, REPORT))
+
+    def test_a_title_cannot_post_a_link_or_a_mention(self):
+        title = "[seeded-a docs](https://evil.example/x) and <https://evil.example/y|seeded-b> <!channel>"
+        body = "### Critical (1)\n\n" + finding(title, "evil")
+        row = sar.headline_from_issue(dict(ISSUE, body=body), REF).splitlines()[1]
+        self.assertNotIn("evil.example", row)
+        self.assertNotIn("<", row)
+        self.assertIn("seeded-a docs and seeded-b !channel", row)
+
     def test_zero_in_the_title_with_findings_in_the_body_is_not_clean(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 0 findings (0 critical)")
         self.assertIsNone(sar.headline_from_issue(issue, REF))
@@ -201,6 +252,14 @@ class HeadlineFallbackTest(unittest.TestCase):
     def test_an_orienting_sentence_above_the_ledger_line_is_not_the_headline(self):
         report = f"Here's this morning's security audit.\n{REPORT}"
         self.assertEqual(sar.headline_fallback(report, REF), sar.headline_fallback(REPORT, REF))
+
+    def test_an_orienting_sentence_is_not_the_headline_over_a_bare_link(self):
+        report = f"Here's this morning's security audit.\n{LINE}\nLedger: {LEDGER}"
+        self.assertEqual(sar.headline_fallback(report, REF), sar.headline_fallback(REPORT, REF))
+
+    def test_no_line_with_counts_over_a_bare_link_has_no_headline(self):
+        report = f"Here's this morning's security audit.\n- seeded-a: 2 open findings\nLedger: {LEDGER}"
+        self.assertIsNone(sar.headline_fallback(report, REF))
 
     def test_a_long_line_keeps_its_coverage(self):
         line = "Workload Reliability Audit: " + "2 critical, 6 major, 11 minor, " * 5 + "across 4 of 9 clusters"

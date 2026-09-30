@@ -74,11 +74,15 @@ headline in place of the composed message (`slack_audit_report.py`, called from
 `relay_cron_report`), provided the Chat Agent composed it, the job's `skills`
 include `fleet-audit`, and the message ends with a link to an issue in a managed
 repository. The headline reads the finding and critical counts and the top two
-findings from that issue if it is open and labelled `agent:audit`. Below them go
-the relayed line, which alone carries coverage, resolved counts and remediation
-pull requests, and the ledger link. When the issue cannot be read, is closed (a
-clean run closes it without rewriting its title) or does not parse, the leg posts
-the relayed line in bold with the link. The full report is also posted into the
+findings from that issue if it is open and labelled `agent:audit`; held rows are
+not findings, and a finding title keeps a link's text but not its target. Below
+them go the relayed line, which alone carries coverage, resolved counts and
+remediation pull requests, and the ledger link; its "<n> new" count joins the
+headline. When the issue cannot be read, is closed (a clean run closes it without
+rewriting its title), does not parse, or has a title whose count disagrees with
+the finding total the relayed line states (a zero-finding partial or held run
+leaves the ledger open over its old title), the leg posts the relayed line in
+bold with the link. The full report is also posted into the
 headline's thread when it is longer than one line or the headline lost part of
 its line (a link target, a clipped tail), and the incident row stores the full
 report either way, so a reply in the thread is answered with the whole report.

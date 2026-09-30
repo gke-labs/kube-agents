@@ -7,7 +7,10 @@ posts :func:`headline_from_issue` as the channel message; when the fetch or the
 parse fails, or the issue is closed or not labelled ``agent:audit``, it posts
 :func:`headline_fallback` instead. A clean run closes its ledger without
 rewriting the title, so a closed issue's counts are the last run's, not this
-one's. The relay's send path
+one's; a zero-finding run that could not read the whole fleet, or did not
+account for a carried finding, leaves the ledger open over the same old title,
+so a finding total in the report's line that disagrees with the title also
+falls back. The relay's send path
 (``hermes send``) takes text and no blocks, and the Slack adapter converts
 standard markdown to mrkdwn on the way out, so the output here is markdown:
 ``**bold**``, ``[label](url)`` and emoji shortcodes.
@@ -16,10 +19,13 @@ The audit SOPs relay one line ending in ``— <issue_url>``. The counts and the
 findings come from the issue itself, whose title is fleet-audit's
 ``issue_title`` (``[audit] <name> — <n> findings (<c> critical)``) and whose
 body has one ``### <Severity> (<n>)`` section per severity, most severe first,
-each finding a ``#### <title> <!-- finding:<id> -->`` heading. Nothing in the
-report's own text can set the counts or pick the link, beyond its last URL.
-The relayed line itself goes under the headline, since it alone carries the
-run's coverage, resolved count and remediation pull requests.
+each finding a ``#### <title> <!-- finding:<id> -->`` heading; the collector's
+held rows under ``## Held by the collector`` are not this run's findings.
+Nothing in the report's own text can set the counts or pick the link, beyond
+its last URL; its line can only withhold them. The relayed line itself goes
+under the headline, since it alone carries the run's coverage, resolved count
+and remediation pull requests. Finding titles are model-written and editable
+on the forge, so a row keeps a link's text and drops its target.
 """
 
 from __future__ import annotations
@@ -39,6 +45,8 @@ HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
 MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+#: A Slack link, ``<url|label>`` or ``<url>``, written straight into a title.
+SLACK_LINK = re.compile(r"<([^<>|\s]+)(?:\|([^<>]*))?>")
 
 ISSUE_URL = r"https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/issues/(?P<number>\d+)"
 #: The ledger link: the report's last URL, after the SOPs' dash or a "Ledger:"
@@ -55,10 +63,18 @@ LEDGER_TITLE = re.compile(
     r"\A\[audit\]\s+(?P<name>.+?)\s+[—–-]+\s+(?P<count>\d+)\s+findings?\s+\((?P<critical>\d+)\s+critical\)\s*\Z"
 )
 SEVERITY_SECTION = re.compile(r"^###[ \t]+(?P<severity>Critical|Major|Minor)[ \t]+\(", re.MULTILINE)
-ANY_SECTION = re.compile(r"^###[ \t]", re.MULTILINE)
+#: What ends a severity section: any heading of level 3 or above, or the start
+#: of fleet-audit's held section (``HELD_SECTION_BEGIN``), whose rows reuse the
+#: finding heading.
+ANY_SECTION = re.compile(r"^(?:#{1,3}[ \t]|<!--[ \t]*audit-held:begin)", re.MULTILINE)
 #: fleet-audit's ``FINDING_MARKER_RE``.
 FINDING_HEADING = re.compile(r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.MULTILINE)
 NEW_COUNT = re.compile(r"\b(?P<count>\d+)\s+new\b", re.IGNORECASE)
+#: A run total in the report's line ("0 findings", "no findings"); "3 new
+#: findings" is a new count, not a total, and does not match.
+FINDINGS_TOTAL = re.compile(r"\b(?P<count>\d+|no)\s+findings?\b", re.IGNORECASE)
+#: The line that carries a composed report's counts, when its last line is only the link.
+COUNTS_DIGIT = re.compile(r"\d")
 TRAILING_AUDIT = re.compile(r"\s+Audit$")
 AUDIT_SUFFIX = " audit"
 #: What is left at the end of the fallback's line once the ledger URL is cut off.
@@ -129,13 +145,26 @@ def _findings_phrase(count: int) -> str:
     return f"{count} finding" if count == 1 else f"{count} findings"
 
 
-def _new_count(report: str) -> int:
-    match = NEW_COUNT.search(report)
-    return int(match.group("count")) if match else 0
+def _new_count(line: str) -> int | None:
+    """The one "<n> new" count in the report's ledger line: 0 when there is none,
+    None when there are several (a count by severity), which no single number states."""
+    counts = NEW_COUNT.findall(line)
+    if len(counts) > 1:
+        return None
+    return int(counts[0]) if counts else 0
 
 
-def _new_phrase(report: str) -> str:
-    count = _new_count(report)
+def _findings_total(line: str) -> int | None:
+    """The run's finding total as the ledger line states it, or None when it states none."""
+    match = FINDINGS_TOTAL.search(line)
+    if not match:
+        return None
+    count = match.group("count")
+    return 0 if count.lower() == "no" else int(count)
+
+
+def _new_phrase(line: str) -> str:
+    count = _new_count(line)
     if not count:
         return ""
     verb = "is" if count == 1 else "are"
@@ -152,8 +181,16 @@ def _balanced_clip(text: str, limit: int) -> str:
     return clipped + BACKTICK
 
 
+def _row_text(title: str) -> str:
+    """A finding title with any link, or a ``<!channel>``-style token, reduced to its text."""
+    text = MD_LINK.sub(r"\1", title)
+    return SLACK_LINK.sub(lambda m: m.group(2) or m.group(1), text)
+
+
 def _severity_findings(body: str) -> list[tuple[str, str]]:
     """``(severity, title)`` for every finding under a severity section, in body order."""
+    # fleet-audit's own reader does the same: a body edited in the browser is CRLF.
+    body = body.replace("\r\n", "\n")
     found = []
     for section in SEVERITY_SECTION.finditer(body):
         start = section.end()
@@ -167,10 +204,12 @@ def _severity_findings(body: str) -> list[tuple[str, str]]:
 def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | None:
     """The channel message built from the fetched ledger issue, or None when it does not parse.
 
-    ``report`` is the relayed report: its "<n> new" count joins the headline and
-    its ledger line goes under it. A closed issue, one without the ledger
-    label, and a zero-finding title do not parse: a clean run closes the
+    ``report`` is the relayed report: its ledger line goes under the headline,
+    and that line's "<n> new" count joins it. A closed issue, one without the
+    ledger label, and a zero-finding title do not parse: a clean run closes the
     ledger over its old title, and the fallback posts the report's own line.
+    Nor does one whose title disagrees with the line's own finding total, which
+    is a zero-finding partial or held run leaving the old ledger open.
     """
     if str(issue.get("state") or "").lower() != LEDGER_STATE:
         return None
@@ -181,33 +220,51 @@ def headline_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> str | 
         return None
     name = TRAILING_AUDIT.sub(AUDIT_SUFFIX, title.group("name").strip())
     count, critical = int(title.group("count")), int(title.group("critical"))
-    if _new_count(report) > count:
+    line = _ledger_line(report)
+    if (_new_count(line) or 0) > count:
         return None  # a stale or wrong ledger: the report has more new findings than it lists
+    total = _findings_total(line)
+    if total is not None and total != count:
+        return None  # the ledger was not rewritten this run
     if count == 0:
         return None
     findings = _severity_findings(str(issue.get("body") or ""))
     link = LEDGER_LINK.format(number=ref.number, url=ref.url)
-    head = f"**{name}: {_findings_phrase(count)}, {critical} critical.**" + _new_phrase(report)
-    line = _ledger_line(report, REPORT_LINE_MAX)
+    head = f"**{name}: {_findings_phrase(count)}, {critical} critical.**" + _new_phrase(line)
+    line = _clip(line, REPORT_LINE_MAX)
     rows = [
-        f"{SEVERITY_MARKERS[severity]} **{severity}**  {_balanced_clip(text, ROW_TEXT_MAX)}"
+        f"{SEVERITY_MARKERS[severity]} **{severity}**  {_balanced_clip(_row_text(text), ROW_TEXT_MAX)}"
         for severity, text in findings[:TOP_FINDINGS]
     ]
     return "\n".join([head, *([line] if line else []), *rows, link + ALL_FINDINGS.format(count=count)])
 
 
-def _fallback_line(line: str, limit: int) -> str:
+def _fallback_line(line: str) -> str:
     match = TRAILING_LEDGER.search(line)
     if match:
         line = line[: match.start()]
-    return _clip(_plain(line).rstrip(LEDGER_SEPARATORS), limit)
+    return _plain(line).rstrip(LEDGER_SEPARATORS)
 
 
-def _ledger_line(report: str, limit: int) -> str:
-    """The report's ledger line as plain text without its link: the last line, or
-    the first when the last is only the link."""
+def _ledger_line(report: str) -> str:
+    """The report's ledger line as plain text without its link, unclipped.
+
+    The last line, the SOPs' one line. When the last is only the link, the
+    first unindented line that carries a count and is not a list item: an
+    orienting sentence the relay turn put at the top carries none, and a
+    finding row, or the evidence indented under it, is not the report's line.
+    Empty when no line qualifies.
+    """
     lines = [line for line in report.splitlines() if line.strip()]
-    return (_fallback_line(lines[-1], limit) or _fallback_line(lines[0], limit)) if lines else ""
+    if not lines:
+        return ""
+    last = _fallback_line(lines[-1])
+    if last:
+        return last
+    for line in lines[:-1]:
+        if COUNTS_DIGIT.search(line) and not line[:1].isspace() and not LIST_MARKER.match(line):
+            return _fallback_line(line)
+    return ""
 
 
 def headline_fallback(report: str, ref: LedgerRef) -> str | None:
@@ -215,9 +272,10 @@ def headline_fallback(report: str, ref: LedgerRef) -> str | None:
 
     The ledger line is the report's last, the SOPs' one line; a sentence the
     relay turn put above it is not the headline. A last line that is only the
-    link falls back to the first.
+    link falls back to the first line carrying a count; with none, there is no
+    headline and the report goes out unchanged.
     """
-    head = _ledger_line(report, REPORT_LINE_MAX)
+    head = _clip(_ledger_line(report), REPORT_LINE_MAX)
     if not head:
         return None
     return f"**{head}**\n{LEDGER_LINK.format(number=ref.number, url=ref.url)}"

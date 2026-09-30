@@ -3492,7 +3492,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         ref = session_kv_server.slack_audit_report.ledger_ref(self.ONE_LINE)
         with patch.object(forge, "call", side_effect=forge.ForgeError("FORGE_RATE_LIMITED")) as call:
             self.assertIsNone(session_kv_server._fetch_ledger_issue(ref))
-        call.assert_called_once_with("issue-view", {"number": 231}, "acme/fleet-config")
+        call.assert_called_once_with("issue-view", {"number": 231}, "acme/fleet-config", retry_transient=True)
         with patch.object(forge, "call", return_value={"issue": self.ISSUE}):
             self.assertEqual(session_kv_server._fetch_ledger_issue(ref), self.ISSUE)
 
