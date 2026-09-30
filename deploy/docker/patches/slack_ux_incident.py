@@ -82,6 +82,8 @@ OPTION_LINE = re.compile(r"^\s*[-*]\s+[*_]*Option ([A-Z])\s*" + TITLE)
 PROPOSED_FIX_LINE = re.compile(r"^\s*[-*]\s+[*_]*Proposed fix\s*" + TITLE)
 #: The report's links line; links elsewhere in the prose stay in the fold only.
 LINKS_MARKER = "🔗"
+#: Any option the section names, parsed or not.
+OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 RECOMMENDED = re.compile(r"Recommended:?[*_\s]*Option ([A-Z])\b")
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 LIST_ITEM = re.compile(r"^\s*[-*+]\s+")
@@ -137,6 +139,9 @@ def parse_triage(report: str) -> dict | None:
             seen.add(letter)
             label = OPTION_LABEL.format(letter=letter, title=_presenter._plain(option.group(2)))
             choices.append((label, bool(recommended) and recommended.group(1) == letter))
+    if not set(OPTION_NAMED.findall(what_to_do)) <= seen:
+        # A button row missing an option the report offers would misstate it.
+        return None
     if not choices:
         single = next((m for m in map(PROPOSED_FIX_LINE.match, lines) if m), None)
         if single:

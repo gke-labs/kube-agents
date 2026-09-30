@@ -130,13 +130,17 @@ CHOICE_ACTION_ID_PATTERN = re.compile(r"\.choice\.\d+$")
 CHOICES_LEAD = "Reply with one of: "
 CHOICE_SEPARATOR = " · "
 
-CODE_FENCE = "```"
+CODE_FENCES = ("```", "~~~")
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
 MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=\S)")
+#: A candidate sentence end: punctuation, then space, then anything but a
+#: lowercase letter ("in ns. prod" runs on).
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[^\sa-z])")
+#: A text ending in one of these abbreviations has not ended its sentence.
+ABBREVIATION_END = re.compile(r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf)\.$", re.IGNORECASE)
 
 
 def enabled() -> bool:
@@ -187,7 +191,7 @@ def _paragraphs(markdown: str) -> list[str]:
     current: list[str] = []
     in_fence = False
     for line in markdown.split("\n"):
-        if line.strip().startswith(CODE_FENCE):
+        if line.strip().startswith(CODE_FENCES):
             in_fence = not in_fence
         if not in_fence and not line.strip():
             if current:
@@ -222,6 +226,14 @@ def _escape(text: str) -> str:
     return text
 
 
+def _first_sentence(line: str) -> tuple[str, str]:
+    """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
+    for match in SENTENCE_END.finditer(line):
+        if not ABBREVIATION_END.search(line[: match.start()]):
+            return line[: match.start()], line[match.end() :].strip()
+    return line, ""
+
+
 def split_answer(markdown: str) -> tuple[str, list[str]]:
     """``(headline, body_sections)`` for an agent's markdown answer.
 
@@ -234,12 +246,11 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     if not paragraphs:
         return "", []
     first, rest = paragraphs[0], paragraphs[1:]
-    if first.lstrip().startswith(CODE_FENCE):
+    if first.lstrip().startswith(CODE_FENCES):
         return "", paragraphs
     first_line, _, more_lines = first.partition("\n")
-    sentences = SENTENCE_END.split(first_line.strip(), maxsplit=1)
-    headline = _clip(_plain(sentences[0]), HEADLINE_MAX)
-    remainder = " ".join(s for s in sentences[1:]).strip()
+    sentence, remainder = _first_sentence(first_line.strip())
+    headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest
     return headline, body

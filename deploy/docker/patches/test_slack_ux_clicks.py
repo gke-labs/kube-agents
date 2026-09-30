@@ -437,6 +437,14 @@ class RuntimeTest(unittest.TestCase):
             self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["message"])
 
+    def test_buttons_left_by_a_failed_rewrite_still_answer(self):
+        adapter = _Adapter(fail=("chat_update",))
+        with self.assertLogs(runtime.logger, level="WARNING"):
+            self._answer(adapter, *_choice(1, "Leave it"))
+            self._answer(adapter, *_choice(0, "Raise to 512Mi"))
+        turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]
+        self.assertEqual(turns, ["Leave it", "Raise to 512Mi"])
+
     def test_empty_label_does_nothing(self):
         adapter = _Adapter()
         self._answer(adapter, *_choice(value="  "))

@@ -301,6 +301,12 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.parse_triage(REPORT.replace("## What's wrong", "## 🚨 What's wrong?"))
         self.assertTrue(triage["headline"].startswith("payments-api in seeded-debug keeps crashing"))
 
+    def test_an_option_that_does_not_parse_keeps_the_reply(self):
+        uneven = REPORT.replace("- **Option B (Restore the secret):**", "- **Option B** (Restore the secret):")
+        self.assertIsNone(runtime.parse_triage(uneven))
+        adapter = _Adapter()
+        self.assertIs(self.wrap(adapter, result=uneven), adapter)
+
     def test_button_text_fits_slack(self):
         long_title = "x" * 120
         triage = runtime.parse_triage(REPORT.replace("Restore the secret", long_title))

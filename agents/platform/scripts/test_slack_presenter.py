@@ -129,6 +129,18 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(headline, "")
         self.assertEqual(body, ["```\nkubectl get pods\n```"])
 
+    def test_an_abbreviation_does_not_end_the_headline(self):
+        for line in (
+            "Pods fail readiness, e.g. checkout-gateway in ns. prod.",
+            "Pods fail readiness, e.g. Checkout in prod.",
+        ):
+            self.assertEqual(sp.split_answer(line), (line, []))
+
+    def test_leading_tilde_block_has_no_headline(self):
+        headline, body = sp.split_answer("~~~\nkubectl get pods\n~~~")
+        self.assertEqual(headline, "")
+        self.assertEqual(body, ["~~~\nkubectl get pods\n~~~"])
+
     def test_long_headline_clipped(self):
         headline, _ = sp.split_answer("word " * 100)
         self.assertLessEqual(len(headline), sp.HEADLINE_MAX)
