@@ -257,14 +257,23 @@
 #      record's insertId and the detector's own log, and split on what they
 #      say. The bullet under PLANTED STATE REQUIRED beginning "When that poll
 #      times out" has the mechanism behind each of these:
-#      - No row, and the detector's unattributed_principals line names the
-#        fixture principal (or a --log-dropped line names the record): the
-#        classifier swallowed the human record. That is this case's finding
-#        in the other direction, so write `human-filtered`, apply cleanly,
-#        and red.
-#      - No row, and the detector never saw the principal at all: nothing
-#        reached it, which is the sink, the topic, the subscription or the
-#        detector itself. Write `ingress-silent` and exit non-zero.
+#      - No row, and a `dropped` line names the human record's insert_id with
+#        a reason beginning `principal is`: the classifier swallowed the
+#        human record. That is this case's finding in the other direction, so
+#        write `human-filtered`, apply cleanly, and red.
+#      - No row, and a `dropped` line names that insert_id with any other
+#        reason — `call failed (status ...)`, or a subresource that changes
+#        no declarative state: the fixture published a record this pipeline
+#        is right to drop, so the run tested nothing. Write `fixture-invalid`
+#        and exit non-zero.
+#      - No row, and a `DRIFT` line names that insert_id: the classifier
+#        forwarded it and the loss is downstream of the filter, so it is not
+#        this case's finding. Write `forwarded-not-recorded` and exit
+#        non-zero, with `detail` naming the `INJECT FAILED for insert_id=`
+#        line when there is one and saying there was none when there is not.
+#      - No row, and no line of any kind naming that insert_id: nothing
+#        reached the detector, which is the sink, the topic, the subscription
+#        or the detector itself. Write `ingress-silent` and exit non-zero.
 #      - A row with notified=0 and delivery_error empty: the daily ceiling
 #        refused the record before any turn was scheduled, so no card was
 #        ever coming. Write `card-quota-refused` and exit non-zero.
@@ -362,6 +371,14 @@
 #   objectives pass. Two of three repetitions green on an unfiltered pipeline.
 #   The ledger row carries the id as object_uid, which is what the
 #   quota-independent check above keys on.
+#   All twelve carry a success outcome — no protoPayload.status.code, or one
+#   set to zero. tally tests Succeeded() before it tests the tier
+#   (classify.go), so a record the fixture marks failed is dropped for the
+#   outcome and never reaches the human/automation decision this case grades.
+#   The detector's own testdata carries a failed-call shape, so this is a
+#   copy away rather than a hypothetical, and it fails as a silent filter:
+#   no ledger row, no DRIFT line, and no explanation unless --log-dropped is
+#   on to name the reason.
 # - The stack does not return until a card carrying the human record's
 #   insertId is on the board. Without that poll the spec grades a board that
 #   is shared and persists between runs, against a
@@ -404,29 +421,59 @@
 #   (main.go), so a human record sorted into TierUnattributed or TierAutomation
 #   -- --human-domains naming a domain the fixture principal does not carry, the
 #   automation allowlist gaining it, any over-filtering change -- writes no row
-#   either, and the per-record drop line is off unless --log-dropped is set.
-#   Reading the detector's own log is what separates them: its progress and
-#   shutdown lines print unattributed_principals=[...] by name (subscriber.go),
-#   so the fixture principal appearing there is the classifier and not the
-#   ingress, and neither it nor a --log-dropped automation line means the
-#   record never arrived at all. A stack that reports none of the three reds
-#   without saying what to fix -- and reports the third as the first, sending
-#   the next reader to the Pub/Sub wiring for a Classify regression. The
-#   three go in the verdict ConfigMap's `detail` whichever way the stack
-#   then exits, because the token alone does not say which log said so.
+#   either. Reading the detector's own log is what separates them, and the
+#   line to read is the per-record one behind --log-dropped, which is why the
+#   unpark has to add --log-dropped to detector_args in
+#   deploy/shared/start-services.sh: it prints
+#   `dropped tier=... reason=... insert_id=...` for every record the filter
+#   refuses (subscriber.go), so the fixture's own insert_id appearing there
+#   with reason `principal is ...` is the classifier and not the ingress.
+#   The progress line will not do this job, and an earlier draft of this
+#   spec was wrong to ask it to. logCountsProgress prints
+#   unattributed_principals=[...] only when countsLogDue() allows -- every
+#   countsLogInterval (10000) records, or once countsLogMaxInterval (15
+#   minutes) has elapsed, and the clock is only consulted when a record
+#   arrives (classify.go) -- and the shutdown line needs a graceful stop this
+#   case never asks for. Worse, tally adds to d.unattributed only for
+#   TierUnattributed, so the misclassification the header names first, the
+#   automation allowlist gaining the principal, never appears in that list at
+#   any interval. Keying human-filtered on it would route the regression this
+#   case exists to catch to ingress-silent, where _provision_death excludes
+#   it as the environment's fault.
+#   The drop line is also not the only thing that has to be read, because a
+#   record can be forwarded and still write no row: Succeeded() is tested
+#   before the tier (classify.go), so a synthetic record carrying a non-zero
+#   protoPayload.status.code is dropped for a reason that is the fixture's
+#   fault rather than the filter's -- hence the fixture-invalid branch, and
+#   hence the requirement above that the twelve records carry a success
+#   status. And a record the filter passes reaches logDriftEvent, which
+#   prints `DRIFT ... principal=... insert_id=...` unconditionally (join.go),
+#   after which driftInjectHandler.Handle can still fail the POST to the
+#   daemon -- API key, daemon down, per-record budget -- logging
+#   `INJECT FAILED for insert_id=...` and writing no row (inject.go). Both
+#   of those look exactly like a silent ingress to a stack reading only for
+#   the absence of a drop line, and both are the install's fault, not the
+#   pipeline's. A stack that reports none of these reds without saying what
+#   to fix -- and one that reports any of them as ingress-silent sends the
+#   next reader to the Pub/Sub wiring for a fault that is not there. The
+#   lines it read go in the verdict ConfigMap's `detail` whichever way the
+#   stack then exits, because the token alone does not say which log said so.
 # - The verdict ConfigMap itself: eval-drift-fixture-verdict in
 #   eval-drift-platform, created by the stack whatever it observes, with
 #   `verdict` set to the string "ok" when the settle found no ledger row
 #   carrying one of this run's eleven churn insertIds AND the insertId poll
 #   found the human card, and to a short token otherwise --
-#   churn-forwarded, human-filtered, ingress-silent, card-quota-refused,
-#   card-turn-failed -- with `detail` carrying the human-readable form,
+#   churn-forwarded, human-filtered, fixture-invalid, forwarded-not-recorded,
+#   ingress-silent, card-quota-refused, card-turn-failed -- with `detail`
+#   carrying the human-readable form,
 #   including the fixture's twelve insertIds so a failing run can be traced
 #   without the apply log. Written last, after the settle, so a "ok" means
-#   both observations were actually made. Three of the five tokens are the
-#   install's fault rather than the agent's and the stack exits non-zero
-#   after writing them, so the safeguard never reads those: the header's
-#   ordering says which three and why. The safeguard asserts the string, not
+#   both observations were actually made. Five of the seven tokens are the
+#   install's or the fixture's fault rather than the agent's and the stack
+#   exits non-zero after writing them, so the safeguard never reads those:
+#   the header's ordering says which five and why. The two it does read are
+#   churn-forwarded and human-filtered, the same regression in opposite
+#   directions. The safeguard asserts the string, not
 #   the absence of an object: a ConfigMap that exists only on failure reads
 #   as a pass when the stack never got far enough to write one, and the
 #   whole point of routing this through the cluster is that the grading
