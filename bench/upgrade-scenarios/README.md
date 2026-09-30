@@ -253,17 +253,18 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
    and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
    every other scenario writes its manifests inline. If any step of the plant fails, the run stops here, before
-   the upgrade, and says so in `final.txt`.
+   the upgrade, with a "precondition not met" note in the evidence.
 3. Breaks it. Twelve scenarios upgrade the control plane and then a node pool; scenario 13 upgrades only a
    node pool (a patch inside 1.31). Scenarios 05, 06, 09, 10 and 11 upgrade only the control plane. Scenarios 14 and 15 show the symptom with no upgrade; 14c then asks for
-   the pool upgrade and runs the migration GKE demands. An upgrade GKE refuses five times in a row because another
-   operation is running stops the run.
+   the pool upgrade and runs the migration GKE demands. An upgrade command that fails stops the run; one GKE
+   refuses because another operation is running is retried up to five times first.
 4. Records the after-state.
 
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code
 and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. The
-availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly. A re-run adds new files
-beside the checked-in ones; commit only a file the table or the notes above cite, after replacing the project
+availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly. A re-run on the same
+cluster skips a node pool or maintenance exclusion already in place and adds new files beside the checked-in
+ones; commit only a file the table or the notes above cite, after replacing the project
 ID and number and any public IP address.
 Redirect the console to `logs/<track>.log` if you want it; `logs/` is gitignored.
 

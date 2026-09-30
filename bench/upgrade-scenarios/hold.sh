@@ -3,19 +3,15 @@
 # Recommender's next daily refresh (about 00:00Z) can see it. Evidence: evidence/NN-hold/.
 # Run as: CLUSTER=upg-07 bash hold.sh 07
 set -u; NN=${1:?scenario number}; TRACK=$NN-hold; CLUSTER=${CLUSTER:?cluster name}
-# shellcheck source-path=SCRIPTDIR source=common.sh
-. "$(dirname "$0")/common.sh"; require_scenario_cluster
-G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 SCHEMA1_IMAGE=gcr.io/google_containers/busybox:1.24     # a Docker schema 1 manifest, which containerd 2.0 refuses
 CD17_VERSION=1.31.14-gke.2704000                        # the newest 1.31 patch still on containerd 1.7
 LEGACY_JVM=eclipse-temurin:11.0.15_10-jdk; JVM_LIMIT=256Mi
 CU13_IMAGE=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 SETTLE=180; GPU_SETTLE=900
-pool_exists(){ G container node-pools describe "$1" --cluster "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1; }
 # abort_hold: a planting step failed, so the hazard is not in place; say so in the evidence and stop.
 abort_hold(){ note hold "precondition not met: $*; the hazard is not planted"; exit 1; }
 # 7: the fail-closed webhook back in place, its Service still without endpoints
-hold_07(){ . "$H/scenarios/07.sh"; plant >/dev/null || abort_hold "scenario 7's webhook did not apply"; sleep 10
+hold_07(){ . "$H/scenarios/07.sh"; run_plant plant >/dev/null; [ "$PLANT_FAILED" -eq 0 ] || abort_hold "a step in scenario 7's plant failed"; sleep 10
   ev webhook config K get validatingwebhookconfiguration fail-closed-gate
   ev webhook no-endpoints K -n scen get endpointslices -l kubernetes.io/service-name=absent-hook
   ev webhook create-refused K -n scen run hold-probe --image=registry.k8s.io/pause:3.9 --restart=Never; }
@@ -91,8 +87,12 @@ Y
   ev gpu-driver gpu-hold-log K -n scen logs deploy/cuda13-hold --tail=4
   ev gpu-driver gpu-hold-node K get nodes -l role=gpuhold -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,DRIVER_LABEL:.metadata.labels.cloud\.google\.com/gke-gpu-driver-version'; }
 # 19: the PD CSI driver add-on off again, with the in-tree PersistentVolume still bound
-hold_19(){ . "$H/scenarios/19.sh"; disable_driver || abort_hold "the PD CSI driver is still on after $DISABLE_TRIES tries"
+hold_19(){ . "$H/scenarios/19.sh"; disable_driver || abort_hold "the PD CSI driver is not confirmed off after $DISABLE_TRIES tries"
   ev csi addon-state csi_state; ev csi pv K get pv intree-pd; ev csi pod K -n scen get pods -l app=pd-user -o wide; }
+# Checked before common.sh is sourced, so an unknown scenario leaves no evidence directory and fetches no credentials.
 [[ $NN == [0-9]* ]] && declare -F "hold_$NN" >/dev/null ||
   { echo "no hold for scenario $NN; holds exist for: $(declare -F | sed -n 's/^declare -f hold_\([0-9]\)/\1/p' | tr '\n' ' ')" >&2; exit 1; }
+# shellcheck source-path=SCRIPTDIR source=common.sh
+. "$(dirname "$0")/common.sh"; require_scenario_cluster
+G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 note hold "re-planting scenario $NN's hazard on $CLUSTER for the Recommender"; "hold_$NN"; note hold "scenario $NN hold done"

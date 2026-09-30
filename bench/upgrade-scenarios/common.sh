@@ -42,13 +42,23 @@ poll_api(){ local sc=$1 stop=$2; local f="$EVID/$sc-api.txt"; echo "# $(ts) api 
 BUSY_RETRIES=5; BUSY_WAIT=30
 MASTER_UPGRADE_TIMEOUT=10800   # seconds; gcloud's own default for a blocking upgrade is 3600, which a slow one can pass
 # GKE refuses an upgrade while any other operation runs on the cluster ("incompatible operation"): wait for it, retry.
-# Returns 1 once every retry was refused, so the caller stops instead of recording an upgrade that never ran.
-retry_busy(){ local f=$1 i; shift; for i in $(seq 1 $BUSY_RETRIES); do wait_ops; "$@"; tail -4 "$f" | grep -q "incompatible operation" || return 0; note upgrade "refused while another operation ran; retry $i"; sleep $BUSY_WAIT; done; note upgrade "gave up after $BUSY_RETRIES refusals; the upgrade did not run"; return 1; }
+# Returns 1 when the command fails for any other reason, or once every retry was refused, so the caller stops instead
+# of recording an upgrade that never ran.
+retry_busy(){ local f=$1 i; shift; for i in $(seq 1 $BUSY_RETRIES); do wait_ops; "$@" && return 0
+  tail -4 "$f" | grep -q "incompatible operation" || { note upgrade "the upgrade command failed (see upgrade.txt); stopping"; return 1; }; note upgrade "refused while another operation ran; retry $i"; sleep $BUSY_WAIT; done; note upgrade "gave up after $BUSY_RETRIES refusals; the upgrade did not run"; return 1; }
 upgrade_master(){ local v=$1 stop="$KCFG_DIR/$CLUSTER.$TRACK.master-done"; rm -f "$stop"; note upgrade "master -> $v"; poll_api zonal-api "$stop" & local p=$!; retry_busy "$EVID/upgrade.txt" ev upgrade master-$v G container clusters upgrade "$CLUSTER" --master --cluster-version "$v" --zone "$ZONE" --quiet --timeout "$MASTER_UPGRADE_TIMEOUT"; local rc=$?; touch "$stop"; wait $p; rm -f "$stop"; [ $rc -eq 0 ] || exit 1; wait_ops; ev upgrade master-$v-version G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; }
 upgrade_pool(){ local pool=$1 v=$2; shift 2; note upgrade "pool $pool -> $v"; for sc_ns_sel in "$@"; do IFS=: read -r sc ns sel <<<"$sc_ns_sel"; poll_avail "$sc" "$ns" "$sel" & done; retry_busy "$EVID/upgrade.txt" ev upgrade pool-$pool-$v G container clusters upgrade "$CLUSTER" --node-pool "$pool" --cluster-version "$v" --zone "$ZONE" --quiet --async || { wait; exit 1; }; sleep 20; wait_ops; wait; ev upgrade pool-$pool-$v-nodes K get nodes -o wide; }
 # hold_exclusion: the held scenarios (06h, 08h, 16h) keep GKE from upgrading the cluster while the hazard waits for the Recommender.
 HOLD_DAYS=2
-hold_exclusion(){ ev hold exclusion G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-recommender --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet; }
+hold_exclusion(){ has_exclusion hold-recommender || ev hold exclusion G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-recommender --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet; }
+pool_exists(){ G container node-pools describe "$1" --cluster "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1; }
+# has_exclusion <name>: the cluster already carries a maintenance exclusion of that name, which GKE refuses to add twice.
+has_exclusion(){ G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(maintenancePolicy.window.maintenanceExclusions)' | grep -Eq "(^|;)$1="; }
+# run_plant <fn>: run a planting function and set PLANT_FAILED=1 if any command in it fails. The function still runs to
+# its end. Bash does not fire the ERR trap inside a function called on the left of || or &&, so call run_plant on a
+# line of its own and test PLANT_FAILED after it.
+# shellcheck disable=SC2034  # PLANT_FAILED is read by the caller
+run_plant(){ PLANT_FAILED=0; set -E; trap 'PLANT_FAILED=1' ERR; "$@"; trap - ERR; set +E; }
 # --- shared plants -------------------------------------------------------------------------------
 pause_deploy(){ # pause_deploy <name> <replicas> <pod-spec placement line, indented 6>; the default pins to the work pool
   local placement="${3-}"; [ -n "$placement" ] || placement="      nodeSelector: {role: work}"

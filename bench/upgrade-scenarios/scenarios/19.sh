@@ -42,7 +42,7 @@ spec:
 Y
   K -n scen rollout status deploy/pd-user --timeout="$ROLLOUT_TIMEOUT"; }   # the pod must have mounted the disk before the driver goes off
 before(){ ev csi addon-default csi_state; sleep 60; ev csi pod-with-driver K -n scen get pods -l app=pd-user -o wide
-  disable_driver || { note csi "precondition not met: the PD CSI driver is still on after $DISABLE_TRIES tries; stopping before the upgrade"; exit 1; }
+  disable_driver || { note csi "precondition not met: the PD CSI driver is not confirmed off after $DISABLE_TRIES tries; stopping before the upgrade"; exit 1; }
   sleep 60; ev csi addon-disabled csi_state; ev csi pod-still-running K -n scen get pods -l app=pd-user -o wide; }
 # An empty state reads as off, but only from a describe that succeeded: a failed one also prints nothing.
 disable_driver(){ local i s; for i in $(seq 1 $DISABLE_TRIES); do

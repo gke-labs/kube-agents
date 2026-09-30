@@ -38,9 +38,8 @@ spec:
       containers: [{name: web, image: $REPO/pause:3.9, imagePullPolicy: IfNotPresent, resources: {requests: {cpu: 10m, memory: 16Mi}}}]
 Y
   K -n scen delete pod -l app=retired-image --ignore-not-found >/dev/null; K -n scen rollout status deploy/retired-image --timeout=$ROLLOUT_TIMEOUT
-  [ "$(pod_phase)" = Running ] || { ev registry plant-failed K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; note registry "precondition not met: the image never ran on the old node; stopping before the retirement"; exit 1; }
-  ev registry cached cached_images; }
-before(){ ev registry before K -n scen get pods -l app=retired-image -o wide; ev registry delete-image G artifacts docker images delete $REPO/pause:3.9 --delete-tags --quiet; sleep 30; ev registry gone G artifacts docker images list $REPO --include-tags; ev registry still-running K -n scen get pods -l app=retired-image -o wide
+  [ "$(pod_phase)" = Running ] || { ev registry plant-failed K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; note registry "precondition not met: the image never ran on the old node; stopping before the retirement"; exit 1; }; }
+before(){ ev registry cached cached_images; ev registry before K -n scen get pods -l app=retired-image -o wide; ev registry delete-image G artifacts docker images delete $REPO/pause:3.9 --delete-tags --quiet; sleep 30; ev registry gone G artifacts docker images list $REPO --include-tags; ev registry still-running K -n scen get pods -l app=retired-image -o wide
   note registry "control: restart the pod on the old node, which still holds the image in its cache"; K -n scen delete pod -l app=retired-image --wait=true >/dev/null
   K -n scen rollout status deploy/retired-image --timeout=120s; ev registry restarted-from-cache K -n scen get pods -l app=retired-image -o wide; }
 break_it(){ V=$(newest_patch REGULAR 1.35); [ "$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)')" = "$V" ] || upgrade_master "$V"; upgrade_pool work-pool "$V" registry:scen:app=retired-image; }

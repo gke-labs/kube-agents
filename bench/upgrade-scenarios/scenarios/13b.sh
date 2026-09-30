@@ -6,7 +6,9 @@
 # measured on gemma-gpu) and the break is a patch-only node upgrade inside 1.31.
 CHANNEL=EXTENDED; START=1.31; POOL_FLAGS=""
 OLD_NODE_VERSION=1.31.14-gke.2704000
-plant(){ ev cluster hold G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-auto --add-maintenance-exclusion-start "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --add-maintenance-exclusion-end "$(in_days 2)" --add-maintenance-exclusion-scope no_upgrades --quiet; ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$OLD_NODE_VERSION" --node-labels=role=work --disk-size 32 --num-nodes 1 --machine-type e2-small --quiet; K -n scen apply -f - <<'Y'
+AUTO_HOLD_DAYS=2; WORK_MACHINE=e2-small
+plant(){ has_exclusion hold-auto || ev cluster hold G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-auto --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$AUTO_HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet
+  pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$OLD_NODE_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --num-nodes 1 --machine-type "$WORK_MACHINE" --quiet; K -n scen apply -f - <<'Y'
 apiVersion: apps/v1
 kind: DaemonSet
 metadata: {name: cri-v1alpha2-agent}
