@@ -37,6 +37,9 @@ program output as often as commands. ``tests/test_skill_inline_commands.py``
 checks inline code for the variable program, or the script path starting with
 a variable, that the skills used to teach. The Dockerfile names the agent
 image's three trees; a plugin's skills ship in its own image and are not read.
+A tree with no shell block fails the check, and so do two trees where one path
+is, or holds, the other: an empty copy, or a path repeated from another tree in
+the Dockerfile, would otherwise pass a tree with nothing read.
 
 Tirith is not in the image, so ``main`` downloads the release ``TIRITH_VERSION``
 names into a temporary directory, checks the archive against the digest pinned
@@ -408,6 +411,11 @@ def _tree(value: str) -> tuple[str, Path]:
     return repo_dir.rstrip("/"), Path(skills_dir)
 
 
+def _overlap(first: Path, second: Path) -> bool:
+    first, second = first.resolve(), second.resolve()
+    return first == second or first in second.parents or second in first.parents
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -423,11 +431,25 @@ def main(argv: list[str] | None = None) -> int:
         help=f"a Tirith binary to use instead of downloading {TIRITH_VERSION}",
     )
     args = parser.parse_args(argv)
+    overlapping = [
+        (first, second)
+        for index, first in enumerate(args.trees)
+        for second in args.trees[index + 1 :]
+        if _overlap(first[1], second[1])
+    ]
+    for (first_repo, first_dir), (second_repo, second_dir) in overlapping:
+        print(
+            f"{first_dir} ({first_repo}) and {second_dir} ({second_repo}) overlap, so one "
+            "tree would be read twice and the other not at all. Check each tree's path in "
+            "the Dockerfile.",
+            file=sys.stderr,
+        )
+    if overlapping:
+        return 1
     try:
-        blocks = [
-            block
+        trees = [
+            (repo_dir, skills_dir, skill_blocks(repo_dir, skills_dir))
             for repo_dir, skills_dir in args.trees
-            for block in skill_blocks(repo_dir, skills_dir)
         ]
     except UnreadableFence as exc:
         print(
@@ -437,6 +459,17 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    empty = [(repo_dir, skills_dir) for repo_dir, skills_dir, found in trees if not found]
+    for repo_dir, skills_dir in empty:
+        print(
+            f"{skills_dir} holds no shell block in any {SKILL_FILE_NAME}, so {repo_dir} "
+            "would pass unread. Check the Dockerfile copies that tree to this path, or, if "
+            "its skills no longer teach shell commands, drop the tree from the invocation.",
+            file=sys.stderr,
+        )
+    if empty:
+        return 1
+    blocks = [block for _, _, found in trees for block in found]
 
     with tempfile.TemporaryDirectory(prefix=TIRITH_HOME_PREFIX) as home:
         try:

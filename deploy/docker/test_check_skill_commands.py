@@ -163,6 +163,49 @@ class SkillBlocksTest(unittest.TestCase):
         self.assertEqual("agents/platform/skills/demo/SKILL.md", caught.exception.path)
         self.assertEqual(2, caught.exception.line)
 
+    def test_a_tree_with_no_shell_block_fails_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as full, tempfile.TemporaryDirectory() as empty:
+            skill = Path(full) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text("```bash\nls\n```\n")
+            (Path(empty) / "demo").mkdir()
+            (Path(empty) / "demo" / "SKILL.md").write_text("```yaml\nkey: value\n```\n")
+            trees = [f"agents/platform/skills={full}", f"agents/cluster/skills={empty}"]
+            with mock.patch.object(check, "install_tirith") as install, \
+                    mock.patch("sys.stderr", new=io.StringIO()) as err:
+                self.assertEqual(1, check.main(trees))
+        install.assert_not_called()
+        self.assertIn(f"{empty} holds no shell block", err.getvalue())
+        self.assertIn("agents/cluster/skills would pass unread", err.getvalue())
+        self.assertNotIn(full, err.getvalue())
+
+    def test_two_trees_on_overlapping_paths_fail_before_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text("```bash\nls\n```\n")
+            for second in (tmp, str(Path(tmp) / "demo")):
+                trees = [f"agents/cluster/skills={tmp}", f"a2a/persona/platform/skills={second}"]
+                with self.subTest(second), \
+                        mock.patch.object(check, "install_tirith") as install, \
+                        mock.patch("sys.stderr", new=io.StringIO()) as err:
+                    self.assertEqual(1, check.main(trees))
+                    install.assert_not_called()
+                    self.assertIn("overlap", err.getvalue())
+
+    def test_trees_that_all_hold_a_shell_block_go_on_to_the_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = Path(tmp) / "demo" / "SKILL.md"
+            skill.parent.mkdir()
+            skill.write_text("```bash\nls\n```\n")
+            with mock.patch.object(
+                check, "tirith_target", return_value="x86_64-unknown-linux-gnu"
+            ), mock.patch.object(
+                check, "install_tirith", side_effect=check.ScannerUnavailable("stop here")
+            ) as install, mock.patch("sys.stderr", new=io.StringIO()):
+                self.assertEqual(1, check.main([f"agents/platform/skills={tmp}"]))
+        install.assert_called_once()
+
 
 class ScanTest(unittest.TestCase):
     ALLOW = check.Block("s/SKILL.md", 1, "ls <dir>\ncd <dir>")
