@@ -181,6 +181,12 @@ class ApplierTest(unittest.TestCase):
             "react order": ("_react(self, channel, timestamp, emoji, team_id, *", "_react(self, channel, emoji, timestamp, team_id, *"),
             "tracked set": ('self._reacting_message_ids = {"m"}', "self._reacting_message_ids = []"),
             "target gone": ("def _reacting_target(self, event):", "def _target(self, event):"),
+            "second target shape": ("            return None\n", "            return (ts, marker)\n"),
+            "target not a tuple": ("return (ts, team_id, marker) if", "return [ts, team_id, marker] if"),
+            "set reassigned": (
+                'self._reacting_message_ids = {"m"}',
+                'self._reacting_message_ids = {"m"}\n        self._reacting_message_ids = []',
+            ),
         }
         for name, (old, new) in drifts.items():
             with self.subTest(drift=name):
@@ -190,6 +196,17 @@ class ApplierTest(unittest.TestCase):
                     verifier.check_adapter(self.root.dir)
         path.write_text(patched)
         verifier.check_adapter(self.root.dir)
+
+    def test_verifier_reads_the_set_off_the_adapter_class(self):
+        # A set assigned in another class does not make the adapter's a set.
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        patched = path.read_text()
+        drifted = patched.replace('self._reacting_message_ids = {"m"}', "self._reacting_message_ids = []")
+        drifted += "\n\nclass Other:\n    def __init__(self):\n        self._reacting_message_ids = set()\n"
+        path.write_text(drifted)
+        with self.assertRaises(SystemExit):
+            verifier.check_adapter(self.root.dir)
 
     def test_verifier_refuses_unpatched_tree(self):
         with self.assertRaises(SystemExit):

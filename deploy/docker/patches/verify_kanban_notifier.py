@@ -1088,9 +1088,6 @@ class _HeldAdapter:
         self.sent.append(content)
         return SimpleNamespace(success=True, message_id=f"m{len(self.sent)}")
 
-    async def edit_message(self, chat_id, message_id, content):
-        return SimpleNamespace(success=True, message_id=message_id)
-
 
 class _HeldRunner:
     def __init__(self):
