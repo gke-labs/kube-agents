@@ -447,14 +447,15 @@ async def deliver(
     last line rather than the whole trail. And a failure the creator's wake will
     explain is held rather than posted, returning ``None`` like the replay path;
     the notifier's wake step drops it once the wake is admitted for the kind, and
-    posts it if the wake raises or never covers the kind, so the thread gets the
-    failure at least once. A line that cannot be held is posted. See section 6
-    of ``gateway/kanban_notifier.py``. And the card's progress goes on its row
-    in the thread's plan rather than in a rolling message of its own, with the
-    rolling message as the fallback when the plan cannot be posted; ``title``
-    is the card's, for the row. See ``gateway/slack_ux_status.py``. Every line
-    it posts, holds or edits keeps the ``@assignee`` and drops the board tag
-    and ``Kanban <id>`` (:func:`slack_line`).
+    posts it if the wake raises or never covers the kind, so a failed wake does
+    not leave the failure untold. A line that cannot be held is posted. Section 6
+    of ``gateway/kanban_notifier.py`` has the retry and the gap it leaves. And
+    the card's progress goes on its row in the thread's plan rather than in a
+    rolling message of its own, with the rolling message as the fallback when
+    the plan cannot be posted; ``title`` is the card's, for the row. See
+    ``gateway/slack_ux_status.py``. Every line it posts, holds or edits keeps
+    the ``@assignee`` and drops the board tag and ``Kanban <id>``
+    (:func:`slack_line`).
     """
     chat_id = sub["chat_id"]
     tracked = tracked_messages(watcher)
