@@ -116,15 +116,10 @@ def check_adapter(root: Path) -> None:
     if not path.is_file():
         raise _fail(f"{path} does not exist")
     tree = ast.parse(path.read_text())
-    hooks = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name in HOOKS
-    }
     for name in HOOKS:
-        node = hooks.get(name)
-        if node is None:
-            raise _fail(f"{ADAPTER} has no async def {name}()")
+        node = _method(tree, name)
+        if not isinstance(node, ast.AsyncFunctionDef):
+            raise _fail(f"{ADAPTER_CLASS}.{name}() is no longer async")
         body = node.body
         if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")

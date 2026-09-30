@@ -1465,7 +1465,7 @@ def store_incident_report(
 # :func:`drop_superseded`) drops it, so a line held across a
 # ``WakeNotAccepted`` tick never lands beneath the recovery. Any other later
 # event leaves it held: a wake that then raises still posts it, after that
-# event rather than never. Six trade-offs, accepted:
+# event rather than never. Seven trade-offs, accepted:
 #
 # * A wake that raised and later succeeds on a retry tells the failure twice,
 #   once as the line and once in the creator's words. Twice is the safe side.
@@ -1482,6 +1482,9 @@ def store_incident_report(
 # * A subscription dropped before its wake step runs (after
 #   ``MAX_SEND_FAILURES`` on a later event in the batch, or by the stale sweep)
 #   leaves its held line to that eviction: untold, and unlogged until then.
+# * A held line dropped for a recovery, with a WARNING, is told only by the
+#   wake after it. If that wake never succeeds the failure goes untold, though
+#   the card did recover.
 # The flag is read through ``gateway.slack_ux_reactions.enabled()``, imported
 # when a delivery runs: that module is copied into the image after this one,
 # and an image without it reads as flag off.

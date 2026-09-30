@@ -2437,6 +2437,7 @@ class DeliverEndToEndTest(unittest.TestCase):
             delivery.tick()
         self.assertEqual([m for _, m, _ in delivery.adapter.sent], ["✖ card completed"])
         self.assertNotIn("untold", "\n".join(logs.output))
+        self.assertEqual((delivery.wakes, delivery.advanced), (2, 1))
 
     def test_flag_on_a_review_handoff_also_drops_the_held_line(self):
         delivery, _ = self.run_ticks(patch_tree(UPSTREAM_NOTIFIER), True, [_WakeNotAccepted()], ticks=1)
