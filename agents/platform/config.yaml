@@ -84,6 +84,10 @@ mcp_servers:
       # block names, so if the operator's path ever moves, an undeclared
       # variable would leave the server reading a database nothing writes.
       SESSION_KV_DB_PATH: "${SESSION_KV_DB_PATH}"
+      # The data root the Cluster Agent profiles live under, for list_cluster_profiles
+      # and get_cluster_profile_name. HERMES_HOME above is the platform profile's own
+      # home in a worker, a level too deep to see the other profiles.
+      PLATFORM_AGENT_HOME: "${PLATFORM_AGENT_HOME}"
   # A remote MCP endpoint, proxied over stdio by mcp-remote. The explicit
   # timeout is a backstop: unpatched, mcp-remote drops the request id when the
   # remote answers non-2xx, so the client parks for the whole 300s default.

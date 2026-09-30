@@ -197,6 +197,51 @@ class DeferredInstallTest(unittest.TestCase):
         sys.modules["fake_relay_patch"].install = explode
         importlib.import_module("gateway.platform_registry")  # must not raise
 
+    def test_failed_trigger_load_rearms_the_finder(self):
+        # An install() that raises fails the trigger import, and Python drops
+        # the half-loaded registry. The next import runs a fresh one, which
+        # must be patched too rather than load behind a latch that already
+        # fired.
+        def explode_once():
+            sys.modules["fake_relay_patch"].install = lambda: self.calls.append("installed")
+            raise RuntimeError("deadlock detected by _ModuleLock")
+
+        sys.modules["fake_relay_patch"].install = explode_once
+        with self.assertRaises(RuntimeError):
+            importlib.import_module("gateway.platform_registry")
+        self.assertNotIn("gateway.platform_registry", sys.modules)
+        importlib.import_module("gateway.platform_registry")
+        self.assertEqual(self.calls, ["installed"])
+
+    def test_failed_registry_body_rearms_the_finder(self):
+        # The same holds when the registry's own body raises, before any
+        # install() runs: the retry executes a fresh registry and patches it.
+        gate = types.ModuleType("_registry_gate")
+        gate.fail = True
+        sys.modules["_registry_gate"] = gate
+        self.addCleanup(sys.modules.pop, "_registry_gate", None)
+        registry = Path(self.tmpdir.name) / "gateway" / "platform_registry.py"
+        registry.write_text(
+            textwrap.dedent(
+                """
+                import _registry_gate
+
+                if _registry_gate.fail:
+                    _registry_gate.fail = False
+                    raise RuntimeError("registry body failed")
+
+                class PlatformRegistry:
+                    pass
+                """
+            )
+        )
+        importlib.invalidate_caches()
+        with self.assertRaises(RuntimeError):
+            importlib.import_module("gateway.platform_registry")
+        self.assertEqual(self.calls, [])
+        importlib.import_module("gateway.platform_registry")
+        self.assertEqual(self.calls, ["installed"])
+
     def test_unrelated_import_error_propagates(self):
         def explode():
             raise ModuleNotFoundError("No module named 'slack_bolt'", name="slack_bolt")

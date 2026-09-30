@@ -31,12 +31,12 @@ variable "cluster_prefix" {
 }
 
 variable "fleet_reader_token_creators" {
-  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. Three callers need it. Two are the identities that run hack/ci-eval-pr.sh in a leased pool project, the presubmit's Prow runner and the nightly periodic's recorder: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as whichever is running, so without its entry here that runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). The third is the CI health bot (eval-dashboard-publisher@kube-agents-prow), whose hourly fixture-state scan (.github/workflows/ci-health.yml, docs/ci-health.md) runs every gcloud and kubectl read as the reader and holds no grant of its own on the project, so a project without its entry scans as 'not checked'. Defaults to all three -- the same three accounts in every pool project, kept equal to FLEET_READER_TOKEN_CREATORS in scripts/verify_ci_pool_project.py by its tests. Override it when applying this stack outside the CI pool."
+  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. Three callers need it. Two are the identities that run hack/ci-eval-pr.sh in a leased pool project, the presubmit's Prow runner and the nightly periodic's recorder: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as whichever is running, so without its entry here that runner cannot assume the read-only account, hack/fleet-kubeconfigs.sh writes nothing and exits 3, and a run that leases the project stops at its fleet step. The third is the CI health bot (eval-dashboard-publisher@kube-agents-prow), whose hourly fixture-state scan (.github/workflows/ci-health.yml, docs/ci-health.md) runs every gcloud and kubectl read as the reader and holds no grant of its own on the project, so a project without its entry scans as 'not checked'. Defaults to all three -- the same three accounts in every pool project, kept equal to FLEET_READER_TOKEN_CREATORS in scripts/verify_ci_pool_project.py by its tests. Override it when applying this stack outside the CI pool."
   type        = list(string)
 
   # Defaulted here rather than passed with -var, because the resource is keyed
   # by member: an apply that does not carry the value plans the binding for
-  # destruction, dropping the project back to the runner's write credential.
+  # destruction, and the next run to lease the project stops at its fleet step.
   # Observed as `1 to destroy` on kube-agents-evals-16 (gke-labs/kube-agents#1051).
   default = [
     "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com",
@@ -46,13 +46,33 @@ variable "fleet_reader_token_creators" {
 
   # A bare email here applies cleanly and grants nothing: the IAM API treats an
   # unprefixed member as invalid, and the mistake would only surface as the
-  # runner falling back to its own credential on the fleet it is grading.
+  # runner refusing to read the fleet (exit 3) on the next lease.
   validation {
     condition = alltrue([
       for m in var.fleet_reader_token_creators :
       can(regex("^(serviceAccount|user|group|domain|principal|principalSet):", m))
     ])
     error_message = "Each member must carry an IAM type prefix, e.g. serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com."
+  }
+}
+
+variable "pool_state_readers" {
+  description = "IAM members granted the read-only project roles the CI health bot's hourly pool-state scan needs (scripts/eval_dashboard/pool_state.py runs scripts/verify_ci_pool_project.py's read-only checks against every pool project as the bot itself; docs/ci-health.md, 'The pool-state scan'). The roles are `local.pool_state_reader_roles` in main.tf, kept equal to POOL_STATE_READER_ROLES in the verifier by its tests. Defaults to the bot, eval-dashboard-publisher@kube-agents-prow, so an apply of this stack in a pool project grants it with no separate step; a project without the grant scans as 'not checked' and drift there goes unseen. Override it when applying this stack outside the CI pool."
+  type        = list(string)
+
+  # Defaulted here for the reason fleet_reader_token_creators is: the resource
+  # is keyed by member and role, so an apply that does not carry the value
+  # plans every binding for destruction.
+  default = [
+    "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com",
+  ]
+
+  validation {
+    condition = alltrue([
+      for m in var.pool_state_readers :
+      can(regex("^(serviceAccount|user|group|domain|principal|principalSet):", m))
+    ])
+    error_message = "Each member must carry an IAM type prefix, e.g. serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com."
   }
 }
 

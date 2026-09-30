@@ -22,8 +22,11 @@ from pathlib import Path
 from typing import Sequence
 
 # Add scripts directory so gitops_workspace is importable
-sys.path.append("/opt/defaults/scripts")
-sys.path.append("/opt/data/scripts")
+# Off when this file is the trusted copy -- see the same block in vcs_client.py.
+TRUSTED_CLOSURE = "/opt/vcs/libexec/platform"
+if not str(Path(__file__).resolve()).startswith(TRUSTED_CLOSURE + "/"):
+    sys.path.append("/opt/defaults/scripts")
+    sys.path.append("/opt/data/scripts")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Ship alongside this script in the same directory, which is sys.path[0] both

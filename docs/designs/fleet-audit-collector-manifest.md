@@ -1,9 +1,10 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, two collectors ship.**
+> **STATUS — design of record; the `finish` side is implemented, three collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
-> `fleet-consistency-drift` stream and `patch_readiness.py` one for `security-patch-orchestrator`;
+> `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`, and
+> `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`;
 > each stream's SOP runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
@@ -92,6 +93,7 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].outcome`                       | **read**         | `collected` means the collector read the target and vouches for `commands`. `unreachable` and `gate-failed` mean it did not, and `error` says why; the document accounts for such a target or is refused. `out-of-scope` means the target is not this audit's: it is not cross-checked, the document need not list it, and it contributes no gap (logged once at INFO).              |
 | `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                              |
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                        |
+| `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                            |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read by `finish`: the stream's SOP says whether the model copies it or re-judges it against fleet context. |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                     |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.       |
@@ -113,7 +115,7 @@ narrowed reads as a complete one and lets `finish` resolve every finding outside
 within the manifest and stable between runs, so a collector sweeping clusters names each one
 `<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
 name qualified only where it collides today moves when the rest of the fleet changes, which is a
-finding announced resolved and refiled as new. The drift and patch collectors do this, and their SOPs carry
+finding announced resolved and refiled as new. The drift, patch and `collect.py` collectors do this, and their SOPs carry
 the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on. The qualification stops at the
 target name: a candidate's `object` names the bare resource, because the identity tuple
 already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
@@ -148,6 +150,11 @@ before any `gh` call:
   inapplicable there, or the document's `checks_not_applicable` names a check the manifest ran to
   `rc == 0` without itself declaring inapplicable. Applicability is corroborated, never prohibited:
   a check the collector never reached still takes the model's judgement.
+- A target's `checks_run` or `checks_not_applicable` names a check the manifest lists in that
+  target's `checks_unevaluated`, or the manifest lists any there and the target carries no
+  `limitations`. The check's own read failed, so it neither ran nor was found inapplicable; naming it
+  in `limitations` makes the run partial and keeps what it filed open, where either list would let a
+  clean document resolve findings over a read that never happened.
 
 ### 3.2 Evidence — `adopt_collector_evidence`, `adopt_arm_impact`
 
@@ -189,8 +196,11 @@ collector_ and says what releases it — the collector no longer emitting it, or
 This is a hold, not a rejection: the model is allowed to reject a candidate as a false positive, so
 a dropped candidate cannot be refused the way a dropped cluster is.
 
-The ledger body is the persistence. This slice has no report store: `previous_ids` is read back out
-of the body's hidden marker, and the body is rewritten from the document on every findings run. A
+The ledger body is the persistence: `previous_ids` is parsed out of the hidden marker of the body
+the previous run published — the copy the report store kept
+([report store design](fleet-audit-report-store.md)), not the issue fetched back from GitHub, except
+once where the store has never held the ledger — and
+the body is rewritten from the document on every findings run. A
 hold that only kept an id out of `resolved` therefore lasted one run — the next previous body no
 longer named the finding, and a clean run closed the ledger over it with its pull request open. So
 the held set for a run is defined on the marker: the previous body's marker ids ∩ `still_flagged_ids`,
@@ -220,34 +230,36 @@ given the same `--manifest-file` refuses it as held rather than as unknown.
 
 Three bounds on the held set, all applied where it is computed, once per run, before the branches
 split. "The document carries it" means the document's own ids plus the postures `finish` withheld
-this run: a withheld posture is the model's finding taken out for want of a search, and withheld
-ids enter no delta block, so it is never held. When the ledger body could not be read, the run has no held set to intersect with — and it does
-not derive one from the manifest, because that would turn every candidate the model has been
-rejecting into a permanent hold on one transient `gh` failure. The ledger is the persistence, and a
-run that cannot read it must not overwrite it, whatever flags it passed: the body, its title, the
-severity label, pull-request promotion and the acknowledgements that would follow it all wait for
-a run that can read the ledger (the old marker and its held ids survive untouched); `/remediate`
-refusals and deferrals are still answered when the run passed a manifest, whose still-flagged set
-tells a held id from a typo — a run with neither the body nor a manifest cannot, so it answers no
-`/remediate` at all (no refusal, deferral or acknowledgement; the next readable run answers them,
-and the deferred marker is what `reply_to_deferrals` guards on, so nothing is lost by waiting); the
-stale-close pass still protects the still-flagged set, the JSON line reads `UPDATED` and partial with a coverage gap saying the body was left as it
-was, and a clean run does not close. These are the two deliberate changes to manifest-less
-behaviour in this slice: main rewrites the body over an unreadable one — a degraded path that
-already skips the delta comment — which would drop every held id the marker carried and retire
-their pull requests, and every published body now spells a `<!--` arriving in model- or
-fleet-authored free text as `&lt;!--` (§3.3), so a run over a document whose text contains a
-comment opener renders that text differently from main; the recorded transcripts cover neither
-path, and none of the five carries an opener in free text. A marker minted under
-another identity scheme is deliberately not this case: the stamp is refreshed only by the rewrite,
-so a scheme bump rewrites the body as it always has; the holds survive it by re-derivation from
-their rows (below), and only ids with no row are lost. And the set is capped at `MAX_HELD_IDS` in
-sorted id order — the ids are a monotone term in the marker that no SOP-side edit can shrink. An id
-past the cap leaves the marker for good: the ledger stops tracking it, it stays on each run's JSON
-line as an unpublished candidate while the collector flags it, its pull request stays open, and the
-dropped ids are logged once with a warning and stated at the end of the section under every tier;
-the ids kept are charged to the budget ahead of the findings, so the body cannot raise over them.
-The fourth tier, when not even the note fits, is no section at all and the ids in the marker alone.
+this run: a withheld posture is the model's finding taken out for want of a search, and withheld ids
+enter no delta block, so it is never held. When the report store holds no usable record of the open
+ledger — `latest.json` missing, unreadable, written for another issue, or out of step with the
+ledger's hidden block, or a never-held store with no block to seed from; the full list is
+[report-store design §4](fleet-audit-report-store.md#4-finishs-own-memory) — the run has no held set to intersect with, and it does not derive one from
+the manifest, because that would turn every candidate the model has been rejecting into a permanent
+hold. It holds nothing and rewrites the body anyway: freezing the body until a run could read its
+memory would freeze it for good, because only a run that writes the body restores the store. The
+cost is that ids held on the lost body are no longer carried; with a manifest their pull requests
+stay protected, because the stale-close pass reads the still-flagged set whole, and without one
+nothing the lost body held is protected. The delta comment is skipped. A run with neither a memory
+nor a manifest answers no `/remediate` at all (no refusal, deferral or acknowledgement; the next run
+with a memory answers them, and the deferred marker is what `reply_to_deferrals` guards on, so
+nothing is lost by waiting). A clean run over a lost memory never closes: it files a lost-memory
+coverage gap, stays open and reports partial — the collector's gap while it still flags something
+the document does not carry, and otherwise the gap saying nothing shows whether the ledger's
+findings were fixed, since a collector covers only its own checks ([report store design
+§4](fleet-audit-report-store.md)). Every published body also spells a `<!--` arriving in model- or
+fleet-authored free text as `&lt;!--` (§3.3), so a run over a document whose text contains a comment
+opener renders that text differently from main; none of the five recorded transcripts carries an
+opener in free text. A marker minted under another identity scheme is deliberately not this case:
+the stamp is refreshed only by the rewrite, so a scheme bump rewrites the body as it always has; the
+holds survive it by re-derivation from their rows (below), and only ids with no row are lost. And
+the set is capped at `MAX_HELD_IDS` in sorted id order — the ids are a monotone term in the marker
+that no SOP-side edit can shrink. An id past the cap leaves the marker for good: the ledger stops
+tracking it, it stays on each run's JSON line as an unpublished candidate while the collector flags
+it, its pull request stays open, and the dropped ids are logged once with a warning and stated at
+the end of the section under every tier; the ids kept are charged to the budget ahead of the
+findings, so the body cannot raise over them. The fourth tier, when not even the note fits, is no
+section at all and the ids in the marker alone.
 
 `--dry-run` previews the hold from the manifest's candidates alone. A clean preview says the run
 would be `HELD` if the ledger's marker carries any of the still-flagged candidates and `CLEAN`
@@ -389,13 +401,18 @@ The reason, passed through the same redactor as a skipped cluster's reason, is a
 nothing is announced resolved, no remediation pull request is retired, and the ledger is not closed,
 by the same rule any other gap applies. A document-authored gap shows in the Scope table's rows; the
 waiver has no row, so the ledger body lists it under a _Coverage_ heading in the Scope section and
-the delta comment, when one is posted, repeats it. The same list carries the other hold the
-document cannot express: the ledger body this run could not read and left as it was (§3.3). The waiver and `--manifest-file` are mutually
+the delta comment, when one is posted, repeats it. The other holds the document cannot express —
+the lost-memory gaps a clean run files when its report store holds no trusted record of the open ledger
+(§3.3) — arise only on a clean run, which comments rather than rewriting the body, so they are named
+in that comment instead. The waiver and `--manifest-file`
+are mutually
 exclusive, a blank reason is a validation error, and `--dry-run` appends the same gap so the preview
 shows the hold the real run will apply.
 
-Neither flag is required. Making the manifest mandatory per stream is the last step of each
-collector's rollout, once its SOP passes the flag on every run.
+On a stream in `COLLECTOR_AUDITS` — every stream whose SOP runs a collector — one of the two flags
+is required, and `finish` exits 2 without either, dry run included. The set is pinned to the
+collectors that exist by a test, so a stream joins it in the change that gives it a collector. A
+stream outside it runs `finish` with neither.
 
 ## 5. Where the roster meets the manifest — `AuditSpec.scopes`
 

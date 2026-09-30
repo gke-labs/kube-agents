@@ -578,23 +578,14 @@ class C1IsolationIsStructural(unittest.TestCase):
         """KNOWN VIOLATION. The sandbox reaches the metadata server anyway.
 
         This is the invariant `spec.security.egressPolicy: Allowlist` exists to
-        establish, and on this tree it does not hold -- on both delivery paths,
-        which is worth stating because checking only one is how this was
-        nearly missed:
-
-        - Operator-rendered: platformagent-gateway-netpol allows
-          169.254.169.254/32 on TCP 80 -- the metadata server's own
-          ports -- and 169.254.169.252/32 on 988, selecting the same
-          `app: platformagent-gateway` pods that
-          platformagent-sandbox-metadata-deny selects.
-        - Kustomize-mode: deploy/kustomize/platform/networkpolicy-core-egress.yaml
-          ships platform-agent-core-egress with the same two metadata rules. It
-          selects on `app.kubernetes.io/name: platform-agent` rather than the
-          `app:` label, a different expression over the same Pods, which the
-          agent carries both of.
+        establish, and on this tree it does not hold: the operator-rendered
+        platformagent-gateway-netpol allows 169.254.169.254/32 on TCP 80 -- the
+        metadata server's own ports -- and 169.254.169.252/32 on 988, selecting
+        the same `app: platformagent-gateway` pods that
+        platformagent-sandbox-metadata-deny selects.
 
         Two policies over one Pod union their allow-sets, so opting into the
-        allowlist does not subtract what either of them adds.
+        allowlist does not subtract what the gateway policy adds.
 
         The failure is real and the feature does not currently do what its name
         says. Recorded here rather than repaired because #676 was deliberate:

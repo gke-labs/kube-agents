@@ -50,15 +50,24 @@ type ActiveTask struct {
 // bucket: contextId, current pod, bus session name, last activity, roster.
 // Runtime state is not git and not pod annotations; KV is the house answer.
 type SessionRecord struct {
-	Key          string      `json:"key"`
-	ContextID    string      `json:"contextId"`
-	BusSession   string      `json:"busSession,omitempty"`
-	PodName      string      `json:"podName,omitempty"`
-	Addressee    string      `json:"addressee"`
-	Kind         string      `json:"kind"`
-	LastActivity time.Time   `json:"lastActivity"`
-	Roster       []string    `json:"roster,omitempty"`
-	ActiveTask   *ActiveTask `json:"activeTask,omitempty"`
+	Key          string    `json:"key"`
+	ContextID    string    `json:"contextId"`
+	BusSession   string    `json:"busSession,omitempty"`
+	PodName      string    `json:"podName,omitempty"`
+	Addressee    string    `json:"addressee"`
+	Kind         string    `json:"kind"`
+	LastActivity time.Time `json:"lastActivity"`
+	// LastTaskActivity is when a task last started or, from an executor's
+	// terminal, ended in this session. It is what the Slack adapter's
+	// session-thread rule bounds on (Gateway.hasSession), separately from
+	// LastActivity, which every verified turn moves: a "@bot stop" with
+	// nothing running is activity for the reap but must not re-admit a
+	// thread whose last task ended hours ago. Zero on records written before
+	// the field existed, which reads as "no task activity": such a thread
+	// needs a fresh mention after the upgrade, once.
+	LastTaskActivity time.Time   `json:"lastTaskActivity,omitempty"`
+	Roster           []string    `json:"roster,omitempty"`
+	ActiveTask       *ActiveTask `json:"activeTask,omitempty"`
 	// SessionRouted marks a conversation on the session-pod route: the
 	// addressee is a bus session name minted fresh per incarnation, and
 	// Profile names the AgentProfile the incarnations run as.

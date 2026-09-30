@@ -1,0 +1,37 @@
+[
+  {
+    "ref": "refs/heads/platform-agent/add-checkout-gateway-pdb",
+    "object": {
+      "sha": "23543bd50c760cc3bf59a713f09fdd0e97b457a3",
+      "type": "commit"
+    }
+  },
+  {
+    "ref": "refs/heads/platform-agent/checkout-gateway-pdb",
+    "object": {
+      "sha": "0d7264e14d68865f5bcde8983e44ad0ecd42a979",
+      "type": "commit"
+    }
+  },
+  {
+    "ref": "refs/heads/platform-agent/checkout-gateway-pdb-new",
+    "object": {
+      "sha": "f6314dad3b1c6e60a5b495350e163fa1badce473",
+      "type": "commit"
+    }
+  },
+  {
+    "ref": "refs/heads/platform-agent/fix-checkout-gateway-pdb",
+    "object": {
+      "sha": "e5164727250ef9a4003eaf34db22676b759d95e9",
+      "type": "commit"
+    }
+  },
+  {
+    "ref": "refs/heads/platform-agent/fix-payments-api",
+    "object": {
+      "sha": "1837f9422e1edde1b2575927d82d0ce131279254",
+      "type": "commit"
+    }
+  }
+]

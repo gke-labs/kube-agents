@@ -83,7 +83,7 @@ model:
   provider: custom
   model: model-default
   default: model-default
-  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
   # The wire protocol a custom provider on this base_url resolves to anyway. Stated
   # explicitly to match the operator's managed render, where its purpose is to pin the

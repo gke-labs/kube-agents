@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -168,11 +168,14 @@ RUFF_SELECT := E9,F63,F7,F82
 lint-python: ## Run ruff's error rules over every Python file (the set tests/test_lint_python.py enforces).
 	@python3 -m ruff check --isolated --select $(RUFF_SELECT) .
 
-# Unit tests for every Python helper outside k8s-operator/, which has its own
-# target. Mostly stdlib-only -- the skill helpers shell out to gh/kubectl
-# rather than importing SDKs -- but the agent scripts do import a few third
-# party packages, listed in requirements-test.txt and installed by
-# `make test-python-deps`. CI installs the same file.
+# Unit tests for every Python helper in the tree, the operator's leader-election
+# wrapper (k8s-operator/internal/controller) included. `make -C k8s-operator
+# test-python` runs that one too, so operator work stays self-contained; it is
+# one small file, so the second run under `make verify` costs nothing. Mostly
+# stdlib-only -- the skill helpers shell out to gh/kubectl rather than importing
+# SDKs -- but the agent scripts do import a few third party packages, listed in
+# requirements-test.txt and installed by `make test-python-deps`. CI installs
+# the same file.
 #
 # The wildcards are what keep this honest: a new skill's tests are picked up
 # without editing this file. Several globs rather than one because the tests do
@@ -212,6 +215,7 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
 	$(wildcard tests/test_*.py) \
@@ -346,9 +350,9 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
 	@echo "==> verify OK"
 
-test-python: ## Run the Python unit tests outside k8s-operator/.
+test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
 	@if [ -z "$(PYTHON_TEST_DIRS)" ]; then \
-		echo "Error: no test_*.py files found under agents/, deploy/docker or scripts/."; \
+		echo "Error: the PYTHON_TEST_DIRS globs matched no test_*.py files."; \
 		echo "Either the tests moved or the globs are stale -- failing rather than reporting success."; \
 		exit 1; \
 	fi
@@ -412,8 +416,10 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 #
 # COVERAGE_STRICT=1 makes the target fail at the end when any directory failed,
 # which is what lets one run serve as both the verdict and the meter. CI's
-# required job sets it, so a pull request pays for the 5638 tests once instead
-# of running them again unmeasured in a second job. The default stays 0 because
+# required job sets it, so the verdict and the number come from one execution
+# rather than a measured run beside an unmeasured one on the same interpreter;
+# the one other run of the sweep in CI is on the agent image's Python, which is
+# a different question, not a second meter. The default stays 0 because
 # a local run against a tree with known-red directories should still print a
 # total. The failing list travels through a file because each recipe line is its
 # own shell: the sweep leaves `$$failed` set in the shell that called it, and
@@ -588,13 +594,17 @@ prompt-check: ## Verify the agent's instructions cite skills and files that exis
 # Documentation that mirrors a machine-readable source is generated rather than
 # hand-kept: the cron jobs, the skill catalogue and the image inventory as
 # <!-- BEGIN GENERATED --> regions, plus docs/family-roster.txt written whole.
+# The SOP line numbers each governance cron prompt cites are recomputed first,
+# so the cron-job-example regions below render the prompt with them current.
 docs-generate: ## Regenerate the generated doc regions and files from their sources.
+	@python3 scripts/generate_sop_geography.py
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
 docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget ## Run every documentation check CI runs.
 
 docs-check-generated:
+	@python3 scripts/generate_sop_geography.py --check
 	@python3 scripts/generate_docs.py --check
 
 docs-check-links:
@@ -636,6 +646,9 @@ tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a pre
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
 	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
+
+fleet-audit-view: ## Render the fleet-audit report store from the agent pod (e.g. make fleet-audit-view ARGS="--flagged").
+	@python3 scripts/fleet_audit_status_view.py $(ARGS)
 
 # Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
 # by someone remembering them, and a conformance suite whose CI entry depends

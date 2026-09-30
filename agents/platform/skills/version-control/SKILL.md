@@ -13,8 +13,25 @@ credential.** These go through `scripts/vcs.py`, which speaks to a broker in
 another container. Only the broker holds the credential; nothing here does.
 The remote verbs are exactly these:
 
-`capabilities`, `clone`, `publish`, `proposal create|list|view|comment`,
-`issue create|list|view|comment`.
+`capabilities`, `identity`, `clone`, `publish`,
+`proposal create|list|view|comment|update|close|commits|acknowledge`,
+`issue create|list|view|comment|update|close`, `label ensure`,
+`remote-branch view|delete`.
+
+`update` edits a title or body and adds or removes labels; `close` closes;
+`commits` lists the revisions on a proposal's source branch; `acknowledge`
+reacts to a comment (its `id` and `kind` come from `view --comments`) so its
+author sees it was read — `capabilities` says whether this forge supports it.
+`issue list --query <text>` searches, and `--without-labels` skips issues
+carrying any of them — that is how a queue is read for unclaimed work.
+`label ensure` creates a label or updates it if it exists. `identity` says
+who this install is on the forge and, with `--login`, whether that login may
+write to the repository. `remote-branch view` says whether the shared
+repository still holds a branch and at which revision; `remote-branch delete`
+removes one only when it is spent — under `platform-agent/`, no open proposal
+on it, and its tip exactly what a merged or closed proposal this install opened
+from this repository carried — and only
+at the `--revision` you just read.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
 onto this filesystem and prints its `path`. Inside it, use the local git, which
@@ -119,6 +136,16 @@ Every `vcs.py` verb after the first infers the repository from the only copy
 there is, or from the directory you are standing in; `--repo` says which when
 there are several.
 
+One repository can be cloned more than once here — the copy is named for its
+branch as well as its repository, so a card working a _different_ branch of the
+same repository gets a copy of its own rather than yours. That is naming, not a
+permission boundary, and it does not separate two cards reading the _same_
+branch: with no `--branch` every reader asks for the trunk and every reader
+lands on the one directory. The second `clone` replaces what is there, and
+refuses to when that copy holds work that was never published. When two copies
+of one repository exist, `--repo` no longer picks between them: **run the verb from inside the
+copy you mean.** The refusal names the paths.
+
 ## Write
 
 ```bash
@@ -135,10 +162,17 @@ python3 $V discard
 revision made since the clone, and the identifiers `log` printed here are the
 identifiers that land on the forge.
 
+**Name the paths you mean.** `commit` with no paths records changes to files
+the copy already tracks and nothing else — it is never `git add .`. A file the
+copy has never seen is refused by name, because the working copy is also where
+your scratch output lands and a log swept into a public proposal cannot be
+taken back. Name it on the `commit` line to include it.
+
 ## Collaborate
 
 ```bash
 python3 $V issue list --state open --labels bug
+python3 $V issue list --state open --without-labels status:in-progress
 python3 $V issue view 42 --comments
 python3 $V issue create --title 'Cluster drift on prod-eu' --body '...'
 python3 $V proposal list
@@ -172,7 +206,25 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   on — clone again and reapply the change. An ordinary push to the target by
   somebody else is _not_ refused: your proposal simply opens with a base behind
   the tip, which is a rebase on the forge and not a problem here. Do not try to
-  force any of them.
+  force any of them. `BRANCH_DIVERGED` on a `platform-agent/` name whose last
+  proposal was closed or squash-merged is a spent branch in the way:
+  `remote-branch view` reads its revision and `remote-branch delete` clears it.
+  That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
+  the closed proposal is not this install's, or it has carried a full page of
+  proposals, too many to read, or an open proposal targets it), `OPEN_PROPOSAL`, `NOT_SPENT` (it holds revisions
+  no proposal carried); treat each as somebody's work — pick another name or
+  report it. `DELETE_REFUSED` means the remote itself refuses
+  the delete (a branch rule, a hook, or a credential without the right); it
+  answers every attempt alike, so pick another name or report it too. Never open and close a proposal on a branch to make
+  it deletable: the delete reads that proposal as proof the branch is yours. `BRANCH_MOVED` means it moved since you read it:
+  view it again, and delete only if it is still spent.
+  `PROTECTED_BRANCH` is never yours to clear. `FORGE_CALL_FAILED` and
+  `GIT_FAILED` mean the delete did not complete, and it may have landed before
+  the failure: read the branch again, and retry once if it is still there.
+  `FORGE_RATE_LIMITED` and `FORGE_UNAVAILABLE` from the delete are the forge
+  turning it away for now: wait, then do the same. A forge without `proposal-list`
+  does not list `remote-branch delete` in `capabilities` and refuses it
+  `FORGE_UNSUPPORTED`.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
   `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
@@ -193,26 +245,55 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 
 ## Reference
 
-| Subcommand         | What it does                                                                                                |
-| ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `capabilities`     | What this install can do for this repository's forge, before anything is spent                              |
-| `clone`            | The history down as a bundle, unpacked into a local working copy; `--branch` for one line                   |
-| `log`              | The revisions behind HEAD; `--patch` for diffs, `--format` a pretty format string, trailing args a pathspec |
-| `show`             | One revision, or `revision:path` for a file as of that revision                                             |
-| `diff`             | Differences in the working copy, or against `--revision`                                                    |
-| `annotate`         | Per-line last-change attribution for one path                                                               |
-| `files`            | Tracked paths with the mode the revision records                                                            |
-| `grep`             | Text search over the working copy; `--regex`, `--ignore-case`                                               |
-| `status`           | What the working copy has that its revision does not                                                        |
-| `branch`           | List lines of development, or start one. Local                                                              |
-| `commit`           | Record a revision locally, with a real parent and identifier                                                |
-| `publish`          | Send the revisions made since `clone` to the shared repository                                              |
-| `discard`          | Remove the local copy                                                                                       |
-| `proposal create`  | Open the forge's change proposal (pull request, merge request)                                              |
-| `proposal list`    | Open proposals; `--state open\|closed\|all`                                                                 |
-| `proposal view`    | One proposal; `--comments` for the discussion, `--diff` for the patch                                       |
-| `proposal comment` | Reply on a proposal                                                                                         |
-| `issue list`       | Work items; `--state`, `--labels`                                                                           |
-| `issue view`       | One issue; `--comments` for the discussion                                                                  |
-| `issue create`     | Open an issue; `--labels`                                                                                   |
-| `issue comment`    | Reply on an issue                                                                                           |
+| Subcommand             | What it does                                                                                                                                 |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `capabilities`         | What this install can do for this repository's forge, before anything is spent                                                               |
+| `clone`                | The history down as a bundle, unpacked into a local working copy; `--branch` for one line                                                    |
+| `log`                  | The revisions behind HEAD; `--patch` for diffs, `--format` a pretty format string, trailing args a pathspec                                  |
+| `show`                 | One revision, or `revision:path` for a file as of that revision                                                                              |
+| `diff`                 | Differences in the working copy, or against `--revision`                                                                                     |
+| `annotate`             | Per-line last-change attribution for one path                                                                                                |
+| `files`                | Tracked paths with the mode the revision records                                                                                             |
+| `grep`                 | Text search over the working copy; `--regex`, `--ignore-case`                                                                                |
+| `status`               | What the working copy has that its revision does not                                                                                         |
+| `branch`               | List lines of development, or start one. Local                                                                                               |
+| `commit`               | Record a revision locally, with a real parent and identifier. Paths, or tracked changes only                                                 |
+| `publish`              | Send the revisions made since `clone` to the shared repository                                                                               |
+| `discard`              | Remove the local copy; `--branch` when the repository is cloned once per branch                                                              |
+| `proposal create`      | Open the forge's change proposal (pull request, merge request)                                                                               |
+| `proposal list`        | Open proposals; `--state open\|closed\|all`, `--source`/`--target` to ask about one branch, `--page` for the next page                       |
+| `proposal view`        | One proposal; `--comments` for the discussion, `--diff` for the patch                                                                        |
+| `proposal comment`     | Reply on a proposal                                                                                                                          |
+| `proposal update`      | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                    |
+| `proposal close`       | Close it without merging                                                                                                                     |
+| `proposal commits`     | The revisions on its source branch, **oldest first**; the last entry is the tip only when `"truncated": false`; `--page` for the next page   |
+| `proposal acknowledge` | React to one comment so its author sees it was read; needs `--comment-id` and `--kind` from `view --comments`                                |
+| `issue list`           | Work items; `--state`, `--labels`, `--without-labels`, `--query`                                                                             |
+| `issue view`           | One issue; `--comments` for the discussion                                                                                                   |
+| `issue create`         | Open an issue; `--labels`                                                                                                                    |
+| `issue comment`        | Reply on an issue                                                                                                                            |
+| `issue update`         | Retitle, rewrite the body, `--add-label`/`--remove-label`                                                                                    |
+| `issue close`          | Close it; `--reason completed\|not-planned`                                                                                                  |
+| `label ensure`         | Make the label exist, or update its `--color`/`--description` if it already does                                                             |
+| `identity`             | Who this install is on this forge; `--login` asks whether that account may write here, `--bot` if `view --comments` said it is an automation |
+| `remote-branch view`   | Whether the shared repository holds this branch, and its `revision` if it does                                                               |
+| `remote-branch delete` | Delete a spent `platform-agent/` branch at `--revision`; refused while a proposal on it is open or when it holds revisions none carried      |
+
+Every listing verb takes `-n/--limit` and answers with `count` and `truncated`.
+`truncated` is the forge's word for "there was more", judged on what it sent
+rather than on what survived filtering — so `count: 0` with `truncated: true` is
+a real answer and means ask again, more narrowly. `proposal list` and
+`proposal commits` are the two you may need to read to the end, and they take
+`--page 2`, `--page 3`, … for the rest; the last page is the one that answers
+`truncated: false`.
+
+`proposal view --comments` and `issue view --comments` say the same thing about
+the conversation they read, as `commentCount` and `commentsTruncated`. Take
+`commentsTruncated: true` seriously before you reply to anything: it means you
+are looking at the oldest page of a longer thread, so the most recent word on
+the subject — including an answer somebody already gave — is not in front of
+you. There is no way to read the rest from here: `-n` can only make the page
+smaller, and it is the same oldest page either way. Say that you could not read
+the whole thread, and do not answer anything that turns on what the rest of it
+says. It is the one truncation where carrying on quietly
+produces a confidently wrong answer rather than an incomplete one.

@@ -1,4 +1,4 @@
-"""LiteLLM pre-call hook that redacts every outbound request body at the gateway.
+"""LiteLLM pre-call hook that redacts outbound request bodies at the gateway.
 
 The chart mounts this file, `redactor.py` beside it and the rendered
 `redaction.yaml` into the stock LiteLLM image next to `/app/config.yaml`, and
@@ -8,10 +8,11 @@ config's directory, so the three files have to share one; `proxy_handler_instanc
 is the attribute it reads.
 
 What runs: `AuditRedactor`'s credential patterns, then the operator's rules
-from the file `KUBE_AGENTS_REDACTION_CONFIG` names, over every string the
-request carries to the provider -- `messages[].content` as a string or as
-`text` content parts, the `input` of an embeddings request and the `prompt` of
-a text completion. Responses are not touched; the limitation is documented on
+from the file `KUBE_AGENTS_REDACTION_CONFIG` names, over these parts of the
+request -- `messages[].content` as a string or as `text` content parts, each
+assistant message's `tool_calls[].function.arguments` (parsed and walked with
+its key names), the `input` of an embeddings request and the `prompt` of a
+text completion. Responses are not touched; the limitation is documented on
 the site's inference-gateway page.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
@@ -28,6 +29,7 @@ never the payload.
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -60,6 +62,12 @@ TEXT_PART_TYPE = "text"
 TEXT_KEY = "text"
 PART_TYPE_KEY = "type"
 SCALAR_INPUT_KEYS = ("input", "prompt")
+# An assistant message's tool calls. `arguments` is a JSON document held in a
+# string, and the model builds it from what it read, so a value it copied out
+# of a tool result goes back up here on every later turn.
+TOOL_CALLS_KEY = "tool_calls"
+FUNCTION_KEY = "function"
+ARGUMENTS_KEY = "arguments"
 
 
 def _load_redactor():
@@ -139,14 +147,56 @@ class KubeAgentsRedactionCallback(CustomLogger):
             return value
         return value
 
+    def _redact_structure(self, value: Any, counts: Dict[str, int]) -> Any:
+        """A parsed document, with the key-aware walk the audit hooks use."""
+        redacted, made = AuditRedactor.redact_counted(value, self._rules)
+        for name, count in made.items():
+            counts[name] = counts.get(name, 0) + count
+        return redacted
+
+    def _redact_arguments(self, arguments: Any, counts: Dict[str, int]) -> Any:
+        """Redact a tool call's arguments, re-serialising only when something changed.
+
+        The parsed document is walked rather than the raw string: key names
+        count (`{"password": …}`, an env `name`/`value` pair, a Secret's
+        `data`), the result is still valid JSON -- a provider rejects
+        tool-call arguments that do not parse -- and the line-based patterns
+        see real newlines rather than `\\n` escapes. Arguments that are not
+        JSON are redacted as text; arguments already sent as an object are
+        walked as they are.
+        """
+        if not isinstance(arguments, str):
+            return self._redact_structure(arguments, counts)
+        try:
+            parsed = json.loads(arguments)
+        except ValueError:
+            return self._redact_text(arguments, counts)
+        redacted = self._redact_structure(parsed, counts)
+        # Compared, not counted: a substitution that swaps one marker for
+        # another nets zero on the counts but still changed the payload.
+        if redacted == parsed:
+            return arguments
+        return json.dumps(redacted, ensure_ascii=False)
+
+    def _redact_tool_calls(self, tool_calls: Any, counts: Dict[str, int]) -> None:
+        if not isinstance(tool_calls, list):
+            return
+        for call in tool_calls:
+            function = call.get(FUNCTION_KEY) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(ARGUMENTS_KEY) is not None:
+                function[ARGUMENTS_KEY] = self._redact_arguments(function[ARGUMENTS_KEY], counts)
+
     def redact_request(self, data: Dict[str, Any]) -> Dict[str, int]:
         """Redact `data` in place and return the substitution counts by rule name."""
         counts: Dict[str, int] = {}
         messages = data.get(MESSAGES_KEY)
         if isinstance(messages, list):
             for message in messages:
-                if isinstance(message, dict) and CONTENT_KEY in message:
+                if not isinstance(message, dict):
+                    continue
+                if CONTENT_KEY in message:
                     message[CONTENT_KEY] = self._redact_value(message[CONTENT_KEY], counts)
+                self._redact_tool_calls(message.get(TOOL_CALLS_KEY), counts)
         for key in SCALAR_INPUT_KEYS:
             if key in data:
                 data[key] = self._redact_value(data[key], counts)

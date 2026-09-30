@@ -6,8 +6,13 @@
 # mistake this exists to make visible. SKIP_PIPELINE means the run does nothing
 # at all — either no validated candidate exists, or the newest one is refused
 # because its tree predates the shared-pipeline restructure. SKIP_PROMOTION means
-# the candidate is real and the matrix runs, but the commit already carries a
-# staging tag, so a pass pushes nothing.
+# the candidate is real and the matrix runs, but the commit already carries an
+# eval-candidate or staging tag, so a pass nominates nothing and pushes nothing.
+#
+# A green matrix is no longer sufficient for promotion, which is why the line it
+# writes says "if the matrix and the eval pass" rather than naming the matrix
+# alone: the matrix nominates the candidate, and the release-candidate eval
+# decides whether the staging tag follows.
 #
 # Which of the two SKIP_PIPELINE causes applies is in SKIP_REASON, so the line
 # below carries it rather than asserting either.
@@ -18,6 +23,7 @@ set -euo pipefail
 
 COMMIT_SHA="${COMMIT_SHA:-}"
 RC_TAG="${RC_TAG:-}"
+EVALCAND_TAG="${EVALCAND_TAG:-}"
 STAGING_TAG="${STAGING_TAG:-}"
 SKIP_PIPELINE="${SKIP_PIPELINE:-}"
 SKIP_PROMOTION="${SKIP_PROMOTION:-}"
@@ -35,11 +41,12 @@ render_summary() {
   echo "| --- | --- |"
   echo "| Candidate | \`${RC_TAG}\` |"
   echo "| Commit | \`${COMMIT_SHA}\` |"
+  echo "| Eval-candidate tag | \`${EVALCAND_TAG}\` |"
   echo "| Staging tag | \`${STAGING_TAG}\` |"
   if [ "${SKIP_PROMOTION}" = "true" ]; then
-    echo "| Promotes | no — already promoted |"
+    echo "| Promotes | no — already nominated or promoted |"
   else
-    echo "| Promotes | yes, if the matrix passes |"
+    echo "| Promotes | yes, if the matrix and the eval pass |"
   fi
   if [ -n "${SKIP_REASON}" ]; then
     echo ""

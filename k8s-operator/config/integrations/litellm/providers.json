@@ -3,7 +3,7 @@
   "defaultProvider": "gemini",
   "gateway": {
     "deployment": "litellm",
-    "service": "litellm",
+    "service": "inference-gateway",
     "configMapBase": "litellm-config",
     "configVolume": "config-volume",
     "container": "litellm-container",

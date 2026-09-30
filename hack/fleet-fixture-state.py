@@ -534,7 +534,7 @@ def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
 class Reader:
     """Reads for one pass, with the server-config lookups memoised.
 
-    A pass over seven roles must not pay one get-server-config per assertion;
+    A pass over eight roles must not pay one get-server-config per assertion;
     a location's channel defaults do not change between two reads seconds
     apart.
     """

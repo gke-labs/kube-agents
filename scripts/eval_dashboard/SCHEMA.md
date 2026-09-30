@@ -119,9 +119,11 @@ the same layout and is collected from the moment it starts running.
   `hack/ci-eval-pr.sh`'s step-0 revalidation ended before the eval loop; then
   it falls back to `finished − started` (which also counts provisioning).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
-  verdict outside the vocabulary below — only the currently-unreachable
-  `[EXPECTED_FAIL]`, which no `task.yaml` sets — does not parse and yields
-  no entry):
+  verdict outside the vocabulary below — `[EXPECTED_FAIL]`, which no
+  `task.yaml` sets, and `[NOT_GRADED_ON_TRANSPORT]`, the inject lane's word
+  for a case whose every objective check is not applicable on that
+  transport — does not parse and yields no entry, so such a case is missing
+  from `tasks[]` rather than misfiled; the next-mode key is #2008's):
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
     `[UNSTABLE]` (a multi-repetition case that passed some but not all
     graded repetitions is not a clean pass; `reps` carries the split),
@@ -357,17 +359,30 @@ Additive, optional, and safe to omit — consumers must default them.
   `artifacts_url` are then `null` — but `commit` is not, when Prow recorded
   a `revision`: it falls back to that ref's first 7 characters, which for a
   tag-push postsubmit is the same commit the banner would have named.
-  `artifacts_url` is additionally `null` for a run outside Prow.
-- `verdict` — the eval's, which is **not** the job's: the lane is advisory,
-  so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
-  config's doing — it runs the driver under `|| true` — not the driver's, so
-  a future config that drops the `|| true` would make the two agree without
-  anything here changing. `NOT RUN` is written on two paths, and on
-  neither is it a judgement on the candidate: the deploy failed, so nothing
-  was measured; or the eval ran and could not be evaluated (`ci-eval-pr.sh`
-  exited `2` and `eval-verdict.json` says `outcome: not_evaluated` — an
-  admitted case lost every repetition to infrastructure), so the candidate
-  was not measured on it.
+  `artifacts_url` is additionally `null` for a run outside Prow. `rc_tag` is
+  whatever tag the job fired on, so the store holds two families: records
+  from before the gate landed carry a `staging_` tag, the deploy tag the job
+  then triggered on, and records after it carry the `evalcand_` tag the
+  nightly now pushes ahead of the deploy. Nothing reads the prefix.
+- `verdict` — the eval's, which is still not the job's, though they now
+  mostly agree: the job runs the driver bare, so a `RED` candidate leaves a
+  `FAILURE` in `result`. They part on `NOT RUN`, which is written on three
+  paths and on none of them is a judgement on the candidate: the deploy
+  failed, so nothing was measured; the eval ran and could not be evaluated
+  (`ci-eval-pr.sh` exited `2` and `eval-verdict.json` says
+  `outcome: not_evaluated` — an admitted case lost every repetition to
+  infrastructure, or every case the run had was not graded on its
+  transport), so the candidate was not measured on it; or the eval
+  exited non-zero without writing `eval-verdict.md` at all, so it stopped
+  before grading anything. On each of them the driver exits non-zero and
+  the build is `FAILURE`. That gap is the reason `verdict` is recorded
+  separately at all, and the reason the promotion reads this word rather
+  than `result`: `RED` holds the candidate back for good, `NOT RUN` lets a
+  later nightly nominate the same commit again. The promotion reads it out
+  of the build's own `artifacts/rc-eval-summary.md` rather than from here —
+  this store is the dashboard's, and nothing decides from it — so a `null`
+  here is a run whose banner was missing, which is the same run the
+  promotion would have found no summary for.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
   may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
   line. `baseline_rate` and `margin` are `null` while the baseline store
@@ -653,8 +668,9 @@ when none did — evidence about `main`, shown beside the case, never a tag.
 `cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
 demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
-(active, off the roster — since 2026-09-22 the presubmit runs the roster only, so this is
-reachable only on a checkout whose presubmit file lists a case the roster does not),
+(active, off the roster, no demotion date: the held-out seat a coverage tracker takes in the
+presubmit file, which is what pdb-remediation-pr shows while seated; a dated one reads
+`demoted`, which is what the compliance canary shows while seated),
 `demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
 2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
@@ -805,7 +821,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -829,7 +845,13 @@ role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
 `fixture_state` block beside `metrics`; the pages show it as the generic
 degraded headline, and `fixture-state.json` beside `health.json` is the
-scan's own document, which no page reads. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+scan's own document, which no page reads. `pool_drift` (the hourly pool-state
+scan found a pool project no longer shaped as the verifier requires;
+docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
+verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
+command}}`), and the `pool_state` block beside `fixture_state` summarises the
+scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean. Both scan
+incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
@@ -877,6 +899,30 @@ day with no runs. The poster needs the difference — going blind must not read 
 the episode ending. `metrics.pool_since` is the open episode's start, held
 across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
+
+A held scan condition (`fixture_drift` or `pool_drift` whose scan is stale,
+blind, or still shows the drift) keeps its `condition` and `incident` while a
+scan condition ranking at or below it (`pool_drift` below `fixture_drift`, or
+its own on other units that do not cover the held ones) is assessed at the same
+severity; `fixture_drift` over a held `pool_drift`, a spread of the same drift,
+and any run-based condition take over as before.
+
+`periodics` is the watched Prow periodics' notes, by job name, one for each job
+whose latest finished build failed (`verdict: FAILED`) or is older than the
+job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
+finished_at, result, stale_after_h, dry_run, detail[], history_url, doc}`,
+where `detail` (on `FAILED` only) names the projects the reconcile's artifact
+says it refused, failed or was interrupted in, up to five (then `and N more`), then the run's own
+`error` line, which also says when the report was not a JSON object; `since` is
+carried from the previous `health.json`. That artifact, `fleet-reconcile.json`
+from `hack/fleet_reconcile.py --report`, is `{schema_version, mode, dry_run,
+started_at, finished_at, exit, exit_code, error, outcomes{project: {outcome,
+detail}}, summary}`; the reader uses `outcomes`, `error` and `dry_run`. `periodics_read` names the jobs a reading arrived for this
+tick, whether or not they are noted; the poster clears a told job only on a
+reading that shows it clean. `periodics_since` is each open note's start, kept
+for a job across the ticks with no reading for it (which write no note for it)
+and dropped once a tick with a reading for it writes no note
+(`scripts/eval_dashboard/periodics.py` owns the notes).
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

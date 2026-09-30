@@ -660,8 +660,9 @@ privilege the pod does not already hold.
   one read, which is how an issue a person closed by hand is noticed and
   replaced rather than edited while closed), and closed with a comment once
   every leg has recovered. The call is
-  `forge.run_gh` through the sandbox and the credential proxy, the same route
-  `github-repo-watcher` takes; the minted token already holds `issues: write`.
+  `forge.call` — a version-control verb, over the sandbox hop into the
+  credential broker — the same route `github-repo-watcher` takes; the minted
+  token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
   own ledger. With no repository to use, the job falls back to the log line
   alone. Two installs that manage one repository would share one issue; the
@@ -688,9 +689,10 @@ identity no write on anything a watcher could use (the site's
 the canonical account of what it does grant), the credential proxy refuses
 every write verb before RBAC is consulted, and the operator reads nothing the
 pod writes, so a condition or an Event needs a new pod-to-operator path and a
-new grant first. The operator binds no metrics endpoint in the shipped deploy
-and no container in the agent pod exposes one unless it is switched on; the
-`PodMonitoring` objects the chart renders are LiteLLM's and Hindsight's. Those are the next step, with this
+new grant first. The operator binds no metrics endpoint in the shipped deploy;
+the ones the agent's pods expose are the event watcher's and the credential
+broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
+Hindsight's, and neither carries anything about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

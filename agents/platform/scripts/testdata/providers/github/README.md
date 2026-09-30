@@ -20,10 +20,13 @@ Each file is one JSON object:
 ```
 
 `payload` is the request the broker would receive on `POST /v1/vcs/<verb>`.
-`responses` are the API answers, in the order the forge asks for them — two
-entries for the `view` verbs, which fetch the object and then its comments.
-The harness raises on any call the file does not cover, so an implementation
-that grew a third request fails rather than quietly reading `None`.
+`responses` are the API answers, in the order the forge asks for them — one
+entry per request, so the count is however many requests the verb makes:
+`issue-view` fetches the issue and then its comments and has two,
+`proposal-view` fetches the pull request, its issue comments, its review
+comments and its reviews and has four. The harness raises on any call the file
+does not cover, so an implementation that grew one more request fails rather
+than quietly reading `None`.
 
 ## Provenance
 
@@ -43,6 +46,15 @@ ways and never regenerated wholesale:
   `issue-list.json` carries an issue-shaped pull request — GitHub returns both
   from `/issues` — so the filtering has something to filter. Those are
   arrangements of real responses, not invented ones.
+
+- **Refusals are recorded too.** A response of the form
+  `{"__status__": 404, "__detail__": "..."}` is what the transport would have
+  raised for that call; the harness raises it. `label-ensure.json` uses one, because
+  the verb's logic is a read that 404s followed by a create.
+- **Three endpoints for one conversation.** `proposal-view.json` carries the
+  conversation, the inline review comments and the review summaries as three
+  responses, in the order the translation asks for them, with one empty-bodied
+  approval among the reviews so the filter has something to drop.
 
 ## Changing them
 

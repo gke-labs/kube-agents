@@ -39,8 +39,6 @@ on:
     workflows:
       - A2A Module Tests
       - Actionlint
-      - Agent Plugin Tests
-      - Agent Startup Tests
       - Conformance
       - Docker Build
       - Docs Build

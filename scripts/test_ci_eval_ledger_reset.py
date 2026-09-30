@@ -45,7 +45,7 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The nine ledger-writing cases and the audit id each grades under; a case
+# The ten ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
@@ -54,6 +54,7 @@ AUDIT_IDS = {
     "consistency-no-environment-label": "fleet-consistency-drift",
     "fleet-cost-idle-pool": "fleet-wide-cost-analysis",
     "obtainability-planted-pdb": "obtainability-audit",
+    "obtainability-planted-orphan-service": "obtainability-audit",
     "stockout-pinned-pool": "stockout-prevention",
     "upgrades-master-behind-offered-elsewhere": "security-patch-orchestrator",
     "upgrade-readiness-lagging-cluster": "security-patch-orchestrator",
@@ -581,8 +582,9 @@ class CallSiteTest(unittest.TestCase):
         # Two cases grade fleet-consistency-drift; their task locks differ, so
         # without this one lane's reset closes the other lane's live ledger
         # and the other's finish lands in this lane's fresh one. The stream
-        # lock is taken after the task lock (one order everywhere, no cycle),
-        # only when the case names a stream, and released on every exit.
+        # lock is taken after the task lock and before the infra lock (one
+        # order everywhere, no cycle), only when the case names a stream, and
+        # released on every exit.
         unit = lifted("run_one_unit")
         task_lock = unit.index('lock_acquire "${STATE_DIR}/lock-task-${name}"')
         stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"')
@@ -596,18 +598,28 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(launch, stream_release)
         self.assertLess(stream_release, task_release)
         self.assertIn('if [ -n "${audit_id}" ] && ! lock_acquire "${STATE_DIR}/lock-stream-${audit_id}"', unit)
-        # Released on the mint-failure path as well as after the run.
-        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 2)
+        # Released on the infra-lock and mint-failure paths as well as after
+        # the run.
+        self.assertEqual(unit.count('[ -n "${audit_id}" ] && lock_release "${STATE_DIR}/lock-stream-${audit_id}"'), 3)
+        # Before the infra lock: a stack-bearing unit waiting on its stream
+        # must not hold the one tofu lane while it waits.
+        infra_lock = unit.index('lock_acquire "${STATE_DIR}/lock-infra"')
+        self.assertLess(stream_lock, infra_lock)
         # One deadline for both locks, and it is the single-unit figure times
         # the cases on the stream: a task-lock holder on a shared stream waits
         # its turn on the stream before its own run, so a same-task successor
         # has to outlast the sibling case's unit as well as the predecessor's.
         self.assertIn(
-            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600) ))"',
+            'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"',
             unit,
         )
         self.assertEqual(unit.count('"${lock_deadline}"'), 2)
         self.assertLess(unit.index('lock_deadline="$(('), task_lock)
+        # A stack-bearing case writing no ledger has no stream term, yet its
+        # previous rep holds the task lock while queued on lock-infra, so the
+        # task-lock deadline carries that queue itself.
+        stack_term = unit.index('if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then')
+        self.assertIn("lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))", unit[stack_term:task_lock])
 
     def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
         # Against the real task files: the two consistency cases share
@@ -632,6 +644,34 @@ class CallSiteTest(unittest.TestCase):
         result = run_bash(body)
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(got, {"drift": "2", "compliance": "1", "patch": "2", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_stream_deadline_covers_its_stack_bearing_cases_infra_queue(self):
+        # The orphan-service case carries a stack and shares
+        # obtainability-audit with the stackless PDB case, which then waits on
+        # the stream through the orphan-service unit's infra queue as well as
+        # its run. A stream with no stack-bearing case adds nothing.
+        tasks = (
+            "./tasks/obtainability-planted-pdb/task.yaml",
+            "./tasks/obtainability-planted-orphan-service/task.yaml",
+            "./tasks/reliability-pdb-probe/task.yaml",
+        )
+        body = "\n".join(
+            [
+                f'BENCH_DIR="{REPO_ROOT / "bench"}"',
+                f"TASKS=({' '.join(tasks)})",
+                'TASK_HAS_STACK=("" "true" "true")',
+                "INFRA_LOCK_DEADLINE=5400",
+                lifted("ledger_audit_id_for_task"),
+                lifted("stream_stack_wait"),
+                'echo "obtainability=$(stream_stack_wait obtainability-audit)"',
+                'echo "compliance=$(stream_stack_wait compliance-audit)"',
+                'echo "none=$(stream_stack_wait "")"',
+            ]
+        )
+        result = run_bash(body)
+        got = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(got, {"obtainability": "5400", "compliance": "0", "none": "0"}, result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_two_units_on_one_stream_serialise_and_two_on_different_streams_do_not(self):

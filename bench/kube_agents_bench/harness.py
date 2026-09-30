@@ -148,7 +148,7 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, transcript, worker_trajectory
+from kube_agents_bench import board, gitops, transcript, worker_trajectory
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
     delegated_task_ids,
@@ -1049,6 +1049,62 @@ def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     _agent_shell(script, timeout)
 
 
+def _worker_token_buckets(
+    by_agent: dict[str, dict[str, int]], unbilled: list[dict[str, str]]
+) -> dict[str, Any] | None:
+    """The workers' counts in the record's buckets, per profile and summed.
+
+    ``by_agent`` and ``unbilled`` are :class:`worker_trajectory.WorkerCapture`'s
+    ``tokens`` and ``unbilled``: hermes' column names per profile, and the
+    sessions that reported no counts. Each profile gets the same buckets the
+    front door's row is read into, with ``total`` summed per
+    :data:`_TOTAL_BUCKETS` (reasoning reported, not added twice), and the
+    profiles add up under the top-level keys; ``unbilled`` rides along so a
+    partial sum says so in the record. ``None`` when no session reported
+    counts, which is not the same as a run whose workers cost nothing.
+    """
+    if not by_agent:
+        return None
+    workers: dict[str, Any] = {bucket: 0 for bucket, _ in _SESSION_TOKEN_KEYS}
+    workers["total"] = 0
+    workers["by_agent"] = {}
+    for agent, columns in by_agent.items():
+        counts = {bucket: int(columns.get(key) or 0) for bucket, key in _SESSION_TOKEN_KEYS}
+        counts["total"] = sum(counts[bucket] for bucket in _TOTAL_BUCKETS)
+        workers["by_agent"][agent] = counts
+        for bucket, value in counts.items():
+            workers[bucket] += value
+    workers["unbilled"] = list(unbilled)
+    return workers
+
+
+def _fold_worker_tokens(tokens: dict[str, Any]) -> None:
+    """Add the workers' spend into the run's buckets, keeping the router's apart.
+
+    Runs after the front door's session row has replaced the summed envelopes
+    (:func:`_canonical_session_tokens`), because that replacement is
+    wholesale: folded any earlier, the workers would be overwritten with the
+    row. The router's own numbers move under ``front_door`` first, so the
+    record keeps both halves and the top level is the run. A run that
+    delegated nothing has no ``workers`` key and is left alone, and so is one
+    whose workers could not be billed (``workers`` is ``None``): its top level
+    stays the router's. Which of the two it was is on the in-process
+    ``metadata["worker_trajectory"]`` -- ``None`` when the pod read never ran,
+    a summary whose ``errors`` name the unbilled sessions when it did.
+    """
+    workers = tokens.get("workers")
+    if not isinstance(workers, dict):
+        return
+    buckets = [bucket for bucket, _ in _SESSION_TOKEN_KEYS] + ["total"]
+    tokens["front_door"] = {bucket: tokens.get(bucket) for bucket in buckets}
+    for bucket in buckets:
+        extra = workers.get(bucket)
+        if not isinstance(extra, int) or isinstance(extra, bool):
+            continue
+        current = tokens.get(bucket)
+        tokens[bucket] = extra if current is None else current + extra
+
+
 def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
     """Add ``extra``'s token buckets into ``base`` in place.
 
@@ -1270,14 +1326,19 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     ``output`` and ``final_message`` are the deliverable -- the posts the
     conversation received for this task that the relay never rewrote, which is
     what a customer would read as the answer. The trajectory is the
-    conversation itself plus the task's lifecycle: the relay does not post
-    ``activity`` artifacts, so no transport reading a conversation carries
-    tool calls, and what it carries instead is every executor state the read
-    route showed and the terminal, as ``a2a.status-update`` entries. Tokens
-    stay null -- the gateway reports no usage -- and ``metadata`` says so
-    rather than inventing a number. ``identity`` is the run, case and
-    repetition the key and message id were built from, stored beside the
-    task id so the record joins to the gateway's ingress log.
+    conversation itself, the task's lifecycle -- every executor state the
+    read route showed and the terminal, as ``a2a.status-update`` entries --
+    and the task's tool calls when the door showed them: the relay does not
+    post ``activity`` artifacts to a conversation, so they come from the
+    read route's probe instead, one entry per call in the api transport's
+    shape behind an ``a2a.activity`` marker that says the door carried the
+    trace at all (``inject_transport.EVENT_ENTRY_ACTIVITY``; a door that
+    cannot show it writes neither, and the scorer sets router-scope
+    ``tool_called`` checks aside only then). Tokens stay null -- the gateway reports no usage --
+    and ``metadata`` says so rather than inventing a number. ``identity`` is
+    the run, case and repetition the key and message id were built from,
+    stored beside the task id so the record joins to the gateway's ingress
+    log.
     """
     fold = exchange.fold
     return AgentResult(
@@ -1300,6 +1361,14 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "posts": len(fold.posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
+            # The marker's arguments (calls written, calls dropped), or None
+            # on a door that carried no trace; the progress artifact's last
+            # line, or None when none was carried. Like the rest of this
+            # block they reach the harness log and not the record --
+            # devops-bench drops ``metadata`` -- so the record's evidence is
+            # the ``a2a.activity`` entry in the trajectory.
+            "activity": fold.activity_summary,
+            "progress": fold.progress or None,
             "tokens_note": _INJECT_TOKENS_NOTE,
         },
     )
@@ -1346,6 +1415,10 @@ class KubeAgentsHarness(AgentHarness):
         """
         transcript.clear()
         started_at = time.time()
+        # The GitOps wait uses it as a lower bound on PR creation time: a rerun
+        # that reuses a cluster name reuses the run branch, and the previous
+        # run's merged PR is still listed against it.
+        self._run_started_at = started_at
         result = super().run(prompt, workspace_path)
         transcript.set(
             result.output,
@@ -1354,6 +1427,7 @@ class KubeAgentsHarness(AgentHarness):
             final_message=str(result.metadata.get("final_message") or ""),
             started_at=started_at,
             worker_commands=result.metadata.get("worker_commands"),
+            worker_capture_gaps=worker_trajectory.gaps(result.metadata.get("worker_trajectory")),
         )
         return result
 
@@ -1502,6 +1576,18 @@ class KubeAgentsHarness(AgentHarness):
                 # transport, so this is the run class, not an answer.
                 return _infra_failure(str(exc))
 
+        # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
+        # request, and the cluster the verifiers grade only changes once that
+        # PR has merged and Argo has synced it. Hold the run open for that, or
+        # for the evidence it will not happen; the outcome is recorded in
+        # metadata["gitops"] and, in the pilot, not scored. Never fatal: a poll
+        # failure must not turn a finished agent run into a crashed one.
+        try:
+            gitops.await_fix_cycle(result, since=getattr(self, "_run_started_at", None))
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised past here
+            _log.error("gitops wait failed: %s", exc)
+            result.metadata.setdefault("gitops", {})["error"] = str(exc)
+
         # One lookup, after the last turn: the session row is cumulative over
         # the conversation, so it supersedes the summed envelopes outright.
         if session_id:
@@ -1513,6 +1599,8 @@ class KubeAgentsHarness(AgentHarness):
                 headers,
                 min(timeout, _SESSION_LOOKUP_TIMEOUT),
             )
+        # And only then the workers', which the row must not overwrite.
+        _fold_worker_tokens(result.tokens)
         return result
 
     def _execute_inject(self, prompt: str) -> AgentResult:
@@ -1868,7 +1956,7 @@ class KubeAgentsHarness(AgentHarness):
             if task.cancel_sent:
                 bounded = (
                     "; a cancel naming the task was published so a bridge that binds later "
-                    "kills the stale prompt rather than running it to completion"
+                    "refuses the stale prompt before spawning it (canceled-before-start)"
                 )
             elif stop_pending:
                 bounded = "; a stop was already pending on the record"
@@ -1968,9 +2056,10 @@ class KubeAgentsHarness(AgentHarness):
             # than the transport's on purpose (the A2A owner's instruction on
             # #1661): when agent-initiated delegation becomes a child task on
             # the bus, this whole block goes and the transport is untouched.
-            # Card ids are read from the trajectory, which on this path
-            # carries no tool calls, so the wait finds nothing outstanding and
-            # settles at once. A status turn is a further message on the same
+            # Card ids are read from ``kanban_create`` tool RESULTS in the
+            # trajectory, and the tool calls this path carries (the door's
+            # activity trace) have no results, so the wait finds nothing
+            # outstanding and settles at once. A status turn is a further message on the same
             # conversation, the way a second message in a chat thread is --
             # and it is a new task rather than a steer, because the first
             # task's terminal has already released the conversation. Each
@@ -2299,6 +2388,12 @@ class KubeAgentsHarness(AgentHarness):
         ``worker_commands`` draws between an empty capture and no capture. It
         stays on the in-process result: devops-bench writes ``trajectory`` to
         the record and drops ``metadata``.
+
+        The workers' token counts land under ``tokens["workers"]`` in the
+        record's buckets, per profile and summed, or ``None`` when no session
+        could be billed. They are added into the run's top-level buckets later,
+        in :meth:`_execute`, after the front door's session row is read
+        (:func:`_fold_worker_tokens` says why the order matters).
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)
@@ -2309,9 +2404,15 @@ class KubeAgentsHarness(AgentHarness):
         captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None
+            # A run that filed no card settles too (nothing to wait for), and
+            # has no workers to bill: leave the key out. ``None`` is for a run
+            # that did delegate and whose pod could not be read.
+            if awaited:
+                result.tokens["workers"] = None
         else:
             result.trajectory.extend(captured.entries)
             result.metadata["worker_trajectory"] = captured.summary
+            result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
     @staticmethod

@@ -55,7 +55,7 @@ A named set of tools and MCP servers exposed to an agent, declared under `platfo
 
 ### Kanban task (delegation)
 
-The unit of coordination between the agent profiles: a card on the shared kanban board at the Hermes root (`kanban.db`). An orchestrator creates a card (`kanban_create(assignee=..., body=...)`); the gateway's kanban **dispatcher** auto-spawns the assigned specialist as a worker (`hermes -p <profile> chat -q "work kanban task <id>"`), which reads the card (`kanban_show`), does the work, and reports back (`kanban_complete` / `kanban_block`). The originating chat session is auto-subscribed, so the worker's `kanban_heartbeat(note=…)` progress notes and its completion both post into the thread; a worker propagates that subscription onto any child cards it creates (`kanban_notify_propagate.py`) so their completions stay visible too. The design of record is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
+The unit of coordination between the agent profiles: a card on the shared kanban board at the Hermes root (`kanban.db`). An orchestrator creates a card (`kanban_create(assignee=..., body=...)`); the gateway's kanban **dispatcher** auto-spawns the assigned specialist as a worker (`hermes -p <profile> chat -q "work kanban task <id>"`), which reads the card (`kanban_show`), does the work, and reports back (`kanban_complete` / `kanban_block`). The originating chat session is auto-subscribed, so the worker's `kanban_heartbeat(note=…)` progress notes and its completion both post into the thread; any child card a worker creates inherits that subscription, so its completion stays visible too. The design of record is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
 ## Runtime and framework
 
@@ -81,7 +81,7 @@ Open-source inference server for local model serving. Alternative to LiteLLM whe
 
 ### Minty (GitHub Token Minter)
 
-In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Deployed as the `github-token-minter` workload (upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)) and queried by `github_token_refresh.py`. Lets `submit-suggestion` open PRs without a long-lived credential.
+In-cluster broker that mints short-lived GitHub App installation tokens via GCP KMS. Deployed as the `github-token-minter` workload (upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)) and queried by `github_token_refresh.py` on the credential side of the boundary. Lets `submit-suggestion` open PRs without a long-lived credential — and without the token ever entering the container the agent's shell runs in.
 
 ### Credential proxy
 

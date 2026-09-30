@@ -60,10 +60,10 @@ const (
 	// agree with the session pod's egress fence -- see the comment at its use.
 	defaultAllowedTools = "Read,Write,Glob,Grep,TodoWrite"
 
-	// defaultModelBaseURL is the install's own LiteLLM. defaultModelAPIKey is
-	// not a credential: LiteLLM here runs keyless and the harness only checks
-	// that the variable is non-empty.
-	defaultModelBaseURL = "http://litellm"
+	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
+	// is not a credential: the gateway here runs keyless and the harness only
+	// checks that the variable is non-empty.
+	defaultModelBaseURL = "http://inference-gateway"
 	defaultModelAPIKey  = "a2a-playground" // #nosec G101 -- placeholder, not a secret
 )
 

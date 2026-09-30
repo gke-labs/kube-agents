@@ -1,6 +1,6 @@
 # Kube-Agents IAM & Workload Identity Module
 
-Reusable Terraform module for provisioning the Platform Agent's Google Service Account (GSA), its Workload Identity binding, and its project-level IAM roles.
+Reusable Terraform module for provisioning the Platform Agent's Google Service Account (GSA), its Workload Identity binding, its project-level IAM roles, and the read grants in the projects, folders and organisations its `scope` input names and in the projects its Shared VPC host and Metrics Scope selectors resolve to.
 
 ## Relationship to the install
 
@@ -33,6 +33,54 @@ stay there until per-cluster RBAC lands. The site's
 [security-and-iam reference](../../../docs/site/src/content/docs/reference/security-and-iam.md)
 owns the topic, including how the mapping reaches the credential broker and
 what the pool does and does not bound.
+
+## Projects, folders, organisations and selectors in scope
+
+`scope` mirrors `spec.scope` on the `PlatformAgent`: `projects`, `folders`, `organizations`,
+`shared_vpc_hosts`, `metrics_scopes`, `exclude.projects` and `exclude.clusters`, with the same
+caps and patterns the CRD enforces, checked at plan time. Each
+project in `projects` other than `project_id` gets the read allowlist in `scope.tf`
+(`roles/container.clusterViewer`, `roles/container.viewer`, `roles/compute.viewer`,
+`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`) intersected with
+`project_roles`, never `project_roles` itself, so a `custom` list that carries an admin role at
+home carries none of it elsewhere; the plan is refused when the intersection leaves no role that
+lists and gets clusters (`roles/container.clusterViewer` or `roles/container.viewer`;
+`roles/iam.securityReviewer` lists but cannot get). `exclude` binds nothing and revokes nothing: it
+travels in the object so the composition renders the CR from the same value, and a project named
+in `projects` is bound even when an exclude entry removes it from the resolved set, so drop it
+from `projects` instead. The one exception is a project a selector resolved to (below), which has
+no list to be dropped from: an exclude entry that names a Shared VPC service project by ID, or a monitored project by its number, withholds its grant, while a monitored project excluded by ID keeps it, since the reconcile names it with that grant before the entry can match. A folder or organisation (`folders`, `organizations`: numeric IDs)
+gets the same intersected allowlist plus `roles/cloudasset.viewer`, bound on the container
+itself (`google_folder_iam_member`, `google_organization_iam_member`), so every project beneath
+it inherits the grant, including one created after the apply, and the reconcile can search the
+container's asset index for clusters; the identity running the apply needs
+`resourcemanager.folders.setIamPolicy` or `resourcemanager.organizations.setIamPolicy` there.
+The same manageability check applies to a container as to a project. A Shared VPC host or a
+Metrics Scope's scoping project (`shared_vpc_hosts`, `metrics_scopes`: project IDs) is not a
+container and inherits nothing, so it is resolved to projects at plan time and the module binds the
+same intersected allowlist in each. The resolution is the
+[`kube-agents-scope-resolver`](../kube-agents-scope-resolver/README.md) module's, whose `members`
+output is this module's `scope_selector_members` input; the plan is refused when a declared
+selector has no entry there, so a caller that skips the resolver is told so rather than getting
+the host bound and its members not. Not resolved here because the composition calls this module
+with a module-level `depends_on`, which would defer a data source inside it to apply time and fail
+the bindings' `for_each` as unknown on a first install. Each scoping project is bound too, and a host
+not otherwise in scope gets `roles/compute.viewer` alone, because the reconcile's lookups read them
+(`compute.projects.get` in the host; the two Resource Manager reads in the scoping project, which
+both managing roles carry), even when an exclude entry names them, and the plan is refused when
+`project_roles` carries no `roles/compute.viewer` beside a host. Binding a resolved project needs
+`setIamPolicy` there for the applying identity, as for an explicit project; a failure lands inside
+the apply, not in the plan. An `exclude.projects` entry
+that names a Shared VPC service project by ID, or a monitored project by its project number, keeps it out of the bindings, the one place `exclude` reaches IAM, and the reconcile matches a number against every row a scope named by it, so the member leaves the set whether or not the run named it before; a monitored project excluded by ID
+keeps its grant, because the reconcile names every monitored project with the agent's own
+credentials before it can match the entry, and without the grant the member is reported by number
+as unnamed and holds the scope prune on every tick. Removing an entry revokes its bindings on the next apply, and
+`terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,
+`scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_bound_projects`, `scope_lookup_only_hosts`,
+`scope_roles` and `scope_container_roles` outputs surface what was bound. An organisation binding
+is wide; the design is
+[`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
+§10 step 3.
 
 ## Usage
 

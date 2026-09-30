@@ -17,7 +17,7 @@ The sweep is therefore **delegated to the `platform` specialist as a kanban task
 
 When a fresh pod starts on a newly onboarded Google Kubernetes Engine (GKE) cluster — or on a new persistent volume (`PVC`) — it runs a deterministic, first-time discovery and onboarding flow made of four parts:
 
-1. **`bootstrap-inventory-scan`** — a `no_agent` cron job on the Chat Agent profile, scheduled `* * * * *`. Because a `no_agent` script is a plain subprocess, it is not bound by the Chat Agent's toolset denylist, but it still cannot reason — so it does not scan. It first runs `cluster_agent_reconcile.py` to completion and retries on the next tick while that fails — but it gives up once the failures pass both thresholds (see `.bootstrap_reconcile_attempts` below) and files anyway, because onboarding runs once and an unreconcilable roster must not hold it shut forever. So the card body never claims the roster is current: it tells the worker to audit every cluster the projects in scope have and to name the ones with no Cluster Agent, which is how a degraded sweep reaches the user as one. It then files a **kanban task assigned to `platform`** carrying the inventory SOP. That privileged worker fans the survey out — one child card per cluster on the roster, each running the single-cluster audit SOP as that cluster's own read-only Cluster Agent — then waits for them on its own card and merges their structured `metadata` (node pools, networking, Workload Identity, workload SRE posture) into the **complete** findings at `/opt/data/INVENTORY.raw.md`. Clusters the roster does not cover, the Platform Agent audits itself. It files that card **once**: the card id is recorded in `/opt/data/.bootstrap_scan_filed`, and while that marker exists the job is a no-op that never touches the board again.
+1. **`bootstrap-inventory-scan`** — a `no_agent` cron job on the Chat Agent profile, scheduled `* * * * *`. Because a `no_agent` script is a plain subprocess, it is not bound by the Chat Agent's toolset denylist, but it still cannot reason — so it does not scan. It first runs `cluster_agent_reconcile.py` to completion and retries on the next tick while that fails — but it gives up once the failures pass both thresholds (see `.bootstrap_reconcile_attempts` below) and files anyway, because onboarding runs once and an unreconcilable roster must not hold it shut forever. So the card body never claims the roster is current: it tells the worker to audit every cluster the projects in scope have and to name the ones with no Cluster Agent, which is how a degraded sweep reaches the user as one. It then files a **kanban task assigned to `platform`** carrying the inventory SOP. The card lists one exact `kanban_create` call per Cluster Agent that is ready and has a readable cluster identity, read by the gate from the profiles in the agent pod, because the worker's terminal runs in the shell sandbox, which has neither `hermes` nor the profiles' configuration. Ready means what `platform_control`'s `list_cluster_profiles` means by it: Hermes registered the profile (`profile.yaml`) and the reconcile finished scaffolding it (`USER.md`). A profile that is not ready or cannot be read is left out and its cluster falls to the worker; if the gate cannot list the profiles at all, the card lists none and the worker audits every cluster itself. That privileged worker fans the survey out — one child card per cluster on the roster, each running the single-cluster audit SOP as that cluster's own read-only Cluster Agent — then waits for them on its own card and merges their structured `metadata` (node pools, networking, Workload Identity, workload SRE posture) into the **complete** findings at `/opt/data/INVENTORY.raw.md`. Clusters the roster does not cover, the Platform Agent audits itself. It files that card **once**: the card id is recorded in `/opt/data/.bootstrap_scan_filed`, and while that marker exists the job is a no-op that never touches the board again.
 2. **Prioritization** — a second kanban card, filed by the sweep once the raw findings are on disk (`idempotency_key='bootstrap-inventory-prioritize'`). That worker reads `INVENTORY.raw.md` and **nothing else**, scores every finding against the rubric in `inventory_prioritize_sop.md`, registers all of them in the findings queue, and writes the short report the user actually receives to `/opt/data/INVENTORY.md` from the top of the order the queue computes. It does not choose which findings there are: `scripts/inventory_findings.py extract` reads them out of the raw file's machine-readable block and `register` refuses to send anything until every extracted finding carries a score, so the worker cannot register a subset. Ranking is a separate card rather than a final step of the sweep because it must see only the findings: run inline, it would rank them against the sweep's own transcript as well, so the same cluster would yield a different report depending on how the sweep happened to go. The full findings stay on disk, the report still shows at most five items, and where it leaves anything out it ends with a count of what is queued behind it.
 3. **`bootstrap-inventory-delivery`** — a `no_agent` cron job, scheduled `* * * * *`. Its script emits `/opt/data/INVENTORY.md` to stdout, which the scheduler delivers **verbatim** to the chat, but only when the report exists _and_ a human has connected — and only after it has atomically claimed the delivery, so two overlapping runs cannot both send it. No LLM is involved in delivery: what prioritization wrote is exactly what the user receives.
 4. **`bootstrap_onboarding` plugin** — a `pre_llm_call` lifecycle hook. On the first human turn from a supported durable chat adapter it greets the user, records that a human is present, points the delivery job at this chat, and asks it to fire promptly. Request/response and local surfaces stay silent because they cannot receive a later delivery. The plugin never presents the report itself, and it greets exactly once per deployment.
@@ -80,9 +80,9 @@ The flow coordinates state through flag files under `/opt/data/`:
 
 | Marker                                        | Created By                                  | Lifecycle & Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | :-------------------------------------------- | :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **`/opt/data/.bootstrap_scan_filed`**         | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Delete it — together with `INVENTORY.raw.md` (see the runbook in §5) — to deliberately re-arm discovery; alone it leaves the gate closed.                                                                                                                                                                                                                                                                                                                                                                                           |
+| **`/opt/data/.bootstrap_scan_filed`**         | `bootstrap_scan_gate.py`                    | Written the moment the sweep card is filed, and contains that card's id. Its presence is what stops the every-minute job filing a second sweep during the many minutes the first one takes. Written only for a card the board confirmed, so a failed create retries on the next tick. Archive the previous run's `bootstrap-inventory-*` cards, then delete it together with `INVENTORY.raw.md`, to deliberately re-arm discovery (see the runbook in §5); alone it leaves the gate closed.                                                                                                                                                                                                                                                                                                                               |
 | **`/opt/data/.cluster_agent_reconcile.lock`** | `cluster_agent_reconcile.py`                | An empty `flock` file, held for the duration of a reconcile run. Two schedules run that script — this gate every minute, and the hourly `cluster-agent-reconcile` job — and the gateway's cron lock is per job id, so the lock lives in the script rather than in either caller. A run that cannot take it returns without reconciling, and exits `EXIT_ALREADY_RUNNING` (4) only under `--require-create-pass` — so the gate reads 4 as "retry next tick" and does not count it against the attempt ceiling, while the hourly job, which passes no flags, exits 0 as every cron producer must. Never cleaned up; its contents are irrelevant.                                                                                                                                                                            |
-| **`/opt/data/fleet_scope.json`**              | `cluster_agent_reconcile.py`                | The resolved scope: every project the last run listed with its outcome. The gate reads it to tell the sweep which projects in scope were not listed, so a partial roster reads as partial. Rewritten by every reconcile run except `--dry-run`; never cleaned up.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| **`/opt/data/fleet_scope.json`**              | `cluster_agent_reconcile.py`                | The resolved scope: every project the last run listed with its outcome. The gate reads it to tell the sweep which projects in scope were not listed and which folders, organisations, Shared VPC hosts or Metrics Scopes could not be resolved, so a partial roster reads as partial. Rewritten by every reconcile run except `--dry-run`; never cleaned up.                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | **`/opt/data/.bootstrap_reconcile_attempts`** | `bootstrap_scan_gate.py`                    | Two lines: the number of consecutive failed reconciles, and the epoch seconds of the first failure in that streak. Reset to a bare `0` on success, which drops the timestamp and starts the next streak fresh. The gate stops waiting and files the sweep against whatever roster exists only once **both** `MAX_RECONCILE_ATTEMPTS` and `RECONCILE_GIVE_UP_SECONDS` are satisfied, so a reconcile that can never succeed (no IAM to list clusters) cannot hold onboarding shut, while one that is merely slow to recover gets the wall-clock window instead of five one-minute ticks. A counter left by an older build has no second line and gives up on the count alone. **Delete it whenever you re-arm discovery** — an exhausted counter left behind means the next run skips the reconcile and files a solo sweep. |
 | **`/opt/data/INVENTORY.raw.md`**              | the sweep's `platform` kanban worker        | The complete findings set — every cluster, workload, and recommendation, with no length limit. Never delivered to chat. Its presence means the sweep finished; prioritization may still be running. **It is never cleaned up**, on purpose: it is what a later "show me the full inventory" request is served from. That also means re-arming discovery requires deleting it (see §5).                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | **`/opt/data/INVENTORY.md`**                  | the prioritization kanban worker            | The ranked, verbatim-delivered report, written from `INVENTORY.raw.md` alone. Written to this absolute path (not the worker's own profile home) so the chat-side jobs can read it. Its presence means the report is ready to send — unchanged as the delivery signal, it simply arrives one stage later than it used to. Renamed to `INVENTORY.delivered.md` by the delivery script (`_cleanup`) after the report is emitted.                                                                                                                                                                                                                                                                                                                                                                                             |
@@ -252,29 +252,70 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- cat /opt/data
 
 `INVENTORY.raw.md` is where a stalled sweep shows itself: present means the sweep finished and prioritization is the stage that has not.
 
-To deliberately re-run discovery, remove the markers for the stages you want to repeat (`.bootstrap_scan_filed` to re-file the sweep, `.bootstrap_greeted` to re-greet, `.bootstrap_completed` to allow another delivery). **`INVENTORY.raw.md` must go too** — unlike the report, nothing ever cleans it up, and the scan gate skips while it exists, so clearing only `.bootstrap_scan_filed` leaves discovery permanently disarmed:
+To deliberately re-run discovery, **archive the previous run's cards first**, while the markers
+still keep the gate idle. The board answers a `kanban_create` whose idempotency key matches a card
+that is not archived by returning that card and creating nothing, so a left-over
+`bootstrap-inventory-scan` card makes the gate's re-file a no-op, and a per-cluster card still open
+from an interrupted sweep either stands in for the new sweep's card or, under a key spelled
+differently, runs beside it for the same cluster. Archive newest first: archiving a card promotes
+whatever was waiting on it, so the sweep card goes last or its prioritize card is dispatched in
+between:
+
+```bash
+kubectl exec -i -n kubeagents-system ${POD_NAME} -c platform-agent -- /opt/hermes/.venv/bin/python3 - <<'PY'
+import sqlite3, subprocess
+board = sqlite3.connect("file:/opt/data/kanban.db?mode=ro", uri=True)
+rows = board.execute(
+    "SELECT id FROM tasks WHERE idempotency_key LIKE 'bootstrap-inventory-%' "
+    "AND status != 'archived' ORDER BY created_at DESC"
+).fetchall()
+for (task_id,) in rows:
+    subprocess.run(["/opt/hermes/.venv/bin/hermes", "kanban", "archive", task_id], check=True)
+left = board.execute(
+    "SELECT id FROM tasks WHERE idempotency_key LIKE 'bootstrap-inventory-%' AND status != 'archived'"
+).fetchall()
+if left:
+    raise SystemExit(f"still open: {[i for (i,) in left]}; a sweep worker is still filing. Run this again.")
+PY
+```
+
+Then remove the markers for the stages you want to repeat (`.bootstrap_scan_filed` to re-file the sweep, `.bootstrap_greeted` to re-greet, `.bootstrap_completed` to allow another delivery). **`INVENTORY.raw.md` must go too** — unlike the report, nothing ever cleans it up, and the scan gate skips while it exists, so clearing only `.bootstrap_scan_filed` leaves discovery permanently disarmed:
 
 ```bash
 kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md /opt/data/.bootstrap_scan_filed /opt/data/.bootstrap_greeted /opt/data/.bootstrap_completed /opt/data/.bootstrap_reconcile_attempts
 ```
 
+The sweep's status check runs in the shell sandbox, whose `/opt/data` is its own volume and
+outlives its pod, so remove the report there too, or the sweep skips discovery:
+
+```bash
+for p in $(kubectl get pods -n kubeagents-system -l app=platform-agent-shell -o name); do
+  kubectl exec -n kubeagents-system "$p" -c shell -- rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md
+done
+```
+
 **Once a report has been delivered, clearing markers is not enough.** `_cleanup` removes both
 onboarding cron jobs after a successful delivery, so there is nothing left to fire and a marker
 reset produces silence. Check with `grep bootstrap /opt/data/cron/jobs.json` inside the pod; if the jobs are gone, either
-re-add them or skip the gate entirely and file the sweep card yourself. Filing directly skips the
+re-add them or skip the gate entirely and file the sweep card yourself. Archive the previous run's
+cards first, as above: the card body lists the same per-cluster keys every time, so the previous
+run's cards would answer them with their old results. Filing directly skips the
 gate's reconcile, and the card body forbids the worker from reconciling the roster itself, so run
-`python3 /opt/data/scripts/cluster_agent_reconcile.py` first or the sweep fans out to a stale roster:
+the reconcile first or the sweep fans out to a stale roster. Run these inside the agent
+container, the first two with the Hermes interpreter named in full: the card body lists the Cluster
+Agents read from the profiles there, reading them needs `yaml`, and a login shell resolves `python3`
+to `/usr/bin/python3`, which does not have it:
 
 ```bash
-BODY=$(python3 -c "import sys; sys.path.insert(0,'agents/chat/scripts'); import bootstrap_scan_gate as g; print(g._task_body())")
+/opt/hermes/.venv/bin/python /opt/data/scripts/cluster_agent_reconcile.py
+BODY=$(/opt/hermes/.venv/bin/python -c "import sys; sys.path.insert(0,'/opt/data/scripts'); import bootstrap_scan_gate as g; print(g._task_body())")
 hermes kanban create --assignee platform --idempotency-key bootstrap-inventory-scan-rerun-$(date +%s) \
   --body "$BODY" "First-time environment discovery: write the onboarding inventory report"
 ```
 
-The key must be fresh. `_cleanup` renames the report and removes the cron jobs, but it never touches
-the board, so the original `bootstrap-inventory-scan` card is still there (completed) — and the board
-answers a repeated key by returning that card's id and spawning nothing. Reusing the original key in
-this runbook is a silent no-op.
+Use a fresh key anyway. `_cleanup` renames the report and removes the cron jobs, but it never
+touches the board, so a `bootstrap-inventory-scan` card the archive step missed is still there — and
+the board answers a repeated key by returning that card's id and spawning nothing.
 
 Filing directly is also the better option for measurement: it starts the clock at card creation
 rather than at the next cron tick, removing up to 60 seconds of scheduling latency from any timing.
@@ -308,9 +349,10 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
   delivery trigger, and that the inventory is never injected into the turn.
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery
   decision, the atomic claim and verbatim emit/archive, the scan job's
-  file-once-then-skip behaviour across repeated ticks, and the prioritization
-  handoff: that the sweep card hands ranking to a separate card rather than
-  doing it inline, and that the raw and delivered paths never collapse into one.
+  file-once-then-skip behaviour across repeated ticks, the Cluster Agent
+  roster the gate writes into the sweep card, and the prioritization handoff:
+  that the sweep card hands ranking to a separate card rather than doing it
+  inline, and that the raw and delivered paths never collapse into one.
 
 Each once-only step is covered twice: once for acting, once for refusing to act
 again (Rule 8).

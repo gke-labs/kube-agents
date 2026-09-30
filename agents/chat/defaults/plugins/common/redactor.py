@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -92,8 +93,50 @@ IPV6_CANDIDATE_PATTERN = re.compile(
 # Counter names for the two built-in layers when a caller asks for counts.
 COUNT_NAME_CREDENTIAL = "credential"
 COUNT_NAME_EMAIL = "email"
-CREDENTIAL_MARKERS = ("[REDACTED_SECRET]", "[REDACTED_PRIVATE_KEY]")
+REDACTED_SECRET_MARKER = "[REDACTED_SECRET]"
+CREDENTIAL_MARKERS = (REDACTED_SECRET_MARKER, "[REDACTED_PRIVATE_KEY]")
 EMAIL_MARKER = "[REDACTED_EMAIL]"
+# Every built-in and rule mask marker starts with this. A value that already
+# holds one is left alone rather than masked again, which is what used to turn
+# a blanked `password: [REDACTED_SECRET]` line into `[REDACTED_SECRET]]`.
+REDACTED_MARKER_PREFIX = "[REDACTED_"
+WHOLE_MARKER_PATTERN = re.compile(r"^\[REDACTED_[A-Z0-9_]+\]$")
+# Values a credential-named key can hold that are not credentials:
+# `automountServiceAccountToken: false` is a switch, `value: none` a
+# placeholder, and masking either puts a marker where a manifest needs the
+# literal.
+NON_CREDENTIAL_VALUES = frozenset({"true", "false", "null", "none"})
+# An env value that only references another variable (`$(DB_PASSWORD)`) names
+# a credential rather than holding one.
+ENV_REFERENCE_PATTERN = re.compile(r"^\$\([A-Za-z_][A-Za-z0-9_]*\)$")
+# A YAML block scalar indicator (`|`, `>-`, `|2+`): the value is on the lines
+# below, not on this one.
+BLOCK_SCALAR_PATTERN = re.compile(r"^[|>][+-]?[0-9]?[+-]?$")
+YAML_QUOTES = ("'", '"')
+# The key names the key/value and env-pair patterns treat as credentials. The
+# secret half of an AWS key pair has no shape of its own, so it is caught here
+# by name (`aws_secret_access_key`), as is a `SECRET_KEY` setting. `secret_key`
+# needs its separator: camel-case `secretKey` is how an ExternalSecret names a
+# key inside a Secret, which is not a credential.
+CREDENTIAL_NAME_WORDS = (
+    r"(?:password|passwd|secret|token|api[_-]?key|apikey"
+    r"|access[_-]?token|access[_-]?key|secret[_-]key|client[_-]?secret)"
+)
+# A Kubernetes Secret as a parsed object: the fields whose every value is
+# credential material, whatever the keys under them are called.
+CREDENTIAL_OBJECT_KIND = "Secret"
+CREDENTIAL_OBJECT_FIELDS = frozenset({"data", "stringData"})
+KIND_KEY = "kind"
+# A parsed env entry: `{"name": "DB_PASSWORD", "value": "…"}`.
+ENV_NAME_KEY = "name"
+ENV_VALUE_KEY = "value"
+# A mapping key that names or points at a credential rather than holding one:
+# `secretName`, `tokenPath`, `passwordFile`, `authMode`. Its last word decides,
+# so `api_key` and `client_secret` still mask. The text patterns reach the
+# same answer by requiring the credential word at the end of the name.
+NON_CREDENTIAL_KEY_SUFFIXES = frozenset({"name", "names", "path", "file", "mode", "ref", "type", "kind"})
+KEY_WORD_SPLIT_PATTERN = re.compile(r"[^a-z0-9]+")
+CAMEL_CASE_BOUNDARY_PATTERN = re.compile(r"([a-z0-9])([A-Z])")
 
 _fallback_salt: Optional[bytes] = None
 _fallback_salt_lock = threading.Lock()
@@ -179,6 +222,35 @@ class AuditRedactor:
     BEARER_TOKEN_PATTERN = re.compile(r"(?i)\b(bearer|basic)\s+([a-zA-Z0-9_\-.=+/]{12,})")
     GITHUB_TOKEN_PATTERN = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")
     OPENAI_TOKEN_PATTERN = re.compile(r"sk-[A-Za-z0-9]{20,}")
+    # `sk-` keys with a hyphenated family segment -- Anthropic (`sk-ant-api03-…`)
+    # and OpenAI project, service-account and admin keys -- which
+    # OPENAI_TOKEN_PATTERN misses because it stops at the first hyphen. Real
+    # ones are long and mixed-case; a Kubernetes name is lower-case by rule, so
+    # the upper-case lookahead keeps `deploy/sk-proj-ingest-worker` readable,
+    # and the lookbehind a name that merely contains `sk-proj-`.
+    PREFIXED_SK_TOKEN_PATTERN = re.compile(
+        r"(?<![\w-])sk-(?:ant|proj|svcacct|admin)-(?=[A-Za-z0-9_\-]*[A-Z])[A-Za-z0-9_\-]{32,}"
+    )
+    # An AWS access key id: `AKIA` for a long-term key, `ASIA` for an STS
+    # session credential, then sixteen base32 characters.
+    AWS_ACCESS_KEY_ID_PATTERN = re.compile(r"\b(?:AKIA|ASIA)[A-Z2-7]{16}\b")
+    # The password in a URL's userinfo, `scheme://user:password@host`. Only the
+    # password is masked, so the record still names the user and the host. It
+    # runs before EMAIL_PATTERN, which would otherwise read `password@host` as
+    # an address and take the host with it, and before the IP rules, which
+    # would otherwise leave the password beside a pseudonymised host.
+    # - The password runs to the last `@` before the host, as URL parsers read
+    #   it, so a raw `@` inside it is masked too.
+    # - Neither part may hold a character RFC 3986 keeps out of userinfo, nor
+    #   `,`, `;` or `'`, so the match cannot run across the fields of compact JSON
+    #   or a CSV line to the next `@`, and `<password>` / `${VAR}` placeholders
+    #   stay readable.
+    # - The scheme is capped so a long alphanumeric run is not rescanned from
+    #   every position.
+    URL_PASSWORD_PATTERN = re.compile(
+        r"\b([a-zA-Z][a-zA-Z0-9+.\-]{0,31}://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)"
+        r"([^\s/?#\[\]\"'<>{}\\|^`,;]+)@"
+    )
     # The three token shapes this redactor was missing that `redact_secrets` in
     # agents/platform/skills/fleet-audit/scripts/audit_report.py already had.
     # The JWT shape is what a projected ServiceAccount token looks like, so it
@@ -193,11 +265,86 @@ class AuditRedactor:
     # bare `\b` before `api_key` matches neither, because `_` is a word
     # character. The trailing `\b` still does the work that matters:
     # `TOKENIZER_PATH` does not match, since `token` is not followed by one.
+    # The separator stays on one line: a key that ends its line
+    # (`serviceAccountToken:`, `secret:` in every pod spec) opens a nested
+    # mapping, and the next line's key is not its value.
+    # The value is one of three shapes. A double-quoted value may hold escapes
+    # (`"a\"b"`); a single-quoted one runs to its quote. An unquoted value
+    # stops at a JSON escape (`\n`, `\"`), so YAML kept inside a JSON string
+    # does not lose its line break to the mask, and never starts with `[`, so
+    # a list under the key (`"tokens": [`) and an existing marker are left
+    # alone. The name's prefix is capped so a long hyphenated run is not
+    # rescanned from every word boundary in it.
     SECRET_KV_PATTERN = re.compile(
-        r"(?i)\b([\w.\-]*?(?:password|passwd|secret|token|api[_-]?key|apikey"
-        r"|access[_-]?token|client[_-]?secret))\b"
-        r"([\"']?\s*[:=]\s*)([\"']?)([^\"'\s,}{\]]+)\3"
+        r"(?i)\b([\w.\-]{0,64}?" + CREDENTIAL_NAME_WORDS + r")\b"
+        r"([\"']?[ \t]*[:=][ \t]*)"
+        r"(?:\"(?P<dq>(?:[^\"\\\r\n]|\\.)*)\"|'(?P<sq>[^'\r\n]*)'"
+        r"|(?P<bare>(?:[^\"'\s,}{\[\]\\]|\\(?![nrt\"/]))(?:[^\"'\s,}{\]\\]|\\(?![nrt\"/]))*))"
     )
+    # A container env entry. Its value is a credential when its name is one,
+    # but kubectl prints the two on separate lines (YAML) or as sibling fields
+    # (JSON), where neither SECRET_KV_PATTERN nor a token shape sees them.
+    # Both orders, because only kubectl is guaranteed to print `name` first.
+    # A YAML value is captured to the end of its line and unquoted in code: it
+    # has to start with a non-space so the split between the separator and the
+    # value is fixed, which keeps a long run of spaces from being rescanned.
+    CREDENTIAL_NAME_PATTERN = re.compile(r"(?i)^[\w.\-]*?" + CREDENTIAL_NAME_WORDS + r"$")
+    ENV_PAIR_YAML_PATTERNS = (
+        re.compile(
+            r"(?m)^(?P<indent>[ \t]*)-[ \t]+name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
+            r"[ \t]*\r?\n(?P=indent)[ \t]+value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)(?=\r?$)"
+        ),
+        re.compile(
+            r"(?m)^(?P<indent>[ \t]*)-[ \t]+value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)\r?\n"
+            r"(?P=indent)[ \t]+name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)[ \t]*(?=\r?$)"
+        ),
+    )
+    ENV_PAIR_JSON_PATTERNS = (
+        re.compile(
+            r"\"name\"\s*:\s*\"(?P<name>[\w.\-]+)\"\s*,\s*"
+            r"\"value\"\s*:\s*\"(?P<value>(?:[^\"\\]|\\.)*)\""
+        ),
+        re.compile(
+            r"\"value\"\s*:\s*\"(?P<value>(?:[^\"\\]|\\.)*)\"\s*,\s*"
+            r"\"name\"\s*:\s*\"(?P<name>[\w.\-]+)\""
+        ),
+    )
+    # An env entry whose value is a YAML block scalar (kubectl prints a
+    # multi-line value as `value: |`): the lines indented under `value:` are
+    # the value. They are replaced by one marker line, which keeps the block
+    # a valid scalar.
+    ENV_BLOCK_PATTERN = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)-[ \t]+name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
+        r"[ \t]*\r?\n(?P=indent)(?P<keyindent>[ \t]+)value:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
+        r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)(?P=keyindent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
+    )
+    # A credential-named key whose value is a YAML block scalar
+    # (`password: |`): the lines indented under it are the value, so they are
+    # replaced by one marker line and the indicator stays.
+    CREDENTIAL_BLOCK_SCALAR_PATTERN = re.compile(
+        r"(?im)^(?P<indent>[ \t]*)(?:-[ \t]+)?[\w.\-]{0,64}?" + CREDENTIAL_NAME_WORDS
+        + r"[\"']?[ \t]*:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
+        r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
+    )
+    # A JSON string that itself holds JSON or multi-line text, such as the
+    # `kubectl.kubernetes.io/last-applied-configuration` annotation in
+    # `kubectl get -o json`, or YAML kept in a ConfigMap. Its contents are
+    # escaped, so no pattern above sees them until the string is decoded.
+    # A string never starts at an escaped quote: on text cut off inside an
+    # escaped string, every `\"` would otherwise start a scan to the end.
+    JSON_STRING_PATTERN = re.compile(r"(?<!\\)\"(?:[^\"\\]|\\.)*\"")
+    JSON_NESTED_ESCAPES = ('\\"', "\\n")
+    # The JSON twin of SECRET_BLOCK_PATTERN, for `kubectl get secret -o json`.
+    # It runs only on text that carries a Secret, because `data` is also the
+    # envelope of ordinary JSON such as a Prometheus query result; within such
+    # text it blanks every `data` object, a ConfigMap's included, as the YAML
+    # rule does. A string value may itself hold braces, so the object body is
+    # matched string by string rather than up to the first `}`.
+    JSON_CREDENTIAL_KIND_PATTERN = re.compile(r"\"kind\"\s*:\s*\"Secret\"")
+    JSON_DATA_OBJECT_PATTERN = re.compile(
+        r"(\"(?:data|stringData)\"\s*:\s*\{)((?:[^{}\"]|\"(?:[^\"\\]|\\.)*\")*)(\})"
+    )
+    JSON_STRING_MEMBER_PATTERN = re.compile(r"(\"(?:[^\"\\]|\\.)*\"\s*:\s*)\"(?:[^\"\\]|\\.)*\"")
     # The opener of a Kubernetes Secret payload, and a key/value pair indented
     # under it. Everything in that block is credential material whatever the
     # individual keys are called, which is the one thing neither the key-name
@@ -263,7 +410,19 @@ class AuditRedactor:
             return text
         out = []
         block_indent: Optional[int] = None
+        # A pair whose value is a block scalar (`tls.key: |`) keeps its
+        # indicator; the lines indented under it become one marker line.
+        scalar_indent: Optional[int] = None
+        scalar_marked = False
         for line in text.split("\n"):
+            indent = len(line) - len(line.lstrip())
+            if scalar_indent is not None:
+                if not line.strip() or indent > scalar_indent:
+                    if line.strip() and not scalar_marked:
+                        out.append(f"{line[:indent]}{REDACTED_SECRET_MARKER}")
+                        scalar_marked = True
+                    continue
+                scalar_indent = None
             opener = cls.SECRET_BLOCK_PATTERN.match(line)
             if opener:
                 block_indent = len(opener.group(1))
@@ -272,12 +431,150 @@ class AuditRedactor:
             if block_indent is not None:
                 pair = cls.INDENTED_PAIR_PATTERN.match(line)
                 if pair and len(pair.group(1)) > block_indent:
-                    out.append(f"{pair.group(1)}{pair.group(2)}: [REDACTED_SECRET]")
+                    if BLOCK_SCALAR_PATTERN.match(pair.group(3).strip()):
+                        out.append(line)
+                        scalar_indent = len(pair.group(1))
+                        scalar_marked = False
+                    else:
+                        out.append(f"{pair.group(1)}{pair.group(2)}: [REDACTED_SECRET]")
                     continue
-                if line.strip() and (len(line) - len(line.lstrip())) <= block_indent:
+                if line.strip() and indent <= block_indent:
                     block_indent = None
             out.append(line)
         return "\n".join(out)
+
+    @classmethod
+    def _mask_credential_block(cls, match: "re.Match[str]") -> str:
+        body = match.group("body")
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        if all(line.startswith(REDACTED_MARKER_PREFIX) for line in lines):
+            return match.group(0)
+        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
+        ending = "\n" if body.endswith("\n") else ""
+        head = match.group(0)[: match.start("body") - match.start()]
+        return f"{head}{body_indent}{REDACTED_SECRET_MARKER}{ending}"
+
+    @classmethod
+    def _redact_json_credential_data(cls, text: str) -> str:
+        """Blank every string value in a `data` / `stringData` object of JSON that holds a Secret."""
+        if not cls.JSON_CREDENTIAL_KIND_PATTERN.search(text):
+            return text
+
+        def blank(match: "re.Match[str]") -> str:
+            body = cls.JSON_STRING_MEMBER_PATTERN.sub(
+                lambda member: f'{member.group(1)}"{REDACTED_SECRET_MARKER}"', match.group(2)
+            )
+            return f"{match.group(1)}{body}{match.group(3)}"
+
+        return cls.JSON_DATA_OBJECT_PATTERN.sub(blank, text)
+
+    @staticmethod
+    def _is_credential_value(value: str) -> bool:
+        """False for what a credential-named field can hold that is not one.
+
+        A block scalar indicator is one of those: the value is on the lines
+        below it, which the block rules mask.
+        """
+        return bool(value) and not (
+            value.startswith(REDACTED_MARKER_PREFIX)
+            or value.lower() in NON_CREDENTIAL_VALUES
+            or ENV_REFERENCE_PATTERN.match(value)
+            or BLOCK_SCALAR_PATTERN.match(value)
+        )
+
+    @staticmethod
+    def _last_key_word(key: Any) -> str:
+        words = KEY_WORD_SPLIT_PATTERN.split(CAMEL_CASE_BOUNDARY_PATTERN.sub(r"\1_\2", str(key)).lower())
+        return next((word for word in reversed(words) if word), "")
+
+    @classmethod
+    def _mask_env_span(cls, match: "re.Match[str]", start: int, end: int) -> str:
+        """Mask `[start, end)` of the match -- offsets into the whole text -- if the entry is a credential."""
+        value = match.string[start:end]
+        if not cls._is_credential_value(value) or not cls.CREDENTIAL_NAME_PATTERN.match(
+            match.group("name")
+        ):
+            return match.group(0)
+        whole = match.group(0)
+        return (
+            f"{whole[:start - match.start()]}{REDACTED_SECRET_MARKER}{whole[end - match.start():]}"
+        )
+
+    @classmethod
+    def _mask_env_value_yaml(cls, match: "re.Match[str]") -> str:
+        raw = match.group("value").rstrip()
+        start = match.start("value")
+        if len(raw) > 1 and raw[0] in YAML_QUOTES and raw[-1] == raw[0]:
+            return cls._mask_env_span(match, start + 1, start + len(raw) - 1)
+        return cls._mask_env_span(match, start, start + len(raw))
+
+    @classmethod
+    def _mask_env_value_json(cls, match: "re.Match[str]") -> str:
+        return cls._mask_env_span(match, match.start("value"), match.end("value"))
+
+    @classmethod
+    def _mask_env_block(cls, match: "re.Match[str]") -> str:
+        if not cls.CREDENTIAL_NAME_PATTERN.match(match.group("name")):
+            return match.group(0)
+        body = match.group("body")
+        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
+        ending = "\n" if body.endswith("\n") else ""
+        return f"{match.group(0)[: match.start('body') - match.start()]}{body_indent}{REDACTED_SECRET_MARKER}{ending}"
+
+    @classmethod
+    def _redact_env_pairs(cls, text: str) -> str:
+        if "name" not in text or "value" not in text:
+            return text
+        text = cls.ENV_BLOCK_PATTERN.sub(cls._mask_env_block, text)
+        for pattern in cls.ENV_PAIR_YAML_PATTERNS:
+            text = pattern.sub(cls._mask_env_value_yaml, text)
+        for pattern in cls.ENV_PAIR_JSON_PATTERNS:
+            text = pattern.sub(cls._mask_env_value_json, text)
+        return text
+
+    @classmethod
+    def _redact_nested_json_strings(cls, text: str) -> str:
+        """Decode each JSON string that holds escaped JSON or lines, redact it, and re-encode it.
+
+        Re-encoded only when something inside changed, so an untouched string
+        keeps its exact escapes. A string that does not decode is left alone.
+        """
+        if "\\" not in text:
+            return text
+
+        def redact_string(match: "re.Match[str]") -> str:
+            literal = match.group(0)
+            if not any(escape in literal for escape in cls.JSON_NESTED_ESCAPES):
+                return literal
+            try:
+                decoded = json.loads(literal)
+            except ValueError:
+                return literal
+            if not isinstance(decoded, str):
+                return literal
+            redacted = cls._redact_credentials(decoded)
+            if redacted == decoded:
+                return literal
+            return json.dumps(redacted, ensure_ascii=False)
+
+        return cls.JSON_STRING_PATTERN.sub(redact_string, text)
+
+    @staticmethod
+    def _mask_url_password(match: "re.Match[str]") -> str:
+        if match.group(2).startswith(REDACTED_MARKER_PREFIX):
+            return match.group(0)
+        return f"{match.group(1)}{REDACTED_SECRET_MARKER}@"
+
+    @classmethod
+    def _mask_kv_value(cls, match: "re.Match[str]") -> str:
+        """Mask the value of a credential-named key, unless it is not a credential or already masked."""
+        for group, quote in (("dq", '"'), ("sq", "'"), ("bare", "")):
+            value = match.group(group)
+            if value is not None:
+                break
+        if not cls._is_credential_value(value):
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}{quote}{REDACTED_SECRET_MARKER}{quote}"
 
     @classmethod
     def redact_text(cls, text: str, rules: Optional[Sequence[RedactionRule]] = None) -> str:
@@ -455,8 +752,13 @@ class AuditRedactor:
 
     @classmethod
     def _redact_credentials(cls, text: str) -> str:
+        text = cls._redact_nested_json_strings(text)
         text = cls.PRIVATE_KEY_PATTERN.sub("[REDACTED_PRIVATE_KEY]", text)
         text = cls._redact_secret_blocks(text)
+        text = cls._redact_json_credential_data(text)
+        text = cls._redact_env_pairs(text)
+        text = cls.CREDENTIAL_BLOCK_SCALAR_PATTERN.sub(cls._mask_credential_block, text)
+        text = cls.URL_PASSWORD_PATTERN.sub(cls._mask_url_password, text)
         text = cls.GCP_API_KEY_PATTERN.sub("[REDACTED_SECRET]", text)
         text = cls.GCP_OAUTH_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)
         text = cls.BEARER_TOKEN_PATTERN.sub(r"\1 [REDACTED_SECRET]", text)
@@ -464,45 +766,128 @@ class AuditRedactor:
         text = cls.GITHUB_PAT_PATTERN.sub("[REDACTED_SECRET]", text)
         text = cls.SLACK_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)
         text = cls.JWT_PATTERN.sub("[REDACTED_SECRET]", text)
+        text = cls.PREFIXED_SK_TOKEN_PATTERN.sub(REDACTED_SECRET_MARKER, text)
         text = cls.OPENAI_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)
-        text = cls.SECRET_KV_PATTERN.sub(r"\1\2\3[REDACTED_SECRET]\3", text)
+        text = cls.AWS_ACCESS_KEY_ID_PATTERN.sub(REDACTED_SECRET_MARKER, text)
+        text = cls.SECRET_KV_PATTERN.sub(cls._mask_kv_value, text)
         text = cls.EMAIL_PATTERN.sub("[REDACTED_EMAIL]", text)
         return text
 
     @classmethod
     def redact(cls, value: Any, rules: Optional[Iterable[RedactionRule]] = None) -> Any:
         """Recursively redact a value, keying off mapping keys where present."""
+        return cls._redact_structure(value, cls._materialise(rules), None)
+
+    @classmethod
+    def redact_counted(
+        cls, value: Any, rules: Optional[Iterable[RedactionRule]] = None
+    ) -> Tuple[Any, Dict[str, int]]:
+        """:meth:`redact`, plus how many substitutions each layer made.
+
+        A value masked because of its key counts as one `credential` (or
+        `email`); strings are counted as :meth:`redact_text_counted` counts
+        them.
+        """
+        counts: Dict[str, int] = {}
+        return cls._redact_structure(value, cls._materialise(rules), counts), counts
+
+    @staticmethod
+    def _materialise(
+        rules: Optional[Iterable[RedactionRule]],
+    ) -> Optional[Sequence[RedactionRule]]:
+        # Materialised once here, because every string below receives the same
+        # object and a generator would be spent after the first.
         if rules is not None and not isinstance(rules, (list, tuple)):
-            # Materialised once here, because every string below receives the
-            # same object and a generator would be spent after the first.
-            rules = tuple(rules)
+            return tuple(rules)
+        return rules
+
+    @classmethod
+    def _redact_string(
+        cls, text: str, rules: Optional[Sequence[RedactionRule]], counts: Optional[Dict[str, int]]
+    ) -> str:
+        if counts is None:
+            return cls.redact_text(text, rules)
+        redacted, made = cls.redact_text_counted(text, rules)
+        for name, count in made.items():
+            counts[name] = counts.get(name, 0) + count
+        return redacted
+
+    @classmethod
+    def _mask_field(
+        cls,
+        item: Any,
+        marker: str,
+        count_name: str,
+        rules: Optional[Sequence[RedactionRule]],
+        counts: Optional[Dict[str, int]],
+    ) -> Any:
+        """A string under a sensitive key becomes the marker; a container is walked."""
+        if isinstance(item, bytes):
+            text = item.decode("utf-8", errors="replace")
+        elif isinstance(item, str):
+            text = item
+        else:
+            return cls._redact_structure(item, rules, counts)
+        # Only a value that is one marker, whole, is already masked here: text
+        # that merely starts with one can carry a real credential after it.
+        already_masked = bool(WHOLE_MARKER_PATTERN.match(text))
+        if already_masked or (
+            marker == REDACTED_SECRET_MARKER
+            and not text.startswith(REDACTED_MARKER_PREFIX)
+            and not cls._is_credential_value(text)
+        ):
+            return item
+        if counts is not None:
+            counts[count_name] = counts.get(count_name, 0) + 1
+        return marker
+
+    @classmethod
+    def _redact_structure(
+        cls, value: Any, rules: Optional[Sequence[RedactionRule]], counts: Optional[Dict[str, int]]
+    ) -> Any:
         if isinstance(value, bytes):
-            return cls.redact_text(value.decode("utf-8", errors="replace"), rules).encode("utf-8")
+            decoded = value.decode("utf-8", errors="replace")
+            return cls._redact_string(decoded, rules, counts).encode("utf-8")
         if isinstance(value, str):
-            return cls.redact_text(value, rules)
+            return cls._redact_string(value, rules, counts)
         if isinstance(value, dict):
             redacted: Dict[Any, Any] = {}
+            credential_object = value.get(KIND_KEY) == CREDENTIAL_OBJECT_KIND
+            env_name = value.get(ENV_NAME_KEY)
+            credential_env = isinstance(env_name, str) and bool(
+                cls.CREDENTIAL_NAME_PATTERN.match(env_name)
+            )
             for key, item in value.items():
                 words = cls._get_key_words(key)
-                if words & cls.SENSITIVE_KEYS:
-                    redacted[key] = (
-                        "[REDACTED_SECRET]"
-                        if isinstance(item, (str, bytes))
-                        else cls.redact(item, rules)
+                if credential_object and key in CREDENTIAL_OBJECT_FIELDS and isinstance(item, dict):
+                    redacted[key] = {
+                        field: cls._mask_field(
+                            payload, REDACTED_SECRET_MARKER, COUNT_NAME_CREDENTIAL, rules, counts
+                        )
+                        for field, payload in item.items()
+                    }
+                elif (
+                    (credential_env and key == ENV_VALUE_KEY)
+                    or (
+                        words & cls.SENSITIVE_KEYS
+                        and cls._last_key_word(key) not in NON_CREDENTIAL_KEY_SUFFIXES
+                    )
+                    or (isinstance(key, str) and cls.CREDENTIAL_NAME_PATTERN.match(key))
+                ):
+                    redacted[key] = cls._mask_field(
+                        item, REDACTED_SECRET_MARKER, COUNT_NAME_CREDENTIAL, rules, counts
                     )
                 elif "email" in words or "mail" in words:
-                    redacted[key] = (
-                        "[REDACTED_EMAIL]"
-                        if isinstance(item, (str, bytes))
-                        else cls.redact(item, rules)
+                    redacted[key] = cls._mask_field(
+                        item, EMAIL_MARKER, COUNT_NAME_EMAIL, rules, counts
                     )
                 else:
-                    redacted[key] = cls.redact(item, rules)
+                    redacted[key] = cls._redact_structure(item, rules, counts)
             return redacted
         if isinstance(value, list):
-            return [cls.redact(item, rules) for item in value]
+            return [cls._redact_structure(item, rules, counts) for item in value]
         if isinstance(value, tuple):
-            return tuple(cls.redact(item, rules) for item in value)
+            return tuple(cls._redact_structure(item, rules, counts) for item in value)
         return value
 
     @staticmethod

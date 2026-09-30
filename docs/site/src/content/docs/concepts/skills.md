@@ -46,17 +46,35 @@ Anything after the frontmatter is procedural instruction: workflows, SOPs, examp
 Two ways a skill enters the model's context:
 
 1. **On-demand.** The agent notices from the user's prompt (or a cron job's prompt) that a particular skill's `description` matches. It loads the skill body and follows the procedure.
-2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. Each fleet audit, for example, always loads `fleet-audit`:
+2. **Explicit reference from a cron job.** `cron/jobs.json` entries can name skills in the `"skills"` field. Each fleet audit always loads `fleet-audit`; the `"skills"` line of the `compliance-audit` entry below is that reference.
 
-   ```json
-   {
-     "id": "compliance-audit",
-     "prompt": "Run the daily fleet security and RBAC posture audit. ...",
-     "skills": ["fleet-audit"]
-   }
-   ```
+<!-- BEGIN GENERATED: cron-job-example -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
 
-   This route is only open to jobs that run a model. A `no_agent` job such as `github-repo-watcher` runs a script instead of a turn, so `skills` has nothing to load into; when its script files a kanban card, the card body names the skill and the worker loads it on demand.
+```json
+{
+  "id": "compliance-audit",
+  "name": "Security & RBAC Posture Audit",
+  "schedule": {
+    "kind": "cron",
+    "expr": "20 6 * * *",
+    "display": "20 6 * * *"
+  },
+  "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 427 lines of it, before you run anything. Its sixteen checks are section 2, lines 90-370, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`skills/fleet-audit/scripts/collect.py compliance-audit`) with --workspace set to the workspace start returned, redirecting its stdout to /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+  "skills": [
+    "fleet-audit"
+  ],
+  "risk": "low",
+  "enabled": true,
+  "deliver": "chat"
+}
+```
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: cron-job-example -->
+
+This route is only open to jobs that run a model. A `no_agent` job such as `github-repo-watcher` runs a script instead of a turn, so `skills` has nothing to load into; when its script files a kanban card, the card body names the skill and the worker loads it on demand.
 
 ## Skill structure conventions
 
@@ -82,7 +100,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 The agent discovers skills from **two** locations at startup:
 
-- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing writes runtime state under them — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. (One mode-gated overlay rides that replace — see [`a2a/persona/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/persona/README.md).) The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`, and a Cluster Agent's identity-stamped `config.yaml`, save for the one image-owned value the entrypoint repairs in it, the remote MCP `User-Agent`) is untouched.
+- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing durable lives under them, and the agent's own tools refuse to write it: `skill_manage` refuses a skill the image ships for its profile, and the file tools refuse any path under the profile's `skills/` or `scripts/` ([`deploy/docker/patches/skill_manage_image_owned.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/skill_manage_image_owned.py)) — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. (One mode-gated overlay rides that replace — see [`a2a/persona/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/persona/README.md).) The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`, and a Cluster Agent's identity-stamped `config.yaml`, save for the one image-owned value the entrypoint repairs in it, the remote MCP `User-Agent`) is untouched.
 - **The profile's runtime workspace** at `$HERMES_HOME/profiles/<profile>/skills` — `HERMES_HOME` defaults to `/opt/data`, so the Platform Agent's is `/opt/data/profiles/platform/skills`. This path is backed by the agent's persistent volume. Note it is _not_ `/opt/data/skills`: that is the `default` profile's home, which belongs to the Planning Agent, and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml) disables the `skills` toolset there — a skill dropped in that directory is loaded by nothing.
 
 That gives you two ways to bring in additional skills — for example from the upstream [`google/skills`](https://github.com/google/skills/tree/main/skills/cloud) catalog.
@@ -138,7 +156,7 @@ kubectl exec -n kubeagents-system -it $AGENT_POD -c platform-agent -- \
   ls -la /opt/data/profiles/platform/skills/<skill-dir>
 ```
 
-The runtime discovers the skill on its next relevant turn. It does **not** survive a pod restart: the entrypoint replaces each specialist profile's `skills/` from the baked template on every start, so an injected skill lasts only as long as the pod. That is the point of Method 2 — it is an iteration loop, not a deployment mechanism. Bake the skill into the image (Method 1) to keep it.
+The runtime discovers the skill on its next relevant turn. It does **not** survive a pod restart: the entrypoint replaces each specialist profile's `skills/` from the baked template on every start, so an injected skill lasts only as long as the pod — and so does a skill the agent authors for itself through `skill_manage`, which is why a gap in a shipped skill is something the agent reports rather than patches. That is the point of Method 2 — it is an iteration loop, not a deployment mechanism. Bake the skill into the image (Method 1) to keep it.
 
 ## Skill vs. governance SOP vs. cron job
 

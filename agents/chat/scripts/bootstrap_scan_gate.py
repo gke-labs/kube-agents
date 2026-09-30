@@ -47,10 +47,13 @@ appears minutes later, from the prioritization card the sweep files, and a
 crashed sweep still leaves board-done/disk-empty. Only a marker written at
 file time covers every case.
 
-Deleting ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which
-nothing else ever removes and which ``should_skip`` also gates on — is the
-supported way to re-arm discovery after a sweep has genuinely failed. Deleting
-the marker alone leaves the gate closed.
+Archiving the previous run's ``bootstrap-inventory-*`` cards and then deleting
+``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which nothing
+else ever removes and which ``should_skip`` also gates on — is the supported way
+to re-arm discovery after a sweep has genuinely failed (the runbook is
+bootstrap_onboarding/README.md §5). Deleting the marker alone leaves the gate
+closed; deleting it without archiving lets the board answer the new sweep card's
+create with the old card, so no sweep runs.
 
 Output is intentionally empty: ``deliver: local`` plus empty stdout means the
 scheduler treats every run as silent. The report reaches the user through
@@ -86,7 +89,8 @@ SCAN_ASSIGNEE = "platform"
 
 # Records that the sweep card has been filed, and which card it was. Its
 # presence — not the existence of the report — is what stops this job filing
-# again. Delete it to deliberately re-arm discovery.
+# again. Delete it, after archiving the previous run's cards, to deliberately
+# re-arm discovery (bootstrap_onboarding/README.md §5).
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 
 # The scan runs as a `platform` worker, whose HERMES_HOME is the platform profile
@@ -118,7 +122,13 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 # projects the roster covers and which it could not list this run.
 SCOPE_SNAPSHOT_NAME = "fleet_scope.json"
 SCOPE_OUTCOME_OK = "ok"
+# The one non-ok container outcome whose lookup succeeded: its members would cross the
+# reconcile's listing cap, so they are carried unlisted. Named apart from a failed lookup.
+SCOPE_OUTCOME_OVER_CAP = "over-cap"
 SCOPE_OUTCOME_UNKNOWN = "unknown"
+# How many unlisted projects the sweep's task prompt names before it counts the rest; a
+# folder or organisation can carry thousands, and the prompt names the container instead.
+SCOPE_GAP_NAMED_LIMIT = 20
 
 # The reconcile that creates the Cluster Agents runs on its own cron at `11 * * * *`,
 # while this gate runs every minute. On a fresh install the gate therefore reaches the
@@ -154,36 +164,85 @@ def _reconcile_script(data_dir: Path) -> Path:
     return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
-def _roster_command() -> str:
-    """The one command that answers "which Cluster Agents exist".
+def _cluster_agent_calls() -> list[str]:
+    """One exact ``kanban_create`` call per Cluster Agent, for Step 2 of the card.
 
-    Both halves are load-bearing and were learned the hard way.
+    The gate reads the roster because the sweep's worker cannot. The worker's
+    ``terminal`` runs in the shell sandbox, which has no ``hermes``, and whose
+    ``/opt/data/profiles`` is a mirror that leaves out every ``config.yaml``
+    (so no ``cluster_identity``) and keeps profiles the reconcile has pruned.
+    This process runs in the agent pod next to the real profiles, and only
+    after ``ensure_cluster_agents`` returns True, so the list is the ready part
+    of the roster the reconcile left, or once it has given up, of whatever
+    roster exists.
 
-    Absolute path, because the kanban worker's terminal runs with a stripped
-    environment in which ``/opt/hermes/.venv/bin`` is not on PATH — a bare
-    ``hermes profile list`` exits 127 there while working fine from an
-    interactive shell, which is why this was not obvious.
+    ``cluster_agent_profile`` resolves the profiles under this process's
+    ``HERMES_HOME``, the same root the markers and the reconcile use, so it
+    follows ``spec.harness.hermes.agentHome``.
 
-    HERMES_HOME pinned unconditionally, because the absolute path ALONE is
-    worse than the 127. The worker is not missing a HERMES_HOME — it has one,
-    pinned to its own profile home, and profiles resolve at
-    ``$HERMES_HOME/profiles/<name>``. Under the worker's value hermes exits 0
-    and prints a plausible roster that is missing profiles (observed:
-    ``default`` only, with ``platform`` absent — the view from inside a
-    profile home). A defaulted expansion like ``${HERMES_HOME:-...}``
-    preserves exactly that wrong value; only an unconditional pin gives the
-    fleet-wide view. A loud failure gets retried; a quiet wrong answer gets
-    believed, and on a real fleet it silently drops clusters from the sweep.
+    A profile is listed only when it meets ``platform_control``'s
+    ``list_cluster_profiles`` rule: registered with Hermes and its scaffold
+    finished. A card assigned to an unregistered directory is never dispatched
+    and the sweep waits on it forever; a profile without ``USER.md`` blocks at
+    preflight, and its cluster is better audited by the sweep itself in Step 4.
 
-    The pinned value is this gate's own data root, resolved when the card is
-    filed — not a literal ``/opt/data``. The gate's HERMES_HOME IS the root
-    the profiles live under (the same one the marker files rely on), while
-    the root itself moves with ``spec.harness.hermes.agentHome``. A hardcoded
-    ``/opt/data`` under a custom home points hermes at a tree with no
-    profiles — the same quiet empty roster, one configuration over; this repo
-    has hit that twice before (see the notes in agents/platform/config.yaml).
+    A profile without a readable ``cluster_identity`` is left out, as the
+    reconcile neither counts nor prunes one: there is no cluster to name on its
+    card, and the card already sends every cluster the list misses to Step 4. A
+    profile whose directory or config cannot be read is skipped the same way: a
+    file like that is what keeps the reconcile failing until it gives up and
+    files the sweep, so it must not take the other profiles with it. An entry
+    whose stat fails with EACCES or EIO fails ``list_profiles`` itself, below;
+    ``list_profiles`` leaves out a dangling symlink.
+
+    Failing to list the profiles, or to import the readiness rule, returns an
+    empty list, which files the solo sweep. Raising would fail the run before
+    the card is filed, on every tick for as long as the failure lasts; like
+    the give-up in ``ensure_cluster_agents``, this gate prefers a degraded
+    report to none.
     """
-    return f"HERMES_HOME={_data_dir()} /opt/hermes/.venv/bin/hermes profile list"
+    try:
+        import cluster_agent_profile as cap  # beside this script in the pod, as for the reconcile
+        from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS
+        from profile_scaffold import is_scaffolded
+
+        names = cap.list_profiles()
+    except Exception as e:  # noqa: BLE001 - never fail the cron run; see the docstring
+        sys.stderr.write(f"bootstrap_scan_gate: could not read the Cluster Agent roster: {e}\n")
+        return []
+    calls = []
+    for name in names:
+        home = cap.profile_home(name)
+        # The probe is inside the try: the image's Python re-raises an is_file()
+        # that fails with EACCES or EIO rather than answering False.
+        try:
+            registered = is_scaffolded(home)
+            missing = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).is_file()]
+            if not registered or missing:
+                sys.stderr.write(
+                    f"bootstrap_scan_gate: skipping Cluster Agent {name}: scaffold not finished "
+                    f"(registered={registered}, missing={missing})\n"
+                )
+                continue
+            identity = cap.read_cluster_identity(home)
+        except Exception as e:  # noqa: BLE001 - see the docstring
+            sys.stderr.write(f"bootstrap_scan_gate: skipping Cluster Agent {name}: {e}\n")
+            continue
+        if identity is None:
+            sys.stderr.write(
+                f"bootstrap_scan_gate: skipping Cluster Agent {name}: no complete cluster_identity in its config\n"
+            )
+            continue
+        # Keyed by the profile name: the identity fields all allow hyphens, so
+        # joining them with hyphens gives two clusters one key, and the board
+        # answers the second create with the first card.
+        calls.append(
+            f"kanban_create(assignee='{name}', "
+            f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}', "
+            f"title='Report cluster inventory: `{identity['cluster']}` (`{identity['project']}`, "
+            f"`{identity['location']}`)', body=<the instructions below>)"
+        )
+    return calls
 
 
 def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
@@ -205,38 +264,87 @@ def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def _scope_has_other_projects(data_dir: Path) -> bool:
-    """Whether the last reconcile resolved more than one project.
+def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
+    """Every row of the snapshot's `containers` array the last reconcile could not resolve, as (id, outcome, projects).
 
-    The task body speaks of "the project" on an install with no scope, exactly as it
-    did before scopes existed, and of "the projects in scope" only once the snapshot
-    names more than one, so a single-project install renders the same prompt as before.
+    A row is a folder, an organisation, a Shared VPC host or a Metrics Scope; the kind is not read here.
+    """
+    try:
+        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
+        return []
+    containers = snapshot.get("containers") if isinstance(snapshot, dict) else None
+    out = []
+    for entry in containers if isinstance(containers, list) else []:
+        if isinstance(entry, dict) and entry.get("id") and entry.get("outcome") != SCOPE_OUTCOME_OK:
+            count = entry.get("projects") if isinstance(entry.get("projects"), int) else 0
+            out.append((str(entry["id"]), str(entry.get("outcome") or SCOPE_OUTCOME_UNKNOWN), count))
+    return sorted(out)
+
+
+def _scope_has_other_projects(data_dir: Path) -> bool:
+    """Whether the last reconcile's scope reaches beyond one project.
+
+    True when the snapshot names more than one project, or any declared folder,
+    organisation, Shared VPC host or Metrics Scope. The task body speaks of "the project" on an install with no scope,
+    exactly as it did before scopes existed, and of "the projects in scope" only then,
+    so a single-project install renders the same prompt as before.
     """
     try:
         snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - absent or unreadable: one project, as before
         return False
     projects = snapshot.get("projects") if isinstance(snapshot, dict) else None
+    containers = snapshot.get("containers") if isinstance(snapshot, dict) else None
+    if isinstance(containers, list) and any(isinstance(c, dict) and c.get("id") for c in containers):
+        return True
     return isinstance(projects, list) and len([p for p in projects if isinstance(p, dict) and p.get("id")]) > 1
 
 
 def _scope_gap_paragraph(data_dir: Path) -> str:
-    """The sweep's note on projects the reconcile could not list, on a scoped install.
+    """The sweep's note on projects, containers and selectors the reconcile could not resolve.
 
-    Rendered only when the snapshot names more than one project: an install with no
-    scope renders the prompt it rendered before scopes existed, whatever its one
-    project's outcome, and that prompt already tells the worker what to do when the
-    project cannot be listed.
+    Rendered when a declared folder, organisation, Shared VPC host or Metrics Scope could not
+    be resolved (each has a row in the snapshot's `containers` array), or when the
+    snapshot names more than one project (or any container) and one project was not listed. An install with
+    no scope renders the prompt it rendered before scopes existed, whatever its one
+    project's outcome: that prompt already tells the worker what to do when the project
+    cannot be listed.
     """
-    if not _scope_has_other_projects(data_dir):
-        return ""
+    containers = _unresolved_containers(data_dir)
     unlisted = _unlisted_projects(data_dir)
-    if not unlisted:
+    # A container the reconcile could not resolve is a gap on its own, even when it
+    # carried no project rows (a first run, or a container the snapshot never reached).
+    if not containers and not (unlisted and _scope_has_other_projects(data_dir)):
         return ""
-    named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted)
+    container_note = ""
+    failed = [c for c in containers if c[1] != SCOPE_OUTCOME_OVER_CAP]
+    over_cap = [c for c in containers if c[1] == SCOPE_OUTCOME_OVER_CAP]
+    if failed:
+        container_note += (
+            "The last reconcile could not resolve "
+            + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in failed)
+            + ", so every project it reaches is unlisted and the container or selector is what to name. "
+        )
+    if over_cap:
+        container_note += (
+            "It resolved "
+            + ", ".join(f"`{cid}` ({count} project(s))" for cid, _outcome, count in over_cap)
+            + " past its listing cap, so those members are carried `over-cap` and unlisted; name the "
+            "container as over the cap, which the declaration fixes (narrower excludes or sub-folders), "
+            "not as unreadable. "
+        )
+    if unlisted:
+        named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted[:SCOPE_GAP_NAMED_LIMIT])
+        rest = len(unlisted) - SCOPE_GAP_NAMED_LIMIT
+        if rest > 0:
+            named += f", and {rest} more (the full list is in `fleet_scope.json`)"
+        project_note = f"The last reconcile did not list these projects: {named}. "
+    else:
+        project_note = "Every project it did resolve was listed. "
     return (
         "**Some projects in scope have no Cluster Agents for a reason the roster cannot show.** "
-        f"The last reconcile did not list these projects: {named}. The roster holds only the "
+        f"{container_note}{project_note}The roster holds only the "
         "clusters of theirs that already had a profile, and you cannot list them yourself. A "
         "project marked `over-cap` is reachable but past the reconcile's listing cap, and the "
         "others the last run could not list. Name each one at the top of the report as not fully "
@@ -379,6 +487,7 @@ def _task_body() -> str:
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
+    calls = "\n".join(f"    {c}" for c in _cluster_agent_calls()) or "    (none)"
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -412,19 +521,20 @@ def _task_body() -> str:
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
-        "**Step 2 — fan out.** Read the roster with exactly this command, exactly once:\n\n"
-        f"    {_roster_command()}\n\n"
-        "Cluster Agents are the profiles whose names start `cluster-`. **If that command "
-        "fails or lists no `cluster-` profiles, there are no Cluster Agents: skip the rest of "
+        "**Step 2 — fan out.** These are the Cluster Agents, one card each, read from the "
+        "profiles when this card was filed. Make every call below exactly once, all of them "
+        "up front:\n\n"
+        f"{calls}\n\n"
+        "This list is the roster. Do not look it up yourself: your terminal runs in a sandbox "
+        "that has neither `hermes` nor the profiles' configuration, so anything you list there "
+        "is incomplete. Pass no `parents` on these calls: a card with this one as its parent "
+        "cannot start until this card completes, and this card waits for them in Step 3. "
+        "**If no calls are listed above, there are no Cluster Agents: skip the rest of "
         "this step and do the whole sweep yourself in Step 4, following Steps 2 to 4 of the "
         "single-cluster audit SOP (its own numbering) for each cluster so the topology and the "
         "workload checks both happen.** That is the normal case for a "
-        "single-cluster install and it is not an error. Use the command as written — the "
-        "absolute path and the `HERMES_HOME` are both required, and a bare `hermes profile "
-        "list` will either fail or quietly return an incomplete roster.\n\n"
-        "For every cluster that has an agent, open one child card per cluster with "
-        "`kanban_create(assignee=<that agent>, "
-        f"idempotency_key='{CLUSTER_IDEMPOTENCY_KEY_PREFIX}<cluster-name>-<location>', ...)`. The body must "
+        "single-cluster install and it is not an error.\n\n"
+        "Each card's body must "
         "send that agent to the single-cluster audit SOP, reading whichever of these exists:\n"
         f"{cluster_audit_list}\n\n"
         "and tell it to complete its card with the structured `metadata` that SOP specifies. "

@@ -3,6 +3,8 @@ name: Prettier Check
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  merge_group:
+    branches: [main]
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
 # second full set of checks behind it. Runs that are not from a pull request
@@ -40,9 +42,16 @@ jobs:
       - name: Run Prettier Check on changed files
         env:
           BASE_REF: ${{ github.base_ref }}
+          # Set only on a merge-queue run, where github.base_ref is empty.
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
-          git fetch origin "$BASE_REF"
-          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=d "origin/$BASE_REF...HEAD" | grep -E '\.md$|\.yaml$|\.yml$' || true)
+          if [ -n "$MERGE_GROUP_BASE_SHA" ]; then
+            BASE="$MERGE_GROUP_BASE_SHA"
+          else
+            git fetch origin "$BASE_REF"
+            BASE="origin/$BASE_REF"
+          fi
+          mapfile -t CHANGED_FILES < <(git diff --name-only --diff-filter=d "$BASE...HEAD" | grep -E '\.md$|\.yaml$|\.yml$' || true)
           if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
             printf 'Checking files:\n'
             printf '%s\n' "${CHANGED_FILES[@]}"

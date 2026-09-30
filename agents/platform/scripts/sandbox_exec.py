@@ -16,6 +16,14 @@ the model from a shell that is already in the sandbox. One call site serves both
 because `sandbox_enabled()` is false in the sandbox — the managed config it reads
 is an agent-pod file — and `run()` then executes locally.
 
+A caller with more than one command to run crosses once, with the whole job,
+rather than once per command: `resolver.py` and `github_token_refresh.py` both
+forward *themselves* through `run()` and do their work on the far side. An ssh
+hop costs the same whatever it carries, and a caller that makes a dozen of them
+under a timeout is spending the budget on the connection rather than on the
+work. Re-entry is not a loop for the same reason one call site serves both
+sides: `sandbox_enabled()` is false over there.
+
 Two things about this module are load-bearing and easy to undo by accident.
 
 It connects as `hermes`, not as `terminal.ssh_user`. That setting is the login
@@ -40,7 +48,7 @@ renders them into the command line rather than into the client's environment.
 `remote_env` is therefore for paths and names, never for secrets. A command
 line is the process's `/proc/<pid>/cmdline`, which every account in the sandbox
 can read — the model's own shell included, and it is the party this boundary
-exists to keep away from the agent pod's credentials. The two callers pass
+exists to keep away from the agent pod's credentials. Its callers pass
 `KUBECONFIG`, a path to a file the sandbox already has. A caller with a secret
 to hand across has no route here and should not invent one: the credential
 proxy holds credentials so that the sandbox never does.
