@@ -54,6 +54,8 @@ everything it refers to.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -96,6 +98,20 @@ __all__ = [
     "INCIDENT_TIMEOUT_SECONDS",
     "actionable_report",
     "store_incident_report",
+    "SLACK_PLATFORM",
+    "COMPLETION_HEAD",
+    "EXPLAINED_KINDS",
+    "WAKING_MODES",
+    "DEFAULT_DELIVERY_MODE",
+    "HELD_ATTR",
+    "HELD_MAX",
+    "TELL_ATTEMPTS",
+    "TELL_RETRY_SECONDS",
+    "slack_ux_on",
+    "completion_text",
+    "explained_by_wake",
+    "hold_explained",
+    "tell_unexplained",
 ]
 
 
@@ -1439,7 +1455,7 @@ def store_incident_report(
 # watcher (:func:`hold_explained`), and the notifier's wake step settles it
 # (:func:`tell_unexplained`): a wake that was admitted for the kind drops it;
 # a wake that raised, or a wake set that turned out not to hold the kind, posts
-# it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry. Three
+# it. ``WakeNotAccepted`` (startup, a full queue) keeps it for the retry. Four
 # trade-offs, accepted:
 #
 # * A wake that raised and later succeeds on a retry tells the failure twice,
@@ -1449,6 +1465,10 @@ def store_incident_report(
 # * A push wake is admission, not narration (``gateway/wake.py``). The line is
 #   dropped once the wake is queued, so a queued turn lost to a restart or an
 #   interrupt before it speaks still leaves the failure untold.
+# * A post that fails is tried :data:`TELL_ATTEMPTS` times in place, then kept
+#   for the next wake attempt. Where there is none (no wake was asked for, or
+#   the attempt that failed was the one that drops the subscription) the line
+#   is lost, and a WARNING names the card.
 # The flag is read through ``gateway.slack_ux_reactions.enabled()``, imported
 # when a delivery runs: that module is copied into the image after this one,
 # and an image without it reads as flag off.
@@ -1472,6 +1492,11 @@ DEFAULT_DELIVERY_MODE = "notify"
 #: and how many subscriptions' worth it keeps before evicting the oldest.
 HELD_ATTR = "_kage_explained_pings"
 HELD_MAX = 256
+
+#: How often a held line's post is tried before it waits for the next wake
+#: attempt, and the pause between tries.
+TELL_ATTEMPTS = 3
+TELL_RETRY_SECONDS = 1.0
 
 
 def slack_ux_on(platform: object) -> bool:
@@ -1542,16 +1567,28 @@ def hold_explained(
         kind, sub["chat_id"], message, dict(metadata or {}),
     )
     while len(held) > HELD_MAX:
-        held.pop(next(iter(held)), None)
+        evicted_key = next(iter(held))
+        evicted = held.pop(evicted_key, None) or {}
+        logger.warning(
+            "kanban notifier: dropping held %s line(s) for %s untold; more than %d "
+            "subscriptions are holding failure lines",
+            ", ".join(sorted(entry[0] for entry in evicted.values())) or "no",
+            evicted_key[0], HELD_MAX,
+        )
 
 
-async def tell_unexplained(runner: object, adapter: object, sub: dict, woken: object) -> None:
+async def tell_unexplained(
+    runner: object, adapter: object, sub: dict, woken: object,
+    scope: Optional[Callable[[], object]] = None,
+) -> None:
     """Post every held line for ``sub`` whose kind is not in ``woken``; drop the rest.
 
     Called by the notifier's wake step with the kinds the wake was admitted for,
-    or an empty set when there was no wake or it raised. Never raises: it runs
-    inside that step's ``try``. A line whose send fails is held again for the
-    next attempt.
+    or an empty set when there was no wake or it raised. ``scope`` is the
+    notification's ``_owner_scope``, so the post reads the subscriber profile's
+    config as upstream's pings do. Never raises: it runs inside that step's
+    ``try``. A post is tried :data:`TELL_ATTEMPTS` times; a line that still
+    fails is held again for the next wake attempt, if there is one.
     """
     try:
         held = getattr(runner, HELD_ATTR, None)
@@ -1567,17 +1604,28 @@ async def tell_unexplained(runner: object, adapter: object, sub: dict, woken: ob
         kind, chat_id, message, metadata = pending[event_id]
         if kind in woken:
             continue
-        try:
-            result = await adapter.send(chat_id, message, metadata=metadata)
-            if getattr(result, "success", True) is False:
-                raise RuntimeError(getattr(result, "error", None) or "send() reported failure")
+        error: Optional[BaseException] = None
+        for attempt in range(TELL_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(TELL_RETRY_SECONDS)
+            try:
+                async with (scope() if scope is not None else contextlib.nullcontext()):
+                    result = await adapter.send(chat_id, message, metadata=metadata)
+                if getattr(result, "success", True) is False:
+                    raise RuntimeError(getattr(result, "error", None) or "send() reported failure")
+            except Exception as exc:
+                error = exc
+                continue
+            error = None
             logger.info(
                 "kanban notifier: posted the %s line for %s, which no wake explained",
                 kind, sub.get("task_id"),
             )
-        except Exception as exc:
+            break
+        if error is not None:
             logger.warning(
-                "kanban notifier: posting the %s line for %s failed: %s; holding it for the retry",
-                kind, sub.get("task_id"), exc,
+                "kanban notifier: posting the %s line for %s failed %d times: %s; holding it "
+                "for the next wake attempt, and it goes untold if there is none",
+                kind, sub.get("task_id"), TELL_ATTEMPTS, error,
             )
             held.setdefault(key, {})[event_id] = pending[event_id]

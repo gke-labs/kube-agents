@@ -38,6 +38,13 @@ object and an ``_EVENT_FORMATTERS`` table:
   after ``_send_event`` returned for *this* event and the send was accounted
   for — which is a stronger guarantee than the old site gave (the old site
   also ran on the non-push path, where nothing had been sent).
+* **The completion message** is ``_fmt_completed``'s ``return``: its
+  ``✔ … done`` f-string becomes a ``completion_text`` call, which returns the
+  same text unless ``KAGE_SLACK_UX`` is on and ``n.platform_str`` is Slack.
+* **The wake step's outcome** is the ``if wake_kinds: try: await self.wake()``
+  block in ``_KanbanNotification.deliver()``, above the ``advance()`` tail.
+  Each way out of it (no wake, wake admitted, wake raised) settles the failure
+  lines anchor 5 describes; ``WakeNotAccepted`` leaves them held.
 
 The old ``LegacyEquivalenceTest`` claim — that this applier's output is
 byte-identical to three superseded appliers' — cannot be made against a
@@ -275,11 +282,15 @@ COMPLETION_PATCHED = (
 # held, which is every delivery with the flag off. See section 6 of
 # gateway/kanban_notifier.py.
 
+# ``self._owner_scope`` rides along so the held line is posted in the
+# subscriber profile's scope, as ``_send_pings`` posts the pings it replaces.
 TELL_WOKEN = (
-    "await _kanban_tell_unexplained(self.runner, self.adapter, self.sub, wake_kinds)\n"
+    "await _kanban_tell_unexplained("
+    "self.runner, self.adapter, self.sub, wake_kinds, self._owner_scope)\n"
 )
 TELL_NONE = (
-    "await _kanban_tell_unexplained(self.runner, self.adapter, self.sub, set())\n"
+    "await _kanban_tell_unexplained("
+    "self.runner, self.adapter, self.sub, set(), self._owner_scope)\n"
 )
 
 TELL_ANCHOR = (
