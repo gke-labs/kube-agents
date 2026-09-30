@@ -1,0 +1,79 @@
+
+## 2026-09-29T13:52:40Z [removed-api/before] K -n kubeagents-system logs job/first-run
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/urllib/request.py", line 1344, in do_open
+    h.request(req.get_method(), req.selector, req.data, headers,
+  File "/usr/local/lib/python3.12/http/client.py", line 1386, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+  File "/usr/local/lib/python3.12/http/client.py", line 1432, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+  File "/usr/local/lib/python3.12/http/client.py", line 1381, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "/usr/local/lib/python3.12/http/client.py", line 1141, in _send_output
+    self.send(msg)
+  File "/usr/local/lib/python3.12/http/client.py", line 1085, in send
+    self.connect()
+  File "/usr/local/lib/python3.12/http/client.py", line 1520, in connect
+    super().connect()
+  File "/usr/local/lib/python3.12/http/client.py", line 1051, in connect
+    self.sock = self._create_connection(
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/socket.py", line 841, in create_connection
+    for res in getaddrinfo(host, port, 0, SOCK_STREAM):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/socket.py", line 978, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno -3] Temporary failure in name resolution
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/app/tuner.py", line 26, in <module>
+    st, body = call("GET", f"{HOST}/version")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/tuner.py", line 20, in call
+    with urllib.request.urlopen(req, context=CTX, timeout=20) as r:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 1392, in https_open
+    return self.do_open(http.client.HTTPSConnection, req,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/urllib/request.py", line 1347, in do_open
+    raise URLError(err)
+urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resolution>
+## exit 0
+
+## 2026-09-29T13:52:41Z [removed-api/audit] G logging read resource.type=k8s_cluster AND resource.labels.cluster_name=upg-06 AND labels."k8s.io/removed-release"="1.32" --freshness 1h --limit 2 --format=value(timestamp,protoPayload.methodName,protoPayload.requestMetadata.callerSuppliedUserAgent)
+## exit 0
+
+## 2026-09-29T13:54:57Z [removed-api/before-retry] first-run-2 (the first run hit DNS before kube-dns was up)
+ok 2026-09-29T13:54:19Z: created FlowSchema legacy-batch-lane via flowcontrol.apiserver.k8s.io/v1beta3 on server v1.31.14-gke.2759000 (HTTP 201)
+1.31.14-gke.2759000	RECONCILING
+
+## 2026-09-29T14:03:09Z [removed-api/after] K -n kubeagents-system logs job/after-upgrade
+BROKEN 2026-09-29T14:02:31Z: server v1.32.13-gke.2504000 no longer serves flowcontrol.apiserver.k8s.io/v1beta3 (discovery returned 404); this tool cannot run
+## exit 0
+
+## 2026-09-29T14:03:10Z [removed-api/v1beta3-discovery] K get --raw /apis/flowcontrol.apiserver.k8s.io/v1beta3
+Error from server (NotFound): the server could not find the requested resource
+## exit 1
+
+## 2026-09-29T14:03:11Z [removed-api/object-via-v1] K get flowschema.v1.flowcontrol.apiserver.k8s.io legacy-batch-lane -o jsonpath={.metadata.name}{"\n"}
+legacy-batch-lane
+## exit 0
+
+## 2026-09-29T14:12:24Z [removed-api/audit-recheck] G logging read resource.type=k8s_cluster AND resource.labels.cluster_name=upg-06 AND labels."k8s.io/removed-release"="1.32" --freshness 3h --limit 5 --format=value(timestamp,protoPayload.methodName,labels."k8s.io/removed-release",protoPayload.requestMetadata.callerSuppliedUserAgent)
+2026-09-29T13:54:19.378013Z	io.k8s.apiserver.flowcontrol.v1beta3.flowschemas.create	1.32	legacy-flowcontrol-tuner/0.3
+## exit 0

@@ -1,0 +1,143 @@
+{
+ "read_at": "2026-09-29T1747Z",
+ "newest_refresh": "2026-09-28T00:00:00Z",
+ "raw": "recommender/2026-09-29T1747Z",
+ "zones": [
+  "asia-east1-a",
+  "asia-southeast1-b",
+  "europe-west1-b",
+  "europe-west4-a",
+  "europe-west4-b",
+  "us-central1-a",
+  "us-central1-b",
+  "us-central1-c",
+  "us-east1-d",
+  "us-east4-c",
+  "us-west1-a",
+  "us-west1-b"
+ ],
+ "clusters": {
+  "gemma-gpu": [
+   {
+    "kind": "insight",
+    "subtype": "NETWORK_POLICIES_UNRECONCILED",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Cluster gemma-gpu contains one or more NetworkPolicy resources, but GKE does not enforce them. This might be intentional if using your own component, but otherwise pod traffic remains unrestricted.",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/984c483e-b421-4457-bc0d-5b8fdf8d87c6"
+   },
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster gemma-gpu is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service account](htt",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/8f61d0b4-ffa3-441f-9b0e-e2aa512cb6e5"
+   },
+   {
+    "kind": "insight",
+    "subtype": "PDB_UNPERMISSIVE",
+    "lastRefreshTime": "2026-09-27T23:56:00Z",
+    "state": "ACTIVE",
+    "description": "PodDisruptionBudget exists that allows for 0 pod evictions. This is impossible to adhere to for pod maintenance activities (like node upgrade) to take place. A PDB must allow for at least one pod to b",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/2b2051c2-0211-4a1a-81a7-ae4cb43893d3"
+   },
+   {
+    "kind": "insight",
+    "subtype": "WORKLOAD_OVERPROVISIONED",
+    "lastRefreshTime": "2026-09-26T15:00:00Z",
+    "state": "ACTIVE",
+    "description": "The workload has containers for which CPU utilization P90 has not exceeded 50% of the requested resources over the past 15 days. [Learn More](https://cloud.google.com/kubernetes-engine/docs/how-to/opt",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/e8494da8-21b6-4491-88a0-41c5069ce8fa"
+   },
+   {
+    "kind": "insight",
+    "subtype": "WORKLOAD_UNDERPROVISIONED",
+    "lastRefreshTime": "2026-09-25T15:00:00Z",
+    "state": "ACTIVE",
+    "description": "The workload has containers for which memory utilization P90 has exceeded 150% of the requested resources over the past 15 days or containers without memory requests. Memory usage can not be throttled",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/a1b01353-c09a-4fce-a06c-b5d206e661ab"
+   }
+  ],
+  "gemma-gpu-upgraded": [
+   {
+    "kind": "insight",
+    "subtype": "NETWORK_POLICIES_UNRECONCILED",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Cluster gemma-gpu-upgraded contains one or more NetworkPolicy resources, but GKE does not enforce them. This might be intentional if using your own component, but otherwise pod traffic remains unrestr",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/cdfc891f-e635-4af6-974f-237f5c648c90"
+   },
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster gemma-gpu-upgraded is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service acc",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/603d1aa2-cc35-4a47-9bb9-8222d3c85ba4"
+   },
+   {
+    "kind": "insight",
+    "subtype": "PDB_UNPERMISSIVE",
+    "lastRefreshTime": "2026-09-27T23:58:00Z",
+    "state": "ACTIVE",
+    "description": "PodDisruptionBudget exists that allows for 0 pod evictions. This is impossible to adhere to for pod maintenance activities (like node upgrade) to take place. A PDB must allow for at least one pod to b",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/d05c2c65-b7c3-4ffa-9e91-93db3425285b"
+   },
+   {
+    "kind": "insight",
+    "subtype": "WORKLOAD_OVERPROVISIONED",
+    "lastRefreshTime": "2026-09-26T15:00:00Z",
+    "state": "ACTIVE",
+    "description": "The workload has containers for which CPU utilization P90 has not exceeded 50% of the requested resources over the past 15 days. [Learn More](https://cloud.google.com/kubernetes-engine/docs/how-to/opt",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/97b20a32-d059-4725-a0a9-e05c6bfb1a67"
+   },
+   {
+    "kind": "insight",
+    "subtype": "WORKLOAD_UNDERPROVISIONED",
+    "lastRefreshTime": "2026-09-26T15:00:00Z",
+    "state": "ACTIVE",
+    "description": "The workload has containers for which memory utilization P90 has exceeded 150% of the requested resources over the past 15 days or containers without memory requests. Memory usage can not be throttled",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/3e7a37af-f397-49cd-9a57-d879566a13e5"
+   }
+  ],
+  "seeded-a": [
+   {
+    "kind": "insight",
+    "subtype": "NETWORK_POLICIES_UNRECONCILED",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Cluster seeded-a contains one or more NetworkPolicy resources, but GKE does not enforce them. This might be intentional if using your own component, but otherwise pod traffic remains unrestricted.",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/7703b28b-f76f-4436-95cc-685ebe23f826"
+   },
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster seeded-a is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service account](http",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/0685dc3e-2403-4e7d-98b6-f72e4a04b877"
+   }
+  ],
+  "seeded-b": [
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster seeded-b is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service account](http",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/ebd456a8-0340-4d0c-9c8f-f0538e48dc34"
+   }
+  ],
+  "seeded-c": [
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-28T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster seeded-c is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service account](http",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-a/insightTypes/google.container.DiagnosisInsight/insights/d90fbdce-cfb3-4ba6-9e3c-6841347844bb"
+   }
+  ]
+ }
+}

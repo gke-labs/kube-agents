@@ -1,0 +1,50 @@
+
+## 2026-09-29T13:50:21Z [budget/before] K -n scen get pdb pinned -o custom-columns=NAME:.metadata.name,MAXU:.spec.maxUnavailable,ALLOWED:.status.disruptionsAllowed,HEALTHY:.status.currentHealthy
+NAME     MAXU   ALLOWED   HEALTHY
+pinned   0      0         1
+## exit 0
+
+## 2026-09-29T13:50:23Z [budget/eviction-by-hand] K create --raw /api/v1/namespaces/scen/pods/pinned-67875bf4d4-29kq5/eviction -f /dev/stdin
+Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's disruption budget.
+## exit 1
+
+## 2026-09-29T15:02:22Z [budget/after-pods] K -n scen get pods -l app=pinned -o wide
+NAME                      READY   STATUS    RESTARTS   AGE    IP       NODE     NOMINATED NODE   READINESS GATES
+pinned-67875bf4d4-8nvf6   0/1     Pending   0          2m7s   <none>   <none>   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:02:22Z [budget/after-events] K -n scen get events --sort-by=.lastTimestamp -o custom-columns=T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message
+T                      R                   O                         M
+2026-09-29T15:00:16Z   NotTriggerScaleUp   pinned-67875bf4d4-8nvf6   Pod didn't trigger scale-up: 
+2026-09-29T15:00:16Z   Killing             pinned-67875bf4d4-gjnz6   Stopping container web
+2026-09-29T15:00:16Z   SuccessfulCreate    pinned-67875bf4d4         Created pod: pinned-67875bf4d4-8nvf6
+2026-09-29T15:01:07Z   FailedScheduling    pinned-67875bf4d4-8nvf6   0/3 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) were unschedulable. no new claims to deallocate, preemption: 0/3 nodes are available: 1 No preemption victims found for incoming pod, 2 Preemption is not helpful for scheduling.
+## exit 0
+
+## 2026-09-29T15:02:23Z [budget/op-timeline] G container operations list --zone us-central1-a --filter=targetLink~clusters/upg-01/nodePools --format=table(operationType,status,startTime,endTime)
+TYPE              STATUS  START_TIME                      END_TIME
+CREATE_NODE_POOL  DONE    2026-09-29T13:48:02.990964814Z  2026-09-29T13:49:09.683826859Z
+UPGRADE_NODES     DONE    2026-09-29T13:59:14.089422087Z  2026-09-29T15:02:11.657672787Z
+## exit 0
+
+## 2026-09-29T15:02:24Z [budget/refused-evictions-audit] G logging read resource.type=k8s_cluster AND resource.labels.cluster_name=upg-01 AND protoPayload.methodName=io.k8s.core.v1.pods.eviction.create AND protoPayload.response.code=429 --freshness 3h --limit 3 --format=value(timestamp,protoPayload.authenticationInfo.principalEmail)
+2026-09-29T15:00:13.790784Z	service-<PROJECT_NUMBER>@container-engine-robot.iam.gserviceaccount.com
+2026-09-29T15:00:11.687422Z	service-<PROJECT_NUMBER>@container-engine-robot.iam.gserviceaccount.com
+2026-09-29T15:00:09.594752Z	service-<PROJECT_NUMBER>@container-engine-robot.iam.gserviceaccount.com
+## exit 0
+
+## 2026-09-29T15:04:31Z [budget/recapture-pending] the replacement pod after GKE reported UPGRADE_NODES DONE at 15:02:11Z; this first-wave pool is one e2-small node
+T                      R                   M
+2026-09-29T15:01:07Z   FailedScheduling    0/3 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) were unschedulable. no new claims to deallocate, preemption: 0/3 nodes are available: 1 No preemption victims found for incoming pod, 2 Preemption is not helpful for scheduling.
+2026-09-29T15:00:16Z   NotTriggerScaleUp   Pod didn't trigger scale-up: 
+2026-09-29T15:02:57Z   FailedScheduling    0/2 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/2 nodes are available: 1 No preemption victims found for incoming pod, 1 Preemption is not helpful for scheduling.
+Allocated resources:
+  (Total limits may be over 100 percent, i.e., overcommitted.)
+  Resource           Requests          Limits
+  --------           --------          ------
+  cpu                938m (99%)        7 (744%)
+  memory             1184462080 (83%)  7380810240 (518%)
+  ephemeral-storage  0 (0%)            0 (0%)
+  hugepages-1Gi      0 (0%)            0 (0%)
+  hugepages-2Mi      0 (0%)            0 (0%)
+## exit 0
