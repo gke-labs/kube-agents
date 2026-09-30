@@ -11,14 +11,17 @@ Imported in the function, as that function already imports ``gateway``: a
 module-level import would run while ``cron.scheduler`` is still loading.
 
 ``gateway/run_turn.py``: the heartbeat's display mode passes through
-``long_running_mode`` straight after it is read, so the ``off`` check below it
-sees the result.
+``long_running_mode``, with the turn's status metadata, straight after it is
+read, so the ``off`` check below it sees the result.
 
 ``gateway/run_shutdown.py``: ``_send_notice_logged``, which sends both the
 shutdown notice and the interrupted-cron-job notice, sends ``notice_text(...)``.
 
-``gateway/run_notifications.py``: the post-restart notice and
-``_send_home_channel_message`` (the home-channel startup notice) do the same.
+``gateway/run_notifications.py``: the post-restart notice returns before its
+send when ``drop_notice`` says so (the ``finally`` still unlinks the marker),
+and the home-channel startup loop skips the channel before calling
+``_send_home_channel_message``. The helper itself is untouched, since the
+session-database warnings share it.
 
 With the flag off every helper returns its input unchanged, so the calls are
 upstream's. What the flag changes, and why, is in the module docstring of
@@ -90,10 +93,11 @@ HEARTBEAT_ANCHOR = (
     " default=True, allow_generic=True)\n"
 )
 HEARTBEAT_PATCHED = HEARTBEAT_ANCHOR + (
-    "        # kube-agents patch: KAGE_SLACK_UX gives Slack the generic heartbeat; see\n"
+    "        # kube-agents patch: KAGE_SLACK_UX drops the heartbeat under Slack's status\n"
+    "        # line and makes it generic elsewhere on Slack; see\n"
     "        # gateway/slack_boilerplate.py. Off, the mode is unchanged.\n"
     "        _long_running_mode = _kage_slack_boilerplate.long_running_mode(\n"
-    "            turn_ctx.source, _long_running_mode)\n"
+    "            turn_ctx.source, _long_running_mode, turn_ctx._status_thread_metadata)\n"
 )
 
 RUN_SHUTDOWN = "gateway/run_shutdown.py"
@@ -109,24 +113,29 @@ SHUTDOWN_SEND_PATCHED = (
 RUN_NOTIFICATIONS = "gateway/run_notifications.py"
 
 RESTARTED_ANCHOR = (
+    "            result = await transport.send(\n"
     '                platform, str(chat_id), "♻ Gateway restarted successfully. Your session continues.",\n'
 )
 RESTARTED_PATCHED = (
-    "                # kube-agents patch: reworded on Slack under KAGE_SLACK_UX; see\n"
-    "                # gateway/slack_boilerplate.py.\n"
-    "                platform, str(chat_id), _kage_slack_boilerplate.notice_text(\n"
-    '                    platform, "♻ Gateway restarted successfully. Your session continues."),\n'
-)
+    "            # kube-agents patch: KAGE_SLACK_UX keeps this notice off Slack; see\n"
+    "            # gateway/slack_boilerplate.py. The finally below still unlinks the marker.\n"
+    "            if _kage_slack_boilerplate.drop_notice(platform):\n"
+    '                logger.info("Restart notification to %s:%s not sent: KAGE_SLACK_UX", platform_str, chat_id)\n'
+    "                return None\n"
+) + RESTARTED_ANCHOR
 
-HOME_CHANNEL_ANCHOR = (
-    '        """Best-effort send to one home channel; True on success, failures logged with ``failure_fmt``."""\n'
-    "        from gateway.run import _non_conversational_metadata\n"
+STARTUP_ANCHOR = (
+    "            target = _notice_target_key(platform.value, home.chat_id, home.thread_id)\n"
+    "            if target in skipped or target in delivered:\n"
+    "                continue\n"
 )
-HOME_CHANNEL_PATCHED = HOME_CHANNEL_ANCHOR + (
-    "        # kube-agents patch: KAGE_SLACK_UX rewords the notice on Slack; see\n"
-    "        # gateway/slack_boilerplate.py. Off, the message is unchanged.\n"
-    "        message = _kage_slack_boilerplate.notice_text(platform, message)\n"
-)
+STARTUP_PATCHED = (
+    "            # kube-agents patch: KAGE_SLACK_UX keeps this notice off Slack; see\n"
+    "            # gateway/slack_boilerplate.py.\n"
+    "            if _kage_slack_boilerplate.drop_notice(platform):\n"
+    '                logger.info("Home-channel startup notification to %s not sent: KAGE_SLACK_UX", platform.value)\n'
+    "                continue\n"
+) + STARTUP_ANCHOR
 
 
 def apply(root: Path) -> None:
@@ -149,7 +158,7 @@ def apply(root: Path) -> None:
     run_notifications = patchlib.Patch(root, RUN_NOTIFICATIONS, prefix=PREFIX)
     run_notifications.refuse_if_patched(BUILD_MARKER)
     run_notifications.substitute(RESTARTED_ANCHOR, RESTARTED_PATCHED, label="post-restart notice")
-    run_notifications.substitute(HOME_CHANNEL_ANCHOR, HOME_CHANNEL_PATCHED, label="_send_home_channel_message")
+    run_notifications.substitute(STARTUP_ANCHOR, STARTUP_PATCHED, label="home-channel startup loop")
     run_notifications.append(GATEWAY_IMPORT)
 
     delivery.commit("2 anchors")

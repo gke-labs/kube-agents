@@ -26,20 +26,27 @@ back out of the header, and it and every non-Slack target keep the wrapper. The
 choice is per target, so one delivery to both Slack and the relay wraps the
 relay's copy only.
 
-**The heartbeat's trace.** A turn that runs past three minutes gets an
-edited-in-place heartbeat, ``⏳ Working — 3 min — terminal``: the name of the
-tool running, or ``starting API call #52``. On Slack it uses Hermes' own
-generic mode instead (a phrase from ``gateway/assets/status_phrases.yaml``,
-"still on it"), the same as ``long_running_notifications: generic`` for Slack
-alone. ``off`` stays off.
+**The heartbeat.** Hermes can post an edited-in-place heartbeat into a turn
+that runs past three minutes, ``⏳ Working — 3 min — terminal``: the name of the
+tool running, or ``starting API call #52``. It is opt-in on Slack: upstream's
+Slack display tier sets ``long_running_notifications`` off, and a stock install
+does not turn it on. Where an operator has, a turn that replies in a thread
+already shows the adapter's status line, which counts the minutes itself, so
+the heartbeat is dropped there. Elsewhere on Slack it uses Hermes' generic
+mode (a phrase from ``gateway/assets/status_phrases.yaml``, "still on it"), the
+same as ``long_running_notifications: generic`` for Slack alone. ``off`` stays
+off.
 
 **The gateway's lifecycle notices.** A restart or shutdown tells the chats it
 interrupts, the home channel and each interrupted cron job's owner about it in
 Hermes' own terms (``⚠️ Gateway restarting — Your current task will be
-interrupted.``, ``♻️ Gateway online — Hermes is back and ready.``). On Slack each
-known notice is reworded in the agent's first person. The notices still go out:
-a user whose question was cut off needs to know. Text this module does not
-recognise, a later upstream rewording included, passes through unchanged.
+interrupted.``). On Slack the shutdown, restarting and interrupted-cron notices
+are reworded in the agent's first person: a user whose question was cut off
+needs to know. The two that only announce the gateway is back, ``♻ Gateway
+restarted successfully.`` to the chat that asked for the restart and ``♻️
+Gateway online — Hermes is back and ready.`` to the home channel, are not sent
+to Slack at all: ``drop_notice`` gates both call sites. Text this module does
+not recognise, a later upstream rewording included, passes through unchanged.
 """
 
 from __future__ import annotations
@@ -67,26 +74,21 @@ FLAG_ON_VALUES = frozenset({"1", "true", "yes", "on"})
 #: The platform name cron targets and message sources carry for Slack.
 PLATFORM = "slack"
 
-#: ``_display_surface_mode``'s values: the heartbeat as upstream writes it, and
-#: the phrase-catalog form.
+#: ``_display_surface_mode``'s values: the heartbeat as upstream writes it, the
+#: phrase-catalog form, and none.
 MODE_RAW = "raw"
 MODE_GENERIC = "generic"
+MODE_OFF = "off"
 
-#: Upstream's lifecycle notices, verbatim, and what Slack is sent instead.
+#: Upstream's interrupting notices, verbatim, and what Slack is sent instead.
 NOTICE_REWORDS = {
     "⚠️ Gateway shutting down — Your current task will be interrupted.":
         "I'm going offline for a moment, so I've had to stop what I was working on.",
     "⚠️ Gateway restarting — Your current task will be interrupted. "
     "Send any message after restart and I'll try to resume where you left off.":
         "I'm restarting, so I've had to stop what I was working on. "
-        "Send me a message once I'm back and I'll pick up where I left off.",
-    "♻ Gateway restarted successfully. Your session continues.":
-        "I'm back. We can carry on where we left off.",
+        "Send me a message in a minute and I'll pick up where I left off.",
 }
-
-#: The home-channel startup notice, which upstream may follow with a second line.
-ONLINE_NOTICE = "♻️ Gateway online — Hermes is back and ready."
-ONLINE_REWORD = "I'm back online."
 
 #: ``_notify_interrupted_cron_jobs``'s notice, and its action words in plain voice.
 CRON_INTERRUPTED = re.compile(
@@ -147,23 +149,32 @@ def cron_delivery_text(
     return text
 
 
-def long_running_mode(source: Any, mode: str) -> str:
-    """The heartbeat's display mode for ``source``: generic on Slack when it was raw."""
-    if mode != MODE_RAW or not enabled():
+def long_running_mode(source: Any, mode: str, metadata: Any = None) -> str:
+    """The heartbeat's display mode for ``source``, whose status metadata is ``metadata``.
+
+    On Slack: off where the turn replies in a thread, since the status line
+    shows there; generic where it was raw. Anything else returns ``mode``.
+    """
+    if mode == MODE_OFF or not enabled():
         return mode
     if _platform_name(getattr(source, "platform", "")) != PLATFORM:
         return mode
-    return MODE_GENERIC
+    if isinstance(metadata, dict) and metadata.get("thread_id"):
+        return MODE_OFF
+    return MODE_GENERIC if mode == MODE_RAW else mode
+
+
+def drop_notice(platform: Any) -> bool:
+    """Whether a back-online notice to ``platform`` is skipped: Slack, with the flag on."""
+    return _platform_name(platform) == PLATFORM and enabled()
 
 
 def notice_text(platform: Any, text: str) -> str:
-    """A gateway lifecycle notice as ``platform`` is sent it: reworded on Slack."""
+    """A gateway interrupting notice as ``platform`` is sent it: reworded on Slack."""
     if _platform_name(platform) != PLATFORM or not isinstance(text, str) or not enabled():
         return text
     if text in NOTICE_REWORDS:
         return NOTICE_REWORDS[text]
-    if text.startswith(ONLINE_NOTICE):
-        return ONLINE_REWORD + text[len(ONLINE_NOTICE):]
     match = CRON_INTERRUPTED.fullmatch(text)
     if match:
         return CRON_INTERRUPTED_REWORD.format(

@@ -4,7 +4,8 @@ Run: python3 -m pytest deploy/docker/patches/test_slack_boilerplate.py
 
 The fixtures carry upstream's call sites verbatim (v2026.9.14) inside trimmed
 stand-ins for the four files: the cron wrapper and the per-target send lanes,
-the heartbeat's mode read, the notice send and the lifecycle notices. The
+the heartbeat's mode read, the notice send, the lifecycle notices and the
+home-channel startup loop. The
 tests apply the patch, exec the patched and unpatched fixtures, and compare
 what each sends: with the flag off, or for any platform but Slack, the two
 must be identical.
@@ -104,6 +105,7 @@ class TurnRunner:
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
             return
+        _status_thread_metadata = turn_ctx._status_thread_metadata
         return _long_running_mode
 '''
 
@@ -155,15 +157,27 @@ class GatewayShutdownMixin:
 
 RUN_NOTIFICATIONS = '''\
 """Fixture standing in for gateway/run_notifications.py."""
+import logging
+
+logger = logging.getLogger(__name__)
+UNLINKED = []
+
+
+def _notice_target_key(platform, chat_id, thread_id):
+    return (platform, str(chat_id), thread_id)
 
 
 class GatewayNotificationsMixin:
     async def _send_restart_notification(self, transport, platform, chat_id):
-        result = await transport.send(
+        platform_str = platform.value
+        try:
+            result = await transport.send(
                 platform, str(chat_id), "♻ Gateway restarted successfully. Your session continues.",
                 metadata=None,
             )
-        return result
+            return result
+        finally:
+            UNLINKED.append(chat_id)
 
     async def _send_home_channel_message(self, platform, home, transport, message: str, failure_fmt: str) -> bool:
         """Best-effort send to one home channel; True on success, failures logged with ``failure_fmt``."""
@@ -172,11 +186,21 @@ class GatewayNotificationsMixin:
         return result
 
     async def _send_home_channel_startup_notifications(self, *, skip_targets=None):
+        delivered = set()
+        skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
         free_tier_line = self._free_tier_startup_line()
         if free_tier_line:
             message = f"{message}\\n{free_tier_line}"
-        return message
+        for platform, home, transport in self._home_channel_transports():
+            target = _notice_target_key(platform.value, home.chat_id, home.thread_id)
+            if target in skipped or target in delivered:
+                continue
+            if await self._send_home_channel_message(
+                platform, home, transport, message, "Home-channel startup notification failed for %s:%s: %s",
+            ):
+                delivered.add(target)
+        return delivered
 '''
 
 FIXTURES = {
@@ -239,8 +263,12 @@ class _Transport:
         self.sent = []
 
     async def send(self, platform, chat_id, message, metadata=None):
-        self.sent.append(message)
+        self.sent.append((_platform(platform), message))
         return SimpleNamespace(success=True)
+
+
+def _platform(platform):
+    return getattr(platform, "value", platform)
 
 
 class _Adapter:
@@ -289,6 +317,27 @@ class ApplierTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             verifier.main(self.root.dir)
         self.assertIn("Gateway stopping", str(caught.exception))
+
+    def test_verifier_refuses_a_back_online_notice_reaching_slack(self):
+        applier.apply(self.root.dir)
+        runtime_path = self.root.dir / "gateway" / "slack_boilerplate.py"
+        good = runtime_path.read_text()
+        runtime_path.write_text(good.replace(
+            "return _platform_name(platform) == PLATFORM and enabled()", "return False"))
+        with self.assertRaises(SystemExit) as caught:
+            verifier.main(self.root.dir)
+        self.assertIn("drop_notice", str(caught.exception))
+        runtime_path.write_text(good)
+        path = self.root.dir / applier.RUN_NOTIFICATIONS
+        patched = path.read_text()
+        for exit_line in ("return None\n", "continue\n            target ="):
+            with self.subTest(exit_line=exit_line):
+                path.write_text(patched.replace(exit_line, "pass\n" + exit_line.partition("\n")[2], 1))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn("drop_notice(platform) guards", str(caught.exception))
+        path.write_text(patched)
+        verifier.main(self.root.dir)
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
@@ -343,9 +392,10 @@ class HeartbeatTest(unittest.TestCase):
         applier.apply(self.root.dir)
         self.patched = self.root.load(applier.RUN_TURN, "patched")["TurnRunner"]()
 
-    def _mode(self, runner, platform, mode, env):
+    def _mode(self, runner, platform, mode, env, metadata=None):
         disp = SimpleNamespace(_display_surface_mode=lambda *a, **k: mode)
-        turn_ctx = SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value=platform)))
+        turn_ctx = SimpleNamespace(
+            source=SimpleNamespace(platform=SimpleNamespace(value=platform)), _status_thread_metadata=metadata)
         with mock.patch.dict(os.environ, env):
             return _run(runner._run_agent_notify_long_running(disp, turn_ctx, []))
 
@@ -353,11 +403,20 @@ class HeartbeatTest(unittest.TestCase):
         for platform in ("slack", "google_chat"):
             for mode in ("raw", "generic", "off"):
                 for env in ({"KAGE_SLACK_UX": ""}, FLAG_ON):
-                    with self.subTest(platform=platform, mode=mode, env=env):
-                        expected = self._mode(self.upstream, platform, mode, env)
-                        if platform == "slack" and mode == "raw" and env is FLAG_ON:
-                            expected = "generic"
-                        self.assertEqual(self._mode(self.patched, platform, mode, env), expected)
+                    for metadata in (None, {"thread_id": "1.2"}, {"reply_to_message_id": "1.2"}):
+                        with self.subTest(platform=platform, mode=mode, env=env, metadata=metadata):
+                            expected = self._mode(self.upstream, platform, mode, env, metadata)
+                            if platform == "slack" and env is FLAG_ON and mode != "off":
+                                threaded = bool(metadata and metadata.get("thread_id"))
+                                expected = None if threaded else "generic"
+                            self.assertEqual(self._mode(self.patched, platform, mode, env, metadata), expected)
+
+    def test_slack_under_a_status_line_posts_no_heartbeat(self):
+        with mock.patch.dict(os.environ, FLAG_ON):
+            slack = SimpleNamespace(platform=SimpleNamespace(value="slack"))
+            self.assertEqual(runtime.long_running_mode(slack, "raw", {"thread_id": "1.2"}), "off")
+            self.assertEqual(runtime.long_running_mode(slack, "generic", {"thread_id": "1.2"}), "off")
+            self.assertEqual(runtime.long_running_mode(slack, "raw", {"thread_id": ""}), "generic")
 
 
 class NoticeTest(unittest.TestCase):
@@ -365,21 +424,20 @@ class NoticeTest(unittest.TestCase):
         self.root = _Root()
         self.addCleanup(self.root.cleanup)
         self.upstream_shutdown = self.root.load(applier.RUN_SHUTDOWN, "upstream")["GatewayShutdownMixin"]
-        self.upstream_notes = self.root.load(applier.RUN_NOTIFICATIONS, "upstream")["GatewayNotificationsMixin"]
+        self.upstream_ns = self.root.load(applier.RUN_NOTIFICATIONS, "upstream")
+        self.upstream_notes = self.upstream_ns["GatewayNotificationsMixin"]
         applier.apply(self.root.dir)
         self.shutdown = self.root.load(applier.RUN_SHUTDOWN, "patched")["GatewayShutdownMixin"]
-        self.notes = self.root.load(applier.RUN_NOTIFICATIONS, "patched")["GatewayNotificationsMixin"]
+        self.notes_ns = self.root.load(applier.RUN_NOTIFICATIONS, "patched")
+        self.notes = self.notes_ns["GatewayNotificationsMixin"]
 
     def _notices(self):
-        """Every lifecycle notice, as upstream's fixture renders it."""
+        """Every interrupting notice, as upstream's fixture renders it."""
         out = []
         for restart in (False, True):
             owner = SimpleNamespace(_restart_requested=restart)
             out.append(_run(self.upstream_shutdown._notify_active_sessions_of_shutdown(owner)))
             out.append(_run(self.upstream_shutdown._notify_interrupted_cron_jobs(owner, {"name": "inventory"}, "j1")))
-        for line in (None, "Inference: free tier"):
-            owner = SimpleNamespace(_free_tier_startup_line=lambda line=line: line)
-            out.append(_run(self.upstream_notes._send_home_channel_startup_notifications(owner)))
         return out
 
     def _send_notice(self, cls, platform, msg, env):
@@ -388,17 +446,29 @@ class NoticeTest(unittest.TestCase):
             _run(cls._send_notice_logged(adapter, "C1", msg, platform, "fail %s %s %s"))
         return adapter.sent[0]
 
-    def _home(self, cls, platform, msg, env):
+    def _restarted(self, namespace, platform, env):
+        """What the post-restart notice sends, and whether the marker was unlinked."""
         transport = _Transport()
+        namespace["UNLINKED"].clear()
+        cls = namespace["GatewayNotificationsMixin"]
         with mock.patch.dict(os.environ, env):
-            _run(cls._send_home_channel_message(None, platform, SimpleNamespace(chat_id="C1"), transport, msg, "f"))
-        return transport.sent[0]
+            _run(cls._send_restart_notification(None, transport, SimpleNamespace(value=platform), "C1"))
+        return transport.sent, list(namespace["UNLINKED"])
 
-    def _restarted(self, cls, platform, env):
+    def _startup(self, cls, platforms, env, free_tier_line=None):
+        """What the home-channel startup notice sends to one home channel per platform."""
         transport = _Transport()
+        owner = SimpleNamespace(
+            _free_tier_startup_line=lambda: free_tier_line,
+            _home_channel_transports=lambda: [
+                (SimpleNamespace(value=p), SimpleNamespace(chat_id=f"C-{p}", thread_id=None), transport)
+                for p in platforms
+            ],
+            _send_home_channel_message=lambda *a: cls._send_home_channel_message(None, *a),
+        )
         with mock.patch.dict(os.environ, env):
-            _run(cls._send_restart_notification(None, transport, platform, "C1"))
-        return transport.sent[0]
+            _run(cls._send_home_channel_startup_notifications(owner))
+        return transport.sent
 
     def test_flag_off_and_other_platforms_are_upstream(self):
         for platform, env in (("slack", {"KAGE_SLACK_UX": ""}), ("google_chat", FLAG_ON), ("telegram", FLAG_ON)):
@@ -408,21 +478,27 @@ class NoticeTest(unittest.TestCase):
                         self._send_notice(self.shutdown, platform, notice, env),
                         self._send_notice(self.upstream_shutdown, platform, notice, env),
                     )
-                    self.assertEqual(self._home(self.notes, platform, notice, env), notice)
-            self.assertEqual(
-                self._restarted(self.notes, platform, env), self._restarted(self.upstream_notes, platform, env)
-            )
+            with self.subTest(platform=platform, notice="restarted"):
+                self.assertEqual(
+                    self._restarted(self.notes_ns, platform, env), self._restarted(self.upstream_ns, platform, env)
+                )
+            for line in (None, "Inference: free tier"):
+                with self.subTest(platform=platform, notice="online", line=line):
+                    self.assertEqual(
+                        self._startup(self.notes, [platform], env, line),
+                        self._startup(self.upstream_notes, [platform], env, line),
+                    )
 
-    def test_flag_on_slack_rewords_every_notice(self):
+    def test_flag_on_slack_rewords_the_interrupting_notices(self):
         texts = [self._send_notice(self.shutdown, "slack", n, FLAG_ON) for n in self._notices()]
-        texts.append(self._restarted(self.notes, "slack", FLAG_ON))
         for text in texts:
             with self.subTest(text=text):
                 self.assertNotIn("Gateway", text)
                 self.assertNotIn("Hermes", text)
+                self.assertNotIn("once I'm back", text)
                 self.assertFalse(text.startswith(("⚠", "♻")))
         self.assertEqual(
-            texts[:4],
+            texts,
             [
                 "I'm going offline for a moment, so I've had to stop what I was working on.",
                 (
@@ -431,7 +507,7 @@ class NoticeTest(unittest.TestCase):
                 ),
                 (
                     "I'm restarting, so I've had to stop what I was working on. "
-                    "Send me a message once I'm back and I'll pick up where I left off."
+                    "Send me a message in a minute and I'll pick up where I left off."
                 ),
                 (
                     "I had to stop the scheduled job 'inventory' before it finished because I was restarting, "
@@ -439,12 +515,24 @@ class NoticeTest(unittest.TestCase):
                 ),
             ],
         )
-        self.assertEqual(texts[4:], ["I'm back online.", "I'm back online.\nInference: free tier",
-                                     "I'm back. We can carry on where we left off."])
 
-    def test_home_channel_rewords_the_startup_notice(self):
-        notice = "♻️ Gateway online — Hermes is back and ready."
-        self.assertEqual(self._home(self.notes, "slack", notice, FLAG_ON), "I'm back online.")
+    def test_flag_on_slack_skips_the_restart_notice_and_still_unlinks_its_marker(self):
+        self.assertEqual(self._restarted(self.notes_ns, "slack", FLAG_ON), ([], ["C1"]))
+
+    def test_flag_on_slack_skips_the_online_notice_and_its_free_tier_line(self):
+        for line in (None, "Inference: free tier"):
+            with self.subTest(line=line):
+                sent = self._startup(self.notes, ["slack", "telegram"], FLAG_ON, line)
+                self.assertEqual(sent, self._startup(self.upstream_notes, ["telegram"], FLAG_ON, line))
+                self.assertEqual([p for p, _ in sent], ["telegram"])
+
+    def test_home_channel_helper_is_untouched(self):
+        transport = _Transport()
+        warning = "⚠️ Session database unavailable — messages may not be persisted."
+        with mock.patch.dict(os.environ, FLAG_ON):
+            _run(self.notes._send_home_channel_message(
+                None, SimpleNamespace(value="slack"), SimpleNamespace(chat_id="C1"), transport, warning, "f"))
+        self.assertEqual(transport.sent, [("slack", warning)])
 
     def test_unknown_text_passes_through(self):
         with mock.patch.dict(os.environ, FLAG_ON):
@@ -457,6 +545,8 @@ class RuntimeTest(unittest.TestCase):
         with mock.patch.dict(os.environ, FLAG_ON):
             slack = SimpleNamespace(platform=SimpleNamespace(value="slack"))
             self.assertEqual(runtime.long_running_mode(slack, "raw"), "generic")
+            self.assertEqual(runtime.long_running_mode(slack, "generic"), "generic")
+            self.assertEqual(runtime.long_running_mode(slack, "off", {"thread_id": "1.2"}), "off")
             self.assertEqual(runtime.long_running_mode(SimpleNamespace(platform="SLACK"), "raw"), "generic")
             self.assertEqual(runtime.long_running_mode(SimpleNamespace(), "raw"), "raw")
 

@@ -11,15 +11,20 @@ Three things are checked:
    ``cron_delivery_text`` over the unwrapped ``content`` and the wrapped
    ``cleaned_delivery_content``, and the wrapper itself is still built, so
    every other target keeps it. The heartbeat mode is passed through
-   ``long_running_mode`` directly after it is read. The notice sends go
-   through ``notice_text``.
-2. The notices themselves. Each lifecycle notice is read out of the patched
+   ``long_running_mode`` directly after it is read. The interrupting notice
+   send goes through ``notice_text``. The post-restart send and the
+   home-channel startup send each sit behind a ``drop_notice`` guard that
+   returns or continues first, and ``_send_home_channel_message``, which the
+   session-database warnings share, carries no guard.
+2. The notices themselves. Each interrupting notice is read out of the patched
    source, rendered, and handed to the runtime: on Slack with the flag on it
    must come back reworded. ``notice_text`` passes text it does not recognise
    through unchanged, so an upstream rewording would otherwise put Hermes'
    wording back on Slack with nothing failing.
-3. The runtime module, loaded by path: flag off, and for any platform other
-   than Slack, every helper returns its input.
+3. The runtime module, loaded by path: on Slack with the flag on,
+   ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
+   off, and for any platform other than Slack, every helper returns its input
+   and ``drop_notice`` is false.
 """
 
 from __future__ import annotations
@@ -53,8 +58,11 @@ CRON_INTERRUPT_FN = "_notify_interrupted_cron_jobs"
 
 RUN_NOTIFICATIONS = "gateway/run_notifications.py"
 RESTARTED_PREFIX = "♻ Gateway restarted"
+RESTART_FN = "_send_restart_notification"
 HOME_CHANNEL_FN = "_send_home_channel_message"
 STARTUP_FN = "_send_home_channel_startup_notifications"
+STATUS_METADATA = "turn_ctx._status_thread_metadata"
+THREAD_METADATA = {"thread_id": "1700000000.000100"}
 
 #: Stands in for the names the interrupted-cron-job notice interpolates.
 CRON_JOB_NAME = "inventory"
@@ -145,7 +153,7 @@ def check_heartbeat(root: Path) -> None:
                 isinstance(second, ast.Assign)
                 and _names(second.targets) == [HEARTBEAT_MODE]
                 and _is_helper(second.value, "long_running_mode")
-                and _names(second.value.args) == ["turn_ctx.source", HEARTBEAT_MODE]
+                and _names(second.value.args) == ["turn_ctx.source", HEARTBEAT_MODE, STATUS_METADATA]
             ):
                 return
             raise _fail(f"{HEARTBEAT_FN}() does not pass its mode through long_running_mode next")
@@ -159,8 +167,21 @@ def _strings(fn: ast.AST, target: str) -> list[ast.expr]:
     ]
 
 
+def _guard_line(fn: ast.AST, exit_type: type) -> int:
+    """The line of ``fn``'s ``if drop_notice(platform):`` whose body ends in ``exit_type``."""
+    guards = [
+        node.lineno for node in ast.walk(fn)
+        if isinstance(node, ast.If) and _is_helper(node.test, "drop_notice")
+        and _names(node.test.args) == ["platform"] and isinstance(node.body[-1], exit_type)
+        and not (exit_type is ast.Return and ast.unparse(node.body[-1]) != "return None")
+    ]
+    if len(guards) != 1:
+        raise _fail(f"{fn.name}() has {len(guards)} drop_notice(platform) guards, expected 1")
+    return guards[0]
+
+
 def check_notices(root: Path) -> list[str]:
-    """Check the notice call sites; return every notice rendered from source."""
+    """Check the notice call sites; return every interrupting notice rendered from source."""
     notices: list[str] = []
 
     tree = _tree(root, RUN_SHUTDOWN)
@@ -188,26 +209,28 @@ def check_notices(root: Path) -> list[str]:
     tree = _tree(root, RUN_NOTIFICATIONS)
     if not _binds_alias(tree):
         raise _fail(f"{RUN_NOTIFICATIONS} does not import gateway.slack_boilerplate as {ALIAS}")
-    restarted = [
-        node for node in ast.walk(tree)
-        if _is_helper(node, "notice_text") and len(node.args) == 2
-        and isinstance(node.args[1], ast.Constant) and str(node.args[1].value).startswith(RESTARTED_PREFIX)
+    restart = _function(tree, RESTART_FN, RUN_NOTIFICATIONS)
+    sends = [
+        node.lineno for node in ast.walk(restart)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "transport.send" and len(node.args) == 3
+        and isinstance(node.args[2], ast.Constant) and str(node.args[2].value).startswith(RESTARTED_PREFIX)
     ]
-    if len(restarted) != 1:
-        raise _fail(f"the post-restart notice is not sent through notice_text in {RUN_NOTIFICATIONS}")
-    notices.append(restarted[0].args[1].value)
+    if len(sends) != 1:
+        raise _fail(f"{RESTART_FN}() no longer sends the post-restart notice as one transport.send literal")
+    if _guard_line(restart, ast.Return) > sends[0]:
+        raise _fail(f"{RESTART_FN}() checks drop_notice after the post-restart notice is sent")
+    startup = _function(tree, STARTUP_FN, RUN_NOTIFICATIONS)
+    home_sends = [
+        node.lineno for node in ast.walk(startup)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == f"self.{HOME_CHANNEL_FN}"
+    ]
+    if len(home_sends) != 1:
+        raise _fail(f"{STARTUP_FN}() calls {HOME_CHANNEL_FN}() {len(home_sends)} times, expected 1")
+    if _guard_line(startup, ast.Continue) > home_sends[0]:
+        raise _fail(f"{STARTUP_FN}() checks drop_notice after the startup notice is sent")
     home = _function(tree, HOME_CHANNEL_FN, RUN_NOTIFICATIONS)
-    if not any(
-        isinstance(node, ast.Assign) and _names(node.targets) == ["message"]
-        and _is_helper(node.value, "notice_text") and _names(node.value.args) == ["platform", "message"]
-        for node in ast.walk(home)
-    ):
-        raise _fail(f"{HOME_CHANNEL_FN}() does not reword its message through notice_text")
-    startup = [ast.literal_eval(v) for v in _strings(_function(tree, STARTUP_FN, RUN_NOTIFICATIONS), "message")
-               if isinstance(v, ast.Constant)]
-    if len(startup) != 1:
-        raise _fail(f"{STARTUP_FN}() has {len(startup)} literal messages, expected 1")
-    notices.append(startup[0])
+    if ALIAS in ast.unparse(home):
+        raise _fail(f"{HOME_CHANNEL_FN}() is patched; the session-database warnings share it")
     return notices
 
 
@@ -244,11 +267,16 @@ def drive(module, notices: list[str]) -> None:
             text = module.cron_delivery_text(target(platform), REPORT, WRAPPED, extract_media)
             if text != (REPORT if reworded else WRAPPED):
                 raise _fail(f"cron_delivery_text for {platform} with the flag {'on' if on else 'off'}: {text!r}")
-            mode = module.long_running_mode(source(platform), "raw")
+            mode = module.long_running_mode(source(platform), "raw", None)
             if mode != ("generic" if reworded else "raw"):
                 raise _fail(f"long_running_mode for {platform} with the flag {'on' if on else 'off'}: {mode!r}")
-            if module.long_running_mode(source(platform), "off") != "off":
+            mode = module.long_running_mode(source(platform), "raw", THREAD_METADATA)
+            if mode != ("off" if reworded else "raw"):
+                raise _fail(f"long_running_mode under a status line for {platform}: {mode!r}")
+            if module.long_running_mode(source(platform), "off", None) != "off":
                 raise _fail(f"long_running_mode turned an off heartbeat on for {platform}")
+            if module.drop_notice(platform) != reworded:
+                raise _fail(f"drop_notice for {platform} with the flag {'on' if on else 'off'}")
             for notice in notices:
                 out = module.notice_text(platform, notice)
                 if reworded and (out == notice or "Gateway" in out or "Hermes" in out):
@@ -265,7 +293,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     drive(_load_runtime(root), notices)
     print(
         "slack_boilerplate verify: Slack cron targets send the unwrapped report, the heartbeat "
-        f"goes generic on Slack, {len(notices)} lifecycle notices reworded on Slack; "
+        f"drops under the status line and goes generic elsewhere on Slack, {len(notices)} interrupting "
+        "notices reworded and both back-online notices skipped on Slack; "
         "flag off and every other platform unchanged"
     )
 
