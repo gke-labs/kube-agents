@@ -1368,7 +1368,11 @@ write_secret_env_var() {
 # level of a script and a local inside a function, so a top-level reader hands
 # back `true` for a line whose value dies with bootstrap_install_env's return
 # and never reaches write_tfvars_from_state. Matching the scope is what makes
-# "what the file records" mean "what the install will read back".
+# "what the file records" mean "what a run that does not already hold the key
+# reads back from it" -- which is the question the guards ask, because the run
+# they warn about is a later one from a shell nobody here can see. It is not
+# "what this run read": see the `unset` paragraph below for the one class where
+# those two come apart.
 #
 # Set-ness travels with the value, so no caller needs a presence test of its
 # own. A `grep -E "^[[:space:]]*(export[[:space:]]+)?${key}="` beside this is
@@ -1391,6 +1395,22 @@ write_secret_env_var() {
 # make. The rest of the environment is inherited on purpose: a file recording
 # `K=$OTHER` assigns whatever the real sourcing will assign, so the reader has
 # to see the same shell the install runs in.
+#
+# That `unset` is the one place this reader and the live ones part company, and
+# the class is `: ${K:=v}` and `K=${K:-v}`: the expansion fires here, where the
+# key was just unset, and does not fire in an install whose shell exports the
+# key already. The reader then reports `v` where this run read the export. It
+# is still the right answer to the question the guards ask -- a later run from
+# a shell without the export does get `v` -- but it is not what this run read,
+# and a guard comparing the two announces a divergence this shell does not
+# have. Kept rather than dropped: without the `unset` an exported key is
+# indistinguishable from a recorded line, which is the defect this guard exists
+# to catch, and answering both questions needs two evaluations and a caller
+# that knows which it wants. Pinned by
+# test_the_reader_and_the_install_diverge_on_a_default_assignment in
+# tests/test_install_script.py, and the recorded-spellings list next to
+# test_a_spelling_only_bash_sees_still_counts_as_recorded leaves `:=` out
+# rather than certifying an agreement that is not there.
 #
 # A subshell of this shell, then, and not a `bash -c` child, which inherits
 # only what is exported. install.defaults.env is sourced without `set -a`

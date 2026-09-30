@@ -7102,6 +7102,18 @@ class DomainScopedFlagsTest(unittest.TestCase):
     # The reader and load_install_env still agree about such a file, because
     # both of them source it and both stop in the same place; what cannot go in
     # this table is a row whose effect is the rest of the table.
+    #
+    # AE expands KUBE_AGENTS_INSTALL_ENV rather than HOME for that same reason.
+    # The class it is here for is "an exported variable the calling shell
+    # holds", and HOME is that variable on a developer's machine and not in
+    # every runner: a systemd system unit or a container with no passwd entry
+    # has none, install.sh runs under `set -u`, and `$HOME` then aborts the
+    # source at AE and empties every row below it -- so the failure surfaces as
+    # a mismatch at AS rather than as anything naming HOME.
+    # TheCloneDirectoryNeedsHomeOnlyWhenCloningTest is where that environment
+    # is the subject; here it was only the carrier. _parse puts
+    # KUBE_AGENTS_INSTALL_ENV in the child's environment on every call, so the
+    # row tests the same expansion against a variable this suite guarantees.
     QUOTING_SPELLINGS = [
         ("A", "A=true # comment"),
         ("B", "B=#hash"),
@@ -7131,7 +7143,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         ("AB", "AB=true >&2"),
         ("AC", "AC=true THIRD_ASSIGNMENT=2 true"),
         ("AD", "AD=a>/dev/null"),
-        ("AE", "AE=$HOME"),
+        ("AE", "AE=$KUBE_AGENTS_INSTALL_ENV"),
         ("AF", 'AF="${NOPE:-true}"'),
         ("AG", "AG=$(printf true)"),
         ("AH", "AH=`printf true`"),
@@ -7593,7 +7605,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         the destroyed-ingress consequence for a reversal the next run cannot
         perform — it re-reads the same line.
 
-        Two spellings are deliberately not in the list, for opposite reasons.
+        Three spellings are deliberately not in the list, for three reasons.
         `declare -x` assigns a local inside the function both live readers
         source from, so the file really does not record it, and the reader
         agreeing with the pattern there is correct rather than lucky.
@@ -7606,13 +7618,23 @@ class DomainScopedFlagsTest(unittest.TestCase):
         of install.env rather than of this flag — but certifying the spelling
         here would say the front door accepts a file it stops on.
 
+        The third is `: ${ENABLE_DRIFT_DETECTOR:=true}`, and the reason is the
+        reader's own `unset`. Neither live reader unsets the key, so the `:=`
+        fires only when the calling shell has not already set it: over an
+        exported ENABLE_DRIFT_DETECTOR the install reads the export and the
+        reader reads `true`, and certifying the spelling here would say the
+        two agree where they do not.
+        test_the_reader_and_the_install_diverge_on_a_default_assignment pins
+        that divergence rather than hiding it, and the `unset` comment in
+        install.sh says why the reader keeps it anyway.
+
         Nothing is warned about and the value is read back as `true`, which is
         the second half of the claim: a reader that found the line and mis-read
         the value would clear the presence assertion alone.
         """
         for line in (
             "export TF_VAR_enable_drift_pubsub=true ENABLE_DRIFT_DETECTOR=true",
-            ": ${ENABLE_DRIFT_DETECTOR:=true}",
+            "PROJECT_ID=p; ENABLE_DRIFT_DETECTOR=true",
             "  ENABLE_DRIFT_DETECTOR=true",
         ):
             with self.subTest(line=line):
@@ -7631,6 +7653,53 @@ class DomainScopedFlagsTest(unittest.TestCase):
                         proc.stdout + proc.stderr,
                     )
                     self.assertIn("VALUE=[true]", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_reader_and_the_install_diverge_on_a_default_assignment(self):
+        """The one class the reader's `unset` answers differently, pinned.
+
+        `read_recorded_install_env_values` unsets each key before sourcing, so
+        that a value coming back means the *file* assigned it rather than the
+        caller's shell — the distinction the drift guard is built on. Neither
+        live reader does that: `bootstrap_install_env` and `load_install_env`
+        source over whatever the shell already holds. For every spelling whose
+        result does not depend on the key's prior state the two agree, which is
+        what the parity table asserts across its rows. For `:=` and `:-` they
+        cannot: the expansion fires in the reader, whose subshell just unset
+        the key, and does not fire in the install, which still holds the
+        export.
+
+        So the reader answers what a later run from a shell that does not set
+        the key will read from the file, and that is the question the guard
+        asks — a later run is from an unknown shell. It is not the same as what
+        *this* run read, and install.sh's contract comment no longer says it
+        is.
+
+        Asserted rather than fixed. Dropping the `unset` would make an exported
+        key indistinguishable from a recorded line, which is the defect the
+        first round of this branch's review opened with; keeping both answers
+        needs two evaluations and a caller that knows which it wants, and that
+        is a change with its own argument. What must not happen silently is
+        someone reading the parity table as covering this: every row there is
+        compared with the key unset on both sides, so the table agrees on
+        exactly the condition the live install does not establish.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text(": ${ENABLE_DRIFT_DETECTOR:=true}\n")
+            proc = self._parse(
+                "-y",
+                f'printf \'READER=[%s]\\n\' "$(recorded_install_env_value '
+                f"'{destination}' ENABLE_DRIFT_DETECTOR)\"\n"
+                f'load_install_env "{destination}" >/dev/null 2>&1\n'
+                "printf 'INSTALL=[%s]\\n' \"${ENABLE_DRIFT_DETECTOR-}\"",
+                env={"ENABLE_DRIFT_DETECTOR": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            # The file's `:=` fires for the reader, which unset the key first.
+            self.assertIn("READER=[true]", combined, combined)
+            # And does not for the install, which sources over the export.
+            self.assertIn("INSTALL=[false]", combined, combined)
 
     def test_a_flag_that_agrees_with_the_recorded_value_is_not_warned_about(self):
         """Nothing is overridden, so there is nothing to lose by omitting it.
