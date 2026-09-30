@@ -73,6 +73,9 @@ def test_the_literal_and_quoted_forms_are_not_flagged():
         'test ! -e "$P" -a -d "$D"',
         '[[ -n "$A" && ! "$N" -gt 0 ]]',
         "if [[ $A == x || ! $B -ge 3 ]]; then :; fi",
+        'kubectl exec "$POD" -n ns -- cat /etc/hosts',
+        'kubectl exec -it "$POD" -n ns -- bash',
+        "docker exec $C -it sh",
     ):
         assert not _flagged(command), command
 
