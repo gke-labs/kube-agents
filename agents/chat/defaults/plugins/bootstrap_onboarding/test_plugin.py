@@ -290,6 +290,11 @@ class PreLlmCallTest(unittest.TestCase):
             self._plant(phrase=phrase, suffix=suffix)
         self.assertIsNone(self._eval_call())
 
+    def test_eval_marker_with_a_padded_phrase_matches_it_trimmed(self):
+        self._plant(phrase="  just installed you ")
+        result = self._eval_call(user_message="hi! priya here, just installed you")
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+
     def test_unreadable_eval_marker_is_ignored(self):
         (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")
         (self.data_dir / ".bootstrap_greet_eval-b").write_text("[]", encoding="utf-8")

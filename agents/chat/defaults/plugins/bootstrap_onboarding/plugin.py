@@ -131,14 +131,14 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[bool]:
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
             request = json.loads(marker.read_text(encoding="utf-8"))
-            phrase = str(request.get(EVAL_KEY_PHRASE) or "")
+            phrase = str(request.get(EVAL_KEY_PHRASE) or "").strip()
             variant = str(request.get(EVAL_KEY_VARIANT) or "")
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError) as e:
             logger.warning("Ignoring unreadable %s: %s", marker, e)
             continue
-        if len(phrase.strip()) < EVAL_PHRASE_MIN_LENGTH:
+        if len(phrase) < EVAL_PHRASE_MIN_LENGTH:
             logger.warning("Ignoring %s: phrase shorter than %d characters.", marker, EVAL_PHRASE_MIN_LENGTH)
             continue
         if phrase not in user_message:
