@@ -27,9 +27,10 @@
 # writes it: a kanban worker's terminal and file tools both run there. Its
 # owner is set to the data volume's, the user those tools run as.
 #
-# It refuses an install where a person has connected (`.user_aligned`),
-# onboarding already delivered (`.bootstrap_completed`), either onboarding
-# cron job is gone, the delivery job is paused, or it sends anywhere but `local`:
+# It refuses an install where a person has connected (`.user_aligned`) or
+# been greeted (`.bootstrap_greeted`), onboarding already delivered
+# (`.bootstrap_completed`), either onboarding cron job is gone, the delivery
+# job is paused, or it sends anywhere but `local`:
 # the ranked report this produces is the one onboarding delivers, and arming
 # delivery with a chat bound would post it there. It also refuses one whose
 # gate has not filed its sweep (no `.bootstrap_scan_filed`), because a sweep
@@ -38,12 +39,19 @@
 # earlier sweep still running cannot do that either; the sweep marker stays,
 # so the gate files no other.
 #
+# Before planting it writes `.bootstrap_greeted` itself, holding `hold_token`,
+# so the onboarding plugin skips a person's first chat until the teardown:
+# a chat during the wait would otherwise bind delivery to that chat and post
+# the planted report there. Such a person is greeted in their next new
+# session instead.
+#
 # Arming writes the two onboarding job records to `state_file` first. The
 # teardown, and the exit trap on a failed apply, remove `.user_aligned` and
-# `.bootstrap_completed` and put back either job the delivery removed, from
-# those records; `state_file` existing is what says this stack armed it. An
-# apply that finds `state_file` left by an earlier run finishes that teardown
-# before its own checks.
+# `.bootstrap_completed`, put back either job the delivery removed, from
+# those records, and then remove `.bootstrap_greeted` if it still holds the
+# token; `state_file` existing is what says this stack armed it. An apply that
+# finds `state_file` or the token left by an earlier run finishes that
+# teardown before its own checks.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -109,11 +117,39 @@ locals {
   scan_job     = "bootstrap-inventory-scan"
   delivery_job = "bootstrap-inventory-delivery"
   state_file   = "${local.home}/.bench-onboarding-jobs.json"
+  # agents/chat/defaults/plugins/bootstrap_onboarding/plugin.py:
+  # GREETED_MARKER. The plugin writes it empty, so one holding the token is
+  # this stack's.
+  greeted    = "${local.home}/.bootstrap_greeted"
+  hold_token = "held by bench/tf/prebuilt/bootstrap-ranking"
   # How long the disarm waits for an onboarding job's run already under way
   # to end, and how often it looks: the scripts take about a second.
   settle_wait = 120
   settle_poll = 2
-  arm_py      = <<-EOP
+  # Written aside and linked into place, so the link fails if the plugin got
+  # there first and no reader sees the marker without the token.
+  hold_py   = <<-EOP
+    import os, sys
+    from cron.jobs import load_jobs
+
+    greeted = "${local.greeted}"
+    tmp = greeted + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("${local.hold_token}")
+    try:
+        os.link(tmp, greeted)
+    except FileExistsError:
+        sys.exit("%s exists: a person has been greeted" % greeted)
+    finally:
+        os.remove(tmp)
+    # A first chat whose check ran before the link may have bound delivery
+    # since step 1 read it.
+    delivery = {j.get("id"): j for j in load_jobs()}.get("${local.delivery_job}", {})
+    if os.path.exists("${local.home}/.user_aligned") or delivery.get("deliver") != "local":
+        sys.exit("a person connected after step 1's read")
+    print("held")
+  EOP
+  arm_py    = <<-EOP
     import json, os, sys
     from cron.jobs import is_job_runnable, load_jobs
 
@@ -145,16 +181,32 @@ locals {
     open("${local.home}/.user_aligned", "x").close()
     print("armed")
   EOP
-  disarm_py   = <<-EOP
+  disarm_py = <<-EOP
     import json, os, sqlite3, sys, time
     from cron.jobs import _jobs_lock, compute_next_run, load_jobs, save_jobs
 
     home = "${local.home}"
     state = "${local.state_file}"
+    greeted = "${local.greeted}"
     ids = ("${local.scan_job}", "${local.delivery_job}")
     ledger = home + "/cron/executions.db"
+
+
+    # Last, so no first chat is taken in while delivery is still armed.
+    def release():
+        try:
+            with open(greeted) as fh:
+                if fh.read() != "${local.hold_token}":
+                    return
+        except FileNotFoundError:
+            return
+        os.remove(greeted)
+        print("released %s" % greeted)
+
+
     if not os.path.exists(state):
         print("delivery was not armed")
+        release()
         sys.exit(0)
     saved = json.load(open(state))["jobs"]
 
@@ -204,6 +256,7 @@ locals {
             save_jobs(jobs + back)
     remove(state)
     print("disarmed delivery; put back: %s" % (", ".join(j["id"] for j in back) or "nothing"))
+    release()
   EOP
 }
 
@@ -333,10 +386,16 @@ resource "null_resource" "ranking" {
       from cron.jobs import is_job_runnable, load_jobs
       home = "${local.home}"
       jobs = {j.get("id"): j for j in load_jobs()}
-      if os.path.exists("${local.state_file}"):
+      try:
+          held = open("${local.greeted}").read() == "${local.hold_token}"
+      except FileNotFoundError:
+          held = False
+      if os.path.exists("${local.state_file}") or held:
           print("armed")
       elif os.path.exists(home + "/.user_aligned"):
           print("aligned")
+      elif os.path.exists("${local.greeted}"):
+          print("greeted")
       elif os.path.exists(home + "/.bootstrap_completed"):
           print("completed")
       elif not os.path.exists(home + "/.bootstrap_scan_filed"):
@@ -353,7 +412,7 @@ resource "null_resource" "ranking" {
       }
       state="$(read_state)"
       if [ "$state" = armed ]; then
-        echo "An earlier run left delivery armed (${local.state_file}); finishing its teardown." >&2
+        echo "An earlier run left its teardown unfinished (${local.state_file} or the token in ${local.greeted}); finishing it." >&2
         if ! clear_inventory || ! disarm >&2; then
           echo "ERROR: could not finish the teardown an earlier run left on ${var.host_cluster_name}; nothing was planted, and the next run tries again." >&2
           exit 1
@@ -364,6 +423,9 @@ resource "null_resource" "ranking" {
         clear) ;;
         aligned)
           echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
+          exit 1 ;;
+        greeted)
+          echo "ERROR: ${local.greeted} exists on ${var.host_cluster_name}: a person has been greeted, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         completed)
           echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed). Clearing the INVENTORY files would delete the report that was delivered." >&2
@@ -408,6 +470,10 @@ resource "null_resource" "ranking" {
         exit 1
       fi
       clear_inventory
+      # Step 1's read is a point in time, and the planted report sits on the
+      # sandbox from here until the teardown.
+      printf '%s' '${base64encode(local.hold_py)}' | base64 -d | agent_py
+      echo "Wrote ${local.greeted}; the onboarding plugin skips first chats until the teardown."
 
       # ---- 3. Plant the raw report on the sandbox ------------------------
       printf '%s' '${local.raw_b64}' | kubectl exec -i -n "${var.agent_namespace}" "$sandbox_pod" -c "${var.sandbox_container}" -- \
