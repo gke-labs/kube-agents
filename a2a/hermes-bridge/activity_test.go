@@ -637,7 +637,7 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // Under a kept key, a name stays and a token is a length: the grammar that
 // tells them apart is the one claim shape mode makes about kept values.
 func TestRedactInput_ShapeKeepsNamesAndShapesTokensUnderKeptKeys(t *testing.T) {
-	names := []string{"seeded-a", "kube-system", "v1beta1", "gke-standard-1", "northamerica-northeast1", "MutatingWebhookConfiguration", "createPullRequestReview", "mcp__gke__listClusters", "projects/p/locations/l", "n2d-standard-4"}
+	names := []string{"seeded-a", "kube-system", "v1beta1", "gke-standard-1", "northamerica-northeast1", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicyBinding", "createPullRequestReview", "listDashboardsForProjectsAndFolders", "mcp__gke__listClusters", "projects/p/locations/l", "n2d-standard-4"}
 	tokens := []string{"sk_live_4eC39HqLyjWDarjtT1zdp7dc", "GOCSPX-aBcDeFgHiJkLmNoPqRsTuVwXyZ12", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "xoxq-1234567890-abcdefghijklmnop", "9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f", "QKIAIOSFODNN7EXAMPLE", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", "admin:hunter2@db", "name with space"}
 	for _, n := range names {
 		out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"name":`+strconvQuote(n)+`}`)))
@@ -763,9 +763,9 @@ func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
 // twin, while a name that merely starts with the word (secretName,
 // tokenizer) still ships.
 func TestRedactInput_CamelCaseKeys(t *testing.T) {
-	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"a-name","secretAccessKey":"w4","secretKey":"w5","passwordHash":"h1","tokenPath":"/t","credentialsFile":"/c","SecretRef":"r-name"}`
+	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","sessionCookie":"sid=c1","cookieHeader":"c2","SESSIONCOOKIE":"c3","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"a-name","secretAccessKey":"w4","secretKey":"w5","passwordHash":"h1","tokenPath":"/t","credentialsFile":"/c","SecretRef":"r-name"}`
 	out := string(redactInput(InputValuesFull, "http_request", json.RawMessage(in)))
-	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, `"w4"`, `"w5"`, `"h1"`} {
+	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, `"w4"`, `"w5"`, `"h1"`, "sid=c1", `"c2"`, `"c3"`} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}

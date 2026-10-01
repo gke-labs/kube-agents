@@ -263,15 +263,15 @@ var (
 	redactedKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|cookie|set-cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:$|[_.-])`)
 	// An all-caps key with the word as an unseparated suffix (PGPASSWORD,
 	// DBPASSWORD, MYSQLPASSWORD): the libpq spelling, not an exotic one.
-	redactedUpperSuffixPattern = regexp.MustCompile(`[A-Z0-9](?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL)S?$`)
-	redactedCamelKeyPattern    = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedUpperSuffixPattern = regexp.MustCompile(`[A-Z0-9](?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|COOKIE|CREDENTIAL)S?$`)
+	redactedCamelKeyPattern    = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Cookie|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
 	// A camelCase key that opens with the word and goes on in another
 	// component (secretAccessKey, SecretKey, tokenValue, passwordHash) is a
 	// credential unless the next component says it is a name, a reference
 	// or a location of one: secretName, SecretRef, tokenPath, credentialsFile,
 	// passwordId stay.
-	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?[A-Z]`)
-	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
+	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?[A-Z]`)
+	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
 	redactedValuePatterns    = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
@@ -343,14 +343,15 @@ var shapeKeptKeys = map[string]bool{
 // shapeKeptValueMax characters. No ':' or '@' (a user:pass@host is
 // neither), no whitespace or quotes. What an identifier is not, a token
 // is: shapeTokenRunPattern shapes a value with a long lowercase run, a
-// long digit run, an all-hex body, an all-caps-and-digits body (an AKIA...
-// key) or a long mixed run (a ghp_ token, a JWT), since a name's words are
-// short and a kind's are Capitalised. A manifest body under "name",
+// long digit run, an all-hex body or an all-caps-and-digits body (an
+// AKIA... key, a ghp_ token's body), and tokenShapedWords a word whose
+// case or digits churn (a JWT, a Stripe key); a long CamelCase kind
+// (ValidatingAdmissionPolicyBinding) is a few short words and stays. A manifest body under "name",
 // anything with a space in it, is shaped like every other string, so the
 // kept keys are a list of places identifiers live and not a hole.
 var (
 	shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._/-]*$`)
-	shapeTokenRunPattern  = regexp.MustCompile(`[a-z0-9]{24,}|[0-9]{8,}|^[a-f0-9]{20,}$|[A-Z]{2}[A-Z0-9]{14,}|[A-Za-z0-9]{32,}`)
+	shapeTokenRunPattern  = regexp.MustCompile(`[a-z0-9]{24,}|[0-9]{8,}|^[a-f0-9]{20,}$|[A-Z]{2}[A-Z0-9]{14,}`)
 )
 
 const (
