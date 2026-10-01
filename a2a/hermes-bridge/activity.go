@@ -229,15 +229,15 @@ var (
 	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
 	// ends one at the end, a separator or the next capital. A key that opens
 	// with the word is handled apart (redactedCamelHeadPattern below).
-	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:$|[_.-])`)
-	redactedCamelKeyPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:$|[_.-])`)
+	redactedCamelKeyPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
 	// A camelCase key that opens with the word and goes on in another
 	// component (secretAccessKey, SecretKey, tokenValue, passwordHash) is a
 	// credential unless the next component says it is a name, a reference
 	// or a location of one: secretName, SecretRef, tokenPath, credentialsFile,
 	// passwordId stay.
-	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?[A-Z]`)
-	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
+	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?[A-Z]`)
+	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
 	redactedValuePatterns    = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
@@ -252,6 +252,9 @@ var (
 		// a Token or Digest value has no shape of its own): scheme and
 		// value, the two words after the key.
 		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?[A-Za-z][A-Za-z0-9-]*\s+[^\s"']+`),
+		// ... and with no scheme word at all (an API that takes the raw key
+		// in the header): the one token after the key.
+		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?[^\s"']+`),
 		// key=value / key: value / "key": "value", where a secret word is a
 		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
 		// quoted value runs to its closing quote, spaces included, so a
@@ -259,14 +262,14 @@ var (
 		// or unterminated one runs to whitespace, punctuation included, so a
 		// generated password's comma or brace does not split it (what follows
 		// on the same word goes with it, the lesser cost).
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
 		// A PEM private-key block, banner to banner: the one credential with
 		// a fixed marker, however it arrived (a heredoc, a file tool's
 		// content, a kubeconfig body under an innocent key).
 		regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
 		// --flag value, the word a component of the flag (--token, --secret-access-key);
 		// a quoted value runs to its closing quote as above.
-		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
+		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
 	}
 )
 
@@ -311,10 +314,10 @@ type hookDelivery struct {
 	Timestamp  string          `json:"timestamp"`
 	DeliveryID string          `json:"delivery_id"`
 	Extra      struct {
-		ToolCallID string `json:"tool_call_id"`
-		DurationMs int64  `json:"duration_ms"`
-		Status     string `json:"status"`
-		ErrorType  string `json:"error_type"`
+		ToolCallID string      `json:"tool_call_id"`
+		DurationMs json.Number `json:"duration_ms"`
+		Status     string      `json:"status"`
+		ErrorType  string      `json:"error_type"`
 	} `json:"extra"`
 }
 
@@ -440,7 +443,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			Input:      redactInput(d.ToolName, d.ToolInput),
 			CallID:     d.Extra.ToolCallID,
 			Status:     status,
-			DurationMs: d.Extra.DurationMs,
+			DurationMs: durationMillis(d.Extra.DurationMs),
 			At:         d.Timestamp,
 		}
 		if status == ActivityStatusError {
@@ -547,6 +550,19 @@ func activityStatus(d hookDelivery) string {
 	return ActivityStatusCompleted
 }
 
+// durationMillis reads hermes's duration_ms whatever its number shape: an
+// integer, or a float a Python emitter may write (12.5). One field's shape
+// is not a reason to drop the delivery.
+func durationMillis(n json.Number) int64 {
+	if i, err := n.Int64(); err == nil {
+		return i
+	}
+	if f, err := n.Float64(); err == nil {
+		return int64(f)
+	}
+	return 0
+}
+
 // secretLookingKey says whether a value under this key never goes on the
 // bus: a secret word as a whole component in any spelling, or a camelCase
 // key that opens with the word and goes on in something other than a name.
@@ -638,12 +654,16 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 		}
 		args = append(args, nested{call: call, raw: raw})
 	}
-	// Only an arguments object that is itself large becomes a stand-in; a
-	// small sibling stays verbatim, since a stand-in is larger than it and
-	// says truncated of nothing.
+	// On the first pass only an arguments object that is itself large
+	// becomes a stand-in, so a small sibling stays verbatim; on the second
+	// every one does, names kept, since that is still more than the whole
+	// stand-in keeps.
+	// First pass: the large arguments objects become stand-ins with a short
+	// head. Second pass: every arguments object becomes a head-less
+	// stand-in, so a wrapper of many small calls still keeps its names.
 	for _, headLen := range []int{activityInputCallHead, 0} {
 		for _, n := range args {
-			if len(n.raw) > activityInputCallHead {
+			if headLen == 0 || len(n.raw) > activityInputCallHead {
 				n.call[wrapperCallArgsKey] = truncatedStandIn(n.raw, headLen)
 			}
 		}
@@ -787,9 +807,10 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 // left behind (killed mid-task, its defers never run) held a copy of the
 // managed .env, and the sweep that finalizes that incarnation's tasks does
 // not know about files. Only that incarnation's leftovers go with it, the
-// direct subdirectories named like a task id; the directory itself and
-// anything else in it are left alone, since BRIDGE_SCRATCH_DIR is whatever
-// the manifest says and may name a mount the bridge does not own.
+// direct subdirectories carrying the bridge's marker file; the directory
+// itself and anything else in it are left alone, since BRIDGE_SCRATCH_DIR
+// is whatever the manifest says and may name a mount the bridge does not
+// own.
 func (b *Bridge) listenActivity() error {
 	// The sweep runs whether or not the door opens: a previous incarnation
 	// with the door open may have left a scope, and this one closing the

@@ -324,8 +324,9 @@ executor publishes `activity`, and whether the door carries it, is each componen
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
 harness asks neither and grades on what the probe carried. Both executors publish it: the
 worker adapter from the harness's `tool_use` blocks, the Hermes bridge from hermes's outbound
-webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool, its
-input, and the call's status, plus a `progress` heartbeat. `worker_commands` reads
+webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
+its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
+`progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded

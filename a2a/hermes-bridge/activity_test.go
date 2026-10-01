@@ -93,7 +93,7 @@ func activityEntries(t *testing.T, task *lib.Task) []ActivityEntry {
 	return out
 }
 
-// artifactNames returns, in stream order, the artifact name of every
+// eventTrail returns, in stream order, the artifact name of every
 // artifact-update and "<state>/final" for every status-update.
 func eventTrail(t *testing.T, events []*lib.Envelope) []string {
 	t.Helper()
@@ -429,6 +429,21 @@ func TestRedactInput(t *testing.T) {
 	}
 }
 
+// A fractional duration_ms (a Python emitter's 12.5) is one field's shape,
+// not a reason to drop the delivery.
+func TestActivity_FractionalDurationIsRead(t *testing.T) {
+	var d hookDelivery
+	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","extra":{"tool_call_id":"c1","duration_ms":12.5,"status":"ok"}}`), &d); err != nil {
+		t.Fatalf("a fractional duration_ms failed to parse: %v", err)
+	}
+	if got := durationMillis(d.Extra.DurationMs); got != 12 {
+		t.Fatalf("durationMillis(12.5) = %d, want 12", got)
+	}
+	if got := durationMillis(json.Number("40")); got != 40 {
+		t.Fatalf("durationMillis(40) = %d", got)
+	}
+}
+
 func TestActivityStatus(t *testing.T) {
 	mk := func(status, errType string) hookDelivery {
 		var d hookDelivery
@@ -617,9 +632,9 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 // The scheme token is case-insensitive, and a credential can arrive under a
 // key outside the first list of words: a private key, a passphrase.
 func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
-	in := `{"content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----\n", "command": "cat > id_rsa <<EOF\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\n-----END OPENSSH PRIVATE KEY-----\nEOF; curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	in := `{"kubeconfig": {"users": [{"user": {"client-key-data": "LS0tLS1CRUdJTi", "client-certificate-data": "cert-ok"}}]}, "cmd2": "kubectl config set-credentials u --client-key-data=LS0tLS1CRUdJTi2; curl -H 'Authorization: lin_api_9f3c2a1b7d' https://api.linear.app; curl -H \"Authorization: 9f3c2a1b7d\" https://r", "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----\n", "command": "cat > id_rsa <<EOF\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\n-----END OPENSSH PRIVATE KEY-----\nEOF; curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
 	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", "MIIEowIBAAKCAQEA7", "b3BlbnNzaC1rZXkt", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
+	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", "MIIEowIBAAKCAQEA7", "b3BlbnNzaC1rZXkt", "LS0tLS1CRUdJTi", "lin_api_9f3c2a1b7d", "9f3c2a1b7d", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -627,7 +642,7 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 	// A short word after "basic" is not a credential, and a camelCase key
 	// that starts with the word is a name, as for secretName.
 	// The curl command's URL and method survive its credential.
-	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d"} {
+	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d", `"client-certificate-data":"cert-ok"`, "https://api.linear.app", "https://r"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("expected %q in %s", kept, out)
 		}
@@ -685,6 +700,17 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	}
 	if strings.Contains(string(whole), `"name":"kanban_comment"`) {
 		t.Fatalf("whole stand-in carried a full nested call: %s", whole)
+	}
+
+	// Many small calls that are over the cap together: the second pass
+	// replaces every arguments object, head-less, and the names survive.
+	var small []string
+	for i := 0; i < 12; i++ {
+		small = append(small, `{"name":"kanban_comment","arguments":{"id":`+strings.Repeat("7", 3)+`,"body":"`+strings.Repeat("s", 200)+`"}}`)
+	}
+	manySmall := redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(small, ",")+`]}`))
+	if len(manySmall) > activityInputCap || strings.Count(string(manySmall), `"name":"kanban_comment"`) != 12 || strings.Contains(string(manySmall), `"head":"{`) {
+		t.Fatalf("many small calls lost their names or kept heads: %d bytes %s", len(manySmall), manySmall[:min(len(manySmall), 160)])
 	}
 
 	// Too many calls to fit even with the heads dropped fall back to the
@@ -851,10 +877,10 @@ func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
 	}
 }
 
-// The start-time sweep takes a previous incarnation's task scopes and
-// nothing else: BRIDGE_SCRATCH_DIR may name a mount the bridge shares, so
-// the directory itself, a file in it, and a subdirectory not named like a
-// task id all survive a restart.
+// The start-time sweep takes a previous incarnation's task scopes, known by
+// the marker file, and nothing else: BRIDGE_SCRATCH_DIR may name a mount
+// the bridge shares, so the directory itself, a file in it, and a
+// subdirectory without the marker all survive a restart.
 func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	scratch := t.TempDir()
 	leftover := filepath.Join(scratch, "task-0123abcd")
