@@ -3625,3 +3625,20 @@ func TestInjectReadRouteRefusesAnotherConversationsTaskID(t *testing.T) {
 		t.Fatalf("the owning conversation lost its own trace: %s", raw)
 	}
 }
+
+// An activity entry over the probe's per-entry bound is replaced by a
+// stand-in that keeps the tool and a wrapper's nested names, so the trace
+// never rides a poll unbounded and a grader still reads what it reads.
+func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
+	big := strings.Repeat("x", injectMaxEntryBytes)
+	wrapper := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"kanban_create","arguments":{"body":"` + big + `"}},{"name":"kanban_list"}]},"status":"completed"}`)
+	out := capActivityEntry(wrapper)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"kanban_create"`) || !strings.Contains(string(out), `"name":"kanban_list"`) || strings.Contains(string(out), big[:64]) {
+		t.Fatalf("wrapper cap: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
+	plain := json.RawMessage(`{"tool":"terminal","input":{"command":"` + big + `"},"status":"completed"}`)
+	out = capActivityEntry(plain)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"truncated":true`) {
+		t.Fatalf("plain cap: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
+}

@@ -51,6 +51,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"sigs.k8s.io/yaml"
 
@@ -107,6 +108,17 @@ const (
 	// progress as one edited chat line, so this is one edit per minute.
 	DefaultProgressInterval = 60 * time.Second
 
+	// InputValuesShape and InputValuesFull are Config.ActivityInputValues'
+	// two settings. Shape is the default: the graders on the inject lane
+	// read tool names (an entry's tool, a tool_call wrapper's calls[].name)
+	// and nothing of the arguments, and a free-text value is where every
+	// credential the scrub ever missed arrived, so by default none leaves
+	// the pod. Under shape a string value becomes "<string, N chars>" unless
+	// its key is one the graders or a reader of the trace needs by name
+	// (shapeKeptKeys), where it is kept after the scrub; numbers, booleans,
+	// nulls and the structure stay.
+	InputValuesShape = "shape"
+	InputValuesFull  = "full"
 	// activityInputCap bounds one call's redacted input on the bus; it is the
 	// tool_call_audit plugin's own _PAYLOAD_LOG_LIMIT.
 	activityInputCap = 2048
@@ -229,8 +241,11 @@ var (
 	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
 	// ends one at the end, a separator or the next capital. A key that opens
 	// with the word is handled apart (redactedCamelHeadPattern below).
-	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:$|[_.-])`)
-	redactedCamelKeyPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|cookie|set-cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:$|[_.-])`)
+	// An all-caps key with the word as an unseparated suffix (PGPASSWORD,
+	// DBPASSWORD, MYSQLPASSWORD): the libpq spelling, not an exotic one.
+	redactedUpperSuffixPattern = regexp.MustCompile(`[A-Z0-9](?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL)S?$`)
+	redactedCamelKeyPattern    = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Credential)s?(?:$|[_.-]|[A-Z])`)
 	// A camelCase key that opens with the word and goes on in another
 	// component (secretAccessKey, SecretKey, tokenValue, passwordHash) is a
 	// credential unless the next component says it is a name, a reference
@@ -251,18 +266,21 @@ var (
 		// however short the credential (Basic root:toor is twelve characters,
 		// a Token or Digest value has no shape of its own): scheme and
 		// value, the two words after the key.
-		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?[A-Za-z][A-Za-z0-9-]*\s+[^\s"']+`),
+		regexp.MustCompile(`(?i)authorization["']?[ \t]*[:=][ \t]*["']?[A-Za-z][A-Za-z0-9-]*[ \t]+[^\s"']+`),
 		// ... and with no scheme word at all (an API that takes the raw key
 		// in the header): the one token after the key.
-		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?[^\s"']+`),
+		regexp.MustCompile(`(?i)authorization["']?[ \t]*[:=][ \t]*["']?[^\s"']+`),
+
 		// key=value / key: value / "key": "value", where a secret word is a
 		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
 		// quoted value runs to its closing quote, spaces included, so a
 		// passphrase does not leave its tail behind the marker; an unquoted
 		// or unterminated one runs to whitespace, punctuation included, so a
 		// generated password's comma or brace does not split it (what follows
-		// on the same word goes with it, the lesser cost).
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
+		// on the same word goes with it, the lesser cost). The separator's
+		// whitespace is same-line only, so a YAML key with its value on the
+		// next line does not take that line's first token.
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?[ \t]*[=:][ \t]*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
 		// A PEM private-key block, banner to banner: the one credential with
 		// a fixed marker, however it arrived (a heredoc, a file tool's
 		// content, a kubeconfig body under an innocent key).
@@ -282,7 +300,28 @@ var (
 var (
 	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n]|&[^&\n])*`)
 	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`)
+	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
+	// the userinfo alone goes, the scheme and host around it stay.
+	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]+:[^\s/@]+(@)`)
+	// A Cookie or Set-Cookie header by its key: the rest of the line, the
+	// character before the key kept.
+	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
 )
+
+// shapeKeptKeys are the keys whose string values survive shape mode: the
+// names and identifiers a grader or a reader of the trace keys on, none of
+// them a place a credential is passed. Matched on the key's lowercase form.
+var shapeKeptKeys = map[string]bool{
+	"name": true, "tool": true, "id": true, "kind": true, "type": true, "status": true,
+	"namespace": true, "project": true, "location": true, "region": true, "zone": true,
+	"cluster": true, "cluster_name": true, "resource": true, "resource_type": true,
+	"skill": true, "skill_name": true, "profile": true, "agent": true, "event": true,
+}
+
+// shapeOf is what a free-text value becomes under shape mode.
+func shapeOf(s string) string {
+	return fmt.Sprintf("<string, %d chars>", utf8.RuneCountInString(s))
+}
 
 // ActivityEntry is one data part of the activity artifact: one tool
 // invocation. tool and input are the worker adapter's shape; the rest is
@@ -323,6 +362,9 @@ type hookDelivery struct {
 
 // activityState is one task's side of the door.
 type activityState struct {
+	// inputValues is the bridge's Config.ActivityInputValues for this task.
+	inputValues string
+
 	// key signs this task's deliveries: the child's env value, verbatim.
 	// hermes HMACs with the secret's text bytes (target.secret.encode()),
 	// so the hex string is the key, not the bytes it spells.
@@ -348,14 +390,18 @@ type activityState struct {
 	done     chan struct{}
 }
 
-func newActivityState(withKey bool) (*activityState, error) {
+func newActivityState(withKey bool, inputValues string) (*activityState, error) {
+	if inputValues != InputValuesFull {
+		inputValues = InputValuesShape
+	}
 	a := &activityState{
-		open:      make(map[string]ActivityEntry),
-		seen:      make(map[string]struct{}),
-		startedAt: time.Now(),
-		appended:  make(map[string]bool),
-		stop:      make(chan struct{}),
-		done:      make(chan struct{}),
+		inputValues: inputValues,
+		open:        make(map[string]ActivityEntry),
+		seen:        make(map[string]struct{}),
+		startedAt:   time.Now(),
+		appended:    make(map[string]bool),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
@@ -426,7 +472,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.open[id] = ActivityEntry{
 			Tool:   d.ToolName,
-			Input:  redactInput(d.ToolName, d.ToolInput),
+			Input:  redactInput(a.inputValues, d.ToolName, d.ToolInput),
 			CallID: d.Extra.ToolCallID,
 			At:     d.Timestamp,
 		}
@@ -440,7 +486,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		status := activityStatus(d)
 		e := ActivityEntry{
 			Tool:       d.ToolName,
-			Input:      redactInput(d.ToolName, d.ToolInput),
+			Input:      redactInput(a.inputValues, d.ToolName, d.ToolInput),
 			CallID:     d.Extra.ToolCallID,
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
@@ -505,6 +551,14 @@ func (a *activityState) underBudget() bool {
 	return false
 }
 
+// countDropped adds calls the drain could not report to the dropped count
+// the marker publishes.
+func (a *activityState) countDropped(n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.dropped += n
+}
+
 // heartbeatUnderBudget is underBudget for a progress part, against the
 // heartbeat's own share: the reserve, and nothing of the trace's, so a short
 // interval under a long deadline silences the heartbeat and never the trace.
@@ -567,18 +621,20 @@ func durationMillis(n json.Number) int64 {
 // bus: a secret word as a whole component in any spelling, or a camelCase
 // key that opens with the word and goes on in something other than a name.
 func secretLookingKey(k string) bool {
-	if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) {
+	if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) || redactedUpperSuffixPattern.MatchString(k) {
 		return true
 	}
 	return redactedCamelHeadPattern.MatchString(k) && !camelHeadNamePattern.MatchString(k)
 }
 
-// redactInput returns the tool input fit for the bus: secret-looking keys
-// blanked at every depth, and the whole thing capped. Over the cap the entry
-// carries the size and a rune-safe head rather than a JSON fragment; for
-// hermes's tool_call wrapper the cap is applied to each nested call's
-// arguments instead, so the nested tool names stay readable.
-func redactInput(tool string, raw json.RawMessage) json.RawMessage {
+// redactInput returns the tool input fit for the bus: under shape mode the
+// structure with free-text values replaced by their shape (name-like keys
+// kept), under full mode the values with secret-looking keys blanked and
+// credential shapes scrubbed; at every depth, and the whole thing capped.
+// Over the cap the entry carries the size and a rune-safe head rather than
+// a JSON fragment; for hermes's tool_call wrapper the cap is applied to each
+// nested call's arguments instead, so the nested tool names stay readable.
+func redactInput(mode, tool string, raw json.RawMessage) json.RawMessage {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil
@@ -594,6 +650,9 @@ func redactInput(tool string, raw json.RawMessage) json.RawMessage {
 		return json.RawMessage(`{"unparseable":true}`)
 	}
 	red := redactValue(v)
+	if mode != InputValuesFull {
+		red = shapeValue(red, "")
+	}
 	out, err := json.Marshal(red)
 	if err != nil {
 		return json.RawMessage(`{"unparseable":true}`)
@@ -678,6 +737,31 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 	return nil, false
 }
 
+// shapeValue is shape mode's pass over an already-scrubbed value: every
+// string becomes its shape unless its key is kept, with the structure,
+// numbers, booleans and nulls left as they are. A "[redacted]" marker stays
+// a marker, so the trace still says a secret-looking key was there.
+func shapeValue(v any, key string) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			t[k] = shapeValue(val, k)
+		}
+		return t
+	case []any:
+		for i := range t {
+			t[i] = shapeValue(t[i], key)
+		}
+		return t
+	case string:
+		if t == redactedValue || shapeKeptKeys[strings.ToLower(key)] {
+			return t
+		}
+		return shapeOf(t)
+	}
+	return v
+}
+
 func redactValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -701,6 +785,8 @@ func redactValue(v any) any {
 		t = curlCommandPattern.ReplaceAllStringFunc(t, func(cmd string) string {
 			return curlUserPattern.ReplaceAllString(cmd, redactedValue)
 		})
+		t = urlUserinfoPattern.ReplaceAllString(t, "${1}"+redactedValue+"${2}")
+		t = cookieHeaderPattern.ReplaceAllString(t, "${1}"+redactedValue)
 		return t
 	}
 	return v
@@ -1004,9 +1090,13 @@ func (b *Bridge) drainActivity(run *taskRun) {
 	}
 	a.signalStop()
 	deadline := time.Now().Add(activityDrainTimeout)
-	for _, e := range a.interrupted() {
+	open := a.interrupted()
+	for i, e := range open {
 		if !time.Now().Before(deadline) {
-			b.cfg.Logger.Warn("activity drain budget spent; interrupted calls not all reported", "task", run.origin.TaskID)
+			// The calls left are counted as dropped, so the marker below says
+			// the trace is short rather than vouching for it.
+			a.countDropped(len(open) - i)
+			b.cfg.Logger.Warn("activity drain budget spent; interrupted calls not all reported", "task", run.origin.TaskID, "unreported", len(open)-i)
 			break
 		}
 		if a.underBudget() {

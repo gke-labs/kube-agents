@@ -320,16 +320,24 @@ so a guardrail refusal stays distinguishable from a tool failure. hermes retries
 that timed out, so each is remembered by its id and a retry is one call. A call still open when the
 task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. `input` is capped (2 KiB): over the cap it becomes
+nothing of it follows the final event. What of the input is published is a setting,
+`BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
+structure with every free-text value replaced by `<string, N chars>` and only name-like fields
+kept (`name`, `tool`, `id`, `kind`, `namespace`, `project`, `location`, `cluster`, `resource`
+and the like), which is all the graders read (a tool's name, a `tool_call` wrapper's
+`calls[].name`), so no credential can ride the trace whatever its spelling; `full` publishes
+the values after the scrub described next, for a debug install that wants them, and is where
+the scrub's best-effort reach matters. In either mode `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
 `api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `passphrase` or `credential` as a
 whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`,
-`SecretAccessKey`, `secretAccessKey`; not `tokenizer`, and not a key that opens with the word
-and goes on as a name, reference or location, `secretName`, `tokenPath`) are replaced before
+`SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`, `client-key-data`, `Cookie`; not
+`tokenizer`, and not a key that opens with the word and goes on as a name, reference or
+location, `secretName`, `tokenPath`) are replaced before
 publishing, and so are the credential shapes a value can carry under an innocent key (a
-bearer value, an `Authorization` header of any scheme, a PEM private-key block, a Google OAuth or API key, a GitHub token, a `key=value`
+bearer value, an `Authorization` or `Cookie` header, a URL's `user:password@`, a PEM private-key block, a Google OAuth or API key, a GitHub token, a `key=value`
 pair or `--flag value` whose key looks like a secret, curl's `-u user:password` with the rest
 of the command kept, a quoted value taken whole to its closing quote) — a terminal
 command is one string, so this is best-effort, and anything else the model pastes into a

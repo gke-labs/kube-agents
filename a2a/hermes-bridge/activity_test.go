@@ -60,11 +60,14 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
 	t.Helper()
 	cfg := Config{
-		NATSURL:        url,
-		Command:        command,
-		TaskDeadline:   20 * time.Second,
-		KillGrace:      500 * time.Millisecond,
-		ActivityListen: "127.0.0.1:0",
+		// Full values, so the tests below can read what the scrub kept; the
+		// shape default has a test of its own.
+		ActivityInputValues: InputValuesFull,
+		NATSURL:             url,
+		Command:             command,
+		TaskDeadline:        20 * time.Second,
+		KillGrace:           500 * time.Millisecond,
+		ActivityListen:      "127.0.0.1:0",
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -261,7 +264,7 @@ print("slow answer")
 // is there from the first line.
 func TestActivity_HeartbeatWithTheDoorClosedSaysTheTraceIsOff(t *testing.T) {
 	now := time.Now()
-	closed, err := newActivityState(false)
+	closed, err := newActivityState(false, InputValuesFull)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +272,7 @@ func TestActivity_HeartbeatWithTheDoorClosedSaysTheTraceIsOff(t *testing.T) {
 	if got := closed.progressLine(now); got != "running 5m0s, tool trace off" {
 		t.Fatalf("door-closed heartbeat = %q", got)
 	}
-	open, err := newActivityState(true)
+	open, err := newActivityState(true, InputValuesFull)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +428,7 @@ func TestRedactInput(t *testing.T) {
 		}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput("terminal", json.RawMessage(tc.in))) })
+		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput(InputValuesFull, "terminal", json.RawMessage(tc.in))) })
 	}
 }
 
@@ -536,7 +539,7 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 		d.Extra.Status, d.Extra.ErrorType = status, errType
 		return d
 	}
-	a, _ := newActivityState(false)
+	a, _ := newActivityState(false, InputValuesFull)
 	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
 		t.Fatalf("blocked -> %+v", e)
 	}
@@ -550,7 +553,7 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 
 func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
 	in := `{"command": "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI; aws s3 ls --secret-access-key hunter6; kubectl --token eyJhbGciOiJSUzI1NiIsImtpZCI6In0 get pods; gcloud x --password hunter5; curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
-	out := string(redactInput("terminal", json.RawMessage(in)))
+	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
 	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy", "eyJhbGciOiJSUzI1NiIsImtpZCI6In0", "hunter5", "wJalrXUtnFEMI", "hunter6"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
@@ -568,7 +571,7 @@ func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
 // trace carries what the worker adapter's would.
 func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 	in := `{"command": "git commit -m 'basic refactoring'; date -u 12:30; sort -u a:b; kubectl get secret my-secret -o yaml", "secretName": "db-creds", "tokenizer": "cl100k", "max_tokens": 4096, "SECRET_KEY": "s3"}`
-	out := string(redactInput("terminal", json.RawMessage(in)))
+	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
 	for _, kept := range []string{"basic refactoring", "date -u 12:30", "sort -u a:b", "kubectl get secret my-secret -o yaml", `"secretName":"db-creds"`, `"tokenizer":"cl100k"`} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("ordinary text %q was scrubbed: %s", kept, out)
@@ -581,13 +584,52 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 	}
 }
 
+// Shape mode, the default: no free-text value leaves the pod, whatever its
+// key; the structure, numbers, booleans, the redaction markers and the
+// name-like fields a grader reads stay, so a tool_call wrapper still names
+// its calls and a terminal command's text is a length.
+func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
+	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}]}`
+	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
+		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
+		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`} {
+			if strings.Contains(out, leaked) {
+				t.Fatalf("mode %q published a free-text value %q: %s", mode, leaked, out)
+			}
+		}
+		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"abc"`, `"name":"kanban_create"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
+			if !strings.Contains(out, kept) {
+				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
+			}
+		}
+	}
+	full := string(redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(in)))
+	if !strings.Contains(full, `"note":"free text"`) || strings.Contains(full, "hunter2") {
+		t.Fatalf("full mode: %s", full)
+	}
+}
+
+// Calls the drain could not report are counted, so the marker says the
+// trace is short rather than vouching for it.
+func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
+	a, _ := newActivityState(false, InputValuesFull)
+	if _, ok := a.truncationMarker(); ok {
+		t.Fatal("a marker with nothing dropped")
+	}
+	a.countDropped(2)
+	m, ok := a.truncationMarker()
+	if !ok || m.Dropped != 2 || m.Tool != activityTruncatedTool {
+		t.Fatalf("marker = %+v, %v", m, ok)
+	}
+}
+
 // camelCase is the native key style of most MCP and HTTP tool schemas: a
 // secret word that starts a component there is blanked like its snake_case
 // twin, while a name that merely starts with the word (secretName,
 // tokenizer) still ships.
 func TestRedactInput_CamelCaseKeys(t *testing.T) {
 	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"a-name","secretAccessKey":"w4","secretKey":"w5","passwordHash":"h1","tokenPath":"/t","credentialsFile":"/c","SecretRef":"r-name"}`
-	out := string(redactInput("http_request", json.RawMessage(in)))
+	out := string(redactInput(InputValuesFull, "http_request", json.RawMessage(in)))
 	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, `"w4"`, `"w5"`, `"h1"`} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
@@ -611,7 +653,7 @@ func TestRedactInput_CamelCaseKeys(t *testing.T) {
 // passphrase must not ship behind a marker that says it was redacted.
 func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z; export DB_PASSWORD=p@ss,w0rd; echo token=ab}cd; curl -u 'admin:p&ss' https://w && echo done", "plain": "kubectl get pods -h db"}`
-	out := string(redactInput("terminal", json.RawMessage(in)))
+	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
 	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8", "w0rd", "}cd", "p&ss"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
@@ -632,9 +674,9 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 // The scheme token is case-insensitive, and a credential can arrive under a
 // key outside the first list of words: a private key, a passphrase.
 func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
-	in := `{"kubeconfig": {"users": [{"user": {"client-key-data": "LS0tLS1CRUdJTi", "client-certificate-data": "cert-ok"}}]}, "cmd2": "kubectl config set-credentials u --client-key-data=LS0tLS1CRUdJTi2; curl -H 'Authorization: lin_api_9f3c2a1b7d' https://api.linear.app; curl -H \"Authorization: 9f3c2a1b7d\" https://r", "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----\n", "command": "cat > id_rsa <<EOF\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\n-----END OPENSSH PRIVATE KEY-----\nEOF; curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
-	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", "MIIEowIBAAKCAQEA7", "b3BlbnNzaC1rZXkt", "LS0tLS1CRUdJTi", "lin_api_9f3c2a1b7d", "9f3c2a1b7d", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
+	in := `{"env": {"PGPASSWORD": "hunter11", "MYSQLPASSWORD": "hunter12", "PGHOST": "db"}, "headers": {"Cookie": "session=9f3c2a1b", "Accept": "json"}, "yaml": "authorization:\n  mode: Webhook\npassword:\n  valueFrom:\n    secretKeyRef: x\n", "urls": "psql postgresql://admin:hunter13@db.internal:5432/app; git clone https://user:glpat-xxxx@gitlab.example/r.git; curl -H 'Cookie: session=abc123' https://c", "kubeconfig": {"users": [{"user": {"client-key-data": "LS0tLS1CRUdJTi", "client-certificate-data": "cert-ok"}}]}, "cmd2": "kubectl config set-credentials u --client-key-data=LS0tLS1CRUdJTi2; curl -H 'Authorization: lin_api_9f3c2a1b7d' https://api.linear.app; curl -H \"Authorization: 9f3c2a1b7d\" https://r", "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----\n", "command": "cat > id_rsa <<EOF\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\n-----END OPENSSH PRIVATE KEY-----\nEOF; curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
+	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", "MIIEowIBAAKCAQEA7", "b3BlbnNzaC1rZXkt", "LS0tLS1CRUdJTi", "lin_api_9f3c2a1b7d", "9f3c2a1b7d", "hunter11", "hunter12", "session=9f3c2a1b", "hunter13", "glpat-xxxx", "session=abc123", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -642,7 +684,7 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 	// A short word after "basic" is not a credential, and a camelCase key
 	// that starts with the word is a name, as for secretName.
 	// The curl command's URL and method survive its credential.
-	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d", `"client-certificate-data":"cert-ok"`, "https://api.linear.app", "https://r"} {
+	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d", `"client-certificate-data":"cert-ok"`, "https://api.linear.app", "https://r", `"PGHOST":"db"`, `"Accept":"json"`, "mode: Webhook", "secretKeyRef: x", "postgresql://[redacted]@db.internal:5432/app", "https://[redacted]@gitlab.example/r.git", "curl -H '[redacted]' https://c"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("expected %q in %s", kept, out)
 		}
@@ -655,7 +697,7 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	big := strings.Repeat("x", activityInputCap)
 	in := `{"calls":[{"name":"kanban_create","arguments":{"title":"a","body":"` + big + `","token":"s1"}},{"name":"kanban_comment","arguments":{"body":"` + big + `"}},{"name":"kanban_list"},{"name":"kanban_get","arguments":{"id":7}}]}`
-	out := redactInput(hermesToolCallWrapper, json.RawMessage(in))
+	out := redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(in))
 	if len(out) > activityInputCap {
 		t.Fatalf("wrapper still over the cap: %d bytes", len(out))
 	}
@@ -694,7 +736,7 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	}
 
 	// The same wrapper under another tool name is capped whole, as before.
-	whole := redactInput("terminal", json.RawMessage(in))
+	whole := redactInput(InputValuesFull, "terminal", json.RawMessage(in))
 	if !strings.HasPrefix(string(whole), `{"bytes":`) && !strings.Contains(string(whole), `"truncated":true`) {
 		t.Fatalf("non-wrapper over the cap was not the stand-in: %s", whole)
 	}
@@ -708,7 +750,7 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		small = append(small, `{"name":"kanban_comment","arguments":{"id":`+strings.Repeat("7", 3)+`,"body":"`+strings.Repeat("s", 200)+`"}}`)
 	}
-	manySmall := redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(small, ",")+`]}`))
+	manySmall := redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(small, ",")+`]}`))
 	if len(manySmall) > activityInputCap || strings.Count(string(manySmall), `"name":"kanban_comment"`) != 12 || strings.Contains(string(manySmall), `"head":"{`) {
 		t.Fatalf("many small calls lost their names or kept heads: %d bytes %s", len(manySmall), manySmall[:min(len(manySmall), 160)])
 	}
@@ -719,7 +761,7 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	for i := 0; i < activityInputCap/8; i++ {
 		many = append(many, `{"name":"kanban_create_`+strings.Repeat("y", 40)+`","arguments":{"b":"`+big+`"}}`)
 	}
-	fallback := redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(many, ",")+`]}`))
+	fallback := redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(many, ",")+`]}`))
 	if len(fallback) > activityInputCap || !strings.Contains(string(fallback), `"truncated":true`) {
 		t.Fatalf("oversized wrapper did not fall back: %d bytes %s", len(fallback), fallback[:min(len(fallback), 120)])
 	}
@@ -791,7 +833,7 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
 	activityEntryBudget, activityHeartbeatReserve = 4, 2
 	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
-	a, _ := newActivityState(false)
+	a, _ := newActivityState(false, InputValuesFull)
 	got := 0
 	for i := 0; i < 3; i++ {
 		if a.underBudget() {
@@ -812,7 +854,7 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	}
 	// And the other way: a heartbeat that spent its share took nothing from
 	// the trace's.
-	b, _ := newActivityState(false)
+	b, _ := newActivityState(false, InputValuesFull)
 	for i := 0; i < 5; i++ {
 		b.heartbeatUnderBudget()
 	}

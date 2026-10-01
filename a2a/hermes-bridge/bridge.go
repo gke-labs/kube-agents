@@ -101,6 +101,13 @@ type Config struct {
 	// negative value turns the heartbeat off. The daemon maps its
 	// environment's 0 to that, since "0 seconds" can only mean off there.
 	ProgressInterval time.Duration
+	// ActivityInputValues says what of a tool call's input reaches the bus:
+	// InputValuesShape (the default, and the zero value) publishes the
+	// input's structure with every free-text value replaced by its shape
+	// and only name-like fields kept, so no credential can ride it whatever
+	// its spelling; InputValuesFull publishes the values after the
+	// best-effort scrub, for a debug install that wants them.
+	ActivityInputValues string
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option
 	Logger      *slog.Logger
@@ -718,7 +725,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	cmd.Stderr = stderr
 	// The activity door's side of this task: a signing key in the child's
 	// environment when the door is open, and the heartbeat either way.
-	act, err := newActivityState(b.activityLn != nil)
+	act, err := newActivityState(b.activityLn != nil, b.cfg.ActivityInputValues)
 	if err != nil {
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
 		return

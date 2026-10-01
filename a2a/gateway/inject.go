@@ -1864,6 +1864,14 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 			report.ActivityDropped = len(trace) - injectMaxActivityEntries
 			trace = trace[len(trace)-injectMaxActivityEntries:]
 		}
+		// Each entry is bounded like every other probe string: the bridge
+		// caps its inputs, the worker adapter does not, and the trace rides
+		// every poll.
+		for i := range trace {
+			if len(trace[i]) > injectMaxEntryBytes {
+				trace[i] = capActivityEntry(trace[i])
+			}
+		}
 		report.Activity = &trace
 	}
 	if !state.SubmittedAt.IsZero() {
@@ -1874,6 +1882,39 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 		report.Error = err.Error()
 	}
 	return report
+}
+
+// capActivityEntry replaces an over-size activity entry with a stand-in that
+// keeps what a grader reads (the tool, and a tool_call wrapper's nested
+// names) and says the input was cut, in the bridge's own stand-in shape.
+func capActivityEntry(raw json.RawMessage) json.RawMessage {
+	var entry map[string]any
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return json.RawMessage(`{"tool":"","input":{"truncated":true,"bytes":` + strconv.Itoa(len(raw)) + `,"head":""}}`)
+	}
+	names := []any{}
+	if in, ok := entry["input"].(map[string]any); ok {
+		if calls, ok := in["calls"].([]any); ok {
+			for _, c := range calls {
+				if m, ok := c.(map[string]any); ok {
+					if n, ok := m["name"].(string); ok {
+						names = append(names, map[string]any{"name": n})
+					}
+				}
+			}
+		}
+	}
+	stand := map[string]any{"truncated": true, "bytes": len(raw), "head": ""}
+	if len(names) > 0 {
+		entry["input"] = map[string]any{"calls": names}
+	} else {
+		entry["input"] = stand
+	}
+	out, err := json.Marshal(entry)
+	if err != nil {
+		return raw[:0]
+	}
+	return out
 }
 
 // injectConversationKey validates a caller's conversation id and prefixes it.
