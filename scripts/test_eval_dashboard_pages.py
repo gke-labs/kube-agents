@@ -53,9 +53,22 @@ HOSTILE_PR = "<<script>script>"
 # The poll-timing tests run the page's setInterval this many times faster, so
 # two polls fit in a budget of a few virtual seconds (see fast_timers_page).
 TIMER_SPEEDUP = 100
-PAGE_REFRESH_MS = int(re.search(r"refreshMs: (\d+)", PAGES_JS.read_text()).group(1))
+# A bare integer literal only: `60 * 1000`, `60_000` or `6e4` would otherwise
+# read as 60 or 6 and shrink the budget below to almost nothing.
+_REFRESH_MATCH = re.search(r"^\s*refreshMs:\s*(\d+)\s*(?:,|\}|$)", PAGES_JS.read_text(), re.MULTILINE)
+if _REFRESH_MATCH is None:
+    raise RuntimeError(f"{PAGES_JS}: PAGE.refreshMs is not a bare integer literal; the poll-timing tests cannot derive their budget")
+PAGE_REFRESH_MS = int(_REFRESH_MATCH.group(1))
 # Boot, then two polls, then half an interval of slack, on the sped-up clock.
 TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEEDUP
+# Below this the page may not finish booting inside the budget, and the
+# scroll-once test would pass or fail on load time rather than on the poll.
+MIN_TWO_POLLS_BUDGET_MS = 1000
+if TWO_POLLS_BUDGET_MS < MIN_TWO_POLLS_BUDGET_MS:
+    raise RuntimeError(
+        f"two polls of PAGE.refreshMs={PAGE_REFRESH_MS} at TIMER_SPEEDUP={TIMER_SPEEDUP} give a "
+        f"{TWO_POLLS_BUDGET_MS} ms budget, under {MIN_TWO_POLLS_BUDGET_MS} ms; lower TIMER_SPEEDUP"
+    )
 
 
 # The scorer's marker-led reason for a delegation-ceiling repetition (#1874);
