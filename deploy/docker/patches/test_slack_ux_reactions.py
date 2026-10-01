@@ -444,6 +444,54 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_c"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
 
+    def test_a_card_under_a_parked_follow_up_does_not_hold_the_settle(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{
+            **_cards("t_b", status="blocked", creator="t_a", gave_up=True),
+            **_cards("t_c", status="todo", creator="t_b"),
+        }]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        self.assertEqual(runtime._deferred, {})
+
+    def test_a_card_under_an_open_follow_up_is_held_from_the_first_completion(self):
+        # t_g, filed by t_b's worker, is held from t_a's completion, so its
+        # give-up makes the ask ❌ although t_b completes afterwards.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_b", creator="t_a"), **_cards("t_g", creator="t_b")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        _run(runtime.settle_delegated(adapter, self._sub("t_g"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        self.boards[:] = [{}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+
+    def test_a_card_past_the_depth_cap_does_not_hold_the_settle(self):
+        depth = runtime.LINEAGE_DEPTH
+        adapter = self._turn("fix it", {}, _cards("t_0"))
+        self.lineage = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, depth + 2)}
+        self.boards[:] = [_cards(f"t_{depth + 1}", status="todo", creator=f"t_{depth}")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_0"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+        adapter = self._turn("fix it", {}, _cards("t_0"))
+        self.boards[:] = [_cards(f"t_{depth}", status="todo", creator=f"t_{depth - 1}")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_0"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+
+    def test_an_unreadable_board_skips_the_lineage_read(self):
+        reads = []
+
+        async def thread_lineage(chat_id, thread_id):
+            reads.append((chat_id, thread_id))
+            return {}
+
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [None]
+        with mock.patch.object(runtime, "thread_lineage", thread_lineage):
+            _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(reads, [])
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+
     def test_the_lineage_walk_stops_at_its_depth_cap_and_on_a_cycle(self):
         chain = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, runtime.LINEAGE_DEPTH + 2)}
         found = runtime._descendants(("default", "t_0"), chain)
@@ -452,6 +500,9 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(runtime._descendants(("default", "t_a"), cycle), {("default", "t_a"), ("default", "t_b")})
         # Another board's card of the same id is not a descendant.
         self.assertEqual(runtime._descendants(("default", "t_a"), {("b2", "t_b"): "t_a"}), set())
+        # Nor is anything under a parked card, which is itself still found.
+        under = {("default", "t_b"): "t_a", ("default", "t_c"): "t_b"}
+        self.assertEqual(runtime._descendants(("default", "t_a"), under, frozenset({("default", "t_b")})), {("default", "t_b")})
 
     def test_a_follow_up_blocked_on_the_user_holds_the_settle_and_pauses_it(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))

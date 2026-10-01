@@ -32,14 +32,16 @@ With the flag on:
   its settle to those cards, and only those: a card already open when the ask
   arrived is not its to wait on, even one unblocked while the turn ran.
   Hermes records no actor on an unblock, so it may be the CLI's or another
-  turn's; that card's own ask carries its outcome. Nor is a new card the
-  worker of a card it did not open created: Hermes copies the creator's
-  subscriptions onto it, so it is in the thread without being the turn's. A
-  turn that failed
-  after opening them still settles ❌ when they finish, whatever they did. The kanban notifier calls
+  turn's; that card's own ask carries its outcome. Nor is a card created
+  under one it did not open, a worker's follow-up or one filed beneath that:
+  Hermes copies the creator's subscriptions onto it, so it is in the thread
+  without being the turn's. A turn that failed after opening them still
+  settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
-  or ❌ if any gave up. A fan-out settles once, when all of it has. Only a
+  or ❌ if any gave up. A completion extends its ask to the open cards created
+  under it, transitively (see :func:`settle_delegated`). A fan-out settles
+  once, when all of it has. Only a
   finish reported while the turn runs, or after it, counts for its ask. Cards
   are read from every live board, as the notifier reads them, and known by
   board and id.
@@ -112,7 +114,9 @@ THREAD_LINEAGE_SQL = (
 )
 
 #: How many creator links a completion follows down to the open cards it holds
-#: the ask for. A worker's follow-up is one link; one filed under that, two.
+#: the ask for. A worker's follow-up is one link; one filed under that, two. A
+#: card further down is not held, so the ask can settle while it runs; that
+#: needs this many cards above it already completed.
 LINEAGE_DEPTH = 8
 
 #: ``ProcessingOutcome`` values, compared by value so this module needs no
@@ -274,14 +278,19 @@ async def thread_lineage(chat_id: str, thread_id: str) -> dict:
         return {}
 
 
-def _descendants(card: tuple, creators: dict) -> set:
-    """The cards created under ``card``, through workers' follow-ups, up to ``LINEAGE_DEPTH`` links down."""
+def _descendants(card: tuple, creators: dict, parked: frozenset = frozenset()) -> set:
+    """The cards created under ``card``, through workers' follow-ups, up to ``LINEAGE_DEPTH`` links down.
+
+    The walk does not go below a card in ``parked``: a card filed under one that
+    gave up cannot be reached by the work this ask is waiting for.
+    """
     found: set = set()
     frontier = {card}
     for _ in range(LINEAGE_DEPTH):
+        parents = frontier - parked
         frontier = {
             (board, task) for (board, task), creator in creators.items()
-            if (board, creator) in frontier and (board, task) not in found
+            if (board, creator) in parents and (board, task) not in found
         }
         if not frontier:
             break
@@ -393,10 +402,13 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     completes, so it was not on the board when the turn ended. Cards created
     under those count as well, through creators that have already completed,
     which a second read of the thread's closed cards supplies; if it fails,
-    only links between open cards are followed. One blocked on
-    the user is kept and puts ⏸️ on the ask. One parked by a give-up is not, and
-    leaves the ask ✅ for the work it did: being subscribed to this thread, the
-    follow-up has posted its own "gave up" line in it, which is the failure. A
+    only links between open cards are followed. A card created under an open
+    follow-up is therefore held from this completion, not from that
+    follow-up's: its ⏸️ shows now, and its give-up makes the ask ❌. One
+    blocked on the user is kept and puts ⏸️ on the ask. One parked by a give-up
+    is not, nor is anything created under it, and it leaves the ask ✅ for the
+    work it did: being subscribed to this thread, the follow-up has posted its
+    own "gave up" line in it, which is the failure. A
     give-up holds on nothing more: the card is parked, so a follow-up it gates
     cannot start, and the ask is ❌ whatever the rest do. A failed read settles
     as though there were none. A card filed under this one after its
@@ -426,10 +438,12 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         return
     follow_ups = {}
     if settle == _presenter.SETTLE_DONE:
-        still_open = await open_cards(*key) or {}
-        creators = {**await thread_lineage(*key), **{c: seen.creator for c, seen in still_open.items()}}
-        under = _descendants(card, creators)
-        follow_ups = {c: seen for c, seen in still_open.items() if c in under and not seen.gave_up}
+        still_open = await open_cards(*key)
+        if still_open:
+            creators = {**await thread_lineage(*key), **{c: seen.creator for c, seen in still_open.items()}}
+            parked = frozenset(c for c, seen in still_open.items() if seen.gave_up)
+            under = _descendants(card, creators, parked)
+            follow_ups = {c: seen for c, seen in still_open.items() if c in under and c not in parked}
     waits_on_user = any(seen.status not in RESUMED_STATUSES for seen in follow_ups.values())
     # The read awaited, so another event may have settled an ask meanwhile.
     asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
