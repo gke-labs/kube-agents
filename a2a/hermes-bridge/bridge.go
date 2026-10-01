@@ -74,7 +74,7 @@ const (
 // sessionIDLine is the last thing `hermes chat -Q` writes on stderr:
 // "session_id: <id>". The id finds the transcript under the profile's session
 // store, which is the evidence the status message cannot carry whole.
-var sessionIDLine = regexp.MustCompile(`(?m)^session_id:\s*(\S+)`)
+var sessionIDLine = regexp.MustCompile(`(?m)^session_id:[ \t]*(\S+)`)
 
 // Config wires one bridge. Zero values get playground defaults in Run.
 type Config struct {
@@ -342,17 +342,23 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 	// Unknown task: the dispatcher rule. Empty events subject means new;
 	// terminal means acked with a warning; non-final events with no local run
 	// is an orphan a follow-up cannot revive.
-	task, err := b.lookupTask(ctx, env.TaskID)
+	task, attempts, err := b.lookupTask(ctx, env.TaskID)
 	switch {
 	case isTaskNotFound(err):
 		b.accept(ctx, env)
+	case err != nil && ctx.Err() != nil:
+		// The bridge is stopping; the lookup did not run its course. Said
+		// so, rather than counted as a cap incident by a reader grepping
+		// the drop line below.
+		b.cfg.Logger.Warn("events lookup interrupted by shutdown; submission left to redelivery",
+			"task", env.TaskID, "attempts", attempts, "err", err)
 	case err != nil:
 		// The lib acks after this handler returns, so the submission is
 		// dropped, not redelivered - no terminal event will follow. Honest
 		// gap: the lib exposes no nak path yet; lookupTask's retries are
 		// what stands in for one.
 		b.cfg.Logger.Error("events lookup failed after retries; dropping submission",
-			"task", env.TaskID, "attempts", taskLookupAttempts, "err", err)
+			"task", env.TaskID, "attempts", attempts, "err", err)
 	case task.Final:
 		b.cfg.Logger.Warn("message for a task with a terminal event; ignoring", "task", env.TaskID)
 	default:
@@ -431,12 +437,12 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
 		return
 	}
-	task, err := b.lookupTask(ctx, env.TaskID)
+	task, attempts, err := b.lookupTask(ctx, env.TaskID)
 	switch {
 	case isTaskNotFound(err):
 		b.cfg.Logger.Warn("cancel for a task with no events; ignoring", "task", env.TaskID)
 	case err != nil:
-		b.cfg.Logger.Error("cancel events lookup failed after retries", "task", env.TaskID, "err", err)
+		b.cfg.Logger.Error("cancel events lookup failed after retries", "task", env.TaskID, "attempts", attempts, "err", err)
 	case task.Final:
 		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
 	default:
@@ -765,8 +771,11 @@ func failureReason(err error, stdout, stderr string) string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "reason: %s - %v", token, err)
-	if m := sessionIDLine.FindStringSubmatch(stderr); m != nil {
-		fmt.Fprintf(&sb, "; session: %s", m[1])
+	// The last match: the CLI prints its own line last, after anything a
+	// tool's nested run echoed; a label with nothing after it matches
+	// nothing, so no id is reported rather than the next line's first word.
+	if all := sessionIDLine.FindAllStringSubmatch(stderr, -1); len(all) > 0 {
+		fmt.Fprintf(&sb, "; session: %s", all[len(all)-1][1])
 	}
 	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
 	return sb.String()
@@ -787,32 +796,31 @@ func tail(s string, n int) string {
 
 // lookupTask is TasksGet with the bounded retry taskLookupAttempts
 // describes. A not-found answer is an answer and returns at once; any other
-// error is retried with a short backoff and the last one is returned.
-func (b *Bridge) lookupTask(ctx context.Context, taskID string) (*lib.Task, error) {
+// error is retried with a growing backoff and the last one is returned. The
+// count is how many lookups were made, which is what the drop log reports:
+// a context that ends the loop after one attempt (a shutdown mid-handler)
+// is one, not the bound.
+func (b *Bridge) lookupTask(ctx context.Context, taskID string) (task *lib.Task, attempts int, err error) {
 	get := b.tasksGet
 	if get == nil {
 		get = b.c.TasksGet
 	}
-	var (
-		task *lib.Task
-		err  error
-	)
-	for attempt := 1; attempt <= taskLookupAttempts; attempt++ {
+	for attempts = 1; attempts <= taskLookupAttempts; attempts++ {
 		task, err = get(ctx, b.cfg.Profile, taskID)
 		if err == nil || isTaskNotFound(err) || ctx.Err() != nil {
-			return task, err
+			return task, attempts, err
 		}
-		if attempt < taskLookupAttempts {
+		if attempts < taskLookupAttempts {
 			b.cfg.Logger.Warn("task lookup failed; retrying",
-				"task", taskID, "attempt", attempt, "of", taskLookupAttempts, "err", err)
+				"task", taskID, "attempt", attempts, "of", taskLookupAttempts, "err", err)
 			select {
-			case <-time.After(taskLookupBackoff * time.Duration(attempt)):
+			case <-time.After(taskLookupBackoff * time.Duration(attempts)):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, attempts, ctx.Err()
 			}
 		}
 	}
-	return task, err
+	return task, taskLookupAttempts, err
 }
 
 // finalize is the single writer of a task's terminal event, idempotent: the

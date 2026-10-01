@@ -1571,8 +1571,42 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 		nf.Add(1)
 		return nil, &lib.A2AError{Code: lib.CodeTaskNotFound}
 	}
-	if _, err := b.lookupTask(context.Background(), "x"); !isTaskNotFound(err) || nf.Load() != 1 {
-		t.Fatalf("not-found was retried or lost: err=%v attempts=%d", err, nf.Load())
+	if _, attempts, err := b.lookupTask(context.Background(), "x"); !isTaskNotFound(err) || nf.Load() != 1 || attempts != 1 {
+		t.Fatalf("not-found was retried or lost: err=%v calls=%d attempts=%d", err, nf.Load(), attempts)
+	}
+
+	// A context that ends inside the first backoff reports one attempt, not
+	// the bound: the drop log must not count a shutdown as a cap incident.
+	ctx, cancel := context.WithCancel(context.Background())
+	b.tasksGet = func(context.Context, string, string) (*lib.Task, error) {
+		cancel()
+		return nil, errors.New("nats: timeout")
+	}
+	if _, attempts, err := b.lookupTask(ctx, "y"); err == nil || attempts != 1 {
+		t.Fatalf("interrupted lookup: err=%v attempts=%d, want an error and 1", err, attempts)
+	}
+}
+
+// The session id is the CLI's own line, the last one, and a label with
+// nothing after it is no id at all rather than the next line's first word.
+func TestFailureReason_SessionIDIsTheLastWholeLine(t *testing.T) {
+	err := errors.New("exit status 1")
+	cases := []struct{ stderr, want string }{
+		{"session_id: a1\n[tool] nested run said\nsession_id: b2\n", "session: b2"},
+		{"session_id:\n[hermes-otel] disabled\n", ""},
+		{"nothing here\n", ""},
+	}
+	for _, c := range cases {
+		got := failureReason(err, "", c.stderr)
+		if c.want == "" {
+			if strings.Contains(got, "session:") {
+				t.Errorf("stderr %q: reason reports a session id: %q", c.stderr, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.want) || strings.Contains(got, "session: a1") || strings.Contains(got, "session: [hermes-otel]") {
+			t.Errorf("stderr %q: reason = %q, want %q and not an earlier line or the next line's word", c.stderr, got, c.want)
+		}
 	}
 }
 
