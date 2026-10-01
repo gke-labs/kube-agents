@@ -1054,6 +1054,27 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "until python3 -m kanban_notify_propagate; do sleep 1; done",
             "coproc python3 -m kanban_notify_propagate",
             "eval 'python3 -m kanban_notify_propagate list'",
+            # Quoted option flags, split-quoted module names, and env var command substitutions (Thread 1)
+            "python3 '-m' cluster_agent_profile list",
+            'python3 "-m" cluster_agent_profile list',
+            "python3 '-um' cluster_agent_profile list",
+            'python3 "-um" cluster_agent_profile list',
+            "python3 '-m' kanban_notify_propagate list",
+            'python3 "-m" kanban_notify_propagate list',
+            "python3 -m cluster_agent_profi'le' list",
+            'python3 -m cluster_agent_profi"le" list',
+            "python3 -m kanban_notify_propa'gate' list",
+            'python3 -m kanban_notify_propa"gate" list',
+            "FOO=$(date) python3 -m cluster_agent_profile list",
+            "PYTHONPATH=$(pwd) python3 -m cluster_agent_profile list",
+            "FOO=`pwd` python3 -m cluster_agent_profile list",
+            "FOO=$(date) python3 -m kanban_notify_propagate list",
+            "PYTHONPATH=$(pwd) python3 -m kanban_notify_propagate list",
+            "FOO=`pwd` python3 -m kanban_notify_propagate list",
+            'python3 \'-c\' "import cluster_agent_profile"',
+            'python3 "-c" "import cluster_agent_profile"',
+            'python3 \'-c\' "import kanban_notify_propagate"',
+            'python3 "-c" "import kanban_notify_propagate"',
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1201,6 +1222,11 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'python3 -c "print({' + ",".join(f'\\"k{i}\\":\\"v{i}\\"' for i in range(10)) + '})"',
             # Verify wrapper-chain alternation does not backtrack exponentially (Thread 4)
             "env " * 26 + "x",
+            # Verify unquoted -c code arguments with long runs of backslash escapes do not backtrack exponentially (Thread 3)
+            "python3 -c " + "\\a" * 30,
+            "python3 -c " + "\\a" * 50,
+            "python3 -c " + "\\\\" * 30,
+            "python3 -c " + "\\\\" * 50,
         ]
         for cmd in flagged_cmds:
             for i, pat in enumerate(forbidden):
