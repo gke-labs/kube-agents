@@ -17,14 +17,14 @@ README's item, the check and the fix are the catalogue's entry.
 The catalogue is the list of ways an upgrade can break an application. The harness is the set of
 scripts that built a disposable cluster for each one, broke it on purpose, and kept the evidence.
 The seeded fleet is the small set of long-lived test clusters every automated test run can look at,
-which can carry a hazard in its before-state but is never upgraded. This page lines the three up:
+which can carry a hazard in its before-state; no test may upgrade or change it, though GKE upgrades it on its own schedule, so a before-state there has to survive a node rebuild. This page lines the three up:
 for each failure, which script reproduces it, what happened when it ran, and whether the shared test
 clusters already carry the hazard, could, or never can.
 
 ## The list
 
 Each line gives the entry, its verdict from the harness, the script the verdict rests on, and what
-the seeded fleet on `main` holds for it. The fleet can carry a before-state only.
+the seeded fleet on `main` holds for it. The fleet can carry a before-state only, and only one that GKE's own node rebuilds do not erase.
 
 1. [A PodDisruptionBudget forbids the eviction](#1-a-poddisruptionbudget-forbids-the-eviction):
    reproduced; `scenarios/01.sh`; none shaped to block a drain on `main`.
@@ -130,8 +130,7 @@ Harness: `scenarios/04.sh` (`upg-04b`); `bash run.sh 04`. Reproduced: an emptyDi
 control-plane upgrade and was replaced after the node rebuild, and nothing reported the loss; only
 emptyDir was tested, not hostPath or Local SSD.
 
-Fleet: no role on `main`; a Deployment writing to an `emptyDir` on seeded-a would carry the
-before-state.
+Fleet: no role on `main`, and none would hold: an `emptyDir` stamp is exactly what the fleet's own node rebuilds erase, so the before-state would become the after-state at GKE's next patch.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/04.sh`, evidence
 `bench/upgrade-scenarios/evidence/04/node-data.txt`, and item 4 of the harness README. Detection,
@@ -242,8 +241,7 @@ Harness: `scenarios/12.sh` (`upg-12b`); `bash run.sh 12`. Reproduced in GKE's fo
 a label set by hand stayed Pending after the rebuilt node came back without it, and GKE reported
 DONE; whether a minor still drops a standard label was not checked.
 
-Fleet: no role on `main`; a workload selecting a hand-set node label on seeded-a would carry the
-before-state.
+Fleet: no role on `main`, and none would hold: a hand-set node label does not survive the node rebuild GKE's own patch upgrades perform, which is the break itself, so the fixture would plant the after-state.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/12.sh`, evidence
 `bench/upgrade-scenarios/evidence/12/label.txt`, and item 12 of the harness README. Detection, where
@@ -272,8 +270,7 @@ pool can still be created on a 1.34 cluster, GKE refused its 1.35 upgrade with a
 the migration to v2 first, and after the migration the old JVM was OOMKilled five times while a
 fixed JVM stayed up.
 
-Fleet: no role on `main`; a cgroup v1 pool with an old JVM on it would carry the before-state until
-GKE migrates it.
+Fleet: no role on `main`, and none would hold for long: GKE migrates a cgroup v1 pool to v2 at 1.33 and refuses v1 at 1.35, so the before-state has a shelf life the fleet's auto-upgrade sets.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/14c.sh` (`14.sh` is the symptom alone), evidence
 `bench/upgrade-scenarios/evidence/14c/cgroup.txt`, and item 14 of the harness README. Detection,
@@ -302,9 +299,7 @@ default-deny NetworkPolicy sat unenforced, switching enforcement on changed noth
 pool upgrade rebuilt the node with calico and cut traffic; the trigger is the enforcement switch
 applied at the rebuild, not a version change.
 
-Fleet: no named role, but seeded-a holds the before-state: a default-deny NetworkPolicy in every
-seeded namespace with neither the network-policy add-on nor Dataplane V2 enforcing it, which the
-first Recommender read counted as the catch for this entry.
+Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in three of its five seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`; `seeded-security` has none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/16.sh`, evidence
 `bench/upgrade-scenarios/evidence/16/dataplane.txt`, and item 16 of the harness README. Detection,
@@ -318,8 +313,7 @@ only where a hand-set label was, the rebuilt node lacked the label, the DaemonSe
 the client on the new node got Connection refused, with the operation DONE; GKE's own node agents
 cannot be broken from outside.
 
-Fleet: no role on `main`; a DaemonSet selecting a hand-set node label, with a consumer on the same
-node, would carry the before-state.
+Fleet: no role on `main`, and none would hold: the hand-set label the DaemonSet selects on is what a node rebuild drops, so GKE's own patch upgrades would turn the fixture into the after-state.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/17.sh`, evidence
 `bench/upgrade-scenarios/evidence/17/node-agent.txt`, and item 17 of the harness README. Detection,
