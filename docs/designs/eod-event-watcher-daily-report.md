@@ -1,6 +1,6 @@
-# SOP: k8s-event-watcher Daily Activity Recap
+# k8s-event-watcher daily activity recap
 
-**Purpose:** Reports the informational events the severity gate held back from chat, grouped by
+The recap reports the informational events the severity gate held back from chat, grouped by
 workload and reason, and nothing else. Critical and Warning events are counted in the headline and
 never listed — chat received them as they happened. That holds even for an alert that never reached
 chat: a ceiling drop and a failed delivery are counted, so neither can be printed over with an
@@ -83,7 +83,7 @@ event was announced in chat. It has a second writer — the drift detector's `gi
 land in the same table under `reason = 'OutOfBandChange'` — and the generator excludes those rows
 before it counts anything, so every number below is still the watcher's alone. That exclusion is
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
-drift record is not an event the watcher forwarded. [`../docs/session_management.md`](../../agents/platform/docs/session_management.md) is
+drift record is not an event the watcher forwarded. [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage
@@ -178,7 +178,7 @@ any non-`Warning` event `Info`, however serious its reason reads. A held-back li
 a judgement that the event was minor. Reasons that appear in no recap at all are a separate case —
 the watcher's `--reason` list in deploy/shared/start-services.sh never forwarded them, so nothing
 was recorded to hold back. Do not read absence from a recap as absence from the fleet. See the
-Severity Gate section of [`../docs/session_management.md`](../../agents/platform/docs/session_management.md).
+Severity Gate section of [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md).
 
 The listing is fixed to `Info` in `LISTED_SEVERITIES` in `eod_report_generator.py`, and nothing
 widens it. Widening it would buy a digest of the day's already-delivered alerts, and it still would
