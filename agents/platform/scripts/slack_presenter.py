@@ -151,6 +151,12 @@ MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 SENTENCE_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][*_])|(?<=[.!?]\*\*)|(?<=[.!?]__))\s+(?=[^\sa-z])")
 #: Bold markers a split can leave open; the first sentence closes one and the rest reopens it.
 BOLD_MARKERS = ("**", "__")
+#: Per marker, an opener (no word character before it) and a closer (none after it);
+#: an in-word run such as ``DB__HOST`` or ``2**20`` is neither.
+BOLD_EDGES = {
+    marker: (re.compile(rf"(?<!\w){re.escape(marker)}(?=\S)"), re.compile(rf"(?<=\S){re.escape(marker)}(?!\w)"))
+    for marker in BOLD_MARKERS
+}
 #: A text ending in one of these abbreviations has not ended its sentence.
 ABBREVIATION_END = re.compile(
     r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|no|min|max|fig|rev|ver|ex|cont|"
@@ -295,8 +301,8 @@ def _first_sentence(line: str) -> tuple[str, str]:
         if not ABBREVIATION_END.search(sentence.rstrip("*_")):
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
-            for marker in BOLD_MARKERS:
-                if sentence.count(marker) % 2:
+            for marker, (opener, closer) in BOLD_EDGES.items():
+                if sentence.count(marker) % 2 and opener.search(sentence) and closer.search(rest):
                     sentence, rest = sentence + marker, marker + rest
             return sentence, rest
     return line, ""

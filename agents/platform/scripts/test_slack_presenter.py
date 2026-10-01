@@ -181,6 +181,14 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(body, ["Raise the limit."])
         self.assertEqual(sp.fallback_text(headline), "*Checkout is down.*")
 
+    def test_an_in_word_double_marker_is_not_rebalanced_as_bold(self):
+        headline, body = sp.split_answer("The env var DB__HOST is unset. Pods crashloop.")
+        self.assertEqual(headline, "The env var DB__HOST is unset.")
+        self.assertEqual(body, ["Pods crashloop."])
+        headline, body = sp.split_answer("Memory is 2**20 bytes. Raise it.")
+        self.assertEqual(headline, "Memory is 2**20 bytes.")
+        self.assertEqual(body, ["Raise it."])
+
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))
