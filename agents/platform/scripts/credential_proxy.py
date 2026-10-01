@@ -2247,7 +2247,93 @@ GIT_LEASE_MARKER = ".lease"
 # directory inside another agent's lease. Both are leased today by every caller
 # that issues them — `ensure_workspace` writes the marker before it clones, at
 # the lease root the clone runs in — so requiring the lease costs nothing and
-# closes the two remaining ways one agent reaches another's tree.
+# The closed set of subcommands the product and its skills issue. Any
+# unrecognised or custom subcommand (including custom aliases) is refused
+# outright, failing closed rather than relying solely on denylists.
+ALLOWED_GIT_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "am",
+        "apply",
+        "blame",
+        "branch",
+        "cat-file",
+        "check-ref-format",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "clone",
+        "commit",
+        "config",
+        "diff",
+        "fetch",
+        "grep",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "merge",
+        "mv",
+        "pull",
+        "push",
+        "rebase",
+        "remote",
+        "reset",
+        "restore",
+        "revert",
+        "rev-parse",
+        "rm",
+        "show",
+        "sparse-checkout",
+        "stash",
+        "status",
+        "submodule",
+        "switch",
+        "symbolic-ref",
+        "tag",
+        "update-ref",
+        "version",
+        "worktree",
+    }
+)
+
+# Keys permitted to be written via repository-local `git config`. Only committer
+# identity configuration is needed by GitOps workspace setup; writing aliases,
+# filters, or execution hooks is refused.
+ALLOWED_GIT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
+
+# Actions that make a `git config` invocation a read-only query.
+# Must appear in option position (before the first positional argument).
+GIT_CONFIG_QUERY_ACTIONS = frozenset(
+    {
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--list",
+        "-l",
+        "--get-color",
+        "--get-colorbool",
+    }
+)
+
+# Mutation actions that write or unset configuration keys.
+GIT_CONFIG_WRITE_ACTIONS = frozenset(
+    {
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+    }
+)
+
+# Options that take a separate argument before positional parameters.
+GIT_CONFIG_OPTIONS_WITH_VALUE = frozenset(
+    {"--default", "--type", "--comment"}
+)
+
 GIT_MUTATING_SUBCOMMANDS = frozenset(
     {
         "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
@@ -2266,14 +2352,14 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {
         "-C",
         "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--exec-path",
-        "--super-prefix",
         "--attr-source",
         "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
         "--shallow-file",
+        "--super-prefix",
+        "--work-tree",
     }
 )
 
@@ -2493,6 +2579,7 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--attr-source": "reads gitattributes from a tree-ish which can select caller-named filters or diff drivers",
     "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
@@ -2991,7 +3078,7 @@ def git_push_violation(argv: list[str], cwd: Path | str | None = None) -> str | 
     return None
 
 
-def git_argument_violation(argv: list[str]) -> str | None:
+def git_argument_violation(argv: list[str], *, check_subcommand: bool = True) -> str | None:
     """Why this git argv may not run, or None if it may.
 
     Matched across the whole argv rather than only the global-option region
@@ -3042,20 +3129,67 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
-    if "config" in rest:
-        for argument in rest:
-            clean = argument.split("=", 1)[0].strip().lower()
-            if (
-                clean.startswith("alias.")
-                or clean == "alias"
-                or clean.startswith("include.")
-                or clean.startswith("includeif.")
-                or clean == "include"
-            ):
-                return (
-                    "`git config` configuring an alias or config include is refused: "
-                    "git aliases and includes cannot be configured through the credential proxy."
-                )
+    subcommand, _ = _git_plan(argv)
+    if check_subcommand and subcommand is not None and subcommand not in ALLOWED_GIT_SUBCOMMANDS:
+        return f"`git {subcommand}` is refused: subcommand is not supported by the credential proxy."
+    if subcommand == "config" or "config" in argv:
+        config_violation = _git_config_violation(argv)
+        if config_violation is not None:
+            return config_violation
+    return None
+
+
+def _git_config_violation(argv: list[str]) -> str | None:
+    """Why this git config argv may not run, or None if it may.
+
+    Git parses `git config` options using PARSE_OPT_STOP_AT_NON_OPTION: options
+    must precede the first positional argument.
+
+    Query actions (--get, --list, etc.) are non-mutating reads and are allowed.
+    Configuration writes (implicit set with >= 2 positionals, or write actions like
+    --add, --replace-all, --unset) are restricted to author identity keys (user.name,
+    user.email). Any attempt to write or unset other keys is refused.
+    """
+    if "config" not in argv:
+        return None
+    try:
+        config_index = argv.index("config")
+    except ValueError:
+        return None
+
+    config_args = argv[config_index + 1:]
+    actions: set[str] = set()
+    positionals: list[str] = []
+    idx = 0
+    while idx < len(config_args):
+        arg = config_args[idx]
+        if not arg.startswith("-") or arg == "--":
+            if arg == "--":
+                idx += 1
+            positionals = config_args[idx:]
+            break
+        name = arg.split("=", 1)[0]
+        if name in GIT_CONFIG_QUERY_ACTIONS:
+            actions.add(name)
+        elif name in GIT_CONFIG_WRITE_ACTIONS:
+            actions.add(name)
+        if name in GIT_CONFIG_OPTIONS_WITH_VALUE and "=" not in arg:
+            idx += 1
+        idx += 1
+
+    if actions and not (actions & GIT_CONFIG_WRITE_ACTIONS) and (actions & GIT_CONFIG_QUERY_ACTIONS):
+        return None
+
+    is_write = bool(actions & GIT_CONFIG_WRITE_ACTIONS) or len(positionals) >= 2
+    if is_write:
+        if not positionals:
+            return "`git config` write is refused: missing configuration key."
+        target_key = positionals[0]
+        if target_key not in ALLOWED_GIT_CONFIG_KEYS:
+            return (
+                f"`git config {target_key}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
     return None
 
 
@@ -4918,7 +5052,11 @@ class CommandExecutor:
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
+            command_environment.pop("KUBECONFIG", None)
+            command_environment.pop("CLOUDSDK_CONFIG", None)
             command_environment.update(self.git_identity)
+        elif argv and Path(argv[0]).name == "kubectl":
+            command_environment.pop("GH_CONFIG_DIR", None)
         if extra_config:
             # Rebuilt rather than appended to, because the count and the keys
             # have to move together. The caller's pairs go first so the forced
@@ -5881,7 +6019,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # over anything argv can say; this refuses the flags that would
         # otherwise re-enable git's hook execution, and it refuses them before
         # the lease check because it does not depend on the working directory.
-        violation = git_argument_violation(argv)
+        has_resolver = hasattr(self.executor, "resolve_git_command")
+        violation = git_argument_violation(argv, check_subcommand=not has_resolver)
         if violation is not None:
             LOGGER.warning("git argument refused request_id=%s", request_id)
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
@@ -5898,7 +6037,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         # Not a policy rule: the policy matches on argv alone, and this refusal
         # turns on the working directory as well.
-        if hasattr(self.executor, "resolve_git_command"):
+        if has_resolver:
             violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
         else:
             violation = self.executor.git_lease_violation(argv, cwd)
@@ -5920,6 +6059,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+
+        if has_resolver:
+            arg_violation = git_argument_violation(exec_argv)
+            if arg_violation is not None:
+                LOGGER.warning("git argument refused request_id=%s", request_id)
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": "git.argument.refused",
+                        "message": arg_violation,
+                    },
+                )
+                return
 
         # Runs after the credential denylist above, so rules like
         # `kubernetes.token-disclosure` keep their own ids and messages rather
