@@ -1130,6 +1130,34 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
             await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind=kind))
         self.assertEqual(self.settled, [("t_e0c1", "archived"), ("t_e0c1", "unblocked")])
 
+    def _blocked_batch(self, last_ping):
+        # unblocked, a note, then blocked again: the batch a rewound claim replays.
+        events = [SimpleNamespace(id=6, kind="unblocked"), _beat(7, "retrying"), SimpleNamespace(id=8, kind="blocked")]
+        sub = {**SLACK_SUB, "last_ping_event_id": last_ping}
+        return SimpleNamespace(sub=sub, adapter=_Adapter(), d={"events": events}), events[0]
+
+    async def test_a_replayed_unblock_leaves_a_later_block_waiting(self):
+        # The wake after the batch was not accepted; its pings were recorded through 8.
+        # Without the batch, last_ping_event_id alone marks the replay.
+        notification, unblocked = self._blocked_batch(last_ping=8)
+        del notification.d
+        await silent_event(notification, unblocked)
+        self.assertEqual(self.settled, [])
+
+    async def test_an_unblock_overtaken_in_its_batch_moves_nothing_when_the_ping_record_lags(self):
+        # blocked 8 was sent but recording its ping failed, so last_ping_event_id is behind it.
+        notification, unblocked = self._blocked_batch(last_ping=0)
+        await silent_event(notification, unblocked)
+        self.assertEqual(self.settled, [])
+
+    async def test_an_unblock_after_the_last_settle_in_its_batch_still_moves_the_row(self):
+        events = [SimpleNamespace(id=5, kind="blocked"), SimpleNamespace(id=6, kind="unblocked"), _beat(7, "retrying")]
+        notification = SimpleNamespace(
+            sub={**SLACK_SUB, "last_ping_event_id": 5}, adapter=_Adapter(), d={"events": events},
+        )
+        await silent_event(notification, events[1])
+        self.assertEqual(self.settled, [("t_e0c1", "unblocked")])
+
     async def test_other_silent_events_and_platforms_do_not(self):
         await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="heartbeat"))
         await silent_event(SimpleNamespace(sub=SUB, adapter=_Adapter()), SimpleNamespace(kind="archived"))

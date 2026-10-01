@@ -191,6 +191,14 @@ check(
     and NOTIFIER_SOURCE[_silent_at:].split("\n", 2)[1].strip() == "continue",
     "an archived or unblocked card would never move its plan row",
 )
+_loop_at = NOTIFIER_SOURCE.rfind('for ev in self.d["events"]:', 0, _silent_at)
+check(
+    "the hook sits in the loop over the delivery's batch, ahead of the ping dedup",
+    0 <= _loop_at < _silent_at
+    and _silent_at < NOTIFIER_SOURCE.find('if ev.id <= self.sub.get("last_ping_event_id", 0):', _silent_at),
+    "silent_event reads notification.d['events'] and last_ping_event_id to skip a replayed unblocked; "
+    "renamed, a rewound claim's replay would revive a row waiting on the user",
+)
 check(
     "the heartbeat formatter still builds the first rendering",
     'f"⏳ {n.progress_header}{note}"' in NOTIFIER_SOURCE,

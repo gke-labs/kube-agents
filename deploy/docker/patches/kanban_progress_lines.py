@@ -441,6 +441,29 @@ async def _settle_plan_row(plan: Any, adapter: Any, sub: dict, kind: str) -> Non
         logger.debug("kanban progress: settling the plan row for %s failed: %s", sub.get("task_id"), exc)
 
 
+def _overtaken(notification: Any, ev: Any) -> bool:
+    """Whether a silent event is a redelivery, or one a later event in its batch settles past.
+
+    A delivery that fails after its pings (a wake not accepted, a wake or a
+    send that raised) rewinds the claim, and the batch is delivered again.
+    Upstream skips a ping already sent by ``last_ping_event_id``, but a silent
+    kind is never recorded there, so a replayed ``unblocked`` would undo the
+    ``blocked`` after it: the row running and Working… held while the card
+    waits on you. A later event that settles the card in the same batch wins
+    even when recording its ping failed and ``last_ping_event_id`` lags it.
+    """
+    event_id = int(getattr(ev, "id", 0) or 0)
+    if event_id and event_id <= int(notification.sub.get("last_ping_event_id") or 0):
+        return True
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    return any(
+        int(getattr(later, "id", 0) or 0) > event_id
+        and str(getattr(later, "kind", "") or "") not in ROLLING_KINDS
+        for later in events or ()
+    )
+
+
 async def silent_event(notification: Any, ev: Any) -> None:
     """Move a Slack card's plan row on a kind upstream keeps silent.
 
@@ -448,12 +471,13 @@ async def silent_event(notification: Any, ev: Any) -> None:
     ``None``, before it skips the event. :func:`deliver` never sees these, so
     without this a card archived by hand would hold its row running, and the
     thread's Working…, and an unblocked card would stay waiting on you until
-    its next note. Only :data:`SILENT_PLAN_KINDS`, only with ``KAGE_SLACK_UX``
-    on for a Slack card, and never raises: it runs inside the send loop.
+    its next note. Only :data:`SILENT_PLAN_KINDS`, never one replayed or
+    overtaken (:func:`_overtaken`), only with ``KAGE_SLACK_UX`` on for a Slack
+    card, and never raises: it runs inside the send loop.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
-        if kind not in SILENT_PLAN_KINDS:
+        if kind not in SILENT_PLAN_KINDS or _overtaken(notification, ev):
             return
         sub = notification.sub
         adapter = getattr(notification, "adapter", None)
