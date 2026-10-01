@@ -136,6 +136,29 @@ GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
      gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
      ```"""
 
+# gke-workload-troubleshooting's Step 5 upstream ends every crashloop walk by opening a pull
+# request, unconditionally ("do not wait for human merge"). This repository's platform persona
+# opens one only when the request asked for the fix (agents/platform/SOUL.md §3, item 3: a request to
+# investigate or report gets the manifest in the reply); under the A2A bridge the persona reads the
+# user's request directly and loads this skill for exactly that walk, so the unconditional step
+# re-created the write the persona's rule forbids (#2037). The replacement conditions item 3 on the
+# request and adds item 4 for the diagnostic case.
+GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET = """3.  Check if a branch or Pull Request (PR) already exists for this
+    workload/failure. If so, update the existing branch/PR or notify the user
+    instead of creating a duplicate. Otherwise, create a branch, commit the
+    change, open a Pull Request (PR) on GitHub, and conclude the workflow (do
+    not wait for human merge)."""
+
+GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET = """3.  If the request asked for the fix to be submitted or applied ("fix it",
+    "open a PR", a card whose task says so), check whether a branch or Pull
+    Request (PR) already exists for this workload/failure. If so, update the
+    existing branch/PR or notify the user instead of creating a duplicate.
+    Otherwise, create a branch, commit the change, open a Pull Request (PR) on
+    GitHub, and conclude the workflow (do not wait for human merge).
+4.  If the request asked you to investigate, diagnose or report, the manifest
+    from step 2 goes in your reply as a recommendation and the pull request is
+    one message away; do not open one (`SOUL.md` §3, item 3)."""
+
 # gke-manifest-generation's grounding step upstream prefers Developer Knowledge's `answer_query`,
 # whose default quota is 50 requests per day per project (developers.google.com/knowledge/quota),
 # shared by every agent in an install; once spent, every lookup 429s for the rest of the day.
@@ -191,6 +214,12 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
             GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
+        ),
+    ],
+    "gke-workload-troubleshooting": [
+        (
+            GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET,
+            GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET,
         ),
     ],
 }

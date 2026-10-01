@@ -220,6 +220,26 @@ class ApplySubstitutionsTest(unittest.TestCase):
             self.assertNotIn(sync.GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET, content)
             self.assertIn(sync.GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET, content)
 
+    def test_applies_workload_troubleshooting_submit_substitution(self):
+        d = self._skill_dir(body=sync.GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET + "\n")
+        self.assertTrue(sync.apply_substitutions(d, "gke-workload-troubleshooting"))
+        content = self._read(d)
+        self.assertNotIn(sync.GKE_WORKLOAD_TROUBLESHOOTING_OLD_STEP5_SUBMIT_SNIPPET, content)
+        self.assertEqual(content.count(sync.GKE_WORKLOAD_TROUBLESHOOTING_NEW_STEP5_SUBMIT_SNIPPET), 1)
+        # Idempotent: a second application finds the replacement and leaves it.
+        self.assertFalse(sync.apply_substitutions(d, "gke-workload-troubleshooting"))
+
+    def test_repo_workload_troubleshooting_skill_carries_the_submit_substitution(self):
+        # The in-tree copy is rmtree'd and re-copied on every sync, so the
+        # condition on Step 5 (#2037) survives only as a registered pair, and
+        # the copy has to already read as a fresh sync would leave it.
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-workload-troubleshooting" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-workload-troubleshooting"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+
     def test_applies_basics_credentials_substitution(self):
         d = self._skill_dir(body=sync.GKE_BASICS_OLD_CREDENTIALS_SNIPPET + "\n")
         self.assertTrue(sync.apply_substitutions(str(d), "gke-basics"))
