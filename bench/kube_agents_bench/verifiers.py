@@ -252,7 +252,7 @@ class ReportContainsVerifier(BaseVerifier):
 
 
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
-# the tools it actually invoked under args["calls"][*]["name"].
+# the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
 _TOOL_CALL_WRAPPER = "tool_call"
 
 
@@ -261,10 +261,22 @@ def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
     if entry.get("name") != _TOOL_CALL_WRAPPER:
         return set()
     args = entry.get("args")
-    calls = args.get("calls") if isinstance(args, dict) else None
-    if not isinstance(calls, list):
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            args = None
+    if not isinstance(args, dict):
         return set()
-    return {str(c.get("name")) for c in calls if isinstance(c, dict) and c.get("name")}
+    names: set[str] = set()
+    if args.get("name"):
+        names.add(str(args["name"]))
+    calls = args.get("calls")
+    if isinstance(calls, list):
+        for c in calls:
+            if isinstance(c, dict) and c.get("name"):
+                names.add(str(c["name"]))
+    return names
 
 
 @VERIFIERS.register("tool_called")
@@ -303,12 +315,13 @@ class ToolCalledVerifier(BaseVerifier):
 
     A worker reaches an MCP tool through Hermes' ``tool_call`` wrapper: the
     entry is named ``tool_call`` and the tool actually invoked sits in its
-    arguments, ``{"calls": [{"name": "mcp__developer_knowledge__search_documents",
+    arguments, ``{"name": "mcp__gke__get_k8s_resource", "arguments": {...}}``
+    or ``{"calls": [{"name": "mcp__developer_knowledge__search_documents",
     "arguments": {...}}]}`` (measured on build 2102459327938826240, #1765).
     A name in ``tool_names`` therefore also matches a ``tool_call`` entry
-    whose ``calls`` list names it, else a worker's MCP calls would be
-    invisible to this check by name. One wrapper entry counts once however
-    many of its calls match; ``require_success`` reads the wrapper's status.
+    whose wrapped name or ``calls`` list names it, else a worker's MCP calls
+    would be invisible to this check by name. One wrapper entry counts once
+    however many of its calls match; ``require_success`` reads the wrapper's status.
 
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful

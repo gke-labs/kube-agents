@@ -938,6 +938,50 @@ def test_tool_called_sees_through_the_tool_call_wrapper():
     assert ToolCalledVerifier(type="tool_called", tool_names=["tool_call"], scope="workers").verify(5.0).status == "pass"
 
 
+def test_tool_called_sees_through_tool_call_wrapper_direct_name_shape():
+    # The recorded trajectory shape from worker session store: args has a top-level name
+    trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "tool_call",
+            "args": {
+                "name": "mcp__gke__get_k8s_resource",
+                "arguments": {
+                    "namespace": "checkout",
+                    "resourceType": "pod",
+                },
+            },
+            "status": "completed",
+            "agent": "platform",
+        },
+        {
+            "name": "tool_call",
+            "args": '{"name": "mcp__platform_control__list_cluster_profiles", "arguments": {}}',
+            "status": "completed",
+            "agent": "platform",
+        },
+        {"name": "kanban_complete", "args": {}, "status": "completed", "agent": "platform"},
+    ]
+    transcript.set("done", trajectory)
+    v1 = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__gke__get_k8s_resource"], scope="workers"
+    )
+    assert v1.verify(5.0).status == "pass"
+
+    v2 = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__platform_control__list_cluster_profiles"],
+        scope="workers",
+    )
+    assert v2.verify(5.0).status == "pass"
+
+    # Uncalled tool returns fail
+    v3 = ToolCalledVerifier(
+        type="tool_called", tool_names=["mcp__gke__delete_k8s_resource"], scope="workers"
+    )
+    assert v3.verify(5.0).status == "fail"
+
+
 def test_tool_call_wrapper_with_malformed_args_matches_nothing():
     transcript.set(
         "done",
