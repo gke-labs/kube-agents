@@ -382,14 +382,14 @@ const (
 	// defaultGchatTokenPath and is rendered explicitly so a reader of the
 	// live Deployment sees it. One hour, like every broker token.
 	a2aGchatTokenPathEnvVar = "A2A_GCHAT_TOKEN_PATH" // #nosec G101 -- Environment variable name, not a credential
-	a2aGchatTokenDir        = "/var/run/secrets/a2a-chat-relay"
+	a2aGchatTokenDir        = "/var/run/secrets/a2a-chat-relay" // #nosec G101 -- Mount path, not a credential
 	a2aGchatTokenKey        = "token" // #nosec G101 -- Projected file name, not a credential
 	a2aGchatTokenPath       = a2aGchatTokenDir + "/" + a2aGchatTokenKey
 	a2aGchatTokenVolume     = "a2a-chat-relay-token" // #nosec G101 -- Volume name, not a credential
 	a2aGchatTokenTTLSeconds = 3600
 	// The broker's side of the same backend.
 	a2aGoogleChatSubscriptionEnvVar      = "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME"
-	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE"
+	credentialProxyA2AChatAudienceEnvVar = "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
 
 	// The condition the status writers publish while a next install's gateway
 	// is withheld for want of a backend (#1660, option 1). Informational rather
