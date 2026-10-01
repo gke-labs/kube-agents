@@ -193,9 +193,9 @@ FIXTURE_NOT_READY = {
         "than red"
     ),
     "cluster-agent-stalled-controller-diagnosis": (
-        "#1873: needs the stalled-controller role, a Deployment in seeded-stall "
-        "on seeded cluster A waiting on a ConfigMap that does not exist; no "
-        "fixture role plants a stall today"
+        "#1873: needs the stalled-controller role applied to every pool "
+        "project; fixture defined in #1893, waiting on fleet re-apply and pool "
+        "verification sweep"
     ),
     "gitops-drift-noise-filtered-triage": (
         "#911: needs an audit ingress on the eval install -- a drift-audit "

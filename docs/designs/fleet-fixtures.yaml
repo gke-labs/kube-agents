@@ -82,6 +82,17 @@ fixtures:
       workload so the declaration silences none of the cases that grade
       checkout-gateway.
 
+  - role: stalled-controller
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/inventory-api
+    namespace: seeded-stall
+    defect: >-
+      One Deployment whose container reads a ConfigMap that does not exist
+      through envFrom. Its pods sit in CreateContainerConfigError and the
+      Deployment never progresses, with no crash and no restart.
+
   - role: crashloop-workload
     slot: a
     available_from_day: 0
