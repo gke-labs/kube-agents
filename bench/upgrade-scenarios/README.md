@@ -271,7 +271,8 @@ Every observation goes through `ev()` in `common.sh`, which appends the command,
 and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. The
 availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly, and scenario 11's own probes
 `zonal-api-1s.txt` and `zonal-probe.txt`. After a pool upgrade, `upgrade.txt` also carries the operation's final
-status and status message, which is where a stockout shows while the operation reads DONE. A re-run on the same
+status and status message, which is where a stockout shows while the operation reads DONE, and after a
+control-plane upgrade it carries the API poller's up and DOWN counts for that upgrade. A re-run on the same
 cluster skips a node pool or maintenance exclusion already in place, and appends to the checked-in evidence
 files, each record under its own timestamp; the pollers' files gain a block per run, and each summary reads only
 the last block. Commit only what the table or the notes above cite, after replacing the project ID and number

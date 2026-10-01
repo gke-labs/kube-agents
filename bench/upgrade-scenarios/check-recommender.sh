@@ -21,7 +21,7 @@ out_dir, dest, project_id, project_number = sys.argv[1:5]
 # (resource names, service-account addresses, console links in a description). Cluster names are the keys results.py
 # matches on and are written as they are; a cluster whose own name contains the project is reported at the end.
 def scrub(s):
-    for value, placeholder in ((project_number, "<PROJECT_NUMBER>"), (project_id, "<PROJECT_ID>")):
+    for value, placeholder in ((project_id, "<PROJECT_ID>"), (project_number, "<PROJECT_NUMBER>")):   # ID first: an ID can contain the number, never the reverse
         if value: s = s.replace(value, placeholder)
     return s
 seen = collections.defaultdict(dict); newest = ""; unmatched = []
