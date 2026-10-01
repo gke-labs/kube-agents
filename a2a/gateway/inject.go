@@ -183,6 +183,9 @@ const (
 	// entry's fields beside its input when the entry is over the bound.
 	injectMaxEntryToolBytes  = 256
 	injectMaxEntryFieldBytes = 128
+	// injectMaxNestedCallBytes is how much of a nested call beside its name
+	// an over-size wrapper keeps verbatim before it becomes a stand-in.
+	injectMaxNestedCallBytes = 128
 	// injectMaxActivityEntries bounds the trace a probe carries: the read
 	// route runs before and after every wait on the harness's hot loop, and
 	// a long run's trace would otherwise ride every poll whole. The newest
@@ -1898,7 +1901,8 @@ var activityEntryKeys = map[string]bool{"tool": true, "input": true, "callId": t
 // capActivityEntry replaces an over-size activity entry with a stand-in that
 // keeps what a grader reads (the tool, and a tool_call wrapper's nested
 // names) and says what was cut, in the bridge's own stand-in shape: the
-// whole input for an ordinary entry, each call's arguments for a wrapper.
+// whole input for an ordinary entry, each call's arguments for a wrapper,
+// where a call whose arguments are small is kept whole.
 func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	var entry map[string]any
 	if err := json.Unmarshal(raw, &entry); err != nil {
@@ -1948,7 +1952,10 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 				if m, ok := c.(map[string]any); ok {
 					if n, ok := m["name"].(string); ok {
 						// Everything of the call but its name is cut, under
-						// whatever key it sat; the stand-in says how much.
+						// whatever key it sat, and the stand-in says how much;
+						// a call whose other keys are small (an empty
+						// arguments object, an id) keeps them, since there is
+						// nothing to cut.
 						call := map[string]any{"name": n}
 						size := 0
 						for k, v := range m {
@@ -1959,8 +1966,12 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 								size += len(b)
 							}
 						}
-						if size > 0 {
+						if size > injectMaxNestedCallBytes {
 							call["arguments"] = map[string]any{"truncated": true, "bytes": size, "head": ""}
+						} else {
+							for k, v := range m {
+								call[k] = v
+							}
 						}
 						names = append(names, call)
 					}

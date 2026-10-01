@@ -152,6 +152,9 @@ const (
 	// falls back to the whole stand-in.
 	hermesToolCallWrapper = "tool_call"
 	wrapperCallsKey       = "calls"
+	// wrapperCallNameKey is the key under which an element of the wrapper's
+	// calls carries the nested tool's name.
+	wrapperCallNameKey    = "name"
 	wrapperCallArgsKey    = "arguments"
 	activityInputCallHead = 256
 	// activityBodyCap bounds one delivery read. hermes's payloads carry the
@@ -333,6 +336,27 @@ var (
 	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
 )
 
+// schemaKeyPattern is what an object key must look like to be published
+// under shape mode: a tool schema's key, letters, digits, underscore or dash,
+// starting with a letter or underscore, at most schemaKeyMax characters. A
+// key is model-written text like a value is (a map keyed by user data, a
+// malformed call with the value in the key slot), so anything else, and
+// anything token-shaped (tokenShapedKey), becomes "<key n, N chars>".
+var (
+	schemaKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+	// keyTokenRunPattern is the token look a schema-shaped key can still
+	// have: a long digit run, an all-hex body, an all-caps-and-digits body
+	// with digits in it, a long lower-case alphanumeric run.
+	keyTokenRunPattern = regexp.MustCompile(`[0-9]{6,}|^[a-f0-9]{20,}$|^[A-Z0-9_]*[0-9][A-Z0-9_]*$|[a-z0-9]{24,}`)
+)
+
+const (
+	schemaKeyMax = 48
+	// keyMaxCaseChanges is how many upper/lower transitions a key may have
+	// before its case reads as base64 churn rather than camelCase.
+	keyMaxCaseChanges = 5
+)
+
 // capRunes cuts s to at most n bytes at a rune boundary.
 func capRunes(s string, n int) string {
 	if len(s) <= n {
@@ -340,16 +364,6 @@ func capRunes(s string, n int) string {
 	}
 	return chunkString(s, n)[0]
 }
-
-// schemaKeyPattern is what an object key must look like to be published
-// under shape mode: a tool schema's key, letters, digits, underscore or dash,
-// starting with a letter or underscore, at most schemaKeyMax characters. A
-// key is model-written text like a value is (a map keyed by user data, a
-// malformed call with the value in the key slot), so anything else, and
-// anything token-shaped (tokenShapedKey), becomes "<key n, N chars>".
-var schemaKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
-
-const schemaKeyMax = 48
 
 // tokenShapedKey says whether a key that fits the schema grammar still
 // reads as a token: too long, a long digit run, an all-caps-and-digits body
@@ -369,10 +383,6 @@ func tokenShapedKey(k string) bool {
 	}
 	return changes > keyMaxCaseChanges
 }
-
-var keyTokenRunPattern = regexp.MustCompile(`[0-9]{6,}|^[a-f0-9]{20,}$|^[A-Z0-9_]*[0-9][A-Z0-9_]*$|[a-z0-9]{24,}`)
-
-const keyMaxCaseChanges = 5
 
 // shapeOf is what a free-text value becomes under shape mode.
 func shapeOf(s string) string {
@@ -830,7 +840,7 @@ func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
 		if t == redactedValue {
 			return t
 		}
-		if wrapper && key == "name" && parent == wrapperCallsKey && depth == wrapperNameDepth {
+		if wrapper && key == wrapperCallNameKey && parent == wrapperCallsKey && depth == wrapperNameDepth {
 			return capRunes(t, activityToolNameCap)
 		}
 		return shapeOf(t)

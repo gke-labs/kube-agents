@@ -3632,7 +3632,7 @@ func TestInjectReadRouteRefusesAnotherConversationsTaskID(t *testing.T) {
 // never rides a poll unbounded and a grader still reads what it reads.
 func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	big := strings.Repeat("x", injectMaxEntryBytes)
-	wrapper := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"kanban_create","arguments":{"body":"` + big + `"}},{"name":"kanban_list"}]},"status":"completed"}`)
+	wrapper := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"kanban_create","arguments":{"body":"` + big + `"}},{"name":"kanban_list"},{"name":"kanban_get","arguments":{"id":7}},{"name":"kanban_noop","arguments":{}}]},"status":"completed"}`)
 	out := capActivityEntry(wrapper)
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"kanban_create"`) || !strings.Contains(string(out), `"name":"kanban_list"`) || strings.Contains(string(out), big[:64]) {
 		t.Fatalf("wrapper cap: %d bytes %s", len(out), out[:min(len(out), 200)])
@@ -3641,6 +3641,10 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	// stand-in shape with its size, the argument-less call stays so.
 	if !strings.Contains(string(out), `"arguments":{"bytes":`+strconv.Itoa(len(`{"body":"`+big+`"}`))+`,"head":"","truncated":true}`) || strings.Contains(string(out), `"name":"kanban_list","arguments"`) {
 		t.Fatalf("wrapper cap carries no per-call marker: %s", out[:min(len(out), 300)])
+	}
+	// Small nested arguments, empty or not, stay as they are: no cut, no marker.
+	if !strings.Contains(string(out), `{"arguments":{"id":7},"name":"kanban_get"}`) || !strings.Contains(string(out), `{"arguments":{},"name":"kanban_noop"}`) {
+		t.Fatalf("small nested arguments were marked cut: %s", out[:min(len(out), 400)])
 	}
 	bulky := json.RawMessage(`{"tool":"terminal","input":{"command":"ls"},"callId":"` + big + `","status":"completed"}`)
 	out = capActivityEntry(bulky)

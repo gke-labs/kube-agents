@@ -215,7 +215,7 @@ time.sleep(30)
 
 	submit(t, c, "task-interrupted", "hang")
 	task := waitTerminal(t, c, "task-interrupted")
-	if task.State != lib.StateFailed || task.FinalMessage == nil || !strings.Contains(joinText(task.FinalMessage.Parts), "deadline-exceeded") {
+	if task.State != lib.StateFailed || !strings.Contains(terminalReason(t, task), "deadline-exceeded") {
 		t.Fatalf("state = %s msg = %v, want failed deadline-exceeded", task.State, task.FinalMessage)
 	}
 	entries := activityEntries(t, task)
@@ -507,14 +507,6 @@ func TestActivityStatus(t *testing.T) {
 	if got := activityStatus(mk("ok", "tool_error")); got != ActivityStatusError {
 		t.Fatalf("error_type alone -> %s", got)
 	}
-}
-
-func joinText(parts []lib.Part) string {
-	var b strings.Builder
-	for _, p := range parts {
-		b.WriteString(p.Text)
-	}
-	return b.String()
 }
 
 // Two tasks at once: each delivery lands on the task whose key signed it,
