@@ -191,8 +191,9 @@ def parse_triage(report: str) -> dict | None:
             seen.add(letter)
             label = OPTION_LABEL.format(letter=letter, title=_presenter._plain(option.group(2)))
             choices.append((label, bool(recommended) and recommended.group(1) == letter))
-    # Fenced lines count here: a fence the parse misreads must not hide an option from the guard.
-    if not set(OPTION_NAMED.findall(rest)) <= seen:
+    # Fenced lines and headings count here: neither may hide an option from the guard.
+    named = "\n".join(f"{heading}\n{body}" for heading, body in sections[starts[0]:]) if starts else ""
+    if not set(OPTION_NAMED.findall(named)) <= seen:
         # A button row missing an option the report offers would misstate it.
         return None
     if not choices:

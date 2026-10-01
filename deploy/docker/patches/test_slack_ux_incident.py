@@ -283,6 +283,10 @@ class RuntimeTest(unittest.TestCase):
                 report = REPORT.replace("- **Option B", cut + "- **Option B")
                 self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
 
+    def test_an_option_named_only_in_a_heading_keeps_the_threaded_reply(self):
+        report = REPORT.replace("- ✅ **Recommended", "### Option C (Drain the node)\nmoves the pods.\n- ✅ **Recommended")
+        self.assertIsNone(runtime.parse_triage(report))
+
     def test_a_stray_heading_after_the_options_keeps_links_and_the_recommendation(self):
         triage = runtime.parse_triage(REPORT.replace("- ✅ **Recommended", "# see the runbook\n- ✅ **Recommended"))
         self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
