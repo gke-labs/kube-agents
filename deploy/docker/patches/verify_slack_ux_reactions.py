@@ -10,8 +10,9 @@ Three things are checked:
 
 1. The adapter. Each hook's first statement after its docstring is the flag
    guard handing over to ``_kage_slack_ux``, and upstream's body still follows
-   it, reacting through ``self._react`` — so with the flag off the hook is
-   upstream's. The import the guard names is bound at module level. The
+   it — so with the flag off the hook is upstream's. That the body still
+   reacts is ``verify_slack_reactions_scope.py``'s check, run just before this
+   one. The import the guard names is bound at module level. The
    members the runtime calls on the adapter are still there in the shape it
    calls them: ``_reacting_target(event)`` returning a 3-tuple,
    ``_react(channel, ts, emoji, team_id, *, remove)``, and
@@ -20,6 +21,8 @@ Three things are checked:
    made with the built tree's ``hermes_cli``: an open card subscribed to the
    thread on the default board and on a second board is found, and a finished
    card, a card in another thread and a card for another platform are not.
+   A card another card's worker created is found through the subscription
+   Hermes copies onto it, with that card as its creator.
 3. The runtime module, loaded by path from ``gateway/`` and driven with a stub
    adapter: flag off it is inert; flag on, an ask gets the arrival reaction for
    its kind, a direct answer settles at once, a delegated one waits for the
@@ -51,6 +54,7 @@ HOOKS = ("on_processing_start", "on_processing_complete")
 GUARD_ALIAS = "_kage_slack_ux"
 IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_reactions"
+ADAPTER_CLASS = "SlackAdapter"
 UPSTREAM_HELPER = "_react"
 TARGET_HELPER = "_reacting_target"
 TRACKED_SET = "_reacting_message_ids"
@@ -127,16 +131,6 @@ def check_adapter(root: Path) -> None:
         body = node.body
         if len(body) < 3 or not _is_guard(body[1], name):
             raise _fail(f"{name}() does not open with the {FLAG_ENV} guard after its docstring")
-        upstream = ast.Module(body=body[2:], type_ignores=[])
-        if not any(
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr == UPSTREAM_HELPER
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "self"
-            for call in ast.walk(upstream)
-        ):
-            raise _fail(f"{name}() no longer runs upstream's reaction body after the guard")
     bound = any(
         isinstance(stmt, ast.ImportFrom)
         and stmt.module == IMPORT_MODULE
@@ -168,28 +162,43 @@ def _check_members(tree: ast.Module) -> None:
     target = _method(tree, TARGET_HELPER)
     if isinstance(target, ast.AsyncFunctionDef) or len(target.args.args) != 2:
         raise _fail(f"{TARGET_HELPER}() is not a plain (self, event) method")
-    returns = [
-        node.value.body if isinstance(node.value, ast.IfExp) else node.value
-        for node in ast.walk(target)
-        if isinstance(node, ast.Return) and node.value is not None
-    ]
-    names = [
-        tuple(e.id if isinstance(e, ast.Name) else None for e in r.elts) for r in returns if isinstance(r, ast.Tuple)
-    ]
-    if TARGET_RETURN not in names:
-        raise _fail(f"{TARGET_HELPER}() no longer returns ({', '.join(TARGET_RETURN)}): {names}")
-    as_set = False
-    for node in ast.walk(tree):
+    # Every value it can return, both arms of a conditional included: the
+    # runtime unpacks whatever is not None into three names, so one other
+    # tuple on any path raises there.
+    values = [node.value for node in ast.walk(target) if isinstance(node, ast.Return)]
+    shapes = []
+    while values:
+        value = values.pop()
+        if isinstance(value, ast.IfExp):
+            values += [value.body, value.orelse]
+        elif value is None or (isinstance(value, ast.Constant) and value.value is None):
+            continue
+        elif isinstance(value, ast.Tuple):
+            shapes.append(tuple(e.id if isinstance(e, ast.Name) else None for e in value.elts))
+        else:
+            shapes.append(None)
+    if not shapes or any(shape != TARGET_RETURN for shape in shapes):
+        raise _fail(f"{TARGET_HELPER}() does not return only ({', '.join(TARGET_RETURN)}) or None: {shapes}")
+    # Every assignment in the adapter class, not one anywhere in the module:
+    # the runtime calls .discard() on the attribute the adapter holds.
+    adapter = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == ADAPTER_CLASS), None,
+    )
+    if adapter is None:
+        raise _fail(f"{ADAPTER} has no class {ADAPTER_CLASS}")
+    kinds = []
+    for node in ast.walk(adapter):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            named = any(isinstance(tg, ast.Attribute) and tg.attr == TRACKED_SET for tg in targets)
+            if not any(isinstance(tg, ast.Attribute) and tg.attr == TRACKED_SET for tg in targets):
+                continue
             value = node.value
-            is_set = isinstance(value, ast.Set) or (
-                isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set"
+            kinds.append(
+                isinstance(value, ast.Set)
+                or (isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "set")
             )
-            as_set = as_set or (named and is_set)
-    if not as_set:
-        raise _fail(f"{ADAPTER} no longer initialises self.{TRACKED_SET} as a set")
+    if not kinds or not all(kinds):
+        raise _fail(f"{ADAPTER_CLASS} does not only ever assign self.{TRACKED_SET} a set")
 
 
 def check_board_read(module, root: Path) -> None:
@@ -212,7 +221,6 @@ def check_board_read(module, root: Path) -> None:
 
         def card(
             board: str, title: str, thread: str = THREAD, platform: str = "slack", done: bool = False,
-            resumed: bool = False,
         ) -> tuple[str, str]:
             conn = kc.connect(board=board)
             try:
@@ -222,16 +230,21 @@ def check_board_read(module, root: Path) -> None:
                     kb.complete_task(conn, task, result="verified")
                 elif thread == THREAD and platform == "slack":
                     expected.add((board, task))
-                if resumed:
-                    for step in (kb.block_task, kb.unblock_task):
-                        if not step(conn, task):
-                            raise _fail(f"hermes_cli.kanban_db.{step.__name__} refused a fresh card")
             finally:
                 conn.close()
             return board, task
 
-        fresh = card(kb.DEFAULT_BOARD, "open on default")
-        resumed = card(kb.DEFAULT_BOARD, "blocked and unblocked", resumed=True)
+        _, fresh = card(kb.DEFAULT_BOARD, "open on default")
+        _, creator = card(kb.DEFAULT_BOARD, "creator")
+        conn = kc.connect(board=kb.DEFAULT_BOARD)
+        try:
+            # No subscription of its own: Hermes copies its creator's.
+            child = kb.create_task(
+                conn, title="spawned", assignee="platform", parents=(fresh,), creator_task_id=creator,
+            )
+        finally:
+            conn.close()
+        expected.add((kb.DEFAULT_BOARD, child))
         card(SECOND_BOARD, "open on the second board")
         card(kb.DEFAULT_BOARD, "finished", done=True)
         card(kb.DEFAULT_BOARD, "another thread", thread=OTHER_THREAD)
@@ -242,10 +255,9 @@ def check_board_read(module, root: Path) -> None:
         found = set(read)
         if found != expected:
             raise _fail(f"the kanban read found {sorted(found)!r}, expected {sorted(expected)!r}")
-        # A resume is read from the card's unblock events, since its status
-        # can be blocked again by the end of the turn that resumed it.
-        if read[fresh].resumes or not read[resumed].resumes:
-            raise _fail(f"the kanban read does not see an unblock: {read[fresh]!r}, {read[resumed]!r}")
+        made_by = read[(kb.DEFAULT_BOARD, child)].creator
+        if made_by != creator or read[(kb.DEFAULT_BOARD, fresh)].creator is not None:
+            raise _fail(f"the kanban read does not see which card created a card: {made_by!r}")
     finally:
         for name, value in saved.items():
             if value is None:
