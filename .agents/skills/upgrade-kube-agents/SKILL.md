@@ -92,7 +92,12 @@ the same revision. A copy of the script carrying no baked version — one built 
 default, and there the flag is the only way to name a revision.
 
 Two flags change what the run targets, and both read differently depending on whether the copy of
-the script carries a baked version. A release copy's version is in place before any flag is parsed:
+the script carries a baked version. A release copy's version is in place before any flag is parsed,
+with one exception: `upgrade.sh` in a checkout of a release line (`release/<X.Y>`) that has moved
+past its latest release, with that release's tag and full history fetched, carries the release's
+version but is not the release, so run from there it drops the baked default, says which line and commit it is on, and
+behaves as a copy with no baked version below (asks for `--image-tag`, accepts `--keep-image-tag`,
+plans at the installed tag):
 
 - `--plan` reports what a full upgrade would change against the install's real Terraform state, and
   changes nothing. Exit 0 means in sync, 2 means there are changes, 1 means the plan failed. This is

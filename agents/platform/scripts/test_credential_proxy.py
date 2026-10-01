@@ -5860,7 +5860,7 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "issue-list", "issue-view"},
+             "proposal-commits", "issue-list", "issue-view", "branch-view"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )

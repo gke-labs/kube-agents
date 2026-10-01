@@ -183,8 +183,9 @@ for — a chart value, a Dockerfile `ARG` default, a compiled constant in the op
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
 default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
-`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
-manifests; and the kustomize integrations, which it requires to name a variable the file owns
+`k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
+fallback, the NATS and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
+worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
 rather than a literal. Two copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
 `platformAgent.harness.memory.provider`, which no render turns on — so their pins in
@@ -220,8 +221,16 @@ the source the flagged line was reached from; the after run reports none. Quote 
 **Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
 code-scanning tab on the merged head is still the final check.
 
+**Terraform module tests.** If you change a module or composition under `terraform/`, run
+`make terraform-test`. It runs the `terraform test` suite of each directory under
+`terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
+needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
+plugin cache); it needs Terraform 1.7 or newer for `mock_provider`, above the 1.5 floor the modules
+and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
+below includes it.
+
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
-and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
+and test, the Python suites, the conformance suite, the Terraform module tests. The per-area targets it wraps, for a faster
 loop while you work:
 
 - `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
@@ -561,7 +570,12 @@ Four states that look like somebody else's problem and are not:
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
 carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
 the changed files has submitted `APPROVED`, and when a human other than the author has submitted
-`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An approval from outside
+`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+`.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
+robot that reviews under a user account re-reviews every push and files its follow-ups as
+`COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
+request and the check-run path would never request a human, and a review request outstanding to it
+is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
 `OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
 comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when

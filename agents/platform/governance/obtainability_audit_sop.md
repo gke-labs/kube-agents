@@ -126,7 +126,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 
 #### 3.1 No CPU or memory request (`no-requests`)
 
-**This check owns the _absence_ of a request and nothing else.** The **value** of a request belongs to the Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.1, `overrequest`), which has the usage samples this audit does not collect. Never propose a number here: two audits sizing the same container in opposite directions makes each run flag the state the other just created.
+**This check owns the _absence_ of a request and nothing else.** The **value** of a request belongs to the Fleet Waste Audit (`fleet-wide-cost-analysis` check 3.1, `overrequest`), which has the usage history this audit does not read. Never propose a number here: two audits sizing the same container in opposite directions makes each run flag the state the other just created.
 
 - **Command:** derived from `$STATE`; confirmed with the object-scoped read above.
 - **Flag when:** any container in `spec.template.spec.containers[]`, or any native sidecar (`initContainers[]` with `restartPolicy: Always`, which counts toward the pod's effective request), declares **no** `resources.requests.cpu` or **no** `resources.requests.memory`.
@@ -142,7 +142,7 @@ Identity is only as stable as those four fields, so **never** let a timestamp, r
 
   Two things the Impact deliberately does not say, both because they replace one false eviction claim with another. It never says a Burstable pod is evicted after a BestEffort one: the kubelet does not rank by class, it sorts on whether usage exceeds requests and then on Pod Priority, so a pod with no memory request sits in the same first group as a BestEffort one — and an unreserved **cpu** request does not affect eviction at all. And it never says the _pod_ is sized without a resource when a single container is missing it, because a sibling's limit can supply it; that sentence is scoped to a container.
 
-- **Remediation:** `kind: manual`, always. Action: "Declare an explicit `resources.requests.cpu` and `resources.requests.memory` on this container." Note that the size comes from the Fleet Waste Audit's usage sampling or from the owner's own observation (`kubectl top pod -n <ns>`) over a representative window, and that this audit deliberately proposes no figure. **Never invent a request value, and never derive one from the container's limits** — a limit is a ceiling the owner chose, not a steady-state size.
+- **Remediation:** `kind: manual`, always. Action: "Declare an explicit `resources.requests.cpu` and `resources.requests.memory` on this container." Note that the size comes from the Fleet Waste Audit's `unsized-workload` check (3.12), which proposes one from a week of Cloud Monitoring usage only where no container in the controller declares a request (a partly sized controller gets no figure from it), or from the owner's own observation (`kubectl top pod -n <ns>`) over a representative window, and that this audit deliberately proposes no figure. **Never invent a request value, and never derive one from the container's limits** — a limit is a ceiling the owner chose, not a steady-state size.
 
 #### 3.2 No memory limit (`no-memory-limit`)
 

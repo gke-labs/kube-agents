@@ -93,7 +93,7 @@
 # wider, realises ~2.4x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the thirteen additions since are priced inside its headroom. The first nights after this change measure it:
+# so the nineteen additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -113,6 +113,17 @@
 # 2026-09-28), so this file's share is thirty-eight cases (114 units) of the
 # fifty-two-case, 156-unit matrix the additions through 2026-09-29 made it; the
 # nightly runs both files, so its matrix and its price do not change.
+# fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
+# fifty-three-case, 159-unit matrix, +3 units, and
+# platform-worker-refuses-shipped-skill-edit forty (120) of fifty-four (162),
+# +3 more: one delegation round trip at the 200s default.
+# Counted from the lists, since the totals above had fallen one behind
+# (vcs-spent-branch-reuse's paragraph re-used fifty-two):
+# first-install-hello-running and -done (listed earlier in the file) make
+# it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
+# fixture. chat-voice-ack-names-target (the last entry below) makes it
+# forty-four (132) of fifty-eight (174), +3 more: one front-door turn plus
+# the card round trip.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -133,6 +144,13 @@
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
 # grows the matrix to fifty cases and 150 units, ~1212-1232 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-29 adds vcs-spent-branch-reuse (#1918): one case, three units,
+# ~50 serial minutes at its 1000s hint (three dev-install repetitions
+# measured 587-1512s, 937s the middle one). It grows the matrix to
+# fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
+# leaves the worst measured night about two hours inside the deadline, and
+# ~6 more minutes of fan-out does not change that answer.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -379,6 +397,11 @@
 # launches in the first cost tier rather than the last.
 ./tasks/vcs-issue-resolver-triage/task.yaml
 ./tasks/vcs-review-feedback-read-back/task.yaml
+# A second proposal under a spent branch name (#1918): open and close one
+# pull request, then open another on the same branch: two pull requests a
+# repetition on the throwaway repository, one of them left closed. Priced at
+# 1000s in unit_cost_hint.
+./tasks/vcs-spent-branch-reuse/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the
@@ -449,3 +472,25 @@
 # rather than presubmit because the fan-out's cards take dispatcher slots
 # from whatever else is running.
 ./tasks/bootstrap-discovery-fanout/task.yaml
+
+# The first-install hello, both variants: the greeting's shape (one message,
+# kube-agents, read-only, results in this chat, changes as pull requests, one
+# question) over the bootstrap_onboarding plugin's eval seam, which
+# prebuilt/first-install-hello arms per case. No fixture; the host install only.
+./tasks/first-install-hello-running/task.yaml
+./tasks/first-install-hello-done/task.yaml
+
+# The fleet-audit report store's reader: a user's question about a past
+# audit, graded on the route (the worker queried the store through the
+# fleet-audit-reports skill) and on nothing being run or published. Reads
+# no fixture; the store holds whatever the install's streams last wrote.
+./tasks/fleet-audit-reports-past-run/task.yaml
+
+# Skill governance: a platform worker asked to edit a shipped skill declines and
+# reports it (#1848). Read-only, transcript-graded, one delegation round trip.
+./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
+
+# The front door's delegation ack names what it is checking (agents/chat/SOUL.md
+# §2, step 4). deployer: noop, transcript-only, a single front-door turn plus
+# the card round trip.
+./tasks/chat-voice-ack-names-target/task.yaml

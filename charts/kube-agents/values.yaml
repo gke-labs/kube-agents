@@ -850,19 +850,24 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
-  # The GCP projects, folders and organisations, beyond the project the agent
-  # runs in, whose GKE clusters the hourly Cluster Agent reconcile enumerates,
-  # and what it leaves unmanaged: rendered as spec.scope on the PlatformAgent
-  # (the CRD reference on the site documents the field). The agent's service
-  # account needs the read roles in each project named, and the read roles
-  # plus roles/cloudasset.viewer on each folder and organisation; the
-  # Terraform composition binds them from the same value it passes here, and
-  # a chart installed on its own needs them granted by hand.
+  # The GCP projects, folders, organisations, Shared VPC hosts and Metrics
+  # Scopes, beyond the project the agent runs in, whose GKE clusters the hourly
+  # Cluster Agent reconcile enumerates, and what it leaves unmanaged: rendered
+  # as spec.scope on the PlatformAgent (the CRD reference on the site documents
+  # the field). The agent's service account needs the read roles in each
+  # project named, the read roles plus roles/cloudasset.viewer on each folder
+  # and organisation, and the read roles in every project a Shared VPC host or
+  # Metrics Scope resolves to, in each scoping project, and roles/compute.viewer
+  # alone in a host not otherwise in scope;
+  # the Terraform composition binds them from the same value it passes here,
+  # resolving the two selectors at plan time, and a chart installed on its own
+  # needs them granted by hand.
   #
-  # A map renders the block as it is, empty lists included (folders and
-  # organizations only when the map carries the key, so a release record from
-  # before the chart knew them re-renders without them and a retag's patch
-  # leaves the CR's lists alone; the composition always passes both): an
+  # A map renders the block as it is, empty lists included (folders,
+  # organizations, sharedVpcHosts and metricsScopes only when the map carries
+  # the key, so a release record from before the chart knew them re-renders
+  # without them and a retag's patch leaves the CR's lists alone; the
+  # composition always passes all four): an
   # empty scope is a present block with empty lists, which the reconcile reads as the
   # declaration that drops projects (their Cluster Agent profiles retire over
   # its next two clean runs), so the composition always passes a map and a
@@ -885,6 +890,8 @@ platformAgent:
   #     projects: [payments-prod, payments-staging]
   #     folders: ["123456789012"]   # numeric IDs; every project beneath, at any depth
   #     organizations: []           # numeric IDs; wide, prefer folders
+  #     sharedVpcHosts: [shared-vpc-host]  # host project IDs; every attached service project
+  #     metricsScopes: []           # scoping project IDs; every project the scope monitors
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple

@@ -691,6 +691,25 @@ def test_the_aggregate_is_advisory_until_the_environment_arms_it(
         assert main(args) == 1, spelling
 
 
+def test_the_default_margin_holds_the_worst_measured_green_run(tmp_path, monkeypatch, capsys):
+    """Armed, no EVAL_AGGREGATE_MARGIN in the environment: the CLI's default
+    is the measured 0.10. 31 of 36 against main at 0.924 -- the worst green
+    presubmit run in the 2026-09-29 sample -- stays green; 29 of 36 (the
+    seventh failed repetition at that window) reds, and the verdict prints
+    the margin it applied."""
+    monkeypatch.delenv("EVAL_AGGREGATE_MARGIN", raising=False)
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
+    worst = case_file(tmp_path, "worst", passes=31, scored=36)
+    assert main(["suite", "--case-result", str(worst), "--baseline-rate", "0.924"]) == 0
+    assert "Admitted-case pass rate: 86.1% (main: 92.4%, margin 10.0%)" in capsys.readouterr().out
+    seven_lost = case_file(tmp_path, "seven-lost", passes=29, scored=36)
+    assert main(["suite", "--case-result", str(seven_lost), "--baseline-rate", "0.924"]) == 1
+    printed = capsys.readouterr().out
+    assert "Admitted-case pass rate: 80.6% (main: 92.4%, margin 10.0%)" in printed
+    assert "### Why it is red" in printed
+    assert "below main's 0.924 by more than the 0.100 margin (over 36 scored repetitions)" in printed
+
+
 def test_the_verdict_is_advisory_with_no_baseline(tmp_path, capsys):
     """The state this ships in, and it must say so rather than imply a pass."""
     assert main(["suite", "--case-result", str(case_file(tmp_path, "a", passes=0, scored=3))]) == 0

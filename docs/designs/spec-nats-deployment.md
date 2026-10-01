@@ -173,17 +173,21 @@ operator who chose the number is not told their stream predates the limit. The
 block is treated the other way - it refuses - because a short consumer budget is not a
 bound the install never had but a shortfall with a load-time failure already attached.
 
-Where that report lands bounds what it is worth, so it is worth saying plainly: the
-provision Job's pod log, and nowhere else. The script exits 0, the reconcile reads the
-Job's `Complete` condition and nothing else, and no Event, no CR condition and no status
-field records that the stream is still unbounded - an install that predates this render
-reads `Ready` with the gap open, exactly as it did before. The 24h TTL removes the
-finished Job and the next reconcile recreates it under the same digested name, so the
-report reappears roughly daily rather than expiring; it is still a pod log, and someone
-has to go and read it. Surfacing it where an operator would see it without being told to
-look is deferred for the same reason the `max_consumers` refusal's own CR surfacing is -
-status plumbing with a blast radius of its own, which is a change about status and not
-about the bus render.
+Where that report lands: the pod log, and an Event on the `PlatformAgent`. The script
+still exits 0, so the Job completes and the CR reads `Ready` - the gap is a report, not a
+failure - but the closing block also writes the finding as one line of JSON to the
+container's termination message (`/dev/termination-log`, the kubelet's default; `{}` when
+it found nothing), and the reconcile that first sees the Job `Complete` reads that off
+the Job's succeeded pod and records a `Warning` Event, reason `TasksSubjectCapMissing`,
+naming the Job, the live and rendered caps, and the `nats stream edit` with its cost. It
+stamps the Job with an annotation so later passes over the same completed Job add
+nothing; the 24h TTL removes the finished Job and the next reconcile recreates it under
+the same digested name, so an unfixed gap is reported once per run, roughly daily, and
+`kubectl describe platformagent` shows it without anyone reading a pod log. It is an
+Event and not a condition because it is a fact about the live stream that a Job
+discovered, not a state the reconcile converges on; the operator's `Recorder` field
+draws that line once. The `max_consumers` refusal in the same block already fails the
+Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 

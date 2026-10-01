@@ -58,16 +58,20 @@ gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
-One provenance note: the bridge image is CI-only. `a2a/Dockerfile.hermes-bridge` builds it
-(`FROM` the platform-agent image plus the one static binary above), and
-`deploy/docker/cloudbuild-ci.yaml` builds it in its `a2a-bridge` step when `hack/ci-deploy.sh`
-runs under `EVAL_MODE_NEXT=1`, `FROM` the platform-agent image that same build produced,
-by the tag it just pushed and never from a registry default, so the sidecar and the agent
-container it shares a pod with are one build; the deploy then declares it on the CR for
-the eval install (`docs/designs/eval-next-transport.md`, "The CI flag"). It is not in
-`images.json` (`hack/check-image-inventory.sh` states the exclusion) and not release
-surface; it joins the release surface at stage-2 graduation or dies before it, whichever
-the dispatcher decides.
+One provenance note: the bridge image is release surface. `a2a/Dockerfile.hermes-bridge`
+builds it (`FROM` the platform-agent image plus the one static binary above), the release
+workflow publishes it as `hermes-bridge` beside the other first-party images, `FROM` the
+platform-agent image the same run pushed under the same commit tag, and `images.json`
+carries it with no operator override, since the operator renders no bridge and the
+sidecar's image is the CR's. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own
+in its `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+platform-agent image that same build produced, by the tag it just pushed and never from a
+registry default; the deploy then declares it on the CR for the eval install
+(`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
+container it shares a pod with are one build. The static `bridge` bus user the next section
+describes is the released mechanism, not scaffolding graduation removes: the password arrives
+as sidecar env from the operator's creds Secret, and it stays a password principal for the
+reason given there.
 
 ## Bus user and grants
 
@@ -185,7 +189,15 @@ returns nothing for entries written after the upgrade.
 Per task: `submitted` on accept (before the consumer ack, so a bridge death before the
 ack just redelivers), `working` when the subprocess spawns, the stdout as a `result`
 artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
-exit is terminal `failed` with the exit code and a stderr tail in the status message. A
+exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
+exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
+and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
+is the last thing the CLI writes before exiting), so the transcript under the profile's session
+store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
+gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
+which the eval harness classes as infrastructure rather than the persona's failure (the image patch
+`apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
+already did). A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it
@@ -319,8 +331,14 @@ dispatcher, not to scaffolding with a demolition date.
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
 path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
 dispatcher's job when it exists), no heartbeats on `agents.hb.>`, a submission whose
-events lookup fails transiently is dropped with a log line rather than redelivered (the
-lib acks unconditionally after the handler; a nak path is a lib delta if it ever bites),
+events lookup keeps failing is dropped with a log line rather than redelivered (a new
+submission's lookup is answered by the direct horizon gets and opens no consumer, so it gets
+one quick retry for a bus hiccup; an orphan cancel's lookup opens the consumer and can be
+refused at the TASKS cap, so a failure from before the consumer existed is retried over six
+seconds, past the inactive threshold the refusal clears on, and a failure from after it is not,
+since that consumer is live and another attempt would open another; the lib acks
+unconditionally after the handler, so a lookup a shutdown interrupts is also dropped, and a nak
+path is a lib delta if a persistent failure ever bites),
 and a terminal publish that fails outright - a bus outage outlasting the finalize
 budget at exactly that moment - leaves the task in the registry for the NEXT
 incarnation's sweep, which may be far away on a healthy sidecar; until then the bridge
