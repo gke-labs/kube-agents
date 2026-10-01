@@ -86,7 +86,18 @@ _INTERPOLATIONS = {
     "local.python": "/opt/hermes/.venv/bin/python3",
     "local.key_like": "bootstrap-inventory-%",
     "local.raw_file": "/opt/data/INVENTORY.raw.md",
-    "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md /opt/data/INVENTORY.items.json",
+    "local.inventory": " ".join(
+        f"/opt/data/{name}"
+        for name in (
+            "INVENTORY.raw.md",
+            "INVENTORY.raw.md.tmp",
+            "INVENTORY.md",
+            "INVENTORY.md.tmp",
+            "INVENTORY.items.json",
+            "INVENTORY.scores.json",
+            "INVENTORY.delivered.md",
+        )
+    ),
     "local.raw_b64": base64.b64encode(_RAW.read_bytes()).decode(),
     "local.card_key": "bootstrap-inventory-prioritize",
     "local.card_assignee": "platform",
@@ -353,7 +364,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(base64.b64decode((self._state / "planted").read_text()), _RAW.read_bytes())
         self.assertEqual((self._state / "plant_args").read_text().split("\n"), ["sh", "/opt/data/INVENTORY.raw.md", "/opt/data"])
 
-    def test_the_in_sandbox_write_decodes_and_takes_the_volume_owner(self):
+    def test_the_in_sandbox_write_decodes_and_runs_under_gnu_stat(self):
         probe = subprocess.run(["stat", "-c", "%u:%g", "."], capture_output=True, text=True)
         if probe.returncode != 0:
             self.skipTest("no GNU stat, which the sandbox image has")
