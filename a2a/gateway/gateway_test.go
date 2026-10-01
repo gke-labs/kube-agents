@@ -1808,3 +1808,89 @@ func TestSessionCommandIgnoredOnAnExplicitCancel(t *testing.T) {
 		t.Fatalf("a cancel was read as /session: %+v", rec)
 	}
 }
+
+// TestSessionCommandWhileAPlatformTaskRunsSaysSo: a bare /session during a
+// platform task marks the route but must not promise that the next message
+// opens a pod - that message steers the running task. The reply says the
+// task finishes first, and the message after it is the one that spawns.
+func TestSessionCommandWhileAPlatformTaskRunsSaysSo(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s10"
+	sessionRigTurn(r, conv, "s-190", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-191", "/session")
+	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "your next message opens a session pod") {
+			t.Fatalf("promised the next message opens a pod while a task runs: %q", p)
+		}
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if !rec.SessionRouted || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+		t.Fatalf("record after /session during a task: %+v", rec)
+	}
+	if len(spawn.calls()) != 0 {
+		t.Fatal("spawned during a running platform task")
+	}
+}
+
+// TestSessionCommandWithTextWhileATaskRunsHoldsTheText: the route turns on,
+// the text is not sent, and the reply says so.
+func TestSessionCommandWithTextWhileATaskRunsHoldsTheText(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s11"
+	sessionRigTurn(r, conv, "s-200", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-201", "/session list the pods")
+	waitFor(t, "held", postedContaining(r, "that message was not sent"))
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.EnvelopeID == origin.EnvelopeID {
+			continue
+		}
+		t.Fatalf("the held text reached the platform task as %s", e.Kind)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if !rec.SessionRouted || len(spawn.calls()) != 0 {
+		t.Fatalf("record %+v, spawns %d", rec, len(spawn.calls()))
+	}
+}
+
+// TestSessionCommandTwiceIsAnsweredOnce: a second bare /session on a routed
+// conversation is answered and changes nothing.
+func TestSessionCommandTwiceIsAnsweredOnce(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s12"
+	sessionRigTurn(r, conv, "s-210", "/session")
+	waitFor(t, "ack", postedContaining(r, "session route on"))
+	sessionRigTurn(r, conv, "s-211", "/session")
+	waitFor(t, "already", postedContaining(r, "already on the session route"))
+	if len(spawn.calls()) != 0 {
+		t.Fatal("a repeated /session spawned")
+	}
+}
+
+// TestSessionStopIsAHintNotATask: "/session stop" must never mint a task
+// whose text reads "stop"; it points at /session off.
+func TestSessionStopIsAHintNotATask(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s13"
+	sessionRigTurn(r, conv, "s-220", "/session stop")
+	waitFor(t, "hint", postedContaining(r, "`/session off`"))
+	if len(spawn.calls()) != 0 {
+		t.Fatal("/session stop spawned a task")
+	}
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec != nil && rec.SessionRouted {
+		t.Fatalf("/session stop marked the route: %+v", rec)
+	}
+}

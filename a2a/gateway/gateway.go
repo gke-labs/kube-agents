@@ -689,19 +689,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
-			if rec.PodName != "" {
-				if !g.closeDetachedBeforeDelete(ctx, rec) {
-					g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-					return
-				}
-				if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-					g.log.Warn("previous incarnation delete failed; pod may linger",
-						"pod", rec.PodName, "err", err)
-				}
-				rec.PodName = ""
+			if !g.retireIncarnation(ctx, rec, "delegate") {
+				return
 			}
 			if rec.Profile == "" {
-				rec.Profile = "chat"
+				rec.Profile = sessionProfile
 			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
@@ -734,19 +726,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				// old pod holds a cap slot sweep can never reclaim. Same
 				// supervisor rule as the Delegate branch: a detached
 				// task's terminal is published before its pod goes.
-				if rec.PodName != "" {
-					if !g.closeDetachedBeforeDelete(ctx, rec) {
-						g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-						return
-					}
-					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-						g.log.Warn("pre-flip incarnation delete failed; pod may linger",
-							"pod", rec.PodName, "err", err)
-					}
-					rec.PodName = ""
+				if !g.retireIncarnation(ctx, rec, "pre-flip upgrade") {
+					return
 				}
 				rec.SessionRouted = true
-				rec.Profile = "chat"
+				rec.Profile = sessionProfile
 				rec.BusSession = mintSessionName(rec.Profile)
 				rec.Addressee = rec.BusSession
 			}
@@ -991,6 +975,32 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	return state, nil
 }
 
+// retireIncarnation deletes the record's lingering session pod before a
+// successor is minted or the route is left. Delete rather than just untrack:
+// once PodName clears, reap can never find the pod again, and sweep only
+// sees terminal phases - a wedged Running pod would hold its bus credential
+// forever. A detached task's supervisor terminal is owed BEFORE the delete
+// (the one deletion rule in Session lifecycle); false means that terminal
+// could not be published, a post has said so, and nothing was touched.
+// Spawner-nil is the W4-rollback shape: the record names a pod nothing can
+// manage, so the binding is cleared and the path degrades as it always did.
+func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why string) bool {
+	if rec.PodName == "" {
+		return true
+	}
+	if !g.closeDetachedBeforeDelete(ctx, rec) {
+		g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
+		return false
+	}
+	if g.spawner != nil {
+		if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+			g.log.Warn(why+": incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
+		}
+	}
+	rec.PodName = ""
+	return true
+}
+
 // freshIncarnation retires the previous session pod, if any, and mints the
 // next incarnation's name as the record's addressee. The worker adapter is
 // one task per process, so a lingering PodName names an executor that can
@@ -1007,21 +1017,8 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
 		return false
 	}
-	if rec.PodName != "" {
-		if !g.closeDetachedBeforeDelete(ctx, rec) {
-			g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-			return false
-		}
-		// Spawner-nil is the W4-rollback shape: the record is
-		// session-routed but nothing can manage pods. Clear the
-		// binding and degrade the way this path always did.
-		if g.spawner != nil {
-			if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-				g.log.Warn("previous incarnation delete failed; pod may linger",
-					"pod", rec.PodName, "err", err)
-			}
-		}
-		rec.PodName = ""
+	if !g.retireIncarnation(ctx, rec, "session route") {
+		return false
 	}
 	rec.BusSession = mintSessionName(rec.Profile)
 	rec.Addressee = rec.BusSession
@@ -1061,15 +1058,8 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 			g.post(rec.Key, "⚠️ a session task is still running — `stop` it first, then `/session off`")
 			return false
 		}
-		if rec.PodName != "" {
-			if !g.closeDetachedBeforeDelete(ctx, rec) {
-				g.post(rec.Key, "⚠️ could not close the previous task on the bus; try again in a moment")
-				return false
-			}
-			if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-				g.log.Warn("session off: incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
-			}
-			rec.PodName = ""
+		if !g.retireIncarnation(ctx, rec, "session off") {
+			return false
 		}
 		rec.SessionRouted = false
 		rec.Profile = ""
@@ -1083,16 +1073,29 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		g.post(rec.Key, "ℹ️ already on the session route")
 		return false
 	}
+	if isStop(rest) {
+		// "/session stop" is almost certainly the way back misspelled. It
+		// must never become a task whose text reads "stop" - the same rule
+		// the stopping case below enforces for a bare "stop".
+		g.post(rec.Key, "ℹ️ to leave the session route say `/session off`; to stop a running task say `stop`")
+		return false
+	}
 	rec.SessionRouted = true
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
-	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "")
-	if rest == "" {
+	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "", "taskRunning", running)
+	switch {
+	case rest == "" && running:
+		// Truthful about the order: the next message steers the running
+		// task (the steer case below), so it is the one after the task
+		// ends that opens the pod.
+		g.post(rec.Key, "🧵 session route on — the running task finishes first; the message after it opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
+		return true
+	case rest == "":
 		g.post(rec.Key, "🧵 session route on — your next message opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
 		return true
-	}
-	if running {
+	case running:
 		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
 		return true
 	}

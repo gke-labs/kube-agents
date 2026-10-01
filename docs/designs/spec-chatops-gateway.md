@@ -291,8 +291,10 @@ turn; `/session off` releases the incarnation (refused while a session task runs
 first) and re-homes to the default addressee. The conversation's `contextId` is unchanged by
 either. Without a spawner, and on an install whose default is already the session route, both
 forms answer with a note and change nothing; `/session <text>` while a task is still running turns
-the route on and holds the text. It is a debugging and opt-in door for the transition, not the
-taught interface. The default flips when the delegation primitive lands: the session's request to
+the route on and holds the text. On Slack a leading slash belongs to the Slack client, which
+refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
+stripped before the gateway reads the text. It is a debugging and opt-in door for the transition,
+not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
 mint, the relay of the child's events into the conversation, and the wake-up turn on the
 child's terminal. The session's bus grants do not change for it (its only subscribe grant is

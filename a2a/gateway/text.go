@@ -129,6 +129,9 @@ const (
 // bare "/session", "off" for the way back, anything else is the first turn.
 // Any other slash word is not a command to the gateway and falls through as
 // plain text; the chat platforms' own slash commands never reach the gateway.
+// Slack also keeps a bare leading slash for itself (an unregistered command
+// is refused client-side), so there the form is "@<bot> /session" - the
+// mention is stripped before this reads the text.
 func isSessionCommand(text string) (string, bool) {
 	trimmed := strings.TrimSpace(text)
 	if len(trimmed) < 1+len(slashSessionWord) || trimmed[0] != '/' {
