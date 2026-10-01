@@ -73,9 +73,11 @@ const (
 	//
 	// CPU is sized for a cold pod. After an eviction the replacement passes
 	// its readiness probe five seconds in, and the first mints then arrive
-	// while gcloud and the Minty client are still warming up, each bounded by
-	// GCLOUD_TIMEOUT_SECONDS and MINTY_REQUEST_TIMEOUT_SECONDS in
-	// agents/platform/scripts/github_token_refresh.py. Observed on Autopilot,
+	// while the Minty client is still warming up, bounded by
+	// MINTY_REQUEST_TIMEOUT_SECONDS in agents/platform/scripts/github_token_refresh.py
+	// (gcloud, bounded by GCLOUD_TIMEOUT_SECONDS there, was on this path when
+	// the numbers below were taken; it is now the fallback behind the metadata
+	// server). Observed on Autopilot,
 	// the composition's default, where a pod without bursting has its CPU
 	// limit clamped to its request: at 100m the request was the ceiling, the
 	// calls timed out for minutes after a start and one throttled pod kept
