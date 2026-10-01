@@ -2372,13 +2372,12 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, and, once the operator renders it, the A2A gateway's. The operator grants
+the same listener, and, when the next stack takes Google Chat, the A2A gateway's. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
 minted for `kubeagents-credential-proxy`, the gateway's for
-`kubeagents-credential-proxy-chat`, the A2A gateway's, once rendered, for whatever
-`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names, and the `TokenReview` response echoes which
+`kubeagents-credential-proxy-chat`, the A2A gateway's for `kubeagents-credential-proxy-a2a-chat`, and the `TokenReview` response echoes which
 audience it validated. A username cannot do this job: the gateway shares its ServiceAccount with the
 broker because the Workload Identity binding names it, so the two Pods are one identity at
 the `TokenReview` layer. The audience is chosen by the operator, per Pod, and the API server

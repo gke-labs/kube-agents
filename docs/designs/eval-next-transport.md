@@ -309,7 +309,7 @@ consumed; the reply came back as lifecycle events with a `result` artifact and r
 conversation the way the relay posts it. These are the components the measured run had down
 while the job stayed green, the gateway among them.
 
-**What it skips.** Chat, Pub/Sub, the relay's pull from the A2A subscription, the allowed-users
+**What it skips.** Chat, Pub/Sub, the A2A relay instance's pull from the install's subscription, the allowed-users
 gate, an `authority` block that names a real principal, and the reply rendered into the thread.
 
 **Which verifiers work.** `report_contains` reads the answer text and works unchanged.
@@ -465,7 +465,7 @@ harness reads is the eval crew's to decide when the stage is built. The presubmi
 to the customer's door in the same change; the inject adapter stays a dev-only door behind the
 eval flag, and the direct-bus transport stays a diagnostic.
 
-What it adds to the proof: the relay pulls the A2A subscription, the gateway authenticates to the
+What it adds to the proof: the A2A relay instance pulls the install's subscription, the gateway authenticates to the
 broker with its own audience, the gateway mints the session and the `authority` block, the
 allowed-users gate admits the sender, and the reply reaches the thread.
 
@@ -473,14 +473,12 @@ The operator work this stage stood on is rendered: under `next` with Google Chat
 gateway carries the adapter's env and relay token, the broker arms the A2A relay instance on
 the install's one subscription with the third audience, the gateway's ServiceAccount is a
 broker caller and a NetworkPolicy peer, and the legacy consumer is not rendered (the gateway
-spec's "Coexistence is by mode"). What remains for this stage is the eval install's own: Chat
-enabled with a Chat app registration and a space per pool project.
+spec's "Coexistence is by mode").
 
 The operator render kept the three conditions the A2A owner set on it: it cites the gateway
 spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
 allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
-as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; the relay URL
-is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
 armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door

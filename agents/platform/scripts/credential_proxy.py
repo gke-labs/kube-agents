@@ -5542,9 +5542,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     slack_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
-    # The A2A gateway's own relay instance, on its own subscription. Two
-    # consumers on one subscription split deliveries randomly, so the A2A
-    # routes never touch chat_relay and vice versa; only the /v1/chat/api
+    # The A2A gateway's relay instance. Two consumers on one subscription
+    # split deliveries randomly, so the operator arms exactly one instance per
+    # install (the mode chooses which) and the A2A routes never touch
+    # chat_relay and vice versa; only the /v1/chat/api
     # passthrough is shared, because both instances hold the same app
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
@@ -6971,8 +6972,8 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     """Return the legacy and A2A Chat subscription names, refusing one shared.
 
     Two relay instances pulling one subscription split its deliveries between
-    them at random — the exact failure the A2A path's own subscription exists
-    to prevent — so pointing both env vars at the same subscription is refused
+    them at random, and the operator arms exactly one instance per install (the
+    mode chooses which), so pointing both env vars at the same subscription is refused
     at startup rather than discovered as every other ask going missing. The
     comparison is on the fully qualified name, the way GoogleChatRelay
     resolves it: a short name and its projects/… spelling are one subscription.
@@ -6989,7 +6990,7 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
         raise RuntimeError(
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
             "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
-            "split its deliveries, so the A2A consumer needs its own"
+            "split its deliveries; arm one relay instance per install"
         )
     return chat_subscription, a2a_subscription
 
@@ -7059,7 +7060,7 @@ def serve(args: argparse.Namespace) -> None:
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
-    # The A2A gateway's own subscription on the same topic and credential;
+    # The A2A gateway's relay instance on the same topic and credential;
     # armed independently so an install can run either consumer alone.
     if chat_project and a2a_subscription:
         CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(

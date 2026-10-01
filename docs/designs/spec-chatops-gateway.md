@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either
 
 ## Purpose
 
@@ -779,14 +779,15 @@ integration's operational surface, and this section records how it sits on it.
 through the credential proxy by whichever brain the mode names.** A Chat app configuration is
 per-GCP-project, so "take Chat events directly" means a second project — not an
 adapter-PR dependency. Two consumers on one subscription split deliveries randomly, so one consumer
-holds it at a time (below), and the subscription is pulled by a
-second `GoogleChatRelay` instance in the credential proxy (routes
+holds it at a time (below), and under `next` the subscription is pulled by the A2A
+`GoogleChatRelay` instance in the credential proxy (routes
 `/v1/chat/a2a/events`, `/v1/chat/a2a/events/ack`, `/v1/chat/a2a/events/nack`), enabled
 only when `A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME` is set alongside the project id. The
 gateway pod stays cloud-credential-free: it authenticates to the proxy the way the
 legacy chat caller does — a projected ServiceAccount token verified by TokenReview —
-but with its OWN audience — whatever `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names on the
-proxy; nothing in-tree fixes the string yet, the operator wiring will — conferring
+but with its OWN audience — the one the operator renders as
+`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` on the proxy, `kubeagents-credential-proxy-a2a-chat` —
+conferring
 the `a2a-chat` role, because the legacy chat caller is the LLM-driven Hermes pod and a
 shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
 silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`
