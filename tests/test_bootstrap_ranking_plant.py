@@ -36,6 +36,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -278,6 +279,13 @@ def _render(block: int, interpolations: dict) -> str:
     return body
 
 
+def _default_sigint():
+    # A runner started as a `&` job hands SIGINT down ignored, and bash cannot
+    # trap a signal that was ignored when it started, so the INT cases would
+    # fail there and pass anywhere else.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 @unittest.skipUnless(shutil.which("bash"), "no bash on PATH")
 class BootstrapRankingPlantTest(unittest.TestCase):
     @classmethod
@@ -311,7 +319,12 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         env["STATE"] = str(self._state)
         env.update({k: str(v) for k, v in scenario.items()})
         completed = subprocess.run(
-            ["bash", str(script or self._script)], env=env, capture_output=True, text=True, timeout=120
+            ["bash", str(script or self._script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            preexec_fn=_default_sigint,
         )
         calls = self._calls.read_text().splitlines() if self._calls.exists() else []
         return completed, calls
