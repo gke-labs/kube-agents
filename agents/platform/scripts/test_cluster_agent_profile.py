@@ -872,6 +872,11 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "/opt/data/scripts/cluster_agent_profile.py",
             "kanban_notify_propagate.py",
             "/opt/data/scripts/kanban_notify_propagate.py",
+            "cd /opt/data/scripts && python3 -m cluster_agent_profile list",
+            "python3 -m cluster_agent_profile",
+            "python3 -u -m cluster_agent_profile list",
+            "python3 -m kanban_notify_propagate",
+            "python -m cluster_agent_profile",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -903,6 +908,19 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
                     f"expected non-matching command {cmd!r} not to be caught",
                 )
 
+    def test_platform_checked_workload_existence_requires_mcp_tool(self):
+        spec = self.data.get("verification_spec", [])
+        check = next(
+            (c for c in spec if c.get("name") == "platform-checked-workload-existence"),
+            None,
+        )
+        self.assertIsNotNone(check, "missing platform-checked-workload-existence check")
+        assert check is not None
+        tool_names = check.get("check", {}).get("tool_names", [])
+        self.assertIn("mcp__gke__get_k8s_resource", tool_names)
+        self.assertIn("mcp_gke_get_k8s_resource", tool_names)
+        self.assertEqual(check.get("check", {}).get("scope"), "workers")
+
     def test_expected_output_requires_delegation(self):
         expected_output = self.data.get("expected_output", "")
         self.assertIn(
@@ -916,12 +934,14 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         check_names = [c.get("name") for c in spec]
         self.assertIn("a-cluster-agent-did-the-work", check_names)
         self.assertIn("platform-enumerated-cluster-profiles", check_names)
+        self.assertIn("platform-checked-workload-existence", check_names)
         self.assertIn("no-stubbed-profile-scripts", check_names)
         self.assertIn("rca-names-the-oom", check_names)
         self.assertIn("the-crashloop-was-diagnosed-not-fixed", check_names)
         # Ineffective in-pod platform_control safeguard was removed;
-        # delegation is checked by a-cluster-agent-did-the-work (worker_agents)
-        # and evaluated by expected_output
+        # existence inspection across the fleet is verified by platform-checked-workload-existence,
+        # worker delegation is verified by a-cluster-agent-did-the-work (worker_agents),
+        # and expected_output prompts the LLM judge for RCA and delegation phrasing.
         self.assertNotIn("no-inline-platform-mcp-diagnostics", check_names)
 
 

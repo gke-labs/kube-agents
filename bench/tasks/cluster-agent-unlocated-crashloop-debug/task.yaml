@@ -53,15 +53,17 @@ fixtures:
   - crashloop-workload
 
 verification_spec:
-  # The positive half: a Cluster Agent profile worked the case, and the platform
-  # worker enumerated managed profiles via list_cluster_profiles. Without worker_agents,
-  # a platform worker that searches every cluster itself passes the forbidden-script
-  # check while delegating nothing. Profile names are `cluster-<project>-<cluster>-<location>`;
+  # The positive half: a Cluster Agent profile worked the case, the platform
+  # worker enumerated managed profiles via list_cluster_profiles, and inspected
+  # workload existence across the fleet using get_k8s_resource before delegating.
+  # Without worker_agents, a platform worker that searches every cluster itself
+  # passes while delegating nothing. Profile names are `cluster-<project>-<cluster>-<location>`;
   # any of them counts because the fleet carries more than one cluster the search may reach.
-  # worker_agents verifies that a Cluster Agent profile worked cards in the run; delegation
-  # of the actual diagnosis (rather than inline diagnosis with fanned-out probe cards) is
-  # evaluated by expected_output alongside root-cause analysis.
-  # Terminal profile scripts are forbidden in the sandbox by no-stubbed-profile-scripts.
+  # Note on verifier boundaries: worker_agents verifies that a Cluster Agent profile
+  # worked cards in the run; expected_output is evaluated by the OutcomeValidity LLM
+  # judge solely off the final message (which does not observe worker tool trajectories).
+  # Existence inspection across the fleet is verified by platform-checked-workload-existence,
+  # and terminal profile scripts are forbidden in the sandbox by no-stubbed-profile-scripts.
   - name: a-cluster-agent-did-the-work
     role: objective
     check:
@@ -77,17 +79,28 @@ verification_spec:
         - mcp_platform_control_list_cluster_profiles
       minimum_calls: 1
       require_success: true
+  - name: platform-checked-workload-existence
+    role: objective
+    check:
+      type: tool_called
+      scope: workers
+      tool_names:
+        - mcp__gke__get_k8s_resource
+        - mcp_gke_get_k8s_resource
+      minimum_calls: 1
   - name: no-stubbed-profile-scripts
     role: objective
     check:
-      # A match anywhere in a command, not only at its start: the scripts are
-      # run by path (`python3 /opt/data/scripts/cluster_agent_profile.py ...`),
-      # quoted, with `--help`, or inside loops the worker writes, and neither
-      # name has a use in a worker's terminal on an install where the stubs
-      # apply.
+      # A match anywhere in a command: catches script executions by file path
+      # or script filename (cluster_agent_profile.py, kanban_notify_propagate.py)
+      # and Python module invocations (python3 -m cluster_agent_profile), while
+      # allowing harmless mentions in text inspection tools (grep, echo, cat).
       type: worker_commands
       forbidden_patterns:
-        ['cluster_agent_profile\.py', 'kanban_notify_propagate\.py']
+        - 'cluster_agent_profile\.py'
+        - 'kanban_notify_propagate\.py'
+        - 'python[0-9.]*\s+(?:-[^\s]+\s+)*-m\s+cluster_agent_profile\b'
+        - 'python[0-9.]*\s+(?:-[^\s]+\s+)*-m\s+kanban_notify_propagate\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert
