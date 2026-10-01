@@ -99,8 +99,9 @@ MAX_RUNS = 500
 
 # Prints the marker's mtime and every run of the job whose window, claimed_at
 # to finished_at, holds it: the run that took the claim. A run still going has
-# no finished_at. A sqlite failure is printed as "error" rather than raised, so
-# the verdict names it instead of reading as an unreachable pod.
+# no finished_at. A stat, sqlite or timestamp failure is printed as "error"
+# rather than raised, so the verdict names it instead of reading as an
+# unreachable pod.
 _RUNS_SCRIPT = """
 import json, os, sqlite3, sys
 from datetime import datetime
@@ -111,6 +112,8 @@ try:
     out["marker"] = os.stat(marker).st_mtime
 except FileNotFoundError:
     pass
+except OSError as exc:
+    out["error"] = str(exc)
 rows = []
 if out["marker"] is not None:
     try:
@@ -121,10 +124,14 @@ if out["marker"] is not None:
     except sqlite3.Error as exc:
         out["error"] = "%s: %s" % (db, exc)
     for status, claimed, finished, error, outcome in rows:
-        if not claimed or datetime.fromisoformat(claimed).timestamp() > out["marker"]:
-            continue
-        if finished and datetime.fromisoformat(finished).timestamp() < out["marker"]:
-            continue
+        try:
+            if not claimed or datetime.fromisoformat(claimed).timestamp() > out["marker"]:
+                continue
+            if finished and datetime.fromisoformat(finished).timestamp() < out["marker"]:
+                continue
+        except (TypeError, ValueError) as exc:
+            out["error"] = "%s: run claimed_at %r, finished_at %r: %s" % (db, claimed, finished, exc)
+            break
         out["runs"].append({"status": status, "claimed_at": claimed, "finished_at": finished,
                             "error": error, "delivery_outcome": outcome})
 print(sentinel)
@@ -251,7 +258,8 @@ def read_delivery_runs(shell: Callable[[str, float], str], timeout: float) -> di
     """The claim marker's mtime and the delivery runs that span it, or ``None`` if the read failed.
 
     A ``"marker"`` of ``None`` means there is no marker. An ``"error"``
-    is the store's sqlite failure, read from a pod that answered. ``shell`` is
+    is a marker that could not be stat'd, the store's sqlite failure, or a
+    run timestamp that does not parse, read from a pod that answered. ``shell`` is
     :func:`agent_shell`, a parameter so the tests can fake it.
     """
     reply = shell(runs_command(), timeout)

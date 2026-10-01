@@ -195,6 +195,44 @@ def test_a_store_without_a_selected_column_is_an_error_that_names_it(store: Stor
     assert "no such column: delivery_outcome" in result.reason
 
 
+@pytest.mark.parametrize("column", ["claimed_at", "finished_at"])
+def test_a_run_whose_timestamp_cannot_be_parsed_is_an_error_that_names_it(
+    store: Store, monkeypatch: pytest.MonkeyPatch, column: str
+) -> None:
+    store.claim()
+    store.run("completed", *_around(), outcome="suppressed")
+    with sqlite3.connect(store.db) as con:
+        con.execute(f"UPDATE executions SET {column} = 'bogus'")
+    monkeypatch.setattr(onboarding, "agent_shell", _lenient_shell)
+    result = _verify()
+    assert result.status == "error"
+    assert "'bogus'" in result.reason
+    assert "kubectl exec failed" not in result.reason
+
+
+def test_an_unparseable_finish_on_a_run_claimed_after_the_marker_is_not_read(store: Store) -> None:
+    store.claim()
+    store.run("completed", *_around(), outcome="suppressed")
+    later = CLAIM + timedelta(minutes=5)
+    store.run("failed", later, later, error=OWNERSHIP_LOST)
+    with sqlite3.connect(store.db) as con:
+        con.execute("UPDATE executions SET finished_at = 'bogus' WHERE status = 'failed'")
+    assert _verify().status == "pass"
+
+
+def test_a_marker_that_cannot_be_stat_ed_is_an_error_that_names_it(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.claim()
+    unstattable = store.marker / "under-a-file"
+    monkeypatch.setattr(onboarding, "COMPLETED_MARKER", str(unstattable))
+    monkeypatch.setattr(onboarding, "agent_shell", _lenient_shell)
+    result = _verify()
+    assert result.status == "error"
+    assert str(unstattable) in result.reason
+    assert "kubectl exec failed" not in result.reason
+
+
 @pytest.mark.parametrize(
     "reply",
     ["", "noise", f"{onboarding.RUNS_READ}\nnot json", f'{onboarding.RUNS_READ}\n{{"marker": 1}}'],

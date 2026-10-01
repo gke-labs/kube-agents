@@ -2664,7 +2664,8 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
 
     Where the output went is not checked: the bench stack delivers to
     ``local``, which the scheduler records as ``suppressed``. The agent pod
-    unreadable, or a cron store sqlite cannot read, is ``status="error"``.
+    unreadable, or a marker, cron store or run timestamp the read cannot use,
+    is ``status="error"``.
     """
 
     type: Literal["bootstrap_delivered"]
@@ -2674,7 +2675,7 @@ class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
         if read is None:
             return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
         if read.get("error"):
-            return "error", f"the agent pod's cron store could not be read: {read['error']}", read
+            return "error", f"the agent pod's claim marker or cron store could not be read: {read['error']}", read
         marker, job = onboarding.COMPLETED_MARKER, onboarding.DELIVERY_JOB_ID
         if read.get("marker") is None:
             return "fail", f"there is no {marker}: the delivery job never claimed the report", read
