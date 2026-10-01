@@ -61,6 +61,21 @@ if _REFRESH_MATCH is None:
 PAGE_REFRESH_MS = int(_REFRESH_MATCH.group(1))
 # Boot, then two polls, then half an interval of slack, on the sped-up clock.
 TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEEDUP
+# dom_html's budget when a test names none: boot and the refresh after it;
+# the first poll is far outside it unless the page's timers are sped up.
+DEFAULT_BUDGET_MS = 3000
+# fast_timers_page marks its copies with this stem suffix; dom_html reads it
+# to know how soon the page polls.
+FAST_TIMERS_SUFFIX = "-fast"
+# The Brief's bare view anchors (#gate, #agent), each the id of a section.
+# dom_html refuses one on a budget the poll fires inside: a fragment naming
+# an element, polled under virtual time, is what stalls headless Chrome on CI.
+_VIEWS_MATCH = re.search(r"^\s*views:\s*\{([^}]*)\}", PAGES_JS.read_text(), re.MULTILINE)
+if _VIEWS_MATCH is None:
+    raise RuntimeError(f"{PAGES_JS}: PAGE.views is not an object literal; dom_html cannot tell a bare view anchor")
+BRIEF_VIEW_ANCHORS = frozenset(re.findall(r'"([^"]+)"', _VIEWS_MATCH.group(1)))
+if not BRIEF_VIEW_ANCHORS:
+    raise RuntimeError(f"{PAGES_JS}: PAGE.views names no view; dom_html cannot tell a bare view anchor")
 # Below this the page may not finish booting inside the budget, and the
 # scroll-once test would pass or fail on load time rather than on the poll.
 MIN_TWO_POLLS_BUDGET_MS = 1000
@@ -150,12 +165,20 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = 3000) -> str:
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = DEFAULT_BUDGET_MS) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
     an XHR with a login redirect puts the pages in. ``budget_ms`` is the
     virtual time the page is given; timers fire inside it, so a budget past
-    PAGE.refreshMs runs the poll too."""
+    PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
+    on a budget the poll fires inside; see fast_timers_page for the stall."""
+    anchor = fragment.lstrip("#")
+    poll_ms = PAGE_REFRESH_MS // TIMER_SPEEDUP if page.stem.endswith(FAST_TIMERS_SUFFIX) else PAGE_REFRESH_MS
+    if budget_ms >= poll_ms and anchor in BRIEF_VIEW_ANCHORS:
+        raise ValueError(
+            f"{fragment} on a {budget_ms} ms budget of a page that polls every {poll_ms} ms: a bare view anchor "
+            f"polled under virtual time stalled headless Chrome on CI (#2227); use #view={anchor}, or a budget the poll is outside"
+        )
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
         [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
@@ -189,10 +212,11 @@ def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
     bare anchors on short budgets have a clean record. The sped-up clock
     alone did not remove the stall: #gate under TWO_POLLS_BUDGET_MS stalled
     the same way, so no call on the poll budget carries a fragment that
-    names an element (test_the_bare_anchor_scrolls_once)."""
+    names an element (test_the_bare_anchor_scrolls_once), and dom_html
+    refuses a bare view anchor on a budget the poll fires inside."""
     shim = ("<script>(() => { const native = window.setInterval;"
             f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
-    copy = page.with_name(page.stem + "-fast" + page.suffix)
+    copy = page.with_name(page.stem + FAST_TIMERS_SUFFIX + page.suffix)
     copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
     return copy
 
@@ -1085,7 +1109,8 @@ class BrowserTest(unittest.TestCase):
         # after #2202's sped-up clock). A fragment naming an element, polled
         # under virtual time, is the condition that stalls it; the default
         # budget ends before the first poll, the shape
-        # test_agent_view_shows_the_numbers uses for #agent.
+        # test_agent_view_shows_the_numbers uses for #agent, and dom_html
+        # refuses #gate on a budget the poll fires inside.
         page = scroll_counting_page(self.index)
         self.assertEqual(scrolls(dom_html(page, fragment="#gate")).group(1), "1", "the bare anchor, the same way")
 
@@ -1402,8 +1427,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
         # The row is scrolled to once, on navigation; the polls that follow
         # re-render without pulling the reader back to it.
-        scrolls = re.search(r'<body[^>]*data-scrolls="(\d+)"', dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000))
-        self.assertEqual(scrolls.group(1), "1")
+        self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000)).group(1), "1")
         clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
         self.assertIn('id="case-retired-probe"', clicked)
 
