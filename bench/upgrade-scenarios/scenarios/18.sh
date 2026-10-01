@@ -37,7 +37,9 @@ probe_round(){ local tag=$1 t=0; wait_gpu; torch_probe cu124-$tag "$CU12_IMAGE";
   ev gpu-driver $tag-pods K -n scen get pods -l app=torch-probe -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,EXIT:.status.containerStatuses[0].state.terminated.exitCode'
   ev gpu-driver $tag-node K get nodes -l role=work -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,DRIVER_LABEL:.metadata.labels.cloud\.google\.com/gke-gpu-driver-version,GPU:.status.allocatable.nvidia\.com/gpu'
   ev gpu-driver $tag-pool G container node-pools describe work-pool --cluster "$CLUSTER" --zone "$ZONE" --format='value(version,config.accelerators[0].gpuDriverInstallationConfig.gpuDriverVersion)'
-  ev gpu-driver $tag-installer sh -c "for p in \$(kubectl --context $CTX -n kube-system get pods -o name | grep nvidia-gpu-device-plugin); do kubectl --context $CTX -n kube-system logs \$p -c nvidia-driver-installer 2>/dev/null | grep -i 'driver version' | tail -2; done"; }
+  ev gpu-driver $tag-installer sh -c "for p in \$(kubectl --context $CTX -n kube-system get pods -o name | grep nvidia-gpu-device-plugin); do kubectl --context $CTX -n kube-system logs \$p -c nvidia-driver-installer 2>/dev/null | grep -i 'driver version' | tail -2; done"
+  # A round whose pods never finished is recorded above but is not a result: stop rather than upgrade on it, or report it as the after-state.
+  probe_done cu124-$tag && probe_done cu130-$tag || { note final "precondition not met: the probe pods of round $tag did not finish within ${PROBE_WAIT}s; stopping"; exit 1; }; }
 plant(){ wait_gpu; }
 before(){ probe_round v132; }
 break_it(){ local v; for m in 1.33 1.34; do v=$(newest_patch EXTENDED $m); upgrade_master "$v"; upgrade_pool work-pool "$v"; [ $m = 1.34 ] || probe_round v${m/./}; done; }

@@ -41,3 +41,6 @@ ev compat $TAG-cu124-init K -n scen logs compat-cu124-$TAG -c copy-compat; ev co
 ev compat $TAG-cu130-init K -n scen logs compat-cu130-$TAG -c copy-compat; ev compat $TAG-cu130 K -n scen logs compat-cu130-$TAG
 ev compat $TAG-pods K -n scen get pods -l app=compat-probe -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,EXIT:.status.containerStatuses[0].state.terminated.exitCode'
 ev compat $TAG-node K get nodes -l role=work -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,GPU:.status.allocatable.nvidia\.com/gpu'
+# The records above show the state either way; a round whose pods never finished is not a baseline, so the probe fails
+# and 18k stops the run rather than upgrading on it.
+done_ compat-cu124-$TAG && done_ compat-cu130-$TAG || { note compat "precondition not met: the probe pods did not finish within ${WAIT}s; the round $TAG is not a result"; exit 1; }
