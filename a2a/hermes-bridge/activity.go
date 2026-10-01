@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -129,6 +130,14 @@ const (
 	activityToolNameCap = 256
 	activityCallIDCap   = 128
 	activityWordCap     = 64
+	// wrapperNameDepth is where a nested tool name sits in hermes's tool_call
+	// wrapper: the root map (0) holds the "calls" array (1), whose element
+	// map (2) holds the "name" string (3). Only that string is a tool name; a
+	// "calls[].name" deeper down is an argument value.
+	wrapperNameDepth = 3
+	// unparseableInput is what an input the door could not decode or
+	// re-encode becomes on the bus.
+	unparseableInput = `{"unparseable":true}`
 	// activityInputHead is how much of an over-cap input survives, as text.
 	activityInputHead = 1024
 	// hermesToolCallWrapper is hermes's batching tool: one call whose input
@@ -344,7 +353,14 @@ var (
 	shapeTokenRunPattern  = regexp.MustCompile(`[a-z0-9]{24,}|[0-9]{8,}|^[a-f0-9]{20,}$|[A-Z]{2}[A-Z0-9]{14,}|[A-Za-z0-9]{32,}`)
 )
 
-const shapeKeptValueMax = 128
+const (
+	shapeKeptValueMax = 128
+	// shapeMaxCaseChanges and shapeMaxDigitChanges bound how often one word
+	// of a kept value may change case, or change between letters and
+	// digits, before it is a token's shape (tokenShapedWords).
+	shapeMaxCaseChanges  = 5
+	shapeMaxDigitChanges = 3
+)
 
 // capRunes cuts s to at most n bytes at a rune boundary.
 func capRunes(s string, n int) string {
@@ -362,7 +378,43 @@ func shapeOf(s string) string {
 // keptUnderShape says whether a string under key is published as it is.
 func keptUnderShape(key, s string) bool {
 	return shapeKeptKeys[strings.ToLower(key)] && len(s) <= shapeKeptValueMax &&
-		shapeKeptValuePattern.MatchString(s) && !shapeTokenRunPattern.MatchString(s)
+		shapeKeptValuePattern.MatchString(s) && !shapeTokenRunPattern.MatchString(s) && !tokenShapedWords(s)
+}
+
+// tokenShapedWords says whether any ._/- separated word of s starts a new
+// CamelCase word, or changes between letters and digits, more often than a
+// name's word does: a CamelCase kind (MutatingWebhookConfiguration) or tool
+// (createPullRequestReview) changes case a few times and a version word
+// (v1beta1) changes between letters and digits a few times, where a
+// mixed-case token (sk_live_4eC39HqLyjWDarjtT1zdp7dc, GOCSPX-aBcDeFg...)
+// changes constantly.
+func tokenShapedWords(s string) bool {
+	for _, w := range strings.FieldsFunc(s, func(r rune) bool { return r == '.' || r == '_' || r == '/' || r == '-' }) {
+		caseChanges, digitChanges := 0, 0
+		var prevUpper, prevDigit, started bool
+		for _, r := range w {
+			upper := r >= 'A' && r <= 'Z'
+			digit := r >= '0' && r <= '9'
+			if started {
+				// A word start: lowercase to uppercase. Uppercase to
+				// lowercase is the rest of the same word and is not counted.
+				if !digit && !prevDigit && upper && !prevUpper {
+					caseChanges++
+				}
+				if digit != prevDigit {
+					digitChanges++
+				}
+			}
+			if !digit {
+				prevUpper = upper
+			}
+			prevDigit, started = digit, true
+		}
+		if caseChanges > shapeMaxCaseChanges || digitChanges > shapeMaxDigitChanges {
+			return true
+		}
+	}
+	return false
 }
 
 // ActivityEntry is one data part of the activity artifact: one tool
@@ -654,7 +706,7 @@ func durationMillis(n json.Number) int64 {
 	if i, err := n.Int64(); err == nil {
 		return i
 	}
-	if f, err := n.Float64(); err == nil {
+	if f, err := n.Float64(); err == nil && f >= 0 && f <= math.MaxInt64 {
 		return int64(f)
 	}
 	return 0
@@ -690,7 +742,7 @@ func redactInput(mode, tool string, raw json.RawMessage) json.RawMessage {
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
-		return json.RawMessage(`{"unparseable":true}`)
+		return json.RawMessage(unparseableInput)
 	}
 	red := redactValue(v)
 	if mode != InputValuesFull {
@@ -698,7 +750,7 @@ func redactInput(mode, tool string, raw json.RawMessage) json.RawMessage {
 	}
 	out, err := json.Marshal(red)
 	if err != nil {
-		return json.RawMessage(`{"unparseable":true}`)
+		return json.RawMessage(unparseableInput)
 	}
 	if len(out) <= activityInputCap {
 		return out
@@ -781,12 +833,6 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 func shapeValue(v any, tool string) any {
 	return shapeValueIn(v, "", "", tool == hermesToolCallWrapper, 0)
 }
-
-// wrapperNameDepth is where a nested tool name sits in hermes's tool_call
-// wrapper: the root map (0) holds the "calls" array (1), whose element map
-// (2) holds the "name" string (3). Only that string is a tool name; a
-// "calls[].name" deeper down is an argument value.
-const wrapperNameDepth = 3
 
 // shapeValueIn is shapeValue with the enclosing key, the container depth
 // and whether this input is hermes's tool_call wrapper, so a tool name is
