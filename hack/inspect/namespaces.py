@@ -4,10 +4,10 @@ from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 
 from k8s_pod import kubectl_ok  # also registers the k8s-pod sandbox
-from harness import harness_agent
+from harness import harness_agent, harness_sandbox
 from scoring import names_exactly
 
-SANDBOX = Path(__file__).parent / "environments/kubectl/sandbox.yaml"
+ENVIRONMENT = Path(__file__).parent / "environments/kubectl"
 ANSWER_PATH = "answer.md"
 NAMESPACE_NAMES = "jsonpath={.items[*].metadata.name}"
 
@@ -27,5 +27,5 @@ def namespaces(harness: str = "gemini", skills: bool = True, identity: str | Non
         ],
         solver=harness_agent(harness, skills, identity),
         scorer=names_exactly(answer_path=ANSWER_PATH, expected=listed),
-        sandbox=("k8s-pod", str(SANDBOX)),
+        sandbox=harness_sandbox(ENVIRONMENT, harness),
     )
