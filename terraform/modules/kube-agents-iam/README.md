@@ -82,6 +82,17 @@ is wide; the design is
 [`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
 §10 step 3.
 
+## Tests
+
+`tests/*.tftest.hcl` plan the module against a mocked `google` provider and assert which bindings a
+declaration plans (the intersected allowlist per project, the scoping project and a lookup-only host
+included, nothing in the management project) and which declarations the preconditions refuse,
+the whole-set cap's counting among them; the role set is read from the module's own `scope_roles`
+rather than spelled out. `make terraform-test` runs them, as the `validate` job in `validate.yml`
+does on every pull request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for
+an install. The repository's `tests/test_scope_iam.py` pins what a plan cannot see, the allowlist
+against the default role list and the cap against the reconcile's constant among it.
+
 ## Usage
 
 ```hcl

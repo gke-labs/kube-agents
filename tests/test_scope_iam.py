@@ -5,7 +5,8 @@ allowlist intersected with project_roles, never project_roles itself; every
 allowlist entry is one the agent holds at home; the host project is never bound
 twice; and the composition feeds the module and the chart from one value. The
 terraform binary is not a suite dependency, so this reads the HCL the way
-tests/test_scoped_sa_pool_iam.py does.
+tests/test_scoped_sa_pool_iam.py does. What the rules evaluate to is under
+terraform/modules/*/tests/ (`make terraform-test`), against mocked providers.
 
 Run: python3 -m unittest discover -s tests -p 'test_scope_iam.py' -v
 """

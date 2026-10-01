@@ -10475,6 +10475,40 @@ class TestKustomizeOverlayDeclarations(unittest.TestCase):
         self.assertIsNone(found)
 
 
+class TestReleaseDeclarationsSurviveMalformedDocuments(unittest.TestCase):
+    """One malformed file in the clone must not crash the run before the
+    manifest prints: each is skipped and the well-formed release indexes.
+    `fleet_waste.py` carries a copy of this function and the same test."""
+
+    GOOD = (
+        "kind: HelmRelease\nmetadata: {name: web, namespace: apps}\n"
+        "spec: {chart: {spec: {chart: web-chart, version: 1.0.0, sourceRef: {name: charts}}}}\n"
+    )
+    # Each shape, and the release key it must not produce (None for a
+    # document that declares no release of its own).
+    MALFORMED = {
+        "chart.spec scalar": ("kind: HelmRelease\nmetadata: {name: a, namespace: apps}\nspec: {chart: {spec: oops}}\n", "a"),
+        "chart.spec list": ("kind: HelmRelease\nmetadata: {name: b, namespace: apps}\nspec: {chart: {spec: [x]}}\n", "b"),
+        "chart list": ("kind: HelmRelease\nmetadata: {name: c, namespace: apps}\nspec: {chart: [x]}\n", "c"),
+        "chart scalar": ("kind: HelmRelease\nmetadata: {name: d, namespace: apps}\nspec: {chart: oops}\n", "d"),
+        "repository spec list": ("kind: HelmRepository\nmetadata: {name: charts, namespace: apps}\nspec: [x]\n", None),
+        "secret labels list": ("kind: Secret\nmetadata: {name: s, labels: [x]}\nstringData: {server: https://x, name: y}\n", None),
+    }
+
+    def test_each_malformed_document_is_skipped(self):
+        for label, (text, release) in self.MALFORMED.items():
+            with self.subTest(label), TemporaryDirectory() as tmp:
+                tree = Path(tmp) / "clusters" / "prod-usc1"
+                tree.mkdir(parents=True)
+                (tree / "good.yaml").write_text(self.GOOD)
+                (tree / "bad.yaml").write_text(text)
+                index = collect.release_declarations(Path(tmp))
+                good = index[("prod-usc1", collect.RELEASE_KEY_RELEASE, "apps", "web")]
+                self.assertEqual((good["chart"], good["repo"]), ("web-chart", ""))
+                if release:
+                    self.assertNotIn(("prod-usc1", collect.RELEASE_KEY_RELEASE, "apps", release), index)
+
+
 class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
     """The release annotation has to survive the trip to a candidate too.
 

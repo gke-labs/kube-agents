@@ -93,10 +93,11 @@ class ApiRoute:
 
 
 API_READ_ROUTES: tuple[ApiRoute, ...] = (
-    # Per-container usage history for the cost stream's overrequest check
-    # (governance/fleet_wide_cost_analysis_sop.md section 3.1), which today
-    # samples `kubectl top` three times; a week of series, one call per metric
-    # per cluster and paginated, is what the follow-up collector reads instead.
+    # Per-container usage history for the cost stream's collector
+    # (`skills/fleet-audit/scripts/fleet_waste.py`, sections 3.1, 3.11,
+    # 3.12 and 3.13 of governance/fleet_wide_cost_analysis_sop.md): a week of series,
+    # one call per metric per cluster and paginated, plus the load-balancer
+    # packet counters its idle-workload check reads per project.
     ApiRoute(
         "monitoring.googleapis.com",
         API_READ_METHOD,

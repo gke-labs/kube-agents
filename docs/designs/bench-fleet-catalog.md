@@ -161,14 +161,17 @@ exists before the apply returns.
 members — and §2.4's floor, a cohort of fewer than three clusters produces no findings
 ever, would floor it out even if only one cluster were new.
 
-`idle-nodepool` waits seven, and no agent can satisfy that gate reliably, because the GKE
-node pool has no creation timestamp to read. The cost SOP's idle-nodepool check refuses
-pools created less than seven days ago, but `gcloud container node-pools describe` returns
-no `createTime` and neither does the REST resource; the only age signal is the boot-disk
-creation time of the pool's current nodes, which a rolling recreation resets while the
-pool object is untouched. So the gate is a judgement the agent makes from a proxy, and a
-node upgrade can silently close it. Treat `idle-nodepool` as the least dependable fixture in
-the catalog, and do not build a blocking objective on the age gate itself.
+`idle-nodepool` waits seven, and the GKE node pool has no creation timestamp to read:
+`gcloud container node-pools describe` returns no `createTime` and neither does the REST
+resource. The cost collector dates a pool from its `CREATE_NODE_POOL` operation in
+`gcloud container operations list`. A pool with no such operation arrived with the cluster
+in `CREATE_CLUSTER`, or before the operations the API still keeps, so it is dated from the
+cluster's `createTime` in `clusters list`. Only when the operations read fails does the
+oldest node's age stand in, and the collector then names each pool that stand-in exempted
+in the cluster's `limitations`, because a rolling node recreation resets node age while the
+pool object is untouched. On apply day the seeded pools are days old by either clock, so
+the gate holds; do not build a blocking objective on the age gate itself, since the
+operations the API keeps are finite and an old fixture pool falls back to its cluster's age.
 
 `orphan-disks` waits thirty, and that one is real: the unattached-disk collector filters
 server-side on the immutable `creationTimestamp<-P30D`. It is the longest gate in the
