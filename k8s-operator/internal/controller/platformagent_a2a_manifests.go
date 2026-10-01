@@ -1912,7 +1912,9 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // even if a route existed. Three independent reasons, which is deliberate:
 // this is the pod that executes model output.
 //
-// A worker that needs the internet is a design change, not a policy widening.
+// A worker that needs the internet is a design change, not a policy widening:
+// the broker rule below is the one admitted widening, flag-gated, and it
+// reaches a pod that authenticates the caller rather than the internet.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
@@ -1928,6 +1930,43 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	// post-NAT and the only rule below naming 80 is LiteLLM's, whose peer is
 	// a Pod selector that no link-local address matches.
 	dnsPeers := clusterDNSPeers(dnsClusterIPs)
+
+	egress := []networkingv1.NetworkPolicyEgressRule{
+		{
+			Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
+			To:    dnsPeers,
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(agent.Namespace, map[string]string{
+					labelPartOf:       a2aPartOf,
+					a2aComponentLabel: "nats",
+				}),
+			},
+		},
+		{
+			Ports: []networkingv1.NetworkPolicyPort{
+				tcpPort(a2aLiteLLMServicePort),
+				tcpPort(a2aLiteLLMUpstreamPort),
+				tcpPort(a2aLiteLLMContainerPort),
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
+			},
+		},
+	}
+	if a2aSessionClusterViewEnabled(agent) {
+		// The credential broker, under the cluster-view flag: the one
+		// widening of this fence, to one pod on one port, and the pod on
+		// the other end authenticates the token and confers the session
+		// role. The API server stays unreachable from here; kubectl runs
+		// in the broker. Header comment: this IS the design change.
+		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+			To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
+		})
+	}
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -1953,31 +1992,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 				networkingv1.PolicyTypeIngress,
 				networkingv1.PolicyTypeEgress,
 			},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{
-					Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
-					To:    dnsPeers,
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, map[string]string{
-							labelPartOf:       a2aPartOf,
-							a2aComponentLabel: "nats",
-						}),
-					},
-				},
-				{
-					Ports: []networkingv1.NetworkPolicyPort{
-						tcpPort(a2aLiteLLMServicePort),
-						tcpPort(a2aLiteLLMUpstreamPort),
-						tcpPort(a2aLiteLLMContainerPort),
-					},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
-					},
-				},
-			},
+			Egress: egress,
 		},
 	}
 }

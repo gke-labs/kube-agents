@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1291,6 +1292,33 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	}
 	if len(scrape.Ports) != 1 || scrape.Ports[0].Port.IntValue() != int(credentialProxyMetricsPort) {
 		t.Errorf("expected the collector admitted on %d alone, got %#v", credentialProxyMetricsPort, scrape.Ports)
+	}
+}
+
+// TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag: a third
+// caller peer on the credentialed port, present exactly when the view is on.
+func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	agent.Spec.Mode = ptr.To("next")
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
+		t.Fatalf("flag off: %d caller peers, want 2", got)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	in := buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0]
+	if len(in.From) != 3 {
+		t.Fatalf("flag on: %d caller peers, want 3", len(in.From))
+	}
+	peer := in.From[2]
+	if peer.PodSelector == nil || peer.NamespaceSelector != nil || peer.IPBlock != nil {
+		t.Fatalf("session peer reaches outside the namespace: %#v", peer)
+	}
+	want := map[string]string{labelPartOf: a2aPartOf, "app.kubernetes.io/component": a2aSessionComponent}
+	if !reflect.DeepEqual(peer.PodSelector.MatchLabels, want) {
+		t.Fatalf("session peer selector = %v, want %v", peer.PodSelector.MatchLabels, want)
+	}
+	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Fatalf("session peer admitted on %#v, want %d only", in.Ports, credentialProxyPort)
 	}
 }
 

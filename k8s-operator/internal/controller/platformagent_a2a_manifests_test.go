@@ -1318,6 +1318,33 @@ func TestBuildA2ASessionNetworkPolicy(t *testing.T) {
 	}
 }
 
+// TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag: a fourth egress
+// rule, to the broker pod on its one port, present exactly when the view is
+// on; off, the fence is the three rules TestBuildA2ASessionNetworkPolicy pins.
+func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
+	agent := a2aTestAgent()
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if got := len(buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"}).Spec.Egress); got != 3 {
+		t.Fatalf("flag off: %d egress rules, want 3", got)
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
+	if len(np.Spec.Egress) != 4 {
+		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
+	}
+	broker := np.Spec.Egress[3]
+	if len(broker.Ports) != 1 || broker.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Fatalf("broker rule ports = %+v, want %d only", broker.Ports, credentialProxyPort)
+	}
+	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
+		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
+	}
+}
+
 // The session fence must not inherit the agent policy's off switch: that flag
 // withholds the agent pod's own gateway policy, and reading it as permission
 // to unfence the workers would make delegation the way around the very
