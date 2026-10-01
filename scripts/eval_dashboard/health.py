@@ -2230,8 +2230,8 @@ def adjudicate(
     # The wall clock, as the pool note's: a job that stopped is measured
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
-    # Per job and project, consecutive failed builds, so a ten-minute job's
-    # single flap is not news and a project unswept for half an hour is.
+    # Per job, consecutive failed checks (and per project, for the message),
+    # so a ten-minute job's single flap is not news and two in a row are.
     streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
     watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))

@@ -528,6 +528,14 @@ def _persistent(periodic: Periodic, streak: dict, artifact: dict | None) -> dict
     return {p: n for p, n in counts.items() if n >= PERSISTENT_AFTER and _project_failed(periodic, outcomes.get(p))}
 
 
+def _failure_text(periodic: Periodic, entry: dict) -> str:
+    """What a failed project's report entry says: the sweep's error line, or
+    the reconcile's outcome and detail."""
+    if periodic.artifact == SWEEP_ARTIFACT:
+        return str(entry.get(REPORT_KEY_ERROR))
+    return f"{entry.get(REPORT_KEY_OUTCOME)} ({entry.get(REPORT_KEY_DETAIL) or 'no detail'})"
+
+
 def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | None) -> list[str]:
     """The persisting projects first with their count, then this build's other
     failed projects, capped together; then the run's own lines."""
@@ -535,10 +543,10 @@ def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | N
     outcomes = outcomes if isinstance(outcomes, dict) else {}
     lines = []
     for project in sorted(persistent, key=lambda p: (-persistent[p], p)):
-        lines.append(f"{project}: failed in {persistent[project]} consecutive checks ({outcomes[project].get(REPORT_KEY_ERROR)})")
+        lines.append(f"{project}: failed in {persistent[project]} consecutive checks ({_failure_text(periodic, outcomes[project])})")
     for project in sorted(outcomes):
         if project not in persistent and _project_failed(periodic, outcomes[project]):
-            lines.append(f"{project}: {outcomes[project].get(REPORT_KEY_ERROR)}")
+            lines.append(f"{project}: {_failure_text(periodic, outcomes[project])}")
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
     project_prefixes = tuple(f"{p}:" for p in outcomes)
