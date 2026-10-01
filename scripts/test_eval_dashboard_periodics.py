@@ -1,12 +1,12 @@
 """scripts/eval_dashboard/periodics.py: the watched Prow periodics' latest
 finished builds, read from the bucket they log to, and the notes health.py carries.
 
-* `fetch` reads the pointer, walks back to a finished build, keeps the
-  artifact for a failed build, writes one <job>.json per job with a
+* `fetch` reads the pointer, walks back to a finished build, keeps the job's
+  report when the build wrote one, writes one <job>.json per job with a
   build, and nothing for a job that never ran or whose pointer is denied;
-* `assess` notes a failed build and a job whose last finished build is older
-  than its stale window, keeps `since` across ticks, and names the reconcile
-  artifact's refused and failed projects;
+* `assess` notes a failed build (the sweep's once two consecutive checks have
+  failed) and a job whose last finished build is older than its stale window,
+  keeps `since` across ticks, and names the report's failed projects;
 * the workflow fetches the readings before it adjudicates and hands the
   directory to health.py.
 """
@@ -353,6 +353,9 @@ class AssessTest(unittest.TestCase):
         # A failed build that did not reach evals-5 (busy) keeps its count.
         three = periodics.streaks({SWEEP.job: reading("3", False, {"kube-agents-evals-3": fail})}, two)
         self.assertEqual(three[SWEEP.job]["projects"], {"kube-agents-evals-3": 3, "kube-agents-evals-5": 1})
+        # A failed build in which evals-5 succeeded drops its count while another project fails the run.
+        dropped = periodics.streaks({SWEEP.job: reading("3b", False, {"kube-agents-evals-3": fail, "kube-agents-evals-5": ok})}, three)
+        self.assertEqual(dropped[SWEEP.job]["projects"], {"kube-agents-evals-3": 4})
         # A clean build clears every count: a project it did not reach was busy, not failing.
         four = periodics.streaks({SWEEP.job: reading("4", True, {"kube-agents-evals-3": ok})}, three)
         self.assertEqual(four[SWEEP.job], {"build": "4", "projects": {}, "runs": 0})

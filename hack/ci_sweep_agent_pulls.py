@@ -221,7 +221,12 @@ class WriteBudget:
 
 
 class SweepError(Exception):
-    """A fault that stops one repository's sweep. The caller reports it."""
+    """A fault that stops one repository's sweep. The caller reports it;
+    `closed` is what the sweep had closed before the fault, for the report."""
+
+    def __init__(self, message, closed=0):
+        super().__init__(message)
+        self.closed = closed
 
 
 def _b64(raw):
@@ -606,7 +611,7 @@ def sweep_repo(project, repo, app_id, dry_run=False, runner=subprocess.run, budg
     if undeleted:
         faults.append("left %d branch(es): %s" % (len(undeleted), ", ".join(undeleted)))
     if faults:
-        raise SweepError("%s: %s" % (repo, "; ".join(faults)))
+        raise SweepError("%s: %s" % (repo, "; ".join(faults)), closed=closed)
     return closed
 
 
@@ -684,6 +689,8 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             subprocess.SubprocessError,
         ) as exc:
             print("  %s: %s" % (name, boskos_pool.describe(exc)), file=sys.stderr)
+            if getattr(exc, "closed", 0):
+                closed[name] = exc.closed
             failures[name] = boskos_pool.describe(exc)
         finally:
             report["left"] = budget.left
@@ -791,6 +798,8 @@ def _run(args, run):
             return 1, error
         return 0, None
     except (SweepError, boskos_pool.BoskosError) as exc:
+        if args.project and getattr(exc, "closed", 0):
+            run["closed"][args.project] = exc.closed
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1, str(exc)
     except urllib.error.HTTPError as exc:

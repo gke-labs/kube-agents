@@ -890,6 +890,40 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 1)
         self.assertIn("twice", doc["outcomes"]["kube-agents-evals-7"]["error"])
 
+    def test_a_repository_with_one_refused_close_among_successes_keeps_its_closes(self):
+        # The ordinary partial failure: one 422 among many closes; the report
+        # carries the closes it made beside the error, as for the limit.
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls, close_errors={2: _http_error(422, body=b'{"message":"Validation Failed"}')})
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, github)
+        self.assertEqual((rc, doc["closed"]), (1, 2))
+        self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 2)
+        self.assertIn("#2", doc["outcomes"]["kube-agents-evals-7"]["error"])
+
+    def test_a_crash_mid_walk_reports_what_it_had_done_and_what_crashed(self):
+        import tempfile
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+
+        class _Crashing(_GitHub):
+            def __call__(self, request, timeout=None):
+                if "evals-8-infra" in request.full_url:
+                    raise KeyError("boom")
+                return super().__call__(request, timeout=timeout)
+
+        github = _Crashing(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]})
+        boskos = _Boskos(["kube-agents-evals-7", "kube-agents-evals-8"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github, boskos)), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(KeyError):
+                    sweeper.main(["--pool", "--boskos-server", BOSKOS, "--boskos-owner", OWNER, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((doc["exit"], doc["exit_code"], doc["error"]), ("error", None, "KeyError: 'boom'"))
+        self.assertEqual(doc["outcomes"], {"kube-agents-evals-7": {"closed": 1}})
+        self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
     def test_a_hand_run_refused_twice_exits_one_and_reports_it(self):
         import tempfile
         refused = _http_error(403, body=b"secondary rate limit", headers={"Retry-After": "1"})
