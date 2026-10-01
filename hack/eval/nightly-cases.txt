@@ -474,8 +474,8 @@
 ./tasks/bootstrap-discovery-fanout/task.yaml
 
 # The first-install hello, both variants: the greeting's shape (one message,
-# kube-agents, read-only, results in this chat, changes as pull requests, one
-# question) over the bootstrap_onboarding plugin's eval seam, which
+# kube-agents, read-only, results in this chat, changes as pull requests, a
+# runbook invitation, one question) over the bootstrap_onboarding plugin's eval seam, which
 # prebuilt/first-install-hello arms per case. No fixture; the host install only.
 ./tasks/first-install-hello-running/task.yaml
 ./tasks/first-install-hello-done/task.yaml

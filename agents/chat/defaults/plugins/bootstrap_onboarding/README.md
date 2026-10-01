@@ -142,7 +142,7 @@ sequenceDiagram
 ### Case B: User engages after the scan finished (quiet boot)
 
 1. **Silent completion:** during the unattended boot the scan writes `/opt/data/INVENTORY.raw.md`, the prioritization card ranks it into `/opt/data/INVENTORY.md`, and both return `[SILENT]`. The delivery job stays silent because `.user_aligned` is absent, so the report waits on disk.
-2. **Turn 1 (`pre_llm_call`):** the plugin does exactly the same things as in Case A (bind origin → touch `.user_aligned` → trigger delivery → mark `.bootstrap_greeted`) and injects `defaults/onboarding/scan_completed.md` (the same short greeting, saying the summary is in this chat and ending on an offer to start on a finding).
+2. **Turn 1 (`pre_llm_call`):** the plugin does exactly the same things as in Case A (bind origin → touch `.user_aligned` → trigger delivery → mark `.bootstrap_greeted`) and injects `defaults/onboarding/scan_completed.md` (the same short greeting, saying the summary is in this chat, inviting runbooks, and ending on an offer to start on a finding).
 3. **Next delivery tick:** both files now exist → the script delivers `INVENTORY.md` verbatim to the origin chat and runs `_cleanup`.
 
 The report therefore arrives as its own message shortly after the greeting, identical to Case A — the user always sees the same verbatim report, never an LLM-reformatted one.

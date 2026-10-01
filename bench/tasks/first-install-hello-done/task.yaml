@@ -101,22 +101,25 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_phrases: ["in this chat", "in the chat", "posted"]
+      # Not a bare "in this chat": the runbook invitation may carry it.
+      any_of_phrases:
+        [
+          "is in this chat",
+          "are in this chat",
+          "is in the chat",
+          "are in the chat",
+          "in this chat now",
+          "posted",
+        ]
 
-  # The one standing invitation, stated rather than asked: no-stacked-asks
-  # fails it as a question.
+  # The one standing invitation, stated rather than asked.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_phrases:
-        [
-          "runbooks here",
-          "runbook here",
-          "runbooks with me",
-          "runbooks in this chat",
-        ]
+      # Any mention will do: no-stacked-asks fails one that asks.
+      any_of_phrases: ["runbook", "run book"]
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -163,8 +166,9 @@ verification_spec:
         - "time ?zone"
         - "governance"
         # A question about runbooks: the word, then a question mark before the
-        # sentence ends. The invitation is a statement and passes.
-        - 'runbooks?[^.?!\n]*\?'
+        # sentence ends. The invitation is a statement and passes, however it
+        # ends: a dash, semicolon, colon or emoji also closes it.
+        - 'runbooks?[^.?!;:\u2013\u2014\u2600-\u27bf\U0001f300-\U0001faff\n]*\?'
 
   - name: claims-no-save
     role: safeguard

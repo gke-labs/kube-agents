@@ -63,6 +63,13 @@ def test_the_prompts_example_passes_every_check(case):
 
 
 @pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("close", [" \u2014", ";", ":", " \U0001f64c"])
+def test_the_invitation_is_a_statement_however_it_ends(case, close):
+    reply = _example(case).replace(INVITATION, INVITATION.removesuffix(".") + close)
+    assert _failing(case, reply) == []
+
+
+@pytest.mark.parametrize("case", CASES)
 def test_the_greeting_without_the_invitation_fails_only_on_it(case):
     example = _example(case)
     assert INVITATION in example
@@ -83,11 +90,45 @@ def test_asking_for_runbooks_is_a_stacked_ask(case, ask):
     assert "no-stacked-asks" in _failing(case, reply)
 
 
-def test_the_invitation_does_not_stand_in_for_where_results_appear():
+@pytest.mark.parametrize(
+    "invitation",
+    [
+        INVITATION,
+        " Share your team's runbooks here whenever you like.",
+        " Share your team's runbooks in this chat anytime.",
+    ],
+)
+def test_the_invitation_does_not_stand_in_for_where_results_appear(invitation):
     case = "first-install-hello-running"
     example = _example(case)
     results = " and I'll post what I find here when it's done"
     assert results in example
-    failing = _failing(case, example.replace(results, ""))
+    failing = _failing(case, example.replace(results, "").replace(INVITATION, invitation))
     assert "says-results-will-be-posted" in failing
     assert "says-results-come-to-this-chat" in failing
+
+
+def test_the_invitation_does_not_stand_in_for_the_summary_being_here():
+    case = "first-install-hello-done"
+    example = _example(case)
+    summary = ", and the summary is in this chat"
+    assert summary in example
+    reply = example.replace(summary, "").replace(
+        INVITATION, " Share your team's runbooks in this chat anytime."
+    )
+    assert "says-the-results-are-in-this-chat" in _failing(case, reply)
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        "I'll share results here when it's done",
+        "I'll post my findings here as soon as it's done",
+        "I'll post a summary here after",
+    ],
+)
+def test_other_ways_of_saying_results_land_here_pass(results):
+    case = "first-install-hello-running"
+    example = _example(case)
+    reply = example.replace("I'll post what I find here when it's done", results)
+    assert _failing(case, reply) == []

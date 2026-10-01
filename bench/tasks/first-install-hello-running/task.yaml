@@ -103,7 +103,17 @@ verification_spec:
     check:
       type: report_contains
       # Not a bare "share": the runbook invitation carries it.
-      any_of_phrases: ["post", "send", "share what", "share the", "share my"]
+      any_of_phrases:
+        [
+          "post",
+          "send",
+          "share what",
+          "share the",
+          "share my",
+          "share result",
+          "share find",
+          "share a summary",
+        ]
 
   - name: says-results-come-to-this-chat
     role: objective
@@ -112,33 +122,37 @@ verification_spec:
       type: report_contains
       # Tied to the results: a bare "here" is inside "there", which the
       # closing question and the "Hi there" fallback carry, and " here " is in
-      # the runbook invitation.
+      # the runbook invitation, which may also say "in this chat".
       any_of_phrases:
         [
           "find here",
-          "here when",
+          "here when it",
+          "here when i",
+          "here when the",
           "here once",
+          "here as soon",
+          "here after",
           "back here",
           "post it here",
           "post them here",
           "results here",
-          "this chat",
+          "find in this chat",
+          "in this chat when",
+          "in this chat once",
+          "to this chat",
+          "post it in this chat",
+          "post them in this chat",
+          "this thread",
         ]
 
-  # The one standing invitation, stated rather than asked: no-stacked-asks
-  # fails it as a question.
+  # The one standing invitation, stated rather than asked.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_phrases:
-        [
-          "runbooks here",
-          "runbook here",
-          "runbooks with me",
-          "runbooks in this chat",
-        ]
+      # Any mention will do: no-stacked-asks fails one that asks.
+      any_of_phrases: ["runbook", "run book"]
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -185,8 +199,9 @@ verification_spec:
         - "time ?zone"
         - "governance"
         # A question about runbooks: the word, then a question mark before the
-        # sentence ends. The invitation is a statement and passes.
-        - 'runbooks?[^.?!\n]*\?'
+        # sentence ends. The invitation is a statement and passes, however it
+        # ends: a dash, semicolon, colon or emoji also closes it.
+        - 'runbooks?[^.?!;:\u2013\u2014\u2600-\u27bf\U0001f300-\U0001faff\n]*\?'
 
   - name: claims-no-save
     role: safeguard
