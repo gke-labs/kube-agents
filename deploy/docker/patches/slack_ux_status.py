@@ -11,7 +11,7 @@ them.
 
 Upstream, and why it changes
 ----------------------------
-**The session status (#576).** With slack-sdk 3.44 or later, Hermes sends its
+**The session status.** With slack-sdk 3.44 or later, Hermes sends its
 thread status to ``agents.sessions.setStatus``: a phrase ("is thinking...")
 every 2 seconds while a turn runs, and ``""`` to clear. That method takes
 ``processing``, ``suspended`` or ``closed`` and nothing else, so every call
