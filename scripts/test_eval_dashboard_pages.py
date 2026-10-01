@@ -81,6 +81,15 @@ if _VIEWS_MATCH is None:
 BRIEF_VIEW_ANCHORS = frozenset(re.findall(r'"([^"]+)"', _VIEWS_MATCH.group(1)))
 if not BRIEF_VIEW_ANCHORS:
     raise RuntimeError(f"{PAGES_JS}: PAGE.views names no view; dom_html cannot tell a bare view anchor")
+# The Cases page's one polled call, in
+# test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
+# the bare case name, under boot and two polls on the page's real clock.
+# The element it scrolls to is id="case-<name>" (pages.js renders the row
+# and reads the hash through linkState's caseHash), so Chrome's native
+# anchor matches nothing and the call has no stall on record. The call
+# site and DomHtmlGuardTest's kept list read these two names, not copies.
+CASES_ROW_ANCHOR = "#cluster-agent-crashloop-evidence-chain"
+CASES_TWO_POLLS_BUDGET_MS = 130000
 # Below this the page may not finish booting inside the budget, and the
 # scroll-once test would pass or fail on load time rather than on the poll.
 MIN_TWO_POLLS_BUDGET_MS = 1000
@@ -612,7 +621,9 @@ class DomHtmlGuardTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         data = load_fixture()
         data["generated_at"] = NOW
-        cls.index = render_to(cls.tmp.name, data, health=health_doc()) / "index.html"
+        out = render_to(cls.tmp.name, data, health=health_doc())
+        cls.index = out / "index.html"
+        cls.cases = out / render.CASES_PAGE
 
     @classmethod
     def tearDownClass(cls):
@@ -644,18 +655,26 @@ class DomHtmlGuardTest(unittest.TestCase):
                         self.assertIn(f"polls every {PAGE_REFRESH_MS // TIMER_SPEEDUP} ms", str(refused.exception))
                         self.assertIn(f"use #view={anchor}", str(refused.exception))
             with self.assertRaises(ValueError) as refused:
-                dom_html(scroll_counting_page(self.index), fragment="#gate", budget_ms=130000)
+                dom_html(scroll_counting_page(self.index), fragment="#gate", budget_ms=CASES_TWO_POLLS_BUDGET_MS)
             self.assertIn(f"polls every {PAGE_REFRESH_MS} ms", str(refused.exception), "a plain page polls at PAGE.refreshMs")
 
     def test_the_calls_the_suite_keeps_reach_chrome(self):
+        # The polled calls the suite makes, each on the page copy its call
+        # site uses: the Brief's two under the sped-up clock, the bare
+        # anchor on the default budget, and the Cases page's row anchor,
+        # which is the bare case name (its element is case-<name>), not a
+        # fragment naming the element. The Cases shape reads the call
+        # site's constants so the list cannot drift from the call.
         fast = scroll_counting_page(fast_timers_page(self.index))
         plain = scroll_counting_page(self.index)
+        cases = scroll_counting_page(self.cases)
         kept = [
             (fast, {"fragment": "#since=2026-09-07T14:00:00Z&view=gate", "budget_ms": TWO_POLLS_BUDGET_MS}),
             (fast, {"budget_ms": TWO_POLLS_BUDGET_MS}),
             (plain, {"fragment": "#gate"}),
-            (plain, {"fragment": "#case-cluster-agent-crashloop-debug", "budget_ms": 130000}),
+            (cases, {"fragment": CASES_ROW_ANCHOR, "budget_ms": CASES_TWO_POLLS_BUDGET_MS}),
         ]
+        self.assertFalse(CASES_ROW_ANCHOR.lstrip("#").startswith("case-"), "the Cases call names the row by case name; case-<name> is the element id")
         with self.no_chrome() as run:
             for page, call in kept:
                 dom_html(page, **call)
@@ -1496,7 +1515,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
         # The row is scrolled to once, on navigation; the polls that follow
         # re-render without pulling the reader back to it.
-        self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000)).group(1), "1")
+        self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment=CASES_ROW_ANCHOR, budget_ms=CASES_TWO_POLLS_BUDGET_MS)).group(1), "1")
         clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
         self.assertIn('id="case-retired-probe"', clicked)
 
