@@ -475,6 +475,12 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
 
+    def test_a_completed_card_still_read_as_open_holds_its_follow_ups(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_a"), **_cards("t_b", status="todo", creator="t_a")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+
     def test_a_card_past_the_depth_cap_does_not_hold_the_settle(self):
         depth = runtime.LINEAGE_DEPTH
         adapter = self._turn("fix it", {}, _cards("t_0"))

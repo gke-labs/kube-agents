@@ -403,7 +403,7 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     completes, so it was not on the board when the turn ended. Cards created
     under those count as well, through creators that have already completed,
     which a second read of the thread's closed cards supplies; if it fails,
-    only the card's own follow-ups are seen, as before. A card created under a
+    only the card's own open follow-ups are seen. A card created under a
     follow-up still open waits for that follow-up's completion, as it would
     have had the follow-up been on the board at the turn's end. One
     blocked on the user is kept and puts ⏸️ on the ask. One parked by a give-up
@@ -442,7 +442,7 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         still_open = await open_cards(*key)
         if still_open:
             creators = {**await thread_lineage(*key), **{c: seen.creator for c, seen in still_open.items()}}
-            under = _descendants(card, creators, frozenset(still_open))
+            under = _descendants(card, creators, frozenset(still_open) - {card})
             follow_ups = {c: seen for c, seen in still_open.items() if c in under and not seen.gave_up}
     waits_on_user = any(seen.status not in RESUMED_STATUSES for seen in follow_ups.values())
     # The read awaited, so another event may have settled an ask meanwhile.
