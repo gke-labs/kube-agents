@@ -1,7 +1,8 @@
 # shellcheck shell=bash disable=SC2034
 # Sourced by run.sh, which reads CHANNEL, START, CREATE_FLAGS and POOL_FLAGS and calls plant, before, break_it and after.
-# 11b: the zonal control plane during its own upgrade, probed with a read AND a write in a loop that sleeps one
-# second between samples; each sample is two API calls under a 3 s timeout, so the recorded gap is about 2.6 to 3 s.
+# 11b: the zonal control plane during its own upgrade, probed with a read AND a write. Each sample is up to three
+# calls, a read, a ConfigMap create and its delete, each under a 3 s timeout, then a one-second sleep; the recorded
+# gap between samples is two to four seconds (see the README's item 11).
 # Run 11 polled only reads (/version), about every 2.6 s because each loop also asked gcloud for the
 # operation, and saw no failure. This run keeps gcloud out of the probe loop and adds a write: a zonal
 # control plane that serves reads from a cache but refuses changes is still an outage for a deploy.

@@ -6,7 +6,7 @@
 CHANNEL=REGULAR; START=1.34; POOL_FLAGS=""
 V1_POOL=v1-pool; LEGACY_IMAGE=eclipse-temurin:11.0.15_10-jdk; JVM_LIMIT=256Mi
 plant(){ printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V1\n' >"$EVID/cgroup-v1.yaml"; printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V2\n' >"$EVID/cgroup-v2.yaml"
-  pool_exists "$V1_POOL" || ev cgroup v1-pool G container node-pools create "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=role=v1 --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet
+  pool_exists "$V1_POOL" || ev cgroup v1-pool G container node-pools create "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --num-nodes 1 --machine-type e2-standard-2 --disk-size "$NODE_DISK_GB" --node-labels=role=v1 --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet
   K -n scen create configmap fill --from-literal=Fill.java='import java.util.*; public class Fill { public static void main(String[] a) throws Exception { System.out.println("max=" + Runtime.getRuntime().maxMemory()); List<byte[]> l = new ArrayList<>(); try { while (true) l.add(new byte[1<<23]); } catch (OutOfMemoryError e) { System.out.println("OOM caught"); } Thread.sleep(Long.MAX_VALUE); } }' --dry-run=client -o yaml | K -n scen apply -f - >/dev/null
   K -n scen apply -f - <<Y
 apiVersion: apps/v1

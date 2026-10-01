@@ -7,16 +7,16 @@ SCHEMA1_IMAGE=gcr.io/google_containers/busybox:1.24     # a Docker schema 1 mani
 CD17_VERSION=1.31.14-gke.2704000                        # the newest 1.31 patch still on containerd 1.7
 LEGACY_JVM=eclipse-temurin:11.0.15_10-jdk; JVM_LIMIT=256Mi
 CU13_IMAGE=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
-SETTLE=180; GPU_SETTLE=900
+SETTLE=180; GPU_SETTLE=900; WEBHOOK_SETTLE=10; LOG_TAIL=3; HOLD_MACHINE=e2-standard-2
 # abort_hold: a planting step failed, so the hazard is not in place; say so in the evidence and stop.
 abort_hold(){ note hold "precondition not met: $*; the hazard is not planted"; exit 1; }
 # 7: the fail-closed webhook back in place, its Service still without endpoints
-hold_07(){ . "$H/scenarios/07.sh"; run_plant plant >/dev/null; [ "$PLANT_FAILED" -eq 0 ] || abort_hold "a step in scenario 7's plant failed"; sleep 10
+hold_07(){ . "$H/scenarios/07.sh"; run_plant plant >/dev/null; [ "$PLANT_FAILED" -eq 0 ] || abort_hold "a step in scenario 7's plant failed"; sleep $WEBHOOK_SETTLE
   ev webhook config K get validatingwebhookconfiguration fail-closed-gate
   ev webhook no-endpoints K -n scen get endpointslices -l kubernetes.io/service-name=absent-hook
   ev webhook create-refused K -n scen run hold-probe --image=registry.k8s.io/pause:3.9 --restart=Never; }
 # 13: a containerd 1.7 pool beside the 2.0 one; the v1alpha2 CRI client and a schema 1 image run on both
-hold_13(){ pool_exists cd17-hold || ev runtime cd17-pool G container node-pools create cd17-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$CD17_VERSION" --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=role=work --quiet || abort_hold "pool cd17-hold was not created"
+hold_13(){ pool_exists cd17-hold || ev runtime cd17-pool G container node-pools create cd17-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$CD17_VERSION" --num-nodes 1 --machine-type "$HOLD_MACHINE" --disk-size "$NODE_DISK_GB" --node-labels=role=work --quiet || abort_hold "pool cd17-hold was not created"
   K -n scen apply -f - <<Y || abort_hold "the schema 1 DaemonSet did not apply"
 apiVersion: apps/v1
 kind: DaemonSet
@@ -32,12 +32,12 @@ Y
   sleep $SETTLE
   ev runtime nodes K get nodes -l role=work -o custom-columns='NAME:.metadata.name,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool,VER:.status.nodeInfo.kubeletVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion'
   ev runtime cri-agents K -n scen get pods -l app=cri-agent -o wide
-  for p in $(K -n scen get pods -l app=cri-agent -o name); do ev runtime "crictl-${p##*/}" K -n scen logs "$p" -c agent --tail=3; done
+  for p in $(K -n scen get pods -l app=cri-agent -o name); do ev runtime "crictl-${p##*/}" K -n scen logs "$p" -c agent --tail=$LOG_TAIL; done
   ev runtime schema1-pods K -n scen get pods -l app=schema1 -o wide
   ev runtime schema1-events K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; }
 # 14: a cgroup v1 pool on 1.34 (the last minor that upgrades one) with the legacy JVM on it
 hold_14(){ local v; v=$(newest_patch REGULAR 1.34); require_version "$v"; printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V1\n' >"$EVID/cgroup-v1.yaml"
-  pool_exists v1-hold || ev cgroup v1-hold-pool G container node-pools create v1-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=role=v1hold --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet || abort_hold "pool v1-hold was not created"
+  pool_exists v1-hold || ev cgroup v1-hold-pool G container node-pools create v1-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type "$HOLD_MACHINE" --disk-size "$NODE_DISK_GB" --node-labels=role=v1hold --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet || abort_hold "pool v1-hold was not created"
   K -n scen apply -f - <<Y || abort_hold "the legacy JVM did not apply"
 apiVersion: apps/v1
 kind: Deployment
@@ -60,7 +60,7 @@ Y
   sleep $SETTLE
   ev cgroup v1-hold-mode G container node-pools describe v1-hold --cluster "$CLUSTER" --zone "$ZONE" --format='value(version,config.effectiveCgroupMode)'
   ev cgroup v1-hold-pods K -n scen get pods -l app=legacy-jvm-hold -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount'
-  ev cgroup v1-hold-log K -n scen logs deploy/legacy-jvm-hold --tail=3; }
+  ev cgroup v1-hold-log K -n scen logs deploy/legacy-jvm-hold --tail=$LOG_TAIL; }
 # 18: a 1.33 L4 pool on the default driver running a CUDA 13 build, which crash-loops until the driver moves
 hold_18(){ local v; v=$(newest_patch EXTENDED 1.33); require_version "$v"
   pool_exists gpu-hold || ev gpu-driver gpu-hold-pool G container node-pools create gpu-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type g2-standard-4 --disk-size 200 --accelerator type=nvidia-l4,count=1,gpu-driver-version=default --node-labels=role=gpuhold --quiet || abort_hold "pool gpu-hold was not created"

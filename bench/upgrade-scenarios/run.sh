@@ -3,7 +3,7 @@
 # (usually an upgrade), record the after-state, and leave the cluster up for the Recommender's next
 # daily refresh. Each scenario is one file in scenarios/ defining CHANNEL, START (minor), optional
 # CREATE_FLAGS and POOL_FLAGS, and the functions plant, before, break_it, after. Evidence: evidence/NN/.
-DEFAULT_POOL_MACHINE=e2-small; NODE_DISK_GB=32; PLANT_SETTLE=60   # the default pool only runs system pods; scenarios add a work-pool
+DEFAULT_POOL_MACHINE=e2-small; PLANT_SETTLE=60   # the default pool only runs system pods; scenarios add a work-pool
 set -u; NN=${1:?scenario number, two digits}; TRACK=$NN; CLUSTER=${CLUSTER:-upg-$NN}
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"; . "$H/scenarios/$NN.sh"

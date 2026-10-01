@@ -9,6 +9,7 @@ CTX="gke_${PROJECT}_${ZONE}_${CLUSTER}"
 KCFG_DIR="$H/.kubeconfigs"; mkdir -p "$KCFG_DIR"; export KUBECONFIG="$KCFG_DIR/$CLUSTER"
 # run.sh labels every cluster it creates purpose=$SCENARIO_LABEL; every script that plants or upgrades refuses any other.
 SCENARIO_LABEL=upgrade-scenarios
+NODE_DISK_GB=32   # every pool the harness or a hold creates
 require_scenario_cluster(){ local p; p=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.purpose)' 2>/dev/null) ||
     { echo "refusing: cannot describe $CLUSTER in $ZONE (missing, or its creation failed)" >&2; exit 1; }
   [ "$p" = "$SCENARIO_LABEL" ] || { echo "refusing: $CLUSTER in $ZONE is not labelled purpose=$SCENARIO_LABEL (label: '$p')" >&2; exit 1; }; }

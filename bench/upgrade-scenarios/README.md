@@ -315,18 +315,8 @@ earlier insights' names now return not found. Whether the Recommender retracted 
 under new names and produced none, a readiness check sees the same thing: an insight present one day was absent
 the next with the hazard unchanged, so an insight's absence proves nothing.
 
-GKE documents a subtype for six of the twenty hazards:
-
-| #   | Documented subtype                                                                   |
-| --- | ------------------------------------------------------------------------------------ |
-| 1   | `PDB_UNPERMISSIVE`                                                                   |
-| 6   | `DEPRECATION_K8S_1_32_API`                                                           |
-| 7   | `K8S_ADMISSION_WEBHOOK_UNAVAILABLE`                                                  |
-| 10  | `CLUSTER_VERSION_SKEW_UNSUPPORTED`                                                   |
-| 13  | `DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API`, `DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES` |
-| 16  | `NETWORK_POLICIES_UNRECONCILED`                                                      |
-
-The other fourteen have no documented subtype. The nearest thing for scenario 14 is not an insight at all:
+The table's "GKE Recommender check for it" column names the documented subtype for each hazard, from the
+`SCENARIOS` entries in `results.py`: six of the twenty have one, the other fourteen none. The nearest thing for scenario 14 is not an insight at all:
 `gcloud` prints `Node pool ... is running cgroupv1 which is deprecated` when it touches a cgroup v1 pool. The
 `gemma-gpu` cluster has run the scenario 6 caller for five days. It carries about 144 audited removed-release
 writes a day, and `DEPRECATION_K8S_1_32_API` has not appeared on them yet.

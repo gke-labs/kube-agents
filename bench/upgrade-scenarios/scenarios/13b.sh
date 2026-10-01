@@ -8,9 +8,13 @@ CHANNEL=EXTENDED; START=1.31; POOL_FLAGS=""
 CLIENT_ROLLOUT_TIMEOUT=300s; CRICTL_VERSION=v1.22.0; CRICTL_URL=https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-$CRICTL_VERSION-linux-amd64.tar.gz
 CRICTL_SHA256=45e0556c42616af60ebe93bf4691056338b3ea0001c0201a6a8ff8b1dbc0652a   # the release's published .sha256; the fetch runs as root beside the containerd socket, so it is checked before anything is unpacked
 OLD_NODE_VERSION=1.31.14-gke.2704000
-AUTO_HOLD_DAYS=2; WORK_MACHINE=e2-small
+AUTO_HOLD_DAYS=2; WORK_MACHINE=e2-small   # POOL_START is read from the pool in plant and used by break_it
 plant(){ has_exclusion hold-auto || ev cluster hold G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-auto --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$AUTO_HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet
-  pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$OLD_NODE_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --num-nodes 1 --machine-type "$WORK_MACHINE" --quiet; K -n scen apply -f - <<Y
+  pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$OLD_NODE_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --num-nodes 1 --machine-type "$WORK_MACHINE" --quiet
+  # The experiment is the patch step off this exact version; a pool already past it (a re-run, or scenario 13's cluster) has nothing to show.
+  POOL_START=$(G container node-pools describe work-pool --cluster "$CLUSTER" --zone "$ZONE" --format='value(version)') || { note final "could not read work-pool's version; stopping"; exit 1; }
+  [ "$POOL_START" = "$OLD_NODE_VERSION" ] || { note final "precondition not met: work-pool is on $POOL_START, not $OLD_NODE_VERSION, so the patch-only step has already happened or this is not 13b's pool; stopping before the upgrade"; exit 1; }
+  K -n scen apply -f - <<Y
 apiVersion: apps/v1
 kind: DaemonSet
 metadata: {name: cri-v1alpha2-agent}
@@ -38,5 +42,5 @@ spec:
 Y
   K -n scen rollout status ds/cri-v1alpha2-agent --timeout="$CLIENT_ROLLOUT_TIMEOUT"; }   # the init container must have fetched and verified crictl, or there is no client to break
 before(){ sleep 60; ev runtime before-runtime K get nodes -l role=work -o custom-columns='NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion'; ev runtime before-crictl K -n scen logs ds/cri-v1alpha2-agent --tail=4; }
-break_it(){ V=$(newest_patch EXTENDED 1.31); note runtime "patch-only node upgrade $OLD_NODE_VERSION -> $V"; upgrade_pool work-pool "$V" runtime:scen:app=cri-agent; }
+break_it(){ V=$(newest_patch EXTENDED 1.31); note runtime "patch-only node upgrade $POOL_START -> $V"; upgrade_pool work-pool "$V" runtime:scen:app=cri-agent; }
 after(){ sleep 90; ev runtime after-runtime K get nodes -l role=work -o custom-columns='NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion'; ev runtime after-crictl K -n scen logs ds/cri-v1alpha2-agent --tail=6; }
