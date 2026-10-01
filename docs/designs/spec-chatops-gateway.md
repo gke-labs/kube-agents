@@ -588,7 +588,7 @@ not be silent about it.
   come back the way the relay posts them - the placeholder, the rolling progress line's edits,
   the deliverable, the terminal - because what a verifier grades has to be what a customer would
   have read. With `probe=1` the same read is also the **read route**: a pure read of the
-  conversation's session record and of the active task's stream (or, with `task=`, of the named
+  conversation's session record and of the active task's stream (or, with `task=`, of a named task the record owns, its active one or one of the last fifty it ran; another conversation's task, or one older than that, is not read; the named
   task's stream whether or not the record still holds it as active - the relay clears the active
   task when it posts the terminal, and that is how a harness reads a finished run's trace after
   the release), which mutates nothing - no

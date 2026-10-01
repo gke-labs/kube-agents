@@ -707,7 +707,9 @@ func durationMillis(n json.Number) int64 {
 	if i, err := n.Int64(); err == nil {
 		return i
 	}
-	if f, err := n.Float64(); err == nil && f >= 0 && f <= math.MaxInt64 {
+	// Strict on the upper side: math.MaxInt64 rounds to 2^63 as a float,
+	// which int64 cannot hold and would wrap negative.
+	if f, err := n.Float64(); err == nil && f >= 0 && f < math.MaxInt64 {
 		return int64(f)
 	}
 	return 0

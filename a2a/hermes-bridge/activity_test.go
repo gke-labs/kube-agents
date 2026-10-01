@@ -488,6 +488,11 @@ func TestActivity_FractionalDurationIsRead(t *testing.T) {
 	if got := durationMillis(json.Number("40")); got != 40 {
 		t.Fatalf("durationMillis(40) = %d", got)
 	}
+	for _, out := range []string{"9223372036854775807.0", "9.223372036854775808e18", "9223372036854775808", "-5.5", "1e400"} {
+		if got := durationMillis(json.Number(out)); got != 0 {
+			t.Fatalf("durationMillis(%s) = %d, want 0", out, got)
+		}
+	}
 }
 
 func TestActivityStatus(t *testing.T) {
