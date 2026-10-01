@@ -1,0 +1,57 @@
+{
+ "read_at": "2026-10-01T0231Z",
+ "newest_refresh": "2026-09-30T00:00:00Z",
+ "raw": "evidence/recommender/2026-10-01T0231Z",
+ "zones": [
+  "asia-east1-a",
+  "asia-southeast1-b",
+  "europe-west1-b",
+  "europe-west4-a",
+  "europe-west4-b",
+  "us-central1-a",
+  "us-central1-b",
+  "us-central1-c",
+  "us-east1-d",
+  "us-east4-c",
+  "us-west1-a",
+  "us-west1-b"
+ ],
+ "clusters": {
+  "upg-18k@us-central1-b": [
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-30T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster upg-18k is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service account](https",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-b/insightTypes/google.container.DiagnosisInsight/insights/8e61bf94-ad91-49e8-b80e-52fcacfec0b4"
+   },
+   {
+    "kind": "recommendation",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-30T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Grant roles/container.defaultNodeServiceAccount role to Node service account to allow for non-degraded operations. [Learn more](https://cloud.google.com/kubernetes-engine/docs/troubleshooting/logging#",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-central1-b/recommenders/google.container.DiagnosisRecommender/recommendations/7d211e64-afc4-4acc-ad5e-35d49e096d07"
+   }
+  ],
+  "upg-18m@us-west1-a": [
+   {
+    "kind": "insight",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-30T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Node service account in your cluster upg-18m is missing critical permissions, which results in degraded operations, such as impeded logging, monitoring or autoscaling. [Identify service account](https",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-west1-a/insightTypes/google.container.DiagnosisInsight/insights/42b245df-9982-4abb-8769-f2c6823d7724"
+   },
+   {
+    "kind": "recommendation",
+    "subtype": "NODE_SA_MISSING_PERMISSIONS",
+    "lastRefreshTime": "2026-09-30T00:00:00Z",
+    "state": "ACTIVE",
+    "description": "Grant roles/container.defaultNodeServiceAccount role to Node service account to allow for non-degraded operations. [Learn more](https://cloud.google.com/kubernetes-engine/docs/troubleshooting/logging#",
+    "name": "projects/<PROJECT_NUMBER>/locations/us-west1-a/recommenders/google.container.DiagnosisRecommender/recommendations/5cbdfbe5-86be-4410-8dff-183e8bcc92ab"
+   }
+  ]
+ }
+}

@@ -134,6 +134,36 @@ func TestTasksGet_ContextCanceled(t *testing.T) {
 	}
 }
 
+// TasksGetOpened reports whether the read created its ordered consumer: true
+// on a task with events (the consumer is then live for its inactive
+// threshold, which is what a caller pacing or retrying reads needs to know),
+// false on a task with none, where the direct horizon gets answer not-found
+// and nothing was opened. The error-after-creation branch (a read that
+// fails once the consumer exists) is covered through the bridge's seam
+// rather than here: the replay's screen keeps a hostile payload from ever
+// reaching the fold, and a post-creation read failure cannot be staged
+// deterministically against an embedded server.
+func TestTasksGetOpened_ReportsWhetherTheReadOpenedAConsumer(t *testing.T) {
+	s := startServer(t)
+	provisionTasksStream(t, clientURL(s))
+	c := replayFixture(t, clientURL(s), "task-fo", []TaskState{StateSubmitted})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	task, opened, err := c.TasksGetOpened(ctx, replayAddressee("task-fo"), "task-fo")
+	if err != nil || task == nil || !opened {
+		t.Fatalf("TasksGetOpened on a task with events = (%v, opened=%v, %v), want the task and opened", task, opened, err)
+	}
+	var a2aErr *A2AError
+	if _, opened, err := c.TasksGetOpened(ctx, replayAddressee("task-none"), "task-none"); !errors.As(err, &a2aErr) || a2aErr.Code != CodeTaskNotFound || opened {
+		t.Fatalf("a task with no events: opened=%v err=%v, want false and TaskNotFound", opened, err)
+	}
+	// TasksGet and TasksGetAttributed are the same read without the bit.
+	if got, err := c.TasksGet(ctx, replayAddressee("task-fo"), "task-fo"); err != nil || got.ID != task.ID {
+		t.Fatalf("TasksGet disagrees with TasksGetOpened: %v %v", got, err)
+	}
+}
+
 // A hostile or foreign write on the events subject must not revoke tasks/get
 // for the task: unparseable bytes and non-event kinds are skipped in replay,
 // the same way the live path terms poison instead of dying.

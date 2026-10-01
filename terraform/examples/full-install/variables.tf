@@ -177,7 +177,11 @@ variable "scope" {
     runs. `exclude.projects` takes project IDs or shell-style globs;
     `exclude.clusters` names single clusters by the full triple, because a
     cluster name is unique only within a project and location. Neither
-    exclusion changes IAM. `folders` and `organizations` are numeric Resource
+    exclusion changes IAM, except that an `exclude.projects` entry naming a
+    Shared VPC service project by ID, or a monitored project by its project
+    number, withholds its grant (a monitored project excluded by ID keeps
+    it, for the reconcile's naming call); a glob is the reconcile's alone. `folders`
+    and `organizations` are numeric Resource
     Manager IDs: each is bound on the container itself with the same allowlist
     plus roles/cloudasset.viewer, so every project beneath it inherits the
     grant and a project created under a declared folder later is discovered
@@ -185,12 +189,23 @@ variable "scope" {
     cloudasset.googleapis.com in project_id, which the reconcile's container
     search calls. An organisation binding reaches every project in the
     organisation; the design recommends folders until the scoped service
-    account pool grants authority.
+    account pool grants authority. `shared_vpc_hosts` and `metrics_scopes`
+    are project IDs, of a Shared VPC host and of a Metrics Scope's scoping
+    project: the module resolves each to the projects it reaches at plan
+    time, as the identity Terraform plans with, and binds the allowlist in
+    every one (and in each scoping project, and roles/compute.viewer alone in
+    a host not otherwise in scope, for the reconcile's lookups),
+    because nothing is inherited through either; a project attached or
+    linked after the apply reads denied until the next one. A lookup the
+    planning identity cannot make fails the plan with the selector named,
+    before anything is applied.
   EOT
   type = object({
-    projects      = optional(list(string), [])
-    folders       = optional(list(string), [])
-    organizations = optional(list(string), [])
+    projects         = optional(list(string), [])
+    folders          = optional(list(string), [])
+    organizations    = optional(list(string), [])
+    shared_vpc_hosts = optional(list(string), [])
+    metrics_scopes   = optional(list(string), [])
     exclude = optional(object({
       projects = optional(list(string), [])
       clusters = optional(list(object({

@@ -5125,7 +5125,10 @@ AI_PROVIDER_CREDENTIAL_ENV_RE = re.compile(
 )
 
 
-def _is_ai_workload(spec: dict) -> bool:
+def _is_inference_workload(spec: dict) -> bool:
+    """The serving half of `_is_ai_workload`: a serving image or an
+    accelerator request. `fleet_stockout.py` §3.2 reads this half alone,
+    because a provider credential marks a workload that calls a model."""
     containers = spec.get("containers") or []
     if any(AI_MODEL_IMAGE_RE.search(c.get("image") or "") for c in containers):
         return True
@@ -5133,6 +5136,13 @@ def _is_ai_workload(spec: dict) -> bool:
         limits = (c.get("resources") or {}).get("limits") or {}
         if any(AI_ACCELERATOR_KEY_RE.search(key) for key in limits):
             return True
+    return False
+
+
+def _is_ai_workload(spec: dict) -> bool:
+    if _is_inference_workload(spec):
+        return True
+    containers = spec.get("containers") or []
     for c in containers:
         # Named, not valued: a `secretKeyRef` is the correct way to hold one of
         # these and still means the workload holds it. Whether the value is a
@@ -7794,7 +7804,7 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
         kind = str(doc.get("kind") or "")
         meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
         if kind == "Secret":
-            labels = meta.get("labels") or {}
+            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
             if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
                 continue
             # `stringData` is what a committed registration uses; `data` is
@@ -7808,7 +7818,8 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
             if server and cluster:
                 servers[server] = cluster
         elif kind == FLUX_HELM_REPOSITORY_KIND:
-            url = str((doc.get("spec") or {}).get("url") or "").strip()
+            repo_spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+            url = str(repo_spec.get("url") or "").strip()
             name = str(meta.get("name") or "")
             namespace = str(meta.get("namespace") or "")
             if url and name:
@@ -7889,7 +7900,15 @@ def release_declarations(root: Path) -> dict[tuple, dict]:
                 continue
             cluster = parts[1]
             namespace = str(meta.get("namespace") or "")
-            chart_spec = ((spec.get("chart") or {}).get("spec") or {}) if isinstance(spec.get("chart"), dict) else {}
+            # A scalar or a list where the chart template goes is a malformed
+            # document, and one malformed file must not crash the whole run
+            # before the manifest prints. Skip it; `sourceRef` is guarded alike.
+            # An absent `chart` is the `chartRef` form, which still indexes, on
+            # an empty chart, for the values field it names.
+            chart = spec.get("chart") if spec.get("chart") is not None else {}
+            chart_spec = chart.get("spec") if isinstance(chart, dict) and chart.get("spec") is not None else {}
+            if not isinstance(chart, dict) or not isinstance(chart_spec, dict):
+                continue
             source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
             repo_namespace = str(source_ref.get("namespace") or namespace)
             repo_name = str(source_ref.get("name") or "")

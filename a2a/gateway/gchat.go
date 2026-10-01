@@ -109,11 +109,15 @@ const (
 )
 
 // verifiedByFor names the mechanism that checked the requester at ingress
-// for one backend (authority.requester.verifiedBy).
+// for one backend (authority.requester.verifiedBy) — the authority block
+// should say what was actually checked, not just "the map". Discord (and
+// anything unlisted) is the test mapping table alone.
 func verifiedByFor(backend string) string {
 	switch backend {
 	case gchatBackend:
 		return gchatVerifiedBy
+	case slackBackend:
+		return slackVerifiedBy
 	case injectBackend:
 		// Its own value, not "principal-map" and deliberately nothing a real
 		// backend stamps. The map is what resolves the author here too, but
@@ -128,7 +132,8 @@ func verifiedByFor(backend string) string {
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
 // allowlist on gchat, the door's own map on inject, the mapping table
-// everywhere else.
+// everywhere else (Discord's ConfigMap, Slack's a2a-slack-principal-map
+// Secret).
 func unverifiedRemedyFor(backend string) string {
 	switch backend {
 	case gchatBackend:
@@ -536,9 +541,11 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 		// durable publish would be at-least-once, but the dedupe map is
 		// in-memory, so a redelivery after a slow publish and a restart
 		// becomes a DUPLICATE task — a worse failure than a lost ask,
-		// which a user retries by typing again. It also matches every
-		// other backend's ingress semantics: Discord and Slack websockets
-		// redeliver nothing at all.
+		// which a user retries by typing again. It also matches the other
+		// backends' ingress semantics closely enough: the Discord websocket
+		// redelivers nothing, and Slack's Socket Mode, which does redeliver
+		// unacked envelopes, carries its own in-adapter dedupe ring for
+		// exactly that (slackSeenCap in slack.go).
 		a.settle(env.Receipt)
 		if decodeErr != nil {
 			a.log.Warn("gchat event payload did not parse; acked away",

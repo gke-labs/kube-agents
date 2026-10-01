@@ -90,25 +90,26 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Nine fixtures: eight across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-five seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
-`seeded-capacity` and `seeded-deprecation`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
+Every fixture but the project-scoped `orphan-disks` sits on one of the three cluster slots. Every in-cluster fixture is on slot `a`, across the
+seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
+`seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
 outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
-| Role                    | Slot    | Day | What is planted                                                                                                                                                               |
-| ----------------------- | ------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rbac-overgrant`        | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                         |
-| `no-pdb-workload`       | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                   |
-| `crashloop-workload`    | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                         |
-| `hpa-saturated`         | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                         |
-| `deprecated-api-caller` | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight |
-| `idle-nodepool`         | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                           |
-| `orphan-disks`          | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                              |
-| `version-laggard`       | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                    |
-| `drift-outlier`         | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                                                                          |
+| Role                       | Slot    | Day | What is planted                                                                                                                                                               |
+| -------------------------- | ------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`           | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                         |
+| `no-pdb-workload`          | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                   |
+| `declared-no-pdb-workload` | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, declared on purpose in the GitOps repository's `knowledge/`                                         |
+| `crashloop-workload`       | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                         |
+| `hpa-saturated`            | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                         |
+| `deprecated-api-caller`    | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight |
+| `idle-nodepool`            | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                           |
+| `orphan-disks`             | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                              |
+| `version-laggard`          | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                    |
+| `drift-outlier`            | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                                                                          |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -129,7 +130,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the nine roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -149,8 +150,9 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Six of the nine are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`crashloop-workload`, `hpa-saturated`, `version-laggard` and `deprecated-api-caller`,
+Assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`declared-no-pdb-workload`, `crashloop-workload`, `hpa-saturated`, `version-laggard` and
+`deprecated-api-caller`,
 covering security, reliability, cluster debugging, remediation, capacity, upgrades and API
 deprecation between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
@@ -161,14 +163,17 @@ exists before the apply returns.
 members — and §2.4's floor, a cohort of fewer than three clusters produces no findings
 ever, would floor it out even if only one cluster were new.
 
-`idle-nodepool` waits seven, and no agent can satisfy that gate reliably, because the GKE
-node pool has no creation timestamp to read. The cost SOP's idle-nodepool check refuses
-pools created less than seven days ago, but `gcloud container node-pools describe` returns
-no `createTime` and neither does the REST resource; the only age signal is the boot-disk
-creation time of the pool's current nodes, which a rolling recreation resets while the
-pool object is untouched. So the gate is a judgement the agent makes from a proxy, and a
-node upgrade can silently close it. Treat `idle-nodepool` as the least dependable fixture in
-the catalog, and do not build a blocking objective on the age gate itself.
+`idle-nodepool` waits seven, and the GKE node pool has no creation timestamp to read:
+`gcloud container node-pools describe` returns no `createTime` and neither does the REST
+resource. The cost collector dates a pool from its `CREATE_NODE_POOL` operation in
+`gcloud container operations list`. A pool with no such operation arrived with the cluster
+in `CREATE_CLUSTER`, or before the operations the API still keeps, so it is dated from the
+cluster's `createTime` in `clusters list`. Only when the operations read fails does the
+oldest node's age stand in, and the collector then names each pool that stand-in exempted
+in the cluster's `limitations`, because a rolling node recreation resets node age while the
+pool object is untouched. On apply day the seeded pools are days old by either clock, so
+the gate holds; do not build a blocking objective on the age gate itself, since the
+operations the API keeps are finite and an old fixture pool falls back to its cluster's age.
 
 `orphan-disks` waits thirty, and that one is real: the unattached-disk collector filters
 server-side on the immutable `creationTimestamp<-P30D`. It is the longest gate in the

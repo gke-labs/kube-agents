@@ -23,7 +23,7 @@ took all of its CPU, `payments-api` and `checkout-gateway` sat Pending on all
 every pull request for a day (#1278). This script is the other half (#1544): for
 each role the runner published it reads the `state` assertions the catalog
 (bench/tf/fleet/fixtures.json) declares -- the crashloop has recorded an
-OOMKilled termination, the healthy workload is Ready, the idle pool's node is
+OOMKilled termination, the healthy workloads are Ready, the idle pool's node is
 Ready and tainted, slot b's control plane is still one minor behind its
 channel -- and reports the roles whose fixture is there but not in the shape
 the cases depend on.
@@ -534,7 +534,7 @@ def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
 class Reader:
     """Reads for one pass, with the server-config lookups memoised.
 
-    A pass over eight roles must not pay one get-server-config per assertion;
+    A pass over every catalog role must not pay one get-server-config per assertion;
     a location's channel defaults do not change between two reads seconds
     apart.
     """

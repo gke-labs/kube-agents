@@ -5045,7 +5045,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
-                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
                 with self.assertRaises(self._Stop):
@@ -5112,7 +5112,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
-                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                    mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", FakeServer), \
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
                 with self.assertRaises(self._Stop):
@@ -5860,7 +5860,7 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "issue-list", "issue-view"},
+             "proposal-commits", "issue-list", "issue-view", "branch-view"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -6300,7 +6300,7 @@ class BackendSocketModeTest(unittest.TestCase):
                     },
                     clear=True,
                 ), \
-                        mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                        mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
                         mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                         mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
                     with self.assertRaises(self._Stop):
@@ -6323,7 +6323,9 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
     """One request must produce one audit record, whatever the caller sends.
 
     The exec line is the only thing that binds a command to a verified
-    identity, and the root formatter is line-oriented plain text. A newline in
+    identity, and under a line-oriented text formatter (the one a local run or an
+    older image installs; the deployed one is JSON, covered by
+    test_credential_proxy_audit_json) a newline in
     any caller-supplied field ends the record and starts another, so an
     unsanitized `requestId` or `argv[0]` lets the caller write a complete,
     well-formed second entry naming a ServiceAccount that made no request.
@@ -7262,7 +7264,7 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
         # Everything that could listen is replaced, so removing the guard makes
         # this test fail loudly instead of blocking on a real serve_forever.
         with mock.patch.dict(os.environ, environment, clear=True), \
-                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", refuse_to_bind), \
                 mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
                 mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
             with self.assertRaises(RuntimeError) as raised:
@@ -7291,7 +7293,7 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
             "CREDENTIAL_PROXY_ENVOY_ADDRESS": "0.0.0.0",
         }
         with mock.patch.dict(os.environ, environment, clear=True), \
-                mock.patch.object(credential_proxy, "ThreadingHTTPServer", refuse_to_bind), \
+                mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", refuse_to_bind), \
                 mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", refuse_to_bind), \
                 mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
             with self.assertRaises(RuntimeError) as raised:
@@ -7335,7 +7337,7 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
         original = CredentialProxyHandler.__dict__.get("authenticator")
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
-                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", FakeServer), \
+                    mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", FakeServer), \
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread):
                 with self.assertRaises(_Stop):
                     credential_proxy.serve(self._args())

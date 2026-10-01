@@ -11,23 +11,28 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker and the auth callout.
-The last three are deliberately absent: this repo builds them, and today publishes them only from
-a dev registry, off the release pipeline, so until the stack graduates their pins live as defaults
-on the operator's `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` env vars, and a
-mirrored or air-gapped install that flips `next` has to override each of them. That graduation
-decision is still open. NATS and nats-box are ordinary third-party pins and are in the table below
-as `nats` and `nats-box`, so `make mirror-images` copies them. The chart does not set their env
-vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at the
-copies by hand.
+The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout and
+the Hermes bridge sidecar, and each is in the tables below. The first-party ones (`a2a-gateway`,
+`a2a-worker`, `a2a-authcallout`, `hermes-bridge`) are built and tagged with the rest of the
+release. The operator derives the three it renders from its own image (`OPERATOR_IMAGE`, which
+the chart sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it
+resolves for itself:
+the same registry and tag, so an install at a release pulls them at that release and a mirrored
+install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
+them;
+`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` on the operator override one at a
+time. The bridge is
+built from the `platform-agent` image of the same commit and is declared on the `PlatformAgent`
+as a sidecar rather than rendered by the operator, so it has no operator override: the sidecar's
+image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
+table as `nats` and `nats-box`, so `make mirror-images` copies them; the chart does not set their
+env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE` at
+the copies by hand.
 
-The exemption covers those published images, not the bases they are built from. `golang`, `node`
-and `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
+The bases those images are built from are inventory entries too. `golang`, `node` and
+`distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
 `a2a/Dockerfile.gateway`, `a2a/Dockerfile.worker` and `a2a/Dockerfile.hermes-bridge` alongside
-every other builder, because an override of `A2A_WORKER_IMAGE` names an image someone still has
-to build, and a build in a mirrored environment has to resolve its bases like any other. The
-bridge image itself is built only for the evaluation pipeline, from the platform-agent image of
-the same build, and is not in the inventory.
+every other builder, so a build in a mirrored environment can resolve them like any other.
 
 Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
 `ARG` default, a compiled constant in the operator — and `make images-check` holds them in step with
@@ -51,6 +56,10 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
 | `gke-stockout-investigator` | `ghcr.io/gke-labs/kube-agents/gke-stockout-investigator` | release tag | — | The gke-stockout-investigator AgentPlugin. |
+| `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way. |
+| `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. |
+| `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install. |
+| `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | — | The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's. |
 
 ### Pulled by an install, built elsewhere
 
@@ -91,7 +100,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 
 ## Published images
 
-Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, tagged with the commit SHA and `:latest`. The same push also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — every image except `k8s-operator` — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
+Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each push to `main`, and when a merge lands on a `release/<X.Y>` branch whose commit has no images yet, tagged with the pushed commit's SHA; `:latest` follows `main` alone. A push to `main` also publishes `platform-agent`, `credential-proxy`, `replay-proxy`, `agent-sandbox`, `pubsub-platform` and `gke-stockout-investigator` — not `k8s-operator`, and not the four A2A `next`-stack images, which are published to GHCR alone — to a Google Artifact Registry repository through [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml), built there by Cloud Build. Production SemVer release tags (`X.Y.Z`) are promoted from the GHCR commit images without rebuilding — see [Release versioning](/kube-agents/deploy/release-versioning/).
 
 ### `platform-agent`
 
@@ -121,7 +130,7 @@ The Kubebuilder-generated operator manager image. Built from `k8s-operator/Docke
 
 ## Container entrypoint
 
-`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Neither container built from that image reaches it under this operator: for both `envoy-credential-proxy` and `agent-api-auth` the operator sets `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright. Before it `exec`s whatever command it was handed, the entrypoint converts Hermes' SQLite databases out of WAL when the managed config pins `database.journal_mode: delete` (see `availability.runtimeClassName` on the [CRD reference](/kube-agents/operator/platformagent-crd/#specdeployment)), seeds `$HERMES_HOME` from `/opt/defaults`, scaffolds the `platform` profile, links profile-targeted plugin volumes, merges the operator-rendered config overlays, and starts the Session KV server.
+`platform-agent` — and `credential-proxy`, which inherits it from the shared `agent-base` stage — run [`deploy/shared/docker-entrypoint.sh`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/docker-entrypoint.sh) as their `ENTRYPOINT`, with `CMD ["hermes", "gateway", "run"]`. Neither container built from that image reaches it under this operator: for both `envoy-credential-proxy` and `agent-api-auth` the operator sets `command` to `/usr/local/bin/start-services`, which replaces the image's `ENTRYPOINT` outright. Before it `exec`s whatever command it was handed, the entrypoint converts Hermes' SQLite databases out of WAL when the managed config pins `database.journal_mode: delete` (see `availability.runtimeClassName` on the [CRD reference](/kube-agents/operator/platformagent-crd/#specdeployment)), seeds `$HERMES_HOME` from `/opt/defaults`, scaffolds the `platform` profile, links profile-targeted plugin volumes, merges the operator-rendered config overlays, copies the managed terminal settings into every profile's `.env`, and starts the Session KV server.
 
 Every one of those writes to the data volume, and a Pod runs this image in more than one container against a single copy of it. Exactly one container may do the setup. A second pass from a container that lacks the plugin volumes and the overlay ConfigMap does not merely duplicate the work — it reads the first container's fresh plugin links as dangling and unlinks them, and reverts the overlay whose source it cannot see. `AGENT_SHARED_STATE_SETUP` decides which container that is:
 
@@ -144,9 +153,13 @@ kubectl exec -i deploy/platform-agent-gateway -c platform-agent -- \
 
 Confining it takes more than a scratch `$PLATFORM_AGENT_HOME`, because two of the setup's effects are not derived from it. Step 4 points `$HOME/.hermes/plugins/hermes_otel/config.yaml` at the config it generates — `hermes-otel` resolves its config below `~/.hermes` whatever `HERMES_HOME` says — and `$HOME` in the gateway is `/opt/data/home`, on the data PVC. Step 5 starts the Session KV server on port 8699, which is pod-wide and scoped by nothing. So each case also gets a scratch `$HOME`, and the server it spawns is killed by its scratch path as the case returns. The run ends by asserting both: that the pod's real compat symlink is byte-for-byte what it was, and that no process from the run is still alive.
 
-One thing the entrypoint does can stop the container rather than warn. Before the setup copies anything to the data volume — in the container that owns the shared state, since a `skip` container has already `exec`ed the command by this point — it checks each skill tree baked into the image (`/opt/hermes/skills`, `/opt/platform-template/skills`, `/opt/cluster-template/skills`) against the SHA-256 manifest the build wrote into it, and exits non-zero if a tree no longer matches — naming the offending file on stderr, with both digests when its content is what changed. Almost every other step here degrades with a `WARN` — the exception is step 1, which runs upstream's `stage2-hook.sh` and inherits `set -e` from the script. This one is a deliberate exception, for the reason [Security &amp; IAM](/kube-agents/reference/security-and-iam/#change-control--safety) gives. A pod crash-looping with `does not match the manifest baked beside it at build time` is reporting a corrupted or altered image, not a misconfiguration: reinstate the image the manifest belongs to rather than looking for a setting to change.
+Three things the entrypoint does can stop the container rather than warn: the skill manifest check, the terminal check (step 4b), and a failed move of the model's files into the shell sandbox (step 5.7). The first: before the setup copies anything to the data volume — in the container that owns the shared state, since a `skip` container has already `exec`ed the command by this point — it checks each skill tree baked into the image (`/opt/hermes/skills`, `/opt/platform-template/skills`, `/opt/cluster-template/skills`, `/opt/a2a-template/skills`) against the SHA-256 manifest the build wrote into it, and exits non-zero if a tree no longer matches — naming the offending file on stderr, with both digests when its content is what changed. Almost every other step here degrades with a `WARN` — the exceptions are step 1, which runs upstream's `stage2-hook.sh` and inherits `set -e` from the script, and the three named above. The manifest check is a deliberate exception, for the reason [Security &amp; IAM](/kube-agents/reference/security-and-iam/#change-control--safety) gives. A pod crash-looping with `does not match the manifest baked beside it at build time` is reporting a corrupted or altered image, not a misconfiguration: reinstate the image the manifest belongs to rather than looking for a setting to change.
 
 The manifest, not the checker, is what makes the check mandatory: a tree carrying one is verified or the container refuses to start. Both sides of that pairing are root-owned in the image — the manifest inside the tree it describes, the verifier in `/opt/defaults/scripts` — so `carries a build-time manifest but nothing here can check it` is not something the agent's own uid can arrange, and it is read the same way as a mismatch: an altered or truncated image, not a setting. A tree with no manifest inside it is skipped, which is how the same entrypoint stays a no-op in images that never reached the stage where manifests are written.
+
+The second is the terminal check, step 4b. Hermes builds the terminal a scheduled run or a kanban wake turn uses from the profile's own settings, not from the managed config the operator renders to `/etc/hermes/config.yaml`, so the entrypoint copies every `terminal:` setting Hermes maps to a `TERMINAL_*` variable (all but `workspace_root`) into the `TERMINAL_*` lines of every profile's `.env` ([`deploy/shared/terminal_env_pin.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/terminal_env_pin.py)) and then asks Hermes what each profile resolves. If a profile would resolve any of those settings differently — a backend other than the `ssh` sandbox, another host — the container exits non-zero naming the profile and the `TERMINAL_*` variables Hermes resolves differently. A cluster profile scaffolded after start-up gets the same check from `cluster_agent_profile.py`, which leaves a profile that fails it unfinished for the next reconcile to retry. In a pod crash-looping with `would not use the managed ssh terminal`, the `[TERMINAL-ENV-PIN] ERROR:` lines above it name the cause. A key in a profile's own `config.yaml` that sets one of those settings to another value, such as `terminal.backend: local`, outranks `.env`, so the step deletes it and leaves the rest of the file as it was, as Hermes' own save does; if it cannot, the error names the keys to delete by hand. Any other error names the file or directory to fix, except `this Hermes does not map terminal.backend`, which means the image ships a Hermes the copy does not support; the image build fails on that first. At start-up, a profile whose `.env` took the copy but whose `config.yaml` Hermes cannot read or parse gets a `WARN` instead: Hermes refuses that profile's terminal, so its scheduled runs fail until the file is fixed. Without `HERMES_MANAGED_DIR`, which only the operator sets, the step copies a `terminal:` block from `/etc/hermes/config.yaml` if one is there, skipping with a `WARN` any value `.env` cannot hold as a plain line and ignoring, with a `WARN`, a file it cannot read or parse, as Hermes does; with no block it does nothing. What it copies is still checked.
+
+The third, step 5.7, stops the container with `the shell sandbox migration failed` when the model's files could not be moved into the sandbox, followed by the last lines of `logs/sandbox_mirror.log`.
 
 ## Base image pin
 
@@ -169,6 +182,8 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-agents` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
+
+One thing to check after the rebuilt images roll out. The `fluent-bit` sidecar lifts the audit records out of Hermes' log lines by matching the line prefix (timestamp, level, an optional session tag, the logger name), and that prefix is Hermes' to change; no test in this repository notices when it does. Once a bumped `platform-agent` is running and has made a tool call, query `jsonPayload.audit_event:*` in Logs Explorer: records mean the lift still holds, and none means the records are arriving as text under `jsonPayload.log` again, which is fixed by updating the `hermes_audit_line` parser in the operator's fluent-bit configuration, and the sample lines its test holds, to the new prefix ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
 
 ## Private / custom registry
 
@@ -249,7 +264,9 @@ when a prefix is in effect:
 
 `CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives the broker image from the agent image
 by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
-on its own. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
+`a2a-authcallout`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
+no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.
 

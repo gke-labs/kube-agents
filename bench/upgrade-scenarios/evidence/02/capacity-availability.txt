@@ -1,0 +1,26 @@
+# 2026-09-29T14:44:46Z poll start scen app=lonely
+2026-09-29T14:45:01Z gke-upg-02b-work-pool-fb51e6fa-xp88/Running/True 
+2026-09-29T14:45:12Z gke-upg-02b-work-pool-fb51e6fa-xp88/Running/True 
+2026-09-29T14:45:24Z /Pending/ 
+2026-09-29T14:45:35Z /Pending/ 
+2026-09-29T14:45:47Z /Pending/ 
+2026-09-29T14:45:58Z /Pending/ 
+2026-09-29T14:46:10Z /Pending/ 
+2026-09-29T14:46:21Z /Pending/ 
+2026-09-29T14:46:33Z /Pending/ 
+2026-09-29T14:46:44Z /Pending/ 
+2026-09-29T14:46:56Z /Pending/ 
+2026-09-29T14:47:07Z /Pending/ 
+2026-09-29T14:47:19Z /Pending/ 
+2026-09-29T14:47:30Z /Pending/ 
+2026-09-29T14:47:42Z /Pending/ 
+2026-09-29T14:47:53Z /Pending/ 
+2026-09-29T14:48:05Z /Pending/ 
+2026-09-29T14:48:16Z /Pending/ 
+2026-09-29T14:48:28Z /Pending/ 
+2026-09-29T14:48:39Z /Pending/ 
+2026-09-29T14:48:51Z /Pending/ 
+2026-09-29T14:49:02Z /Pending/ 
+2026-09-29T14:49:14Z /Pending/ 
+2026-09-29T14:49:25Z /Pending/ 
+# 2026-09-29T14:49:37Z poll end
