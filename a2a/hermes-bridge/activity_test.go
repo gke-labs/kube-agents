@@ -362,11 +362,7 @@ func TestChildManagedScope_WritesTheConfigBeforeTheEnv(t *testing.T) {
 	}
 	t.Cleanup(func() { writeScopeFile = prev })
 	scratch := t.TempDir()
-	b := &Bridge{cfg: Config{ScratchDir: scratch, ManagedScopeDir: src, ActivityListen: "127.0.0.1:0"}}
-	if err := b.listenActivity(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = b.activityLn.Close() })
+	b := &Bridge{cfg: Config{ScratchDir: scratch, ManagedScopeDir: src}}
 	if _, err := b.childManagedScope("task-order"); err != nil {
 		t.Fatal(err)
 	}

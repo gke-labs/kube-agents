@@ -3679,6 +3679,13 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["result"]`) {
 		t.Fatalf("bulk under an extra key: %d bytes %s", len(out), out[:min(len(out), 200)])
 	}
+	// Bulk under a number key that does not hold a number: outside the
+	// shape, dropped and named; the input and the string fields stay.
+	notNumber := json.RawMessage(`{"tool":"x","input":{"a":1},"callId":"c","status":"completed","durationMs":["` + big + `"],"dropped":"` + big + `"}`)
+	out = capActivityEntry(notNumber)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || !strings.Contains(string(out), `"callId":"c"`) || !strings.Contains(string(out), `"status":"completed"`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["dropped","durationMs"]`) {
+		t.Fatalf("bulk under a non-numeric number key: %d bytes %s", len(out), out[:min(len(out), 300)])
+	}
 	// Bulk made of many small extra keys: the input stays whole and
 	// unclaimed, the first names are kept and the rest are a count.
 	var many strings.Builder

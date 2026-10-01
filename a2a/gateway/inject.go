@@ -1907,6 +1907,11 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 // anything else on an over-size entry is dropped before the input is.
 var activityEntryKeys = map[string]bool{"tool": true, "input": true, "callId": true, "status": true, "errorType": true, "durationMs": true, "at": true, "dropped": true}
 
+// activityEntryNumberKeys are the entry keys whose value is a number; one
+// carrying anything else is outside the entry's shape and is dropped and
+// named like an extra key, so its bulk is never charged to the input.
+var activityEntryNumberKeys = map[string]bool{"durationMs": true, "dropped": true}
+
 // capActivityEntry replaces an over-size activity entry with a stand-in that
 // keeps what a grader reads (the tool, and a tool_call wrapper's nested
 // names) and says what was cut, in the bridge's own stand-in shape: the
@@ -1935,8 +1940,9 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	// entry whose bulk is many small extra keys ends here with its input
 	// whole and claims no cut of it.
 	var dropped []string
-	for key := range entry {
-		if !activityEntryKeys[key] {
+	for key, v := range entry {
+		_, number := v.(float64)
+		if !activityEntryKeys[key] || (activityEntryNumberKeys[key] && !number) {
 			dropped = append(dropped, key)
 		}
 	}
