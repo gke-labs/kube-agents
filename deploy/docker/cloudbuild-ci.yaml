@@ -172,9 +172,10 @@ steps:
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
   # entry fails the build, which is why this step pushes from inside itself.
-  # Without an override the operator derives the released images from the
-  # agent image it resolves, which is not this pull request's build; the
-  # deploy script points the operator at these builds instead. Context is the a2a/ module root, as each
+  # The deploy script points the operator at these builds through its
+  # overrides; without them the operator would derive the same references
+  # from its own image, which is this build's, so the overrides keep the
+  # deploy's inputs explicit rather than change them. Context is the a2a/ module root, as each
   # Dockerfile's header says. One step rather than three: they share the Go
   # module download layer, which the daemon serves to the second and third.
   # Nothing here depends on the platform image, so the step starts at once,

@@ -192,10 +192,11 @@ const (
 	a2aGatewayImageName = "a2a-gateway"
 
 	// The session-pod image, on the same terms as the gateway above. The
-	// gateway binary carries this same default of its own (gateway/config.go),
-	// which is what a gateway run outside the operator falls back to; the
-	// operator renders the env unconditionally so that the override exists
-	// wherever the operator is what installed the gateway. Arming spawning
+	// gateway binary carries a default of its own for the same image
+	// (defaultWorkerRepository in gateway/config.go, the published repository
+	// at :latest), which is what a gateway run outside the operator falls
+	// back to; the operator renders the env unconditionally so that the
+	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
 	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"

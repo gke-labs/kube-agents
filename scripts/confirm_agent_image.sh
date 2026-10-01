@@ -152,13 +152,17 @@ readonly PLUGIN_VOLUME_MAX_LEN=63
 readonly PLUGIN_NAME_HASH_LEN=8
 readonly AGENT_RELEASE_JSONPATH='{range .items[*]}{.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
 readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
-# The containers a PlatformAgent declares under spec.deployment.sidecars. The
-# operator copies them into the template as written, and no deploy of this
-# release sets their tag: a release image declared there (the Hermes bridge
-# of a mode: next install, built from the agent image of its own commit)
-# carries whatever reference the CR names, so it is reported and left out of
-# the verdict, like a plugin installed outside the release.
-readonly DECLARED_SIDECAR_JSONPATH='{range .items[*]}{range .spec.deployment.sidecars[*]}{.name}{"\n"}{end}{end}'
+# The containers the PlatformAgent that owns this Deployment declares under
+# spec.deployment.sidecars. The operator copies them into the template as
+# written, and no deploy of this release sets their tag: a release image
+# declared there (the Hermes bridge of a mode: next install, built from the
+# agent image of its own commit) carries whatever reference the CR names, so
+# it is reported and left out of the verdict, like a plugin installed outside
+# the release. Read from the owning CR alone, by the Deployment's owner
+# reference: another agent's sidecar named like one of this agent's rendered
+# containers must not take that container out of the verdict.
+readonly OWNER_JSONPATH='{range .metadata.ownerReferences[?(@.kind=="PlatformAgent")]}{.name}{"\n"}{end}'
+readonly DECLARED_SIDECAR_JSONPATH='{range .spec.deployment.sidecars[*]}{.name}{"\n"}{end}'
 
 stderr_file="$(mktemp)"
 # Carry the real status through the cleanup. A bare `rm` in an EXIT trap
@@ -293,7 +297,11 @@ while true; do
   # agent no Helm release owns, reads as empty and every plugin entry counts.
   agent_releases="$(kubectl get platformagent -n "$namespace" -o jsonpath="$AGENT_RELEASE_JSONPATH" 2>/dev/null | grep -v '^$' | sort -u || true)"
   plugin_releases="$(kubectl get agentplugin -n "$namespace" -o jsonpath="$PLUGIN_RELEASE_JSONPATH" 2>/dev/null || true)"
-  declared_sidecars="$(kubectl get platformagent -n "$namespace" -o jsonpath="$DECLARED_SIDECAR_JSONPATH" 2>/dev/null | grep -v '^$' || true)"
+  declared_sidecars=""
+  owner="$(kubectl get "deployment/${deployment}" -n "$namespace" -o jsonpath="$OWNER_JSONPATH" 2>/dev/null | grep -v '^$' | head -n1 || true)"
+  if [ -n "$owner" ]; then
+    declared_sidecars="$(kubectl get "platformagent/${owner}" -n "$namespace" -o jsonpath="$DECLARED_SIDECAR_JSONPATH" 2>/dev/null | grep -v '^$' || true)"
+  fi
   inspect_template "$listing"
 
   if [ "$matched" -gt 0 ] && [ -z "$mismatched" ]; then

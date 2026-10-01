@@ -130,6 +130,7 @@ class _StubKubectl:
         agent_release="kube-agents",
         plugin_releases="",
         declared_sidecars="",
+        sidecar_owner="platform-agent",
     ):
         """Run the script against one or more stubbed reads of the template.
 
@@ -191,8 +192,14 @@ class _StubKubectl:
                   printf '%s\\n' '{plugin_releases}'
                   exit 0
                 fi
+                if [[ "$*" == *ownerReferences* ]]; then
+                  echo 'platform-agent'
+                  exit 0
+                fi
                 if [[ "$*" == *sidecars* ]]; then
-                  printf '%s\\n' '{declared_sidecars}'
+                  if [[ "$*" == *'platformagent/{sidecar_owner}'* ]]; then
+                    printf '%s\\n' '{declared_sidecars}'
+                  fi
                   exit 0
                 fi
                 if [[ "$*" == *status.phase* ]]; then
@@ -308,6 +315,13 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         undeclared = self._run(listing)
         self.assertEqual(undeclared.returncode, 1, undeclared.stdout + undeclared.stderr)
         self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", undeclared.stdout)
+
+        # Only the owning CR's declaration counts: a sidecar of that name on
+        # another PlatformAgent in the namespace does not take this
+        # Deployment's container out of the verdict.
+        other = self._run(listing, declared_sidecars="hermes-bridge", sidecar_owner="other-agent")
+        self.assertEqual(other.returncode, 1, other.stdout + other.stderr)
+        self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", other.stdout)
 
     def test_a_plugin_installed_outside_the_release_is_not_judged(self):
         """agentplugins/*/install.sh releases a plugin on its own, at its own tag.
