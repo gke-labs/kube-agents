@@ -224,6 +224,10 @@ class RuntimeTest(unittest.TestCase):
                 report = SINGLE.replace("- **To authorize:**", second + "- **To authorize:**")
                 self.assertIsNone(runtime.parse_triage(report))
 
+    def test_an_option_title_keeps_its_in_word_double_markers(self):
+        triage = runtime.parse_triage(REPORT.replace("Roll back to 14:02", "Set DB__HOST and DB__PORT"))
+        self.assertEqual(triage["choices"][0][0], "apply Option A: Set DB__HOST and DB__PORT")
+
     def test_link_labels_are_plain_and_reach_the_fallback_text(self):
         report = REPORT.replace("[GKE Workloads]", "[**GKE Workloads**]")
         triage = runtime.parse_triage(report)

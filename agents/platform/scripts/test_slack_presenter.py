@@ -189,6 +189,12 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(headline, "Memory is 2**20 bytes.")
         self.assertEqual(body, ["Raise it."])
 
+    def test_plain_keeps_paired_in_word_double_markers(self):
+        self.assertEqual(sp.split_answer("DB__HOST or DB__PORT is unset.")[0], "DB__HOST or DB__PORT is unset.")
+        self.assertEqual(sp._plain("Set DB__HOST and DB__PORT"), "Set DB__HOST and DB__PORT")
+        self.assertEqual(sp._plain("2**20 and 2**30 bytes"), "2**20 and 2**30 bytes")
+        self.assertEqual(sp._plain("**Checkout** and __payments__ are down"), "Checkout and payments are down")
+
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))

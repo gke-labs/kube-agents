@@ -135,7 +135,14 @@ CHOICE_SEPARATOR = " · "
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
-MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+#: Bold markers. An opener has no word character before it and a closer none after
+#: it, so an in-word run such as ``DB__HOST`` or ``2**20`` is text.
+BOLD_MARKERS = ("**", "__")
+BOLD_OPEN = r"(?<!\w){0}(?=\S)"
+BOLD_CLOSE = r"(?<=\S){0}(?!\w)"
+MD_BOLD = re.compile(
+    "|".join(BOLD_OPEN.format(re.escape(m)) + "(.+?)" + BOLD_CLOSE.format(re.escape(m)) for m in BOLD_MARKERS)
+)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: ``*italic*`` and ``_italic_``; a ``*`` inside a word (``2*3``) or unpaired (``*.tmp``) is text.
@@ -150,12 +157,10 @@ MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 #: lowercase letter ("in ns. prod" runs on).
 #: A sentence ends at ``.``, ``!`` or ``?``, or just after the emphasis that closes on one.
 SENTENCE_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][*_])|(?<=[.!?]\*\*)|(?<=[.!?]__))\s+(?=[^\sa-z])")
-#: Bold markers a split can leave open; the first sentence closes one and the rest reopens it.
-BOLD_MARKERS = ("**", "__")
-#: Per marker, an opener (no word character before it) and a closer (none after it);
-#: an in-word run such as ``DB__HOST`` or ``2**20`` is neither.
+#: Per bold marker, its opener and closer, which a split can leave unpaired; the first
+#: sentence closes one and the rest reopens it.
 BOLD_EDGES = {
-    marker: (re.compile(rf"(?<!\w){re.escape(marker)}(?=\S)"), re.compile(rf"(?<=\S){re.escape(marker)}(?!\w)"))
+    marker: (re.compile(BOLD_OPEN.format(re.escape(marker))), re.compile(BOLD_CLOSE.format(re.escape(marker))))
     for marker in BOLD_MARKERS
 }
 #: A text ending in one of these abbreviations has not ended its sentence.
