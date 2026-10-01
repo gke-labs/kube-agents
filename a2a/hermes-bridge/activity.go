@@ -779,32 +779,39 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 // numbers, booleans and nulls left as they are. A "[redacted]" marker stays
 // a marker, so the trace still says a secret-looking key was there.
 func shapeValue(v any, tool string) any {
-	return shapeValueIn(v, "", "", tool == hermesToolCallWrapper)
+	return shapeValueIn(v, "", "", tool == hermesToolCallWrapper, 0)
 }
 
-// shapeValueIn is shapeValue with the enclosing key and whether this input
-// is hermes's tool_call wrapper, so a tool name is known as one: in the
-// wrapper, the "name" of an element of the top-level "calls" array is what
-// a tool_called check reads and is kept whatever its spelling, bounded like
-// the entry's own tool. Under any other tool a "calls[].name" is the
-// model's text and is shaped; the identifier grammar is for the kept keys.
-func shapeValueIn(v any, key, parent string, wrapper bool) any {
+// wrapperNameDepth is where a nested tool name sits in hermes's tool_call
+// wrapper: the root map (0) holds the "calls" array (1), whose element map
+// (2) holds the "name" string (3). Only that string is a tool name; a
+// "calls[].name" deeper down is an argument value.
+const wrapperNameDepth = 3
+
+// shapeValueIn is shapeValue with the enclosing key, the container depth
+// and whether this input is hermes's tool_call wrapper, so a tool name is
+// known as one: in the wrapper, the "name" of an element of the top-level
+// "calls" array is what a tool_called check reads and is kept whatever its
+// spelling, bounded like the entry's own tool. Any other string under a
+// "name", at any depth and under any tool, is the model's text and is
+// shaped unless the identifier grammar keeps it.
+func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			t[k] = shapeValueIn(val, k, key, wrapper)
+			t[k] = shapeValueIn(val, k, key, wrapper, depth+1)
 		}
 		return t
 	case []any:
 		for i := range t {
-			t[i] = shapeValueIn(t[i], key, parent, wrapper)
+			t[i] = shapeValueIn(t[i], key, parent, wrapper, depth+1)
 		}
 		return t
 	case string:
 		if t == redactedValue || keptUnderShape(key, t) {
 			return t
 		}
-		if wrapper && key == "name" && parent == wrapperCallsKey {
+		if wrapper && key == "name" && parent == wrapperCallsKey && depth == wrapperNameDepth {
 			return capRunes(t, activityToolNameCap)
 		}
 		return shapeOf(t)

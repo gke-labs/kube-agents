@@ -532,10 +532,17 @@ print("answer for " + prompt)
 `), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
+	// The two stubs each sleep 1.5 s between their calls; run together both
+	// terminals land well inside twice that, run one after the other they
+	// cannot. The bound is what makes "at once" a tested claim.
+	started := time.Now()
 	submit(t, c, "task-a", "A")
 	submit(t, c, "task-b", "B")
 	ta := waitTerminal(t, c, "task-a")
 	tb := waitTerminal(t, c, "task-b")
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
+	}
 	for _, tc := range []struct {
 		task *lib.Task
 		want string
@@ -627,6 +634,44 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 	}
 }
 
+// The shape default, end to end: a bridge whose Config says nothing about
+// input values puts shapes on the bus, with the redaction marker and the
+// numbers kept, and the raw argument text absent from every part.
+func TestActivity_ShapeIsTheDefaultOnTheBus(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+call("kubectl", {"cmd": "get pods", "token": "hunter2", "nested": {"api_key": "k", "keep": 1}, "project": "p"}, "call_1")
+print("the answer")
+`), func(c *Config) { c.ActivityInputValues = "" })
+	c := gatewayClient(t, url)
+	submit(t, c, "task-shape", "list the fleet")
+	task := waitTerminal(t, c, "task-shape")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	entries := activityEntries(t, task)
+	if len(entries) != 1 {
+		t.Fatalf("activity entries = %d, want 1: %+v", len(entries), entries)
+	}
+	var input map[string]any
+	if err := json.Unmarshal(entries[0].Input, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input["cmd"] != shapeOf("get pods") || input["token"] != redactedValue || input["project"] != "p" {
+		t.Fatalf("default input not shaped as designed: %v", input)
+	}
+	if nested := input["nested"].(map[string]any); nested["api_key"] != redactedValue || nested["keep"] != float64(1) {
+		t.Fatalf("nested default input not shaped as designed: %v", nested)
+	}
+	for _, art := range task.Artifacts {
+		for _, p := range art.Parts {
+			if strings.Contains(string(p.Data), "get pods") || strings.Contains(string(p.Data), "hunter2") || strings.Contains(p.Text, "hunter2") {
+				t.Fatalf("raw argument text on the bus under %s: %s %s", art.Name, p.Data, p.Text)
+			}
+		}
+	}
+}
+
 // Shape mode, the default: no free-text value leaves the pod, whatever its
 // key; the structure, numbers, booleans, the redaction markers and the
 // name-like fields a grader reads stay, so a tool_call wrapper still names
@@ -645,6 +690,11 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
 				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
 			}
 		}
+	}
+	// A calls[].name below the wrapper's own array is an argument value.
+	deep := string(redactInput(InputValuesShape, hermesToolCallWrapper, json.RawMessage(`{"calls":[{"name":"kanban_create","arguments":{"calls":[{"name":"my password is hunter2"}]}}],"other":{"calls":[{"name":"not a tool name either"}]}}`)))
+	if strings.Contains(deep, "hunter2") || strings.Contains(deep, "not a tool name") || !strings.Contains(deep, `"name":"kanban_create"`) {
+		t.Fatalf("a nested calls[].name below the wrapper's array was kept: %s", deep)
 	}
 	// Under any other tool a calls[].name is the model's text, not a tool name.
 	other := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"calls":[{"name":"admin:hunter2@db"},{"name":"kanban_create"}]}`)))
