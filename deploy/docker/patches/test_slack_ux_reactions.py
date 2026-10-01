@@ -325,7 +325,10 @@ class RuntimeTest(unittest.TestCase):
         self.addCleanup(cards.stop)
         self.lineage = {}
 
+        self.lineage_reads = 0
+
         async def thread_lineage(chat_id, thread_id):
+            self.lineage_reads += 1
             return self.lineage
 
         lineage = mock.patch.object(runtime, "thread_lineage", thread_lineage)
@@ -652,6 +655,34 @@ class RuntimeTest(unittest.TestCase):
         after = {**_cards("t_a"), **_cards("t_b", creator="t_a"), **_cards("t_c", creator="t_b")}
         self._turn_racing("why?", _cards("t_a"), after, [], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+
+    def test_a_card_under_a_left_out_cards_follow_up_that_closed_within_the_turn_is_left_out(self):
+        # Ask 1's t_c is running when ask 2 arrives. During ask 2's turn t_c's
+        # worker files t_a, t_a's worker files t_b, and t_a completes, so the
+        # end read shows t_b under t_a and no t_a; the lineage links t_a to t_c.
+        for events in ([], [("t_a", "completed")]):
+            with self.subTest(delivered=bool(events)):
+                runtime._deferred.clear()
+                log = []
+                first = self._turn("fix it", {}, _cards("t_c"), adapter=_Stub("111.001", log))
+                self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c", ("default", "t_b"): "t_a"}
+                second = _Stub("111.002", log)
+                self._turn_racing("why?", _cards("t_c"), {**_cards("t_c"), **_cards("t_b", creator="t_a")}, events, second)
+                self.assertEqual(second.calls, [("eyes", False), ("white_check_mark", False)])
+                # t_b is ask 1's: its follow-up's follow-up, held once t_c completes.
+                self.boards[:] = [_cards("t_b", creator="t_a")]
+                _run(runtime.settle_delegated(first, self._sub("t_c"), "completed"))
+                self.assertNotIn(("111.001", "white_check_mark"), log)
+                _run(runtime.settle_delegated(first, self._sub("t_b"), "completed"))
+                self.assertEqual(log[-1], ("111.001", "white_check_mark"))
+                self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
+
+    def test_the_turn_reads_the_lineage_only_for_a_creator_neither_read_shows(self):
+        self._turn("why?", _cards("t_old"), _cards("t_old"))
+        self._turn("fix it", {}, {**_cards("t_a"), **_cards("t_b", creator="t_a")})
+        self.assertEqual(self.lineage_reads, 0)
+        self._turn("fix it", {}, _cards("t_b", creator="t_a"))
+        self.assertEqual(self.lineage_reads, 1)
 
     def test_a_card_the_turns_own_cards_worker_creates_is_its(self):
         adapter = _Stub()

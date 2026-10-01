@@ -33,9 +33,10 @@ With the flag on:
   arrived is not its to wait on, even one unblocked while the turn ran.
   Hermes records no actor on an unblock, so it may be the CLI's or another
   turn's; that card's own ask carries its outcome. Nor is a card created
-  under one it did not open, a worker's follow-up or one filed beneath that:
-  Hermes copies the creator's subscriptions onto it, so it is in the thread
-  without being the turn's. A turn that failed after opening them still
+  under one it did not open, a worker's follow-up or one filed beneath that,
+  even through a follow-up that completed while the turn ran: Hermes copies
+  the creator's subscriptions onto it, so it is in the thread without being
+  the turn's. A turn that failed after opening them still
   settles ❌ when they finish, whatever they did. The kanban notifier calls
   :func:`settle_delegated` on each terminal event: ⏸️ as soon as one of the
   ask's cards blocks on the user, and once every one of them has finished, ✅,
@@ -304,28 +305,38 @@ def _where(event: Any) -> tuple[str | None, str]:
     return getattr(source, "chat_id", None), str(getattr(source, "thread_id", "") or "")
 
 
-def _own_cards(before: dict, after: dict, finished: dict) -> set:
+def _own_cards(before: dict, after: dict, finished: dict, lineage: dict | None = None) -> set:
     """The cards this turn answers for: open at its end, or finished during it, and not open at its start.
 
     A card open at the start is never the turn's, even one unblocked while it
     ran: Hermes's ``unblocked`` event names no actor, so the turn cannot show
     the unblock was its own rather than the CLI's or another turn's. Nor is a
     new card whose creator was open at the start, such as a follow-up an
-    earlier ask's worker files, nor one created under such a card. Only workers
-    set a creator; the parents a turn names do not make a card anyone else's. A
-    creator open at neither read opened within the turn, so it and the cards it
-    created are the turn's, even when it closed before the notifier reported it.
+    earlier ask's worker files, nor one created under such a card, through
+    creators the end read shows or, for one already closed, ``lineage``: the
+    thread's ``{(board, id): creator id}``. Only workers set a creator; the
+    parents a turn names do not make a card anyone else's. A creator whose own
+    chain reaches no card open at the start opened within the turn, so it and
+    the cards it created are the turn's, even when it closed before the
+    notifier reported it.
     """
     opened = {card for card in (*after, *finished) if card not in before}
+    creators = {card: (card[0], creator) for card, creator in (lineage or {}).items() if creator}
+    creators.update({card: (card[0], seen.creator) for card, seen in after.items() if seen.creator})
     foreign = set(before)
     while True:
-        more = {
-            (board, task) for board, task in opened - foreign
-            if (board, task) in after and (board, after[(board, task)].creator) in foreign
-        }
+        more = {card for card, creator in creators.items() if card not in foreign and creator in foreign}
         if not more:
             return opened - foreign
         foreign |= more
+
+
+def _creator_unseen(before: dict, after: dict, finished: dict) -> bool:
+    """Whether a card the turn would own has a creator neither read shows, or is closed and its creator unknown."""
+    return any(
+        card not in after or (after[card].creator and (card[0], after[card].creator) not in after)
+        for card in _own_cards(before, after, finished)
+    )
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
@@ -359,11 +370,20 @@ async def on_processing_complete(adapter: Any, event: Any, outcome: Any) -> None
         _started.pop(marker, None)
         return
     after = await open_cards(chat_id, thread_id)
-    # Still in flight across the read, so a card finishing during it is seen;
+    # A closed creator is in neither read; the lineage read links it to its
+    # own creator. Taken while the turn is still in flight, as the read above.
+    lineage: dict = {}
+    pending = _started.get(marker)
+    if (
+        pending is not None and pending.before is not None and after is not None
+        and _creator_unseen(pending.before, after, pending.finished)
+    ):
+        lineage = await thread_lineage(chat_id, thread_id)
+    # Still in flight across the reads, so a card finishing during them is seen;
     # nothing below awaits before the ask is deferred.
     turn = _started.pop(marker, None)
     before = turn.before if turn is not None else None
-    new = _own_cards(before, after, turn.finished) if before is not None and after is not None else set()
+    new = _own_cards(before, after, turn.finished, lineage) if before is not None and after is not None else set()
     if new:
         waiting = new - set(turn.finished)
         # The turn's own failure carries into the deferred settle: cards that
