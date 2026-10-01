@@ -91,9 +91,10 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
-	// The legacy Chat consumer's broker env, and the fully qualified
-	// subscription form both consumers' env carries.
-	legacyGoogleChatProjectIDEnvVar    = "GOOGLE_CHAT_PROJECT_ID"
+	// The Chat consumers' broker env: the project id both carry, the legacy
+	// consumer's subscription name, and the fully qualified subscription
+	// form both consumers' env carries.
+	googleChatProjectIDEnvVar          = "GOOGLE_CHAT_PROJECT_ID"
 	legacyGoogleChatSubscriptionEnvVar = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
 	googleChatSubscriptionFormat       = "projects/%s/subscriptions/%s"
 	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
@@ -4082,7 +4083,7 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	if integration := agent.Spec.Integration; integration != nil {
 		if gchat := integration.GoogleChat; googleChatEnabled(agent) {
 			subscription := fmt.Sprintf(googleChatSubscriptionFormat, gchat.ProjectID, gchat.SubscriptionName)
-			envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatProjectIDEnvVar, Value: gchat.ProjectID})
+			envVars = append(envVars, corev1.EnvVar{Name: googleChatProjectIDEnvVar, Value: gchat.ProjectID})
 			if a2aChatArmed(agent) {
 				// The next stack takes Chat: the install's one subscription
 				// goes to the A2A relay instance and the legacy instance is

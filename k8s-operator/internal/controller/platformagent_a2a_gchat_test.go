@@ -47,15 +47,6 @@ func gchatTestAgent(mode string, enabled bool) *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
-// gchatEnv indexes a container's env by name.
-func gchatEnv(c corev1.Container) map[string]corev1.EnvVar {
-	out := map[string]corev1.EnvVar{}
-	for _, e := range c.Env {
-		out[e.Name] = e
-	}
-	return out
-}
-
 // TestChatConsumerIsChosenByMode: the two predicates are exact complements
 // of each other whenever Chat is enabled, and both false when it is not, so
 // an install is never rendered with two Chat consumers or none.
@@ -128,7 +119,7 @@ func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 	agent := gchatTestAgent("next", true)
 	dep := buildA2AGatewayDeployment(agent)
 	c := dep.Spec.Template.Spec.Containers[0]
-	env := gchatEnv(c)
+	env := envMapOf(c.Env)
 
 	want := map[string]string{
 		a2aGchatRelayURLEnvVar:      "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765",
@@ -187,7 +178,7 @@ func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 func TestAnEmptyAllowlistArmsAllowAllUnderNext(t *testing.T) {
 	agent := gchatTestAgent("next", true)
 	agent.Spec.Integration.GoogleChat.AllowedUsers = nil
-	env := gchatEnv(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0])
+	env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
 	if env[a2aGchatAllowAllUsersEnvVar].Value != "true" || env[a2aGchatAllowedUsersEnvVar].Value != "" {
 		t.Errorf("empty allowlist renders %s=%q %s=%q, want allow-all true and an empty list",
 			a2aGchatAllowAllUsersEnvVar, env[a2aGchatAllowAllUsersEnvVar].Value,
@@ -199,7 +190,7 @@ func TestAnEmptyAllowlistArmsAllowAllUnderNext(t *testing.T) {
 func TestDisplayModeFollowsTheCRField(t *testing.T) {
 	agent := gchatTestAgent("next", true)
 	agent.Spec.Integration.GoogleChat.Mode = "debug"
-	env := gchatEnv(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0])
+	env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
 	if env[a2aChatDisplayModeEnvVar].Value != "debug" {
 		t.Errorf("%s = %q, want debug", a2aChatDisplayModeEnvVar, env[a2aChatDisplayModeEnvVar].Value)
 	}
@@ -223,7 +214,7 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dep := buildA2AGatewayDeployment(tc.agent)
 			c := dep.Spec.Template.Spec.Containers[0]
-			env := gchatEnv(c)
+			env := envMapOf(c.Env)
 			for _, name := range []string{a2aGchatRelayURLEnvVar, a2aGchatAllowedUsersEnvVar, a2aGchatAllowAllUsersEnvVar, a2aChatDisplayModeEnvVar, a2aGchatTokenPathEnvVar} {
 				if _, ok := env[name]; ok {
 					t.Errorf("%s rendered on an unarmed gateway", name)
@@ -326,7 +317,7 @@ func TestNoRenderCarriesBothChatSubscriptions(t *testing.T) {
 		containers = append(containers, buildPodTemplateSpec(agent, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers...)
 		legacy, a2a := false, false
 		for _, c := range containers {
-			env := gchatEnv(c)
+			env := envMapOf(c.Env)
 			if _, ok := env["GOOGLE_CHAT_SUBSCRIPTION_NAME"]; ok {
 				legacy = true
 			}
@@ -389,7 +380,7 @@ func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
-			env := gchatEnv(*brokerContainerNamed(pod.Spec.Containers, "platform-agent"))
+			env := envMapOf(*brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
 			managed := renderManagedEnv(tc.agent)
 			config := renderConfigYAML(tc.agent, nil)
 			for _, name := range legacyNames {
@@ -431,7 +422,7 @@ func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := gchatTestAgent("next", true)
 			agent.Spec.Integration.GoogleChat.AllowedUsers = tc.users
-			env := gchatEnv(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0])
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
 			if got := env[a2aGchatAllowedUsersEnvVar].Value; got != tc.wantList {
 				t.Errorf("%s = %q, want %q", a2aGchatAllowedUsersEnvVar, got, tc.wantList)
 			}

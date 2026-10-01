@@ -6887,7 +6887,8 @@ class RequiredRoleTest(unittest.TestCase):
 
     Reads ``required_roles`` (plural) since this branch: a route can admit more
     than one caller role, because the /v1/chat/api passthrough is shared by the
-    legacy chat relay and the A2A one — one credential, two subscriptions. The
+    legacy chat relay and the A2A one — one credential, one relay instance per
+    install. The
     singular ``required_role`` these tests were written against returned the
     first match and could not express that.
     """

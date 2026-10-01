@@ -483,7 +483,8 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 # (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
 # the namespace can replay it until it expires.  mTLS closes that and is not
 # done here.  buildCredentialProxyNetworkPolicy narrows who can open the
-# connection at all, to the sandbox Pod and the gateway Pod.
+# connection at all, to the sandbox Pod, the gateway Pod and, when the next
+# stack takes Google Chat, the A2A gateway Pod.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
