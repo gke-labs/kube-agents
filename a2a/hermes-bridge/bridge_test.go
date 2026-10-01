@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -1346,6 +1349,135 @@ exit 3`))
 	}
 	if !strings.Contains(s.Status.Message.Parts[0].Text, "exit status 3") {
 		t.Fatal("failed event does not carry the exit code")
+	}
+}
+
+// A failed turn's diagnosis is on stdout: `hermes chat -Q` prints a failed
+// turn's final_response there and exits 1, and prints the session id last on
+// stderr. The terminal carries both, so the loss class #2036 recorded (an
+// "Error: max retries exhausted" discarded with the exit) is in the status
+// message and the transcript is findable from it.
+func TestLifecycle_FailedKeepsStdoutAndSessionID(t *testing.T) {
+	_, url := startServer(t)
+	startBridge(t, url, script(t, `echo "Error: max retries exhausted after 6 attempts"
+echo "[hermes-otel] disabled" >&2
+echo "" >&2
+echo "session_id: 20260925_181506_ab12cd" >&2
+exit 1`))
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-fail-out", "doomed")
+	task := waitTerminal(t, c, "task-fail-out")
+	if task.State != lib.StateFailed {
+		t.Fatalf("state = %s, want failed", task.State)
+	}
+	reason := terminalReason(t, task)
+	for _, want := range []string{
+		"reason: hermes-exited-nonzero - exit status 1",
+		"session: 20260925_181506_ab12cd",
+		"stdout tail: Error: max retries exhausted after 6 attempts",
+		"stderr tail: ",
+	} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("terminal reason lacks %q:\n%s", want, reason)
+		}
+	}
+}
+
+// Exit 75 is Hermes's EX_TEMPFAIL for a turn that gave up on the provider's
+// rate limit. The terminal names it, so the harness classes a quota storm as
+// infrastructure rather than the persona's failure.
+func TestLifecycle_RateLimitedExitIsNamed(t *testing.T) {
+	_, url := startServer(t)
+	startBridge(t, url, script(t, `echo "Error: rate limit retries exhausted"
+echo "session_id: 20260925_181506_rl" >&2
+exit 75`))
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-rl", "doomed")
+	task := waitTerminal(t, c, "task-rl")
+	if task.State != lib.StateFailed {
+		t.Fatalf("state = %s, want failed", task.State)
+	}
+	reason := terminalReason(t, task)
+	if !strings.HasPrefix(reason, "reason: hermes-rate-limited - exit status 75") {
+		t.Errorf("reason = %q, want the rate-limited token", reason)
+	}
+	if strings.Contains(reason, "hermes-exited-nonzero") {
+		t.Errorf("reason names the generic token beside the specific one: %q", reason)
+	}
+}
+
+// The tails are bounded and cut on a rune boundary.
+func TestTail_BoundedOnARuneBoundary(t *testing.T) {
+	long := strings.Repeat("é", 2000) // 4000 bytes
+	got := tail(long, 2048)
+	if len(got) > 2048 || !utf8.ValidString(got) || !strings.HasSuffix(long, got) {
+		t.Fatalf("tail: len=%d valid=%v suffix=%v", len(got), utf8.ValidString(got), strings.HasSuffix(long, got))
+	}
+	if tail("short", 2048) != "short" {
+		t.Fatal("a short string is returned whole")
+	}
+}
+
+// A transient lookup failure on a submission is retried, not dropped: the
+// lib acks after the handler returns, so without the retry the task was lost.
+// Driven through the tasksGet seam so no bus fault has to be staged.
+func TestLookup_TransientErrorIsRetriedThenAccepted(t *testing.T) {
+	_, url := startServer(t)
+	var calls atomic.Int32
+	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
+		real := b.c.TasksGet
+		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+			if calls.Add(1) < 3 {
+				return nil, errors.New("nats: maximum consumers limit reached")
+			}
+			return real(ctx, addressee, taskID)
+		}
+	})
+	defer stop()
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-retry", "hello")
+	task := waitTerminal(t, c, "task-retry")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed after the lookup retries", task.State)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("lookup attempts = %d, want 3 (two transient failures, then the real read)", got)
+	}
+}
+
+// A lookup that keeps failing is still dropped, after the bounded attempts,
+// and a not-found answer is never retried.
+func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
+	_, url := startServer(t)
+	var calls atomic.Int32
+	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
+		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+			calls.Add(1)
+			return nil, errors.New("nats: timeout")
+		}
+	})
+	defer stop()
+	c := gatewayClient(t, url)
+	submit(t, c, "task-drop", "hello")
+	time.Sleep(2 * time.Second)
+	if got := calls.Load(); got != taskLookupAttempts {
+		t.Fatalf("lookup attempts = %d, want %d", got, taskLookupAttempts)
+	}
+	if ev := replayEvents(t, url, "task-drop"); len(ev) != 0 {
+		t.Fatalf("a dropped submission published %d events, want none", len(ev))
+	}
+
+	b := &Bridge{cfg: Config{Profile: "platform", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	var nf atomic.Int32
+	b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+		nf.Add(1)
+		return nil, &lib.A2AError{Code: lib.CodeTaskNotFound}
+	}
+	if _, err := b.lookupTask(context.Background(), "x"); !isTaskNotFound(err) || nf.Load() != 1 {
+		t.Fatalf("not-found was retried or lost: err=%v attempts=%d", err, nf.Load())
 	}
 }
 

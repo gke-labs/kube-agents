@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,9 +33,24 @@ const (
 	// taskQueueCapacity bounds the accepted-but-not-started queue; hitting
 	// it on a playground bridge is a fault, not load.
 	taskQueueCapacity = 1024
-	// stderrTailBytes is how much subprocess stderr a failed task's status
-	// message can carry.
+	// stderrTailBytes and stdoutTailBytes are how much of each stream a
+	// failed task's status message carries. stdout matters on failure too:
+	// `hermes chat -Q` prints a failed turn's final_response (its own
+	// "Error: …" summary when the retries gave up) on stdout and exits 1,
+	// so a terminal that kept stderr alone threw the diagnosis away (#2036).
 	stderrTailBytes = 2048
+	stdoutTailBytes = 2048
+	// rateLimitedExitCode is EX_TEMPFAIL, the code Hermes exits with when a
+	// turn gave up on the provider's rate limit; the terminal names it so a
+	// quota storm is not graded as the persona's failure.
+	rateLimitedExitCode = 75
+	// taskLookupAttempts bounds the TasksGet retries behind handleMessage
+	// and cancelOrphan. The lib acks after the handler returns and exposes
+	// no nak, so a transient read failure (a consumer-cap refusal, a bus
+	// hiccup) used to drop the submission for good; a bounded retry turns a
+	// lost task into a late one (#2043).
+	taskLookupAttempts = 3
+	taskLookupBackoff  = 200 * time.Millisecond
 	// finalizePublishTimeout bounds the result+terminal publishes of one
 	// finalize; it must outlast a NATS reconnect, not a task.
 	finalizePublishTimeout = 20 * time.Second
@@ -49,6 +65,11 @@ const (
 	shutdownReason            = "reason: bridge-shutdown - the bridge was terminated while this task was in flight"
 	canceledBeforeStartReason = "reason: canceled-before-start"
 )
+
+// sessionIDLine is the last thing `hermes chat -Q` writes on stderr:
+// "session_id: <id>". The id finds the transcript under the profile's session
+// store, which is the evidence the status message cannot carry whole.
+var sessionIDLine = regexp.MustCompile(`(?m)^session_id:\s*(\S+)`)
 
 // Config wires one bridge. Zero values get playground defaults in Run.
 type Config struct {
@@ -180,6 +201,9 @@ type Bridge struct {
 	// so a test can keep the release pending and count slots in hand without
 	// racing the timer.
 	holdReplaySlot func(release func())
+	// tasksGet is the task lookup lookupTask retries; nil means the
+	// client's. Tests set it to drive the retry without a bus fault.
+	tasksGet func(ctx context.Context, addressee, taskID string) (*lib.Task, error)
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -313,16 +337,17 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 	// Unknown task: the dispatcher rule. Empty events subject means new;
 	// terminal means acked with a warning; non-final events with no local run
 	// is an orphan a follow-up cannot revive.
-	task, err := b.c.TasksGet(ctx, b.cfg.Profile, env.TaskID)
+	task, err := b.lookupTask(ctx, env.TaskID)
 	switch {
 	case isTaskNotFound(err):
 		b.accept(ctx, env)
 	case err != nil:
 		// The lib acks after this handler returns, so the submission is
 		// dropped, not redelivered - no terminal event will follow. Honest
-		// gap: the lib exposes no nak path yet.
-		b.cfg.Logger.Error("events lookup failed; dropping submission",
-			"task", env.TaskID, "err", err)
+		// gap: the lib exposes no nak path yet; lookupTask's retries are
+		// what stands in for one.
+		b.cfg.Logger.Error("events lookup failed after retries; dropping submission",
+			"task", env.TaskID, "attempts", taskLookupAttempts, "err", err)
 	case task.Final:
 		b.cfg.Logger.Warn("message for a task with a terminal event; ignoring", "task", env.TaskID)
 	default:
@@ -401,12 +426,12 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
 		return
 	}
-	task, err := b.c.TasksGet(ctx, b.cfg.Profile, env.TaskID)
+	task, err := b.lookupTask(ctx, env.TaskID)
 	switch {
 	case isTaskNotFound(err):
 		b.cfg.Logger.Warn("cancel for a task with no events; ignoring", "task", env.TaskID)
 	case err != nil:
-		b.cfg.Logger.Error("cancel events lookup failed", "task", env.TaskID, "err", err)
+		b.cfg.Logger.Error("cancel events lookup failed after retries", "task", env.TaskID, "err", err)
 	case task.Final:
 		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
 	default:
@@ -717,9 +742,72 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// Killed by shutdownTasks; name the real cause, not the exit code.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
-		b.finalize(run, lib.StateFailed,
-			fmt.Sprintf("reason: hermes-exited-nonzero - %v; stderr tail: %s", err, stderr.String()), nil)
+		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
+}
+
+// failureReason is the terminal message for a subprocess that exited
+// non-zero: the reason token, the exit error, the session id if hermes
+// printed one, and a bounded tail of each stream. Exit 75 (EX_TEMPFAIL) is
+// the rate-limit exit and gets its own token; everything else is
+// hermes-exited-nonzero. Newlines are kept: the message is a text part, and
+// the tails are read by a person.
+func failureReason(err error, stdout, stderr string) string {
+	token := "hermes-exited-nonzero"
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == rateLimitedExitCode {
+		token = "hermes-rate-limited"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "reason: %s - %v", token, err)
+	if m := sessionIDLine.FindStringSubmatch(stderr); m != nil {
+		fmt.Fprintf(&sb, "; session: %s", m[1])
+	}
+	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
+	return sb.String()
+}
+
+// tail is the last n bytes of s, cut on a rune boundary so the text part
+// stays valid UTF-8.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := len(s) - n
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[cut:]
+}
+
+// lookupTask is TasksGet with the bounded retry taskLookupAttempts
+// describes. A not-found answer is an answer and returns at once; any other
+// error is retried with a short backoff and the last one is returned.
+func (b *Bridge) lookupTask(ctx context.Context, taskID string) (*lib.Task, error) {
+	get := b.tasksGet
+	if get == nil {
+		get = b.c.TasksGet
+	}
+	var (
+		task *lib.Task
+		err  error
+	)
+	for attempt := 1; attempt <= taskLookupAttempts; attempt++ {
+		task, err = get(ctx, b.cfg.Profile, taskID)
+		if err == nil || isTaskNotFound(err) || ctx.Err() != nil {
+			return task, err
+		}
+		if attempt < taskLookupAttempts {
+			b.cfg.Logger.Warn("task lookup failed; retrying",
+				"task", taskID, "attempt", attempt, "of", taskLookupAttempts, "err", err)
+			select {
+			case <-time.After(taskLookupBackoff * time.Duration(attempt)):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return task, err
 }
 
 // finalize is the single writer of a task's terminal event, idempotent: the

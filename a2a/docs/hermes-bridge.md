@@ -185,7 +185,14 @@ returns nothing for entries written after the upgrade.
 Per task: `submitted` on accept (before the consumer ack, so a bridge death before the
 ack just redelivers), `working` when the subprocess spawns, the stdout as a `result`
 artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
-exit is terminal `failed` with the exit code and a stderr tail in the status message. A
+exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
+exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
+and the session id is the one `hermes chat -Q` prints last on stderr, so the transcript under the
+profile's session store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for
+a turn that gave up on the provider's rate limit; it is named `reason: hermes-rate-limited` instead,
+which the eval harness classes as infrastructure rather than the persona's failure (the image patch
+`apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
+already did). A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it
