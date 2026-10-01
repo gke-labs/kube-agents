@@ -1418,6 +1418,13 @@ func TestTail_BoundedOnARuneBoundary(t *testing.T) {
 	if tail("short", 2048) != "short" {
 		t.Fatal("a short string is returned whole")
 	}
+	// The stderr buffer cuts on bytes as it fills and opens on a rune when read.
+	tb := newTailBuffer(4)
+	_, _ = tb.Write([]byte("aé")) // 3 bytes
+	_, _ = tb.Write([]byte("éb")) // +3 = 6; the last 4 bytes open inside the first é
+	if got := tb.String(); !utf8.ValidString(got) || got != "éb" {
+		t.Fatalf("tailBuffer.String() = %q (valid=%v), want \"éb\"", got, utf8.ValidString(got))
+	}
 }
 
 // A transient lookup failure on a submission is retried, not dropped: the
@@ -1448,6 +1455,21 @@ func TestLookup_TransientErrorIsRetriedThenAccepted(t *testing.T) {
 	}
 }
 
+// The retry schedule outlasts the fault it is named for: a consumer-cap
+// refusal clears when the ephemeral consumers holding the cap are reaped,
+// after the lib's inactive threshold. Pinned as arithmetic, because the
+// constant it has to beat lives in another package and could move.
+func TestLookup_ScheduleOutlastsTheConsumerInactiveThreshold(t *testing.T) {
+	var total time.Duration
+	for attempt := 1; attempt < taskLookupAttempts; attempt++ {
+		total += taskLookupBackoff * time.Duration(attempt)
+	}
+	if total <= lib.EphemeralConsumerInactiveThreshold {
+		t.Fatalf("retry schedule waits %s in total, which does not outlast the %s inactive threshold a cap refusal clears on",
+			total, lib.EphemeralConsumerInactiveThreshold)
+	}
+}
+
 // A lookup that keeps failing is still dropped, after the bounded attempts,
 // and a not-found answer is never retried.
 func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
@@ -1462,7 +1484,7 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 	defer stop()
 	c := gatewayClient(t, url)
 	submit(t, c, "task-drop", "hello")
-	time.Sleep(2 * time.Second)
+	time.Sleep(8 * time.Second) // the full schedule (1s+2s+3s) plus slack
 	if got := calls.Load(); got != taskLookupAttempts {
 		t.Fatalf("lookup attempts = %d, want %d", got, taskLookupAttempts)
 	}

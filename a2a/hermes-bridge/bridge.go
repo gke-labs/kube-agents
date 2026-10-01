@@ -48,9 +48,14 @@ const (
 	// and cancelOrphan. The lib acks after the handler returns and exposes
 	// no nak, so a transient read failure (a consumer-cap refusal, a bus
 	// hiccup) used to drop the submission for good; a bounded retry turns a
-	// lost task into a late one (#2043).
-	taskLookupAttempts = 3
-	taskLookupBackoff  = 200 * time.Millisecond
+	// lost task into a late one (#2043). The schedule is sized to the fault
+	// it is named for: a TASKS consumer-cap refusal clears when the
+	// ephemeral consumers holding the cap are reaped, which takes the lib's
+	// inactive threshold (lib.EphemeralConsumerInactiveThreshold, 5s), so
+	// the waits (1s, 2s, 3s) outlast it. The cost is paid by the durable's
+	// serial handler, once, only while a lookup is failing.
+	taskLookupAttempts = 4
+	taskLookupBackoff  = time.Second
 	// finalizePublishTimeout bounds the result+terminal publishes of one
 	// finalize; it must outlast a NATS reconnect, not a task.
 	finalizePublishTimeout = 20 * time.Second
@@ -1002,8 +1007,14 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// String is the kept tail, opened on a rune boundary so the text part it
+// becomes is valid UTF-8 (the byte cut in Write can land mid-rune).
 func (t *tailBuffer) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return string(t.buf)
+	start := 0
+	for start < len(t.buf) && !utf8.RuneStart(t.buf[start]) {
+		start++
+	}
+	return string(t.buf[start:])
 }
