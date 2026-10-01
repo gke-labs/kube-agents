@@ -66,7 +66,18 @@ type Config struct {
 	NATSPassword string
 	DiscordToken string
 
-	// PrincipalMapPath is the mounted principal-map ConfigMap.
+	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
+	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
+	// no inbound endpoint, nothing to expose). Exactly one backend may be
+	// configured per gateway process: two gateways bound to one relay
+	// durable split event deliveries (Options.RelayDurable), so a second
+	// backend is a second Deployment with its own durable, not a second
+	// adapter here.
+	SlackBotToken string
+	SlackAppToken string
+
+	// PrincipalMapPath is the mounted principal map — Discord's test
+	// ConfigMap or Slack's admin-owned Secret; same on-disk shape either way.
 	PrincipalMapPath string
 
 	// GchatRelayURL is the credential proxy's relay base URL — the gchat
@@ -140,8 +151,9 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the last user message (decided
-	// 8/24: 30 minutes, config-backed).
+	// IdleTTL is the reap threshold since the session's last activity: a
+	// verified turn, or an executor ending a live task (decided 8/24: 30
+	// minutes, config-backed; the task's end counts since 2026-09-30).
 	IdleTTL time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
@@ -265,19 +277,21 @@ type Config struct {
 	MaxSessions int
 }
 
-// Backend names the REAL chat backend this config arms: "gchat", "discord",
-// or "" when the inject side door is the only way in. FromEnv refuses more
-// than one real backend, so the order here only decides what a hand-built
-// Config means.
+// Backend names the REAL chat backend this config arms: "gchat", "slack",
+// "discord", or "" when the inject side door is the only way in. FromEnv
+// refuses more than one real backend, so the order here only decides what a
+// hand-built Config means.
 //
 // The door is deliberately not one of the answers. It can be armed beside
-// either backend, so "which backend is this gateway" and "is the door open"
+// any one backend, so "which backend is this gateway" and "is the door open"
 // are two questions, and collapsing them is what would make the door
 // exclusive again.
 func (c *Config) Backend() string {
 	switch {
 	case c.GchatRelayURL != "":
 		return gchatBackend
+	case c.SlackBotToken != "":
+		return slackBackend
 	case c.DiscordToken != "":
 		return discordBackend
 	case c.InjectListen != "":
@@ -303,6 +317,8 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
+		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
+		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
@@ -330,16 +346,24 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	// One REAL backend per gateway process, chosen by which variable is set.
-	// A silent default here would make a two-backend misconfiguration a
+	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
+	// choice, so it refuses rather than silently running another backend.
+	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
+		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
+	}
+	// One REAL backend per gateway process, chosen by which credential is
+	// set. A silent default here would make a two-backend misconfiguration a
 	// working Discord gateway that quietly never consumes Chat — refuse both
-	// directions instead. Counted rather than enumerated pairwise: with a
-	// third backend the pairs are the easy thing to leave a hole in, and the
-	// fourth (Slack, #1248) must not be addable with a combination nobody
-	// checked. Adding a backend is one entry in this list.
+	// directions instead. Counted rather than enumerated pairwise: with three
+	// backends the pairs are the easy thing to leave a hole in, and a fourth
+	// must not be addable with a combination nobody checked. Adding a backend
+	// is one entry in this list.
 	var armed []string
 	if cfg.GchatRelayURL != "" {
 		armed = append(armed, "A2A_GCHAT_RELAY_URL")
+	}
+	if cfg.SlackBotToken != "" {
+		armed = append(armed, "the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
 	}
 	if cfg.DiscordToken != "" {
 		armed = append(armed, "DISCORD_TOKEN")
@@ -366,10 +390,10 @@ func FromEnv() (*Config, error) {
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
 		if cfg.InjectListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or A2A_INJECT_LISTEN (the dev-only inject side door)")
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), or A2A_INJECT_LISTEN (the dev-only inject side door)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside either", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The inject side door (A2A_INJECT_LISTEN) is not a backend in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is

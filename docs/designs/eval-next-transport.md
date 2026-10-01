@@ -78,7 +78,7 @@ direct-bus transport the first draft of this document proposed proves the bus, t
 streams and the executor, but it leaves out the gateway's routing, its session registry and the
 relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
-the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
+the gateway**, a backend beside Discord, Google Chat and Slack, HTTP on localhost or a ClusterIP
 Service, off by default, rendered by the operator only under the eval flag. Its design text is
 the gateway spec's "The inject backend" section; this document records what the harness does
 with it. The direct-bus transport survives as a diagnostic, below.
