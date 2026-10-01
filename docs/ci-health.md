@@ -368,37 +368,65 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
 reconcile, hourly against the drifted projects and weekly against every free
 one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
-per job with its label, its stale window and the artifact it writes, so adding
-the next periodic is one line. The 15-minute tick's `Fetch the watched periodics'
+per job with its label, its stale window, the report it writes, and the words
+its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
 identities cannot write the Prow archive),
 walks back to a build with a `finished.json` (the newest is often still
-running), keeps the reconcile's `fleet-reconcile.json` when a failed build wrote
-one, and hands the readings to `health.py --periodics-dir`.
+running), keeps the job's report when the build wrote one (the reconcile's
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`), and hands the readings
+to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
-latest finished build failed is a `FAILED` note; one whose latest finished
+latest finished build failed is a `FAILED` note, once it is news: the sweep runs
+every ten minutes and this tick reads its latest finished build every fifteen,
+so the unit is the check, not the build (one sweep build in three is never
+read), and one failed check followed by a clean one is a flap. The sweep's note
+waits until two consecutive checks have failed; the reconciles' first failed
+build is the news. Any project's failure fails a sweep run, so a per-project
+threshold could never fire before the run's; the per-project counts name, in
+the message, the projects that failed in this check and the ones before it.
+The counts are `periodics_streaks` in `health.json`, advanced once per newly
+read build and carried across ticks; a failed build that did not reach a
+project (busy) keeps its count, and a clean build clears every count. A tick
+that could not fetch the previous `health.json` has no counts to carry, so it
+notes any failed build rather than hide one already told. A
+recovery needs a build that passed: a failed check under the threshold writes
+no note and is not one. One whose latest finished
 build is older than its stale window (an hour for the sweep, three for the
 hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
-for that job included), the job's history link, where the
-recovery is written, and for the reconcile the projects it refused, failed or
-was interrupted in, with each one's reason, up to five. A job with no reading
-writes no note and ends none: that is the bot losing sight of the job, not the
-job recovering.
+for that job included), the job's history link, the runbook link, the words the
+message is built from (where the job acts, what stops happening when it fails
+and resumes when it recovers, what it does and how often, what a failure costs),
+a one-line summary of what the run did from its report, and the report's detail
+lines, up to five: for the reconcile the projects it refused, failed or was
+interrupted in with each one's reason; for the sweep the projects whose sweep
+failed with GitHub's answer, what the run left for the next one under its write
+budget, the projects it did not reach after stopping, and why it stopped if it
+did. `periodics_runs` carries every read
+job's latest build and its summary, which is what the recovery message says. A
+job with no reading writes no note and ends none: that is the bot losing sight
+of the job, not the job recovering.
 
 The poster sends one message per episode and verdict: a job's first failing
 build (in orange; a newer build that fails the same way is not news, and the
 digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
-was told about passes again, on a reading only. The digest carries one line per
-open note.
-Nothing here files an issue: the recovery is a person's, and the failed
-message says where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
+was told about passes again, on a reading only. The failed and stopped
+messages are four lines, the failed one with the report's detail lines under its
+second: a headline naming where and what stopped happening ("Eval GitOps repos:
+leftover pull requests from eval runs are not being cleaned up"); the job, what
+it does and how often, which run and how it failed; the effect and the scope
+("CI eval infrastructure only"); the runbook link and the build link. The
+recovery is one line naming the run and what it did ("closed 241 pull request(s)
+across 12 project(s)"). The digest carries one line per open note. Nothing here
+files an issue: the recovery is a person's, and the failed and stopped messages
+link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
 ## The comment on a red pull request
 
@@ -765,7 +793,8 @@ record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
 `evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
-`periodics`, `periodics_read`, `periodics_since`, `metrics`, `dashboard_url`,
+`pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
+`periodics_since`, `metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line
 was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled
