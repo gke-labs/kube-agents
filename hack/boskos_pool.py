@@ -93,7 +93,9 @@ def error_body(exc):
     if kept is None:
         try:
             kept = exc.read().decode("utf-8", "replace")[:ERROR_BODY_CHARS].strip()
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError, http.client.HTTPException):
+            # A body cut short mid-read (IncompleteRead) must not replace the
+            # status the caller is about to act on.
             kept = ""
         exc.body = kept
     return kept

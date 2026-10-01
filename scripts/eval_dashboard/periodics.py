@@ -127,7 +127,6 @@ KEY_DETAIL = "detail"
 KEY_HISTORY_URL = "history_url"
 KEY_PLACE = "place"
 KEY_ABSENCE = "absence"
-KEY_PRESENCE = "presence"
 KEY_DOES = "does"
 KEY_EFFECT = "effect"
 KEY_RUNBOOK = "runbook"
@@ -597,7 +596,6 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_HISTORY_URL: history_url(periodic.job),
             KEY_PLACE: periodic.place,
             KEY_ABSENCE: periodic.absence,
-            KEY_PRESENCE: periodic.presence,
             KEY_DOES: periodic.does,
             KEY_EFFECT: periodic.effect,
             KEY_RUNBOOK: periodic.runbook,

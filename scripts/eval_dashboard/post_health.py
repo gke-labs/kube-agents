@@ -1003,7 +1003,9 @@ def render_periodic_clear(health: dict, prev: dict | None) -> str:
         run = runs.get(job) or {}
         when = clock(parse_iso(run.get("finished_at"))) if run.get("finished_at") else None
         did = run.get("summary")
-        tail = f" Its {when} run (build {run.get('build')}): {did}." if when and did else (f" Its {when} run (build {run.get('build')}) finished clean." if when else " Its latest run finished clean.")
+        # A clear needs a passed build on record, and a passed build has a
+        # finish time (none is STALE and noted), so `when` is always there.
+        tail = f" Its {when} run (build {run.get('build')}): {did}." if did else f" Its {when} run (build {run.get('build')}) finished clean."
         lines.append(f"✅ *{words['place']}: {words['presence']}.*{tail}")
     return "\n".join(lines)
 

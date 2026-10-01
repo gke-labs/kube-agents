@@ -141,8 +141,9 @@ MAX_PAGES = 20
 # What GitHub answers when the installation lacks a permission the mint asked
 # for. Its message is about the token, which reads as a code fault; the usual
 # cause is an installation whose permissions were narrowed. Not the only one --
-# 403 also covers a suspended installation and a secondary rate limit -- so the
-# error names all three rather than asserting the first.
+# 403 also covers a suspended installation (a 403 GitHub marks as its rate limit
+# never reaches here: api() ends the run on it) -- so the error names both
+# rather than asserting the first.
 PERMISSION_NOT_GRANTED_CODES = (403, 422)
 
 # Where every pool project keeps the App's private key: the import-only signing
@@ -507,92 +508,97 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
     deleted = 0
     unclosed = []
     undeleted = []
-    pulls = open_pulls(repo, authorization)
-    still_open = set()
-    gone = set()
-    deferred = set()
-    for pull in pulls:
-        if not is_agent_pull_request(pull, repo, bot_login):
-            still_open.add(str((pull.get("head") or {}).get("ref") or ""))
-            continue
-        number = pull["number"]
-        ref = pull["head"]["ref"]
-        print("  #%s (%s)" % (number, ref))
-        if dry_run:
-            closed += 1
-            gone.add(ref)
-            continue
-        if budget is not None and not budget.take(repo, writes_left_if_not=WRITES_PER_PULL_REQUEST):
-            still_open.add(ref)
-            continue
-        # Each close stands alone. One that fails is reported and the sweep
-        # carries on: giving up here would leave every later pull request open,
-        # which is the thing being fixed. HTTPException covers a response cut
-        # short mid-read, which urllib does not raise as OSError.
-        try:
-            write(
-                "PATCH",
-                "/repos/%s/pulls/%s" % (repo, number),
-                authorization,
-                {"state": "closed"},
-            )
-        except RateLimited as exc:
-            exc.closed = closed
-            raise
-        except CALL_FAULTS as exc:
-            print("  #%s did not close (%s)" % (number, boskos_pool.describe(exc)), file=sys.stderr)
-            unclosed.append(number)
-            still_open.add(ref)
-            continue
-        closed += 1
-        # The branch only after the close: a branch deleted first would leave
-        # the pull request open on a head that no longer exists. A branch the
-        # budget cannot pay for is a closed pull request's, which the next
-        # run's branch pass below deletes.
-        if budget is not None and not budget.take(repo):
-            deferred.add(ref)
-            continue
-        try:
-            delete_branch(repo, ref, authorization)
-            deleted += 1
-            gone.add(ref)
-        except RateLimited as exc:
-            exc.closed = closed
-            raise
-        except CALL_FAULTS as exc:
-            print("  #%s closed but %s was not deleted (%s)" % (number, ref, boskos_pool.describe(exc)), file=sys.stderr)
-            undeleted.append(ref)
-    # Branches an earlier run left behind -- a delete that failed, a job killed
-    # between a close and its delete -- belong to closed pull requests, which
-    # no later listing of open ones finds. So the branches are listed too:
-    # every one under the agent's prefix in the repository itself goes, unless
-    # an open pull request (anyone's) still has it as head. In the repository
-    # itself only the agent pushes under its prefix; the prefix-alone caveat
-    # is about forks, which this listing never reaches.
     try:
-        leftover_refs = agent_branches(repo, authorization)
-    except RateLimited as exc:
-        # The first call after a burst of writes is where a refusal lands.
+        pulls = open_pulls(repo, authorization)
+        still_open = set()
+        gone = set()
+        deferred = set()
+        for pull in pulls:
+            if not is_agent_pull_request(pull, repo, bot_login):
+                still_open.add(str((pull.get("head") or {}).get("ref") or ""))
+                continue
+            number = pull["number"]
+            ref = pull["head"]["ref"]
+            print("  #%s (%s)" % (number, ref))
+            if dry_run:
+                closed += 1
+                gone.add(ref)
+                continue
+            if budget is not None and not budget.take(repo, writes_left_if_not=WRITES_PER_PULL_REQUEST):
+                still_open.add(ref)
+                continue
+            # Each close stands alone. One that fails is reported and the sweep
+            # carries on: giving up here would leave every later pull request open,
+            # which is the thing being fixed. HTTPException covers a response cut
+            # short mid-read, which urllib does not raise as OSError.
+            try:
+                write(
+                    "PATCH",
+                    "/repos/%s/pulls/%s" % (repo, number),
+                    authorization,
+                    {"state": "closed"},
+                )
+            except RateLimited as exc:
+                exc.closed = closed
+                raise
+            except CALL_FAULTS as exc:
+                print("  #%s did not close (%s)" % (number, boskos_pool.describe(exc)), file=sys.stderr)
+                unclosed.append(number)
+                still_open.add(ref)
+                continue
+            closed += 1
+            # The branch only after the close: a branch deleted first would leave
+            # the pull request open on a head that no longer exists. A branch the
+            # budget cannot pay for is a closed pull request's, which the next
+            # run's branch pass below deletes.
+            if budget is not None and not budget.take(repo):
+                deferred.add(ref)
+                continue
+            try:
+                delete_branch(repo, ref, authorization)
+                deleted += 1
+                gone.add(ref)
+            except RateLimited as exc:
+                exc.closed = closed
+                raise
+            except CALL_FAULTS as exc:
+                print("  #%s closed but %s was not deleted (%s)" % (number, ref, boskos_pool.describe(exc)), file=sys.stderr)
+                undeleted.append(ref)
+        # Branches an earlier run left behind -- a delete that failed, a job killed
+        # between a close and its delete -- belong to closed pull requests, which
+        # no later listing of open ones finds. So the branches are listed too:
+        # every one under the agent's prefix in the repository itself goes, unless
+        # an open pull request (anyone's) still has it as head. In the repository
+        # itself only the agent pushes under its prefix; the prefix-alone caveat
+        # is about forks, which this listing never reaches.
+        try:
+            leftover_refs = agent_branches(repo, authorization)
+        except RateLimited as exc:
+            # The first call after a burst of writes is where a refusal lands.
+            exc.closed = closed
+            raise
+        for ref in leftover_refs:
+            if ref in gone or ref in still_open or ref in undeleted or ref in deferred:
+                continue
+            print("  branch %s (no open pull request)" % ref)
+            if dry_run:
+                deleted += 1
+                continue
+            if budget is not None and not budget.take(repo):
+                continue
+            try:
+                delete_branch(repo, ref, authorization)
+                deleted += 1
+            except RateLimited as exc:
+                exc.closed = closed
+                raise
+            except CALL_FAULTS as exc:
+                print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
+                undeleted.append(ref)
+    except Terminated as exc:
+        # Prow's signal mid-repository: what was closed before it goes with it.
         exc.closed = closed
         raise
-    for ref in leftover_refs:
-        if ref in gone or ref in still_open or ref in undeleted or ref in deferred:
-            continue
-        print("  branch %s (no open pull request)" % ref)
-        if dry_run:
-            deleted += 1
-            continue
-        if budget is not None and not budget.take(repo):
-            continue
-        try:
-            delete_branch(repo, ref, authorization)
-            deleted += 1
-        except RateLimited as exc:
-            exc.closed = closed
-            raise
-        except CALL_FAULTS as exc:
-            print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
-            undeleted.append(ref)
     return closed, deleted, unclosed, undeleted
 
 
@@ -681,6 +687,13 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
                 closed[name] = exc.closed
             failures[name] = str(exc)
             report["ended_early"] = str(exc)
+        except Terminated as exc:
+            # Recorded, then re-raised: the report written on the way out
+            # names this project and its closes, as the reconcile's does.
+            if getattr(exc, "closed", 0):
+                closed[name] = exc.closed
+            failures[name] = "terminated mid-sweep (%s)" % exc
+            raise
         except (
             SweepError,
             urllib.error.HTTPError,
@@ -782,6 +795,11 @@ def _run(args, run):
                 run["ended_early"] = str(exc)
                 print("ERROR: %s" % exc, file=sys.stderr)
                 return 1, str(exc)
+            except Terminated as exc:
+                if getattr(exc, "closed", 0):
+                    run["closed"][args.project] = exc.closed
+                run["failures"][args.project] = "terminated mid-sweep (%s)" % exc
+                raise
             return 0, None
         _, failures, _ = sweep_pool(
             args.boskos_server,

@@ -826,6 +826,19 @@ class HoldTest(unittest.TestCase):
         self.assertIn("currently owned by other-run", failures["kube-agents-evals-7"])
         self.assertEqual(boskos.released, [])
 
+    def test_a_body_cut_short_does_not_replace_the_error_being_read(self):
+        class _Cut:
+            def read(self):
+                raise http.client.IncompleteRead(b"partial")
+
+            def close(self):
+                pass
+
+        exc = urllib.error.HTTPError("https://api.github.com/x", 429, "reason", {"Retry-After": "5"}, _Cut())
+        self.assertEqual(sweeper.boskos_pool.error_body(exc), "")
+        self.assertEqual(sweeper.boskos_pool.describe(exc), "HTTP 429 reason")
+        self.assertTrue(sweeper.is_rate_limited(exc), "the status still decides")
+
     def test_a_release_refused_for_another_reason_is_not_retried(self):
         boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
         with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stderr", io.StringIO()):
@@ -876,7 +889,8 @@ class ReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rc, doc = self._main_with_report(tmp, github, boskos)
         self.assertEqual((rc, doc["exit"]), (sweeper.TERMINATED_EXIT_CODE, "terminated"))
-        self.assertEqual((doc["closed"], doc["outcomes"]), (1, {"kube-agents-evals-7": {"closed": 1}}))
+        # The project the signal landed in is named too, with nothing closed.
+        self.assertEqual((doc["closed"], doc["outcomes"]), (1, {"kube-agents-evals-7": {"closed": 1}, "kube-agents-evals-8": {"error": "terminated mid-sweep (signal 15)"}}))
         self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
 
     def test_a_project_with_closes_and_a_refusal_reports_both(self):
@@ -923,6 +937,26 @@ class ReportTest(unittest.TestCase):
         self.assertEqual((doc["exit"], doc["exit_code"], doc["error"]), ("error", None, "KeyError: 'boom'"))
         self.assertEqual(doc["outcomes"], {"kube-agents-evals-7": {"closed": 1}})
         self.assertEqual(boskos.released, ["kube-agents-evals-7", "kube-agents-evals-8"])
+
+    def test_a_termination_after_a_close_keeps_that_repositorys_closes(self):
+        # The signal lands inside a repository after one close: the report
+        # names the project, its closes, and that it was interrupted.
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2)]
+
+        class _TerminatingOnSecond(_GitHub):
+            def __call__(self, request, timeout=None):
+                if request.method == "PATCH" and request.full_url.endswith("/pulls/2"):
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = self._main_with_report(tmp, _TerminatingOnSecond(pulls=pulls), boskos)
+        self.assertEqual((rc, doc["exit"], doc["closed"]), (sweeper.TERMINATED_EXIT_CODE, "terminated", 1))
+        self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 1)
+        self.assertIn("terminated mid-sweep", doc["outcomes"]["kube-agents-evals-7"]["error"])
+        self.assertEqual(boskos.released, ["kube-agents-evals-7"])
 
     def test_a_hand_run_refused_twice_exits_one_and_reports_it(self):
         import tempfile

@@ -1778,7 +1778,7 @@ def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet 
     return {
         "job": job, "label": label, "verdict": verdict, "since": finished, "build": build, "finished_at": finished, "result": "FAILURE" if verdict == "FAILED" else "SUCCESS",
         "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "summary": summary, "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{job}",
-        "place": words.place, "absence": words.absence, "presence": words.presence, "does": words.does, "effect": words.effect, "runbook": words.runbook,
+        "place": words.place, "absence": words.absence, "does": words.does, "effect": words.effect, "runbook": words.runbook,
     }
 
 
