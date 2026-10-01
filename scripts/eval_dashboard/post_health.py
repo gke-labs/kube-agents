@@ -1073,8 +1073,9 @@ def pool_state_digest_line(health: dict) -> str | None:
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
     if unread:
-        # A project counts as checked when one check read anything; a scan
-        # that read little must not be reported as a clean bill.
+        # A project counts as checked when one GCP check read anything (the
+        # GitHub read alone does not count); a scan that read little must
+        # not be reported as a clean bill.
         return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, no drift in what was read; {unread} {plural(unread, 'check')} not read in full{unchecked}."
     return f"🧭 *Pool projects:* {checked} of {total} pool projects checked at {when}, every one shaped as the verifier requires{unchecked}."
 

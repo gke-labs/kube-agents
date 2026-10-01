@@ -344,15 +344,26 @@ def _read_checks(entry: dict, whole: bool) -> list[str]:
     return sorted(out)
 
 
+def _gcp_read_checks(entry: dict) -> list[str]:
+    """The GCP reads among the checks read on one project: what "checked"
+    means. The default-branch read (`gitops_default_branch`) runs with the
+    job's own GitHub credential whatever gcloud answered, so a healthy one
+    says nothing about the project; counting it would let a pool whose
+    publisher roles are gone (#1927, the shape `pool_state.unknown` exists
+    for) scan as fully checked with a footnote."""
+    return [c for c in _read_checks(entry, whole=False) if c in verifier.GCP_CHECKS]
+
+
 def unread_units(document: dict | None) -> int:
     """How many checks were not read in full on projects the scan did check:
     not checked at all, or read in part with the rest refused (healthy or
     drifted with `unread`). The digest's "every one shaped as the verifier
-    requires" is only as true as this is zero."""
+    requires" is only as true as this is zero. A project no GCP read reached
+    is blind, not partial, whatever the GitHub read said."""
     count = 0
     for project, entry in _entries(document):
         checks = entry.get(KEY_CHECKS) if isinstance(entry, dict) else None
-        if not isinstance(checks, dict) or not _read_checks(entry, whole=False):
+        if not isinstance(checks, dict) or not _gcp_read_checks(entry):
             continue
         for verdict in checks.values():
             if not isinstance(verdict, dict):
@@ -410,9 +421,10 @@ def check_of(document: dict | None, project: str, finding_id: str) -> str:
 
 
 def checked_projects(document: dict | None) -> int:
-    """Projects where at least one check read anything; a partial read is
-    not a blind scan."""
-    return sum(1 for _, entry in _entries(document) if _read_checks(entry, whole=False))
+    """Projects where at least one GCP check read anything; a partial read
+    is not a blind scan, and the GitHub read alone is not a read of the
+    project (`_gcp_read_checks`)."""
+    return sum(1 for _, entry in _entries(document) if _gcp_read_checks(entry))
 
 
 def _project_reason(entry: dict) -> str | None:

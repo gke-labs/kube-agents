@@ -2858,7 +2858,7 @@ def check_gitops_default_branch(project_id: str) -> CheckResult:
     reporting drift on every private repository its token cannot open.
     """
     name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_DEFAULT_BRANCH]
-    repo_slug = f"gke-agentic/{project_id}-infra"
+    repo_slug = _gitops_repo_slug(project_id)
     rc, out, err = run_cmd(["gh", "api", GITOPS_REPO_API_PATH.format(repo=repo_slug), "--jq", ".default_branch"])
     observed = out.strip()
     if rc != 0 or not observed:

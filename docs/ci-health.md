@@ -767,7 +767,11 @@ document: the same finding on the same project in two consecutive scans, or on
 a scan that could read the incident's checks on its projects no longer shows the
 findings, and a scan that is missing, stale, blind or could not read one of them
 holds it with a note. A scan older than 3 hours is ignored; one that could check
-no project is `pool_state.unknown`, said once by the poster and never a drift. An
+no project is `pool_state.unknown`, said once by the poster and never a drift. A
+project counts as checked when one of its GCP reads happened; the default-branch
+read alone does not count, since it runs with the job's own GitHub credential
+whatever gcloud answered, so a pool whose publisher roles are gone still scans as
+`pool_state.unknown` once the secret exists. An
 extra role is drift like a missing one.
 
 **What it posts.** One Chat message naming the findings and how many projects,

@@ -186,6 +186,21 @@ class OneProject(ScanHarness):
         self.assertEqual(entry["summary"]["not_checked"], 1)
         self.assertEqual(doc["summary"]["checked"], 1, "the GCP checks still make the project a checked one")
 
+    def test_a_default_branch_read_alone_does_not_make_a_project_checked(self):
+        # The #1927 shape once the secret exists: every GCP read refused, the
+        # GitHub read fine. The project is blind, so `checked` stays 0 (which
+        # is what makes health.py raise pool_state.unknown and surface the
+        # reason), and its unread checks are not partial-read units.
+        world = {check: unchecked() for check in CHECKS if check != "gitops_default_branch"}
+        world["gitops_default_branch"] = {"status": "pass", "message": "defaults to main", "exit": 0}
+        doc = self.scan({PROJECT: report(**world)})
+        entry = doc["projects"][PROJECT]
+        self.assertEqual(entry["checks"]["gitops_default_branch"]["state"], "healthy")
+        self.assertEqual(pool_state.checked_projects(doc), 0, "the GitHub read is not a read of the project")
+        self.assertEqual(doc["summary"]["checked"], 0)
+        self.assertEqual(pool_state.unread_units(doc), 0, "a GCP-blind project is blind, not partial")
+        self.assertIn("PERMISSION_DENIED", pool_state.not_checked_reason(doc) or "")
+
     def test_the_stub_exits_the_way_the_verifier_does(self):
         # The fixtures' exit codes sit on the check records; the stub must
         # exit with them or the tests below never see a non-zero verifier.
