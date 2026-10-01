@@ -85,17 +85,17 @@ class CredentialProxyPairTest(unittest.TestCase):
         self.assertIn("git version", out)
         self.assertEqual("", err)
 
-    def test_a_policy_block_surfaces_as_exit_126_naming_the_rule(self):
+    def test_a_policy_block_surfaces_as_exit_77_naming_the_rule(self):
         code, _, err = self._execute(
             ["gcloud", "container", "clusters", "delete", "prod-cluster"]
         )
-        self.assertEqual(126, code)
+        self.assertEqual(77, code)
         self.assertIn("cluster deletion is not available here", err)
         self.assertIn("policy rule: gcloud.destroy", err)
 
     def test_an_unleased_git_write_comes_back_as_a_readable_refusal(self):
         code, _, err = self._execute(["git", "commit", "-m", "x"])
-        self.assertEqual(126, code)
+        self.assertEqual(77, code)
         self.assertIn("policy rule: git.workspace.lease", err)
 
     def test_a_non_json_error_body_is_a_message_not_a_traceback(self):
