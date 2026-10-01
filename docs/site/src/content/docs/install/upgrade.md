@@ -88,7 +88,13 @@ without one predates the Terraform and Helm engine, and has to be re-installed t
 
 A release copy of the script carries the version it upgrades to, which is what makes the one-liner
 above flagless. That baked version is the run's target from the moment it starts, before any flag
-is read, so two of the flags below behave differently depending on which copy you are holding.
+is read, so two of the flags below behave differently depending on which copy you are holding. One
+copy is the exception: `upgrade.sh` in a checkout of a release line (`release/<X.Y>`) that has moved
+past its latest release still carries that release's version but is not that release, so run from
+there, with the release's tag and full history fetched, it drops the baked default, says which line
+and commit it is on, and asks for `--image-tag` the way a copy with no baked version does; a clone that
+lacks the tag, or whose shallow history stops short of the release, is refused and told which fetch
+to run.
 
 - `--image-tag` names a revision to move to instead: a release tag or a full commit SHA. It
   overrides the baked version, and it exists for development and CI/CD testing — a candidate

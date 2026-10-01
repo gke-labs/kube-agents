@@ -16,9 +16,11 @@ from tests.testing.common import (
 )
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
     MOCK_SAMPLE_COMMIT_SHA,
     MOCK_TARGET_RELEASE_TAG,
+    commit_required_release_images,
     create_mock_docker_binary,
 )
 
@@ -95,6 +97,38 @@ class PromoteReleaseImagesScriptTest(unittest.TestCase):
                 self.assertIn(f"Promoted {img} to {MOCK_TARGET_RELEASE_TAG}", proc.stdout)
             docker_log = pathlib.Path(temp_dir.name) / "bin" / "docker.log"
             self.assertIn("--prefer-index=false", docker_log.read_text())
+        finally:
+            temp_dir.cleanup()
+
+    def test_promote_iterates_the_candidates_own_list(self):
+        """The candidate's common.sh names fewer images than this checkout's;
+        those, and only those, are promoted (#2211). The stamp commit between
+        the candidate and the tag changes no list, so the tag's parent reads
+        the candidate's."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_docker_binary(bin_dir)
+
+            candidate_commit = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+            git("checkout", "--detach", candidate_commit)
+            (pathlib.Path(repo_dir) / "version.txt").write_text("v0.2.0\n")
+            git("add", "version.txt")
+            git("commit", "-m", "chore(release): stamp release version 0.2.0")
+            git("tag", MOCK_TARGET_RELEASE_TAG, git("rev-parse", "HEAD").stdout.strip())
+
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true"},
+                bin_dir=str(bin_dir),
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"lists at {candidate_commit[:7]}", proc.stderr)
+            for img in MOCK_CANDIDATE_RELEASE_IMAGES:
+                self.assertIn(f"Promoted {img} to {MOCK_TARGET_RELEASE_TAG}", proc.stdout)
+            for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
+                self.assertNotIn(f"Promoting {img}", proc.stdout, f"{img} is not in the candidate's list")
         finally:
             temp_dir.cleanup()
 

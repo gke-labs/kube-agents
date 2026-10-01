@@ -144,11 +144,13 @@ func credentialProxyName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // credentialProxySelector reproduces the labels the pre-#368 standalone proxy
-// carried, down to the component label nothing reads any more. A Deployment's
-// spec.selector is immutable, so an install old enough to still have that
-// Deployment — one that has not reconciled since #368's cleanup removed it —
-// would otherwise fail the apply and wedge the whole reconcile rather than
-// adopting the object.
+// carried, component label included. A Deployment's spec.selector is
+// immutable, so an install old enough to still have that Deployment — one
+// that has not reconciled since #368's cleanup removed it — would otherwise
+// fail the apply and wedge the whole reconcile rather than adopting the
+// object. The chart's PodMonitoring for the broker selects on both labels as
+// well (tests/test_chart_platform_agent_monitoring.py holds it to them), so a
+// change here is a change there.
 func credentialProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{
 		"app":                           credentialProxyName(agent),
@@ -321,7 +323,12 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/usr/local/bin/start-services"},
 		Env:             envVars,
-		Ports:           []corev1.ContainerPort{{Name: "cred-proxy", ContainerPort: credentialProxyPort}},
+		Ports: []corev1.ContainerPort{
+			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
+			// The runtime's metrics-only listener, for the chart's PodMonitoring
+			// (see credentialProxyMetricsPort).
+			{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
+		},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/healthz", Port: intstr.FromString("cred-proxy"),
@@ -465,6 +472,12 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 // hosted here. TokenReview already rejects a caller this pod does not serve;
 // this is the layer that keeps such a caller from opening the connection.
 //
+// A second rule admits the managed-Prometheus collector, from its own
+// namespace and to the metrics-only port alone: the runtime serves its counters
+// on credentialProxyMetricsPort rather than behind Envoy so that the collector
+// never has a route to the credentialed listener, and that is the port this
+// rule opens.
+//
 // Ingress only. Egress is left open because this pod is the one that talks to
 // the world — GKE control planes, the Google Chat and Slack APIs, the token
 // broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
@@ -480,16 +493,26 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
-			Ingress: []networkingv1.NetworkPolicyIngressRule{{
-				From: []networkingv1.NetworkPolicyPeer{
-					{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
-					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: []networkingv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
+						{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": agent.Name + "-gateway"}}},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{{
+						Protocol: &tcp,
+						Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
+					}},
 				},
-				Ports: []networkingv1.NetworkPolicyPort{{
-					Protocol: &tcp,
-					Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
-				}},
-			}},
+				{
+					From: []networkingv1.NetworkPolicyPeer{{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+						},
+					}},
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyMetricsPort)},
+				},
+			},
 		},
 	}
 	withCommonLabels(np, agent)

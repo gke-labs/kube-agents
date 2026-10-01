@@ -15,7 +15,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
-- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
+- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
@@ -34,7 +34,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in eleven places here, with different runners and different answers to "does this catch a
+Tests live in many places, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -61,12 +61,12 @@ did not expect, or nowhere at all, and the suite reports green around it.
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.
 
-One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
+One rule holds wherever it lands: a new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
 suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
 deliberately; its README says why.
 
-The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
@@ -344,8 +344,8 @@ Agents with a user in the loop follow this file.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
   on changed Markdown and YAML, `make shellcheck` on changed shell scripts, a local Docker build of
   the agent runner, the image-layer budget if you added a `RUN` or `COPY` to
-  `deploy/docker/Dockerfile`, and `go build` inside whichever Go module you touched
-  (`k8s-operator/`, `a2a/`).
+  `deploy/docker/Dockerfile`, `go build` inside whichever Go module you touched
+  (`k8s-operator/`, `a2a/`), and `make terraform-test` on a changed Terraform module.
   Each has a constraint that costs a CI run to rediscover — the pinned prettier version, the
   mandatory `--platform linux/amd64`, the layer ceiling that only fails after merge. The
   commands and those reasons are in

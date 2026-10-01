@@ -188,5 +188,47 @@ class TestGatewayDispatch(AuditTestCase):
         self.assertEqual(record["user_id"], "")
 
 
+class TestEnvelope(AuditTestCase):
+    """Every record is self-describing: the schema's kind, severity and time, plus
+    the status and tool the structured schema names, beside the keys the Admin
+    Console has always read."""
+
+    def test_a_tool_call_carries_the_envelope_and_the_schema_fields(self):
+        start = self.emit(audit.log_pre_tool_call, tool_name="Bash", args={"command": "ls"}, task_id="t-1")
+        self.assertEqual(start["event_type"], "tool_call_start")
+        self.assertEqual(start["audit_event"], start["event_type"])
+        self.assertEqual(start["severity"], "INFO")
+        self.assertRegex(start["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+        self.assertEqual((start["tool"], start["status"]), ("Bash", "started"))
+
+        end = self.emit(audit.log_post_tool_call, tool_name="Bash", result="ok", duration_ms=7, task_id="t-1")
+        self.assertEqual((end["event_type"], end["tool"], end["status"], end["duration_ms"]), ("tool_call_end", "Bash", "completed", 7))
+
+    def test_every_record_is_one_line_of_json(self):
+        for call, kwargs in (
+            (audit.log_pre_tool_call, {"tool_name": "Bash", "args": {"command": "echo\nhi"}}),
+            (audit.log_post_tool_call, {"tool_name": "Bash", "result": "a\nb"}),
+            (audit.log_pre_approval_request, {"command": "rm -rf /\n", "description": "d"}),
+            (audit.log_post_approval_response, {"command": "x", "choice": "deny"}),
+        ):
+            with self.subTest(call=call.__name__):
+                with self.assertLogs(audit.logger, level="INFO") as captured:
+                    call(**kwargs)
+                line = captured.records[0].getMessage()
+                self.assertNotIn("\n", line)
+                json.loads(line)
+
+    def test_approvals_and_dispatch_carry_a_status_or_a_principal(self):
+        request = self.emit(audit.log_pre_approval_request, command="x", description="d")
+        self.assertEqual(request["status"], "requested")
+        response = self.emit(audit.log_post_approval_response, command="x", choice="allow")
+        self.assertEqual(response["status"], "answered")
+        source = SimpleNamespace(platform="google_chat", user_id=EMAIL)
+        event = SimpleNamespace(source=source, text="hello")
+        dispatch = self.emit(audit.log_pre_gateway_dispatch, event=event)
+        self.assertEqual(dispatch["principal"], AuditRedactor.hmac_hash(EMAIL))
+        self.assertEqual(dispatch["principal"], dispatch["user_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

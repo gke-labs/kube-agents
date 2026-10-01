@@ -5,10 +5,16 @@
 # under the EXACT SAME tag.
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 #
-# The gate is the staging_<ts>_<sha> tag and nothing beside it. An rc_*_validated tag is not checked
-# as well, because it is implied: a staging tag is only ever created by the nightly pipeline, which
-# only ever promotes a candidate that already carries one. Two gates to keep in step is how one of
-# them ends up answering for the other.
+# The gate for a release from main is the staging_<ts>_<sha> tag and nothing beside it. An
+# rc_*_validated tag is not checked as well, because it is implied: a staging tag is only ever
+# created by the nightly pipeline, which only ever promotes a candidate that already carries one.
+# Two gates to keep in step is how one of them ends up answering for the other.
+#
+# A release line (RELEASE_LINE=X.Y) has the other gate: rc_*_validated on the line's head, earned
+# by dispatching rc-release-pipeline.yml against it. The nightly matrix and the eval nominate main
+# commits only, so a line never carries a staging_ tag. Its candidate is the line's own, as
+# release_line_resolve_candidate reads it: the head; the commit a head that is itself a stamped
+# release was cut from; or, with a version named, the commit that version's stamp was cut from.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +26,11 @@ TARGET_COMMIT_INPUT="${2:-${RC_CANDIDATE_COMMIT:-${TARGET_COMMIT:-}}}"
 TARGET_REPO="$(get_target_repo)"
 SKIP_VALIDATION="${SKIP_STAGING_VALIDATION:-${3:-false}}"
 EMERGENCY_REASON="${EMERGENCY_OVERRIDE_REASON:-${4:-}}"
+RELEASE_LINE="${RELEASE_LINE:-}"
+if [ -n "${RELEASE_LINE}" ] && ! [[ "${RELEASE_LINE}" =~ ${RELEASE_LINE_SHAPE_REGEX} ]]; then
+  echo "❌ ERROR: RELEASE_LINE '${RELEASE_LINE}' is not a release line; expected X.Y." >&2
+  exit 1
+fi
 
 if [ -z "${TARGET_VERSION}" ]; then
   echo "❌ ERROR: TARGET_VERSION is required as first argument or environment variable." >&2
@@ -54,7 +65,14 @@ fi
 
 # 2. Resolve Candidate Commit SHA
 RC_CANDIDATE_COMMIT=""
-if [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
+if [ -n "${RELEASE_LINE}" ]; then
+  if [ "$(release_line_for_version "${TARGET_VERSION}")" != "${RELEASE_LINE}" ]; then
+    echo "❌ ERROR: Version '${TARGET_VERSION}' is not on release line ${RELEASE_LINE}." >&2
+    exit 1
+  fi
+  RC_CANDIDATE_COMMIT="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_COMMIT_INPUT}" "${TARGET_VERSION}")" || exit 1
+  echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${RC_CANDIDATE_COMMIT:0:7}"
+elif [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
   if ! RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${TARGET_COMMIT_INPUT}^{commit}" 2>/dev/null)"; then
     echo "❌ ERROR: Cannot resolve valid Git commit from '${TARGET_COMMIT_INPUT}'!" >&2
     exit 1
@@ -165,10 +183,30 @@ if is_truthy "${SKIP_VALIDATION}"; then
   exit 0
 fi
 
-# 5. Check for a staging promotion tag pointing at target commit.
+# 5. Check the validation gate at the target commit: a staging promotion tag for a release
+# from main, an RC validation marker for a release line.
 #
-# Shape-matched via common.sh rather than by the staging_ prefix: the prefix is a live deploy
-# trigger anyone can push, so a hand-made 'staging_hotfix' would otherwise satisfy the release gate.
+# Both shape-matched via common.sh rather than by prefix: the staging_ prefix is a live deploy
+# trigger anyone can push and the rc_ family is open to hand-made names, so a 'staging_hotfix' or
+# an 'rc_hotfix_validated' would otherwise satisfy the release gate. The line's is also bound to
+# the candidate's own short sha, the name the pipeline mints for it, so a composed
+# 'rc_<ts>_0000000_validated' does not satisfy the one gate a line has.
+if [ -n "${RELEASE_LINE}" ]; then
+  echo "🔎 Checking for rc_*_validated tags pointing at release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT}..."
+  VALIDATED_TAGS="$(validated_rc_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
+  if [ -z "${VALIDATED_TAGS}" ]; then
+    echo "❌ BLOCKED: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT} has NOT passed the RC validation!" >&2
+    echo "   No 'rc_<ts>_${RC_CANDIDATE_COMMIT:0:7}_validated' tag from the RC pipeline points to this commit." >&2
+    OTHER_MARKERS="$(git tag --points-at "${RC_CANDIDATE_COMMIT}" "rc_*_validated" 2>/dev/null | tr '\n' ' ' || true)"
+    if [ -n "${OTHER_MARKERS}" ]; then
+      echo "   It carries ${OTHER_MARKERS}- not that name, so earned under a hand-named rc_tag dispatch input or placed by hand; neither counts here." >&2
+    fi
+    echo "   Dispatch '.github/workflows/rc-release-pipeline.yml' with commit_sha=${RC_CANDIDATE_COMMIT} and rc_tag empty (it reuses only its own rc_<ts>_<sha> tag and mints one otherwise), and wait for it to tag the commit validated." >&2
+    exit 1
+  fi
+  FIRST_VAL_TAG="$(head -n 1 <<<"${VALIDATED_TAGS}")"
+  echo "✅ ELIGIBLE: Found RC validation tag(s) on commit ${RC_CANDIDATE_COMMIT}:"
+else
 echo "🔎 Checking for staging_<ts>_<sha> tags pointing at commit ${RC_CANDIDATE_COMMIT}..."
 VALIDATED_TAGS="$(staging_promotion_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
 
@@ -184,6 +222,7 @@ fi
 
 FIRST_VAL_TAG="$(head -n 1 <<<"${VALIDATED_TAGS}")"
 echo "✅ ELIGIBLE: Found staging promotion tag(s) on commit ${RC_CANDIDATE_COMMIT}:"
+fi
 for tag in ${VALIDATED_TAGS}; do
   echo "   • ${tag}"
 done

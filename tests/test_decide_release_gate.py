@@ -264,5 +264,21 @@ class DecideReleaseGateTest(unittest.TestCase):
             temp_dir.cleanup()
 
 
+    def test_a_release_line_is_a_bypass_dispatch_and_names_no_commit(self):
+        """A line's patch is hand-dispatched from its own branch; the resolver reads main's gate."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        for env, phrase in (
+            ({"SCHEDULE_GATE": "evaluate", "RELEASE_LINE": "0.2"}, "cannot decide it"),
+            ({"SCHEDULE_GATE": "dry-run", "RELEASE_LINE": "0.2"}, "cannot decide it"),
+            ({"SCHEDULE_GATE": "bypass", "RELEASE_LINE": "0.2", "TARGET_COMMIT": "abc1234"}, "cannot be named alongside"),
+        ):
+            with self.subTest(env=env):
+                proc, _, _ = self._run(repo_dir, env=env)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(phrase, proc.stderr)
+        proc, _, _ = self._run(repo_dir, env={"SCHEDULE_GATE": "bypass", "RELEASE_LINE": "0.2"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
 if __name__ == "__main__":
     unittest.main()

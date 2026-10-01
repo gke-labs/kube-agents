@@ -510,7 +510,8 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
 
 - **Angle J already has an author to filter by**, which the skill cannot assume:
   `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
-  review comments on any sibling touching adjacent paths.
+  review comments on any sibling touching adjacent paths. A sibling the body names by number may
+  already have merged, and no listing will hold it — fetch that one with `gh pr view`.
 
 - **No green-suite bypass.** Do not skip hunting candidates because CI or unit tests are passing.
   Work every angle explicitly against the diff as defined in `review-adversarial`.

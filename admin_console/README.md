@@ -314,7 +314,10 @@ continuation tokens only in the UI session; **Load more activity** appends the
 next pages without rereading earlier results. Logging uses 500-record pages, a
 60-second per-page timeout, and a shared 90-second load deadline. A later-page
 failure retains the earlier pages and is reported as partial data. Trace and
-each of Logging's two non-overlapping queries stop after ten pages; the UI asks
+each of Logging's two queries — one over records whose fields the fluent-bit
+sidecar lifted, one over the wrapped text form of a record it did not lift, so
+neither reads the other's rows; a record both return is still merged by
+`insertId` and counted once — stop after ten pages; the UI asks
 the user to narrow the time window when a query reaches that ceiling. The
 forensic ledger separately paginates the loaded events at 50 rows per page so
 source completeness does not create an oversized browser table.

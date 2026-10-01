@@ -77,8 +77,7 @@ def _clear_mount_skeleton(home: Path) -> bool:
 
 # Absolute, because a kanban worker's terminal runs with a stripped environment in
 # which /opt/hermes/.venv/bin is not on PATH — a bare `hermes` raises ENOENT there
-# while working fine from an interactive shell. Same trap as `_roster_command` in
-# agents/chat/scripts/bootstrap_scan_gate.py.
+# while working fine from an interactive shell.
 HERMES_BIN = os.environ.get("HERMES_BIN") or "/opt/hermes/.venv/bin/hermes"
 
 

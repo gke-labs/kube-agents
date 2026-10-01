@@ -62,6 +62,11 @@ def trace_payload(trace_id: str) -> dict:
     }
 
 
+def is_lifted_query(filter_text: str) -> bool:
+    """The Logging query over lifted records, as opposed to the one over the wrapped text."""
+    return 'jsonPayload.log:"audit_event"' not in filter_text
+
+
 def logging_payload(insert_id: str) -> dict:
     return {
         "insertId": insert_id,
@@ -89,7 +94,7 @@ class TelemetryNormalizationTest(unittest.TestCase):
         def read(request, *, timeout):
             body = json.loads(request.data)
             requests.append((request, body, timeout))
-            direct = "jsonPayload.audit_event" in body["filter"]
+            direct = is_lifted_query(body["filter"])
             token = body.get("pageToken", "")
             if not token:
                 return JsonResponse(
@@ -183,7 +188,7 @@ class TelemetryNormalizationTest(unittest.TestCase):
 
         def read(request, *, timeout):
             body = json.loads(request.data)
-            if "jsonPayload.audit_event" in body["filter"]:
+            if is_lifted_query(body["filter"]):
                 raise TimeoutError
             return JsonResponse({"entries": [logging_payload("wrapped")]})
 
@@ -295,6 +300,73 @@ class TelemetryNormalizationTest(unittest.TestCase):
     def test_trace_page_budget_is_bounded(self):
         with self.assertRaisesRegex(ValueError, "trace pages"):
             CloudTelemetryProvider("demo-project", trace_pages=11)
+
+    def test_logging_text_query_excludes_the_records_the_sidecar_lifted(self):
+        provider = CloudTelemetryProvider("demo-project")
+        provider._start = datetime(2026, 8, 1, tzinfo=UTC)
+        provider._end = datetime(2026, 8, 2, tzinfo=UTC)
+
+        wrapped, lifted = provider._logging_queries()
+
+        self.assertIn('jsonPayload.log:"audit_event"', wrapped)
+        self.assertIn("NOT jsonPayload.audit_event:*", wrapped)
+        self.assertIn("jsonPayload.audit_event:*", lifted)
+        self.assertNotIn("NOT", lifted)
+        self.assertNotIn("jsonPayload.log", lifted)
+
+    def test_normalizes_lifted_cron_tool_audit_from_the_line_prefix(self):
+        # The row the fluent-bit sidecar writes: the record's keys lifted to
+        # jsonPayload fields, the raw Hermes line kept under `log`. The cron
+        # session tag is only in that line's prefix.
+        line = (
+            "2026-07-28 19:07:04,711 INFO [cron_capacity_20260728_190038] "
+            'hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", '
+            '"duration_ms": 711, "event_type": "tool_call_end", '
+            '"result": "{\\"exit_code\\": 0}", "severity": "INFO", '
+            '"status": "completed", "task_id": "task-1", '
+            '"timestamp": "2026-07-28T19:07:04.711Z", "tool": "terminal", '
+            '"tool_name": "terminal"}'
+        )
+        row = {
+            "insertId": "log-lifted",
+            "timestamp": "2026-07-28T19:07:04Z",
+            "logName": "projects/demo/logs/stdout",
+            "resource": {
+                "labels": {
+                    "cluster_name": "test-cluster-01",
+                    "namespace_name": "kubeagents-system",
+                    "container_name": "fluent-bit",
+                }
+            },
+            "jsonPayload": {
+                "log": line,
+                "file_path": "/opt/data/logs/agent.log",
+                "app": "agent",
+                "log_source": "agent-file",
+                "audit_event": "tool_call_end",
+                "event_type": "tool_call_end",
+                "severity": "INFO",
+                "timestamp": "2026-07-28T19:07:04.711Z",
+                "tool_name": "terminal",
+                "tool": "terminal",
+                "status": "completed",
+                "task_id": "task-1",
+                "duration_ms": 711,
+                "result": '{"exit_code": 0}',
+            },
+        }
+
+        event = normalize_logging_row(row, "demo-project")
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.trigger_kind, TriggerKind.CRON)
+        self.assertEqual(event.attribution, AttributionLevel.INHERITED)
+        self.assertEqual(event.session_id, "cron_capacity_20260728_190038")
+        self.assertEqual(event.interaction_id, "task-1")
+        self.assertEqual(event.status, "completed")
+        self.assertEqual(event.agent_name, "gateway-runtime")
+        self.assertEqual(event.details["collector_container"], "fluent-bit")
 
     def test_normalizes_wrapped_cron_tool_audit(self):
         row = {

@@ -87,6 +87,14 @@ PARAM_REGION=""
 # before the flag existed: the namespace came from install.env alone.
 PARAM_AGENT_NAMESPACE=""
 PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
+# Whether that default came from the baked version alone: the one default a
+# release-line checkout past its stamp takes back (see
+# drop_baked_default_on_a_line_checkout_past_it). parse_args clears it when
+# --image-tag is passed, which is not a default.
+IMAGE_TAG_DEFAULTED_FROM_BAKED="false"
+if [ -z "${IMAGE_TAG:-}" ] && [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+  IMAGE_TAG_DEFAULTED_FROM_BAKED="true"
+fi
 TEMP_REPO_DIR=""
 # Set when this run detached the install's own checkout onto the target
 # release. Everything that can still refuse the upgrade — the configuration
@@ -305,7 +313,9 @@ Options:
   --keep-image-tag         Upgrade everything except the images, leaving them on
                            the tag the install already serves. Use instead of
                            --image-tag, not alongside it; a script carrying a
-                           baked release version already has one, and refuses it.
+                           baked release version already has one, and refuses it,
+                           unless it runs from a release-line checkout past that
+                           release, which carries no version of its own to keep.
   --drop-undeclared-values With --upgrade-mode=operator or harness, drop the
                            release's recorded values the target chart's schema
                            does not declare, instead of refusing the upgrade
@@ -751,6 +761,143 @@ sys.stdout.buffer.write(text.encode("utf-8"))
   rm -f "$dropped_file"
 }
 
+# A release-line checkout between stamps. A patch is stamped as a child of the
+# line's head, so every backport that lands on release/<X.Y> after a release
+# descends from a stamped commit and carries its BAKED_RELEASE_VERSION, which is
+# the previous release's. True when the directory is a Git checkout whose HEAD
+# descends from the baked release's commit without being it: unreleased
+# development on the line, whose images are built per commit, so the release is
+# not the tag to default to. Exactly the tag's commit is the release checkout,
+# and a HEAD that is neither is left to verify_local_source_ref, which refuses
+# the mismatch as before. A tag the checkout does not hold reads as "not past":
+# the release's own commit is on the line's history, so a clone of the line
+# brings the tag with it. And only a checkout whose own scripts carry the
+# baked version (release_version_of_source_tree): the version belongs to the
+# script that is running, and a tree whose upgrade.sh was replaced by another
+# release's is not a line checkout of that release. Same rule as install.sh's;
+# the front doors carry their own copies of what they need before any sources
+# are acquired.
+checkout_is_past_baked_release() {
+  local repo_dir="${1:-.}" tag_commit head_commit
+  [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
+  [ "$(release_version_of_source_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
+  head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  [ "$tag_commit" != "$head_commit" ] || return 1
+  git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
+}
+
+# What stands between a line checkout and being recognised, for the refusals in
+# verify_local_source_ref, mirroring checkout_is_past_baked_release's conditions
+# and where main reads it from: the release's tag not fetched, or a shallow
+# history the ancestry walk cannot cross (a `--depth 1` clone of the line, which
+# `git fetch --tags` alone does not mend); else a running upgrade.sh that is not
+# the tree's own (piped, or run from elsewhere); else a HEAD that does not
+# descend from the release, which no fetch mends. Printed only for a tree whose
+# own scripts carry the version; the caller checks that. Same text as
+# install.sh's.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" descends="false" line="${BAKED_RELEASE_VERSION%.*}"
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    descends="true"
+  fi
+  # The fetches the predicate's walk would need, and only those: no tag, or a
+  # shallow history the walk could not cross. A shallow clone deep enough to
+  # hold the release needs nothing fetched.
+  if [ -z "$tag_commit" ]; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$descends" != "true" ] && [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  script_dir="$(script_checkout_dir)"
+  [ -z "$script_dir" ] || script_dir="$(cd "$script_dir" && pwd -P)"
+  local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
+  if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release upgrade.sh, or one run from another directory: only the
+    # checkout's own upgrade.sh recognises a release-line checkout, so that comes
+    # first, with whatever fetch it would also need.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the upgrade.sh running is not this checkout's. If it is a checkout of a release line, run its own ./upgrade.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ "$descends" = "true" ]; then
+    # Recognisable, and asked for the release by name anyway (--image-tag, or
+    # IMAGE_TAG in the shell or install.env, naming the baked version): the
+    # checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; or ${own_images}."
+  elif [ -n "$remedies" ]; then
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
+  else
+    # Tag present, history complete, the checkout's own script running: HEAD
+    # simply does not descend from the release (a cherry-picked or rebased
+    # stamp). No fetch changes that.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but ${head_commit:0:7} is neither that release's commit nor a descendant of it, so it is not a release-line checkout past it. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
+  fi
+}
+
+# The directory this script runs from, when that is a kube-agents checkout;
+# empty under `curl … | bash`, where no file names one. acquire_upgrade_sources
+# and the release-line check in main both read it.
+#
+# Under `curl … | bash` there is no script file on disk. At the top level
+# `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
+# this runs — what bash reports depends on its version: `main` or nothing on
+# the releases on_error's comment above describes, and `$0` on bash 5.3
+# (measured): `bash` for the documented one-liner, or the interpreter's own
+# path (`/bin/bash`) when it is invoked by path. None of them names this
+# script. An unguarded `dirname` turns the empty value, `main` and a bare
+# `bash` into `.`, and `pwd` into the directory the operator is standing in,
+# which would skip the checkout arms in acquire_upgrade_sources. Two checks
+# share the job:
+# requiring a non-empty path that names an existing file rejects the empty
+# value, `main` and a bare `bash` (short of a file by that name in the
+# working directory), and the installer-helper marker check that follows
+# rejects the interpreter's directory, which carries no checkout.
+script_checkout_dir() {
+  local script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd || echo "")"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+    printf '%s' "$script_dir"
+  fi
+}
+
+# The baked version is the run's target from the moment it starts, which is
+# right for a release's own upgrade.sh and wrong for the upgrade.sh of a line
+# checkout that has moved past that release: it would upgrade to the previous
+# release's images under the backport's engine, a mismatch nobody asked for,
+# and verify_local_source_ref would refuse it as a source mismatch rather than
+# ask for a version. So a defaulted target is taken back on such a checkout,
+# and the run asks the way a copy with no baked version does. An explicit
+# --image-tag or IMAGE_TAG is not a default and is left alone.
+# Arguments: $1 = the checkout to judge (the script's own, in main)
+drop_baked_default_on_a_line_checkout_past_it() {
+  local repo_dir="${1:-}"
+  [ "$IMAGE_TAG_DEFAULTED_FROM_BAKED" = "true" ] || return 0
+  [ -n "$repo_dir" ] && checkout_is_past_baked_release "$repo_dir" || return 0
+  local head_commit count
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD)"
+  count="$(git -C "$repo_dir" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")"
+  # The remedy depends on what the run is about: a plan or a --keep-image-tag
+  # run reads the installed tag next and needs no --image-tag, so it is not
+  # told to pass one.
+  local remedy="pass --image-tag ${head_commit} for this commit's images, or run tag ${BAKED_RELEASE_VERSION}'s own upgrade.sh for the release."
+  if [ "$PARAM_KEEP_IMAGE_TAG" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    remedy="this run reads the tag the install already serves instead."
+  fi
+  print_info "This checkout is release line ${BAKED_RELEASE_VERSION%.*} at ${head_commit:0:7}, ${count} commit(s) past release ${BAKED_RELEASE_VERSION}, whose version its scripts still carry. Its images are built per commit and not released, so ${BAKED_RELEASE_VERSION} is not this run's default: ${remedy}"
+  PARAM_IMAGE_TAG=""
+}
+
+# Whether main's tag block is looking at the default the function above took
+# back: the baked version was the default and the tag is now empty, which
+# nothing else produces. The "--image-tag is required" exit reads it to say why
+# rather than that the script carries no baked version.
+baked_default_was_dropped() {
+  [ "$IMAGE_TAG_DEFAULTED_FROM_BAKED" = "true" ] && [ -z "$PARAM_IMAGE_TAG" ]
+}
+
 # The two refusals that do not need a ref to make sense: an unversioned source
 # directory, and a dirty one. Split out of verify_local_source_ref because a
 # tagless run still applies this checkout's Terraform and charts to a live
@@ -857,11 +1004,26 @@ verify_local_source_ref() {
   local expected_commit current_commit
   if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    # Only when the tree's own scripts carry the version (the line
+    # checkout_is_past_baked_release draws): a piped release upgrade.sh
+    # standing in some other checkout that lacks the tag is not a line checkout
+    # to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     return 1
   fi
   current_commit="$(git -C "$repo_dir" rev-parse HEAD)"
   if [ "$current_commit" != "$expected_commit" ]; then
     print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+    # The tag is here and HEAD is not it: a line checkout asked for the release
+    # by name (--image-tag with the baked version), one the predicate could not
+    # walk (a shallow clone), or an unrelated commit. Same gate as above.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     return 1
   fi
   # Whose '0.6.0' is this? For sources this run fetched, the answer is settled:
@@ -1102,8 +1264,8 @@ parse_args() {
       --gcp-region) PARAM_REGION="$2"; shift 2 ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
-      --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
-      --image-tag) PARAM_IMAGE_TAG="$2"; shift 2 ;;
+      --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift ;;
+      --image-tag) PARAM_IMAGE_TAG="$2"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift 2 ;;
       --help|-h) show_help; exit 0 ;;
       *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
     esac
@@ -1193,24 +1355,9 @@ acquire_upgrade_sources() {
   # locals dynamically, so a local sharing a name with the variable named in
   # $1 or $2 would be the one printf -v writes to, and the caller would read
   # back an empty string.
-  local resolved_dir="" found_checkout="" script_dir="" script_path="${BASH_SOURCE[0]:-}"
-  # Under `curl … | bash` there is no script file on disk. At the top level
-  # `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
-  # this runs — what bash reports depends on its version: `main` or nothing on
-  # the releases on_error's comment above describes, and `$0` on bash 5.3
-  # (measured): `bash` for the documented one-liner, or the interpreter's own
-  # path (`/bin/bash`) when it is invoked by path. None of them names this
-  # script. An unguarded `dirname` turns the empty value, `main` and a bare
-  # `bash` into `.`, and `pwd` into the directory the operator is standing in,
-  # which would skip the checkout arms below. Two checks share the job:
-  # requiring a non-empty path that names an existing file rejects the empty
-  # value, `main` and a bare `bash` (short of a file by that name in the
-  # working directory), and the installer-helper marker check that follows
-  # rejects the interpreter's directory, which carries no checkout.
-  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
-    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd || echo "")"
-  fi
-  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+  local resolved_dir="" found_checkout="" script_dir=""
+  script_dir="$(script_checkout_dir)"
+  if [ -n "$script_dir" ]; then
     resolved_dir="$script_dir"
   elif [ -f "$(pwd)/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ] && {
     [ -z "$expected_ref" ] || ! is_kube_agents_clone "$(pwd)"
@@ -1326,11 +1473,16 @@ main() {
   # A flag rather than "empty means keep", because empty already means
   # something: it is the shape of a CI job whose IMAGE_TAG variable did not
   # resolve, and that has to stay the hard error it has always been.
+  drop_baked_default_on_a_line_checkout_past_it "$(script_checkout_dir)"
   if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_KEEP_IMAGE_TAG" = "true" ]; then
     print_info "--keep-image-tag: this run keeps the tag the install is already serving."
   elif [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_info "No --image-tag given; the plan will use the tag this install is already running."
   elif [ -z "$PARAM_IMAGE_TAG" ]; then
+    if baked_default_was_dropped && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! { [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; }; }; then
+      print_error "--image-tag is required from a release-line checkout past its release; pass this commit's full SHA (above) or a validated release tag."
+      exit 1
+    fi
     if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       print_error "--image-tag is required; this copy of the script carries no baked release version. Re-run the release-pinned script for the version you want, or pass a validated release tag or full commit SHA."
       exit 1
