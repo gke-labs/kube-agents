@@ -133,11 +133,11 @@ const (
 	activityToolNameCap = 256
 	activityCallIDCap   = 128
 	activityWordCap     = 64
-	// wrapperNameDepth is where a nested tool name sits in hermes's tool_call
-	// wrapper: the root map (0) holds the "calls" array (1), whose element
-	// map (2) holds the "name" string (3). Only that string is a tool name; a
-	// "calls[].name" deeper down is an argument value.
-	wrapperNameDepth = 3
+	// wrapperCallsDepth is where hermes's tool_call wrapper carries its
+	// calls array: the root object's own "calls" value (the root map is
+	// depth 0, its values depth 1). Only the elements of that array are
+	// calls whose "name" is a tool name.
+	wrapperCallsDepth = 1
 	// unparseableInput is what an input the door could not decode or
 	// re-encode becomes on the bus.
 	unparseableInput = `{"unparseable":true}`
@@ -173,9 +173,9 @@ const (
 	// activityDrainTimeout bounds finalize's flush of the calls still open,
 	// so a slow bus cannot spend the terminal's budget.
 	activityDrainTimeout = 5 * time.Second // activityDrainBudget below is its variable
-	// activitySeenCap bounds the delivery ids remembered per task for
-	// dedupe; hermes retries a delivery at most once, so the set only
-	// grows with the calls.
+	// activitySeenCap is how many delivery ids a task remembers for
+	// dedupe, the most recent kept: hermes retries a delivery once, right
+	// after it, so an id older than the newest 8192 has no retry coming.
 	activitySeenCap  = 8192
 	activityKeyBytes = 32
 	// activityTruncatedTool names the one entry published in place of the
@@ -444,6 +444,8 @@ type activityState struct {
 	open       map[string]ActivityEntry // calls started and not yet ended
 	openOrder  []string                 // their ids, in start order
 	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
+	seenRing   []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
+	seenNext   int
 	calls      int
 	published  int // trace parts sent, against the budget less the reserve
 	heartbeats int // progress parts sent, against the reserve
@@ -530,9 +532,16 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		if _, dup := a.seen[d.DeliveryID]; dup {
 			return ActivityEntry{}, false
 		}
-		if len(a.seen) < activitySeenCap {
-			a.seen[d.DeliveryID] = struct{}{}
+		// The most recent activitySeenCap ids: a retry follows its first
+		// delivery closely, so the oldest id is the one safe to forget.
+		if len(a.seenRing) < activitySeenCap {
+			a.seenRing = append(a.seenRing, d.DeliveryID)
+		} else {
+			delete(a.seen, a.seenRing[a.seenNext])
+			a.seenRing[a.seenNext] = d.DeliveryID
+			a.seenNext = (a.seenNext + 1) % activitySeenCap
 		}
+		a.seen[d.DeliveryID] = struct{}{}
 	}
 	a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 	switch d.Event {
@@ -811,16 +820,18 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 // left as they are. A "[redacted]" marker stays a marker, so the trace still
 // says a secret-looking key was there.
 func shapeValue(v any, tool string) any {
-	return shapeValueIn(v, "", "", tool == hermesToolCallWrapper, 0)
+	return shapeValueIn(v, "", tool == hermesToolCallWrapper, 0, false)
 }
 
-// shapeValueIn is shapeValue with the enclosing key, the container depth
-// and whether this input is hermes's tool_call wrapper, so a tool name is
-// known as one: in the wrapper, the "name" of an element of the top-level
-// "calls" array is what a tool_called check reads and is kept whatever its
-// spelling, bounded like the entry's own tool. Every other string, under
-// any key, at any depth and under any tool, is shaped.
-func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
+// shapeValueIn is shapeValue with the enclosing key, the container depth,
+// whether this input is hermes's tool_call wrapper and whether v is an
+// element of the wrapper's own calls array (the array that is the root
+// object's "calls" value), so a tool name is known as one by its path: the
+// "name" string of such an element is what a tool_called check reads and
+// is kept whatever its spelling, bounded like the entry's own tool. Every
+// other string, under any key, at any depth and under any tool, is shaped,
+// a "calls" that is a map or sits deeper included.
+func shapeValueIn(v any, key string, wrapper bool, depth int, callElem bool) any {
 	switch t := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(t))
@@ -831,20 +842,22 @@ func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
 				shaped++
 				nk = fmt.Sprintf("<key %d, %d chars>", shaped, utf8.RuneCountInString(k))
 			}
-			out[nk] = shapeValueIn(val, k, key, wrapper, depth+1)
+			if name, ok := val.(string); ok && callElem && k == wrapperCallNameKey && name != redactedValue {
+				out[nk] = capRunes(name, activityToolNameCap)
+				continue
+			}
+			out[nk] = shapeValueIn(val, k, wrapper, depth+1, false)
 		}
 		return out
 	case []any:
+		elem := wrapper && depth == wrapperCallsDepth && key == wrapperCallsKey
 		for i := range t {
-			t[i] = shapeValueIn(t[i], key, parent, wrapper, depth+1)
+			t[i] = shapeValueIn(t[i], key, wrapper, depth+1, elem)
 		}
 		return t
 	case string:
 		if t == redactedValue {
 			return t
-		}
-		if wrapper && key == wrapperCallNameKey && parent == wrapperCallsKey && depth == wrapperNameDepth {
-			return capRunes(t, activityToolNameCap)
 		}
 		return shapeOf(t)
 	}

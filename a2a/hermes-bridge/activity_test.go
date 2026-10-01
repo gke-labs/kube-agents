@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -446,8 +447,6 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 	}
 }
 
-// A delivery signed for a task that the door cannot decode is a call the
-// trace will not carry: it counts on the marker rather than vanishing.
 // An unreadable signed delivery is logged and not counted: whichever event
 // it was, the call is in the trace (whole from its post, or interrupted at
 // the drain), so a marker would overcount.
@@ -712,6 +711,15 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyWrapperNames(t *testing.T) {
 	deep := string(redactInput(InputValuesShape, hermesToolCallWrapper, json.RawMessage(`{"calls":[{"name":"kanban_create","arguments":{"calls":[{"name":"my password is hunter2"}]}}],"other":{"calls":[{"name":"not a tool name either"}]}}`)))
 	if strings.Contains(deep, "hunter2") || strings.Contains(deep, "not a tool name") || !strings.Contains(deep, `"name":"kanban_create"`) {
 		t.Fatalf("a nested calls[].name below the wrapper's array was kept: %s", deep)
+	}
+	// Only an element of the root's calls array is a call: a "calls" that is
+	// a map, at the root or under another key, or an array nested in the
+	// calls array, carries the model's text under "name".
+	mapForm := string(redactInput(InputValuesShape, hermesToolCallWrapper, json.RawMessage(`{"calls":{"name":"map form hunter4"},"x":{"calls":{"name":"deeper map hunter5"}},"y":{"calls":[{"name":"deeper array hunter6"}]},"z":[{"calls":[{"name":"array in array hunter7"}]}]}`)))
+	for _, leaked := range []string{"hunter4", "hunter5", "hunter6", "hunter7"} {
+		if strings.Contains(mapForm, leaked) {
+			t.Fatalf("a name off the wrapper's calls array was kept: %q in %s", leaked, mapForm)
+		}
 	}
 	// Under any other tool a calls[].name is the model's text, not a tool name.
 	other := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"calls":[{"name":"admin:hunter2@db"},{"name":"kanban_create"}]}`)))
@@ -1197,5 +1205,33 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	}
 	if _, err := os.Stat(fileNamedLikeATask); err != nil {
 		t.Fatalf("the sweep took a file: %v", err)
+	}
+}
+
+// The dedupe remembers the most recent activitySeenCap delivery ids: past
+// the cap the oldest is forgotten and the newest still dedupes, so a late
+// retry of a recent post is one call however long the run.
+func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
+	a := newActivityState(false, InputValuesShape)
+	post := func(id string) (ActivityEntry, bool) {
+		var d hookDelivery
+		if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","delivery_id":"`+id+`","extra":{"tool_call_id":"`+id+`","status":"ok"}}`), &d); err != nil {
+			t.Fatal(err)
+		}
+		return a.observe(d)
+	}
+	for i := 0; i < activitySeenCap+1; i++ {
+		if _, ok := post(fmt.Sprintf("d-%d", i)); !ok {
+			t.Fatalf("delivery %d not observed", i)
+		}
+	}
+	if _, ok := post(fmt.Sprintf("d-%d", activitySeenCap)); ok {
+		t.Fatal("a retry of the newest delivery past the cap was counted again")
+	}
+	if _, ok := post("d-0"); !ok {
+		t.Fatal("the oldest id was not the one forgotten")
+	}
+	if a.calls != activitySeenCap+2 {
+		t.Fatalf("calls = %d", a.calls)
 	}
 }

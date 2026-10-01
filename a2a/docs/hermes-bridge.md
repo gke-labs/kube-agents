@@ -319,7 +319,7 @@ worker adapter's `{"tool","input"}` so one fold reads both executors:
 `status` is `completed` or `error` from the hook's own verdict, and on `error` an
 `errorType` keeps hermes's word for it (`blocked`, `cancelled`, `timeout`, `tool_error`),
 so a guardrail refusal stays distinguishable from a tool failure. hermes retries a delivery
-that timed out, so each is remembered by its id and a retry is one call. A call still open when the
+that timed out, so each is remembered by its id (the most recent 8192 per task) and a retry is one call. A call still open when the
 task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the door could not
 read (logged, not counted, since the call is then in the trace; an unreadable `pre_tool_call`
 costs nothing, its `post` carries the record whole) — is flushed as `interrupted` inside
