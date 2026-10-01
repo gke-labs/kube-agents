@@ -435,7 +435,7 @@ Rough standing cost: about $285 per month — the GKE management fee (three zona
 clusters) is most of it, the six nodes (20 GB disks) and two 10 GB orphan disks the
 rest. The no-surge pool on `seeded-b` adds a seventh node, a fifth e2-small, and
 seeded-d adds a fourth management fee, an e2-small and an e2-standard-2, so a project carrying
-the whole stack costs roughly $400 per month — the fee, not the nodes, is the larger
+the whole stack costs roughly $435 per month — the fee, not the nodes, is the larger
 part of the increase. No separate rollout stands between a merge and that cost: a new
 cluster or pool plans as a create, which `hack/fleet_reconcile.py` applies, so its weekly
 run creates both in every free pool project it applies to once the periodic is past its
