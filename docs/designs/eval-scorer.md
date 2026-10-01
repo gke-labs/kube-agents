@@ -1564,7 +1564,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition
   stricter, so the flat margin stays for its legibility. Two things to watch when it is replaced:
-  `30` is not load-bearing except as "enough to tolerate four failed repetitions at the 0.85
+  `30` is not load-bearing except as "enough to tolerate six failed repetitions at the 0.80
   threshold", and the advisory note must keep reporting when the rate fell below the margin, or a
   rule that never fires goes unnoticed. The rule is still unarmed by default above the floor
   (`EVAL_AGGREGATE_ARMED`): the margin is measured now, so what remains is the decision, taken in
