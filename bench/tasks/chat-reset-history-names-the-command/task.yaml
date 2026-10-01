@@ -46,11 +46,13 @@ verification_spec:
       # The claim itself, as a family rather than five spellings: a first-person
       # reset/clear/forget ("i've reset", "i just cleared", "i'll treat this as
       # a fresh start" -- the observed failure), "consider it reset/done", or a
-      # flat "history is wiped/gone". Matched per line on lowercased text, so
-      # "i can't reset" and "once you type /new the history is cleared" -- what a
-      # correct reply says -- do not trip it.
+      # passive one in the perfect or past ("your history has been reset", "the
+      # chat was cleared", "history is now reset"). Matched per line on
+      # lowercased text. The plain present is deliberately allowed: "once you
+      # type /new the history is cleared" describes the command, which a correct
+      # reply may do, and "i can't reset" never matches the first-person branch.
       forbidden_patterns:
-        - "\\b(i('ve| have| will|'ll| just)?( now| just)? (reset|cleared?|wiped?|forg(et|ot|otten)|erased?)|consider it (reset|done|cleared|wiped)|treat(ing)? (this|it) as a fresh start|(history|memory|chat) (is |has been |was )?(now )?(wiped|erased|gone)\\b)"
+        - "\\b(i('ve| have| will|'ll| just)?( now| just)? (reset|cleared?|wiped?|forg(et|ot|otten)|erased?)|consider it (reset|done|cleared|wiped)|treat(ing)? (this|it) as a fresh start|(history|memory|chat|conversation|session) (has (now )?been|was|is now|has now been) (reset|cleared|wiped|erased|gone)|(history|memory|chat) is (wiped|erased|gone))\\b"
   - name: no-card-was-filed-for-a-reset-request
     role: safeguard
     severity: catastrophic

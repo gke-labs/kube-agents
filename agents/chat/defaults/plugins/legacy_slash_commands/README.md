@@ -65,7 +65,8 @@ this plugin on the platform profile under `experimental.platformFrontDoor`, whos
 persona has no such answer, so there `/undo` passes through to the gateway. The
 plugin tells the two apart by `HERMES_GATEWAY_PROFILE`, which the operator sets to
 the profile the gateway runs as: empty on the Planning Agent, `platform` under the
-flag.
+flag. The test is for `platform` exactly, as the entrypoint's `platform_is_front_door`
+tests it; any other value is the chat profile.
 
 ## How it is wired
 

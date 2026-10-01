@@ -43,8 +43,11 @@ _DISABLED_UNDO_TEXT = "undo"
 # also enables this plugin on the platform profile under `experimental.platformFrontDoor`,
 # and names the profile the gateway runs as in HERMES_GATEWAY_PROFILE: empty on the
 # Planning Agent, "platform" under the flag (k8s-operator/internal/controller/
-# platformagent_manifests.go, gatewayProfileEnvVar).
+# platformagent_manifests.go, gatewayProfileEnvVar). The entrypoint's
+# platform_is_front_door tests for "platform" exactly, and so does this: any other value
+# runs the gateway on the chat profile, whose SOUL.md carries the answer.
 _GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
+_FRONT_DOOR_PROFILE = "platform"
 
 
 def _subcommand_map() -> Dict[str, str]:
@@ -106,8 +109,8 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
 
 
 def on_planning_agent_profile() -> bool:
-    """True unless the operator named another gateway profile (the front-door flag)."""
-    return not os.environ.get(_GATEWAY_PROFILE_ENV, "").strip()
+    """True unless the operator homed the gateway on the platform profile (the front-door flag)."""
+    return os.environ.get(_GATEWAY_PROFILE_ENV, "") != _FRONT_DOOR_PROFILE
 
 
 def disable_undo_command(text: str) -> Optional[str]:

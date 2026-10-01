@@ -85,11 +85,13 @@ class DisableUndoCommandTest(unittest.TestCase):
 
     def test_only_the_planning_agent_profile_disables_undo(self):
         # The operator names the gateway's profile in HERMES_GATEWAY_PROFILE: empty on
-        # the Planning Agent, "platform" under experimental.platformFrontDoor.
+        # the Planning Agent, "platform" under experimental.platformFrontDoor. The
+        # entrypoint's platform_is_front_door matches "platform" exactly, so every
+        # other value is the chat profile (tests/test_docker_entrypoint.py pins these).
         with mock.patch.dict(os.environ, {"HERMES_GATEWAY_PROFILE": "platform"}):
             self.assertFalse(plugin.on_planning_agent_profile())
             self.assertIsNone(plugin.disable_undo_command("/undo"))
-        for value in ("", "  "):
+        for value in ("", "default", "Platform", "platform2", " platform"):
             with mock.patch.dict(os.environ, {"HERMES_GATEWAY_PROFILE": value}):
                 self.assertTrue(plugin.on_planning_agent_profile())
                 self.assertEqual(plugin.disable_undo_command("/undo"), "undo")
