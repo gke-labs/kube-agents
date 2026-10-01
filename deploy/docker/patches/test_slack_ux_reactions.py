@@ -110,9 +110,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _cards(*ids, board="default", status="running", resumes=0):
+def _cards(*ids, board="default", status="running", creator=None):
     """A board read: open cards as ``{(board, id): _Card}``."""
-    return {(board, task): runtime._Card(status, resumes) for task in ids}
+    return {(board, task): runtime._Card(status, creator) for task in ids}
 
 
 class _Root:
@@ -468,34 +468,63 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
         self.assertEqual(log[-1], ("111.002", "white_check_mark"))
 
-    def test_a_resumed_card_that_gives_up_within_the_turn_fails_it(self):
-        # Blocked at the start, unblocked, and parked at blocked again before the end.
+    def test_a_card_unblocked_by_someone_else_during_a_direct_answer_is_not_its(self):
+        # A CLI unblock lands while "why?" is answered; nothing names who did it.
         adapter = _Stub()
-        before, after = _cards("t_a", status="blocked", resumes=7), _cards("t_a", status="blocked", resumes=9)
-        self._turn_racing("try again", before, after, [("t_a", "gave_up")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("x", False)])
+        self._turn_racing("why?", _cards("t_a", status="blocked"), _cards("t_a"), [], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
         self.assertFalse(runtime._deferred)
-
-    def test_a_give_up_from_before_the_turn_reported_during_it_is_not_the_turns(self):
-        # The card was parked before the ask arrived; the notifier's report lags.
-        adapter = _Stub()
-        blocked = _cards("t_a", status="blocked", resumes=7)
-        self._turn_racing("why?", blocked, blocked, [("t_a", "gave_up")], adapter)
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
 
-    def test_a_resumed_card_that_blocks_again_within_the_turn_pauses_the_ask(self):
+    def test_a_blocked_card_that_gives_up_again_during_the_turn_does_not_fail_it(self):
+        # Unblocked and parked again, or a give-up from before the ask reported
+        # late: either way the card's own ask carries the ❌.
         adapter = _Stub()
-        before, after = _cards("t_a", status="blocked"), _cards("t_a", status="blocked", resumes=3)
-        self._turn_racing("yes, go ahead", before, after, [("t_a", "blocked")], adapter)
-        self.assertEqual(adapter.calls, [("eyes", False), ("double_vertical_bar", False)])
-        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
-        self.assertEqual(adapter.calls[-1], ("x", False))
+        blocked = _cards("t_a", status="blocked")
+        self._turn_racing("try again", blocked, blocked, [("t_a", "gave_up")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertFalse(runtime._deferred)
 
-    def test_a_blocked_card_that_completes_within_the_turn_is_its(self):
-        # Completed from blocked means resumed first; the card is closed at the end.
+    def test_a_blocked_card_that_blocks_again_during_the_turn_does_not_pause_it(self):
+        adapter = _Stub()
+        blocked = _cards("t_a", status="blocked")
+        self._turn_racing("yes, go ahead", blocked, blocked, [("t_a", "blocked")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+
+    def test_a_card_an_earlier_asks_worker_creates_is_not_the_turns(self):
+        # Ask 1's worker files a follow-up while "why?" is answered; the
+        # follow-up inherited the thread's subscription from t_a.
+        adapter = _Stub()
+        after = {**_cards("t_a"), **_cards("t_b", creator="t_a")}
+        self._turn_racing("why?", _cards("t_a"), after, [], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertFalse(runtime._deferred)
+
+    def test_a_card_created_under_a_left_out_card_is_left_out_too(self):
+        adapter = _Stub()
+        after = {**_cards("t_a"), **_cards("t_b", creator="t_a"), **_cards("t_c", creator="t_b")}
+        self._turn_racing("why?", _cards("t_a"), after, [], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+
+    def test_a_card_the_turns_own_cards_worker_creates_is_its(self):
+        adapter = _Stub()
+        after = {**_cards("t_a"), **_cards("t_b", creator="t_a")}
+        self._turn_racing("fix it", {}, after, [], adapter)
+        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_a"), ("default", "t_b")})
+
+    def test_a_card_the_turn_creates_after_an_older_card_is_its(self):
+        # "Once t_a finishes, run the smoke test": the turn names t_a as the
+        # parent, which gives the new card no creator.
+        adapter = _Stub()
+        self._turn_racing("fix it", _cards("t_a"), _cards("t_a", "t_b"), [], adapter)
+        self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_b")})
+
+    def test_a_blocked_card_that_completes_during_the_turn_is_not_its(self):
         adapter = _Stub()
         self._turn_racing("yes, go ahead", _cards("t_a", status="blocked"), {}, [("t_a", "completed")], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertFalse(runtime._deferred)
 
     def test_a_card_that_blocks_before_the_turn_ends_pauses_the_ask(self):
         adapter = _Stub()
@@ -506,7 +535,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_card_that_blocks_and_resumes_within_the_turn_does_not_pause_the_ask(self):
         adapter = _Stub()
-        self._turn_racing("fix it", {}, _cards("t_a", resumes=4), [("t_a", "blocked")], adapter)
+        self._turn_racing("fix it", {}, _cards("t_a"), [("t_a", "blocked")], adapter)
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_a")})
 
@@ -526,26 +555,26 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         self.assertEqual(runtime._deferred[(CHANNEL, THREAD)][0].cards, {("default", "t_a")})
 
-    def test_resuming_a_blocked_card_waits_on_it(self):
+    def test_answering_a_blocked_card_settles_the_answer_and_leaves_the_card_to_its_ask(self):
         # Ask 1's card blocks on the user; ask 2 answers and unblocks it.
         log = []
         first = self._turn("fix it", {}, _cards("t_a"), adapter=_Stub("111.001", log))
         _run(runtime.settle_delegated(first, self._sub("t_a"), "blocked"))
         self._turn("yes, go ahead", _cards("t_a", status="blocked"), _cards("t_a"), adapter=_Stub("111.002", log))
-        self.assertEqual(log[-1], ("111.002", "eyes"))
+        self.assertEqual(log[-2:], [("111.002", "eyes"), ("111.002", "white_check_mark")])
         _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
-        self.assertEqual(sorted(log[-2:]), [("111.001", "white_check_mark"), ("111.002", "white_check_mark")])
+        self.assertEqual(log[-1], ("111.001", "white_check_mark"))
+        self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
 
-    def test_a_retry_after_give_up_waits_on_the_new_run(self):
+    def test_a_retry_after_give_up_settles_on_its_own_turn(self):
         log = []
         first = self._turn("fix it", {}, _cards("t_a"), adapter=_Stub("111.001", log))
         _run(runtime.settle_delegated(first, self._sub("t_a"), "gave_up"))
         self.assertEqual(log[-1], ("111.001", "x"))
         # Hermes parks the gave-up card at blocked; "try again" unblocks it.
         self._turn("try again", _cards("t_a", status="blocked"), _cards("t_a"), adapter=_Stub("111.002", log))
-        self.assertEqual(log[-1], ("111.002", "eyes"))
-        _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
         self.assertEqual(log[-1], ("111.002", "white_check_mark"))
+        _run(runtime.settle_delegated(first, self._sub("t_a"), "completed"))
         self.assertEqual(len(log), 4)
 
     def test_a_card_still_blocked_after_the_turn_is_not_its(self):
@@ -597,15 +626,16 @@ class OpenCardsQueryTest(unittest.TestCase):
         conn.executescript(
             "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);"
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
-            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
-            "INSERT INTO task_events VALUES (1,'b','unblocked'),(2,'b','blocked'),(3,'b','unblocked'),(4,'a','blocked');"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+            "INSERT INTO task_events VALUES (1,'a','created','{\"creator_task_id\": null}'),"
+            " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}');"
             "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready');"
             "INSERT INTO kanban_notify_subs VALUES"
             " ('a','slack','C1','111.000'),('b','slack','C1','111.000'),('c','slack','C1','111.000'),"
             " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000');"
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
-        self.assertEqual(sorted(rows), [("a", "running", 0), ("b", "blocked", 3)])
+        self.assertEqual(sorted(rows), [("a", "running", None), ("b", "blocked", "c")])
 
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
@@ -647,11 +677,11 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(default).touch()
         Path(b2).touch()
         paths = {"default": default, "alias": default, "b2": b2}
-        rows = {default: [("t_a", "running", 0)], b2: [("t_b", "running", 0), ("t_c", "blocked", 5)]}
+        rows = {default: [("t_a", "running", None)], b2: [("t_b", "running", None), ("t_c", "blocked", "t_b")]}
         reads = []
         with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, reads)):
             found = runtime._query_open_cards("C1", "111.000")
-        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", resumes=5)})
+        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", creator="t_b")})
         self.assertEqual([path for path, _ in reads], [default, b2])
         self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
 
@@ -660,7 +690,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(good).touch()
         reads = []
         paths = {"default": good, "b3": absent}
-        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", 0)]}, reads)):
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None)]}, reads)):
             found = runtime._query_open_cards("C1", "111.000")
         self.assertEqual(found, _cards("t_a"))
         # b3 has no database: never connected to, so never created.
@@ -672,7 +702,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         good, bad = self._databases("good.db", "bad.db")
         Path(good).touch()
         Path(bad).touch()
-        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", 0)]}, [], broken={"b2"})
+        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", None)]}, [], broken={"b2"})
         with mock.patch.dict(sys.modules, hermes):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
         hermes["hermes_cli.kanban_db"].list_boards = mock.Mock(side_effect=RuntimeError("locked"))
