@@ -98,9 +98,10 @@ user-permission awareness).
    reach an agent_ — authenticated chat + `AllowedUsers` + per-audience entrypoints; only trusted
    humans get in. v1 does **not** check the requester's own GCP/K8s permissions and does not union them
    with the agent SA — the agent's read-only, tier-scoped identity is the ceiling ([03](03-security-model.md)
-   §4a). A human selects the agent by handle / slash command / NL routing through the `@kage` gateway
-   ([02](02-agent-personas.md) §2.4); routing is a convenience, not an authz signal, and the gateway
-   enforces the target agent's `AllowedUsers` before dispatch. Per-request user-scoped authorization
+   §4a). A human selects the agent by handle or slash command through the `@kage` gateway, or writes
+   free text and the gateway hands the turn to the conversation's session agent ([02](02-agent-personas.md) §2.4); routing is a convenience, not an authz signal, and the gateway
+   enforces the target agent's `AllowedUsers` before dispatch (and, when a session delegates, when it
+   mints the child task). Per-request user-scoped authorization
    (the SAR/IAM check + down-scoping) is deferred (§5).
 10. **Coordination is indirect** via the GitOps repo + OKF ([02](02-agent-personas.md) §2.3). No
     co-located multiplexer and no synchronous agent-to-agent messaging.
