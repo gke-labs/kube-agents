@@ -339,7 +339,7 @@ the finalize lock, ahead of the result and the terminal, so the trace is complet
 nothing of it follows the final event. What of the input is published is a setting,
 `BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
 structure with every string value replaced by `<string, N chars>` and every key that is not
-shaped like a schema key (letters, digits, `_`, `-`, at most 48, not token-like) by
+shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
 `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
 wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
 name, a wrapper's nested names); no grammar tells a resource name from a credential under the

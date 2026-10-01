@@ -1240,14 +1240,14 @@ func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
 // password holding / or @, are scrubbed in full mode; --user-agent is not
 // --user, and a URL with no userinfo keeps an @ in its path.
 func TestRedactInput_CurlClustersAndUserinfoWithSlashes(t *testing.T) {
-	in := `{"command": "curl -su admin:hunter2 https://h; curl -fsSLu root:hunter3 https://i -o f; curl --user-agent ua https://j; psql postgres://u:pa/ss@h:5432/db; curl https://u:pa@ss@k/x; echo https://plain.example/a@b"}`
+	in := `{"command": "curl -su admin:hunter2 https://h; curl -fsSLu root:hunter3 https://i -o f; curl --user-agent ua https://j; psql postgres://u:pa/ss@h:5432/db; curl https://u:pa@ss@k/x; echo https://plain.example/a@b; curl http://api.internal:8080/notify?to=ops@example.com; curl http://user:p4ss@h:8080/x"}`
 	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"hunter2", "hunter3", "pa/ss", "pa@ss", "ss@k"} {
+	for _, leaked := range []string{"hunter2", "hunter3", "pa/ss", "pa@ss", "ss@k", "p4ss"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
 	}
-	for _, kept := range []string{"https://h;", "https://i -o f", "--user-agent ua https://j", "postgres://[redacted]@h:5432/db", "https://[redacted]@k/x", "https://plain.example/a@b"} {
+	for _, kept := range []string{"https://h;", "https://i -o f", "--user-agent ua https://j", "postgres://[redacted]@h:5432/db", "https://[redacted]@k/x", "https://plain.example/a@b", "http://api.internal:8080/notify?to=ops@example.com", "http://[redacted]@h:8080/x"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("expected %q in %s", kept, out)
 		}
@@ -1261,5 +1261,43 @@ func TestRedactInput_ShapeModeSkipsTheValueScrub(t *testing.T) {
 	out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"h":"Bearer abcdefghijklmnop","token":"x"}`)))
 	if !strings.Contains(out, `"h":"\u003cstring, 23 chars\u003e"`) || !strings.Contains(out, `"token":"[redacted]"`) {
 		t.Fatalf("shape mode: %s", out)
+	}
+}
+
+// One field of a surprising type does not drop the delivery: the call is
+// observed with that field zero, so a finished call is never recorded
+// interrupted for a word in duration_ms or a number in tool_call_id.
+func TestActivity_OneFieldsTypeDoesNotDropTheDelivery(t *testing.T) {
+	a := newActivityState(false, InputValuesShape)
+	var d hookDelivery
+	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","tool_input":{"command":"ls"},"timestamp":{"x":1},"delivery_id":12,"extra":{"tool_call_id":7,"duration_ms":"fast","status":"ok","error_type":null}}`), &d); err != nil {
+		t.Fatalf("a field's type dropped the delivery: %v", err)
+	}
+	e, ok := a.observe(d)
+	if !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted || e.DurationMs != 0 || e.CallID != "7" || e.At != "" {
+		t.Fatalf("observed %+v %v", e, ok)
+	}
+	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","extra":"not an object"}`), &d); err != nil || d.Extra.ToolCallID != "" || d.Event != "post_tool_call" {
+		t.Fatalf("a non-object extra: %v %+v", err, d)
+	}
+	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","extra":"not an object"`), &d); err == nil {
+		t.Fatal("a body that is not JSON parsed")
+	}
+}
+
+// A key shaped like a credential is shaped whatever its body: a known
+// prefix, a long single-case run, or classes that churn like base62; a
+// camelCase schema key with a few words stays.
+func TestRedactInput_TokenShapedKeys(t *testing.T) {
+	out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"ghp_abcdefghijklmnopqrstuvwABCDEFGHIJKL":1,"AIzaSyA_bcdefghijklmnopqrstuvwxyzABC":1,"a1B2c3D4e5F6g7":1,"QWERTYUIOPASDFGHJKLZXCVB":1,"resourceVersion":1,"includeUninitializedResourceVersion":1,"sha256Digest":1}`)))
+	for _, leaked := range []string{"ghp_", "AIza", "a1B2c3D4", "QWERTYUIOPASDFGHJKLZXCVB"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("a token-shaped key was published: %q in %s", leaked, out)
+		}
+	}
+	for _, kept := range []string{`"resourceVersion":1`, `"includeUninitializedResourceVersion":1`, `"sha256Digest":1`} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("a schema key was shaped: %q missing in %s", kept, out)
+		}
 	}
 }

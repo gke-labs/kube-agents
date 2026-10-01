@@ -335,9 +335,16 @@ var (
 	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-[sSfLkvigGjJnNqRZ46#]*[ub][\s=]*|--(?:user|cookie)[\s=]+)(?:"[^"\n]*"|'[^'\n]*'|\S+)`)
 	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
 	// the userinfo alone goes, the scheme and host around it stay. The
-	// password runs to the last @ that a host follows, so a / or an @ inside
-	// it (pa/ss, pa@ss) is inside the cut, not the end of it.
-	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]*:\S+(@[^\s@/]+)`)
+	// userinfo ends at the authority's end (/, ?, #), so a URL with a port
+	// and an @ in its path or query has none and is kept whole; inside it
+	// the password runs to the last @ a host follows, so an @ in it (pa@ss)
+	// is inside the cut.
+	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:?#]*:[^\s/?#]+(@[^\s@/?#]+)`)
+	// urlUserinfoSlashPattern is the same for a password holding a /, which
+	// a URL's authority cannot but a pasted one may: told from host:port/path
+	// by the run after the colon not being all digits, the password runs
+	// across the / to the first @ a host follows.
+	urlUserinfoSlashPattern = regexp.MustCompile(`(://)[^\s/@:?#]*:[^\s/@?#]*[^\s/@?#0-9][^\s/@?#]*/[^\s@]*(@[^\s@/]+)`)
 	// A Cookie or Set-Cookie header by its key: the rest of the line, the
 	// character before the key kept.
 	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
@@ -354,13 +361,19 @@ var (
 	// keyTokenRunPattern is the token look a schema-shaped key can still
 	// have: a long digit run, an all-hex body, an all-caps-and-digits body
 	// with digits in it, a long lower-case alphanumeric run.
-	keyTokenRunPattern = regexp.MustCompile(`[0-9]{6,}|^[a-f0-9]{20,}$|^[A-Z0-9_]*[0-9][A-Z0-9_]*$|[a-z0-9]{24,}`)
+	keyTokenRunPattern = regexp.MustCompile(`[0-9]{6,}|^[a-f0-9]{20,}$|^[A-Z0-9_]*[0-9][A-Z0-9_]*$|[a-z0-9]{24,}|[a-z]{20,}|[A-Z]{20,}`)
+	// keyTokenPrefixPattern is the credential prefixes a key can start with
+	// (GitHub, Google, Slack, AWS, GitLab, OpenAI tokens, a JWT); a key so
+	// shaped is a token in the key slot whatever its body looks like.
+	keyTokenPrefixPattern = regexp.MustCompile(`^(?:gh[pousr]_|github_pat_|ya29\.|AIza|xox[abposr]-|AKIA|ASIA|glpat-|sk-|eyJ)`)
 )
 
 const (
 	schemaKeyMax = 48
-	// keyMaxCaseChanges is how many upper/lower transitions a key may have
-	// before its case reads as base64 churn rather than camelCase.
+	// keyMaxCaseChanges is how many camelCase humps and letter-digit
+	// boundaries a key may have before it reads as base62 churn rather than
+	// camelCase: a 36-character random body has about fifteen, a schema
+	// key's words a handful.
 	keyMaxCaseChanges = 5
 )
 
@@ -373,20 +386,34 @@ func capRunes(s string, n int) string {
 }
 
 // tokenShapedKey says whether a key that fits the schema grammar still
-// reads as a token: too long, a long digit run, an all-caps-and-digits body
-// with digits in it, an all-hex body, or case that churns like base64.
+// reads as a token: too long, a known credential prefix, a long digit,
+// hex or single-case letter run, an all-caps-and-digits body with digits
+// in it, or character classes that churn like base62. No grammar tells
+// every token from every key; this names the shapes, and a key it refuses
+// costs its spelling, not the trace.
 func tokenShapedKey(k string) bool {
-	if len(k) > schemaKeyMax || keyTokenRunPattern.MatchString(k) {
+	if len(k) > schemaKeyMax || keyTokenRunPattern.MatchString(k) || keyTokenPrefixPattern.MatchString(k) {
 		return true
 	}
 	changes := 0
-	prevUpper := false
-	for i, r := range k {
-		upper := r >= 'A' && r <= 'Z'
-		if i > 0 && upper && !prevUpper && r != '_' && r != '-' {
+	prev := 0
+	for _, r := range k {
+		class := 0
+		switch {
+		case r >= 'a' && r <= 'z':
+			class = 1
+		case r >= 'A' && r <= 'Z':
+			class = 2
+		case r >= '0' && r <= '9':
+			class = 3
+		}
+		// A camelCase hump (lower to upper) and a letter-digit boundary
+		// each count once; the fall back to lower case after a capital is
+		// the hump's own end, not a change.
+		if class != 0 && prev != 0 && class != prev && !(prev == 2 && class == 1) {
 			changes++
 		}
-		prevUpper = upper
+		prev = class
 	}
 	return changes > keyMaxCaseChanges
 }
@@ -432,6 +459,56 @@ type hookDelivery struct {
 		Status     string      `json:"status"`
 		ErrorType  string      `json:"error_type"`
 	} `json:"extra"`
+}
+
+// UnmarshalJSON reads a delivery leniently: the body has to be a JSON
+// object, and each field is taken when it has the expected type and left
+// zero when it does not, so one field of a surprising type on a
+// post_tool_call (a duration_ms that is a word, a tool_call_id that is a
+// number) does not drop the delivery and leave its call to end
+// interrupted. A string field also takes a number's or boolean's literal.
+func (d *hookDelivery) UnmarshalJSON(b []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(b, &top); err != nil {
+		return err
+	}
+	d.Event = lenientString(top["hook_event_name"])
+	d.ToolName = lenientString(top["tool_name"])
+	d.ToolInput = top["tool_input"]
+	d.Timestamp = lenientString(top["timestamp"])
+	d.DeliveryID = lenientString(top["delivery_id"])
+	var extra map[string]json.RawMessage
+	if raw, ok := top["extra"]; ok {
+		_ = json.Unmarshal(raw, &extra)
+	}
+	d.Extra.ToolCallID = lenientString(extra["tool_call_id"])
+	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
+	d.Extra.Status = lenientString(extra["status"])
+	d.Extra.ErrorType = lenientString(extra["error_type"])
+	return nil
+}
+
+// lenientString is a JSON string's value, a number's or boolean's literal,
+// and "" for anything else (absent, null, an object, an array).
+func lenientString(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" || t[0] == '{' || t[0] == '[' {
+		return ""
+	}
+	return t
+}
+
+// lenientNumber is a JSON number, or a string holding one; "" otherwise.
+func lenientNumber(raw json.RawMessage) json.Number {
+	var n json.Number
+	if json.Unmarshal(raw, &n) == nil {
+		return n
+	}
+	return ""
 }
 
 // activityState is one task's side of the door.
@@ -900,6 +977,7 @@ func redactValue(v any, values bool) any {
 			return curlUserPattern.ReplaceAllString(cmd, redactedValue)
 		})
 		t = urlUserinfoPattern.ReplaceAllString(t, "${1}"+redactedValue+"${2}")
+		t = urlUserinfoSlashPattern.ReplaceAllString(t, "${1}"+redactedValue+"${2}")
 		t = cookieHeaderPattern.ReplaceAllString(t, "${1}"+redactedValue)
 		return t
 	}
