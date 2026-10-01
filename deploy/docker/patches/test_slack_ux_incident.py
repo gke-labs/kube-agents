@@ -205,6 +205,7 @@ class RuntimeTest(unittest.TestCase):
             "1. **Proposed fix (Restart):** Restart the pods.",
             "**Proposed fix (Restart):** Restart the pods.",
             "- **proposed fix (Restart)**: Restart the pods.",
+            "- **PROPOSED FIX (Restart)**: Restart the pods.",
             "- **Proposed fix:** Restart the pods.",
             "### Proposed fix\nRestart the pods.",
             "```\n- **Proposed fix (Restart):** Restart the pods.\n```",
@@ -214,9 +215,14 @@ class RuntimeTest(unittest.TestCase):
                 self.assertIsNone(runtime.parse_triage(report))
 
     def test_two_proposed_fixes_without_options_keep_the_threaded_reply(self):
-        second = "- **Proposed fix (Raise the quota):** Request 64 more CPUs.\n"
-        report = SINGLE.replace("- **To authorize:**", second + "- **To authorize:**")
-        self.assertIsNone(runtime.parse_triage(report))
+        for second in (
+            "- **Proposed fix (Raise the quota):** Request 64 more CPUs.\n",
+            "- **Proposed fix:** Request 64 more CPUs.\n",
+            "- **proposed fix (Raise the quota):** Request 64 more CPUs.\n",
+        ):
+            with self.subTest(second=second):
+                report = SINGLE.replace("- **To authorize:**", second + "- **To authorize:**")
+                self.assertIsNone(runtime.parse_triage(report))
 
     def test_link_labels_are_plain_and_reach_the_fallback_text(self):
         report = REPORT.replace("[GKE Workloads]", "[**GKE Workloads**]")
