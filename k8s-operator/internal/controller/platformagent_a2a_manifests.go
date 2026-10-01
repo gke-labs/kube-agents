@@ -3521,6 +3521,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}
 	}
 
+	var clusterViewEnv []corev1.EnvVar
+	if a2aSessionClusterViewEnabled(agent) {
+		// The spawner's half of the cluster view: told, and told where the
+		// broker is. Both or neither - the gateway refuses the first
+		// without the second (a2a/gateway/config.go).
+		clusterViewEnv = []corev1.EnvVar{
+			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
+			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
+		}
+	}
+
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
@@ -3637,7 +3648,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// name, so the render and the spawner must agree
 							// or every session is refused at connect.
 							{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
-						}, injectEnv...),
+						}, append(injectEnv, clusterViewEnv...)...),
 						Ports: injectPorts,
 						VolumeMounts: append([]corev1.VolumeMount{{
 							Name: "principal-map", MountPath: "/etc/a2a/principal-map", ReadOnly: true,
