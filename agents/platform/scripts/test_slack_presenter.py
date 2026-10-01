@@ -167,6 +167,20 @@ class SplitAnswerTest(unittest.TestCase):
         headline, _body = sp.split_answer("`__init__.py` is missing.")
         self.assertEqual(sp.fallback_text(headline), "*__init__.py is missing.*")
 
+    def test_a_leading_heading_is_not_joined_to_the_next_line(self):
+        headline, body = sp.split_answer("##\tSummary\nCheckout is down. Since 14:02.")
+        self.assertEqual(headline, "Summary")
+        self.assertEqual(body, ["Checkout is down. Since 14:02."])
+
+    def test_bold_around_the_first_sentence_leaves_no_stray_markers(self):
+        headline, body = sp.split_answer("**Checkout is crashlooping on OOM. Raise the limit.**")
+        self.assertEqual(headline, "Checkout is crashlooping on OOM.")
+        self.assertEqual(body, ["**Raise the limit.**"])
+        headline, body = sp.split_answer("**Checkout is down.** Raise the limit.")
+        self.assertEqual(headline, "Checkout is down.")
+        self.assertEqual(body, ["Raise the limit."])
+        self.assertEqual(sp.fallback_text(headline), "*Checkout is down.*")
+
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))

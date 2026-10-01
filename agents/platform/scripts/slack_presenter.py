@@ -147,7 +147,10 @@ CODE_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 #: A candidate sentence end: punctuation, then space, then anything but a
 #: lowercase letter ("in ns. prod" runs on).
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[^\sa-z])")
+#: A sentence ends at ``.``, ``!`` or ``?``, or just after the emphasis that closes on one.
+SENTENCE_END = re.compile(r"(?:(?<=[.!?])|(?<=[.!?][*_])|(?<=[.!?]\*\*)|(?<=[.!?]__))\s+(?=[^\sa-z])")
+#: Bold markers a split can leave open; the first sentence closes one and the rest reopens it.
+BOLD_MARKERS = ("**", "__")
 #: A text ending in one of these abbreviations has not ended its sentence.
 ABBREVIATION_END = re.compile(
     r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|no|min|max|fig|rev|ver|ex|cont|"
@@ -288,8 +291,14 @@ def _escape(text: str) -> str:
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
-        if not ABBREVIATION_END.search(line[: match.start()]):
-            return line[: match.start()], line[match.end() :].strip()
+        sentence = line[: match.start()]
+        if not ABBREVIATION_END.search(sentence.rstrip("*_")):
+            rest = line[match.end() :].strip()
+            # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
+            for marker in BOLD_MARKERS:
+                if sentence.count(marker) % 2:
+                    sentence, rest = sentence + marker, marker + rest
+            return sentence, rest
     return line, ""
 
 
@@ -307,10 +316,11 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     first, rest = paragraphs[0], paragraphs[1:]
     if _opens_fence(first.split("\n", 1)[0]):
         return "", paragraphs
-    # A soft-wrapped sentence continues onto the next line; a list item, heading or fence does not.
+    # A soft-wrapped sentence continues onto the next line; a list item, heading or fence does not,
+    # and nothing continues a heading.
     lines = first.split("\n")
     wrapped = 1
-    while wrapped < len(lines) and not (
+    while wrapped < len(lines) and not HEADING.match(lines[0]) and not (
         LIST_MARKER.match(lines[wrapped]) or HEADING.match(lines[wrapped]) or _opens_fence(lines[wrapped])
     ):
         wrapped += 1
