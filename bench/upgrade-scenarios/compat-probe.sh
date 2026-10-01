@@ -5,7 +5,7 @@
 # copies them from the nvidia/cuda base image in an init container and puts them first on LD_LIBRARY_PATH, as an
 # image does when it forces forward compatibility, then asks torch to open the GPU. Evidence: <track>/compat.txt.
 set -uo pipefail
-H=$(cd "$(dirname "$0")" && pwd); . "$H/common.sh"; require_scenario_cluster
+H=$(cd "$(dirname "$0")" && pwd); . "$H/common.sh"; require_scenario_cluster; require_own_cluster "$TRACK"   # the same two guards run.sh applies: the probe writes to TRACK's evidence
 TAG=$1; WAIT=900; POLL=10
 CU12_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04; CU12_TORCH=pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 CU13_BASE=nvidia/cuda:13.0.0-base-ubuntu24.04; CU13_TORCH=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime

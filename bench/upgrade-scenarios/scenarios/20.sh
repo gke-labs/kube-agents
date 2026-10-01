@@ -25,7 +25,7 @@ pod_phase(){ K -n scen get pods -l app=retired-image -o jsonpath='{.items[*].sta
 push_image(){ local dc rc; dc=$(mktemp -d)
   gcloud auth print-access-token | DOCKER_CONFIG=$dc "$CRANE" auth login us-central1-docker.pkg.dev -u oauth2accesstoken --password-stdin >/dev/null &&
     DOCKER_CONFIG=$dc "$CRANE" copy "$SOURCE_IMAGE" "$IMAGE" && DOCKER_CONFIG=$dc "$CRANE" digest "$IMAGE"; rc=$?; rm -rf "$dc"; return $rc; }
-plant(){ G artifacts repositories describe upg-scenarios --location us-central1 >/dev/null 2>&1 || G artifacts repositories create upg-scenarios --repository-format=docker --location=us-central1 --quiet; ev registry push push_image; ev registry grant-pull grant_pull; K -n scen apply -f - <<Y
+plant(){ describe_exists "repository upg-scenarios" G artifacts repositories describe upg-scenarios --location us-central1 || G artifacts repositories create upg-scenarios --repository-format=docker --location=us-central1 --quiet; ev registry push push_image; ev registry grant-pull grant_pull; K -n scen apply -f - <<Y
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: retired-image}

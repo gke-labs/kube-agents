@@ -10,7 +10,7 @@ DISK="$CLUSTER-intree"
 DISABLE_TRIES=4; DISABLE_WAIT=120; ROLLOUT_TIMEOUT=300s
 csi_state(){ G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(addonsConfig.gcePersistentDiskCsiDriverConfig)'; }
 pd_events(){ K -n scen get events --field-selector involvedObject.kind=Pod -o custom-columns='T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message' | grep -v "Pulling\|Pulled\|Created\|Started" | tail -8; }
-plant(){ G compute disks describe "$DISK" --zone "$ZONE" >/dev/null 2>&1 || G compute disks create "$DISK" --zone "$ZONE" --size 10GB --type pd-balanced --quiet >/dev/null; K apply -f - <<Y
+plant(){ describe_exists "disk $DISK" G compute disks describe "$DISK" --zone "$ZONE" || G compute disks create "$DISK" --zone "$ZONE" --size 10GB --type pd-balanced --quiet >/dev/null; K apply -f - <<Y
 apiVersion: v1
 kind: PersistentVolume
 metadata: {name: intree-pd}

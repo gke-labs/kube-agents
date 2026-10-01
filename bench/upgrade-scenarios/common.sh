@@ -12,6 +12,13 @@ SCENARIO_LABEL=upgrade-scenarios
 require_scenario_cluster(){ local p; p=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.purpose)' 2>/dev/null) ||
     { echo "refusing: cannot describe $CLUSTER in $ZONE (missing, or its creation failed)" >&2; exit 1; }
   [ "$p" = "$SCENARIO_LABEL" ] || { echo "refusing: $CLUSTER in $ZONE is not labelled purpose=$SCENARIO_LABEL (label: '$p')" >&2; exit 1; }; }
+# require_own_cluster <NN>: the cluster's scenario label (set by run.sh at creation) must be NN, or share NN's number as the
+# base a lettered re-run extends (CLUSTER=upg-10 bash run.sh 10b; CLUSTER=upg-14b bash run.sh 14c). A hold cluster (label
+# ending in h) is accepted only by its own scenario, since a change there ends the multi-day hold the Recommender waits on.
+require_own_cluster(){ local nn=$1 label base=${1%%[a-z]*}; label=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)') ||
+    { echo "refusing: cannot read $CLUSTER's scenario label" >&2; exit 1; }
+  [ "$label" = "$nn" ] || { [ "${label%%[a-z]*}" = "$base" ] && [[ $label != *h ]]; } ||
+    { echo "refusing: $CLUSTER was built for scenario '$label', which is not $nn, a base it extends, or the same number without a hold suffix" >&2; exit 1; }; }
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 in_days(){ date -u -v+"$1"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "+$1 days" +%Y-%m-%dT%H:%M:%SZ; }   # BSD date, then GNU
 # ev returns the command's own exit status, not tee's, so a caller can stop on a failed step.
@@ -79,8 +86,11 @@ hold_exclusion(){ has_exclusion hold-recommender && return; retry_busy hold ev h
 # pool_exists <pool> / has_exclusion <name>: both key off the describe's exit status. A describe that fails for any reason
 # other than "not found" stops the run: read as "absent", it would lead to a create GKE refuses as a duplicate, and the
 # run would stop on that refusal with a note blaming the wrong thing.
-pool_exists(){ local out; out=$(G container node-pools describe "$1" --cluster "$CLUSTER" --zone "$ZONE" 2>&1) && return 0
-  grep -Eq "code=404|[Nn]ot found|NOT_FOUND" <<<"$out" && return 1; note final "could not tell whether pool $1 exists ($(tail -1 <<<"$out")); stopping"; exit 1; }
+# describe_exists <what> <describe command...>: 0 when the describe succeeds, 1 when it says not found, and a stop for any
+# other failure. Every "create unless it exists" in the harness goes through it.
+describe_exists(){ local what=$1 out; shift; out=$("$@" 2>&1) && return 0
+  grep -Eq "code=404|[Nn]ot [Ff]ound|NOT_FOUND|HTTPError 404" <<<"$out" && return 1; note final "could not tell whether $what exists ($(tail -1 <<<"$out")); stopping"; exit 1; }
+pool_exists(){ describe_exists "pool $1" G container node-pools describe "$1" --cluster "$CLUSTER" --zone "$ZONE"; }
 has_exclusion(){ local x; x=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(maintenancePolicy.window.maintenanceExclusions)') ||
     { note final "could not read the cluster's maintenance exclusions; stopping"; exit 1; }; grep -Eq "(^|;)$1=" <<<"$x"; }
 # attempt_refusal <track> <ev command...>: a cluster change the scenario expects GKE to refuse (10, 10b, 14c ask for a

@@ -412,7 +412,8 @@ During this campaign, several `gcloud container clusters create` and `get-creden
 
 Every cluster the campaign created carries the label `purpose=upgrade-scenarios`. `run.sh` sets it at creation,
 and `run.sh`, `hold.sh` and `compat-probe.sh` refuse a cluster without it, so a mistyped `CLUSTER=` cannot plant
-a defect in, or upgrade, a cluster the campaign does not own:
+a defect in, or upgrade, a cluster the campaign does not own; `run.sh` and `compat-probe.sh` also refuse a campaign
+cluster built for another scenario, and `hold.sh` one that is not the scenario's own or a lettered re-run of it:
 
 ```bash
 gcloud container clusters list --project "$PROJECT" --filter='resourceLabels.purpose=upgrade-scenarios' --format='value(name,location)'
