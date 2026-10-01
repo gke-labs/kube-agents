@@ -237,7 +237,7 @@ var (
 	// or a location of one: secretName, SecretRef, tokenPath, credentialsFile,
 	// passwordId stay.
 	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?[A-Z]`)
-	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids|Key|Keys)?$`)
+	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
 	redactedValuePatterns    = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
