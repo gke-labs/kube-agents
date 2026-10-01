@@ -337,37 +337,29 @@ task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the
 read (logged, not counted, since the call is then in the trace; an unreadable `pre_tool_call`
 costs nothing, its `post` carries the record whole) — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. What of the input is published is a setting,
-`BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
+nothing of it follows the final event. What of the input is published is its **shape**: its
 structure with every string value replaced by `<string, N chars>` and every key that is not
 shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
 `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
 wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
-name, a wrapper's nested names); no grammar tells a resource name from a credential under the
-same key, so none is attempted and no string value rides the trace under any key; `full` publishes
-the values after the scrub described next, for a debug install that wants them, and is where
-the scrub's best-effort reach matters. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
+name, a wrapper's nested names). No grammar tells a resource name from a credential under the
+same key, so none is attempted, no string value rides the trace under any key, and there is no
+value scrub to have a reach: a credential a model pastes into a terminal command is one string
+under `command` and ships as a length. Values under keys with `token`, `secret`, `password`,
+`passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,
+`signing_key`, `key_data`, `cookie` or `credential` as a whole component (`access_token`,
+`SECRET_KEY`, `accessToken`, `clientSecret`, `SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`,
+`client-key-data`, `Cookie`; not `tokenizer`, and not a key that opens with the word and goes on
+as a name, reference or location, `secretName`, `tokenPath`) are replaced by `[redacted]` before
+the shaping, so the trace still says a secret-looking key was there. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
 large file write is a few MiB); a larger one is refused and logged, and since the cut body cannot
 be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
 over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
 small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
-terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. In either mode `input` is capped (2 KiB): over the cap it becomes
+terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
-readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
-`passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `key_data`, `cookie`
-or `credential` as a whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`,
-`SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`, `client-key-data`, `Cookie`; not
-`tokenizer`, and not a key that opens with the word and goes on as a name, reference or
-location, `secretName`, `tokenPath`) are replaced before
-publishing, and so are the credential shapes a value can carry under an innocent key (a
-bearer value, an `Authorization` or `Cookie` header, a URL's `user:password@`, a PEM private-key block, a Google OAuth or API key, a GitHub token, a `key=value`
-pair or `--flag value` whose key looks like a secret, curl's `-u user:password` and `-b`, also
-folded into a short-flag cluster (`-su`), with the rest of the command kept and the command read
-across its backslash-newline continuations, a quoted value taken whole to its closing quote) — a
-terminal
-command is one string, so this is best-effort, and anything else the model pastes into a
-command line ships. Tool results are not published: no check
+readable. Tool results are not published: no check
 reads them and they are the riskiest payload in the pod. One task publishes at most 3000
 trace and progress parts together: the task's events subject is capped at 4096 messages, and
 a looping persona publishing without bound would evict its own `submitted` and `working`. The

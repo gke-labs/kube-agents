@@ -69,14 +69,11 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
 	t.Helper()
 	cfg := Config{
-		// Full values, so the tests below can read what the scrub kept; the
-		// shape default has a test of its own.
-		ActivityInputValues: InputValuesFull,
-		NATSURL:             url,
-		Command:             command,
-		TaskDeadline:        20 * time.Second,
-		KillGrace:           500 * time.Millisecond,
-		ActivityListen:      "127.0.0.1:0",
+		NATSURL:        url,
+		Command:        command,
+		TaskDeadline:   20 * time.Second,
+		KillGrace:      500 * time.Millisecond,
+		ActivityListen: "127.0.0.1:0",
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -159,8 +156,8 @@ print("the answer")
 	if err := json.Unmarshal(first.Input, &input); err != nil {
 		t.Fatal(err)
 	}
-	if input["cmd"] != "get pods" || input["token"] != redactedValue {
-		t.Fatalf("input not redacted as designed: %v", input)
+	if input["cmd"] != shapeOf("get pods") || input["token"] != redactedValue {
+		t.Fatalf("input not shaped and redacted as designed: %v", input)
 	}
 	if nested := input["nested"].(map[string]any); nested["api_key"] != redactedValue || nested["keep"] != float64(1) {
 		t.Fatalf("nested input not redacted as designed: %v", nested)
@@ -273,12 +270,12 @@ print("slow answer")
 // is there from the first line.
 func TestActivity_HeartbeatWithTheDoorClosedSaysTheTraceIsOff(t *testing.T) {
 	now := time.Now()
-	closed := newActivityState(false, InputValuesFull)
+	closed := newActivityState(false)
 	closed.startedAt = now.Add(-5 * time.Minute)
 	if got := closed.progressLine(now); got != "running 5m0s, tool trace off" {
 		t.Fatalf("door-closed heartbeat = %q", got)
 	}
-	open := newActivityState(true, InputValuesFull)
+	open := newActivityState(true)
 	open.startedAt = now.Add(-5 * time.Minute)
 	if got := open.progressLine(now); got != "running 5m0s, 0 tool call(s)" {
 		t.Fatalf("door-open heartbeat = %q", got)
@@ -401,13 +398,15 @@ func TestRedactInput(t *testing.T) {
 				t.Fatalf("got %s", out)
 			}
 		}},
-		{"secret keys at every depth", `{"Authorization":"Bearer x","list":[{"PASSWORD":"p","ok":true}],"cmd":"ls"}`, func(t *testing.T, out json.RawMessage) {
+		{"secret keys at every depth, every other string a shape", `{"Authorization":"Bearer x","list":[{"PASSWORD":"p","ok":true}],"cmd":"ls"}`, func(t *testing.T, out json.RawMessage) {
 			s := string(out)
-			if strings.Contains(s, "Bearer x") || strings.Contains(s, `"p"`) || !strings.Contains(s, `"cmd":"ls"`) || !strings.Contains(s, `"ok":true`) {
+			if strings.Contains(s, "Bearer x") || strings.Contains(s, `"p"`) || !strings.Contains(s, `"Authorization":"[redacted]"`) || !strings.Contains(s, `"cmd":"\u003cstring, 2 chars\u003e"`) || !strings.Contains(s, `"ok":true`) {
 				t.Fatalf("got %s", s)
 			}
 		}},
-		{"over the cap keeps a head", `{"blob":"` + strings.Repeat("é", activityInputCap) + `"}`, func(t *testing.T, out json.RawMessage) {
+		// A string is a length on the bus, so only structure can be over the
+		// cap: an array of numbers is.
+		{"over the cap keeps a head", `{"blob":[` + strings.Repeat("1,", activityInputCap) + `1]}`, func(t *testing.T, out json.RawMessage) {
 			var v struct {
 				Truncated bool   `json:"truncated"`
 				Bytes     int    `json:"bytes"`
@@ -416,7 +415,7 @@ func TestRedactInput(t *testing.T) {
 			if err := json.Unmarshal(out, &v); err != nil || !v.Truncated || v.Bytes <= activityInputCap || len(v.Head) == 0 || len(v.Head) > activityInputHead {
 				t.Fatalf("got %s (%v)", out, err)
 			}
-			if !strings.HasPrefix(v.Head, `{"blob":"`) {
+			if !strings.HasPrefix(v.Head, `{"blob":[`) {
 				t.Fatalf("head = %q", v.Head)
 			}
 		}},
@@ -427,14 +426,14 @@ func TestRedactInput(t *testing.T) {
 		}},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput(InputValuesFull, "terminal", json.RawMessage(tc.in))) })
+		t.Run(tc.name, func(t *testing.T) { tc.want(t, redactInput("terminal", json.RawMessage(tc.in))) })
 	}
 }
 
 // The entry's other fields are bounded from the delivery: a long tool name,
 // call id or timestamp cannot make a part the size of the door's body cap.
 func TestActivity_EntryFieldsAreBounded(t *testing.T) {
-	a := newActivityState(false, InputValuesShape)
+	a := newActivityState(false)
 	long := strings.Repeat("n", 4096)
 	var d hookDelivery
 	d.Event, d.ToolName, d.Timestamp = hookPostToolCall, long, long
@@ -450,7 +449,7 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 // the drain), so a marker would overcount.
 func TestActivity_UnreadableSignedDeliveryIsNotCounted(t *testing.T) {
 	b := &Bridge{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: map[string]*taskRun{}}
-	a := newActivityState(true, InputValuesShape)
+	a := newActivityState(true)
 	run := &taskRun{origin: &lib.Envelope{TaskID: "task-bad", ContextID: "ctx", CorrelationID: "corr"}}
 	run.act.Store(a)
 	b.tasks["task-bad"] = run
@@ -525,9 +524,9 @@ func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	startBridgeCfg(t, url, hermesStub(t, `
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
-call(tool, {"which": prompt}, "call-" + prompt)
+call(tool, {"which": ord(prompt)}, "call-" + prompt)
 time.sleep(1.5)
-call(tool + "-again", {"which": prompt}, "call2-" + prompt)
+call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
 `), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
@@ -543,16 +542,19 @@ print("answer for " + prompt)
 	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
 	}
+	// The input carries the prompt as a number, since no string value rides
+	// the trace: "A" is 65, "B" is 66.
 	for _, tc := range []struct {
-		task *lib.Task
-		want string
-	}{{ta, "A"}, {tb, "B"}} {
+		task  *lib.Task
+		want  string
+		which string
+	}{{ta, "A", "65"}, {tb, "B", "66"}} {
 		entries := activityEntries(t, tc.task)
 		if len(entries) != 2 {
 			t.Fatalf("task %s: %d entries, want 2: %+v", tc.want, len(entries), entries)
 		}
 		for _, e := range entries {
-			if !strings.HasPrefix(e.Tool, "tool-for-"+tc.want) || !strings.Contains(string(e.Input), `"which":"`+tc.want+`"`) {
+			if !strings.HasPrefix(e.Tool, "tool-for-"+tc.want) || !strings.Contains(string(e.Input), `"which":`+tc.which) {
 				t.Fatalf("task %s carries another task's call: %+v", tc.want, e)
 			}
 		}
@@ -589,7 +591,7 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 		d.Extra.Status, d.Extra.ErrorType = status, errType
 		return d
 	}
-	a := newActivityState(false, InputValuesFull)
+	a := newActivityState(false)
 	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
 		t.Fatalf("blocked -> %+v", e)
 	}
@@ -601,48 +603,37 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 	}
 }
 
-func TestRedactInput_ValuesUnderInnocentKeys(t *testing.T) {
-	in := `{"command": "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI; aws s3 ls --secret-access-key hunter6; kubectl --token eyJhbGciOiJSUzI1NiIsImtpZCI6In0 get pods; gcloud x --password hunter5; curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123' -u admin:hunter2 -d '{\"password\":\"hunter3\", \"token\": \"hunter4\"}' -H 'Authorization: Basic dXNlcjpodW50ZXIy' https://x; export GH=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345; gcloud --access-token=ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz ls", "plain": "kubectl get pods -n kube-system", "id": 9007199254740993}`
-	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"abcdefghijklmnopqrstuvwxyz0123", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "ya29.a0AfH6SMB", "hunter2", "hunter3", "hunter4", "dXNlcjpodW50ZXIy", "eyJhbGciOiJSUzI1NiIsImtpZCI6In0", "hunter5", "wJalrXUtnFEMI", "hunter6"} {
-		if strings.Contains(out, leaked) {
-			t.Fatalf("leaked %q in %s", leaked, out)
+// Names are not credentials: a key that merely contains or opens with a
+// secret word (secretName, tokenizer) is not blanked, so the trace still
+// says the key was there and how long its value was; the key rule is what
+// tells the two apart, not the value, which is a length either way.
+func TestRedactInput_KeyRuleSparesNames(t *testing.T) {
+	in := `{"command": "kubectl get secret my-secret -o yaml", "secretName": "db-creds", "tokenizer": "cl100k", "max_tokens": 4096, "SECRET_KEY": "s3"}`
+	out := string(redactInput("terminal", json.RawMessage(in)))
+	for _, name := range []string{"command", "secretName", "tokenizer"} {
+		if strings.Contains(out, `"`+name+`":"[redacted]"`) {
+			t.Fatalf("name %q was blanked: %s", name, out)
 		}
 	}
-	if !strings.Contains(out, "kubectl get pods -n kube-system") {
-		t.Fatalf("innocent value was damaged: %s", out)
-	}
-	if !strings.Contains(out, `"id":9007199254740993`) {
-		t.Fatalf("a 64-bit id lost digits through the scrub: %s", out)
-	}
-}
-
-// Ordinary text and names are not credentials: the scrub leaves them, so the
-// trace carries what the worker adapter's would.
-func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
-	in := `{"command": "git commit -m 'basic refactoring'; date -u 12:30; sort -u a:b; kubectl get secret my-secret -o yaml", "secretName": "db-creds", "tokenizer": "cl100k", "max_tokens": 4096, "SECRET_KEY": "s3"}`
-	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, kept := range []string{"basic refactoring", "date -u 12:30", "sort -u a:b", "kubectl get secret my-secret -o yaml", `"secretName":"db-creds"`, `"tokenizer":"cl100k"`} {
-		if !strings.Contains(out, kept) {
-			t.Fatalf("ordinary text %q was scrubbed: %s", kept, out)
-		}
+	if strings.Contains(out, "my-secret") || strings.Contains(out, "db-creds") || !strings.Contains(out, `"secretName":"\u003cstring, 8 chars\u003e"`) {
+		t.Fatalf("a string value reached the trace: %s", out)
 	}
 	// The accepted price: a key that ends in a secret word is blanked even
 	// when it is a count, so SECRET_KEY-style keys are caught.
-	if !strings.Contains(out, `"max_tokens":"[redacted]"`) || strings.Contains(out, `"s3"`) {
+	if !strings.Contains(out, `"max_tokens":"[redacted]"`) || !strings.Contains(out, `"SECRET_KEY":"[redacted]"`) || strings.Contains(out, `"s3"`) {
 		t.Fatalf("component rule not applied as documented: %s", out)
 	}
 }
 
-// The shape default, end to end: a bridge whose Config says nothing about
-// input values puts shapes on the bus, with the redaction marker and the
-// numbers kept, and the raw argument text absent from every part.
-func TestActivity_ShapeIsTheDefaultOnTheBus(t *testing.T) {
+// End to end: no argument text reaches the bus. The trace carries shapes,
+// with the redaction marker and the numbers kept, and the raw argument text
+// is absent from every part of every artifact.
+func TestActivity_NoArgumentTextReachesTheBus(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 call("kubectl", {"cmd": "get pods", "token": "hunter2", "nested": {"api_key": "k", "keep": 1}, "project": "p"}, "call_1")
 print("the answer")
-`), func(c *Config) { c.ActivityInputValues = "" })
+`), nil)
 	c := gatewayClient(t, url)
 	submit(t, c, "task-shape", "list the fleet")
 	task := waitTerminal(t, c, "task-shape")
@@ -672,29 +663,27 @@ print("the answer")
 	}
 }
 
-// Shape mode, the default: no string value leaves the pod, whatever its
-// key; the structure, numbers, booleans and the redaction markers stay, and
-// the one exception is a tool_call wrapper's own nested tool names, which a
-// grader reads. No grammar keeps a "name": a resource name and a credential
-// under the same key are the same length to the trace.
-func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyWrapperNames(t *testing.T) {
+// No string value leaves the pod, whatever its key; the structure, numbers,
+// booleans and the redaction markers stay, and the one exception is a
+// tool_call wrapper's own nested tool names, which a grader reads. No
+// grammar keeps a "name": a resource name and a credential under the same
+// key are the same length to the trace.
+func TestRedactInput_ShapesEveryStringButWrapperNames(t *testing.T) {
 	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}},{"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"}],"resource":"apiVersion: v1\nkind: Secret","project":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","cluster":"name with space","kind":"PodDisruptionBudget"}`
-	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
-		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
-		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "wJalrXUtnFEMI", "name with space", "seeded-a", "kube-system", "PodDisruptionBudget", `"id":"abc"`} {
-			if strings.Contains(out, leaked) {
-				t.Fatalf("mode %q published a string value %q: %s", mode, leaked, out)
-			}
+	out := string(redactInput(hermesToolCallWrapper, json.RawMessage(in)))
+	for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "wJalrXUtnFEMI", "name with space", "seeded-a", "kube-system", "PodDisruptionBudget", `"id":"abc"`} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("a string value %q was published: %s", leaked, out)
 		}
-		for _, kept := range []string{`"count":3`, `"dry_run":true`, `"name":"kanban_create"`, `"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`, `"name":"\u003cstring, 8 chars\u003e"`} {
-			if !strings.Contains(out, kept) {
-				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
-			}
+	}
+	for _, kept := range []string{`"count":3`, `"dry_run":true`, `"name":"kanban_create"`, `"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`, `"name":"\u003cstring, 8 chars\u003e"`} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("lost %q: %s", kept, out)
 		}
 	}
 	// Keys are model-written text too: a credential in a key slot, a map
 	// keyed by user data, is shaped; a schema key stays.
-	keyed := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"headers":{"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y":"","Accept":"json"},"env":{"GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345":"","PGHOST":"db"},"labels":{"app.kubernetes.io/name":"web","9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f":"x"},"dry_run":true,"maxResults":3}`)))
+	keyed := string(redactInput("http_request", json.RawMessage(`{"headers":{"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y":"","Accept":"json"},"env":{"GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345":"","PGHOST":"db"},"labels":{"app.kubernetes.io/name":"web","9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f":"x"},"dry_run":true,"maxResults":3}`)))
 	for _, leaked := range []string{"eyJhbGciOiJIUzI1NiJ9", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "9f3c2a1b7d", "app.kubernetes.io/name"} {
 		if strings.Contains(keyed, leaked) {
 			t.Fatalf("a key carried text onto the trace: %q in %s", leaked, keyed)
@@ -706,27 +695,23 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyWrapperNames(t *testing.T) {
 		}
 	}
 	// A calls[].name below the wrapper's own array is an argument value.
-	deep := string(redactInput(InputValuesShape, hermesToolCallWrapper, json.RawMessage(`{"calls":[{"name":"kanban_create","arguments":{"calls":[{"name":"my password is hunter2"}]}}],"other":{"calls":[{"name":"not a tool name either"}]}}`)))
+	deep := string(redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[{"name":"kanban_create","arguments":{"calls":[{"name":"my password is hunter2"}]}}],"other":{"calls":[{"name":"not a tool name either"}]}}`)))
 	if strings.Contains(deep, "hunter2") || strings.Contains(deep, "not a tool name") || !strings.Contains(deep, `"name":"kanban_create"`) {
 		t.Fatalf("a nested calls[].name below the wrapper's array was kept: %s", deep)
 	}
 	// Only an element of the root's calls array is a call: a "calls" that is
 	// a map, at the root or under another key, or an array nested in the
 	// calls array, carries the model's text under "name".
-	mapForm := string(redactInput(InputValuesShape, hermesToolCallWrapper, json.RawMessage(`{"calls":{"name":"map form hunter4"},"x":{"calls":{"name":"deeper map hunter5"}},"y":{"calls":[{"name":"deeper array hunter6"}]},"z":[{"calls":[{"name":"array in array hunter7"}]}]}`)))
+	mapForm := string(redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":{"name":"map form hunter4"},"x":{"calls":{"name":"deeper map hunter5"}},"y":{"calls":[{"name":"deeper array hunter6"}]},"z":[{"calls":[{"name":"array in array hunter7"}]}]}`)))
 	for _, leaked := range []string{"hunter4", "hunter5", "hunter6", "hunter7"} {
 		if strings.Contains(mapForm, leaked) {
 			t.Fatalf("a name off the wrapper's calls array was kept: %q in %s", leaked, mapForm)
 		}
 	}
 	// Under any other tool a calls[].name is the model's text, not a tool name.
-	other := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"calls":[{"name":"admin:hunter2@db"},{"name":"kanban_create"}]}`)))
+	other := string(redactInput("http_request", json.RawMessage(`{"calls":[{"name":"admin:hunter2@db"},{"name":"kanban_create"}]}`)))
 	if strings.Contains(other, "hunter2") || strings.Contains(other, `"name":"kanban_create"`) {
 		t.Fatalf("calls[].name kept under a tool that is not the wrapper: %s", other)
-	}
-	full := string(redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(in)))
-	if !strings.Contains(full, `"note":"free text"`) || strings.Contains(full, "hunter2") {
-		t.Fatalf("full mode: %s", full)
 	}
 }
 
@@ -739,7 +724,7 @@ func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
 	t.Cleanup(func() { activityDrainBudget = prev })
 	_, url := startServer(t)
 	b := startBridgeCfg(t, url, []string{"true"}, nil)
-	a := newActivityState(false, InputValuesFull)
+	a := newActivityState(false)
 	for _, id := range []string{"c1", "c2"} {
 		var d hookDelivery
 		d.Event, d.ToolName, d.Extra.ToolCallID = hookPreToolCall, "terminal", id
@@ -760,13 +745,13 @@ func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
 // camelCase is the native key style of most MCP and HTTP tool schemas: a
 // secret word that starts a component there is blanked like its snake_case
 // twin, while a name that merely starts with the word (secretName,
-// tokenizer) still ships.
+// tokenizer) is not.
 func TestRedactInput_CamelCaseKeys(t *testing.T) {
 	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","sessionCookie":"sid=c1","cookieHeader":"c2","SESSIONCOOKIE":"c3","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"a-name","secretAccessKey":"w4","secretKey":"w5","passwordHash":"h1","tokenPath":"/t","credentialsFile":"/c","SecretRef":"r-name"}`
-	out := string(redactInput(InputValuesFull, "http_request", json.RawMessage(in)))
-	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, `"w4"`, `"w5"`, `"h1"`, "sid=c1", `"c2"`, `"c3"`} {
-		if strings.Contains(out, leaked) {
-			t.Fatalf("leaked %q in %s", leaked, out)
+	out := string(redactInput("http_request", json.RawMessage(in)))
+	for _, blanked := range []string{"accessToken", "clientSecret", "dbPassword", "authToken", "xApiKey", "gcpAPIKey", "awsSecretAccessKey", "refreshTokens", "apiKey", "sessionCookie", "cookieHeader", "SESSIONCOOKIE", "AWSSecretAccessKey", "DBPassword", "IDToken", "TLSPassphrase", "SecretAccessKey", "TokenValue", "secretAccessKey", "secretKey", "passwordHash"} {
+		if !strings.Contains(out, `"`+blanked+`":"[redacted]"`) {
+			t.Fatalf("key %q not blanked in %s", blanked, out)
 		}
 	}
 	// The accepted price, the camelCase twin of max_tokens.
@@ -776,69 +761,34 @@ func TestRedactInput_CamelCaseKeys(t *testing.T) {
 	// A key that opens with the word is a name only when it goes on as a
 	// name, reference or location (secretName, SecretRef, tokenPath,
 	// credentialsFile); otherwise it is a credential (secretAccessKey).
-	for _, kept := range []string{`"secretName":"db-creds"`, `"tokenizer":"cl100k"`, `"credentialsPath":"/x"`, `"SecretName":"a-name"`, `"tokenPath":"/t"`, `"credentialsFile":"/c"`, `"SecretRef":"r-name"`} {
-		if !strings.Contains(out, kept) {
-			t.Fatalf("name %q was scrubbed: %s", kept, out)
+	for _, name := range []string{"secretName", "tokenizer", "credentialsPath", "SecretName", "tokenPath", "credentialsFile", "SecretRef"} {
+		if strings.Contains(out, `"`+name+`":"[redacted]"`) {
+			t.Fatalf("name %q was blanked: %s", name, out)
 		}
 	}
 }
 
-// A quoted secret with spaces in it is scrubbed whole: the tail of a
-// passphrase must not ship behind a marker that says it was redacted.
-func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
-	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z; curl --cookie 'session=9f3c2a1b7d' https://k; curl -b sid=c0ffee https://m; export DB_PASSWORD=p@ss,w0rd; echo token=ab}cd; curl -u 'admin:p&ss' https://w && echo done", "plain": "kubectl get pods -h db"}`
-	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8", "w0rd", "}cd", "p&ss", "session=9f3c2a1b7d", "sid=c0ffee"} {
+// The key rule reads every spelling a schema or an environment uses: an
+// all-caps key with the word as an unseparated suffix (PGPASSWORD), a
+// header's own key (Cookie), kebab-case key material (client-key-data), and
+// the words outside the first list (private_key, passphrase, ssh_key,
+// signing_key); a path to one (privateKeyPath) is a name.
+func TestRedactInput_KeySpellings(t *testing.T) {
+	in := `{"env": {"PGPASSWORD": "hunter11", "MYSQLPASSWORD": "hunter12", "PGHOST": "db"}, "headers": {"Cookie": "session=9f3c2a1b", "Set-Cookie": "sid=1", "Accept": "json"}, "kubeconfig": {"users": [{"user": {"client-key-data": "LS0tLS1CRUdJTi", "client-certificate-data": "cert-ok"}}]}, "private_key": "-----BEGIN PRIVATE KEY-----", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "key_data": "d1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	out := string(redactInput("terminal", json.RawMessage(in)))
+	for _, blanked := range []string{"PGPASSWORD", "MYSQLPASSWORD", "Cookie", "Set-Cookie", "client-key-data", "private_key", "passphrase", "sshKey", "signing_key_id", "key_data"} {
+		if !strings.Contains(out, `"`+blanked+`":"[redacted]"`) {
+			t.Fatalf("key %q not blanked in %s", blanked, out)
+		}
+	}
+	for _, name := range []string{"PGHOST", "Accept", "client-certificate-data", "privateKeyPath", "basic"} {
+		if strings.Contains(out, `"`+name+`":"[redacted]"`) {
+			t.Fatalf("name %q was blanked: %s", name, out)
+		}
+	}
+	for _, leaked := range []string{"hunter11", "9f3c2a1b", "LS0tLS1CRUdJTi", "cert-ok", "BEGIN PRIVATE KEY", "refactoring", `"db"`} {
 		if strings.Contains(out, leaked) {
-			t.Fatalf("leaked %q in %s", leaked, out)
-		}
-	}
-	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`, "https://y", "https://z", "https://k", "https://m", "https://w ", "echo done"} {
-		if !strings.Contains(out, kept) {
-			t.Fatalf("text after the secret was lost: %q missing in %s", kept, out)
-		}
-	}
-	// An unterminated quote falls back to the whitespace rule: the first
-	// word is scrubbed and the rest of the line survives.
-	if !strings.Contains(out, ` tail;`) {
-		t.Fatalf("unterminated-quote fallback lost the line: %s", out)
-	}
-}
-
-// A curl command continued over backslash-newlines is one command: its -u
-// and -b on a continuation line are scrubbed, the lines around them kept,
-// and the next command after the separator is untouched.
-func TestRedactInput_CurlContinuationLines(t *testing.T) {
-	in := `{"command": "curl -sS https://api.example.com/v1 \\\n  -u admin:hunter2 \\\n  -H 'Accept: json'; curl https://q \\\r\n -b sid=deadbeef99 \\\n -o out.json\necho -u notcurl"}`
-	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"hunter2", "deadbeef99"} {
-		if strings.Contains(out, leaked) {
-			t.Fatalf("leaked %q in %s", leaked, out)
-		}
-	}
-	for _, kept := range []string{"https://api.example.com/v1", "-H 'Accept: json'", "https://q", "-o out.json", "echo -u notcurl"} {
-		if !strings.Contains(out, kept) {
-			t.Fatalf("expected %q in %s", kept, out)
-		}
-	}
-}
-
-// The scheme token is case-insensitive, and a credential can arrive under a
-// key outside the first list of words: a private key, a passphrase.
-func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
-	in := `{"env": {"PGPASSWORD": "hunter11", "MYSQLPASSWORD": "hunter12", "PGHOST": "db"}, "headers": {"Cookie": "session=9f3c2a1b", "Accept": "json"}, "yaml": "authorization:\n  mode: Webhook\npassword:\n  valueFrom:\n    secretKeyRef: x\n", "urls": "psql postgresql://admin:hunter13@db.internal:5432/app; git clone https://user:glpat-xxxx@gitlab.example/r.git; curl -H 'Cookie: session=abc123' https://c", "kubeconfig": {"users": [{"user": {"client-key-data": "LS0tLS1CRUdJTi", "client-certificate-data": "cert-ok"}}]}, "cmd2": "kubectl config set-credentials u --client-key-data=LS0tLS1CRUdJTi2; curl -H 'Authorization: lin_api_9f3c2a1b7d' https://api.linear.app; curl -H \"Authorization: 9f3c2a1b7d\" https://r", "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----\n", "command": "cat > id_rsa <<EOF\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\n-----END OPENSSH PRIVATE KEY-----\nEOF; curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
-	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", "MIIEowIBAAKCAQEA7", "b3BlbnNzaC1rZXkt", "LS0tLS1CRUdJTi", "lin_api_9f3c2a1b7d", "9f3c2a1b7d", "hunter11", "hunter12", "session=9f3c2a1b", "hunter13", "glpat-xxxx", "session=abc123", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
-		if strings.Contains(out, leaked) {
-			t.Fatalf("leaked %q in %s", leaked, out)
-		}
-	}
-	// A short word after "basic" is not a credential, and a camelCase key
-	// that starts with the word is a name, as for secretName.
-	// The curl command's URL and method survive its credential.
-	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d", `"client-certificate-data":"cert-ok"`, "https://api.linear.app", "https://r", `"PGHOST":"db"`, `"Accept":"json"`, "mode: Webhook", "secretKeyRef: x", "postgresql://[redacted]@db.internal:5432/app", "https://[redacted]@gitlab.example/r.git", "https://c"} {
-		if !strings.Contains(out, kept) {
-			t.Fatalf("expected %q in %s", kept, out)
+			t.Fatalf("a string value reached the trace: %q in %s", leaked, out)
 		}
 	}
 }
@@ -847,9 +797,11 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 // call's arguments is capped on its own, so a tool_called check on a nested
 // tool still sees it, and the wrapper is not the whole-input stand-in.
 func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
-	big := strings.Repeat("x", activityInputCap)
-	in := `{"calls":[{"name":"kanban_create","arguments":{"title":"a","body":"` + big + `","token":"s1"}},{"name":"kanban_comment","arguments":{"body":"` + big + `"}},{"name":"kanban_list"},{"name":"kanban_get","arguments":{"id":7}}]}`
-	out := redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(in))
+	// A string is a length on the bus, so the bulk that puts a call over
+	// the cap is structure: an array of numbers.
+	big := `[` + strings.Repeat("1,", activityInputCap) + `1]`
+	in := `{"calls":[{"name":"kanban_create","arguments":{"title":"a","body":` + big + `,"token":"s1"}},{"name":"kanban_comment","arguments":{"body":` + big + `}},{"name":"kanban_list"},{"name":"kanban_get","arguments":{"id":7}}]}`
+	out := redactInput(hermesToolCallWrapper, json.RawMessage(in))
 	if len(out) > activityInputCap {
 		t.Fatalf("wrapper still over the cap: %d bytes", len(out))
 	}
@@ -888,7 +840,7 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	}
 
 	// The same wrapper under another tool name is capped whole, as before.
-	whole := redactInput(InputValuesFull, "terminal", json.RawMessage(in))
+	whole := redactInput("terminal", json.RawMessage(in))
 	if !strings.HasPrefix(string(whole), `{"bytes":`) && !strings.Contains(string(whole), `"truncated":true`) {
 		t.Fatalf("non-wrapper over the cap was not the stand-in: %s", whole)
 	}
@@ -900,10 +852,10 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	// replaces every arguments object, head-less, and the names survive.
 	var small []string
 	for i := 0; i < 12; i++ {
-		small = append(small, `{"name":"kanban_comment","arguments":{"id":`+strings.Repeat("7", 3)+`,"body":"`+strings.Repeat("s", 200)+`"}}`)
+		small = append(small, `{"name":"kanban_comment","arguments":{"id":`+strings.Repeat("7", 3)+`,"body":[`+strings.Repeat("1,", 100)+`1]}}`)
 	}
-	manySmall := redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(small, ",")+`]}`))
-	if len(manySmall) > activityInputCap || strings.Count(string(manySmall), `"name":"kanban_comment"`) != 12 || strings.Contains(string(manySmall), `"head":"{`) {
+	manySmall := redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(small, ",")+`]}`))
+	if len(manySmall) > activityInputCap || strings.Count(string(manySmall), `"name":"kanban_comment"`) != 12 || strings.Contains(string(manySmall), `"head":"[`) {
 		t.Fatalf("many small calls lost their names or kept heads: %d bytes %s", len(manySmall), manySmall[:min(len(manySmall), 160)])
 	}
 
@@ -911,9 +863,9 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	// whole stand-in rather than an over-cap wrapper.
 	var many []string
 	for i := 0; i < activityInputCap/8; i++ {
-		many = append(many, `{"name":"kanban_create_`+strings.Repeat("y", 40)+`","arguments":{"b":"`+big+`"}}`)
+		many = append(many, `{"name":"kanban_create_`+strings.Repeat("y", 40)+`","arguments":{"b":`+big+`}}`)
 	}
-	fallback := redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(many, ",")+`]}`))
+	fallback := redactInput(hermesToolCallWrapper, json.RawMessage(`{"calls":[`+strings.Join(many, ",")+`]}`))
 	if len(fallback) > activityInputCap || !strings.Contains(string(fallback), `"truncated":true`) {
 		t.Fatalf("oversized wrapper did not fall back: %d bytes %s", len(fallback), fallback[:min(len(fallback), 120)])
 	}
@@ -985,7 +937,7 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
 	activityEntryBudget, activityHeartbeatReserve = 4, 2
 	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
-	a := newActivityState(false, InputValuesFull)
+	a := newActivityState(false)
 	got := 0
 	for i := 0; i < 3; i++ {
 		if a.underBudget() {
@@ -1006,7 +958,7 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	}
 	// And the other way: a heartbeat that spent its share took nothing from
 	// the trace's.
-	b := newActivityState(false, InputValuesFull)
+	b := newActivityState(false)
 	for i := 0; i < 5; i++ {
 		b.heartbeatUnderBudget()
 	}
@@ -1210,7 +1162,7 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 // the cap the oldest is forgotten and the newest still dedupes, so a late
 // retry of a recent post is one call however long the run.
 func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
-	a := newActivityState(false, InputValuesShape)
+	a := newActivityState(false)
 	post := func(id string) (ActivityEntry, bool) {
 		var d hookDelivery
 		if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","delivery_id":"`+id+`","extra":{"tool_call_id":"`+id+`","status":"ok"}}`), &d); err != nil {
@@ -1234,39 +1186,11 @@ func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
 	}
 }
 
-// curl's -u folded into a cluster of boolean short flags, and a URL
-// password holding / or @, are scrubbed in full mode; --user-agent is not
-// --user, and a URL with no userinfo keeps an @ in its path.
-func TestRedactInput_CurlClustersAndUserinfoWithSlashes(t *testing.T) {
-	in := `{"command": "curl -su admin:hunter2 https://h; curl -fsSLu root:hunter3 https://i -o f; curl --user-agent ua https://j; psql postgres://u:pa/ss@h:5432/db; curl https://u:pa@ss@k/x; echo https://plain.example/a@b; curl http://api.internal:8080/notify?to=ops@example.com; curl http://user:p4ss@h:8080/x"}`
-	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"hunter2", "hunter3", "pa/ss", "pa@ss", "ss@k", "p4ss"} {
-		if strings.Contains(out, leaked) {
-			t.Fatalf("leaked %q in %s", leaked, out)
-		}
-	}
-	for _, kept := range []string{"https://h;", "https://i -o f", "--user-agent ua https://j", "postgres://[redacted]@h:5432/db", "https://[redacted]@k/x", "https://plain.example/a@b", "http://api.internal:8080/notify?to=ops@example.com", "http://[redacted]@h:8080/x"} {
-		if !strings.Contains(out, kept) {
-			t.Fatalf("expected %q in %s", kept, out)
-		}
-	}
-}
-
-// Shape mode never publishes a string, so it skips the credential scrub
-// over values: the length it reports is the string's own, and the markers
-// it keeps are the key-based ones.
-func TestRedactInput_ShapeModeSkipsTheValueScrub(t *testing.T) {
-	out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"h":"Bearer abcdefghijklmnop","token":"x"}`)))
-	if !strings.Contains(out, `"h":"\u003cstring, 23 chars\u003e"`) || !strings.Contains(out, `"token":"[redacted]"`) {
-		t.Fatalf("shape mode: %s", out)
-	}
-}
-
 // One field of a surprising type does not drop the delivery: the call is
 // observed with that field zero, so a finished call is never recorded
 // interrupted for a word in duration_ms or a number in tool_call_id.
 func TestActivity_OneFieldsTypeDoesNotDropTheDelivery(t *testing.T) {
-	a := newActivityState(false, InputValuesShape)
+	a := newActivityState(false)
 	var d hookDelivery
 	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","tool_input":{"command":"ls"},"timestamp":{"x":1},"delivery_id":12,"extra":{"tool_call_id":7,"duration_ms":"fast","status":"ok","error_type":null}}`), &d); err != nil {
 		t.Fatalf("a field's type dropped the delivery: %v", err)
@@ -1287,7 +1211,7 @@ func TestActivity_OneFieldsTypeDoesNotDropTheDelivery(t *testing.T) {
 // prefix, a long single-case run, or classes that churn like base62; a
 // camelCase schema key with a few words stays.
 func TestRedactInput_TokenShapedKeys(t *testing.T) {
-	out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"ghp_abcdefghijklmnopqrstuvwABCDEFGHIJKL":1,"AIzaSyA_bcdefghijklmnopqrstuvwxyzABC":1,"a1B2c3D4e5F6g7":1,"QWERTYUIOPASDFGHJKLZXCVB":1,"resourceVersion":1,"includeUninitializedResourceVersion":1,"sha256Digest":1}`)))
+	out := string(redactInput("terminal", json.RawMessage(`{"ghp_abcdefghijklmnopqrstuvwABCDEFGHIJKL":1,"AIzaSyA_bcdefghijklmnopqrstuvwxyzABC":1,"a1B2c3D4e5F6g7":1,"QWERTYUIOPASDFGHJKLZXCVB":1,"resourceVersion":1,"includeUninitializedResourceVersion":1,"sha256Digest":1}`)))
 	for _, leaked := range []string{"ghp_", "AIza", "a1B2c3D4", "QWERTYUIOPASDFGHJKLZXCVB"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("a token-shaped key was published: %q in %s", leaked, out)

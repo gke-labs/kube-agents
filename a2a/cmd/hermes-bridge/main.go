@@ -131,14 +131,11 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
 		// The activity door (a2a/hermes-bridge/activity.go): on by default;
 		// each child is handed whatever address the door bound.
-		ActivityListen: activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
-		ScratchDir:     os.Getenv("BRIDGE_SCRATCH_DIR"),
-		// BRIDGE_ACTIVITY_INPUT_VALUES=full publishes scrubbed argument
-		// values on the trace; unset or anything else publishes shapes.
-		ActivityInputValues: os.Getenv("BRIDGE_ACTIVITY_INPUT_VALUES"),
-		ManagedScopeDir:     managedScopeDir(),
-		ProgressInterval:    progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
-		Logger:              log,
+		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
+		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
+		ManagedScopeDir:  managedScopeDir(),
+		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
+		Logger:           log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
 		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}

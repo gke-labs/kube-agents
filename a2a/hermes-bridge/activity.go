@@ -111,18 +111,6 @@ const (
 	// progress as one edited chat line, so this is one edit per minute.
 	DefaultProgressInterval = 60 * time.Second
 
-	// InputValuesShape and InputValuesFull are Config.ActivityInputValues'
-	// two settings. Shape is the default: the graders on the inject lane
-	// read tool names (an entry's tool, a tool_call wrapper's calls[].name)
-	// and nothing of the arguments, and a string value is where every
-	// credential the scrub ever missed arrived, so by default none leaves
-	// the pod. Under shape every string value becomes "<string, N chars>",
-	// the one exception being the nested tool names of hermes's tool_call
-	// wrapper, which a grader reads; numbers, booleans, nulls, the
-	// redaction markers and the structure stay. No grammar tells a name
-	// from a token, so none is attempted.
-	InputValuesShape = "shape"
-	InputValuesFull  = "full"
 	// activityInputCap bounds one call's input on the bus: two KiB, enough
 	// for any argument object a grader would read and small beside the
 	// stream's per-message ceiling.
@@ -212,19 +200,17 @@ const (
 	redactedValue = "[redacted]"
 )
 
-// Two redactions, because the worker adapter publishes tool_use input
-// verbatim and this stream is retained for days and copied into eval
-// records. redactedKeyPattern names input keys whose values never go on the
-// bus. redactedValuePatterns catch the credential shapes a value can carry
-// under an innocent key - a terminal command is one string under "command" -
-// and are best-effort by nature: a bearer or basic authorization value,
-// a Google OAuth access token, a Google API key, a GitHub token, a
-// user:password given to curl's -u, or a key that looks like a secret
-// followed by its value - with or without the quotes and spaces a JSON body
-// or a header puts around the separator, and as a command-line flag with
-// its value after a space (--token v, --access-token v, --password v).
-// Anything else the model pastes into a command line ships, a bare -p v
-// included, since -p is a port as often as a password.
+// What of an input reaches the bus is decided twice, because this stream
+// is retained for days and copied into eval records. redactedKeyPattern
+// and its siblings name input keys whose values never go on the bus, so
+// the trace still says a secret-looking key was there. Then every string
+// value becomes its shape (shapeValue): the graders on the inject lane
+// read tool names (an entry's tool, a tool_call wrapper's calls[].name)
+// and nothing of the arguments, and no grammar tells a resource name from
+// a credential under the same key, so no string value leaves the pod
+// whatever its key, and no value scrub is attempted. A credential a model
+// pastes into a terminal command is one string under "command", and ships
+// as a length.
 // activityEntryBudget bounds the parts one task publishes on its trace and
 // its heartbeat together. Both ride the task's own events subject, which
 // the TASKS stream caps at 4096 messages per subject with discard-old, so a
@@ -283,71 +269,6 @@ var (
 	// passwordId stay.
 	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?[A-Z]`)
 	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids)?$`)
-	redactedValuePatterns    = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
-		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
-		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
-		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		// The header form, in any case (the scheme token is case-insensitive)
-		// and long enough to be a credential, so "basic refactoring" in a
-		// commit message is not one: the word after it is too short.
-		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
-		// An Authorization header by its own key, whatever the scheme and
-		// however short the credential (Basic root:toor is twelve characters,
-		// a Token or Digest value has no shape of its own): scheme and
-		// value, the two words after the key.
-		regexp.MustCompile(`(?i)authorization["']?[ \t]*[:=][ \t]*["']?[A-Za-z][A-Za-z0-9-]*[ \t]+[^\s"']+`),
-		// ... and with no scheme word at all (an API that takes the raw key
-		// in the header): the one token after the key.
-		regexp.MustCompile(`(?i)authorization["']?[ \t]*[:=][ \t]*["']?[^\s"']+`),
-
-		// key=value / key: value / "key": "value", where a secret word is a
-		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
-		// quoted value runs to its closing quote, spaces included, so a
-		// passphrase does not leave its tail behind the marker; an unquoted
-		// or unterminated one runs to whitespace, punctuation included, so a
-		// generated password's comma or brace does not split it (what follows
-		// on the same word goes with it, the lesser cost). The separator's
-		// whitespace is same-line only, so a YAML key with its value on the
-		// next line does not take that line's first token.
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?[ \t]*[=:][ \t]*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
-		// A PEM private-key block, banner to banner: the one credential with
-		// a fixed marker, however it arrived (a heredoc, a file tool's
-		// content, a kubeconfig body under an innocent key).
-		regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
-		// --flag value, the word a component of the flag (--token, --secret-access-key);
-		// a quoted value runs to its closing quote as above.
-		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
-	}
-)
-
-// curl's -u user:password and -b/--cookie: the command is found whole (so
-// "date -u 12:30" and "sort -u a:b" are not read), and only the credential
-// inside it is replaced, the URL and headers around it kept. A quoted value runs to its
-// closing quote, the attached form (-uuser:pass) is read, and so is the flag
-// folded into a cluster of curl's boolean short flags (-su, -fsSLu); a long
-// flag needs its separator, so --user-agent is not --user. The
-// command runs to a separator (;, |, &&, newline), not to a lone & inside a
-// quoted password, and across a backslash-newline continuation, the way a
-// model writes a long command.
-var (
-	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n\\]|&[^&\n]|\\\r?\n|\\[^\n])*`)
-	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-[sSfLkvigGjJnNqRZ46#]*[ub][\s=]*|--(?:user|cookie)[\s=]+)(?:"[^"\n]*"|'[^'\n]*'|\S+)`)
-	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
-	// the userinfo alone goes, the scheme and host around it stay. The
-	// userinfo ends at the authority's end (/, ?, #), so a URL with a port
-	// and an @ in its path or query has none and is kept whole; inside it
-	// the password runs to the last @ a host follows, so an @ in it (pa@ss)
-	// is inside the cut.
-	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:?#]*:[^\s/?#]+(@[^\s@/?#]+)`)
-	// urlUserinfoSlashPattern is the same for a password holding a /, which
-	// a URL's authority cannot but a pasted one may: told from host:port/path
-	// by the run after the colon not being all digits, the password runs
-	// across the / to the first @ a host follows.
-	urlUserinfoSlashPattern = regexp.MustCompile(`(://)[^\s/@:?#]*:[^\s/@?#]*[^\s/@?#0-9][^\s/@?#]*/[^\s@]*(@[^\s@/]+)`)
-	// A Cookie or Set-Cookie header by its key: the rest of the line, the
-	// character before the key kept.
-	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
 )
 
 // schemaKeyPattern is what an object key must look like to be published
@@ -519,8 +440,6 @@ func lenientNumber(raw json.RawMessage) json.Number {
 
 // activityState is one task's side of the door.
 type activityState struct {
-	// inputValues is the bridge's Config.ActivityInputValues for this task.
-	inputValues string
 
 	// key signs this task's deliveries: the child's env value, verbatim.
 	// hermes HMACs with the secret's text bytes (target.secret.encode()),
@@ -549,18 +468,14 @@ type activityState struct {
 	done     chan struct{}
 }
 
-func newActivityState(withKey bool, inputValues string) *activityState {
-	if inputValues != InputValuesFull {
-		inputValues = InputValuesShape
-	}
+func newActivityState(withKey bool) *activityState {
 	a := &activityState{
-		inputValues: inputValues,
-		open:        make(map[string]ActivityEntry),
-		seen:        make(map[string]struct{}),
-		startedAt:   time.Now(),
-		appended:    make(map[string]bool),
-		stop:        make(chan struct{}),
-		done:        make(chan struct{}),
+		open:      make(map[string]ActivityEntry),
+		seen:      make(map[string]struct{}),
+		startedAt: time.Now(),
+		appended:  make(map[string]bool),
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
@@ -638,7 +553,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.open[id] = ActivityEntry{
 			Tool:   capRunes(d.ToolName, activityToolNameCap),
-			Input:  redactInput(a.inputValues, d.ToolName, d.ToolInput),
+			Input:  redactInput(d.ToolName, d.ToolInput),
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
@@ -652,7 +567,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		status := activityStatus(d)
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
-			Input:      redactInput(a.inputValues, d.ToolName, d.ToolInput),
+			Input:      redactInput(d.ToolName, d.ToolInput),
 			CallID:     capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
@@ -798,32 +713,28 @@ func secretLookingKey(k string) bool {
 	return redactedCamelHeadPattern.MatchString(k) && !camelHeadNamePattern.MatchString(k)
 }
 
-// redactInput returns the tool input fit for the bus: under shape mode the
-// structure with free-text values replaced by their shape (name-like keys
-// kept), under full mode the values with secret-looking keys blanked and
-// credential shapes scrubbed; at every depth, and the whole thing capped.
-// Over the cap the entry carries the size and a rune-safe head rather than
-// a JSON fragment; for hermes's tool_call wrapper the cap is applied to each
+// redactInput returns the tool input fit for the bus: the structure with
+// the values under secret-looking keys blanked and every other string
+// replaced by its shape, at every depth, and the whole thing capped. Over
+// the cap the entry carries the size and a rune-safe head rather than a
+// JSON fragment; for hermes's tool_call wrapper the cap is applied to each
 // nested call's arguments instead, so the nested tool names stay readable.
-func redactInput(mode, tool string, raw json.RawMessage) json.RawMessage {
+func redactInput(tool string, raw json.RawMessage) json.RawMessage {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil
 	}
 	// UseNumber: a number decoded into float64 and written back loses the
 	// low digits of a 64-bit id, and the worker adapter publishes the same
-	// argument verbatim; json.Number falls through redactValue and marshals
-	// as its literal.
+	// argument verbatim; json.Number falls through redactKeys and shapeValue
+	// and marshals as its literal.
 	dec := json.NewDecoder(strings.NewReader(trimmed))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
 		return json.RawMessage(unparseableInput)
 	}
-	red := redactValue(v, mode == InputValuesFull)
-	if mode != InputValuesFull {
-		red = shapeValue(red, tool)
-	}
+	red := shapeValue(redactKeys(v), tool)
 	out, err := json.Marshal(red)
 	if err != nil {
 		return json.RawMessage(unparseableInput)
@@ -902,10 +813,10 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 	return nil, false
 }
 
-// shapeValue is shape mode's pass over an already-scrubbed value: every
-// string becomes its shape, with the structure, numbers, booleans and nulls
-// left as they are. A "[redacted]" marker stays a marker, so the trace still
-// says a secret-looking key was there.
+// shapeValue is the pass over a key-blanked value: every string becomes
+// its shape, with the structure, numbers, booleans and nulls left as they
+// are. A "[redacted]" marker stays a marker, so the trace still says a
+// secret-looking key was there.
 func shapeValue(v any, tool string) any {
 	return shapeValueIn(v, "", tool == hermesToolCallWrapper, 0, false)
 }
@@ -951,40 +862,24 @@ func shapeValueIn(v any, key string, wrapper bool, depth int, callElem bool) any
 	return v
 }
 
-// redactValue blanks the values under secret-looking keys in every mode
-// (the marker is kept by shape mode too) and, when values is set, scrubs
-// credential shapes out of every string; shape mode replaces each string
-// with its length right after, so it skips that pass, which is most of
-// the work on the door's request path.
-func redactValue(v any, values bool) any {
+// redactKeys blanks the values under secret-looking keys at every depth;
+// shapeValue replaces every other string right after, so no value is read
+// for what it carries.
+func redactKeys(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
 			if secretLookingKey(k) {
 				t[k] = redactedValue
 			} else {
-				t[k] = redactValue(val, values)
+				t[k] = redactKeys(val)
 			}
 		}
 		return t
 	case []any:
 		for i := range t {
-			t[i] = redactValue(t[i], values)
+			t[i] = redactKeys(t[i])
 		}
-		return t
-	case string:
-		if !values {
-			return t
-		}
-		for _, re := range redactedValuePatterns {
-			t = re.ReplaceAllString(t, redactedValue)
-		}
-		t = curlCommandPattern.ReplaceAllStringFunc(t, func(cmd string) string {
-			return curlUserPattern.ReplaceAllString(cmd, redactedValue)
-		})
-		t = urlUserinfoPattern.ReplaceAllString(t, "${1}"+redactedValue+"${2}")
-		t = urlUserinfoSlashPattern.ReplaceAllString(t, "${1}"+redactedValue+"${2}")
-		t = cookieHeaderPattern.ReplaceAllString(t, "${1}"+redactedValue)
 		return t
 	}
 	return v
