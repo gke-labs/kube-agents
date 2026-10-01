@@ -154,9 +154,12 @@ const (
 	wrapperCallsKey       = "calls"
 	wrapperCallArgsKey    = "arguments"
 	activityInputCallHead = 256
-	// activityBodyCap bounds one delivery read; hermes's own payloads are
-	// tool inputs and results, never more than a few KiB.
-	activityBodyCap = 1 << 20
+	// activityBodyCap bounds one delivery read. hermes's payloads carry the
+	// tool input and result whole, so a file write of a large manifest is a
+	// few MiB; the cap is set well above that, since a delivery over it
+	// cannot be attributed (the cut body verifies against no key) and its
+	// call is then absent from the trace with nothing counting it.
+	activityBodyCap = 8 << 20
 	// activityPublishTimeout bounds one artifact publish; the trace is
 	// telemetry and must never stall the run or the terminal. hermes waits
 	// on the delivery for the hook entry's timeout, which is longer, so a
@@ -337,6 +340,39 @@ func capRunes(s string, n int) string {
 	}
 	return chunkString(s, n)[0]
 }
+
+// schemaKeyPattern is what an object key must look like to be published
+// under shape mode: a tool schema's key, letters, digits, underscore or dash,
+// starting with a letter or underscore, at most schemaKeyMax characters. A
+// key is model-written text like a value is (a map keyed by user data, a
+// malformed call with the value in the key slot), so anything else, and
+// anything token-shaped (tokenShapedKey), becomes "<key n, N chars>".
+var schemaKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+
+const schemaKeyMax = 48
+
+// tokenShapedKey says whether a key that fits the schema grammar still
+// reads as a token: too long, a long digit run, an all-caps-and-digits body
+// with digits in it, an all-hex body, or case that churns like base64.
+func tokenShapedKey(k string) bool {
+	if len(k) > schemaKeyMax || keyTokenRunPattern.MatchString(k) {
+		return true
+	}
+	changes := 0
+	prevUpper := false
+	for i, r := range k {
+		upper := r >= 'A' && r <= 'Z'
+		if i > 0 && upper && !prevUpper && r != '_' && r != '-' {
+			changes++
+		}
+		prevUpper = upper
+	}
+	return changes > keyMaxCaseChanges
+}
+
+var keyTokenRunPattern = regexp.MustCompile(`[0-9]{6,}|^[a-f0-9]{20,}$|^[A-Z0-9_]*[0-9][A-Z0-9_]*$|[a-z0-9]{24,}`)
+
+const keyMaxCaseChanges = 5
 
 // shapeOf is what a free-text value becomes under shape mode.
 func shapeOf(s string) string {
@@ -774,10 +810,17 @@ func shapeValue(v any, tool string) any {
 func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
 	switch t := v.(type) {
 	case map[string]any:
+		out := make(map[string]any, len(t))
+		shaped := 0
 		for k, val := range t {
-			t[k] = shapeValueIn(val, k, key, wrapper, depth+1)
+			nk := k
+			if !schemaKeyPattern.MatchString(k) || tokenShapedKey(k) {
+				shaped++
+				nk = fmt.Sprintf("<key %d, %d chars>", shaped, utf8.RuneCountInString(k))
+			}
+			out[nk] = shapeValueIn(val, k, key, wrapper, depth+1)
 		}
-		return t
+		return out
 	case []any:
 		for i := range t {
 			t[i] = shapeValueIn(t[i], key, parent, wrapper, depth+1)

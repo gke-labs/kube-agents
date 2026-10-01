@@ -691,6 +691,19 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyWrapperNames(t *testing.T) {
 			}
 		}
 	}
+	// Keys are model-written text too: a credential in a key slot, a map
+	// keyed by user data, is shaped; a schema key stays.
+	keyed := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"headers":{"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.x.y":"","Accept":"json"},"env":{"GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345":"","PGHOST":"db"},"labels":{"app.kubernetes.io/name":"web","9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f":"x"},"dry_run":true,"maxResults":3}`)))
+	for _, leaked := range []string{"eyJhbGciOiJIUzI1NiJ9", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "9f3c2a1b7d", "app.kubernetes.io/name"} {
+		if strings.Contains(keyed, leaked) {
+			t.Fatalf("a key carried text onto the trace: %q in %s", leaked, keyed)
+		}
+	}
+	for _, kept := range []string{`"headers":`, `"Accept":`, `"env":`, `"PGHOST":`, `"labels":`, `"dry_run":true`, `"maxResults":3`, `"\u003ckey 1, `} {
+		if !strings.Contains(keyed, kept) {
+			t.Fatalf("shape mode lost %q: %s", kept, keyed)
+		}
+	}
 	// A calls[].name below the wrapper's own array is an argument value.
 	deep := string(redactInput(InputValuesShape, hermesToolCallWrapper, json.RawMessage(`{"calls":[{"name":"kanban_create","arguments":{"calls":[{"name":"my password is hunter2"}]}}],"other":{"calls":[{"name":"not a tool name either"}]}}`)))
 	if strings.Contains(deep, "hunter2") || strings.Contains(deep, "not a tool name") || !strings.Contains(deep, `"name":"kanban_create"`) {

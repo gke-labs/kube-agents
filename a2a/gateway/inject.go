@@ -1947,12 +1947,19 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 			for _, c := range calls {
 				if m, ok := c.(map[string]any); ok {
 					if n, ok := m["name"].(string); ok {
+						// Everything of the call but its name is cut, under
+						// whatever key it sat; the stand-in says how much.
 						call := map[string]any{"name": n}
-						if args, has := m["arguments"]; has {
-							size := 0
-							if b, err := json.Marshal(args); err == nil {
-								size = len(b)
+						size := 0
+						for k, v := range m {
+							if k == "name" {
+								continue
 							}
+							if b, err := json.Marshal(v); err == nil {
+								size += len(b)
+							}
+						}
+						if size > 0 {
 							call["arguments"] = map[string]any{"truncated": true, "bytes": size, "head": ""}
 						}
 						names = append(names, call)

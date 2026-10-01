@@ -3647,6 +3647,12 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"input":{"command":"ls"}`) || strings.Contains(string(out), `"truncated"`) {
 		t.Fatalf("bulk outside the input: the input must stay and claim no cut: %d bytes %s", len(out), out[:min(len(out), 200)])
 	}
+	// A nested call's bulk under a key other than arguments is cut and said.
+	otherKey := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"x","input":{"body":"` + big + `"}}]},"status":"completed"}`)
+	out = capActivityEntry(otherKey)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"x"`) || !strings.Contains(string(out), `"arguments":{"bytes":`) {
+		t.Fatalf("nested bulk under another key cut without a marker: %s", out[:min(len(out), 200)])
+	}
 	// Bulk under a key outside the entry's shape: that key goes, named, and
 	// the input is neither replaced nor charged with the cut.
 	extra := json.RawMessage(`{"tool":"x","input":{"a":1},"result":"` + big + `","status":"completed"}`)
