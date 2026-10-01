@@ -75,12 +75,23 @@ FAST_TIMERS_SHIM = ("<script>(() => { const native = window.setInterval;"
 # The Brief's bare view anchors (#gate, #agent), each the id of a section.
 # dom_html refuses one on a budget the poll fires inside: a fragment naming
 # an element, polled under virtual time, is what stalls headless Chrome on CI.
-_VIEWS_MATCH = re.search(r"^\s*views:\s*\{([^}]*)\}", PAGES_JS.read_text(), re.MULTILINE)
-if _VIEWS_MATCH is None:
-    raise RuntimeError(f"{PAGES_JS}: PAGE.views is not an object literal; dom_html cannot tell a bare view anchor")
-BRIEF_VIEW_ANCHORS = frozenset(re.findall(r'"([^"]+)"', _VIEWS_MATCH.group(1)))
-if not BRIEF_VIEW_ANCHORS:
-    raise RuntimeError(f"{PAGES_JS}: PAGE.views names no view; dom_html cannot tell a bare view anchor")
+def brief_view_anchors(pages_js: str) -> frozenset:
+    """PAGE.views' values from pages.js's text, a flat object of quoted
+    strings. Any other shape raises, so a reshaped literal fails the import
+    rather than the guard: the match cannot cross a nested brace, where one
+    stopping at the first `}` would read a nested value's first strings as
+    the anchors, keep the import quiet, and let the views after it reach
+    Chrome on the poll budget."""
+    match = re.search(r"^\s*views:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views is not a flat object literal; dom_html cannot tell a bare view anchor")
+    anchors = frozenset(re.findall(r'"([^"]+)"', match.group(1)))
+    if not anchors:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views names no quoted view; dom_html cannot tell a bare view anchor")
+    return anchors
+
+
+BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
 # The Cases page's one polled call, in
 # test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
 # the bare case name, under boot and two polls on the page's real clock.
@@ -613,8 +624,9 @@ ROSTER_AT_SPLIT = frozenset({
 
 class DomHtmlGuardTest(unittest.TestCase):
     """dom_html's refusal of a bare view anchor on a budget the poll fires
-    inside. It is decided before Chrome runs, so it holds on a host without
-    one, and the admitted calls are checked against a mocked subprocess."""
+    inside, and the parse of PAGE.views it reads the anchors from. Both are
+    decided before Chrome runs, so they hold on a host without one, and the
+    admitted calls are checked against a mocked subprocess."""
 
     @classmethod
     def setUpClass(cls):
@@ -657,6 +669,24 @@ class DomHtmlGuardTest(unittest.TestCase):
             with self.assertRaises(ValueError) as refused:
                 dom_html(scroll_counting_page(self.index), fragment="#gate", budget_ms=CASES_TWO_POLLS_BUDGET_MS)
             self.assertIn(f"polls every {PAGE_REFRESH_MS} ms", str(refused.exception), "a plain page polls at PAGE.refreshMs")
+
+    def test_a_reshaped_views_literal_fails_the_import_not_the_guard(self):
+        # The guard refuses exactly the anchors the parse found, so a parse
+        # that misreads a reshaped literal loses an anchor with no test
+        # noticing: a match stopping at the first `}` reads the nested
+        # literal below as {"gate", "Gate"}, non-empty, and #agent on the
+        # poll budget then reaches Chrome. The parse must raise instead,
+        # naming the file, as it does for a literal with no quoted value.
+        flat = 'const PAGE = {\n  views: { gate: "gate", agent: "agent" },\n  refreshMs: 60000,\n};\n'
+        nested = ('const PAGE = {\n  views: { gate: { id: "gate", label: "Gate" }, agent: { id: "agent", label: "Agent" } },\n'
+                  '  refreshMs: 60000,\n};\n')
+        unquoted = 'const PAGE = {\n  views: { gate: GATE, agent: AGENT },\n};\n'
+        self.assertEqual(brief_view_anchors(flat), frozenset({"gate", "agent"}))
+        for shape, text in (("nested", nested), ("unquoted", unquoted), ("empty", "const PAGE = {\n  views: {},\n};\n")):
+            with self.subTest(shape=shape):
+                with self.assertRaises(RuntimeError) as refused:
+                    brief_view_anchors(text)
+                self.assertIn(str(PAGES_JS), str(refused.exception))
 
     def test_the_calls_the_suite_keeps_reach_chrome(self):
         # The polled calls the suite makes, each on the page copy its call
