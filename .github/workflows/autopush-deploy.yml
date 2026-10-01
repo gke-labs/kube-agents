@@ -14,6 +14,13 @@ on:
       - "Publish Images to GHCR"
     types:
       - completed
+    # Only main's publishes: the publish workflow also completes for pushes to a
+    # release line, and a run created for one would enter this workflow's single
+    # concurrency group before the job's `if:` skips it, cancelling a pending
+    # main deploy. The `if:` below keeps its own head_branch check as the
+    # second layer.
+    branches:
+      - main
   #checkov:skip=CKV_GHA_7:Standalone launch requires optional image tag, lease policy and force reconcile inputs
   workflow_dispatch:
     inputs:

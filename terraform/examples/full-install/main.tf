@@ -29,6 +29,16 @@ locals {
   scope_apis = length(var.scope.folders) + length(var.scope.organizations) > 0 ? [
     "cloudasset.googleapis.com",
   ] : []
+  # Only when a Shared VPC host is declared: the resolver's getXpnResources read
+  # at plan time and the reconcile's lookup of the host's service projects use
+  # the Compute API in project_id (a Metrics Scope's reads use the Monitoring
+  # and Resource Manager APIs, in base_apis). A project that hosts a GKE
+  # cluster has it on already; naming it here is what makes the composition own
+  # every API the selectors' reads use, as the installer's pre-enablement and
+  # the documents say it does.
+  selector_apis = length(var.scope.shared_vpc_hosts) > 0 ? [
+    "compute.googleapis.com",
+  ] : []
 
   use_vertex     = var.model_provider == "vertex_ai"
   vertex_project = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
@@ -53,7 +63,7 @@ locals {
   github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
   github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
 
-  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis))
+  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis, local.selector_apis))
 
   # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
   # paths hand the agent the same authority. Kubernetes RBAC is read-only
@@ -261,15 +271,38 @@ locals {
   }
 }
 
+# The two scope selectors that are not containers, resolved to projects at
+# plan time. Called with no depends_on and no input a managed resource
+# produces, on purpose: module.kube_agents_iam below carries a module-level
+# depends_on, which would defer a data source inside it to apply time on a
+# first install or on any upgrade that enables an API, and the bindings keyed
+# on the resolved projects would then fail the plan as unknown. Here the reads
+# happen on every plan, and a read the planning identity cannot make fails
+# the plan with the selector named, before anything is applied.
+module "scope_resolver" {
+  source = "../../modules/kube-agents-scope-resolver"
+
+  shared_vpc_hosts = var.scope.shared_vpc_hosts
+  metrics_scopes   = var.scope.metrics_scopes
+  exclude_projects = var.scope.exclude.projects
+  # The consumer project of the reads: the management project, whose APIs
+  # this composition enables (and install.sh pre-enables before a first apply,
+  # since the reads run in the plan).
+  quota_project = var.project_id
+}
+
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id         = var.project_id
-  namespace          = var.namespace
-  project_roles      = local.agent_project_roles
-  scoped_clusters    = var.scoped_clusters
-  scope              = var.scope
-  service_account_id = var.agent_service_account_id
+  project_id      = var.project_id
+  namespace       = var.namespace
+  project_roles   = local.agent_project_roles
+  scoped_clusters = var.scoped_clusters
+  scope           = var.scope
+  # What the selectors resolved to, from the module above; the IAM module
+  # binds these and refuses a selector with no entry.
+  scope_selector_members = module.scope_resolver.members
+  service_account_id     = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
   # description in variables.tf says why it exists and what bounds it.
@@ -675,9 +708,11 @@ resource "helm_release" "kube_agents" {
       # removing the last scoped project here has to reach the CR as an
       # emptied block, never as a missing one.
       scope = {
-        projects      = var.scope.projects
-        folders       = var.scope.folders
-        organizations = var.scope.organizations
+        projects       = var.scope.projects
+        folders        = var.scope.folders
+        organizations  = var.scope.organizations
+        sharedVpcHosts = var.scope.shared_vpc_hosts
+        metricsScopes  = var.scope.metrics_scopes
         exclude = {
           projects = var.scope.exclude.projects
           clusters = [

@@ -46,6 +46,10 @@ import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
 import workspace_paths  # noqa: E402
 
+# `BaseTestCase` empties the set so the suite's thousand compliance-audit runs
+# need not each carry a manifest; the guard's own tests put this back.
+REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
+
 
 @dataclass
 class GitResult:
@@ -195,19 +199,27 @@ NUMBER_WORDS = {
 
 
 def _outside_fences(lines):
-    """Yield `(1-indexed line number, text)` for lines outside ``` fences.
+    """Yield `(1-indexed line number, text)` for non-blank lines outside fences.
 
     Every heading scan below has to skip fenced blocks. A `### ` inside one is
     a shell comment or a JSON fragment, and counting it as a section heading
     shifts every span derived afterwards — silently, in the direction that
     makes a stale citation look correct.
+
+    The fences are read by `strip_fenced_blocks`, so the grammar is the one
+    the harness uses on issue bodies (CommonMark: a run of three or more
+    backticks or tildes indented at most three spaces, closed by a run of the
+    same character at least as long). A toggle on "```" is not that grammar:
+    it reads the inner fence of a four-backtick block as a closer and a
+    four-space-indented run as a delimiter, and either exposes a `### ` the
+    scan then counts. The function blanks fenced lines in place, so line
+    numbers survive; blank lines are dropped here, which no heading scan
+    notices. `scripts/generate_sop_geography.py` carries the same rule,
+    standard-library only, and its tests hold it to these cases.
     """
-    fenced = False
-    for number, line in enumerate(lines, start=1):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-            continue
-        if not fenced:
+    stripped = audit_report.strip_fenced_blocks("\n".join(lines)).split("\n")
+    for number, line in enumerate(stripped, start=1):
+        if line:
             yield number, line
 
 
@@ -448,6 +460,9 @@ class Recorder:
         # branch to describe a repository that is not on `main`, or to None to
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
+        # (audit, repo, issue number) -> the body a `gh issue list` entry that
+        # names none should carry. None leaves listings exactly as replied.
+        self.listed_body = None
 
     def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
         self.calls.append(list(cmd))
@@ -470,8 +485,33 @@ class Recorder:
         self._simulate_clone(cmd)
         for key, payload in self.replies.items():
             if key in joined:
-                return CompletedProcess(cmd, 0, payload, "")
+                return CompletedProcess(cmd, 0, self._with_listed_bodies(cmd, payload), "")
         return CompletedProcess(cmd, 0, "", "")
+
+    def _with_listed_bodies(self, cmd, payload):
+        """Give each issue a ledger listing names the body the store last wrote.
+
+        `finish` checks its stored memory against the body `gh issue list`
+        returns (`memory_matches_ledger`). A test that describes a listing
+        without bodies is describing a ledger nobody rewrote behind the store's
+        back, so each entry without one gets the body the store holds for it.
+        A test about a rewritten ledger names the body itself.
+        """
+        if cmd[:3] != ["gh", "issue", "list"] or self.listed_body is None:
+            return payload
+        try:
+            issues = json.loads(payload)
+        except (TypeError, ValueError):
+            return payload
+        if not isinstance(issues, list):
+            return payload
+        label = cmd[cmd.index("--label") + 1] if "--label" in cmd else ""
+        repo = cmd[cmd.index("-R") + 1] if "-R" in cmd else ""
+        audit = label.split(":", 1)[1] if label.startswith("audit:") else ""
+        for issue in issues:
+            if isinstance(issue, dict) and "body" not in issue:
+                issue["body"] = self.listed_body(audit, repo, issue.get("number"))
+        return json.dumps(issues)
 
     @staticmethod
     def _simulate_clone(cmd):
@@ -587,8 +627,16 @@ class BaseTestCase(unittest.TestCase):
         # whether the run asks the broker at all, so a developer who exports it
         # would otherwise put the whole suite on a different code path than CI.
         # Directory mode has to be the explicit state, not the ambient one.
+        # The report store is pointed at the temp tree for the same reason as
+        # the scratch directory: off-cluster /opt/data does not exist.
+        self.reports_dir = self.tmp_path / "reports"
         env = patch.dict(
-            os.environ, {"GITOPS_BASE_BRANCH": "", "CREDENTIAL_PROXY_URL": ""}
+            os.environ,
+            {
+                "GITOPS_BASE_BRANCH": "",
+                "CREDENTIAL_PROXY_URL": "",
+                "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
+            },
         )
         env.start()
         self.addCleanup(env.stop)
@@ -597,6 +645,11 @@ class BaseTestCase(unittest.TestCase):
         # tests about the note itself put the real check back.
         self.real_claim_in_flight = audit_report.claim_in_flight
         self.patch_attr("claim_in_flight", lambda *a, **k: None)
+        # `compliance-audit` is a collector stream, so on the real set every
+        # `finish` here would need a manifest, and passing one is not neutral:
+        # it changes holds, `unpublished_candidates` and the lost-store answer.
+        # `TestCollectorStreamsRequireAManifest` holds the real set.
+        self.patch_attr("COLLECTOR_AUDITS", frozenset())
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -707,6 +760,66 @@ class HarnessTestCase(BaseTestCase):
         # asking git — it would assert `origin/main` on a repository whose
         # default branch the harness was never consulted about.
         audit_report.set_workspace(self.workspace)
+        self._audit_in_flight = None
+        self.harness.listed_body = self.stored_ledger_body
+
+    def stored_ledger_body(self, audit, repo, number):
+        """The ledger body the store last wrote for `number`, or "" without one."""
+        try:
+            envelope = json.loads(
+                (self.store_dir(audit, repo) / "latest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(envelope, dict) or envelope.get("issue_number") != number:
+            return ""
+        return str(envelope.get("ledger_body") or "")
+
+    def store_dir(self, audit=AUDIT, repo="acme/fleet"):
+        """The store directory `finish` keeps for `audit` on `repo`."""
+        return self.reports_dir / audit / repo
+
+    def seed_report(self, body, issue=42, repo="acme/fleet", audit=None):
+        """Leave the report store a previous run would have, rendering `body` on `issue`."""
+        audit = audit or self._audit_in_flight or AUDIT
+        directory = self.store_dir(audit, repo)
+        directory.mkdir(parents=True, exist_ok=True)
+        envelope = {
+            "audit_id": audit,
+            "repo": repo,
+            "issue_number": issue,
+            "ledger_body": body,
+            "current_ids": audit_report.parse_delta_block(body),
+            "id_scheme": audit_report.parse_id_scheme(body),
+            "document": {"findings": []},
+        }
+        (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+
+    def run_main(self, argv):
+        """Run the CLI, with the store seeded from the recorder's ledger replies.
+
+        A test describes the previous ledger the way it always has — the body
+        `gh issue view --json body` would return, or that call failing — and
+        this turns it into what `finish` and `start` now read instead: the
+        report store's `latest.json` for the issue `gh issue list` names. A
+        failing read is an absent store. With neither, the store is left as the
+        runs before it wrote it, so a test that runs `finish` twice sees the
+        first run's memory — unless there is no store directory at all, where
+        the recorder's default reply, an empty body, is what the test described.
+        A directory without `latest.json` is left alone, as production reads it:
+        a lost memory, never an empty one.
+        """
+        self._audit_in_flight = argv[argv.index("--audit") + 1] if "--audit" in argv else None
+        audit = self._audit_in_flight or AUDIT
+        listed = json.loads(self.harness.replies.get("issue list") or "[]")
+        if "--json body" in self.harness.failures:
+            shutil.rmtree(self.reports_dir, ignore_errors=True)
+        elif listed and "--json body" in self.harness.replies:
+            body = json.loads(self.harness.replies["--json body"]).get("body") or ""
+            self.seed_report(body, issue=int(listed[0]["number"]))
+        elif listed and not self.store_dir(audit).exists():
+            self.seed_report("", issue=int(listed[0]["number"]))
+        return super().run_main(argv)
 
     def unclone(self):
         """Put the workspace back to how a freshly started pod finds it."""
@@ -2651,11 +2764,13 @@ class TestAuditCatalogue(unittest.TestCase):
                         "for Standard/Autopilot",
                     )
 
-    def test_cost_sop_check_3_8_handles_autopilot_when_3_7_skipped(self):
-        """Check 3.8 must specify evaluation for Autopilot where 3.7 is skipped."""
+    def test_cost_sop_check_3_8_goes_with_3_7_on_autopilot(self):
+        """3.8 examines only 3.7's flagged nodes, so the SOP declares both
+        inapplicable on Autopilot, matching what `fleet_waste.py` writes."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-wide-cost-analysis"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("Autopilot clusters where 3.7 is skipped", text)
+        self.assertIn("skip 3.7 and 3.8, and declare both", text)
+        self.assertNotIn("Autopilot clusters where 3.7 is skipped", text)
 
     def test_drift_sop_declares_autopilot_non_configurable_facets_inapplicable(self):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
@@ -3071,7 +3186,7 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["resolved"], 0)
 
     def test_unreadable_previous_body_suppresses_the_delta(self):
-        # None is not "": an unreadable body makes the delta unknowable, and
+        # None is not "": a lost store makes the delta unknowable, and
         # announcing every live finding as new is worse than announcing none.
         self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"--json body": 1}
@@ -3084,7 +3199,13 @@ class TestFinishWithFindings(HarnessTestCase):
         self.assertEqual(result["status"], "UPDATED")
         self.assertEqual(result["new"], 0)
         self.assertEqual(result["resolved"], 0)
-        self.assertIn("unreadable", self.err)
+        self.assertIn("unknowable", self.err)
+        # `new: 0` is "not known" here, so the scheduled verdict must not be
+        # `[SILENT]`: the ids published now are the next run's baseline, and
+        # any new among them would never be announced. The audit still looked,
+        # so it is not a coverage gap.
+        self.assertFalse(result["silent_ok"])
+        self.assertFalse(result["partial"])
 
     def test_gcloud_only_run_still_publishes(self):
         self.harness.replies = {
@@ -3827,22 +3948,22 @@ class TestHeldClose(HarnessTestCase):
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["unaccounted"], [])
 
-    def test_an_unreadable_previous_body_holds_nothing_and_closes_nothing(self):
-        # Same rule as the delta: nothing can be joined against a body that
-        # could not be read, so nothing is claimed either way — and, since the
-        # collector contract landed, nothing is closed over it either: the
-        # ledger body is the only memory of what a collector holds, so a run
-        # that cannot read it leaves it as it was and reports partial. (This
-        # test asserted the close before that change; it is the one place the
-        # manifest-less path moved, deliberately — see the collector design.)
+    def test_a_lost_store_without_a_manifest_holds_the_ledger_open(self):
+        # Nothing can be joined against a memory that is gone, and with no
+        # manifest there is no still-flagged set either: an empty document
+        # would close the ledger and its pull requests over findings nothing
+        # says were fixed. It stays open, partial, and says why.
         self.harness.replies = {"issue list": self.issue_list()}
-        self.harness.failures = {"issue view": 1}
+        self.harness.failures = {"--json body": 1}
         self.assertEqual(self.run_finish(naming_doc()), 0)
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["prs_closed"], [])
         self.assertEqual(payload["unaccounted"], [])
 
     def test_a_gap_takes_precedence_over_the_hold(self):
@@ -4147,6 +4268,17 @@ class TestStart(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertFalse(note.is_file())
 
+    def test_a_started_at_outside_datetime_s_range_counts_from_the_mtime(self):
+        # Milliseconds, `inf`, NaN: none is a time `report_status` can read,
+        # and an `inf` taken at face value would hold the lease past every
+        # TTL. The note is still a claim, so its mtime dates it.
+        note = Path(tempfile.mkdtemp(prefix="inflight-")) / "note.json"
+        self.addCleanup(shutil.rmtree, note.parent, ignore_errors=True)
+        for started_at in (1759000000000, float("inf"), float("nan")):
+            with self.subTest(started_at=started_at):
+                note.write_text(json.dumps({"audit": AUDIT, "started_at": started_at}))
+                self.assertEqual(audit_report._in_flight_since(note), note.stat().st_mtime)
+
     def test_a_note_write_that_fails_leaves_no_phantom_claim(self):
         # `write_text` opens O_TRUNC and then writes. A write that fails on
         # the shared volume (ENOSPC, EDQUOT, EIO) must not leave an empty
@@ -4274,12 +4406,12 @@ class TestStart(HarnessTestCase):
         ]
         audit_report.validate_findings(doc, AUDIT)
 
-    def test_an_unreadable_body_hands_over_nothing_and_says_so(self):
+    def test_a_lost_store_hands_over_nothing_and_says_so(self):
         self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"--json body": 1}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
         self.assertEqual(json.loads(self.out.strip())["carried"], [])
-        self.assertIn("could not read issue #42", self.err)
+        self.assertIn("unknowable", self.err)
 
     def test_start_hands_over_the_roster(self):
         """Coverage must not depend on how far into the SOP the worker read.
@@ -7456,6 +7588,17 @@ class TestRenderBudget(BaseTestCase):
     def test_truncation_notice_names_the_omitted_count(self):
         body = self.render(make_doc(findings=bulk_findings(250)))
         self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
+        self.assertIn("kept in full in this run's stored report", body)
+
+    def test_an_evidence_table_that_does_not_fit_says_where_it_went(self):
+        clusters = make_doc()["scope"]["clusters"]
+        whole = audit_report._render_check_evidence(clusters, AUDIT, 10**6)
+        self.assertIn("</details>", whole)
+        dropped = audit_report._render_check_evidence(clusters, AUDIT, 400)
+        self.assertNotIn("</details>", "\n".join(dropped))
+        self.assertIn("omitted here", "\n".join(dropped))
+        self.assertIn("stored report", "\n".join(dropped))
+        self.assertEqual(audit_report._render_check_evidence(clusters, AUDIT, 10), [])
 
     def test_title_carries_the_true_total_even_when_truncated(self):
         findings = bulk_findings(250)
@@ -10509,6 +10652,33 @@ class TestFenceScanning(unittest.TestCase):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
 
 
+class TestOutsideFences(unittest.TestCase):
+    """The heading scans' fence rule is the harness's, not a toggle on ```."""
+
+    def numbers(self, text):
+        return [n for n, _ in _outside_fences(text.split("\n"))]
+
+    def test_a_heading_inside_a_fence_is_not_outside(self):
+        self.assertEqual([5], self.numbers("```bash\n### 2. comment\n```\n\n### 2. Checks"))
+
+    def test_a_shorter_run_inside_a_longer_fence_does_not_close_it(self):
+        # The shape inventory.md uses: a ```` block wrapping a ``` one. A
+        # toggle closes at the inner fence and counts the heading on line 3.
+        self.assertEqual([6], self.numbers("````\n```\n### 9. inner\n```\n````\n### 1. real"))
+
+    def test_a_tilde_fence_is_a_fence(self):
+        self.assertEqual([4], self.numbers("~~~\n### 9. inner\n~~~\n### 1. real"))
+
+    def test_a_four_space_indented_run_does_not_close_a_block(self):
+        self.assertEqual([5], self.numbers("```\n    ```\n### 9. inner\n```\n### 1. real"))
+
+    def test_three_spaces_of_indent_is_still_a_fence(self):
+        self.assertEqual([4], self.numbers("   ```\n### 9. inner\n   ```\n### 1. real"))
+
+    def test_an_unterminated_fence_runs_to_the_end(self):
+        self.assertEqual([1], self.numbers("### 1. real\n```\n### 9. inner\n"))
+
+
 class TestBlockQuoteScanning(unittest.TestCase):
     def strip(self, text):
         return audit_report.strip_block_quotes(text)
@@ -11686,19 +11856,25 @@ class TestFindExistingIssue(HarnessTestCase):
         self.harness.replies = {
             "issue list": json.dumps(
                 [
-                    {"number": 7, "url": "https://github.com/acme/fleet/issues/7"},
-                    {"number": 42, "url": "https://github.com/acme/fleet/issues/42"},
+                    {"number": 7, "url": "https://github.com/acme/fleet/issues/7", "body": "seven"},
+                    {"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": "forty-two"},
                 ]
             )
         }
-        number, url = self.find()
+        number, url, body = self.find()
         self.assertEqual(number, 42)
         self.assertTrue(url.endswith("/42"))
+        self.assertEqual(body, "forty-two")
         self.assertIn("7", self.err)
+
+    def test_a_listing_without_a_body_names_none(self):
+        self.harness.listed_body = None
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.assertEqual(self.find()[2], None)
 
     def test_no_ledger_is_not_an_error(self):
         self.harness.replies = {"issue list": "[]"}
-        self.assertEqual(self.find(), (None, None))
+        self.assertEqual(self.find(), (None, None, None))
 
     def test_an_outage_raises_rather_than_reporting_no_ledger(self):
         self.harness.failures = {"issue list": 1}
@@ -13156,6 +13332,117 @@ class TestLoadManifest(BaseTestCase):
         )
 
 
+class TestClustersListedMarker(unittest.TestCase):
+    """`clusters_listed: 0` on a project entry: a fleet with no clusters is not
+    a run that lost them.
+
+    Without it, a cost or stockout run over cluster-free projects reported "no
+    cluster targets were audited" and stayed partial on every run, so it could
+    never close a ledger entry. The marker comes from the collector, is carried
+    verbatim onto `scope.clusters`, and lifts the cluster kind's gap only when
+    every project target carries it.
+    """
+
+    STREAMS = ("fleet-wide-cost-analysis", "stockout-prevention")
+    NETWORKING = "gcp-networking-fabric-audit"
+    KEY = audit_report.CLUSTERS_LISTED_KEY
+
+    def _project(self, audit_id, project, **extra):
+        entry = {
+            "name": f"project/{project}",
+            "location": "-",
+            "project": project,
+            "checks_run": list(audit_report.audit_target_checks(audit_id, f"project/{project}")),
+        }
+        entry.update(extra)
+        return entry
+
+    def _gaps(self, audit_id, clusters):
+        return audit_report.coverage_gaps(make_doc(findings=[], audit=audit_id, clusters=clusters))
+
+    def test_every_project_marked_empty_lifts_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [
+                    self._project(audit_id, "acme", **{self.KEY: 0}),
+                    self._project(audit_id, "beta", **{self.KEY: 0}),
+                ]
+                self.assertEqual(self._gaps(audit_id, clusters), [])
+
+    def test_one_unmarked_project_keeps_the_cluster_gap(self):
+        # beta's list failed or timed out: its clusters may exist unaudited.
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [self._project(audit_id, "acme", **{self.KEY: 0}), self._project(audit_id, "beta")]
+                gaps = self._gaps(audit_id, clusters)
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_no_marked_project_keeps_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                gaps = self._gaps(audit_id, [self._project(audit_id, "acme")])
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_the_marker_never_lifts_the_project_gap(self):
+        # A run of clusters alone still owes the project checks.
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme"}
+        gaps = audit_report._unenumerated_kind_gaps(self.STREAMS[0], [cluster])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no project targets were audited", gaps[0])
+
+    def test_a_stream_that_never_emits_it_is_unchanged(self):
+        """Networking is unpartitioned: the key changes nothing it reports."""
+        target = {"name": "project/acme", "location": "-", "project": "acme"}
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [dict(target, **{self.KEY: 0})]),
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [target]),
+        )
+
+    def test_validation_accepts_the_collectors_zero_on_a_project_entry(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.validate_findings(doc, audit_id)
+
+    def test_validation_rejects_anything_the_collector_would_not_write(self):
+        audit_id = self.STREAMS[0]
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme", self.KEY: 0}
+        cases = {
+            "a cluster entry": cluster,
+            "a non-zero count": self._project(audit_id, "acme", **{self.KEY: 3}),
+            "a bool": self._project(audit_id, "acme", **{self.KEY: False}),
+            "a string": self._project(audit_id, "acme", **{self.KEY: "0"}),
+        }
+        for label, entry in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(make_doc(findings=[], audit=audit_id, clusters=[entry]), audit_id)
+                self.assertIn(self.KEY, str(caught.exception))
+
+    def _manifest(self, audit_id, **extra):
+        entry = {
+            "name": "project/acme",
+            "outcome": "collected",
+            "commands": [{"check": c, "rc": 0} for c in audit_report.audit_target_checks(audit_id, "project/acme")],
+        }
+        entry.update(extra)
+        return {"clusters": [entry]}
+
+    def test_the_manifest_must_carry_the_marker_the_document_claims(self):
+        # A worker cannot hand-claim an empty fleet to turn a partial run clean.
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(doc, self._manifest(audit_id))
+        self.assertIn(self.KEY, str(caught.exception))
+
+    def test_a_marker_copied_from_the_manifest_passes(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.cross_check_manifest(doc, self._manifest(audit_id, **{self.KEY: 0}))
+
+
 class TestCrossCheckManifest(unittest.TestCase):
     """Manifest-scoped attestation: see `audit_report.cross_check_manifest`."""
 
@@ -14163,6 +14450,28 @@ class TestTriageMarkedFindings(BaseTestCase):
         self.assertEqual(plan.needs_triage, ["fronted"])
         self.assertEqual(plan.uncorroborated, [])
 
+    def test_a_new_compute_class_stockout_is_passed_over_and_an_edit_is_not(self):
+        """§3.11's create case is two files under one path; editing an
+        existing class is one, and stays the sweep's to open."""
+        slug = "autoscaler-out-of-resources"
+        obj = "ScaleUpError/scale.up.error.out.of.resources"
+        manifest = {
+            "clusters": [
+                _ran("c1", slug, candidates=[{**_cand(slug, "c1", obj), "needs_triage": "new-computeclass"}]),
+                _ran("c2", slug, candidates=[{**_cand(slug, "c2", obj), "needs_triage": None}]),
+            ]
+        }
+        remediation = {"kind": "manifest", "note": "n"}
+        findings = [
+            _pub("create", slug, "c1", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/new.yaml"}},
+            _pub("edit", slug, "c2", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/burst.yaml"}},
+        ]
+        plan = audit_report.promotion_candidates(
+            findings, {}, triage_marked=audit_report.triage_marked_findings(findings, manifest)
+        )
+        self.assertEqual(plan.promote, ["edit"])
+        self.assertEqual(plan.needs_triage, ["create"])
+
     def test_an_explicit_remediate_still_opens_it(self):
         plan = audit_report.promotion_candidates(
             [manifest_finding("fronted", "b.yaml")],
@@ -14206,8 +14515,9 @@ class TestTriageMarkedFindings(BaseTestCase):
 class TestScopedCoverage(unittest.TestCase):
     """Coverage is measured against what a target owes, not the whole roster.
 
-    No shipped roster declares `scopes` yet, so these run against a copy of
-    the stockout and networking specs partitioned the way their SOPs read: the
+    The shipped cost and stockout rosters declare `scopes`, but these run
+    against a fixed copy of the stockout and networking specs, partitioned the
+    way their SOPs read, so a roster edit does not move them: the
     project entry owes the quota and reservation checks, every cluster owes
     the rest plus the reservation check's cluster form, and a networking
     subnet owes IP exhaustion alone. Rated against the whole roster, a project
@@ -14269,6 +14579,21 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertEqual(audit_report.target_kind("project/acme-prod"), "project")
         self.assertEqual(audit_report.target_kind("acme-prod/us-east4/gke-nodes"), "subnet")
         self.assertEqual(audit_report.target_kind("prod-us-east"), "cluster")
+
+    def test_a_qualified_cluster_is_a_cluster_where_no_subnet_scope_exists(self):
+        qualified = "acme-stage/europe-west1/stage-eu"
+        self.assertEqual(
+            audit_report.audit_target_checks(self.STOCKOUT, qualified),
+            audit_report.audit_target_checks(self.STOCKOUT, "stage-eu"),
+        )
+        gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster(qualified)]))
+        self.assertEqual(gaps, [])
+
+    def test_the_same_shape_stays_a_subnet_where_a_subnet_scope_exists(self):
+        self.assertEqual(
+            audit_report.audit_target_checks(self.NETWORKING, "acme-prod/us-east4/gke-nodes"),
+            ("subnet-ip-exhaustion",),
+        )
 
     def test_a_project_target_owes_only_the_project_scoped_checks(self):
         gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster()]))
@@ -14333,8 +14658,9 @@ class TestScopedCoverage(unittest.TestCase):
         """A partitioned stream that meets an unexpected target must not go
         quiet: the safe reading is that the target owes the whole roster and
         shows up as a gap — the alternative, an empty denominator, reports the
-        target as fully audited."""
-        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        target as fully audited. Two segments, because three are a qualified
+        cluster in a stream with no subnet scope."""
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/net")
         self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
 
     def test_a_kind_with_no_targets_is_a_gap(self):
@@ -14383,6 +14709,14 @@ class TestScopedCoverage(unittest.TestCase):
         )
         self.assertEqual(gaps, [])
 
+    def test_a_check_a_present_kind_carries_is_not_stranded(self):
+        """Stockout with clusters and no project: `reservation-mismatch-risk`
+        ran on its cluster arm, so only the project-only check is stranded."""
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("stockout-prevention", [{"name": "acme/us-east4/prod"}]),
+            ["no project targets were audited — 1 check(s) ran against nothing (quota-exhaustion-risk)"],
+        )
+
     def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
         self.assertEqual(
             audit_report._unenumerated_kind_gaps("compliance-audit", [{"name": "prod-us-east"}]),
@@ -14414,12 +14748,68 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertNotIn("⚠", out)
 
 
+class TestCollectorStreamsRequireAManifest(HarnessTestCase):
+    """A stream whose SOP runs a collector cannot publish on the model's word
+    alone: `finish` refuses it without `--manifest-file` or a waiver."""
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("COLLECTOR_AUDITS", REAL_COLLECTOR_AUDITS)
+
+    def test_every_collector_stream_requires_its_manifest(self):
+        import collect
+        import fleet_drift
+        import fleet_stockout
+        import fleet_waste
+        import patch_readiness
+
+        expected = set(collect.CHECK_TABLES) | {
+            fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
+        }
+        self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
+        self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
+
+    def test_streams_with_no_collector_are_not_held_to_it(self):
+        for audit in ("gce-compute-fleet-audit", "gcp-networking-fabric-audit"):
+            with self.subTest(audit=audit):
+                self.assertIn(audit, audit_report.AUDITS)
+                self.assertNotIn(audit, REAL_COLLECTOR_AUDITS)
+
+    def test_no_flag_is_refused_and_nothing_is_published(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]))
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required for compliance-audit", self.err)
+        self.assertIn("--no-collector-manifest", self.err)
+        self.assertFalse(self.harness.matching("issue"))
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_a_dry_run_is_refused_too(self):
+        rc = self.run_finish(make_doc(findings=[]), ["--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file is required", self.err)
+
+    def test_the_waiver_publishes_as_partial(self):
+        self.harness.replies = {"issue list": "[]"}
+        rc = self.run_finish(make_doc(findings=[]), ["--no-collector-manifest", "collector crashed"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertTrue(self.stdout_json()["partial"])
+
+    def test_a_manifest_is_accepted(self):
+        self.harness.replies = {"issue list": "[]"}
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest()), encoding="utf-8")
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", str(path)])
+        self.assertEqual(rc, 0, self.err)
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
-    Both flags are optional, and `TestFinishWithoutAManifestIsUnchanged` holds
-    the run without either to its recorded transcript; this class is about
-    what each flag adds.
+    The suite's base class lifts the collector-stream requirement, which
+    `TestCollectorStreamsRequireAManifest` holds; with it lifted,
+    `TestFinishWithoutAManifestIsUnchanged` holds the run without either flag
+    to its recorded transcript, and this class is about what each flag adds.
     """
 
     NETPOL_COMMAND = "KUBECONFIG=/opt/data/.kubeconfigs/kc.yaml kubectl get networkpolicy -A -o json"
@@ -14546,6 +14936,24 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("FINDINGS REJECTED", self.err)
         self.assertFalse(self.harness.matching("issue", "create"))
         self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_the_clusters_listed_marker_needs_a_manifest(self):
+        # Hand-written, the marker would lift the no-cluster gap on the worker's word alone.
+        audit_id = "fleet-wide-cost-analysis"
+        project = {
+            "name": "project/acme",
+            "location": "-",
+            "project": "acme",
+            "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
+            audit_report.CLUSTERS_LISTED_KEY: 0,
+        }
+        doc = make_doc(findings=[], audit=audit_id, clusters=[project])
+        for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():
+            with self.subTest(case=label):
+                self.harness.replies = {"issue list": "[]"}
+                rc = self.run_finish(doc, ["--dry-run", *extra], audit=audit_id)
+                self.assertEqual(rc, 2)
+                self.assertIn("only the collector manifest can back", self.err)
 
     def test_a_missing_manifest_file_is_rejected(self):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
@@ -14769,6 +15177,7 @@ class TestFinishManifestFlag(HarnessTestCase):
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {
             "issue list": self.issue_list(),
             "--json body": json.dumps({"body": body}),
@@ -15199,20 +15608,33 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual([r["id"] for r in rows], [expected])
         self.assertLessEqual(len(expected), audit_report.MAX_FINDING_ID)
 
-    def replay_unreadable_ledger(self):
-        """A fresh recorder whose open ledger's body cannot be read."""
+    def replay_lost_store(self):
+        """A fresh recorder over an open ledger with no store directory and
+        nothing to seed from. A replaced volume alone is not this: its run
+        seeds from the body `gh issue list` returns. Here the store is removed
+        before that call answers, so `stored_ledger_body` lists "" — a ledger
+        whose body has lost its hidden blocks as well as its store."""
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {"issue list": self.issue_list()}
         self.harness.failures = {"--json body": 1}
         self.patch_attr("run_cmd", self.harness)
 
-    def test_an_unreadable_ledger_body_is_left_as_it_was(self):
-        """The ledger is the persistence, and a run that cannot read it must not
-        overwrite it: no body edit on the unreadable run, a coverage gap saying
-        so, and the marker's held id survives to the next readable run — while
-        a candidate the ledger never carried is not turned into a hold."""
+    def replay_store(self):
+        """A fresh recorder over the open ledger, reading the store the
+        previous run wrote."""
+        self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.patch_attr("run_cmd", self.harness)
+
+    def test_a_lost_store_rewrites_the_body_and_the_next_run_is_trusted(self):
+        """Freezing the body over a lost store would never recover, since only a
+        run that writes the body writes the store. So the run rewrites it,
+        claims no delta, carries no held id it cannot see — and the run after it
+        reads the store that run wrote and is whole."""
         self.previous_a_and_b()
-        a_id, c_id = derived_id(fid="a"), derived_id(fid="c")
+        a_id = derived_id(fid="a")
         both = _full_manifest(
             candidates=[
                 self.netpol_candidate(object="Namespace/a"),
@@ -15224,58 +15646,123 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         body_n = self.harness.bodies_for("issue", "edit")[0]
         self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        # The store holds the block as published, held id included, so a
+        # reader's `current` counts what the issue lists.
+        stored_n = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(
+            stored_n["current_ids"], sorted(set(audit_report.parse_delta_block(body_n)))
+        )
+        self.assertIn(a_id, stored_n["current_ids"])
 
-        # Run N+1: `gh issue view` fails; the collector now also flags c, which
-        # the model has been rejecting and no ledger ever carried.
+        # Run N+1: the store is gone; the collector now also flags c.
         with_c = _full_manifest(
             candidates=both["clusters"][0]["candidates"] + [self.netpol_candidate(object="Namespace/c")]
         )
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(with_c)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.bodies_for("issue", "edit"), [])
+        edits = self.harness.bodies_for("issue", "edit")
+        self.assertEqual(len(edits), 1)
+        body_n1 = edits[0]
+        self.assertNotIn(a_id, audit_report.parse_delta_block(body_n1))
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "UPDATED")
-        self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
-        self.assertIn("left as it was", self.err)
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertNotIn("] HELD:", self.err)
-        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        self.assertFalse([b for b in self.harness.bodies_for("issue", "comment") if "audit delta" in b])
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(stored["ledger_body"], body_n1)
 
-        # Run N+2 reads the untouched body: a is held, c never became one.
+        # Run N+2 reads the store run N+1 wrote: trusted, and b resolves.
         clean = make_doc(findings=[])
-        clean["resolved_because"] = resolved_for(body_n)
-        a_and_c = _full_manifest(
-            candidates=[
-                self.netpol_candidate(object="Namespace/a"),
-                self.netpol_candidate(object="Namespace/c"),
-            ]
-        )
-        self.replay_ledger(body_n)
-        rc = self.run_finish(clean, ["--manifest-file", self.manifest_file(a_and_c)])
+        clean["resolved_because"] = resolved_for(body_n1)
+        self.replay_store()
+        rc = self.run_finish(clean)
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
-        self.assertEqual(payload["status"], "HELD")
-        self.assertEqual(payload["unaccounted"], [a_id])
-        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
-        self.assertIn(c_id, [r["id"] for r in payload["unpublished_candidates"]])
+        self.assertEqual(payload["resolved"], 1)
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertNotIn("unknowable", self.err)
 
-    def test_a_clean_run_over_an_unreadable_body_does_not_close(self):
-        self.replay_unreadable_ledger()
+    def test_a_clean_run_over_a_lost_store_does_not_close_over_a_flagged_candidate(self):
+        """A candidate the collector still flags may be a finding the lost body
+        carried, so the ledger stays open over it. Once the collector stops
+        flagging it stays open still: the lost body may carry findings from
+        checks no collector covers, and closing would retire their pull
+        requests on an empty document's word."""
+        self.replay_lost_store()
         manifest = _full_manifest(candidates=[self.netpol_candidate()])
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
         self.assertEqual(self.harness.gh_calls("issue", "close"), [])
         self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertEqual(payload["resolved"], 0)
         self.assertEqual(payload["prs_closed"], [])
+        # The collector stops flagging: the other lost-memory gap holds it.
+        self.replay_lost_store()
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(payload["prs_closed"], [])
+
+    def test_a_remediate_over_a_lost_store_is_told_the_record_was_lost(self):
+        """The target is one the collector does not flag, but the lost record
+        may have carried it: neither "no longer reproduces" nor a coverage wait
+        that a clean fleet never ends."""
+        self.replay_lost_store()
+        target = derived_id(fid="a")
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {target}")]}
+        )
+        rc = self.run_finish(
+            make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        comments = self.harness.bodies_for("issue", "comment")
+        answers = [b for b in comments if "/remediate" in b]
+        self.assertEqual(len(answers), 1)
+        answer = answers[0]
+        self.assertNotIn("no longer reproduces", answer)
+        self.assertNotIn("could not see the whole fleet", answer)
+        self.assertIn("the report store lost its record of this ledger", answer)
+        self.assertIn(f"whether `{target}` was among the findings the ledger carried", answer)
+        self.assertIn("until a run that reports findings rebuilds the record", answer)
+        partial = [b for b in comments if "found nothing" in b]
+        self.assertEqual(len(partial), 1)
+        self.assertIn("found nothing — but the report store lost its record", partial[0])
+        self.assertNotIn("did not see the whole fleet", partial[0])
+        self.assertNotIn("reads the whole fleet", partial[0])
+
+    def test_a_guarded_lost_store_answers_an_unflagged_remediate_with_the_lost_record(self):
+        """The collector still flags b, so the gap is the guarded one; a
+        request for a, which it does not flag, gets the lost-record answer."""
+        self.replay_lost_store()
+        target = derived_id(fid="a")
+        self.harness.replies["--json comments"] = json.dumps(
+            {"comments": [comment(f"/remediate {target}")]}
+        )
+        manifest = _full_manifest(candidates=[self.netpol_candidate(object="Namespace/b")])
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.LOST_MEMORY_GAP, self.stdout_json()["coverage_gaps"])
+        answers = [b for b in self.harness.bodies_for("issue", "comment") if "/remediate" in b]
+        self.assertEqual(len(answers), 1)
+        self.assertIn(f"whether `{target}` was among the findings the ledger carried", answers[0])
+        self.assertIn(audit_report.LOST_RECORD_WAY_OUT, answers[0])
+        self.assertNotIn("no longer reproduces", answers[0])
 
     def test_a_scheme_bump_rewrites_the_body_and_the_next_run_is_whole(self):
-        """A marker under another identity scheme is not an unreadable ledger:
-        the stamp is refreshed only by the rewrite, so freezing the body over
-        it would freeze it for good. The bump costs one run's re-spelled holds
+        """A marker under another identity scheme is not a lost memory: the
+        stored body keeps its own stamp and is re-spelled on read, so the
+        scheme is no trust condition. The bump costs one run's re-spelled holds
         and nothing after it."""
         previous_body = published_body(make_doc(), generated_at=NOW).replace(
             f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->", "<!-- audit-id-scheme: 1 -->"
@@ -15294,7 +15781,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(audit_report.parse_id_scheme(rewritten), audit_report.ID_SCHEME)
         payload = self.stdout_json()
         self.assertFalse(payload["partial"])
-        self.assertNotIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         # The next run reads a current stamp and is whole.
         self.replay_ledger(rewritten)
         rc = self.run_finish(doc_b, ["--manifest-file", self.manifest_file(manifest)])
@@ -15304,15 +15791,18 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
         self.assertTrue(payload["silent_ok"])
 
-    def test_the_unreadable_ledger_path_touches_only_what_it_may(self):
-        """The inventory: no body or title edit, no label, no promotion, no
-        acknowledgement, no delta comment — refusals and deferrals answered."""
+    def test_a_lost_store_findings_run_writes_and_keeps_flagged_prs(self):
+        """The findings branch over a lost store does everything a run does —
+        body, promotion, `/remediate` — except announce a delta, and a pull
+        request for an id the collector still flags stays open, since the
+        stale-close pass reads the still-flagged set whole."""
         a_id = derived_id(fid="a")
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
+        self.open_pr_for_a()
         self.harness.replies["--json comments"] = json.dumps(
             {"comments": [comment(f"/remediate {a_id}")]}
         )
-        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/8\n"
+        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/9\n"
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
             candidates=[
@@ -15320,22 +15810,23 @@ class TestFinishManifestFlag(HarnessTestCase):
                 self.netpol_candidate(),
             ]
         )
-        # The document's own critical manifest finding would otherwise promote.
         rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        # The body, then the relink that names the promoted pull request; the
+        # store keeps the relinked one, since that is what the ledger shows.
+        edits = self.harness.bodies_for("issue", "edit")
+        self.assertEqual(len(edits), 2)
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        stored = json.loads((self.store_dir() / "latest.json").read_text())
+        self.assertEqual(stored["ledger_body"], edits[-1])
+        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
         posted = self.harness.bodies_for("issue", "comment")
         self.assertFalse([b for b in posted if "audit delta" in b])
-        self.assertFalse([b for b in posted if audit_report.acked_marker("IC_1") in b])
         deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
         self.assertEqual(len(deferrals), 1, posted)
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "UPDATED")
-        self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
-        self.assertEqual(payload["prs_opened"], [])
-        self.assertIn("body, title, label and promotions wait", self.err)
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
 
     def test_a_manifest_for_another_audit_is_refused(self):
         self.harness.replies = {"issue list": "[]"}
@@ -15353,6 +15844,7 @@ class TestFinishManifestFlag(HarnessTestCase):
                 if declared:
                     manifest["audit"] = declared
                 self.harness = Recorder()
+                self.harness.listed_body = self.stored_ledger_body
                 self.harness.replies = {"issue list": "[]"}
                 self.patch_attr("run_cmd", self.harness)
                 rc = self.run_finish(
@@ -15381,6 +15873,7 @@ class TestFinishManifestFlag(HarnessTestCase):
              "checks_run": [ran(c, "alpha-cluster") for c in audit_report.audit_checks(AUDIT)]}
         )
         self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
         self.harness.replies = {"issue list": "[]"}
         self.patch_attr("run_cmd", self.harness)
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
@@ -15707,30 +16200,26 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("<!-- finding:odd-id-with-no-segments -->", lines)
         self.assertIn("not recorded on the previous ledger; carried by id", lines)
 
-    def test_a_flagless_run_over_an_unreadable_body_leaves_it_as_it_was(self):
-        """The one deliberate change to manifest-less behaviour: main rewrote
-        the body over an unreadable one, dropping every held id its marker
-        carried and retiring their pull requests."""
+    def test_a_flagless_run_over_a_lost_store_drops_the_holds(self):
+        """Without a manifest or a memory there is nothing to hold with: the run
+        rewrites the body without the held ids, and nothing protects their
+        pull requests — the manifest-less run's semantics before holds existed."""
         body_n, doc_b = self.held_run()
         a_id = derived_id(fid="a")
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         self.open_pr_for_a()
-        self.harness.replies["pr create"] = "https://github.com/acme/fleet/pull/9\n"
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b)
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
-        self.assertEqual(self.harness.gh_calls("pr", "close"), [])
+        edits = self.harness.bodies_for("issue", "edit")
+        self.assertEqual(len(edits), 1)
+        self.assertNotIn(a_id, audit_report.parse_delta_block(edits[0]))
         payload = self.stdout_json()
-        self.assertTrue(payload["partial"])
-        self.assertIn(audit_report.UNREADABLE_LEDGER_GAP, payload["coverage_gaps"])
         self.assertEqual(payload["status"], "UPDATED")
-        # The next readable run finds the marker intact and carries a on.
-        self.replay_ledger(body_n)
-        rc = self.run_finish(doc_b)
-        self.assertEqual(rc, 0, self.err)
-        self.assertIn(a_id, audit_report.parse_delta_block(self.harness.bodies_for("issue", "edit")[0]))
+        self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
+        self.assertIn(a_id, audit_report.parse_delta_block(body_n))
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(len(self.harness.gh_calls("pr", "close")), 1)
 
     def test_the_carried_rendering_names_the_last_recorded_command_or_nothing(self):
         recorded = self.held_entry(1)
@@ -15890,14 +16379,15 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn(current, audit_report.parse_delta_block(bumped))
 
     def test_a_flagless_unreadable_run_answers_no_remediate(self):
-        """Without a manifest and without the body, the held set is unknown,
-        so a standing `/remediate` gets no answer this run — not a refusal,
-        not a deferral, not an acknowledgement — and the next readable run
+        """Without a manifest and with the report store's record of the ledger
+        lost, the held set is unknown, so a standing `/remediate` gets no
+        answer this run — not a refusal, not a deferral, not an
+        acknowledgement — and the next run that can read the held set
         defers it."""
         body_n, doc_b = self.held_run()
         a_id = derived_id(fid="a")
         request = comment(f"/remediate {a_id}")
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(doc_b)
@@ -15911,14 +16401,14 @@ class TestFinishManifestFlag(HarnessTestCase):
                 self.assertNotIn(marker, body)
         self.assertIn("no /remediate is answered", self.err)
         # The clean variant answers nothing either.
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
         rc = self.run_finish(make_doc(findings=[]))
         self.assertEqual(rc, 0, self.err)
         for body in self.harness.bodies_for("issue", "comment"):
             self.assertNotIn(audit_report.acked_marker("IC_1"), body)
             self.assertNotIn("no longer reproduces", body)
-        # The next readable run defers it.
+        # The next run with a memory defers it.
         self.replay_ledger(body_n)
         self.harness.replies["--json comments"] = json.dumps({"comments": [request]})
         rc = self.run_finish(doc_b)
@@ -15926,10 +16416,10 @@ class TestFinishManifestFlag(HarnessTestCase):
         posted = self.harness.bodies_for("issue", "comment")
         self.assertEqual(len([b for b in posted if audit_report.deferred_marker("IC_1") in b]), 1, posted)
 
-    def test_a_manifest_still_answers_remediate_over_an_unreadable_body(self):
+    def test_a_manifest_still_answers_remediate_over_a_lost_store(self):
         self.held_run()
         a_id = derived_id(fid="a")
-        self.replay_unreadable_ledger()
+        self.replay_lost_store()
         self.harness.replies["--json comments"] = json.dumps({"comments": [comment(f"/remediate {a_id}")]})
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         manifest = _full_manifest(
@@ -16851,12 +17341,23 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     One deviation is deliberate and is recorded in the transcripts rather than
     excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
     qualifying cluster names, from 3 to 4 when the patch-readiness
-    collector did the same, and from 4 to 5 when `collect.py` did it for three
-    more streams, and the stamp is global, so every stream's bodies
+    collector did the same, from 4 to 5 when `collect.py` did it for three
+    more streams, and from 5 to 6 when `fleet_waste.py` and `fleet_stockout.py`
+    did it for cost and stockout, and the stamp is global, so every stream's bodies
     carry the current number. That is the whole of the change here -- five
     lines, one per body -- and this class is what proves it. The compliance
     roster growing from eleven checks to sixteen is recorded the same way: the
     Scope table's `n/n` column and the unrun-check prose count the roster.
+    The report store is the other: the previous body is read from the store
+    rather than from `gh issue view --json body`, so that one call is gone
+    from every transcript that had an open ledger, and the `gh issue list`
+    that finds the ledger asks for `number,url,body` rather than
+    `number,url`, the body being what the store's record is checked against
+    and, where the store never held the ledger, what seeds it. One line of
+    output moved with it: the clean-over-a-gap run's stderr says the gaps mean
+    it "cannot vouch for the ledger's state", where it said it "cannot speak
+    for the fleet", because a lost store record also makes a clean run
+    partial, and the line now covers both causes. Nothing else moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,
@@ -16973,6 +17474,632 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
         rc = self.run_finish(make_doc(findings=self.two_findings()), ["--dry-run"])
         self.check("dry_run", rc)
 
+
+
+class TestReportStore(HarnessTestCase):
+    """The report store: what `finish` writes, what the next run trusts."""
+
+    def envelope(self, **overrides):
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {"status": "UPDATED", "partial": False, "coverage_gaps": []},
+            make_doc(),
+            NOW,
+            repo="acme/fleet",
+            issue_number=42,
+            ledger_body="body",
+            new_ids=["b", "a"],
+            resolved_ids=[],
+            rendered_ids=["b", "a", "b"],
+        )
+        envelope.update(overrides)
+        return envelope
+
+    def stored(self):
+        return json.loads((self.store_dir() / "latest.json").read_text())
+
+    def test_a_written_report_is_read_back_for_the_same_ledger(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        memory = audit_report.read_report_memory(AUDIT, 42, "acme/fleet")
+        self.assertEqual(memory["ledger_body"], "body")
+        self.assertEqual(memory["current_ids"], ["a", "b"])
+        self.assertEqual(memory["new_ids"], ["a", "b"])
+        self.assertEqual(memory["id_scheme"], audit_report.ID_SCHEME)
+        runs = list((self.store_dir() / "runs").glob("*.json"))
+        self.assertEqual([p.name for p in runs], ["20260801T093000.000000Z.json"])
+
+    def test_a_report_for_another_ledger_is_not_trusted(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        for issue, repo in ((43, "acme/fleet"), (42, "acme/other"), (None, "acme/fleet")):
+            with self.subTest(issue=issue, repo=repo):
+                self.assertIsNone(audit_report.read_report_memory(AUDIT, issue, repo))
+
+    def test_each_repository_keeps_its_own_memory(self):
+        """An SOP walking `managed_repos` finishes one stream once per
+        repository; each run must find its own ledger's memory, not the one
+        the other repository's run wrote a minute before."""
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        audit_report.write_report(
+            AUDIT,
+            self.envelope(repo="acme/other", issue_number=12, ledger_body="other body"),
+            NOW.replace(minute=31),
+        )
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body"
+        )
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 12, "acme/other")["ledger_body"],
+            "other body",
+        )
+        for repo in ("acme/fleet", "acme/other"):
+            with self.subTest(repo=repo):
+                runs = list(self.store_dir(repo=repo).joinpath("runs").glob("*.json"))
+                self.assertEqual(len(runs), 1)
+
+    def test_a_repository_that_is_not_owner_name_is_never_a_path(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for repo in ("../../etc", "acme", "acme/fleet/x", "acme/..", ""):
+                with self.subTest(repo=repo):
+                    audit_report.write_report(AUDIT, self.envelope(repo=repo), NOW)
+                    self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, repo))
+        self.assertFalse(self.reports_dir.exists())
+        self.assertIn("is not owner/name", err.getvalue())
+
+    def test_a_store_write_is_readable_whatever_the_umask(self):
+        """A temp file is 0600 and a directory narrows to the umask: under a
+        hardened operator shell's 077 a root hand-run would leave a store no
+        uid-1000 run can read."""
+        mask = os.umask(0o077)
+        try:
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        finally:
+            os.umask(mask)
+        directory = self.store_dir()
+        for path in (self.reports_dir, directory, directory / "runs"):
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        for path in (directory / "latest.json", *(directory / "runs").glob("*.json")):
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_a_root_run_hands_what_it_creates_to_the_stores_owner(self):
+        """Mode cannot let uid 1000 write into a root-owned directory; root
+        hands every directory and file it creates to the nearest existing
+        directory's owner, so the next scheduled run can write."""
+        self.reports_dir.parent.mkdir(parents=True, exist_ok=True)
+        owner = self.reports_dir.parent.stat()
+        chowned = []
+        with (
+            patch.object(audit_report.os, "geteuid", return_value=0),
+            patch.object(
+                audit_report.os, "chown", side_effect=lambda path, uid, gid: chowned.append(
+                    (Path(path), uid, gid)
+                )
+            ),
+        ):
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+        directory = self.store_dir()
+        paths = {path for path, _, _ in chowned}
+        for created in (self.reports_dir, directory, directory / "runs"):
+            with self.subTest(created=created):
+                self.assertIn(created, paths)
+        # One temp file per write: the ring entry and latest.json.
+        self.assertEqual(len([path for path in paths if path.suffix == ".tmp"]), 2)
+
+    def test_another_uids_store_is_named_when_it_is_denied(self):
+        """What a root hand-run from before the handover left behind: the
+        warning names the path and both uids rather than a bare lost memory."""
+        if os.geteuid() == 0:
+            self.skipTest("root reads a 0000 file")
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        latest = self.store_dir() / "latest.json"
+        latest.chmod(0)
+        self.addCleanup(latest.chmod, 0o644)
+        err = io.StringIO()
+        other = os.geteuid() + 1
+        with (
+            contextlib.redirect_stderr(err),
+            patch.object(audit_report.os, "geteuid", return_value=other),
+        ):
+            self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+        self.assertIn(
+            f"{latest} is owned by uid {latest.stat().st_uid} and this run is uid {other}",
+            err.getvalue(),
+        )
+
+    def test_a_malformed_report_is_not_trusted_and_fails_nothing(self):
+        directory = self.store_dir()
+        directory.mkdir(parents=True)
+        for text in ("not json", "[]", json.dumps({"issue_number": 42, "repo": "acme/fleet"})):
+            with self.subTest(text=text):
+                (directory / "latest.json").write_text(text)
+                self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+
+    def test_the_ring_keeps_the_newest_runs(self):
+        for minute in range(audit_report.REPORT_HISTORY + 3):
+            audit_report.write_report(AUDIT, self.envelope(), NOW.replace(minute=minute))
+        runs = sorted(p.name for p in (self.store_dir() / "runs").glob("*.json"))
+        self.assertEqual(len(runs), audit_report.REPORT_HISTORY)
+        self.assertTrue(runs[0].startswith("20260801T090300"), runs[0])
+
+    def test_a_failed_write_drops_latest_rather_than_leave_it_stale(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        err = io.StringIO()
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(err):
+            audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        self.assertIn("report store write", err.getvalue())
+
+    def test_a_failed_write_over_an_unchanged_ledger_keeps_latest(self):
+        """A run that left the body as it found it has nothing the stored
+        record lacks, so a failed write must not cost the next run its memory."""
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            audit_report.write_report(AUDIT, self.envelope(), NOW, ledger_unchanged=True)
+        self.assertEqual(
+            audit_report.read_report_memory(AUDIT, 42, "acme/fleet")["ledger_body"], "body"
+        )
+
+    def test_the_document_is_redacted(self):
+        token = "ghp_" + "a" * 36
+        doc = make_doc(findings=[make_finding(fid="a", title=f"leaked {token}")])
+        envelope = audit_report.report_envelope(
+            AUDIT, {}, doc, NOW, repo="acme/fleet", issue_number=42,
+            ledger_body="", new_ids=[], resolved_ids=[], rendered_ids=[],
+        )
+        self.assertNotIn(token, json.dumps(envelope))
+
+    def test_a_finding_id_is_not_redacted_in_the_document(self):
+        """The body's block and `current_ids` publish ids raw; a redacted id in
+        the document would name a finding no other key does."""
+        fid = (
+            "image-not-pinned.prod-us.batch."
+            "deployment-task-runner-controller-manager-with-long-name"
+        )
+        finding = make_finding(fid="a")
+        finding["id"] = fid
+        envelope = audit_report.report_envelope(
+            AUDIT, {}, make_doc(findings=[finding]), NOW, repo="acme/fleet",
+            issue_number=42, ledger_body="", new_ids=[], resolved_ids=[], rendered_ids=[],
+        )
+        self.assertNotEqual(audit_report.redact_secrets(fid), fid)
+        self.assertEqual(envelope["document"]["findings"][0]["id"], fid)
+
+    def test_repository_casing_names_one_store(self):
+        """GitHub's names are not case-sensitive, so `--repo Acme/Fleet` and a
+        ConfigMap's `acme/fleet` are one ledger with one memory."""
+        audit_report.write_report(AUDIT, self.envelope(repo="Acme/Fleet"), NOW)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        memory = audit_report.read_report_memory(AUDIT, 42, "acme/fleet")
+        self.assertEqual(memory["ledger_body"], "body")
+
+    def test_a_findings_run_stores_the_body_it_wrote(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        stored = self.stored()
+        body = self.harness.bodies_for("issue", "edit")[-1]
+        self.assertEqual(stored["ledger_body"], body)
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["current_ids"], sorted(audit_report.parse_delta_block(body)))
+        self.assertEqual(stored["status"], self.stdout_json()["status"])
+        self.assertIs(stored["ledger_held_open"], False)
+
+    def test_a_clean_run_held_open_carries_the_previous_body_forward(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        # A store a findings run left: its own document, which the carried
+        # body renders.
+        self.seed_report(previous)
+        latest = self.store_dir() / "latest.json"
+        seeded = json.loads(latest.read_text())
+        seeded["document"] = make_doc()
+        latest.write_text(json.dumps(seeded), encoding="utf-8")
+        self.harness.replies = {"issue list": self.issue_list()}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        gap["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        stored = self.stored()
+        self.assertEqual(stored["ledger_body"], previous)
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["current_ids"], sorted(audit_report.parse_delta_block(previous)))
+        # `document` is this run's; the one the carried body renders rides
+        # beside it for the next run's titles, and no reader is handed both.
+        self.assertEqual(stored["document"]["findings"], [])
+        self.assertEqual(stored["document"]["scope"]["skipped"][0]["cluster"], "dr-west")
+        self.assertEqual(stored["ledger_document"], make_doc())
+        # A reader counting this run's zero must be told the issue is not clear.
+        self.assertIs(stored["ledger_held_open"], True)
+        normal = audit_report.report_envelope(
+            AUDIT, {"status": "UPDATED"}, make_doc(), NOW, repo="acme/fleet", issue_number=42,
+            ledger_body="b", new_ids=[], resolved_ids=[], rendered_ids=[])
+        self.assertNotIn("ledger_document", normal)
+        self.assertIs(normal["ledger_held_open"], False)
+
+    def test_a_held_open_run_whose_store_write_fails_keeps_the_memory(self):
+        """Held open, the run only commented; the record from before still
+        describes the body exactly, so the next run keeps trusting it."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        gap["resolved_because"] = resolved_for(previous)
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+            self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn("report store write", self.err)
+        stored = self.stored()
+        self.assertEqual(stored["issue_number"], 42)
+        self.assertEqual(stored["ledger_body"], previous)
+
+    def test_a_findings_run_whose_store_write_fails_drops_the_memory(self):
+        # Seeded first, so the assertion below needs the drop to pass. The
+        # pre-edit invalidation is patched out: it drops the same file before
+        # the body is rewritten, and left in, it would pass this test with
+        # `write_report`'s own drop deleted.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.object(audit_report, "invalidate_report_memory"), patch.object(
+            audit_report, "_atomic_write", side_effect=OSError("disk full")
+        ):
+            self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+
+    def run_finish_unseeded(self, doc):
+        """`finish` with no store the harness wrote on the test's behalf: the
+        ledger body the recorder serves is only what GitHub would return."""
+        findings_file = self.write_findings(doc)
+        return BaseTestCase.run_main(
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file]
+        )
+
+    def body_reads(self):
+        return [c for c in self.harness.calls if "--json" in c and "body" in c]
+
+    def listing(self, body, number=42):
+        return json.dumps(
+            [{"number": number, "url": f"https://github.com/acme/fleet/issues/{number}", "body": body}]
+        )
+
+    def test_a_seed_from_the_listing_survives_a_failing_issue_view(self):
+        """The listing already carried the body, so a `gh issue view` that
+        would fail has no say: the seed still holds the ledger open."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        self.harness.failures = {"--json body": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertNotIn("could not be read to seed one", self.err)
+
+    def test_start_seeds_from_the_listing_without_a_second_read(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        self.harness.failures = {"--json body": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.body_reads(), [])
+        self.assertTrue(json.loads(self.out.strip())["carried"])
+
+    def test_a_listing_without_a_body_falls_back_to_issue_view(self):
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"--json body": json.dumps({"body": previous})}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
+        self.assertEqual(memory["ledger_body"], previous)
+        self.assertEqual(len(self.body_reads()), 1)
+
+    def test_a_failing_issue_view_seeds_nothing(self):
+        """No store and no body in the listing: the fallback read is the only
+        source, and when it fails the memory is lost, not empty."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"--json body": json.dumps({"body": previous})}
+        self.harness.failures = {"--json body": 1}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None)
+        self.assertIsNone(memory)
+        self.assertEqual(len(self.body_reads()), 1)
+        self.assertIn("could not be read to seed one", err.getvalue())
+
+    def test_a_failed_close_leaves_the_memory_intact(self):
+        """The close leaves the body as it was, so until it lands the stored
+        memory is still the open ledger; a transient failure must not cost the
+        next run it."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.seed_report(previous)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        self.harness.failures = {"issue close": 1}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous)
+        self.assertNotEqual(self.run_finish_unseeded(clean), 0)
+        self.assertEqual(len(self.harness.gh_calls("issue", "close")), 1)
+        self.assertEqual(
+            (self.stored()["issue_number"], self.stored()["ledger_body"]), (42, previous)
+        )
+        self.assertIsNotNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", previous))
+
+    def test_a_withheld_delta_is_recorded_on_the_envelope(self):
+        """A lost memory stores empty `new_ids`/`resolved_ids` because the
+        delta was withheld; the envelope must say so, or a reader prints +0/−0."""
+        self.rewrite_ledger_behind_the_store()
+        doc = make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")])
+        self.assertEqual(self.run_finish_unseeded(doc), 0, self.err)
+        stored = self.stored()
+        self.assertIs(stored["delta_known"], False)
+        self.assertEqual((stored["new_ids"], stored["resolved_ids"]), ([], []))
+
+    def test_a_known_delta_is_recorded_on_the_envelope(self):
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertIs(self.stored()["delta_known"], True)
+
+    def test_a_never_stored_ledger_is_seeded_once_from_its_block(self):
+        """The first run after the store lands, or after the volume is replaced,
+        must still refuse to close over findings its empty document does not
+        account for; the ledger's hidden block stands in for the store once."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertIn("seeding this run's memory once", self.err)
+        # The listing brought the body, so the seed is read off it, not re-fetched.
+        self.assertEqual(self.body_reads(), [])
+        stored = self.stored()
+        self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
+        self.assertIs(stored["ledger_held_open"], True)
+
+    def test_a_held_open_run_after_a_seed_carries_no_empty_document(self):
+        """Seeded off the block, then held open twice: neither memory wrote
+        the body, so neither run's empty document may ride forward as the
+        document the body renders."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        for run in (1, 2):
+            with self.subTest(run=run):
+                self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+                self.assertEqual(self.stdout_json()["status"], "HELD")
+                stored = self.stored()
+                self.assertIs(stored["ledger_held_open"], True)
+                self.assertEqual(stored["ledger_body"], previous)
+                self.assertNotIn("ledger_document", stored)
+
+    def test_a_closed_ledger_is_not_remembered_for_its_issue(self):
+        """Reopened by hand, a closed ledger is not the empty one the close
+        left, so its next run must read a lost memory, not a trusted empty one."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": previous})}
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        self.assertEqual(len(self.harness.gh_calls("issue", "close")), 1)
+        self.assertIsNone(self.stored()["issue_number"])
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+
+    def test_a_run_that_dies_before_its_write_leaves_no_trusted_memory(self):
+        """Killed between the issue edit and the store write, a run must not
+        leave the envelope of the run before it reading as current."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        self.assertTrue(list((self.store_dir() / "runs").glob("*.json")))
+
+    def test_the_run_after_a_killed_one_reads_a_lost_memory(self):
+        """The directory survives the kill, so the next run finds a store with
+        no `latest.json`: a lost memory, never an empty one to delta against."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertNotEqual(payload["status"], "CLOSED")
+        self.assertTrue(
+            {audit_report.LOST_MEMORY_GAP, audit_report.LOST_MEMORY_UNGUARDED_GAP}
+            & set(payload["coverage_gaps"]),
+            payload["coverage_gaps"],
+        )
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+
+    def rewrite_ledger_behind_the_store(self):
+        """Run N publishes a; then something that never touches the store — a
+        `finish` from an older image — rewrites the ledger to list a and w.
+        Returns (run N's body, the rewritten body)."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+        body_n = self.stored()["ledger_body"]
+        rewritten = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue list": json.dumps(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": rewritten}]
+            )
+        }
+        return body_n, rewritten
+
+    def test_a_ledger_rewritten_behind_the_store_is_a_lost_memory(self):
+        """The record still names the open issue and repository, so trusted on
+        those alone it would announce w — which the window already published —
+        as new. The ledger's block no longer matches the record's, so the
+        memory is lost and the run claims no delta."""
+        self.rewrite_ledger_behind_the_store()
+        doc = make_doc(findings=[make_finding(fid="a"), make_finding(fid="w", title="Window finding")])
+        self.assertEqual(self.run_finish_unseeded(doc), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual((payload["new"], payload["resolved"]), (0, 0))
+        self.assertFalse(payload["silent_ok"])
+        self.assertIn("no longer matches issue #42", self.err)
+        self.assertFalse([b for b in self.harness.bodies_for("issue", "comment") if "audit delta" in b])
+
+    def test_a_clean_run_does_not_close_over_what_the_window_reported(self):
+        """The stale record lists only a, which the clean document accounts for;
+        w, which only the window reported, would go unchecked and the ledger
+        would close. A lost memory holds it open instead."""
+        body_n, _ = self.rewrite_ledger_behind_the_store()
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(body_n)
+        self.assertEqual(self.run_finish_unseeded(clean), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertNotEqual(self.stdout_json()["status"], "CLOSED")
+
+    def test_a_ledger_whose_block_is_unchanged_keeps_its_memory(self):
+        """Prose around the block is not what the delta reads: a hand edit to
+        the body, or GitHub's newline handling, must not lose the memory."""
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+        edited = "A human note.\r\n\r\n" + self.stored()["ledger_body"].replace("\n", "\r\n")
+        memory = audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", edited)
+        self.assertIsNotNone(memory)
+
+    def test_a_listing_that_brought_no_body_cannot_vouch_for_the_store(self):
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None))
+        self.assertIn("did not come back", err.getvalue())
+
+    def test_an_existing_store_is_never_backfilled_from_the_ledger(self):
+        audit_report.write_report(AUDIT, self.envelope(issue_number=43), NOW)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": "x"})}
+        self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", "x"))
+        self.assertEqual(self.body_reads(), [])
+
+    def test_a_body_without_a_block_seeds_nothing(self):
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.harness.replies = {"issue list": self.issue_list(), "--json body": json.dumps({"body": "hand-written"})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(audit_report.previous_run_memory(AUDIT, 42, "acme/fleet", None))
+        self.assertEqual(len(self.body_reads()), 1)
+        self.assertIn("unknowable", err.getvalue())
+
+    def test_titles_come_from_the_document_the_ledger_renders(self):
+        own = {"findings": [{"id": "own", "title": "This run"}]}
+        carried = {"findings": [{"id": "held", "title": "Still on the issue"}]}
+        self.assertEqual(audit_report.report_finding_titles({"document": own}), {"own": "This run"})
+        self.assertEqual(
+            audit_report.report_finding_titles({"document": own, "ledger_document": carried}),
+            {"held": "Still on the issue"},
+        )
+
+    def test_a_clean_run_held_open_over_a_lost_store_breaks_the_trust_chain(self):
+        # The body it would carry is not known, so it stores no issue number:
+        # the next run's trust check fails by design rather than trusting ""
+        # as the body GitHub shows.
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"--json body": 1}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertIsNone(self.stored()["issue_number"])
+
+    def test_a_clean_run_that_only_comments_keeps_the_memory_when_killed(self):
+        # Held open over a gap, a clean run comments and leaves the body as the
+        # stored envelope describes it, so dying before the write must not turn
+        # the next run into a lost memory that can never close.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        with patch.object(audit_report, "write_report", side_effect=SystemExit(137)):
+            with self.assertRaises(SystemExit):
+                self.run_finish(gap)
+        self.assertEqual(self.harness.gh_calls("issue", "close"), [])
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+
+    def test_a_failed_lookup_before_the_ledger_changes_keeps_the_memory(self):
+        # Nothing touched the ledger, so the stored envelope still describes it
+        # exactly; deleting it would cost the next run its memory for nothing.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.harness.failures = {"pr list": 1}
+        self.assertNotEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertEqual(self.stored()["issue_number"], 42)
+
+    def test_a_kill_before_the_findings_rewrite_keeps_the_memory(self):
+        # The comment read and the label sync are round trips that leave the
+        # body alone; a kill in them leaves the stored envelope still true.
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        with patch.object(
+            audit_report, "sync_open_remediation_labels", side_effect=SystemExit(137)
+        ):
+            with self.assertRaises(SystemExit):
+                self.run_finish(make_doc())
+        self.assertEqual(self.harness.gh_calls("issue", "edit"), [])
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+
+    def test_a_dry_run_writes_no_report(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc(), ["--dry-run"]), 0, self.err)
+        self.assertFalse((self.reports_dir / AUDIT).exists())
+
+    def test_start_reads_the_carried_locations_from_the_store(self):
+        body = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue list": self.issue_list()}
+        self.seed_report(body)
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertFalse([c for c in self.harness.gh_calls("issue", "view") if "body" in c])
+        self.assertTrue(json.loads(self.out.strip())["carried"])
+
+
+
+class TestLostRecordWayOut(unittest.TestCase):
+    """Beside a lost record, the comment and the /remediate answer name the
+    same way out, whatever coverage gap stands with it."""
+
+    NOW = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    COVERAGE_GAP = "dr-west: control plane unreachable"
+
+    def test_a_mixed_gap_comment_gives_the_lost_record_way_out(self):
+        comment_body = audit_report.render_clean_comment(
+            "compliance-audit",
+            {"scope": {"clusters": [{"name": "prod-us-east"}]}, "findings": []},
+            self.NOW,
+            gaps=[audit_report.LOST_MEMORY_UNGUARDED_GAP, self.COVERAGE_GAP],
+        )
+        self.assertIn("did not see the whole fleet", comment_body)
+        self.assertNotIn("closes on the next run that reads the whole fleet", comment_body)
+        self.assertIn("a run that reads the whole fleet will not close it either", comment_body)
+        self.assertIn(audit_report.LOST_RECORD_WAY_OUT, comment_body)
+
+    def test_a_partial_lost_record_answer_names_both(self):
+        answer = audit_report.render_clean_remediate_answer(
+            "compliance-audit",
+            {"author": "dev", "targets": ["x"], "comment_id": "IC_1"},
+            self.NOW,
+            closing=False,
+            lost_memory=True,
+            partial=True,
+        )
+        self.assertIn(
+            audit_report.LOST_RECORD_WAY_OUT + " This run also did not see the whole fleet.",
+            answer,
+        )
+        self.assertNotIn("could not see the whole fleet", answer)
 
 
 if __name__ == "__main__":

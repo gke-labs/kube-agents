@@ -499,6 +499,14 @@ jobs:
             fi
           done
 
+      # The scope modules carry `terraform test` suites under tests/, run
+      # against mocked providers, so a plan-time rule (a precondition, a
+      # postcondition on a read, the bindings a declaration plans) is
+      # exercised rather than grepped for. Reuses the provider cache the loop
+      # above warmed; tests/test_terraform_module_tests.py pins this step.
+      - name: Run Terraform module tests
+        run: make terraform-test
+
       # lifecycle.sh reads its inputs out of `terraform console`, whose output
       # shapes the unit tests can only stub. #1309's stub answered `null` where
       # the binary answers `tostring(null)`, every autopush deploy failed, and

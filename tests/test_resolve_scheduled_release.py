@@ -348,6 +348,58 @@ class ResolveScheduledReleaseTest(unittest.TestCase):
 
     # ── Genuine machinery failures stay red ──────────────────────────────────
 
+    def test_main_that_cannot_be_read_in_ci_is_an_error_with_outputs_written(self):
+        """The gate picker fails closed in CI when main cannot be fetched; the outputs still land.
+
+        The release repository's https URL is rewritten onto a path that does
+        not exist, so the fetch fails offline; the tracking ref that exists must
+        not be used instead, and the failure must leave through the same exit as
+        every verdict rather than a bare `set -e` death with empty outputs.
+        """
+        temp_dir, repo_dir, git, _ = self._repo()
+        try:
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+            unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+            git(
+                "config",
+                f"url.{unreachable}.insteadOf",
+                "https://github.com/no-such-org-kube-agents/no-such-repo.git",
+            )
+
+            proc, outputs, summary = self._run(
+                repo_dir, env={"CI": "true", "GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"}
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Could not fetch main", proc.stderr)
+            self.assertEqual(outputs["should_release"], "false")
+            self.assertIn("Could not read the tag graph against main", outputs["skip_reason"])
+            self.assertIn("DID NOT ANSWER", proc.stdout)
+        finally:
+            temp_dir.cleanup()
+
+    def test_a_release_line_tag_numerically_ahead_is_not_mains_base(self):
+        """A 0.9.0 stamped off a branch that is not main leaves main's base where it was."""
+        temp_dir, repo_dir, git, head = self._repo()
+        try:
+            git("switch", "-c", "release/0.9", _GA_TAG)
+            (pathlib.Path(repo_dir) / "line.txt").write_text("line\n")
+            git("add", "line.txt")
+            git("commit", "-m", "fix: on a line")
+            (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.9.0\n")
+            git("add", "stamp.txt")
+            git("commit", "-m", "chore(release): stamp release version 0.9.0")
+            git("tag", "-a", "0.9.0", "-m", "release 0.9.0")
+            git("switch", "main")
+
+            proc, outputs, summary = self._run(repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(outputs["should_release"], "true")
+            self.assertEqual(outputs["release_commit"], head)
+            self.assertIn(_GA_TAG, proc.stdout)
+            self.assertNotIn("0.9.0", proc.stdout)
+        finally:
+            temp_dir.cleanup()
+
     def test_a_gate_tag_that_names_no_commit_is_an_error(self):
         """Not a skip: the newest gate tag failing to resolve means the graph is broken.
 

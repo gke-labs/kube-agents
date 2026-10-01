@@ -2683,9 +2683,11 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     EMPTY_BLOCK = (
         "scope = {\n"
-        "  projects      = []\n"
-        "  folders       = []\n"
-        "  organizations = []\n"
+        "  projects         = []\n"
+        "  folders          = []\n"
+        "  organizations    = []\n"
+        "  shared_vpc_hosts = []\n"
+        "  metrics_scopes   = []\n"
         "  exclude = {\n"
         "    projects = []\n"
         "    clusters = []\n"
@@ -2695,6 +2697,7 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     def _scope_env(self, **keys):
         env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+               "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
         env.update(keys)
         return env
@@ -2708,14 +2711,18 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
             SCOPE_PROJECTS="payments-prod, payments-staging",
             SCOPE_FOLDERS="123456789012 210987654321",
             SCOPE_ORGANIZATIONS="987654321098",
+            SCOPE_SHARED_VPC_HOSTS="shared-net-host, shared-net-host-2",
+            SCOPE_METRICS_SCOPES="observability-hub",
             SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
             SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
         ))
         self.assertIn(
             "scope = {\n"
-            '  projects      = ["payments-prod", "payments-staging"]\n'
-            '  folders       = ["123456789012", "210987654321"]\n'
-            '  organizations = ["987654321098"]\n'
+            '  projects         = ["payments-prod", "payments-staging"]\n'
+            '  folders          = ["123456789012", "210987654321"]\n'
+            '  organizations    = ["987654321098"]\n'
+            '  shared_vpc_hosts = ["shared-net-host", "shared-net-host-2"]\n'
+            '  metrics_scopes   = ["observability-hub"]\n'
             "  exclude = {\n"
             '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
             '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
@@ -2781,6 +2788,8 @@ _LIVE_SCOPE_LINES = (
     'SCOPE_PROJECTS="p2-project p3-project"',
     'SCOPE_FOLDERS=""',
     'SCOPE_ORGANIZATIONS=""',
+    'SCOPE_SHARED_VPC_HOSTS=""',
+    'SCOPE_METRICS_SCOPES=""',
     'SCOPE_EXCLUDE_PROJECTS=""',
     'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
 )
@@ -2848,6 +2857,7 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
                    "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                    "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
             env.update(keys or {})
             body = (
@@ -2957,22 +2967,38 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         older = '{"platformAgent":{"scope":{"projects":[],"exclude":{"projects":[],"clusters":[]}}}}'
         self._assert_rc(self._run(only_containers, older), 1)
 
-    def test_selectors_on_the_live_cr_are_reported_and_never_weighed(self):
-        # sharedVpcHosts and metricsScopes (phase 3) have no installer key and
-        # the chart renders neither, so an apply leaves them alone: a CR
-        # carrying only selectors passes with a note, and a refused mixed edit
-        # still prints the lines it can reproduce plus the note.
+    def test_a_hand_declared_selector_is_protected_like_a_project(self):
+        # The chart renders sharedVpcHosts and metricsScopes now, so an apply
+        # over a CR that carries one the record and the keys do not is the
+        # same silent replace as for a project: refused, with the two lines
+        # that reproduce it, passed once the keys carry it, and never a note
+        # about a key the installer lacks.
         only_selectors = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"sharedVpcHosts":["shared-net-host"],'
                           '"metricsScopes":["observability-hub"]}}}]}')
         proc = self._run(only_selectors, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_SHARED_VPC_HOSTS="shared-net-host"', proc.stdout)
+        self.assertIn('INFO:   SCOPE_METRICS_SCOPES="observability-hub"', proc.stdout)
+        self.assertNotIn("has no key for", proc.stdout)
+        proc = self._run(only_selectors, "norelease",
+                         keys={"SCOPE_SHARED_VPC_HOSTS": "shared-net-host", "SCOPE_METRICS_SCOPES": "observability-hub"})
         self._assert_rc(proc, 0)
-        self.assertIn("also declares sharedVpcHosts: shared-net-host metricsScopes: observability-hub, which the installer has no key for yet", proc.stdout)
+        self.assertNotIn("has no key for", proc.stdout)
+        # A record that carries the selectors makes the keys the new
+        # declaration, dropping them included; a record from before the chart
+        # rendered them (the container keys only) does not account for them.
+        record = ('{"platformAgent":{"scope":{"projects":[],"folders":[],"organizations":[],"sharedVpcHosts":["shared-net-host"],'
+                  '"metricsScopes":["observability-hub"],"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_selectors, record), 0)
+        between = ('{"platformAgent":{"scope":{"projects":[],"folders":[],"organizations":[],'
+                   '"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_selectors, between), 1)
         mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
                  '"sharedVpcHosts":["shared-net-host"]}}}]}')
         proc = self._run(mixed, "norelease")
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
-        self.assertIn("also declares sharedVpcHosts: shared-net-host, which the installer has no key for yet", proc.stdout)
+        self.assertIn('INFO:   SCOPE_SHARED_VPC_HOSTS="shared-net-host"', proc.stdout)
 
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.
@@ -3045,6 +3071,98 @@ _GOOGLE_CREDENTIAL_VARIABLES = (
     "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
     "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
 )
+
+
+class ScopeSelectorApisTest(unittest.TestCase):
+    """enable_scope_selector_apis: silent with no selector declared; with one,
+    lists the management project's enabled APIs and enables whichever of the
+    APIs the plan-time resolution of that selector reads is off (Resource
+    Manager and Monitoring for a Metrics Scope, Compute for a Shared VPC host,
+    the composition's own split), since the reads run in the plan and the
+    composition enables the APIs only in the apply that follows. Nothing is
+    called when they are on; a listing that fails enables every API the
+    declared selectors read; an enable that fails is a warning, not an abort."""
+
+    ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
+
+    def _run(self, keys, enabled=ALL, list_fails=False, enable_fails=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            log.write_text("")
+            listing = "exit 1" if list_fails else "printf '%s\\n' " + " ".join(enabled.split()) + "; exit 0"
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"services list --enabled"*) {listing} ;;\n'
+                f'  *"services enable"*) echo "$*" >>"$GCLOUD_LOG"; exit {1 if enable_fails else 0} ;;\n'
+                "esac\nexit 1\n"
+            )
+            (bin_dir / "gcloud").chmod(0o755)
+            env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
+                   "GCLOUD_LOG": str(log)}
+            env.update(keys)
+            body = (
+                "set -u\n"
+                'print_info() { echo "INFO: $*"; }; print_error() { echo "ERROR: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; enable_scope_selector_apis; echo "rc=$?"\n'
+            )
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)), cwd=str(_REPO_ROOT))
+            return proc, log.read_text()
+
+    def test_no_selector_calls_nothing(self):
+        proc, calls = self._run({"SCOPE_PROJECTS": "p2-project", "SCOPE_FOLDERS": "123456789012"}, list_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_every_api_already_on_calls_nothing(self):
+        # A re-run or a Day-2 apply of an existing install: the previous apply
+        # enabled all three, so no enable and no line.
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_only_the_apis_that_are_off_and_that_the_declared_selector_reads_are_enabled(self):
+        # Monitoring on, Resource Manager and Compute off: a Metrics Scope wants Resource
+        # Manager alone (Compute is not among its reads, as the composition's API list
+        # says), a Shared VPC host Compute alone, and both declared want both.
+        cases = (({"SCOPE_METRICS_SCOPES": "observability-hub"}, "cloudresourcemanager.googleapis.com"),
+                 ({"SCOPE_SHARED_VPC_HOSTS": "shared-net-host, other-host"}, "compute.googleapis.com"),
+                 ({"SCOPE_METRICS_SCOPES": "observability-hub", "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"},
+                  "cloudresourcemanager.googleapis.com compute.googleapis.com"))
+        for keys, expected in cases:
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, enabled="monitoring.googleapis.com container.googleapis.com")
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, f"services enable {expected} --project=test-project\n")
+                self.assertIn(f"INFO: Enabling {expected.replace(' ', ', ')} in project 'test-project'", proc.stdout)
+
+    def test_a_listing_that_fails_enables_every_api_the_declared_selectors_read(self):
+        cases = (({"SCOPE_METRICS_SCOPES": "observability-hub"}, "cloudresourcemanager.googleapis.com monitoring.googleapis.com"),
+                 ({"SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, "compute.googleapis.com"),
+                 ({"SCOPE_METRICS_SCOPES": "observability-hub", "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, self.ALL))
+        for keys, expected in cases:
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, f"services enable {expected} --project=test-project\n")
+                self.assertIn("could not be listed", proc.stdout)
+
+    def test_an_enable_that_fails_warns_and_goes_on(self):
+        # Under the front doors' set -eE and ERR trap: the plan reports a
+        # disabled API with the same command as its remedy, and gcloud's active
+        # account need not be the one Terraform applies with.
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"}, enabled="monitoring.googleapis.com", enable_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("TRAP-FIRED", proc.stdout)
+        self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com --project=test-project", proc.stdout)
 
 
 class ScopeContainerPreflightTest(unittest.TestCase):

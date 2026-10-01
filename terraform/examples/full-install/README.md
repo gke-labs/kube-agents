@@ -28,7 +28,10 @@ install without the interview.
   [Remote state](#remote-state)), its read-only project roles, and the Workload
   Identity binding to the agent KSA (`agent_ksa_name`,
   `kubeagents-platform-agent` by default; see
-  [IAM roles](#iam-roles-permission_set-and-project_roles) below).
+  [IAM roles](#iam-roles-permission_set-and-project_roles) below), and, when
+  `scope` names a Shared VPC host or Metrics Scope, the read grants in the projects
+  the [`kube-agents-scope-resolver`](../../modules/kube-agents-scope-resolver)
+  module resolves them to at plan time.
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
   subscription, and Chat integration wiring.
@@ -502,7 +505,7 @@ equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
 
-### Projects, folders and organisations in scope (`scope`)
+### Projects, folders, organisations and selectors in scope (`scope`)
 
 `scope` is the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the
 install from this one value: the `kube-agents-iam` module binds its read allowlist (the read
@@ -513,9 +516,10 @@ rendered on every apply, empty lists included: an emptied `projects` list is the
 drops projects (their read roles are revoked and their Cluster Agent profiles retire over the
 reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
-`cluster_name` triple; neither changes IAM. Through the installer the value comes from
-`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
-`SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+`cluster_name` triple; neither changes IAM, except that an entry naming a Shared VPC service project
+by ID, or a monitored project by number, withholds its grant (below). Through the installer the value comes from
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
+`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
 forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
 declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that
@@ -543,6 +547,45 @@ check before the apply and the composition run directly does not. An organisatio
 every project in the organisation; the design recommends folders until the scoped service account
 pool grants authority ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
 §9).
+
+`scope.shared_vpc_hosts` and `scope.metrics_scopes` take project IDs: a Shared VPC host project,
+whose attached service projects are in scope, and the scoping project of a Cloud Monitoring
+Metrics Scope, whose monitored projects are. Neither is a Resource Manager container, so nothing
+is inherited through them. The composition resolves each at plan time through the
+[`kube-agents-scope-resolver`](../../modules/kube-agents-scope-resolver/README.md) module, with the
+same three reads the reconcile makes each run (the Compute API for a host's service projects, the
+Monitoring API for a scope's monitored projects, Resource Manager to name each of those, which the
+Monitoring API returns by number), made with the google provider's own token so they are answered
+for the identity that applies, and hands the members to the IAM module, which binds the allowlist
+in every project resolved and in each scoping project, and `roles/compute.viewer` alone in a host
+not otherwise in scope, which is all the reconcile's lookup of its service projects reads. The resolver is a module of its own, called without a `depends_on`, because the IAM
+module's module-level `depends_on` would defer a read inside it to apply time and fail the plan on
+a first install. A read that identity cannot make fails the plan before anything is applied,
+naming the selector and the API's answer: it needs
+`compute.projects.get` on a host, to read the Metrics Scope in its scoping project
+(`roles/monitoring.metricsScopesViewer` is the narrowest role) with `monitoring.googleapis.com`
+enabled there, and `resourcemanager.projects.get` on each monitored project; a monitored project
+it cannot name, or one whose ID the scope cannot carry, is left out by naming its project number
+in `exclude.projects`. The reads are billed to `project_id`, whose `cloudresourcemanager` and
+`monitoring` APIs a Metrics Scope's use and whose `compute` API a Shared VPC host's does; the
+composition enables them in the apply, per selector, so `install.sh` enables whichever the declared
+selectors read is off before an apply that carries one; a 403 that names a disabled
+API is reported with that remedy, and one that refuses the identity the consumer project
+(`USER_PROJECT_DENIED`) with the `serviceusage.services.use` it needs there. The reconcile lists at
+most 100 projects of the resolved set, the management project included, so a declaration whose
+management project, `projects` and selector members together exceed that (once each, less an exact
+`exclude.projects` entry; a project both in `projects` and excluded by its number stays counted, so drop
+it from `projects`) is refused at plan rather than bound in full while a selector is declared
+(without one the count is the CRD's own, and a plan that declares none is not refused for it), and a
+single selector past it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
+at runtime. An exclude entry that names a Shared VPC service project by ID, or a monitored project
+by number, keeps it out of the bindings, the one place `exclude` reaches IAM, because a selector's
+member has no list to be dropped from; a monitored project excluded by ID keeps its grant, which the
+reconcile's naming call needs before the exclusion can match; a glob is the reconcile's alone. What the
+selectors do not have is a container's zero-touch onboarding: a service project attached, or a
+project added to the scope, after the last apply reads `denied` in the reconcile's snapshot until
+the next apply binds it. `scope_selector_members` outputs what each resolved to, under the name
+the snapshot's `containers` array uses.
 
 ### Backups
 
@@ -730,7 +773,7 @@ module "gke_cluster" {
 }
 ```
 
-(and likewise for `kube-agents-iam`, `chat-pubsub`, `github-minter`,
+(and likewise for `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`,
 `gke-backup-plan`, and `drift-pubsub`), and
 would install the chart from the OCI registry rather than a local path — see
 the [chart README](../../../charts/kube-agents/README.md).

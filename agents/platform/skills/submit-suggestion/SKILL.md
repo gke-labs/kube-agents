@@ -115,21 +115,42 @@ second round on that branch instead of a replacement. `--force` deletes those
 revisions; it is the answer only once you have read them and decided they should
 not exist.
 
-`prepare` refuses the name for a second reason: the proposal it was last used
-for is closed, and its revisions are not in the history you just cloned. That is
-what a squash merge leaves behind — the change is in the trunk under a different
-revision, the branch is still on the forge, and building on it again would
-re-propose work that has already landed. Choose a different name; the derived
-one is a default, not a requirement.
+A name can also be spent: the proposal it was last used for is closed or
+squash-merged, and its revisions are not in the history you just cloned. If the
+forge still holds that branch, a change cut fresh from the base does not build
+on it and `submit` would be refused as `BRANCH_DIVERGED`. `prepare` handles this
+itself: it asks the forge whether the branch is still there and, when it is,
+deletes it — the broker allows that only for a branch under `platform-agent/`,
+with no open proposal, whose tip is exactly what a closed proposal from this
+repository carried, and every proposal on it opened by this install's
+credential. A credential that cannot name its own login cannot show the last
+part, so for it the prefix and the same-repository rule are the whole bar.
+The log line says which happened. On GitHub nothing is lost: the revisions stay
+reachable from the closed pull request.
 
-That refusal holds only while the forge still has the branch, and many
-repositories delete it as they merge it. Nothing here can tell the two apart:
-no read verb reports whether a branch exists, so a name whose branch is gone
-looks exactly like a name whose branch is in the way. If you know the
-repository deletes merged branches, `--allow-reused-branch` says so and
-`prepare` proceeds on the name. It is a claim, not a check — get it wrong and
-`submit` is refused as `BRANCH_DIVERGED` at the end of the turn, after the
-change is written.
+If the broker refuses the delete, `prepare` refuses the name and names the
+code. `NOT_SPENT` means the branch moved on after its proposal closed;
+`BRANCH_MOVED` means something pushed to it a moment ago — run `prepare` once
+more, which reads it again; if a person or a sibling card on the same name added
+to it, that second run refuses it as `NOT_SPENT`. `OPEN_PROPOSAL` means a
+proposal was opened on the name since `prepare` looked; run `prepare` once
+more, and it adds to that proposal's branch. `BRANCH_NOT_OURS` means a proposal from it was
+not this install's, or the name is not under `platform-agent/`, or it has
+carried a full page of proposals, too long a history to read, or an open
+proposal targets it (the message says which). Either way, do not delete it another way. `DELETE_REFUSED` means the
+repository itself refuses to delete the branch (a branch rule, a hook, or a
+credential without the right), and it will refuse again. Choose a different name where
+the derived one is only a default, or report the refusal and stop where the name
+is fixed. `FORGE_CALL_FAILED`, `GIT_FAILED`, or a delete refused with no code
+is different: the delete did not complete (it may have landed before the
+failure), and running `prepare` once more, which reads the branch afresh, is
+the move; a second failure is reported, not retried. `FORGE_RATE_LIMITED` or
+`FORGE_UNAVAILABLE` from the delete is the forge turning it away for now: wait
+a few minutes, then run `prepare` once more. The same codes from the read of
+the branch that comes before the delete get the same moves, and `prepare` says
+which one. A proxy older than the
+sandbox cannot read the branch at all; `prepare` then refuses the name with
+`BROKER_ROUTE_UNSUPPORTED` and says so — use another name, or report it where the name is fixed.
 
 ### Step 2: Make the Changes
 

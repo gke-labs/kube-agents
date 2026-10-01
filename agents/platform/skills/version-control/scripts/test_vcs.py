@@ -773,6 +773,21 @@ class CollaborationTest(VcsTestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("bot", self.broker.payload("identity"))
 
+    def test_remote_branch_view_and_delete_carry_the_branch_and_revision(self):
+        code, _ = self.run_vcs("remote-branch", "view", "platform-agent/fix")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.broker.payload("branch-view")["branch"], "platform-agent/fix")
+        code, _ = self.run_vcs(
+            "remote-branch", "delete", "platform-agent/fix", "--revision", "a" * 40
+        )
+        self.assertEqual(code, 0)
+        payload = self.broker.payload("branch-delete")
+        self.assertEqual((payload["branch"], payload["revision"]), ("platform-agent/fix", "a" * 40))
+
+    def test_remote_branch_delete_will_not_go_without_the_revision_it_read(self):
+        with self.assertRaises(SystemExit):
+            self.run_vcs("remote-branch", "delete", "platform-agent/fix")
+
     def test_issue_list_carries_state_and_labels(self):
         code, _ = self.run_vcs(
             "issue", "list", "--state", "closed", "--labels", "bug", "p1"
@@ -1093,9 +1108,16 @@ class AbstractionTest(unittest.TestCase):
 
         parser = vcs.build_parser()
         commands = parser._subparsers._group_actions[0].choices  # noqa: SLF001
+        # The two spelled otherwise. `branch` is the local verb and takes a
+        # branch name, so `branch view` would be a branch called "view".
+        spelled_otherwise = {
+            "branch-view": ("remote-branch", "view"),
+            "branch-delete": ("remote-branch", "delete"),
+        }
         for verb in vcs_broker.route_table(mock.Mock()):
             # `proposal-create` is `proposal create`: the hyphen is the space.
             command, _, action = verb.partition("-")
+            command, action = spelled_otherwise.get(verb, (command, action))
             with self.subTest(verb=verb):
                 self.assertIn(command, commands)
                 if not action:

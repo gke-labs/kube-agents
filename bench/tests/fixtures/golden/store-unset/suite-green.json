@@ -5,7 +5,7 @@
   "not_graded": [],
   "pass_rate": 1.0,
   "baseline_rate": null,
-  "margin": 0.05,
+  "margin": 0.1,
   "scored": 3,
   "cases": [
     {

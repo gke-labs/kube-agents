@@ -2,7 +2,7 @@
 # ==============================================================================
 # Release-candidate eval (the postsubmit job's entrypoint)
 # ==============================================================================
-# Resolve the newest release candidate, check it out, deploy its published
+# Resolve the newest release candidate on main, check it out, deploy its published
 # images, and evaluate them. GATING: the verdict this writes is what decides
 # whether the candidate reaches the staging cluster. Step 5 of
 # staging-promotion-pipeline.yml polls this run's artifacts and pushes the
