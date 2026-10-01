@@ -225,6 +225,16 @@ const (
 	// explicit "true" is off, so a typo leaves the door shut.
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
+	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
+	// cluster view: the pod becomes a caller of the credential broker with
+	// the broker's `session` role (kubectl and gcloud, read-only, nothing
+	// else). A demo aid until declarative profiles (spec-subagent-profiles)
+	// carry a session's identity and tools; the flag and everything it
+	// renders go when they do. Operator-level and off by default for the
+	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
+	// what widens its fence is a property of who deployed the operator.
+	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
+
 	// a2aInjectListenEnvVar is what the operator renders onto the gateway to
 	// select the backend; a2aInjectListenHost and a2aInjectPort are the
 	// address it listens on. The host is the pod's loopback, not every
@@ -895,6 +905,14 @@ func a2aStrictEventsWriter() string {
 // here "relaxed" is the shut door.
 func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
+}
+
+// a2aSessionClusterViewEnabled reports whether this install's session pods
+// get the temporary cluster view: the literal "true" on the operator, and a
+// mode-next CR (nothing else spawns a session pod). Anything but "true" is
+// off, so a typo leaves the fence as it is.
+func a2aSessionClusterViewEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return renderMode(agent, "a2a-session") == ModeNext && os.Getenv(a2aSessionClusterViewEnvVar) == "true"
 }
 
 // a2aNATSName and a2aCredsSecretName are spelled in the API package, because

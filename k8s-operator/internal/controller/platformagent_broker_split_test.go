@@ -881,3 +881,55 @@ func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 		t.Errorf("spec.deployment.env moved the metrics listener: %#v", found)
 	}
 }
+
+// TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
+// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true on a
+// mode-next install, and never otherwise.
+func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
+	agent := brokerPodAgent()
+	agent.Spec.Mode = ptr.To("next")
+	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "")
+	if strings.Contains(allowedBrokerCallers(agent), sessionCaller) {
+		t.Fatal("the session ServiceAccount is a broker caller with the flag unset")
+	}
+	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
+	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); found {
+		t.Fatal("the session audience is rendered with the flag unset")
+	}
+
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	want := "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
+	if got := allowedBrokerCallers(agent); got != want {
+		t.Fatalf("callers = %q, want %q", got, want)
+	}
+	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
+	if v, _ := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_SESSION_AUDIENCE"); v != credentialProxySessionAudience {
+		t.Fatalf("CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", v, credentialProxySessionAudience)
+	}
+	if credentialProxySessionAudience == credentialProxyAudience || credentialProxySessionAudience == credentialProxyChatAudience {
+		t.Fatal("the session audience collides with another; the broker would refuse to confer the role")
+	}
+}
+
+// TestSessionClusterViewIsInertOutsideModeNext: the flag means nothing on a
+// today install, where no session pod exists to be a caller.
+func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	agent := brokerPodAgent() // mode unset: today
+	if a2aSessionClusterViewEnabled(agent) {
+		t.Fatal("enabled outside mode next")
+	}
+	if strings.Contains(allowedBrokerCallers(agent), "a2a-session") {
+		t.Fatal("session caller named on a today install")
+	}
+	for _, v := range []string{"", "false", "TRUE", "1"} {
+		t.Setenv(a2aSessionClusterViewEnvVar, v)
+		next := brokerPodAgent()
+		next.Spec.Mode = ptr.To("next")
+		if a2aSessionClusterViewEnabled(next) {
+			t.Errorf("value %q enabled the view; only the literal true may", v)
+		}
+	}
+}

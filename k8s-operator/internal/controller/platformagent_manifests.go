@@ -4021,6 +4021,14 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+	)
+	if a2aSessionClusterViewEnabled(agent) {
+		// The session pods' audience. Rendered only with the flag, so a
+		// broker on an install without it has no session role to confer
+		// and a stray session token is "another audience", 401.
+		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience})
+	}
+	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
@@ -4123,6 +4131,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		// And one that could set CREDENTIAL_PROXY_SESSION_AUDIENCE to the
+		// shell's audience would hand the session the shell's role.
+		"CREDENTIAL_PROXY_SESSION_AUDIENCE",
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
