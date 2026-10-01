@@ -871,6 +871,21 @@ func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return gchat != nil && gchat.Enabled != nil && *gchat.Enabled
 }
 
+// a2aGchatAllowlist reads the CR's allowed-users list the way the gateway's
+// FromEnv reads the env it becomes: each entry trimmed, the empty ones
+// dropped. The operator decides allow-all on the result, so a list that holds
+// only whitespace is an empty list on both sides rather than a restriction to
+// nobody on one of them.
+func a2aGchatAllowlist(users []string) []string {
+	var out []string
+	for _, u := range users {
+		if u = strings.TrimSpace(u); u != "" {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
 // a2aChatDisplayMode maps the CR's googleChat.mode onto A2A_CHAT_DISPLAY_MODE:
 // the field's value when set, its own default when not. Not the gateway's
 // default, which is debug; see a2aChatDisplayModeDefault.
@@ -3114,17 +3129,21 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var chatVolumes []corev1.Volume
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
+		allowed := a2aGchatAllowlist(gchat.AllowedUsers)
 		discordEnv = nil
 		chatEnv = []corev1.EnvVar{
 			// The relay is the broker; the gateway pod holds no cloud credential.
 			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
 			// The allowed-users gate, carried as environment because
 			// environment is what the agent cannot rewrite, from the same
-			// CR list the legacy pin uses and with the same empty-means-all
-			// rule (allowAllUsers). The gateway refuses to start the adapter
-			// with neither.
-			{Name: a2aGchatAllowedUsersEnvVar, Value: strings.Join(gchat.AllowedUsers, ",")},
-			{Name: a2aGchatAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(gchat.AllowedUsers))},
+			// CR list the legacy pin uses, normalized the way the gateway
+			// reads it (a2aGchatAllowlist) and with the same empty-means-all
+			// rule (allowAllUsers) applied to what is left. With an empty
+			// list and allow-all off the gateway starts and drops every
+			// message at verification, so the two sides must agree on what
+			// an empty list is.
+			{Name: a2aGchatAllowedUsersEnvVar, Value: strings.Join(allowed, ",")},
+			{Name: a2aGchatAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(allowed))},
 			{Name: a2aChatDisplayModeEnvVar, Value: a2aChatDisplayMode(gchat.Mode)},
 			// Rendered explicitly at the gateway's default, like
 			// A2A_MAX_SESSIONS: the path and the mount below are one fact.

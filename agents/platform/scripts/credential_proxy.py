@@ -547,7 +547,7 @@ CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
-    # one credential, two subscriptions — while each side's event routes
+    # one credential, one relay instance per install — while each side's event routes
     # stay its own. _validate_route_roles below enforces that order, and the
     # shape of every entry, at import; do not sort this table.
     ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),

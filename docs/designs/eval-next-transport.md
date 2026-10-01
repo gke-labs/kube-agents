@@ -4,8 +4,8 @@
 > and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
 > only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
 > flips the install, declares the sidecar and runs the matrix through the door (The CI flag). The
-> presubmit still runs `today` unless a job sets the flag, and stage 2 (Chat ingress) is not
-> started.
+> presubmit still runs `today` unless a job sets the flag, and stage 2's operator wiring is
+> rendered and its eval-install half is not started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
 > owner answered the first draft's questions on 2026-09-17 and reviewed the draft the same day;

@@ -300,7 +300,7 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         parser-differential class -- and it only works while the audience is
         set.
 
-        There are two audiences in every golden since #913 split the broker's routes by caller (a third, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat and needs a next golden before this check can see it):
+        There are two audiences in every golden since #913 split the broker's routes by caller (a third, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
         the exec audience for the agent, and a `-chat` one for the gateway, so
         the sandbox cannot reach `/v1/chat/**` and the gateway cannot reach
         `/v1/exec`. Both are asserted, and both are required to be present --

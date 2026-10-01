@@ -409,3 +409,35 @@ func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
 		})
 	}
 }
+
+// TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt: the gateway trims
+// each entry and drops the empty ones, so a CR whose list holds only
+// whitespace would render ALLOW_ALL=false beside a list the gateway reads as
+// nobody, and the install would answer no one, silently. The render
+// normalizes first and decides allow-all on what is left, so the two sides
+// agree on what an empty allowlist is.
+func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		users    []string
+		wantList string
+		wantAll  string
+	}{
+		{"whitespace only", []string{" "}, "", "true"},
+		{"empty strings only", []string{"", "  "}, "", "true"},
+		{"padded and empty entries", []string{" a@example.com ", "", "b@example.com"}, "a@example.com,b@example.com", "false"},
+		{"nil", nil, "", "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := gchatTestAgent("next", true)
+			agent.Spec.Integration.GoogleChat.AllowedUsers = tc.users
+			env := gchatEnv(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0])
+			if got := env[a2aGchatAllowedUsersEnvVar].Value; got != tc.wantList {
+				t.Errorf("%s = %q, want %q", a2aGchatAllowedUsersEnvVar, got, tc.wantList)
+			}
+			if got := env[a2aGchatAllowAllUsersEnvVar].Value; got != tc.wantAll {
+				t.Errorf("%s = %q, want %q", a2aGchatAllowAllUsersEnvVar, got, tc.wantAll)
+			}
+		})
+	}
+}
