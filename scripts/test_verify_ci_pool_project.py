@@ -3868,6 +3868,7 @@ class ReportDocumentTest(unittest.TestCase):
              mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)), \
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("d", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 60)
         self.assertEqual(iam.call_count, 1)
