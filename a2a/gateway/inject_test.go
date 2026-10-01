@@ -3636,6 +3636,11 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"kanban_create"`) || !strings.Contains(string(out), `"name":"kanban_list"`) || strings.Contains(string(out), big[:64]) {
 		t.Fatalf("wrapper cap: %d bytes %s", len(out), out[:min(len(out), 200)])
 	}
+	bulky := json.RawMessage(`{"tool":"terminal","input":{"command":"ls"},"callId":"` + big + `","status":"completed"}`)
+	out = capActivityEntry(bulky)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) {
+		t.Fatalf("bulk outside the input not bounded: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
 	plain := json.RawMessage(`{"tool":"terminal","input":{"command":"` + big + `"},"status":"completed"}`)
 	out = capActivityEntry(plain)
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"truncated":true`) {

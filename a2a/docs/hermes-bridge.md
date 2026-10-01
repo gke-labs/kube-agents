@@ -322,10 +322,11 @@ task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interru
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
 nothing of it follows the final event. What of the input is published is a setting,
 `BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
-structure with every free-text value replaced by `<string, N chars>` and only name-like fields
-kept (`name`, `tool`, `id`, `kind`, `namespace`, `project`, `location`, `cluster`, `resource`
-and the like), which is all the graders read (a tool's name, a `tool_call` wrapper's
-`calls[].name`), so no credential can ride the trace whatever its spelling; `full` publishes
+structure with every free-text value replaced by `<string, N chars>` and only identifier
+fields kept (`name`, `tool`, `kind`, `namespace`, `project`, `location`, `cluster`, `skill`,
+`profile` and the like, and only when the value is one short identifier: no whitespace, no
+quotes, at most 128 characters), which is all the graders read (a tool's name, a `tool_call`
+wrapper's `calls[].name`), so no free text rides the trace under any key; `full` publishes
 the values after the scrub described next, for a debug install that wants them, and is where
 the scrub's best-effort reach matters. In either mode `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,

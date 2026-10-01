@@ -178,6 +178,9 @@ const (
 	// holds. It applies to what the GATEWAY posts, never to the prompt: the
 	// inbound text goes to the bus, not into this transcript.
 	injectMaxEntryBytes = 64 * 1024
+	// injectMaxEntryToolBytes bounds the tool name kept when an activity
+	// entry's bulk is not its input.
+	injectMaxEntryToolBytes = 256
 	// injectMaxActivityEntries bounds the trace a probe carries: the read
 	// route runs before and after every wait on the harness's hot loop, and
 	// a long run's trace would otherwise ride every poll whole. The newest
@@ -1910,7 +1913,22 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	} else {
 		entry["input"] = stand
 	}
-	out, err := json.Marshal(entry)
+	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
+		return out
+	}
+	// The bulk was not the input: keep what a grader reads and nothing
+	// else, the tool (bounded) and the nested names (bounded), then the
+	// tool alone.
+	tool, _ := entry["tool"].(string)
+	minimal := map[string]any{"tool": truncateRunes(tool, injectMaxEntryToolBytes), "input": stand}
+	if len(names) > 0 {
+		minimal["input"] = map[string]any{"calls": names}
+		if out, err := json.Marshal(minimal); err == nil && len(out) <= injectMaxEntryBytes {
+			return out
+		}
+		minimal["input"] = stand
+	}
+	out, err := json.Marshal(minimal)
 	if err != nil {
 		return raw[:0]
 	}

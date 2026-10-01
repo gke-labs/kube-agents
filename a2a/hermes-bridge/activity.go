@@ -145,7 +145,7 @@ const (
 	activityPublishTimeout = 5 * time.Second
 	// activityDrainTimeout bounds finalize's flush of the calls still open,
 	// so a slow bus cannot spend the terminal's budget.
-	activityDrainTimeout = 5 * time.Second
+	activityDrainTimeout = 5 * time.Second // activityDrainBudget below is its variable
 	// activitySeenCap bounds the delivery ids remembered per task for
 	// dedupe; hermes retries a delivery at most once, so the set only
 	// grows with the calls.
@@ -215,6 +215,9 @@ const (
 var (
 	activityEntryBudget      = 3000
 	activityHeartbeatReserve = 120
+	// activityDrainBudget is activityDrainTimeout as a variable, so a test
+	// can spend the drain's budget before it starts.
+	activityDrainBudget = activityDrainTimeout
 )
 
 // taskIDPattern is what a task id may look like before it becomes a path
@@ -312,15 +315,28 @@ var (
 // names and identifiers a grader or a reader of the trace keys on, none of
 // them a place a credential is passed. Matched on the key's lowercase form.
 var shapeKeptKeys = map[string]bool{
-	"name": true, "tool": true, "id": true, "kind": true, "type": true, "status": true,
-	"namespace": true, "project": true, "location": true, "region": true, "zone": true,
-	"cluster": true, "cluster_name": true, "resource": true, "resource_type": true,
-	"skill": true, "skill_name": true, "profile": true, "agent": true, "event": true,
+	"name": true, "tool": true, "kind": true, "namespace": true, "project": true,
+	"location": true, "region": true, "zone": true, "cluster": true, "cluster_name": true,
+	"resource_type": true, "skill": true, "skill_name": true, "profile": true, "agent": true,
 }
+
+// shapeKeptValuePattern is the shape a kept value must have to survive:
+// one identifier, no whitespace, no quotes, at most shapeKeptValueMax
+// characters. A manifest body under "name", a token-length blob, anything
+// with a space in it is shaped like every other string, so the kept keys
+// are a list of places identifiers live and not a hole.
+var shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z0-9._/:@-]+$`)
+
+const shapeKeptValueMax = 128
 
 // shapeOf is what a free-text value becomes under shape mode.
 func shapeOf(s string) string {
 	return fmt.Sprintf("<string, %d chars>", utf8.RuneCountInString(s))
+}
+
+// keptUnderShape says whether a string under key is published as it is.
+func keptUnderShape(key, s string) bool {
+	return shapeKeptKeys[strings.ToLower(key)] && len(s) <= shapeKeptValueMax && shapeKeptValuePattern.MatchString(s)
 }
 
 // ActivityEntry is one data part of the activity artifact: one tool
@@ -679,11 +695,9 @@ func truncatedStandIn(out []byte, headLen int) map[string]any {
 	return map[string]any{"truncated": true, "bytes": len(out), "head": head}
 }
 
-// capWrapperCalls caps a tool_call wrapper per nested call: every
-// arguments object becomes its own stand-in, first with a short head, then
-// with none, until the wrapper fits. False when it does not, or when the
-// input is not the wrapper's shape, and the caller falls back to the whole
-// stand-in.
+// capWrapperCalls caps a tool_call wrapper per nested call in two passes
+// (below). False when the wrapper still does not fit, or when the input is
+// not the wrapper's shape, and the caller falls back to the whole stand-in.
 func capWrapperCalls(red any) (json.RawMessage, bool) {
 	m, ok := red.(map[string]any)
 	if !ok {
@@ -754,7 +768,7 @@ func shapeValue(v any, key string) any {
 		}
 		return t
 	case string:
-		if t == redactedValue || shapeKeptKeys[strings.ToLower(key)] {
+		if t == redactedValue || keptUnderShape(key, t) {
 			return t
 		}
 		return shapeOf(t)
@@ -807,11 +821,16 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		return "", fmt.Errorf("scratch dir: %w", err)
 	}
 	dir = filepath.Join(scratch, taskID)
-	if rel, err := filepath.Rel(scratch, dir); err != nil || rel != taskID {
-		return "", fmt.Errorf("task id %q leaves the scratch dir", taskID)
+	if err := os.MkdirAll(scratch, childScopeDirMode); err != nil {
+		return "", fmt.Errorf("scratch dir: %w", err)
 	}
-	if err := os.MkdirAll(dir, childScopeDirMode); err != nil {
-		return "", fmt.Errorf("child scope dir: %w", err)
+	// Mkdir, not MkdirAll: the scope is made fresh or not at all. A task id
+	// that names something already in the scratch dir (a shared mount's
+	// cache, a symlink planted by a same-uid process) must not be adopted
+	// as a scope, written into and removed at exit; it is refused with the
+	// reason and the task fails at spawn.
+	if err := os.Mkdir(dir, childScopeDirMode); err != nil {
+		return "", fmt.Errorf("child scope dir %s: %w", dir, err)
 	}
 	// Nothing half-written survives a failure: the copy carries the
 	// managed .env, and a directory left behind would hold it for the
@@ -1089,7 +1108,7 @@ func (b *Bridge) drainActivity(run *taskRun) {
 		return
 	}
 	a.signalStop()
-	deadline := time.Now().Add(activityDrainTimeout)
+	deadline := time.Now().Add(activityDrainBudget)
 	open := a.interrupted()
 	for i, e := range open {
 		if !time.Now().Before(deadline) {

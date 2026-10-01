@@ -232,9 +232,9 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # ``tool_call`` wrapper capped that way has lost its ``input.calls[]``, so
 # the verifier cannot unwrap the tools it invoked, and a ``tool_called``
 # naming one of them would fail on this transport where the api path
-# passes. The bridge caps a wrapper per nested call first (each large
-# call's ``arguments`` becomes its own stand-in, small ones and the names
-# stay), and only a wrapper that still does not fit is replaced whole. The marker counts
+# passes. The bridge caps a wrapper per nested call first (the large
+# ``arguments`` objects become stand-ins, then every one does, the names
+# staying), and only a wrapper that still does not fit is replaced whole. The marker counts
 # these, and the scorer reads the count as a loss (below).
 # The stand-in is recognised by its whole shape -- exactly these three
 # keys with the flag true -- not by the flag alone, because the input is

@@ -105,8 +105,9 @@ type Config struct {
 	// InputValuesShape (the default, and the zero value) publishes the
 	// input's structure with every free-text value replaced by its shape
 	// and only name-like fields kept, so no credential can ride it whatever
-	// its spelling; InputValuesFull publishes the values after the
-	// best-effort scrub, for a debug install that wants them.
+	// its spelling (a kept value is one short identifier, never free
+	// text); InputValuesFull publishes the values after the best-effort
+	// scrub, for a debug install that wants them.
 	ActivityInputValues string
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option

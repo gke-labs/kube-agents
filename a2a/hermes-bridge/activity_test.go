@@ -589,15 +589,15 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // name-like fields a grader reads stay, so a tool_call wrapper still names
 // its calls and a terminal command's text is a length.
 func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
-	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}]}`
+	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"AKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `"}`
 	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
 		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
-		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`} {
+		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "AKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129)} {
 			if strings.Contains(out, leaked) {
 				t.Fatalf("mode %q published a free-text value %q: %s", mode, leaked, out)
 			}
 		}
-		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"abc"`, `"name":"kanban_create"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
+		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"\u003cstring, 3 chars\u003e"`, `"name":"kanban_create"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
 			if !strings.Contains(out, kept) {
 				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
 			}
@@ -610,16 +610,29 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
 }
 
 // Calls the drain could not report are counted, so the marker says the
-// trace is short rather than vouching for it.
+// trace is short rather than vouching for it: with the drain's budget
+// already spent, two open calls become dropped=2 on the marker.
 func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
+	prev := activityDrainBudget
+	activityDrainBudget = 0
+	t.Cleanup(func() { activityDrainBudget = prev })
+	_, url := startServer(t)
+	b := startBridgeCfg(t, url, hermesStub(t, "pass"), nil)
 	a, _ := newActivityState(false, InputValuesFull)
-	if _, ok := a.truncationMarker(); ok {
-		t.Fatal("a marker with nothing dropped")
+	for _, id := range []string{"c1", "c2"} {
+		var d hookDelivery
+		d.Event, d.ToolName, d.Extra.ToolCallID = hookPreToolCall, "terminal", id
+		a.observe(d)
 	}
-	a.countDropped(2)
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-drain", ContextID: "ctx", CorrelationID: "corr"}}
+	run.act.Store(a)
+	if _, ok := a.truncationMarker(); ok {
+		t.Fatal("a marker before the drain")
+	}
+	b.drainActivity(run)
 	m, ok := a.truncationMarker()
 	if !ok || m.Dropped != 2 || m.Tool != activityTruncatedTool {
-		t.Fatalf("marker = %+v, %v", m, ok)
+		t.Fatalf("marker after a spent drain = %+v, %v", m, ok)
 	}
 }
 
@@ -897,6 +910,27 @@ func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
 			t.Fatalf("task id %q accepted: %s", bad, dir)
 		}
 	}
+	// A task id that names something already in the scratch dir is refused
+	// rather than adopted: a shared mount's directory, a symlink a same-uid
+	// process planted. Neither is written into or removed.
+	if err := os.MkdirAll(filepath.Join(scratch, "cache", "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(scratch, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	for _, taken := range []string{"cache", "linked"} {
+		if dir, err := b.childManagedScope(taken); err == nil {
+			t.Fatalf("task id %q adopted an existing entry: %s", taken, dir)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(scratch, "cache", "keep")); err != nil {
+		t.Fatalf("a refused id removed the directory it named: %v", err)
+	}
+	if entries, _ := os.ReadDir(target); len(entries) != 0 {
+		t.Fatalf("a refused id wrote through the symlink: %v", entries)
+	}
 	// Any legal path segment the bus accepts as a task id gets a scope: the
 	// sweep keys on the marker, not on a name shape, so no id is refused
 	// for its spelling.
@@ -911,8 +945,10 @@ func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
 		_ = os.RemoveAll(dir)
 	}
 	entries, _ := os.ReadDir(scratch)
-	if len(entries) != 0 {
-		t.Fatalf("a refused id left something in the scratch dir: %v", entries)
+	for _, e := range entries {
+		if e.Name() != "cache" && e.Name() != "linked" {
+			t.Fatalf("a refused id left something in the scratch dir: %v", entries)
+		}
 	}
 	if dir, err := b.childManagedScope("task-ok_1"); err != nil || filepath.Dir(dir) != scratch {
 		t.Fatalf("a plain id was refused or misplaced: %s %v", dir, err)
