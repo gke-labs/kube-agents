@@ -115,8 +115,30 @@ func TestConsoleDropsAnUnknownKind(t *testing.T) {
 	if got := r.inbound(); len(got) != 1 || got[0].MessageID != "m7" {
 		t.Errorf("got %+v, want only m7", got)
 	}
-	if !strings.Contains(r.logs.String(), `console frame dropped`) || !strings.Contains(r.logs.String(), `unknown kind \"command\"`) {
+	if !strings.Contains(r.logs.String(), `console frame dropped`) || !strings.Contains(r.logs.String(), `reason="unknown kind" kind=command`) {
 		t.Errorf("unknown-kind drop not logged with its kind:\n%s", r.logs.String())
+	}
+}
+
+func TestConsoleLogsAnOversizeKindBounded(t *testing.T) {
+	r := startConsoleRig(t)
+	huge := strings.Repeat("k", 64*1024)
+	r.send(t, "tab-6", ConsoleInFrame{MessageID: "m8", Text: "x", Kind: huge})
+	// Frames on one subscription are handled in order, so once m9 is in,
+	// m8's drop line has been written.
+	r.send(t, "tab-6", ConsoleInFrame{MessageID: "m9", Text: "a real ask"})
+	waitFor(t, "the text frame", func() bool { return len(r.inbound()) == 1 })
+	if got := r.inbound(); got[0].MessageID != "m9" {
+		t.Errorf("got %+v, want only m9", got)
+	}
+	if !strings.Contains(r.logs.String(), `reason="unknown kind"`) {
+		t.Errorf("unknown-kind drop not logged:\n%.2000s", r.logs.String())
+	}
+	if strings.Contains(r.logs.String(), strings.Repeat("k", consoleMessageIDCap+1)) {
+		t.Errorf("kind logged past the %d-byte cap", consoleMessageIDCap)
+	}
+	if n := r.logs.Len(); n > 4*1024 {
+		t.Errorf("log is %d bytes after one frame, want it bounded", n)
 	}
 }
 

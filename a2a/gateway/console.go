@@ -328,8 +328,9 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		a.log.Warn("console frame dropped", "reason", "oversize messageId", "conversation", conversation, "bytes", len(f.MessageID))
 		return InboundMessage{}, "", false
 	}
+	// kind is sender-chosen too, so it is logged bounded, by the same cap.
 	if f.Kind != "" && f.Kind != "text" {
-		a.log.Warn("console frame dropped", "reason", fmt.Sprintf("unknown kind %q", f.Kind), "conversation", conversation, "messageId", f.MessageID)
+		a.log.Warn("console frame dropped", "reason", "unknown kind", "kind", truncateRunes(f.Kind, consoleMessageIDCap), "conversation", conversation, "messageId", f.MessageID)
 		return InboundMessage{}, "", false
 	}
 	text := strings.TrimSpace(f.Text)
