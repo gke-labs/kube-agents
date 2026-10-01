@@ -969,6 +969,42 @@ class PlanTest(_RuntimeCase):
         )
         self.assertEqual(runtime._lapsed, {})
 
+    def test_a_set_aside_plan_with_only_a_running_row_expires(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs")
+            await asyncio.sleep(0.1)
+            self.assertIn((CHANNEL, THREAD), runtime._lapsed)
+            await asyncio.sleep(0.3)
+            self.assertEqual(runtime._lapsed, {})
+            sent = len(adapter.calls)
+            await runtime.settle_row(adapter, _sub(), "completed")
+            self.assertEqual(len(adapter.calls), sent, "a terminal event after the expiry found the plan")
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05), mock.patch.object(
+            runtime, "SET_ASIDE_MAX_SECONDS", 0.1,
+        ):
+            _run(scenario(adapter))
+        self.assertEqual(self._sent(adapter)[-1], "closed")
+
+    def test_a_set_aside_plan_with_a_card_waiting_outlives_the_expiry(self):
+        async def scenario(adapter):
+            await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs")
+            await runtime.settle_row(adapter, _sub(), "blocked")
+            await asyncio.sleep(0.4)
+            self.assertIn((CHANNEL, THREAD), runtime._lapsed)
+            await adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn")
+            await adapter._set_thread_status(CHANNEL, TEAM, THREAD, "", "turn")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
+            await runtime.settle_row(adapter, _sub(), "unblocked")
+            self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
+
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05), mock.patch.object(
+            runtime, "SET_ASIDE_MAX_SECONDS", 0.1,
+        ):
+            _run(scenario(adapter))
+
     def test_a_card_answered_beside_a_newer_plan_holds_working(self):
         async def scenario(adapter):
             await runtime.deliver_row(adapter, _sub("t_w"), 1, "check payments", "asking")

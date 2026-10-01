@@ -61,7 +61,11 @@ event. Its cards' later events still update their rows on it, and a card
 answered there runs on it again: it becomes the thread's plan once more, or,
 beside a newer plan, holds ``processing`` for another hold. Past
 :data:`LAPSED_PER_THREAD` a thread drops a set-aside plan that is quiet and
-has no card waiting first. A plan evicted at :data:`PLANS_MAX`, current or set
+has no card waiting first. A set-aside plan with no card waiting on the user
+or given up is dropped once :data:`SET_ASIDE_MAX_SECONDS` pass without a note
+or settled row, its session sent, so a rolling card or running row whose
+terminal event was lost does not keep it for good. A plan evicted at
+:data:`PLANS_MAX`, current or set
 aside, has its session sent again on the way out, since nothing else would;
 the current plan evicted is the thread with the oldest note.
 Past ``slack_status.ROWS_MAX`` rows the oldest settled rows leave the plan
@@ -119,6 +123,13 @@ SESSION_REFRESH_SECONDS = 60.0
 #: reach no one.
 PLAN_HOLD_SECONDS = 1800.0
 
+#: How long a set-aside plan is kept after its last note or settled row when
+#: nothing on it waits on a person: no card waiting on the user and none that
+#: gave up. Its running rows and rolling cards lost their terminal events, or
+#: their cards have been quiet this long; well past a card's silent stretches,
+#: so a late event almost always still finds its row.
+SET_ASIDE_MAX_SECONDS = 4 * 3600.0
+
 #: ``fail_label`` for the adapter's status setter when the plan sets it.
 PLAN_STATUS_LABEL = "plan"
 
@@ -168,7 +179,7 @@ class _Row:
 
 
 class _Plan:
-    __slots__ = ("fallback", "lapse", "rolling", "rows", "team_id", "touched", "ts", "waiting")
+    __slots__ = ("expiry", "fallback", "lapse", "rolling", "rows", "team_id", "touched", "ts", "waiting")
 
     def __init__(self, team_id: str) -> None:
         self.ts = ""
@@ -185,6 +196,9 @@ class _Plan:
         self.touched = time.monotonic()
         #: The timer that sets the plan aside after :data:`PLAN_HOLD_SECONDS`.
         self.lapse: asyncio.TimerHandle | None = None
+        #: The timer that drops the plan once set aside, after
+        #: :data:`SET_ASIDE_MAX_SECONDS`.
+        self.expiry: asyncio.TimerHandle | None = None
 
 
 #: ``(channel, thread) -> (status sent, when)``. No team: a kanban
@@ -409,7 +423,9 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
 
 def _arm(adapter: Any, key: tuple, plan: _Plan) -> None:
     """(Re)start the plan's lapse timer; with no running loop there is nothing to close later."""
-    _disarm(plan)
+    if plan.lapse is not None:
+        plan.lapse.cancel()
+        plan.lapse = None
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -418,9 +434,62 @@ def _arm(adapter: Any, key: tuple, plan: _Plan) -> None:
 
 
 def _disarm(plan: _Plan) -> None:
-    if plan.lapse is not None:
-        plan.lapse.cancel()
-        plan.lapse = None
+    for timer in (plan.lapse, plan.expiry):
+        if timer is not None:
+            timer.cancel()
+    plan.lapse = plan.expiry = None
+
+
+def _arm_expiry(adapter: Any, key: tuple, plan: _Plan, delay: float) -> None:
+    """(Re)start the timer that drops a set-aside plan; with no running loop nothing drops it."""
+    if plan.expiry is not None:
+        plan.expiry.cancel()
+        plan.expiry = None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    plan.expiry = loop.call_later(delay, _start_expiry, adapter, key, plan)
+
+
+def _start_expiry(adapter: Any, key: tuple, plan: _Plan) -> None:
+    plan.expiry = None
+    task = asyncio.ensure_future(_expire(adapter, key, plan))
+    _lapsing.add(task)
+    task.add_done_callback(_lapsing.discard)
+
+
+def _kept(plan: _Plan) -> bool:
+    """Whether a set-aside plan waits on a person: a card waiting on the user, or one that gave up."""
+    return _waiting(plan) or any(
+        row.status == _status.TASK_ERROR and not row.archived for row in plan.rows.values()
+    )
+
+
+async def _expire(adapter: Any, key: tuple, plan: _Plan) -> None:
+    """Drop a set-aside plan untouched for :data:`SET_ASIDE_MAX_SECONDS`, and send its session.
+
+    A plan that waits on a person (:func:`_kept`) stays, bounded by the caps,
+    and is looked at again a full period later, as is one touched since.
+    """
+    plans = _lapsed.get(key)
+    if not plans or not any(old is plan for old in plans):
+        return  # dropped, evicted, or running as the thread's plan again
+    remaining = SET_ASIDE_MAX_SECONDS - (time.monotonic() - plan.touched)
+    if _kept(plan) or remaining > 0:
+        _arm_expiry(adapter, key, plan, remaining if remaining > 0 else SET_ASIDE_MAX_SECONDS)
+        return
+    logger.info(
+        "slack_ux_status: dropping the set-aside plan in %s/%s, quiet for %ss; resending its session",
+        key[0], key[1], int(SET_ASIDE_MAX_SECONDS),
+    )
+    _disarm(plan)
+    left = [old for old in plans if old is not plan]
+    if left:
+        _lapsed[key] = left
+    else:
+        _lapsed.pop(key, None)
+    await _session(adapter, key, plan)
 
 
 def _start_lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -479,6 +548,8 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
         plans.remove(dropped)
     _lapsed[key] = plans
     _lapsed.move_to_end(key)
+    if plan in plans:
+        _arm_expiry(adapter, key, plan, SET_ASIDE_MAX_SECONDS)
     while len(_lapsed) > PLANS_MAX:
         old_key, evicted = _lapsed.popitem(last=False)
         for old in evicted:
