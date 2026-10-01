@@ -64,9 +64,14 @@ TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEE
 # dom_html's budget when a test names none: boot and the refresh after it;
 # the first poll is far outside it unless the page's timers are sped up.
 DEFAULT_BUDGET_MS = 3000
-# fast_timers_page marks its copies with this stem suffix; dom_html reads it
-# to know how soon the page polls.
+# fast_timers_page names its copies with this stem suffix and writes this shim
+# into them. dom_html reads the shim from the copy, not the suffix from the
+# name: every page-copy helper appends its own suffix after whatever it is
+# handed, so the name says which wrapper was outermost, and only the shim
+# says how soon the page polls.
 FAST_TIMERS_SUFFIX = "-fast"
+FAST_TIMERS_SHIM = ("<script>(() => { const native = window.setInterval;"
+                    f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
 # The Brief's bare view anchors (#gate, #agent), each the id of a section.
 # dom_html refuses one on a budget the poll fires inside: a fragment naming
 # an element, polled under virtual time, is what stalls headless Chrome on CI.
@@ -173,7 +178,7 @@ def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms:
     PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
     on a budget the poll fires inside; see fast_timers_page for the stall."""
     anchor = fragment.lstrip("#")
-    poll_ms = PAGE_REFRESH_MS // TIMER_SPEEDUP if page.stem.endswith(FAST_TIMERS_SUFFIX) else PAGE_REFRESH_MS
+    poll_ms = PAGE_REFRESH_MS // TIMER_SPEEDUP if FAST_TIMERS_SHIM in page.read_text() else PAGE_REFRESH_MS
     if budget_ms >= poll_ms and anchor in BRIEF_VIEW_ANCHORS:
         raise ValueError(
             f"{fragment} on a {budget_ms} ms budget of a page that polls every {poll_ms} ms: a bare view anchor "
@@ -213,11 +218,11 @@ def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
     alone did not remove the stall: #gate under TWO_POLLS_BUDGET_MS stalled
     the same way, so no call on the poll budget carries a fragment that
     names an element (test_the_bare_anchor_scrolls_once), and dom_html
-    refuses a bare view anchor on a budget the poll fires inside."""
-    shim = ("<script>(() => { const native = window.setInterval;"
-            f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
+    refuses a bare view anchor on a budget the poll fires inside, telling
+    the sped-up clock by this shim in the copy, whichever wrapper is
+    outermost."""
     copy = page.with_name(page.stem + FAST_TIMERS_SUFFIX + page.suffix)
-    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    copy.write_text(page.read_text().replace("<head>", "<head>" + FAST_TIMERS_SHIM, 1))
     return copy
 
 
@@ -595,6 +600,70 @@ ROSTER_AT_SPLIT = frozenset({
     "cluster-agent-crashloop-evidence-chain",
     "agent-kanban-smoke",
 })
+
+
+class DomHtmlGuardTest(unittest.TestCase):
+    """dom_html's refusal of a bare view anchor on a budget the poll fires
+    inside. It is decided before Chrome runs, so it holds on a host without
+    one, and the admitted calls are checked against a mocked subprocess."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        data = load_fixture()
+        data["generated_at"] = NOW
+        cls.index = render_to(cls.tmp.name, data, health=health_doc()) / "index.html"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def no_chrome():
+        """subprocess.run replaced, so a call the guard admits is recorded
+        and never launches a browser: the refused shapes below are the
+        ones that stalled CI, and a guard that let one through must fail
+        the test, not hang it."""
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        return unittest.mock.patch.object(subprocess, "run", return_value=completed)
+
+    def test_a_bare_view_anchor_on_the_poll_budget_is_refused_whichever_wrapper_is_outermost(self):
+        # The sped-up clock is read from the shim in the copy, not from the
+        # file name: scroll_counting_page(fast_timers_page(...)) is named
+        # "-fast-scrolls", and a check on the name's end would admit the
+        # exact call that stalled CI (#2227).
+        pages = (fast_timers_page(scroll_counting_page(self.index)),
+                 scroll_counting_page(fast_timers_page(self.index)),
+                 clock_page(fast_timers_page(self.index), NOW))
+        with self.no_chrome():
+            for page in pages:
+                for anchor in sorted(BRIEF_VIEW_ANCHORS):
+                    with self.subTest(page=page.name, anchor=anchor):
+                        with self.assertRaises(ValueError) as refused:
+                            dom_html(page, fragment=f"#{anchor}", budget_ms=TWO_POLLS_BUDGET_MS)
+                        self.assertIn(f"polls every {PAGE_REFRESH_MS // TIMER_SPEEDUP} ms", str(refused.exception))
+                        self.assertIn(f"use #view={anchor}", str(refused.exception))
+            with self.assertRaises(ValueError) as refused:
+                dom_html(scroll_counting_page(self.index), fragment="#gate", budget_ms=130000)
+            self.assertIn(f"polls every {PAGE_REFRESH_MS} ms", str(refused.exception), "a plain page polls at PAGE.refreshMs")
+
+    def test_the_calls_the_suite_keeps_reach_chrome(self):
+        fast = scroll_counting_page(fast_timers_page(self.index))
+        plain = scroll_counting_page(self.index)
+        kept = [
+            (fast, {"fragment": "#since=2026-09-07T14:00:00Z&view=gate", "budget_ms": TWO_POLLS_BUDGET_MS}),
+            (fast, {"budget_ms": TWO_POLLS_BUDGET_MS}),
+            (plain, {"fragment": "#gate"}),
+            (plain, {"fragment": "#case-cluster-agent-crashloop-debug", "budget_ms": 130000}),
+        ]
+        with self.no_chrome() as run:
+            for page, call in kept:
+                dom_html(page, **call)
+        self.assertEqual(run.call_count, len(kept))
+        for (page, call), invocation in zip(kept, run.call_args_list):
+            argv = invocation.args[0]
+            self.assertIn(f"--virtual-time-budget={call.get('budget_ms', DEFAULT_BUDGET_MS)}", argv, call)
+            self.assertEqual(argv[-1], page.as_uri() + call.get("fragment", ""), call)
 
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
