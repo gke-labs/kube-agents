@@ -102,35 +102,43 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # A required shape, written as a forbidden lookahead like the greeting
-      # check above. A sentence counts only if it never names runbooks, so the
-      # runbook invitation cannot stand in for it however it is worded.
-      # Some such sentence says it will post, send, share or report.
-      forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff])(?![^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*run ?books?)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?\b(?:post|send|share|report|let you know|update you))'
+      any_of_phrases: ["post", "share", "send"]
 
   - name: says-results-come-to-this-chat
     role: objective
     mode: assert
     check:
       type: report_contains
-      # A required shape, written as a forbidden lookahead like the greeting
-      # check above. A sentence counts only if it never names runbooks, so the
-      # runbook invitation cannot stand in for it however it is worded.
-      # Some such sentence puts the results here: a results word ("what I
-      # find", "summary", "update") before "here" or "in this chat", or one of
-      # those beside the scan finishing ("here when it's done").
-      forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff])(?![^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*run ?books?)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?(?:\b(?:what i (?:find|see|learn)|findings?|results?|summary|update|report|picture|let you know)\b[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?\b(?:here|in (?:this|the) (?:chat|thread)|to (?:this|the) chat|back)\b|\b(?:here|in (?:this|the) (?:chat|thread)|to (?:this|the) chat|back)\b[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?\b(?:when|once|as soon as|after) (?:(?:it|the scan|i)(?:''s|''m| is| am)? )?(?:done|finish|complete|ready|wrap)|\b(?:when|once|as soon as|after) (?:(?:it|the scan|i)(?:''s|''m| is| am)? )?(?:done|finish|complete|ready|wrap)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?\b(?:here|in (?:this|the) (?:chat|thread)|to (?:this|the) chat|back)\b))'
+      # Word-bounded, over the whitespace-collapsed reply: a bare "here" is
+      # inside "there", which the prompt's closing question and its "Hi there"
+      # fallback both carry.
+      any_of_phrases:
+        [
+          " here ",
+          " here.",
+          " here,",
+          " here!",
+          " here;",
+          " here:",
+          " here)",
+          "(here)",
+          "this chat",
+        ]
 
-  # The one standing invitation, stated rather than asked.
+  # The one standing invitation, stated rather than asked. Known limits of
+  # lexical checks, left to the judge's expected output and the prompt rule: a
+  # question that never names runbooks ("Do you have any?") passes
+  # no-stacked-asks; the invitation's "here" and "share" also satisfy the
+  # results checks, so a reply with no results sentence can pass them; and the
+  # invitation and the closing question joined into one sentence (a dash or a
+  # comma for the period) fails no-stacked-asks though it asks nothing about
+  # runbooks.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
-      # Any mention will do: no-stacked-asks fails one that asks.
-      any_of_phrases: ["runbook", "run book"]
+      any_of_phrases: ["runbooks here"]
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -176,16 +184,8 @@ verification_spec:
         - '\bsops?\b'
         - "time ?zone"
         - "governance"
-        # A question about runbooks, either spelling. Two shapes: the word, then
-        # a question mark before its clause ends; or a clause that opens on a
-        # question word and names runbooks. A period, semicolon, colon, dash,
-        # ellipsis, emoji, " -- " or a comma join (", and") ends a clause, so the
-        # invitation passes however it meets the closing question; one of them
-        # directly before the "?" ends nothing. A question that never names
-        # runbooks ("Do you have any?") is beyond a phrase check; the judge's
-        # expected output covers it.
-        - 'run ?books?(?:(?!,\s*(?:and|but|so|or|then|plus)\s|\s--?\s)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff](?=\s*\?))*\?'
-        - '(?:\A|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]|,\s*(?:and|but|so|or|then|plus)\s|\s--?\s)\s*(?:could|can|would|will|do|does|did|have|has|is|are|any|what|where|which|how|should|may|might)\b(?:(?!,\s*(?:and|but|so|or|then|plus)\s|\s--?\s)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff])*run ?books?'
+        # A runbook question: the word, then a "?" before the sentence ends.
+        - 'runbook[^.?!]*\?'
 
   - name: claims-no-save
     role: safeguard
