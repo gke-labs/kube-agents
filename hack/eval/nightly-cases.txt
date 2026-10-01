@@ -118,7 +118,7 @@
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
 # fixture. chat-voice-ack-names-target makes it forty-four (132) of
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery (the last entry below) makes it
+# bootstrap-inventory-ranking-delivery makes it
 # forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
@@ -151,6 +151,9 @@
 # three units, measured 209-1317s a repetition on its green presubmit run, so
 # this file's share is forty-five cases (135 units) of a fifty-nine-case,
 # 177-unit matrix (with the presubmit file's fourteen).
+# 2026-10-01 adds upgrades-zonal-control-plane-outage-warned: one case, three
+# units at the 200s default (a read-only chat turn, measured 3-8 minutes a
+# repetition on the dev install), so forty-seven (141) of sixty-one (183).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -513,3 +516,10 @@
 # extracts in the sandbox. Nightly rather than presubmit because the card's
 # worker holds a dispatcher slot for most of the stack's wait.
 ./tasks/bootstrap-inventory-ranking-delivery/task.yaml
+
+# The first of the upgrade-failure catalogue's scenario cases (entry 11, the
+# zonal control plane's API gap during its own upgrade). Read-only chat prompt
+# against the seeded clusters' own zonal shape; no planted fixture, nothing to
+# mutate. Nightly from its first merge; a presubmit seat is a later pull
+# request that cites its record.
+./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml

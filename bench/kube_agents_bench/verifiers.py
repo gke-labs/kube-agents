@@ -134,14 +134,88 @@ def _normalize(text: str) -> str:
     return collapsed.lower()
 
 
-def _normalize_lines(text: str) -> str:
-    """``_normalize`` applied per line, newlines kept.
+# A line's decoration, folded before the pattern clauses see it when the
+# check asks for it (``fold_decoration: true``). The lead is any run of
+# non-word characters (bullets, quotes, pipes, arrows, symbols, a checkbox),
+# ordinals (`1.`, `(1)`, `a)`, `ii.`, a circled digit), citation markers
+# (`[1]`) and whitespace, up to the first word character; a Markdown link
+# around a name is kept as its text, and a quote or bracket closing a name
+# goes with the opener the lead took. The trail is any run of non-word
+# characters (a stop, a list's comma or semicolon, quotes, pipes, a
+# hard-break backslash, symbols of any number of code points), a `<br>`, or
+# a footnote marker (`[1]`, `[^note]`, `(1)`, a superscript digit, a linked
+# `[1](url)`). A pattern anchored with ``^...$`` then spells
+# a declared line once rather than once per rendering -- the reason
+# `_MARKDOWN_NOISE` exists, applied to the line's edges. Interior
+# punctuation is untouched. Opt-in, because a case may forbid the decoration
+# itself (a bulleted capability list, say), and that pattern needs the
+# markers left where they are.
+_LINE_LEAD_DECORATION = re.compile(
+    r"^(?:\[\s*[x ]?\s*\]|\[\^?\d{1,3}\]|\(?\d{1,3}[.)](?=\s)|\(?[ivx]{1,4}[.)](?=\s)|[a-z][.)](?=\s)"
+    r"|[\u2460-\u2473\u24ea-\u24ff\u2776-\u2793]|[^\w\n])+"
+)
+# A footnote marker at the end of a line: `[1]`, `[^1]`, `[^note]` (a named
+# footnote needs the caret, so a bracketed word such as `[mostly]` is a
+# value, not a marker), `(1)`, a superscript digit, or a linked `[1](url)`.
+_LINE_TRAIL_FOOTNOTE = re.compile(
+    r"(?:\s*(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079]))+\s*$"
+)
+# What a line may end with and still be the same line: closing punctuation,
+# quotes, brackets, pipes, whitespace, a `<br>`, and symbols used as marks.
+# Not a question mark, an exclamation mark, an ellipsis or a negating mark
+# (a cross, a stop sign, a warning sign, a question or exclamation symbol):
+# those change what the last word says, so they stay and make a hedged value
+# the wrong value.
+_HEDGE_MARKS = "?!\u2026\u274c\u2716\u2718\u26d4\u1f6ab\u26a0\u2753\u2754\u2755\u2757\u2049\u203c"
+_LINE_TRAIL_DECORATION = re.compile(r"(?:(?![" + _HEDGE_MARKS + r"])[^\w\n]|<br\s*/?>)+$")
+# The same without a closing bracket, so a closer after a footnote marker
+# ("[1].") is taken without eating the marker's own bracket.
+_LINE_TRAIL_CLOSER = re.compile(r"(?:(?![" + _HEDGE_MARKS + r"\])])[^\w\n]|<br\s*/?>)+$")
+_TRAIL_FOLD_PASSES = 3
+# A name the agent quotes or brackets instead of emphasising, with or without
+# a parenthetical inside the quotes: the lead fold has taken the opener, so
+# what is left is the name with its closer stuck to it before the colon or
+# slash that ends the name.
+_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]]+(?=[:/\s(])")
+_MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
 
-    ``forbidden_patterns`` need a boundary a Markdown bullet or heading can
-    end on; the whitespace collapse above would otherwise fuse a negated
-    bullet into its unnegated neighbour before the regex runs.
+
+def _fold_trail(line: str) -> str:
+    # Markers and closers interleave ("unaffected [1]."), so a closer strip
+    # that spares brackets alternates with the marker strip until the line
+    # stops changing; the full closer class runs once at the end.
+    for _ in range(_TRAIL_FOLD_PASSES):
+        folded = _LINE_TRAIL_FOOTNOTE.sub("", _LINE_TRAIL_CLOSER.sub("", line))
+        if folded == line:
+            break
+        line = folded
+    return _LINE_TRAIL_DECORATION.sub("", line)
+
+
+def _fold_line_decoration(line: str) -> str:
+    # Footnote markers first, so a linked marker is folded as a marker; then
+    # every other link is kept as its text, so a linked value stays a value.
+    footnoted = _LINE_TRAIL_FOOTNOTE.sub("", line)
+    unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
+    led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
+    unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
+    return _fold_trail(unquoted)
+
+
+def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
+    """``_normalize`` applied per line, newlines kept; with ``fold_decoration``
+    each line's decoration is folded as well.
+
+    ``forbidden_patterns`` and ``any_of_patterns`` need a boundary a Markdown
+    bullet or heading can end on; the whitespace collapse above would
+    otherwise fuse a negated bullet into its unnegated neighbour before the
+    regex runs. The fold, when asked for, means a line-anchored pattern
+    matches the line however the agent listed, linked or quoted it.
     """
-    return "\n".join(_normalize(line) for line in text.splitlines())
+    lines = (_normalize(line) for line in text.splitlines())
+    if fold_decoration:
+        lines = (_fold_line_decoration(line) for line in lines)
+    return "\n".join(lines)
 
 
 @VERIFIERS.register("report_contains")
@@ -151,9 +225,10 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the one regex exception, for the shape a
-    substring cannot express: a banned word whose negated uses are
-    legitimate ("no guarantee"). Each is ``re.search``ed against a
+    ``forbidden_patterns`` and ``any_of_patterns`` are the regex exceptions,
+    for the shapes a substring cannot express: a banned word whose negated
+    uses are legitimate ("no guarantee"), and a required claim whose subject
+    and verb an adverb or a tense can separate. Each is ``re.search``ed against a
     line-preserving variant of the same normalization — newlines survive,
     so a Markdown bullet or heading with no terminal punctuation is its own
     segment and a pattern may anchor on ``\\n``; the flat collapse would
@@ -187,11 +262,21 @@ class ReportContainsVerifier(BaseVerifier):
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    # The regex form of any_of_phrases, for a claim a phrase list cannot
+    # carry: a whole declared line, or a subject bound to its verb across an
+    # adverb. Searched against the same line-preserving text as
+    # forbidden_patterns, so a pattern may anchor on a newline and should keep
+    # it out of its gaps.
+    any_of_patterns: list[str] = Field(default_factory=list)
+    # Fold each line's decoration (bullets, numbers, quotes, links, a trailing
+    # stop or mark) before the pattern clauses run, so a declared line is
+    # spelled once. Off by default: a case may forbid the decoration itself.
+    fold_decoration: bool = False
     scope: Literal["final", "full"] = "final"
 
-    @field_validator("forbidden_patterns")
+    @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
-    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
             re.compile(pattern)
         return patterns
@@ -210,13 +295,15 @@ class ReportContainsVerifier(BaseVerifier):
         text = _normalize(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        pattern_hits = [
-            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
-        ]
+        lines = _normalize_lines(raw, fold_decoration=self.fold_decoration)
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, lines)]
         any_of_miss = bool(self.any_of_phrases) and not any(
             _normalize(p) in text for p in self.any_of_phrases
         )
-        if missing or present or pattern_hits or any_of_miss:
+        any_pattern_miss = bool(self.any_of_patterns) and not any(
+            re.search(p, lines) for p in self.any_of_patterns
+        )
+        if missing or present or pattern_hits or any_of_miss or any_pattern_miss:
             parts = []
             if missing:
                 parts.append(f"required phrases absent from the report: {missing}")
@@ -229,6 +316,10 @@ class ReportContainsVerifier(BaseVerifier):
             if any_of_miss:
                 parts.append(
                     f"none of the alternative phrasings present: {self.any_of_phrases}"
+                )
+            if any_pattern_miss:
+                parts.append(
+                    f"none of the alternative patterns matched: {self.any_of_patterns}"
                 )
             return VerificationResult(
                 success=False,
@@ -251,6 +342,10 @@ class ReportContainsVerifier(BaseVerifier):
         if self.any_of_phrases:
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
+            )
+        if self.any_of_patterns:
+            satisfied.append(
+                f"at least one of {len(self.any_of_patterns)} alternative pattern(s)"
             )
         return VerificationResult(
             success=True,

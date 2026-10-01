@@ -87,7 +87,9 @@ role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.
 the contract for why.
 
 A case whose spec reads live cluster state must declare it. `fixtures: []` is the
-declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
+declaration for a case that plants its own state, and for a case that depends on a slot's
+shape rather than on a plant (every seeded cluster is zonal, say), which says so in a
+comment beside the empty list rather than borrowing a role from that slot — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it.
 
@@ -171,9 +173,13 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Seven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
-regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express), `tool_called` (calls in the
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`any_of_patterns` are regular expressions searched against a line-preserving text, with each
+line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
+numbers, headings, quotes, links, a trailing stop or mark), so a pattern anchored at both ends
+spells a declared line once and should keep `\n` out of its gaps, for what no substring can
+express: a banned word whose negated uses are legitimate, and a required claim whose
+subject and verb an adverb or a tense can separate), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
