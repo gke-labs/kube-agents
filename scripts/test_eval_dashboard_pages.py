@@ -174,13 +174,22 @@ def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
+def scrolls(html: str) -> "re.Match[str] | None":
+    """The scroll count a scroll_counting_page recorded, or None when
+    nothing scrolled."""
+    return re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
+
+
 def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
     """A copy of the rendered page whose setInterval runs TIMER_SPEEDUP
     times faster, so the poll every PAGE.refreshMs fires inside a short
     virtual-time budget. A budget spanning real polls (130 s) on a URL whose
     fragment names an element on the page (#gate) intermittently stalled
     headless Chrome's virtual clock on CI until the wall-clock timeout;
-    bare anchors on short budgets have a clean record."""
+    bare anchors on short budgets have a clean record. The sped-up clock
+    alone did not remove the stall: #gate under TWO_POLLS_BUDGET_MS stalled
+    the same way, so no call on the poll budget carries a fragment that
+    names an element (test_the_bare_anchor_scrolls_once)."""
     shim = ("<script>(() => { const native = window.setInterval;"
             f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
     copy = page.with_name(page.stem + "-fast" + page.suffix)
@@ -1064,10 +1073,21 @@ class BrowserTest(unittest.TestCase):
         # they fit in a short budget. The section is scrolled to once; the
         # polls, which re-render the page, must not pull a reader back to it.
         page = fast_timers_page(scroll_counting_page(self.index))
-        scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
         self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1")
-        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1", "the bare anchor, the same way")
         self.assertIsNone(scrolls(dom_html(page, budget_ms=TWO_POLLS_BUDGET_MS)), "no view, no scroll")
+
+    def test_the_bare_anchor_scrolls_once(self):
+        # The bare anchor selects the view the same way (#gate and view=gate
+        # reach the same link.view in linkState), so the poll test above
+        # covers its poll. This call stays off the poll budget: #gate under
+        # TWO_POLLS_BUDGET_MS, the fast-timer shim in effect, still stalled
+        # headless Chrome on CI until the 90 s wall-clock timeout (#2227,
+        # after #2202's sped-up clock). A fragment naming an element, polled
+        # under virtual time, is the condition that stalls it; the default
+        # budget ends before the first poll, the shape
+        # test_agent_view_shows_the_numbers uses for #agent.
+        page = scroll_counting_page(self.index)
+        self.assertEqual(scrolls(dom_html(page, fragment="#gate")).group(1), "1", "the bare anchor, the same way")
 
     def test_hostile_parameters_never_reach_the_dom(self):
         for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):
