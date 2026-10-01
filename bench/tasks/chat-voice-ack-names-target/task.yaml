@@ -64,10 +64,14 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\A\s*+(?![^\n]*checkout-gateway)'
-  # The ack paragraph is everything before the first blank line. The
-  # specialist's answer after it is not the front door's voice. Objectives,
-  # not recoverable safeguards: a recoverable result never fails a run, and
-  # "no apology, no preamble" is what this case exists to hold.
+  # The front door's own text is everything before the first delivered
+  # section: _append_final opens each with "Result of delegated task <id>:" or
+  # "Artifact <name> produced by delegated task <id>:" (harness.py), and the
+  # specialist's answer after it is not the front door's voice. The walk
+  # crosses blank lines, so a receipt or sign-off in a second paragraph of
+  # the closing message still fails. Objectives, not recoverable safeguards:
+  # a recoverable result never fails a run, and "no apology, no preamble" is
+  # what this case exists to hold.
   #
   # A receipt that happens to mention the target is still the receipt the ack
   # replaces: no task id, no "delegated to", no promise of where the answer
@@ -79,16 +83,16 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*\bt_?[0-9a-f]{6,}\b'
-        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*delegated to'
-        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*will post'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\bt_?[0-9a-f]{6,}\b'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*delegated to'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*will post'
   - name: no-apology-or-sign-off-in-the-ack
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A\s*+(?:[^\S\n]*\S[^\n]*\n)*?[^\n]*(?:sorry|apolog|let me know)'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*(?:sorry|apolog|let me know)'
   - name: the-ack-opens-without-preamble
     role: objective
     mode: assert
