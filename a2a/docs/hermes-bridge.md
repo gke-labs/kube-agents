@@ -324,10 +324,11 @@ nothing of it follows the final event. What of the input is published is a setti
 `BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
 structure with every free-text value replaced by `<string, N chars>` and only identifier
 fields kept (`name`, `tool`, `kind`, `namespace`, `project`, `location`, `cluster`, `skill`,
-`profile` and the like, and only when the value is shaped like a resource name: lowercase
-words joined by `.`, `_`, `/` or `-`, or a Capitalised word or two, at most 128 characters, no
-whitespace, quotes, `:` or `@`, and no token-length run or all-hex body, so an `AKIA...` key or
-a hex secret under `name` is a length like any other string), which is all the graders read (a tool's name, a `tool_call`
+`profile` and the like, and only when the value is shaped like an identifier: letters, digits
+and `._/-`, starting with a letter, at most 128 characters, no whitespace, quotes, `:` or `@`,
+and nothing token-shaped, a long lowercase or mixed run, a digit run, an all-hex or
+all-caps-and-digits body, so an `AKIA...` key, a `ghp_` token or a hex secret under `name` is a
+length like any other string while `mcp__gke__listClusters` or `PodDisruptionBudget` stays), which is all the graders read (a tool's name, a `tool_call`
 wrapper's `calls[].name`), so no free text rides the trace under any key; `full` publishes
 the values after the scrub described next, for a debug install that wants them, and is where
 the scrub's best-effort reach matters. In either mode `input` is capped (2 KiB): over the cap it becomes

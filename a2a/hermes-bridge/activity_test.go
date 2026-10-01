@@ -603,15 +603,15 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // name-like fields a grader reads stay, so a tool_call wrapper still names
 // its calls and a terminal command's text is a length.
 func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
-	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"QKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `","tool":"mcp__gke__list_clusters","kind":"PodDisruptionBudget","location":"projects/p/locations/northamerica-northeast1","skill":"QKIAIOSFODNN7EXAMPLE","project":"9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f","agent":"xoxq-1234567890-abcdefghijklmnop"}`
+	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"QKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `","tool":"mcp__gke__list_clusters","kind":"PodDisruptionBudget","location":"projects/p/locations/northamerica-northeast1","skill":"QKIAIOSFODNN7EXAMPLE","calls2":[{"name":"mcp__gke__listClusters"},{"name":"createPullRequest"},{"name":"mcp__kubernetesdiagnostics__inspect"}],"region":"ValidatingAdmissionPolicy","namespace2":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345","project":"9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f","agent":"xoxq-1234567890-abcdefghijklmnop"}`
 	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
 		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
-		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "QKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129), "9f3c2a1b7d9f3c2a1b7d", "xoxq-"} {
+		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "QKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129), "9f3c2a1b7d9f3c2a1b7d", "xoxq-", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"} {
 			if strings.Contains(out, leaked) {
 				t.Fatalf("mode %q published a free-text value %q: %s", mode, leaked, out)
 			}
 		}
-		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"\u003cstring, 3 chars\u003e"`, `"name":"kanban_create"`, `"tool":"mcp__gke__list_clusters"`, `"kind":"PodDisruptionBudget"`, `"location":"projects/p/locations/northamerica-northeast1"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
+		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"\u003cstring, 3 chars\u003e"`, `"name":"kanban_create"`, `"tool":"mcp__gke__list_clusters"`, `"kind":"PodDisruptionBudget"`, `"location":"projects/p/locations/northamerica-northeast1"`, `"name":"mcp__gke__listClusters"`, `"name":"createPullRequest"`, `"name":"mcp__kubernetesdiagnostics__inspect"`, `"region":"ValidatingAdmissionPolicy"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
 			if !strings.Contains(out, kept) {
 				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
 			}

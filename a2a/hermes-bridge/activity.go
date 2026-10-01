@@ -327,24 +327,21 @@ var shapeKeptKeys = map[string]bool{
 	"resource_type": true, "skill": true, "skill_name": true, "profile": true, "agent": true,
 }
 
-// shapeKeptValuePattern is the shape a kept value must have to survive:
-// a resource name, which is lowercase words joined by ._/- (seeded-a,
-// kube-system, mcp__gke__list_clusters, projects/p/locations/l) or a
-// Capitalised word or two (Deployment, PodDisruptionBudget), at most
+// shapeKeptValuePattern is the shape a kept value must have to survive: an
+// identifier, starting with a letter, made of letters, digits and ._/-
+// (seeded-a, kube-system, mcp__gke__list_clusters, mcp__gke__listClusters,
+// projects/p/locations/l, PodDisruptionBudget, createPullRequest), at most
 // shapeKeptValueMax characters. No ':' or '@' (a user:pass@host is
-// neither), no mixed-case or digit-heavy token: an AKIA... key, a hex
-// secret, an xoxb- token are not names, so shapeTokenRunPattern shapes any
-// value with a long word, a long digit run or an all-hex body. A
-// manifest body under "name", anything with a space in it, is shaped like
-// every other string, so the kept keys are a list of places identifiers
-// live and not a hole.
+// neither), no whitespace or quotes. What an identifier is not, a token
+// is: shapeTokenRunPattern shapes a value with a long lowercase run, a
+// long digit run, an all-hex body, an all-caps-and-digits body (an AKIA...
+// key) or a long mixed run (a ghp_ token, a JWT), since a name's words are
+// short and a kind's are Capitalised. A manifest body under "name",
+// anything with a space in it, is shaped like every other string, so the
+// kept keys are a list of places identifiers live and not a hole.
 var (
-	shapeKeptValuePattern = regexp.MustCompile(`^(?:[a-z0-9]+(?:[._/-][a-z0-9_]+)*|[A-Z][a-z]+(?:[A-Z][a-z]+)*)$`)
-	// A lowercase word of sixteen or more characters, a run of eight or
-	// more digits, or an all-hex body is a token's shape, not a name's
-	// (xoxb-1234567890-..., a hex secret): the words of a resource name are
-	// short, and a CamelCase kind is several short words.
-	shapeTokenRunPattern = regexp.MustCompile(`[a-z0-9]{16,}|[0-9]{8,}|^[a-f0-9]{20,}$`)
+	shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._/-]*$`)
+	shapeTokenRunPattern  = regexp.MustCompile(`[a-z0-9]{24,}|[0-9]{8,}|^[a-f0-9]{20,}$|[A-Z]{2}[A-Z0-9]{14,}|[A-Za-z0-9]{32,}`)
 )
 
 const shapeKeptValueMax = 128
@@ -385,7 +382,8 @@ type ActivityEntry struct {
 	DurationMs int64  `json:"durationMs,omitempty"`
 	At         string `json:"at,omitempty"`
 	// Dropped is set only on the activityTruncatedTool entry: how many
-	// calls past activityEntryBudget were counted and not published.
+	// calls are missing from the trace, past the budget, failed to publish,
+	// or left unreported by the drain's deadline.
 	Dropped int `json:"dropped,omitempty"`
 }
 
@@ -509,7 +507,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			a.seen[d.DeliveryID] = struct{}{}
 		}
 	}
-	a.lastTool = d.ToolName
+	a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 	switch d.Event {
 	case hookPreToolCall:
 		if _, seen := a.open[id]; !seen {

@@ -1132,7 +1132,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
 	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, Concurrency: 8})
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, Concurrency: 8, ScratchDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1279,7 +1279,7 @@ func TestFinalize_IdempotentAndCancelAfterFinalIsANoOp(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
 	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}})
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, ScratchDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
