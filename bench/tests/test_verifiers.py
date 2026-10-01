@@ -970,6 +970,52 @@ def test_tool_called_workers_scope_counts_only_the_tagged_entries():
     assert router_only.verify(5.0).status == "fail"
 
 
+def test_tool_called_workers_scope_filters_by_agent():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "platform",
+        },
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    transcript.set("done", multi_agent_trajectory)
+    # Filtered by agent: platform sees exactly 1 call
+    platform_only = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert platform_only.status == "pass" and platform_only.raw == {"matching_calls": 1}
+    assert "for agent 'platform'" in platform_only.reason
+
+    # Filtered by agent: cluster sees 1 call with regex
+    cluster_only = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent=r"cluster-.+",
+    ).verify(5.0)
+    assert cluster_only.status == "pass" and cluster_only.raw == {"matching_calls": 1}
+
+    # If platform did not call the tool, minimum_calls=1 fails
+    no_cluster = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["nonexistent_tool"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert no_cluster.status == "fail" and no_cluster.raw == {"matching_calls": 0}
+
+
 def test_tool_called_all_scope_counts_both():
     transcript.set("done", _WORKER_TAGGED)
     v = ToolCalledVerifier(

@@ -118,6 +118,8 @@ class SpecToolRegistryTest(unittest.TestCase):
         # #1765: the 50-a-day Developer Knowledge method the personas forbid
         # and knowledge-grounding-sources-probe's safeguard names.
         ("developer_knowledge", "answer_query"),
+        # #953: read-only workload existence inspection across clusters
+        ("gke", "get_k8s_resource"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",

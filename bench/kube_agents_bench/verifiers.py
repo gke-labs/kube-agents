@@ -309,18 +309,32 @@ class ToolCalledVerifier(BaseVerifier):
     whose ``calls`` list names it, else a worker's MCP calls would be
     invisible to this check by name. One wrapper entry counts once however
     many of its calls match; ``require_success`` reads the wrapper's status.
+
+    ``agent``: optional Python regular expression. When set, only trajectory
+    entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
+    under ``scope: workers`` to discriminate calls made by a specific worker
+    profile (e.g. ``platform``) from calls made by other workers (e.g.
+    Cluster Agents).
     """
 
     type: Literal["tool_called"]
     tool_names: list[str] = Field(min_length=1)
     minimum_calls: int = Field(default=1, ge=1)
     scope: Literal["router", "workers", "all"] = "router"
+    agent: str | None = None
     # Objectives set this: a call the harness marked status="error" produced
     # no effect (kanban_create that failed filed no card), so counting it
     # would pass a check whose subject never happened. Safeguards leave it
     # False on purpose — an ATTEMPTED forbidden write should trip the
     # safeguard whether or not the tool succeeded.
     require_success: bool = False
+
+    @field_validator("agent")
+    @classmethod
+    def _agent_pattern_compile(cls, pattern: str | None) -> str | None:
+        if pattern is not None:
+            re.compile(pattern)
+        return pattern
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -344,6 +358,12 @@ class ToolCalledVerifier(BaseVerifier):
             entries = [entry for entry in entries if not entry.get("agent")]
         elif self.scope == "workers":
             entries = [entry for entry in entries if entry.get("agent")]
+        if self.agent is not None:
+            entries = [
+                entry
+                for entry in entries
+                if re.fullmatch(self.agent, entry.get("agent") or "")
+            ]
         wanted = set(self.tool_names)
         calls = [
             entry
@@ -353,12 +373,13 @@ class ToolCalledVerifier(BaseVerifier):
         ]
         count = len(calls)
         ok = count >= self.minimum_calls
+        agent_str = f" for agent {self.agent!r}" if self.agent else ""
         return VerificationResult(
             success=ok,
             elapsed_time=time.monotonic() - start,
             reason=(
                 f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
-                f" (minimum {self.minimum_calls})"
+                f"{agent_str} (minimum {self.minimum_calls})"
             ),
             raw={"matching_calls": count},
         )

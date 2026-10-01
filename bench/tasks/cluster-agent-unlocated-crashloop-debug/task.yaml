@@ -62,7 +62,9 @@ verification_spec:
   # Note on verifier boundaries: worker_agents verifies that a Cluster Agent profile
   # worked cards in the run; expected_output is evaluated by the OutcomeValidity LLM
   # judge solely off the final message (which does not observe worker tool trajectories).
-  # Existence inspection across the fleet is verified by platform-checked-workload-existence,
+  # Existence inspection across the fleet is verified by platform-checked-workload-existence
+  # scoped to agent: platform (ensuring pre-delegation inspection by the platform worker
+  # rather than satisfied by the Cluster Agent's subsequent crashloop investigation),
   # and terminal profile scripts are forbidden in the sandbox by no-stubbed-profile-scripts.
   - name: a-cluster-agent-did-the-work
     role: objective
@@ -74,6 +76,7 @@ verification_spec:
     check:
       type: tool_called
       scope: workers
+      agent: platform
       tool_names:
         - mcp__platform_control__list_cluster_profiles
         - mcp_platform_control_list_cluster_profiles
@@ -84,6 +87,7 @@ verification_spec:
     check:
       type: tool_called
       scope: workers
+      agent: platform
       tool_names:
         - mcp__gke__get_k8s_resource
         - mcp_gke_get_k8s_resource
@@ -93,14 +97,15 @@ verification_spec:
     check:
       # A match anywhere in a command: catches script executions by file path
       # or script filename (cluster_agent_profile.py, kanban_notify_propagate.py)
-      # and Python module invocations (python3 -m cluster_agent_profile), while
+      # and Python module invocations (python3 -m cluster_agent_profile), including
+      # options with arguments (-W ignore, -X dev) and -mmodule syntax, while
       # allowing harmless mentions in text inspection tools (grep, echo, cat).
       type: worker_commands
       forbidden_patterns:
         - 'cluster_agent_profile\.py'
         - 'kanban_notify_propagate\.py'
-        - 'python[0-9.]*\s+(?:-[^\s]+\s+)*-m\s+cluster_agent_profile\b'
-        - 'python[0-9.]*\s+(?:-[^\s]+\s+)*-m\s+kanban_notify_propagate\b'
+        - 'python[0-9.]*(?:\s+\S+)*?\s+-m\s*cluster_agent_profile\b'
+        - 'python[0-9.]*(?:\s+\S+)*?\s+-m\s*kanban_notify_propagate\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert
