@@ -14,6 +14,7 @@ import subprocess
 import yaml
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -1066,12 +1067,49 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "echo \"note; echo 'import cluster_agent_profile' | python3 is refused\"",
             'echo "stub refused; python3 <<< \'import kanban_notify_propagate\' fails" >> notes.md',
             "echo \"note; echo 'import kanban_notify_propagate' | python3 is refused\"",
+            # Tokens inside quoted data expressions or piped data without imports
+            'python3 -c \'print("cluster_agent_profile" in open("notes.md").read())\'',
+            'python3 -c \'print("cluster_agent_profile")\'',
+            'python3 -c "import sys; print(\\"cluster_agent_profile\\")"',
+            'echo "see cluster_agent_profile" | python3 -m json.tool',
+            'echo "cluster_agent_profile" | python3 -m json.tool',
+            'echo "cluster_agent_profile" | python3 script.py',
+            'echo "see kanban_notify_propagate" | python3 -m json.tool',
+            'python3 -c \'print("kanban_notify_propagate" in open("notes.md").read())\'',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
                 self.assertFalse(
                     any(re.search(pat, cmd) for pat in forbidden),
                     f"expected non-matching command {cmd!r} not to be caught",
+                )
+
+    def test_no_stubbed_profile_scripts_avoids_exponential_backtracking(self):
+        spec = self.data.get("verification_spec", [])
+        no_stubbed = next(
+            (c for c in spec if c.get("name") == "no-stubbed-profile-scripts"),
+            None,
+        )
+        self.assertIsNotNone(no_stubbed, "missing no-stubbed-profile-scripts check")
+        assert no_stubbed is not None
+        forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
+
+        # Verify that commands with many short flags do not cause exponential backtracking (ReDoS)
+        flagged_cmds = [
+            "python3 " + " ".join("-a" for _ in range(50)) + " script.py",
+            "timeout --foreground 60 python3 " + " ".join("-a" for _ in range(50)) + " script.py",
+            "env FOO=bar python3 " + " ".join(f"--flag{i}" for i in range(50)) + " script.py",
+        ]
+        for cmd in flagged_cmds:
+            for i, pat in enumerate(forbidden):
+                t0 = time.time()
+                res = re.search(pat, cmd)
+                elapsed = time.time() - t0
+                self.assertFalse(res, f"unexpected match on {cmd!r} by pattern {i}")
+                self.assertLess(
+                    elapsed,
+                    0.05,
+                    f"pattern {i} took too long ({elapsed:.4f}s) on {cmd!r} (catastrophic backtracking)",
                 )
 
     def test_platform_checked_workload_existence_requires_mcp_tool(self):
