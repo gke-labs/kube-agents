@@ -137,17 +137,23 @@ MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: ``*italic*`` and ``_italic_``; a ``*`` inside a word (``2*3``) or unpaired (``*.tmp``) is text.
-MD_ITALIC = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
+MD_ITALIC = re.compile(r"(?<![\w*])\*(?=[^\s.])([^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=[^\s.])([^_\n]+?)(?<=\S)_(?![\w_])")
 #: Inline code.
 MD_CODE = re.compile(r"`([^`\n]+)`")
+#: Holds a code span's place while the other markup is stripped; NUL never appears in an answer.
+CODE_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 #: A candidate sentence end: punctuation, then space, then anything but a
 #: lowercase letter ("in ns. prod" runs on).
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[^\sa-z])")
 #: A text ending in one of these abbreviations has not ended its sentence.
 ABBREVIATION_END = re.compile(
-    r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|no|min|max|fig)\.$", re.IGNORECASE
+    r"(?:^|\s)(?:e\.g|i\.e|vs|approx|incl|cf|etc|esp|no|min|max|fig|rev|ver|ex|cont|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.$",
+    re.IGNORECASE,
 )
+#: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
+CLIP_MIN_SHARE = 2
 
 
 def enabled() -> bool:
@@ -212,19 +218,33 @@ def _paragraphs(markdown: str) -> list[str]:
 
 
 def _plain(markdown: str) -> str:
-    """One line of markdown as plain text: no heading, list marker, emphasis or link syntax."""
-    text = HEADING.sub("", markdown.strip())
+    """One line of markdown as plain text: no heading, list marker, emphasis or link syntax.
+
+    Code spans are held out first, as a renderer resolves them first, so ``__init__`` in one stays.
+    """
+    spans: list[str] = []
+
+    def hold(match: re.Match) -> str:
+        spans.append(match.group(1))
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = MD_CODE.sub(hold, markdown.strip())
+    text = HEADING.sub("", text)
     text = LIST_MARKER.sub("", text)
     text = MD_LINK.sub(r"\1", text)
     text = MD_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
     text = MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
-    return MD_CODE.sub(r"\1", text).strip()
+    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))], text).strip()
 
 
 def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    cut = text[: limit - len(ELLIPSIS)].rsplit(" ", 1)[0] or text[: limit - len(ELLIPSIS)]
+    hard = text[: limit - len(ELLIPSIS)]
+    cut = hard.rsplit(" ", 1)[0]
+    # A long unbroken word would otherwise take everything after the last space with it.
+    if len(cut) * CLIP_MIN_SHARE < len(hard):
+        cut = hard
     return cut.rstrip() + ELLIPSIS
 
 
@@ -256,9 +276,15 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     first, rest = paragraphs[0], paragraphs[1:]
     if first.lstrip().startswith(CODE_FENCES):
         return "", paragraphs
-    first_line, _, more_lines = first.partition("\n")
+    # A soft-wrapped sentence continues onto the next line; a list item or heading does not.
+    lines = first.split("\n")
+    wrapped = 1
+    while wrapped < len(lines) and not (LIST_MARKER.match(lines[wrapped]) or HEADING.match(lines[wrapped])):
+        wrapped += 1
+    joined = " ".join(line.strip() for line in lines[:wrapped])
+    more_lines = "\n".join(lines[wrapped:])
     # The list marker goes first, or "1. Checkout is down." would end at "1.".
-    sentence, remainder = _first_sentence(LIST_MARKER.sub("", first_line.strip()))
+    sentence, remainder = _first_sentence(LIST_MARKER.sub("", joined))
     headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest

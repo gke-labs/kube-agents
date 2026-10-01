@@ -283,6 +283,12 @@ class RuntimeTest(unittest.TestCase):
                 report = REPORT.replace("- **Option B", cut + "- **Option B")
                 self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
 
+    def test_a_line_opening_with_a_code_span_is_not_a_fence(self):
+        report = REPORT.replace("- ✅ **Recommended", "```kubectl rollout undo``` is the command.\n- ✅ **Recommended")
+        triage = runtime.parse_triage(report)
+        self.assertEqual([rec for _label, rec in triage["choices"]], [False, True])
+        self.assertEqual([label for label, _url in triage["links"]], ["GKE Workloads", "Cloud Logs"])
+
     def test_an_option_named_only_in_a_heading_keeps_the_threaded_reply(self):
         report = REPORT.replace("- ✅ **Recommended", "### Option C (Drain the node)\nmoves the pods.\n- ✅ **Recommended")
         self.assertIsNone(runtime.parse_triage(report))

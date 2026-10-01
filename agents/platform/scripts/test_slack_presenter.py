@@ -140,6 +140,27 @@ class SplitAnswerTest(unittest.TestCase):
         headline, _body = sp.split_answer("Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.")
         self.assertEqual(headline, "Deployments, StatefulSets, etc. All fail readiness.")
 
+    def test_a_soft_wrapped_first_sentence_is_the_whole_headline(self):
+        md = "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one"
+        headline, body = sp.split_answer(md)
+        self.assertEqual(headline, "payments-api keeps crashing: secret payments-db-creds is missing.")
+        self.assertEqual(body, ["Since 14:02.\n- one"])
+
+    def test_more_abbreviations_do_not_end_the_headline(self):
+        for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
+            self.assertEqual(sp.split_answer(line), (line, []))
+
+    def test_plain_leaves_code_spans_and_globs_alone(self):
+        self.assertEqual(sp._plain("`__init__.py` is missing"), "__init__.py is missing")
+        self.assertEqual(sp._plain("Delete `__pycache__` and **this**"), "Delete __pycache__ and this")
+        self.assertEqual(sp._plain("Remove *.log,*.tmp"), "Remove *.log,*.tmp")
+
+    def test_clip_keeps_the_start_of_a_long_word(self):
+        clipped = sp._clip("apply Option B: " + "x" * 120, sp.BUTTON_TEXT_MAX)
+        self.assertTrue(clipped.startswith("apply Option B: xxx"))
+        self.assertLessEqual(len(clipped), sp.BUTTON_TEXT_MAX)
+        self.assertEqual(sp._clip("word " * 30, 20), "word word word…")
+
     def test_plain_keeps_a_literal_star_and_drops_markup(self):
         self.assertEqual(sp._plain("Scale replicas 2*3 → 6"), "Scale replicas 2*3 → 6")
         self.assertEqual(sp._plain("Delete *.tmp under /var/cache"), "Delete *.tmp under /var/cache")

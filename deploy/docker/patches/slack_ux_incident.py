@@ -120,15 +120,15 @@ def enabled() -> bool:
 def _next_fence(line: str, fence: str | None) -> str | None:
     """The fence open after ``line``, given the one open before it.
 
-    As in CommonMark, only a line of the opener's character, at least as long, closes it, and an
-    unclosed fence runs to the end.
+    As in CommonMark, only a line of the opener's character, at least as long, closes it, an
+    unclosed fence runs to the end, and a backtick run followed by another backtick is a code span.
     """
     match = FENCE.match(line)
     if not match:
         return fence
     mark = match.group(1)
     if fence is None:
-        return mark
+        return None if mark[0] == "`" and "`" in line[match.end():] else mark
     closes = mark[0] == fence[0] and len(mark) >= len(fence) and not line.strip().strip(mark[0])
     return None if closes else fence
 

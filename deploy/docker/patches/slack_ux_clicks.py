@@ -34,8 +34,11 @@ With the flag on, :func:`register` adds two listeners:
 A message is answered once: the first authorized click wins, and a second
 click on the same message, before the rewrite lands, is dropped in this
 process and logged. If the rewrite fails, the buttons stay on the message but
-the click still counts: its turn runs, so a later click on them is dropped and
-logged rather than running a second apply.
+the click still counts: its turn runs, and a later click on them is dropped and
+logged rather than running a second apply. That memory is this process's and
+holds the last ``ANSWERED_MAX`` answers, so only a failed rewrite followed by a
+gateway restart, or by that many later answers, lets the leftover buttons run
+again.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
 still runs, because the click was the user's answer.
