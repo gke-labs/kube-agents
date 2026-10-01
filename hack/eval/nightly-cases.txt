@@ -79,9 +79,8 @@
 # 2026-09-25 also added obtainability-planted-orphan-service (~45min at the
 # 900s band; tofu, so it serializes on the infra lock with the other tofu
 # cases). Forty-nine cases, ~1176-1196min serial. 2026-09-28 adds
-# bootstrap-discovery-fanout and 2026-09-29 bootstrap-inventory-ranking-delivery
-# (~30min each at their 600s hints; tofu, so they too serialize on the infra
-# lock): fifty-three cases across the two files,
+# bootstrap-discovery-fanout (~30min at its 600s hint; tofu, so it too
+# serializes on the infra lock): fifty-two cases across the two files,
 # counted from the lists, since the running totals above had fallen two
 # behind. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
