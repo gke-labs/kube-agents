@@ -289,7 +289,8 @@ faults as well as the persona's. The reason rides as the terminal's status messa
 takes the token up to the next space, so `bus-publish-failed at working` reads as
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
-`spawn-failed` and `bridge-died-without-terminal-event` and the worker adapter's `worker-evicted`
+`spawn-failed`, `bridge-died-without-terminal-event` and `hermes-rate-limited` (a turn that gave
+up on the provider's rate limit or billing, Hermes's exit 75) and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the

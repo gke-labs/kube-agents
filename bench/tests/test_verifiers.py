@@ -3332,3 +3332,56 @@ def test_the_envelope_safeguard_lets_projections_through(command):
     assert not any(
         re.search(p, command) for p in _past_run_envelope_forbidden()
     ), command
+
+
+_ACK_CASE = TASKS / "chat-voice-ack-names-target" / "task.yaml"
+_ACK_VOICE_OBJECTIVES = ("the-ack-is-not-a-receipt", "no-apology-or-sign-off-in-the-ack")
+_ACK_RESULT = (
+    "Result of delegated task t_cc52a43d:\n"
+    "checkout-gateway is not crashlooping. I delegated to the cluster agent; "
+    "let me know if you want the logs."
+)
+
+
+def _ack_voice_patterns() -> list[str]:
+    spec = yaml.safe_load(_ACK_CASE.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] in _ACK_VOICE_OBJECTIVES]
+    assert len(entries) == len(_ACK_VOICE_OBJECTIVES), _ACK_CASE
+    return [p for e in entries for p in e["check"]["forbidden_patterns"]]
+
+
+def _ack_voice_hits(final_message: str) -> list[str]:
+    text = verifiers._normalize_lines(final_message)
+    return [p for p in _ack_voice_patterns() if re.search(p, text)]
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        # The old receipt, which is two paragraphs of its own.
+        "> 🔀 Delegated to the **platform** agent\n\n"
+        "I've started this as task `t_cc52a43d`. The answer will post into this thread.",
+        # A clean ack line with the receipt or a sign-off after a blank line.
+        "checking checkout-gateway.\n\n> 🔀 Delegated to the **platform** agent\n\n"
+        "I've started this as task `t_cc52a43d`. The answer will post into this thread.",
+        "checking checkout-gateway.\n\nlet me know if you'd like anything else.",
+        f"checking checkout-gateway.\n\nsorry for the wait.\n\n{_ACK_RESULT}",
+        f"checking checkout-gateway.\n\nI've started task t_cc52a43d.\n\n{_ACK_RESULT}",
+    ],
+)
+def test_the_ack_voice_objectives_read_the_whole_closing_message(final_message):
+    assert _ack_voice_hits(final_message), final_message
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        "checking checkout-gateway.",
+        f"checking checkout-gateway.\n\n{_ACK_RESULT}",
+        "checking checkout-gateway.\n\n"
+        "Artifact rca.md produced by delegated task t_cc52a43d:\n"
+        "delegated to the cluster agent; sorry, the answer will post later.",
+    ],
+)
+def test_the_ack_voice_objectives_stop_at_the_delivered_sections(final_message):
+    assert not _ack_voice_hits(final_message), final_message

@@ -186,12 +186,6 @@ FIXTURE_NOT_READY = {
         "account is denied, as a fixture role of its own; the evaluation fleet has "
         "one project per install today, so the case cannot be red on main"
     ),
-    "obtainability-declared-intent-no-finding": (
-        "#1341: needs a second multi-replica workload as a fixture role of its "
-        "own in bench/tf/fleet/fixtures.json (a declaration for checkout-gateway "
-        "would silence the five active cases that grade it) and a knowledge/ "
-        "declaration seeded in each pool project's *-infra repository"
-    ),
     "vcs-history-only-fact": (
         "#1253: needs the git-access-ab/r200 branch pushed to every pool "
         "project's GitOps repository; the dev project carries it, the pool does "

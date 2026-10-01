@@ -314,7 +314,7 @@ endef
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
-PYTHON_TEST_IMPORTS := fastapi httpx mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
+PYTHON_TEST_IMPORTS := fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt

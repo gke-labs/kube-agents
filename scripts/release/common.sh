@@ -44,6 +44,11 @@ readonly GIT_BRANCH_REF_PREFIX="refs/heads/"
 readonly RELEASE_MAIN_BRANCH="main"
 readonly RELEASE_MAIN_TRACKING_REF="refs/remotes/origin/main"
 readonly GIT_FETCH_HEAD_REF="FETCH_HEAD"
+# Where the required release image list lives in the tree, and the array that
+# holds it: how required_release_images_at reads a candidate commit's own list
+# instead of this checkout's.
+readonly REQUIRED_RELEASE_IMAGES_PATH="scripts/release/common.sh"
+readonly REQUIRED_RELEASE_IMAGES_NAME="REQUIRED_RELEASE_IMAGES"
 
 # The registry the docker-free existence probe below knows how to query, and the
 # manifest media types that probe must accept. Omitting the OCI types gets a
@@ -717,13 +722,116 @@ ghcr_image_status() {
   esac
 }
 
-# Checks if all required candidate container images exist in GHCR for a specific commit SHA
+# ─── Required images, as the candidate lists them ─────────────────────────────
+# The names a scripts/release/common.sh text lists in REQUIRED_RELEASE_IMAGES,
+# one per line, read from stdin. The parse is the one
+# tests/test_promotion_pipeline_wiring.py applies to this file: the block from
+# `<name>=(` to the first `)`, every non-blank line in it one double-quoted
+# name, no name twice, at least one name. A list that test accepts reads the
+# same here, and nothing else does: a comment inside the block, two names on a
+# line, an unquoted name, a duplicate or an empty block return 1 with nothing
+# printed, so the caller falls back whole rather than act on a partial list.
+required_release_images_in_text() {
+  awk -v name="${REQUIRED_RELEASE_IMAGES_NAME}" '
+    BEGIN { opener = name "=("; count = 0; bad = 0; inblock = 0; closing = 0 }
+    !inblock {
+      at = index($0, opener)
+      if (at == 0) next
+      inblock = 1
+      $0 = substr($0, at + length(opener))
+    }
+    {
+      close_at = index($0, ")")
+      if (close_at > 0) { closing = 1; $0 = substr($0, 1, close_at - 1) }
+      if ($0 ~ /^[[:space:]]*"[^"[:space:]]+"[[:space:]]*$/) {
+        gsub(/[[:space:]"]/, "")
+        if ($0 in seen) bad = 1
+        seen[$0] = 1
+        names[count++] = $0
+      } else if ($0 !~ /^[[:space:]]*$/) {
+        bad = 1
+      }
+      if (closing) exit
+    }
+    END {
+      if (!inblock || bad || count == 0) exit 1
+      for (i = 0; i < count; i++) print names[i]
+    }
+  '
+}
+
+# The required release images of a candidate commit, one per line: the
+# REQUIRED_RELEASE_IMAGES its own scripts/release/common.sh lists, read with
+# `git show <sha>:scripts/release/common.sh` in the current repository. A
+# commit's images are the ones its publish run built from its own list, so that
+# list, not this checkout's, is what every rung asks the registry for: a
+# candidate from before the list grew is not refused for a name it never built,
+# and a release line that grew its list by backport is checked, promoted and
+# signed for every name it has, however old the main these scripts run from.
+# The candidate's list wins in both directions.
+#
+# When that list cannot be read -- no commit named, a commit this repository
+# does not have, no such file at it, or an array the parse above does not
+# accept -- this checkout's array is printed instead and one line on stderr
+# names the reason. That is the behaviour every rung had before this helper,
+# so the fallback never refuses or accepts anything the old gate did not; the
+# one shape it never takes is an empty list, which would pass the gate with
+# nothing checked. Always exits 0; a caller that reads nothing back has a
+# broken pipe, not an empty list, and must fail rather than proceed.
+# Arguments: $1 = candidate commit-ish
+required_release_images_at() {
+  local sha="${1:-}" names="" fallback_reason=""
+  if [ -z "${sha}" ]; then
+    fallback_reason="no candidate commit named"
+  elif ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null 2>&1; then
+    fallback_reason="commit ${sha:0:7} is not in this repository"
+  elif ! git cat-file -e "${sha}:${REQUIRED_RELEASE_IMAGES_PATH}" 2>/dev/null; then
+    fallback_reason="${sha:0:7} has no ${REQUIRED_RELEASE_IMAGES_PATH}"
+  elif ! names="$(git show "${sha}:${REQUIRED_RELEASE_IMAGES_PATH}" 2>/dev/null | required_release_images_in_text)"; then
+    fallback_reason="${REQUIRED_RELEASE_IMAGES_PATH} at ${sha:0:7} has no readable ${REQUIRED_RELEASE_IMAGES_NAME}"
+  fi
+  if [ -n "${fallback_reason}" ]; then
+    echo "⚠️ Required release images: ${fallback_reason}; using the ${#REQUIRED_RELEASE_IMAGES[@]} this checkout's ${REQUIRED_RELEASE_IMAGES_PATH} lists." >&2
+    printf '%s\n' "${REQUIRED_RELEASE_IMAGES[@]}"
+    return 0
+  fi
+  echo "ℹ️ Required release images: the $(grep -c . <<<"${names}") ${REQUIRED_RELEASE_IMAGES_PATH} lists at ${sha:0:7}." >&2
+  printf '%s\n' "${names}"
+}
+
+# The required release images of a GA version, one per line, for the rungs the
+# workflow hands only the version (signing, the SBOMs): required_release_images_at
+# on the version's tag commit. A stamped release commit changes the installer
+# scripts, the chart and the Terraform example only (create_stamped_release_commit),
+# so the tag carries its candidate's scripts/release/common.sh and reads the same
+# list the candidate was published from. Without the tag in this repository the
+# list is this checkout's, and both this and required_release_images_at say so.
+# Arguments: $1 = GA version (X.Y.Z)
+required_release_images_for_release() {
+  local version="${1:-}" release_commit
+  release_commit="$(resolve_release_commit "${version}" 2>/dev/null || true)"
+  if [ -z "${release_commit}" ]; then
+    echo "⚠️ No tag '${version}' in this repository to read the release's image list at." >&2
+  fi
+  required_release_images_at "${release_commit}"
+}
+
+# Checks if all required candidate container images exist in GHCR for a specific
+# commit SHA: the images the commit's own scripts/release/common.sh lists
+# (required_release_images_at), since those are what its publish run built.
 check_commit_images_exist() {
   local sha="$1"
   local registry_prefix
   registry_prefix="$(get_registry_prefix)"
 
-  for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+  local images=() img
+  while IFS= read -r img; do images+=("${img}"); done < <(required_release_images_at "${sha}")
+  if [ "${#images[@]}" -eq 0 ]; then
+    echo "❌ ERROR: no required release images resolved for commit ${sha:0:7}; refusing to call its images complete." >&2
+    return 1
+  fi
+
+  for img in "${images[@]}"; do
     local target_img="${registry_prefix}/${img}:${sha}"
     if ! registry_image_exists "${target_img}"; then
       return 1
@@ -2195,7 +2303,16 @@ promote_release_images() {
     return 0
   fi
 
-  for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+  # The candidate's own list (required_release_images_at): the images its
+  # publish run built, which may be fewer or more than this checkout's.
+  local images=() img
+  while IFS= read -r img; do images+=("${img}"); done < <(required_release_images_at "${resolved_commit}")
+  if [ "${#images[@]}" -eq 0 ]; then
+    echo "❌ ERROR: no required release images resolved for commit ${resolved_commit:0:7}; nothing promoted." >&2
+    return 1
+  fi
+
+  for img in "${images[@]}"; do
     local source_image="${registry_prefix}/${img}:${resolved_commit}"
     local target_image="${registry_prefix}/${img}:${release_version}"
     echo "  • Promoting ${img}..."

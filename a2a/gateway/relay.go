@@ -99,7 +99,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		rec, e = g.reg.Get(ctx, sessionKey)
 		return e
 	})
-	if err != nil || rec == nil {
+	if err != nil {
 		// The events stay unrendered but the stream keeps them; requeue the
 		// batch so a transient KV failure on a terminal event cannot wedge
 		// the conversation with the result never posted.
@@ -110,6 +110,23 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 				g.events.enqueue(sessionKey, item)
 			}
 		}()
+		return
+	}
+	if rec == nil {
+		// The session record was deleted/retired past SessionTTL; the conversation
+		// no longer exists. Drop the batch and retire the task routing state so
+		// subsequent stragglers are discarded immediately rather than looping.
+		g.log.Warn("relay: session record retired; dropping batch", "session", sessionKey)
+		for _, item := range batch {
+			taskID := item.env.TaskID
+			g.mu.Lock()
+			delete(g.relays, taskID)
+			delete(g.taskSessions, taskID)
+			g.mu.Unlock()
+			if err := g.reg.DropTask(ctx, taskID); err != nil {
+				g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
+			}
+		}
 		return
 	}
 

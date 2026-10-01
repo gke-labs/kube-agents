@@ -687,8 +687,8 @@ scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 against every pool project, seven at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the two GitHub checks
-(each needs a credential the bot must not hold), the mapping (about the checkout).
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the GitHub-reading checks
+(`github_repo_and_app`, `gitops_declaration`, `ledger_read_credential`; each needs a credential the bot must not hold), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,

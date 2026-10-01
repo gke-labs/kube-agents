@@ -1938,6 +1938,7 @@ def test_the_infrastructure_reasons_are_the_executors_own() -> None:
         "bridge-died-without-terminal-event",
         "worker-evicted",
         "bus-subscribe-failed",
+        "hermes-rate-limited",
     }
     assert not inject.INFRASTRUCTURE_REASONS & inject.PERSONA_REASONS
 
