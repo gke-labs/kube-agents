@@ -21,6 +21,14 @@ import (
 // conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
 const sessionProfile = "chat"
 
+// What retireIncarnation posts when the previous task cannot be closed on
+// the bus, by what the caller was about to do: three callers start a task,
+// one leaves the route, and the user needs to hear which did not happen.
+const (
+	retireRefusalNotStarted = "⚠️ not started: could not close the previous task on the bus; try again in a moment"
+	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
+)
+
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
 // slot instead of holding it forever. Where the clock starts relative to
@@ -622,10 +630,6 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// reading of "any update on the rollout" would steal a NEW task to
 	// replay a dead one, so the cost argument inverts there too.
 	wideStatus := !rec.AddressedToOwnSession() && !(active != nil && active.Detached)
-	// An explicit cancel from a backend that can express one is read before
-	// the text is read at all: it is not an ask, and a program must never
-	// have to spell "stop" to reach a control path.
-	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
 	// A slash command resolves before everything else (architecture 02,
 	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
 	// steer. Text only - a programmatic cancel keeps its intent whatever
@@ -638,6 +642,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// without the prefix, not a confirmation that drops the ask.
 		msg.Text, sessionCmd = sessionRest, false
 	}
+	// An explicit cancel from a backend that can express one is read before
+	// the text is read at all: it is not an ask, and a program must never
+	// have to spell "stop" to reach a control path. Read after the strip
+	// above, so a post-flip "/session stop" is the stop it unwraps to.
+	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
 	switch {
 	case msg.Intent == "" && sessionCmd:
 		if !g.sessionCommand(ctx, rec, msg, sessionRest, principal, authority) {
@@ -696,7 +705,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
-			if !g.retireIncarnation(ctx, rec, "delegate") {
+			if !g.retireIncarnation(ctx, rec, "delegate", retireRefusalNotStarted) {
 				return
 			}
 			if rec.Profile == "" {
@@ -733,7 +742,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 				// old pod holds a cap slot sweep can never reclaim. Same
 				// supervisor rule as the Delegate branch: a detached
 				// task's terminal is published before its pod goes.
-				if !g.retireIncarnation(ctx, rec, "pre-flip upgrade") {
+				if !g.retireIncarnation(ctx, rec, "pre-flip upgrade", retireRefusalNotStarted) {
 					return
 				}
 				rec.SessionRouted = true
@@ -991,12 +1000,12 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 // could not be published, a post has said so, and nothing was touched.
 // Spawner-nil is the W4-rollback shape: the record names a pod nothing can
 // manage, so the binding is cleared and the path degrades as it always did.
-func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why string) bool {
+func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why, refusal string) bool {
 	if rec.PodName == "" {
 		return true
 	}
 	if !g.closeDetachedBeforeDelete(ctx, rec) {
-		g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
+		g.post(rec.Key, refusal)
 		return false
 	}
 	if g.spawner != nil {
@@ -1025,7 +1034,7 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
 		return false
 	}
-	if !g.retireIncarnation(ctx, rec, "session route") {
+	if !g.retireIncarnation(ctx, rec, "session route", retireRefusalNotStarted) {
 		return false
 	}
 	rec.BusSession = mintSessionName(rec.Profile)
@@ -1078,7 +1087,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 			g.post(rec.Key, "⚠️ a session task is still running — `stop` it first, then `/session off`")
 			return true
 		}
-		if !g.retireIncarnation(ctx, rec, "session off") {
+		if !g.retireIncarnation(ctx, rec, "session off", retireRefusalStillOn) {
 			return false
 		}
 		rec.SessionRouted = false
@@ -1114,6 +1123,12 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	case rest == "":
 		g.post(rec.Key, "🧵 session route on — your next message opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
+		return true
+	case running && rec.AddressedToOwnSession():
+		// Already on the route with its own task running: the text is what
+		// a plain message would have been, a steer into that task.
+		msg.Text = rest
+		g.steerTask(ctx, rec, msg, authority)
 		return true
 	case running:
 		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
@@ -1175,12 +1190,16 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
 		return true, now.Add(g.cfg.IdleTTL), nil
 	}
-	if rec.SessionRouted {
-		// A thread bound by /session is a session thread while it is active,
-		// task or no task: the Slack adapter admits an unmentioned reply only
-		// where this says so, and the ack after a bare /session promises the
-		// next message opens the pod. LastActivity is the right clock here
-		// because the binding is the record's own; it clears on /session off.
+	if rec.SessionRouted && g.cfg.DefaultAddressee != RouteSession {
+		// A thread a user bound with /session is a session thread while it
+		// is active, task or no task: the Slack adapter admits an unmentioned
+		// reply only where this says so, and the ack after a bare /session
+		// promises the next message opens the pod. LastActivity is the right
+		// clock here because the binding is the record's own; it clears on
+		// /session off. Opt-in installs only: post-flip, mintSession marks
+		// every record session-routed, and a route the install hands out
+		// must not adopt a thread a bare stop or a cap-refused ask touched -
+		// there, only a started task does (the branch below).
 		if until := rec.LastActivity.Add(g.cfg.IdleTTL); now.Before(until) {
 			return true, until, nil
 		}

@@ -289,8 +289,9 @@ naming a route rather than a handle. A bare `/session` marks the conversation se
 and the next message opens the pod; `/session <text>` marks it and runs the text as the first
 turn; `/session off` releases the incarnation (refused while a session task runs; stop it
 first) and re-homes to the default addressee. The conversation's `contextId` is unchanged by
-either. Without a spawner, and on an install whose default is already the session route, both
-forms answer with a note and change nothing; `/session <text>` while a task is still running turns
+either. Without a spawner the on-forms answer with a note and change nothing, and the way back
+still works; on an install whose default is already the session route the bare forms answer
+with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <text>` while a task is still running turns
 the route on and holds the text. On Slack a leading slash belongs to the Slack client, which
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and a thread bound by `/session` counts as a session

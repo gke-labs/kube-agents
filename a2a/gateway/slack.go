@@ -841,7 +841,9 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
 // it mentions the bot or the thread is already a session thread — one the
-// gateway has started a task in, which a mention alone does not make it,
+// gateway has started a task in, or (on an install whose default is not
+// the session route) one a user bound with /session, which a mention alone
+// does not make it,
 // the channel ask's own thread included: the gateway starting the task
 // there does (TaskStarted), the same as for any other thread, and a channel
 // mention from an unmapped sender roots nothing. Everything else — bots,

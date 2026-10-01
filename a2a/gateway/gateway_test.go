@@ -2051,3 +2051,82 @@ func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
 		t.Fatal("spawned")
 	}
 }
+
+// TestPostFlipSessionStopIsAStop: on a session-default install the stripped
+// "/session stop" must be the stop it unwraps to - a cancel on the running
+// task, never a steer whose text reads "stop" and never a new task.
+func TestPostFlipSessionStopIsAStop(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-s19"
+	sessionRigTurn(r, conv, "s-280", "check the fleet")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-281", "/session stop")
+	waitFor(t, "cancel detached the task", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+		if e.EnvelopeID == origin.EnvelopeID {
+			continue
+		}
+		if e.Kind == lib.KindMessage {
+			t.Fatalf("/session stop reached the session task as a message (steer): %s", string(e.Payload))
+		}
+	}
+	if got := len(spawn.calls()); got != 1 {
+		t.Fatalf("/session stop spawned: %d spawns", got)
+	}
+}
+
+// TestHasSessionIgnoresTheMintedRouteOnASessionDefaultInstall: post-flip
+// every record is minted session-routed, so the route alone must not adopt
+// a thread; only a started task does, as the Slack rule says.
+func TestHasSessionIgnoresTheMintedRouteOnASessionDefaultInstall(t *testing.T) {
+	r, _ := startRigWithSpawnerRoute(t, RouteSession)
+	ctx := context.Background()
+	minted := &SessionRecord{Key: "slack:channel/C9/1.1", ContextID: "ctx-m", Kind: "group", SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC()}
+	if err := r.g.reg.Put(ctx, minted); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, _ := r.g.hasSession(ctx, minted.Key); held {
+		t.Fatal("a task-less minted record adopted the thread on a session-default install")
+	}
+}
+
+// TestSessionWithTextOnARunningSessionSteers: already on the route with its
+// own task running, "/session <text>" is what a plain message would be - a
+// steer into that task - not an ack that drops the text.
+func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s20"
+	sessionRigTurn(r, conv, "s-290", "/session long task")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	call := spawn.calls()[0]
+	origin := r.awaitTask(t, call.Session)
+	exec := r.execFor(t, origin, call.Session)
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-291", "/session make it about NATS")
+	waitFor(t, "steer on the session in subject", func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, call.Session) {
+			var sm lib.Message
+			if e.Kind == lib.KindMessage && e.EnvelopeID != origin.EnvelopeID &&
+				json.Unmarshal(e.Payload, &sm) == nil && joinTextParts(sm.Parts) == "make it about NATS" {
+				return true
+			}
+		}
+		return false
+	})
+	if got := len(spawn.calls()); got != 1 {
+		t.Fatalf("a steer spawned: %d", got)
+	}
+}
