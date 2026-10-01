@@ -43,7 +43,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -181,14 +180,16 @@ const (
 	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
 	// beside the other first-party images, images.json carries them (as
 	// a2a-gateway, a2a-worker and a2a-authcallout), and
-	// hack/check-image-inventory.sh holds these repository constants to the
-	// inventory. They resolve through a2aReleaseImage: the env override, else
-	// this repository's name under the registry and tag of OPERATOR_IMAGE,
-	// else of the agent image the operator resolves for itself, else the
-	// published default at the fallback tag. So a chart install at X.Y.Z
-	// pulls these at X.Y.Z, and an install that mirrored the operator has
-	// mirrored these too.
-	defaultA2AGatewayRepository = "ghcr.io/gke-labs/kube-agents/a2a-gateway"
+	// hack/check-image-inventory.sh holds these names to the inventory's
+	// entries (the name, and the repository as that name under the agent
+	// image's registry). Bare names, like shellSandboxRepositoryName: the
+	// registry is never this constant's to say. They resolve through
+	// a2aReleaseImage: the env override, else this name under the registry
+	// and tag of OPERATOR_IMAGE, else of the agent image the operator
+	// resolves for itself (whose fallback is the published registry). So a
+	// chart install at X.Y.Z pulls these at X.Y.Z, and an install that
+	// mirrored the operator has mirrored these too.
+	a2aGatewayImageName = "a2a-gateway"
 
 	// The session-pod image, on the same terms as the gateway above. The
 	// gateway binary carries this same default of its own (gateway/config.go),
@@ -301,7 +302,7 @@ const (
 	// on `…events` before it, and refusing those folds every recent task
 	// non-terminal. A flip that needed a new image would not get made.
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
-	defaultA2AWorkerRepository  = "ghcr.io/gke-labs/kube-agents/a2a-worker"
+	a2aWorkerImageName          = "a2a-worker"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
@@ -674,15 +675,15 @@ func a2aProvisionImage() string {
 }
 
 func a2aGatewayImage() string {
-	return a2aReleaseImage(a2aGatewayImageEnvVar, defaultA2AGatewayRepository)
+	return a2aReleaseImage(a2aGatewayImageEnvVar, a2aGatewayImageName)
 }
 
 func a2aWorkerImage() string {
-	return a2aReleaseImage(a2aWorkerImageEnvVar, defaultA2AWorkerRepository)
+	return a2aReleaseImage(a2aWorkerImageEnvVar, a2aWorkerImageName)
 }
 
 // a2aReleaseImage resolves one of the first-party next-stack images: the env
-// override if set; else the repository's name swapped into OPERATOR_IMAGE,
+// override if set; else the image name swapped into OPERATOR_IMAGE,
 // the rung resolveShellSandboxImage uses and for the same reason - the
 // gateway, the callout and the worker consume what the operator renders (the
 // identity map, the env, the spawn spec), so their version contract is with
@@ -697,14 +698,14 @@ func a2aWorkerImage() string {
 // spec.deployment.image: a custom agent image is that agent's choice, and the
 // bus components are not. The three env vars stay the override for an
 // install that pins one apart.
-func a2aReleaseImage(envVar, repository string) string {
+func a2aReleaseImage(envVar, name string) string {
 	if override := os.Getenv(envVar); override != "" {
 		return override
 	}
 	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" {
-		return deriveImageFromOperator(opImg, path.Base(repository))
+		return deriveImageFromOperator(opImg, name)
 	}
-	return deriveImageFromOperator(defaultPlatformAgentImage(), path.Base(repository))
+	return deriveImageFromOperator(defaultPlatformAgentImage(), name)
 }
 
 // a2aStrictEventsWriter renders "false" for anything but an explicit "true",

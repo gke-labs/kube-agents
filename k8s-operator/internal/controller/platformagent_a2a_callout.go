@@ -95,9 +95,9 @@ const a2aIdentityMapSchema = "2"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
-	// worker (the comment on defaultA2AGatewayRepository says how).
-	defaultA2ACalloutRepository = "ghcr.io/gke-labs/kube-agents/a2a-authcallout"
-	a2aCalloutImageEnvVar       = "A2A_CALLOUT_IMAGE"
+	// worker (the comment on a2aGatewayImageName says how).
+	a2aCalloutImageName   = "a2a-authcallout"
+	a2aCalloutImageEnvVar = "A2A_CALLOUT_IMAGE"
 
 	// a2aBusTokenAudience is the audience every bus token is bound to.
 	//
@@ -123,7 +123,7 @@ const (
 )
 
 func a2aCalloutImage() string {
-	return a2aReleaseImage(a2aCalloutImageEnvVar, defaultA2ACalloutRepository)
+	return a2aReleaseImage(a2aCalloutImageEnvVar, a2aCalloutImageName)
 }
 
 // a2aBusTokenVolumeSource is the projected token every callout-authenticated

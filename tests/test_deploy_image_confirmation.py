@@ -129,6 +129,7 @@ class _StubKubectl:
         images_json=None,
         agent_release="kube-agents",
         plugin_releases="",
+        declared_sidecars="",
     ):
         """Run the script against one or more stubbed reads of the template.
 
@@ -188,6 +189,10 @@ class _StubKubectl:
                 fi
                 if [[ "$*" == *agentplugin* ]]; then
                   printf '%s\\n' '{plugin_releases}'
+                  exit 0
+                fi
+                if [[ "$*" == *sidecars* ]]; then
+                  printf '%s\\n' '{declared_sidecars}'
                   exit 0
                 fi
                 if [[ "$*" == *status.phase* ]]; then
@@ -283,6 +288,27 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         self.assertIn("Only plugin images are off the tag", result.stdout)
         self.assertIn("--set plugins.<name>.image.tag", result.stdout)
 
+    def test_a_sidecar_the_cr_declares_is_not_judged(self):
+        """A `mode: next` install declares the Hermes bridge on
+        spec.deployment.sidecars, a release image (built from the agent image
+        of its own commit) whose tag no deploy of this release sets. It is
+        reported and left out of the verdict; the same container with no
+        declaration behind it is judged like any other release image.
+        """
+        listing = f"""
+            platform-agent={_GHCR}/platform-agent:{_TAG}
+            hermes-bridge={_GHCR}/hermes-bridge:{_OLD}
+            """
+        result = self._run(listing, declared_sidecars="hermes-bridge")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 release image(s)", result.stdout)
+        self.assertIn("sidecar declared on the PlatformAgent", result.stdout)
+        self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", result.stdout)
+
+        undeclared = self._run(listing)
+        self.assertEqual(undeclared.returncode, 1, undeclared.stdout + undeclared.stderr)
+        self.assertIn(f"hermes-bridge: {_GHCR}/hermes-bridge:{_OLD}", undeclared.stdout)
+
     def test_a_plugin_installed_outside_the_release_is_not_judged(self):
         """agentplugins/*/install.sh releases a plugin on its own, at its own tag.
 
@@ -299,7 +325,7 @@ class ConfirmAgentImageScriptTest(_StubKubectl, unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 1 release image(s)", result.stdout)
-        self.assertIn("Not judged, installed outside the release", result.stdout)
+        self.assertIn("Not judged, not tagged by this release", result.stdout)
         self.assertIn("stage-pubsubplatform", result.stdout)
 
     def test_a_plugin_of_the_release_on_an_older_tag_still_fails(self):

@@ -152,6 +152,13 @@ readonly PLUGIN_VOLUME_MAX_LEN=63
 readonly PLUGIN_NAME_HASH_LEN=8
 readonly AGENT_RELEASE_JSONPATH='{range .items[*]}{.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
 readonly PLUGIN_RELEASE_JSONPATH='{range .items[*]}{.metadata.name}={.metadata.annotations.meta\.helm\.sh/release-name}{"\n"}{end}'
+# The containers a PlatformAgent declares under spec.deployment.sidecars. The
+# operator copies them into the template as written, and no deploy of this
+# release sets their tag: a release image declared there (the Hermes bridge
+# of a mode: next install, built from the agent image of its own commit)
+# carries whatever reference the CR names, so it is reported and left out of
+# the verdict, like a plugin installed outside the release.
+readonly DECLARED_SIDECAR_JSONPATH='{range .items[*]}{range .spec.deployment.sidecars[*]}{.name}{"\n"}{end}{end}'
 
 stderr_file="$(mktemp)"
 # Carry the real status through the cleanup. A bare `rm` in an EXIT trap
@@ -184,6 +191,11 @@ is_release_image() {
   segment="${segment##*/}"
   segment="${segment%%:*}"
   grep -qxF "$segment" <<<"$release_names"
+}
+
+# A container the CR declares as a sidecar, by name.
+is_declared_sidecar() {
+  [ -n "$declared_sidecars" ] && grep -qxF "$1" <<<"$declared_sidecars"
 }
 
 # The first eight hex characters of sha256 of a plugin name, as the operator
@@ -258,6 +270,10 @@ inspect_template() {
       skipped="${skipped}  ${name}: ${image} (AgentPlugin of another Helm release)"$'\n'
       continue
     fi
+    if is_declared_sidecar "$name"; then
+      skipped="${skipped}  ${name}: ${image} (sidecar declared on the PlatformAgent; its tag is the CR's)"$'\n'
+      continue
+    fi
     matched=$((matched + 1))
     case "$image" in
       *:"$tag") ;;
@@ -277,11 +293,12 @@ while true; do
   # agent no Helm release owns, reads as empty and every plugin entry counts.
   agent_releases="$(kubectl get platformagent -n "$namespace" -o jsonpath="$AGENT_RELEASE_JSONPATH" 2>/dev/null | grep -v '^$' | sort -u || true)"
   plugin_releases="$(kubectl get agentplugin -n "$namespace" -o jsonpath="$PLUGIN_RELEASE_JSONPATH" 2>/dev/null || true)"
+  declared_sidecars="$(kubectl get platformagent -n "$namespace" -o jsonpath="$DECLARED_SIDECAR_JSONPATH" 2>/dev/null | grep -v '^$' || true)"
   inspect_template "$listing"
 
   if [ "$matched" -gt 0 ] && [ -z "$mismatched" ]; then
     echo "Operator applied tag ${tag} to all ${matched} release image(s) in ${deployment}."
-    [ -z "$skipped" ] || printf 'Not judged, installed outside the release:\n%s' "$skipped"
+    [ -z "$skipped" ] || printf 'Not judged, not tagged by this release:\n%s' "$skipped"
     exit 0
   fi
 

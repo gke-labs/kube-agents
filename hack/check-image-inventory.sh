@@ -243,9 +243,10 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout) are release
 #    images with no fixed tag in the inventory, so the operator compiles in
-#    the repository alone and takes registry and tag from the agent image it
-#    resolves; the second check below holds each repository constant to the
-#    inventory exactly.
+#    the bare image name and takes registry and tag from its own or the
+#    agent image; the second check below holds each name to the inventory's
+#    entry, and that entry's repository to the name under the agent image's
+#    registry, which is what the operator renders when nothing overrides it.
 # ---------------------------------------------------------------------------
 check_operator_pin() {
   local name=$1 gofile=$2 constant=$3
@@ -260,10 +261,25 @@ check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.
 check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
 check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
 
+# A compiled image name for a release image the operator renders: the
+# constant must be the inventory entry's name, and the entry's repository
+# must be that name beside platform-agent's, since the operator derives the
+# registry from the agent image and never from the constant.
+check_compiled_image_name() {
+  local name=$1 gofile=$2 constant=$3
+  local want_repo got
+  want_repo="$(dirname "$(repo_of platform-agent)")/${name}"
+  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  [ "$got" = "$name" ] ||
+    fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY names the image '$name'."
+  [ "$(repo_of "$name")" = "$want_repo" ] ||
+    fail "$INVENTORY: '$name' has repository '$(repo_of "$name")', but the operator renders it as '$want_repo' (the name beside platform-agent) when nothing overrides it."
+}
+
 # A compiled repository for a release image: the constant must be the
 # inventory's repository, character for character, since the tag is not the
 # constant's to know. The gateway binary keeps its own copy of the worker
-# repository for a run outside the operator, held on the same terms.
+# repository for a run outside the operator, which it concatenates whole.
 check_compiled_repository() {
   local name=$1 gofile=$2 constant=$3
   local want got
@@ -273,9 +289,9 @@ check_compiled_repository() {
     fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has repository '$want' for '$name'."
 }
 
-check_compiled_repository a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AGatewayRepository
-check_compiled_repository a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AWorkerRepository
-check_compiled_repository a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go defaultA2ACalloutRepository
+check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName
+check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName
+check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
