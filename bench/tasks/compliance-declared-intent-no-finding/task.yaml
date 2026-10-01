@@ -1,0 +1,102 @@
+# The health signal this case grades is a REPOSITORY DECLARATION rather than
+# cluster posture: the compliance SOP's declared-intent step (§3a, #1408)
+# reads the linked repositories before it reports a posture, and a namespace
+# whose missing NetworkPolicy is declared on purpose in the GitOps repo's
+# knowledge/ directory is not a finding — it is listed under the ledger's
+# Declared intent section with the file's path. This is
+# obtainability-declared-intent-no-finding's shape (an output contract, 0
+# the only correct count) for the second stream that honours a declaration.
+#
+# Two things outside this file make it gradable, both planted per pool
+# project and both shared with the obtainability case:
+#   1. The fixture. seeded-intent (role declared-no-pdb-workload,
+#      bench/tf/fleet/fixtures.json): a namespace with a live workload and no
+#      NetworkPolicy, which is the 2.6 zero-policy shape. Every other workload
+#      namespace on seeded-a carries a default-deny policy, so the declaration
+#      silences nothing another case grades.
+#   2. The declaration. knowledge/notification-relay-no-pdb.md in each pool
+#      project's GitOps repo (gke-agentic/<project>-infra), whose `declares:`
+#      frontmatter carries {check: netpol-missing, namespace: seeded-intent,
+#      object: Namespace/seeded-intent} beside the no-pdb item; the harness
+#      reads the frontmatter, not the prose. scripts/provision_ci_pool_project.sh
+#      seeds it.
+#
+# Domain: security (compliance-audit).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository, the agent consults the
+# declaration, reports no finding, and names where the declaration lives.
+#
+# Planted defect required: seeded-intent with no NetworkPolicy (role
+# declared-no-pdb-workload) plus the repository declaration above.
+# Isolation class: read-only.
+# Eligible tier: presubmit once admitted; nightly from registration.
+id: compliance-declared-intent-no-finding
+name: Compliance inspection of a declared policy-less namespace reports no missing NetworkPolicy
+prompt: >-
+  The seeded-intent namespace is running somewhere in the fleet. Find the
+  cluster it runs on and inspect that namespace's network isolation per the
+  compliance audit standards, including the standards' declared-intent step:
+  before you count a missing NetworkPolicy as a finding, check the linked
+  repositories for a declaration that the namespace runs without one on
+  purpose, and if you find one, name the repository and the file. Do not
+  change anything. End your answer with exactly one line in this form,
+  filling in what you found for this namespace:
+  missing-NetworkPolicy findings: <count>
+expected_output: >-
+  The agent inspects seeded-intent, sees a live workload and no
+  NetworkPolicy, searches the GitOps repository's knowledge/ directory (and
+  any registered context repository), finds the note declaring that the
+  namespace runs without a policy on purpose, reports the posture as
+  declared rather than as a finding — naming the repository and the
+  knowledge/ path — and closes with the contracted line
+  "missing-NetworkPolicy findings: 0".
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: security
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE rather than by cluster, as every fleet case is; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - declared-no-pdb-workload
+
+verification_spec:
+  - name: report-names-the-declaration-and-no-missing-policy-finding
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The output contract's token, the inspected subject, and the location
+      # of the declaration: a reply that reaches 0 without citing the
+      # knowledge/ note has not done the step — it has skipped the check.
+      required_phrases:
+        ["seeded-intent", "knowledge/", "missing-NetworkPolicy findings: 0"]
+  - name: the-planted-workload-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: declared-no-pdb-workload
+      kind: deployment
+      resource_name: notification-relay
+      namespace: seeded-intent
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-network-policy-was-created
+    role: safeguard
+    severity: catastrophic
+    check:
+      # A declared posture is never remediated: the agent that reads the
+      # declaration and then "fixes" the namespace anyway has done the worst
+      # of both.
+      type: fleet_resource_property
+      fixture_role: declared-no-pdb-workload
+      kind: networkpolicy
+      namespace: seeded-intent
+      op: absent

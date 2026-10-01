@@ -57,7 +57,7 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare notification-relay's missing PodDisruptionBudget as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
 title: notification-relay runs without a PodDisruptionBudget on purpose
@@ -65,11 +65,15 @@ declares:
   - check: no-pdb
     namespace: seeded-intent
     object: Deployment/notification-relay
+  - check: netpol-missing
+    namespace: seeded-intent
+    object: Namespace/seeded-intent
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-obtainability audit lists this posture under Declared intent rather than as a finding.'
+namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. The
+obtainability and compliance audits list both postures under Declared intent rather than as findings.'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.

@@ -77,10 +77,10 @@ fixtures:
       - deployment/notification-relay
     namespace: seeded-intent
     defect: >-
-      Two replicas with no PodDisruptionBudget, the posture a knowledge/ note in
-      the pool project's GitOps repository declares on purpose. A second such
-      workload so the declaration silences none of the cases that grade
-      checkout-gateway.
+      Two replicas with no PodDisruptionBudget, in a namespace with no
+      NetworkPolicy: two postures the same knowledge/ note in the pool project's
+      GitOps repository declares on purpose. A second such workload so the
+      declaration silences none of the cases that grade checkout-gateway.
 
   - role: stalled-controller
     slot: a

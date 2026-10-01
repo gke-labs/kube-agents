@@ -1802,7 +1802,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
             "no declares": "has no `declares` list",
             "other object": "no declares item is check no-pdb",
             "strings but no structure": "not valid YAML",
-            "empty cluster": "the parser skipped every item",
+            "empty cluster": "no declares item is check no-pdb for Deployment/notification-relay in seeded-intent",
             "another cluster": "name cluster seeded-b",
             "unquoted impossible date": "not valid YAML (ValueError)",
             "null declares": "has no `declares` list",
@@ -1922,11 +1922,27 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertEqual(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", body)
         self.assertIsNone(checker._note_declaration_problem(body, "gke-agentic/kube-agents-evals-3-infra"))
 
-    def test_the_declarable_set_is_the_audits(self):
-        # The check asks the audit which slugs a note may justify; the fixture's
-        # check has to be one of them, or the note it seeds declares nothing.
+    def test_the_declarable_sets_are_the_audits(self):
+        # The check asks each audit which slugs a note may justify; every
+        # fixture declaration's check has to be in its stream's set, or the
+        # note it seeds declares nothing there.
         audit = checker._load_audit_report()
-        self.assertIn(checker.GITOPS_INTENT_NOTE_DECLARATION["check"], audit.audit_declarable_checks(checker.GITOPS_INTENT_NOTE_AUDIT))
+        for stream, item in checker.GITOPS_INTENT_NOTE_DECLARATIONS:
+            with self.subTest(stream):
+                self.assertIn(item["check"], audit.audit_declarable_checks(stream))
+
+    def test_a_note_missing_one_of_the_two_declarations_fails(self):
+        # The fixture rests on two postures in one note; a note that declares
+        # only the budget leaves the compliance case failing on that project.
+        good = checker.GITOPS_INTENT_NOTE_CONTENT
+        only_pdb = good.replace("  - check: netpol-missing\n    namespace: seeded-intent\n    object: Namespace/seeded-intent\n", "")
+        self.assertNotEqual(good, only_pdb)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(only_pdb, sha="deadbeef"))]
+            result = checker.check_gitops_declaration("kube-agents-evals-3")
+        self.assertFalse(result.passed)
+        self.assertIn("no declares item is check netpol-missing for Namespace/seeded-intent in seeded-intent", result.message)
+        self.assertIn("-f sha=deadbeef", result.message)
 
     def test_the_note_the_verifier_names_is_the_one_provisioning_seeds(self):
         # One note, defined twice: the script seeds it, the verifier reads it

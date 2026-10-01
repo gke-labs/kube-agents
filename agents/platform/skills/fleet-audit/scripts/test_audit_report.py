@@ -63,9 +63,13 @@ class GitResult:
 
 
 AUDIT = "compliance-audit"
-# The one stream whose SOP has a declared-intent step, so the one stream on
-# which a `declared` list validates. Every other stream rejects the list.
+# The pilot stream whose SOP has a declared-intent step, so a stream on which
+# a `declared` list validates. Every stream without such a step rejects the
+# list; compliance-audit is the second stream with one.
 DECLARING_AUDIT = "obtainability-audit"
+# A stream whose SOP has no declared-intent step, for the tests about what such a
+# stream rejects and owes; the generic AUDIT is a declaring stream now.
+NON_DECLARING_AUDIT = "security-patch-orchestrator"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 # How far the run-record stamp may sit from wall-clock and still be this run's.
 # Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
@@ -411,7 +415,7 @@ def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
         }
 
     clusters = [with_checks(cluster) for cluster in clusters]
-    return {
+    doc = {
         "audit": audit,
         "scope": {
             "clusters": clusters,
@@ -419,6 +423,21 @@ def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
         },
         "findings": findings if findings is not None else [make_finding()],
     }
+    # compliance-audit declares two postures, so a document on the generic
+    # stream whose roster ran either owes the declared-intent search record,
+    # or `finish` withholds its netpol findings and the tests below read a
+    # coverage gap where they meant a finding. The generic stream carries the
+    # record by default; DECLARING_AUDIT documents do not, because the tests
+    # about the record itself build those and set it on purpose.
+    declarable = audit_report.audit_declarable_checks(audit)
+    checks_that_ran = {
+        entry["check"] if isinstance(entry, dict) else entry
+        for cluster in clusters
+        for entry in cluster.get("checks_run", [])
+    }
+    if audit == AUDIT and declarable & checks_that_ran:
+        doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/fleet")
+    return doc
 
 
 THREE_SEVERITIES = [
@@ -840,6 +859,16 @@ class BaseTestCase(unittest.TestCase):
 
     def run_main(self, argv):
         """Invoke the CLI, capturing stdout/stderr into self.out / self.err."""
+        if argv and argv[0] in ("finish", "remediate") and AUDIT in argv and not Path(audit_report.run_record_path_for(AUDIT)).exists():
+            # The record `start` leaves and `finish` measures the search
+            # against; the generic stream declares postures now, so a run
+            # that never called `start` here needs it or reads as no search.
+            # A test that left SCRATCH_DIR at its default gets one under the
+            # test's own directory: the default is /opt/data, which no dev
+            # machine or CI runner can create.
+            if not Path(audit_report.SCRATCH_DIR).parent.exists():
+                self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
+            self.record_run(audit=AUDIT)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = audit_report.main(argv)
@@ -4231,12 +4260,13 @@ class TestStart(HarnessTestCase):
                 "carried": [],
                 "context_repos": [],
                 "declared_intent_repos": ["acme/fleet"],
-                # A stream with no declared-intent step searches nothing on
-                # the harness's behalf, and says so with empty lists rather
-                # than by leaving the keys out.
+                # compliance-audit declares two postures, so `start` searches
+                # the GitOps repository for it; this harness stubs no clone,
+                # so the repository is reported unsearched rather than left
+                # out, and `finish` withholds the postures it covers.
                 "declared_intent_searched": [],
                 "declared_intent_sources": [],
-                "declared_intent_unsearched": [],
+                "declared_intent_unsearched": [{"repo": "acme/fleet", "ref": None}],
                 "declarations_path": str(
                     self.tmp_path / "declarations_compliance-audit.json"
                 ),
@@ -5013,7 +5043,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Eight streams have no §4a. A worker on one of them that writes a
+        # Seven streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -5024,8 +5054,8 @@ class TestDeclaredIntent(BaseTestCase):
             for audit_id, spec in audit_report.AUDITS.items()
             if not spec.declarable
         ]
-        self.assertIn(AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 1)
+        self.assertIn(NON_DECLARING_AUDIT, silent)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 2)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -5587,7 +5617,7 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         )
 
     def test_other_streams_owe_nothing(self):
-        doc = audit_report.validate_findings(make_doc(), AUDIT)
+        doc = audit_report.validate_findings(make_doc(audit=NON_DECLARING_AUDIT, findings=[]), NON_DECLARING_AUDIT)
         self.assertFalse(audit_report.declared_intent_applies(doc))
         self.assertEqual(audit_report.withhold_unsearched_postures(doc, None), [])
 
@@ -5709,12 +5739,12 @@ class TestDeclaredIntentSearch(HarnessTestCase):
                 self.rejects(doc, DECLARING_AUDIT, "declared_intent_searched[0]", "owner/name@sha")
 
     def test_the_key_is_rejected_on_a_stream_with_no_declared_intent_step(self):
-        doc = make_doc()
+        doc = make_doc(audit=NON_DECLARING_AUDIT, findings=[])
         doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = searched("acme/fleet")
-        self.rejects(doc, AUDIT, "declared_intent_searched[0]", "no declared-intent step")
+        self.rejects(doc, NON_DECLARING_AUDIT, "declared_intent_searched[0]", "no declared-intent step")
         # `[]` says the same thing as an absent key, everywhere.
         doc[audit_report.DECLARED_INTENT_SEARCHED_KEY] = []
-        audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+        audit_report.validate_findings(copy.deepcopy(doc), NON_DECLARING_AUDIT)
 
     def test_a_short_sha_is_accepted(self):
         doc = self.doc()
@@ -7119,8 +7149,8 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
 
     def test_a_stream_with_no_declared_intent_step_clones_nothing(self):
         self.context("acme/terraform-live")
-        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
-        rc = self.run_main(["start", "--audit", AUDIT])
+        self.workspace = self.gitops_root / NON_DECLARING_AUDIT / "acme__fleet"
+        rc = self.run_main(["start", "--audit", NON_DECLARING_AUDIT])
         self.assertEqual(rc, 0, self.err)
         payload = json.loads(self.out)
         self.assertEqual(payload["context_repos"], ["acme/terraform-live"])
@@ -18015,7 +18045,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     output moved with it: the clean-over-a-gap run's stderr says the gaps mean
     it "cannot vouch for the ledger's state", where it said it "cannot speak
     for the fleet", because a lost store record also makes a clean run
-    partial, and the line now covers both causes. Nothing else moved.
+    partial, and the line now covers both causes. Nothing else moved. So
+    is compliance-audit gaining a declared-intent step: its bodies carry the
+    `Declared-intent search:` line every declaring stream's bodies carry.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
     and is confined to the call surface: every body, the stdout line and every

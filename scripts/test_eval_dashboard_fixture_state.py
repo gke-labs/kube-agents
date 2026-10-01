@@ -225,6 +225,7 @@ def healthy_world(*projects):
             "namespace/seeded-intent": {"metadata": {"name": "seeded-intent"}},
             "deployment/notification-relay": {"status": {"readyReplicas": 2, "replicas": 2}},
             "poddisruptionbudget?": {"items": []},
+            "networkpolicy?": {"items": []},
             "clusterrolebinding/debug-binding": {"roleRef": {"name": "cluster-admin"}, "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}]},
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [{"spec": {"taints": [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
             "namespace/seeded-stall": {"metadata": {"name": "seeded-stall"}},

@@ -457,7 +457,7 @@
       "cluster_slot": "a",
       "namespace": "seeded-intent",
       "probes": ["deployment/notification-relay"],
-      "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget in the namespace; the workload a repository declaration covers, so the declared-intent case silences nothing another case grades",
+      "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget, in a namespace with no NetworkPolicy; both postures a repository declaration covers, so the declared-intent cases silence nothing another case grades",
       "state": [
         {
           "subject": "deployment/notification-relay",
@@ -471,6 +471,12 @@
           "path": null,
           "op": "absent",
           "why": "a PodDisruptionBudget anyone adds to seeded-intent removes the posture the declaration covers, and the case then grades nothing"
+        },
+        {
+          "subject": "networkpolicy?",
+          "path": null,
+          "op": "absent",
+          "why": "a NetworkPolicy anyone adds to seeded-intent removes the compliance posture the declaration covers, and that case then grades nothing"
         }
       ]
     }
