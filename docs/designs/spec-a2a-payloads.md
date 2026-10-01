@@ -341,8 +341,10 @@ four carry reserved semantics. An `activity` entry is one `data` part whose obje
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,
-unreported at its drain, or delivered to it unreadably; `dropped` counts them all, the one loss
-outside it being a delivery over the executor's body cap, which it logs, the call it belonged to ending `interrupted` when its opening delivery arrived and absent when it did not), `errorType` (the executor's own word for
+or unreported at its drain; `dropped` counts them all, and a delivery the executor could not
+read or refused over its body cap is outside it, logged, the call it belonged to in the trace
+as `interrupted` when its opening delivery arrived and whole from the closing one when the
+opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
 an error), `durationMs` and `at`; the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 

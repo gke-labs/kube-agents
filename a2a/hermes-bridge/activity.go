@@ -160,8 +160,10 @@ const (
 	// activityBodyCap bounds one delivery read. hermes's payloads carry the
 	// tool input and result whole, so a file write of a large manifest is a
 	// few MiB; the cap is set well above that, since a delivery over it
-	// cannot be attributed (the cut body verifies against no key) and its
-	// call is then absent from the trace with nothing counting it.
+	// cannot be attributed (the cut body verifies against no key), so
+	// nothing counts it: the call it was for ends interrupted when its pre
+	// arrived, and is absent when the pre was the large one, since the post
+	// carries the same input and is larger still.
 	activityBodyCap = 8 << 20
 	// activityPublishTimeout bounds one artifact publish; the trace is
 	// telemetry and must never stall the run or the terminal. hermes waits
@@ -992,15 +994,21 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 func (b *Bridge) listenActivity() error {
 	// The sweep runs whether or not the door opens: a previous incarnation
 	// with the door open may have left a scope, and this one closing the
-	// door is not a reason to leave its credential copy behind.
+	// door is not a reason to leave its credential copy behind. With the
+	// door closed nothing is written, so a scratch dir that is missing or
+	// unusable is said in the log and the executor starts; with it open
+	// every task needs a scope there, so the same is a start-time failure.
+	if b.cfg.ActivityListen == "" {
+		if err := sweepTaskScopes(b.cfg.ScratchDir, b.cfg.Logger); err != nil && !os.IsNotExist(err) {
+			b.cfg.Logger.Warn("scratch dir not swept; the door is closed and nothing is written there", "dir", b.cfg.ScratchDir, "err", err)
+		}
+		return nil
+	}
 	if err := os.MkdirAll(b.cfg.ScratchDir, childScopeDirMode); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
 	if err := sweepTaskScopes(b.cfg.ScratchDir, b.cfg.Logger); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
-	}
-	if b.cfg.ActivityListen == "" {
-		return nil
 	}
 	ln, err := net.Listen("tcp", b.cfg.ActivityListen)
 	if err != nil {
@@ -1108,13 +1116,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	var d hookDelivery
 	if err := json.Unmarshal(body, &d); err != nil {
-		// Signed for this task and unreadable: a call the trace will not
-		// carry (and whose pre, if any, will end interrupted), so the
-		// marker says the trace is short.
+		// Signed for this task and unreadable, and which event it was
+		// cannot be known: an unreadable pre costs the trace nothing (the
+		// post carries the record whole), an unreadable post leaves its
+		// call open to end interrupted at the drain, so the call is in the
+		// trace either way and the marker does not count it. Said in the
+		// log.
 		b.cfg.Logger.Warn("activity delivery unparseable", "task", run.origin.TaskID, "err", err)
-		if act := run.act.Load(); act != nil {
-			act.countDropped(1)
-		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

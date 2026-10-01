@@ -448,7 +448,10 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 
 // A delivery signed for a task that the door cannot decode is a call the
 // trace will not carry: it counts on the marker rather than vanishing.
-func TestActivity_UnreadableSignedDeliveryCountsDropped(t *testing.T) {
+// An unreadable signed delivery is logged and not counted: whichever event
+// it was, the call is in the trace (whole from its post, or interrupted at
+// the drain), so a marker would overcount.
+func TestActivity_UnreadableSignedDeliveryIsNotCounted(t *testing.T) {
 	b := &Bridge{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: map[string]*taskRun{}}
 	a := newActivityState(true, InputValuesShape)
 	run := &taskRun{origin: &lib.Envelope{TaskID: "task-bad", ContextID: "ctx", CorrelationID: "corr"}}
@@ -464,8 +467,17 @@ func TestActivity_UnreadableSignedDeliveryCountsDropped(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status %d", rec.Code)
 	}
-	if m, ok := a.truncationMarker(); !ok || m.Dropped != 1 {
-		t.Fatalf("marker after an unreadable delivery = %+v, %v", m, ok)
+	if m, ok := a.truncationMarker(); ok {
+		t.Fatalf("marker after an unreadable delivery = %+v; the call is not missing", m)
+	}
+	// The readable post that follows an unreadable pre is the call, whole.
+	good := []byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","tool_input":{"command":"ls"},"extra":{"tool_call_id":"c1","status":"ok"}}`)
+	var d hookDelivery
+	if err := json.Unmarshal(good, &d); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
+		t.Fatalf("post without an open pre was not published whole: %+v %v", e, ok)
 	}
 }
 
@@ -1160,6 +1172,19 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	}
 	if _, err := os.Stat(again); !os.IsNotExist(err) {
 		t.Fatalf("a door-closed start left a scope behind: stat err = %v", err)
+	}
+	// A scratch dir that cannot exist (under a file) fails the start only
+	// when the door is open and scopes would be written there; closed, the
+	// executor starts and says so in the log.
+	unusable := filepath.Join(foreignFile, "scratch")
+	closedUnusable := &Bridge{cfg: Config{ScratchDir: unusable, ActivityListen: "", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	if err := closedUnusable.listenActivity(); err != nil {
+		t.Fatalf("door closed, unusable scratch dir refused the start: %v", err)
+	}
+	openUnusable := &Bridge{cfg: Config{ScratchDir: unusable, ActivityListen: "127.0.0.1:0", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	if err := openUnusable.listenActivity(); err == nil {
+		_ = openUnusable.activityLn.Close()
+		t.Fatal("door open, unusable scratch dir did not fail the start")
 	}
 	// A directory still has to be a directory to go: a file named like a
 	// task id is not a scope the bridge wrote.

@@ -282,7 +282,9 @@ managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually
 `secret_env: A2A_ACTIVITY_SECRET`, appended to any entry the operator's own managed config
 carries) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
 (the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
-exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent, each copy removed when
+exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent while the door is open, and
+with the door closed a scratch dir that cannot be made or read is logged and the bridge starts,
+since nothing is written there; each copy removed when
 its child exits, the ones a previous incarnation left (its direct subdirectories that carry the
 bridge's own marker file, whatever their name, nothing else in it and never the directory
 itself) removed when the bridge starts, and
@@ -319,7 +321,8 @@ worker adapter's `{"tool","input"}` so one fold reads both executors:
 so a guardrail refusal stays distinguishable from a tool failure. hermes retries a delivery
 that timed out, so each is remembered by its id and a retry is one call. A call still open when the
 task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the door could not
-read, which also counts on the marker — is flushed as `interrupted` inside
+read (logged, not counted, since the call is then in the trace; an unreadable `pre_tool_call`
+costs nothing, its `post` carries the record whole) — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
 nothing of it follows the final event. What of the input is published is a setting,
 `BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
