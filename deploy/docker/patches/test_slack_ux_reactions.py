@@ -677,19 +677,25 @@ class OpenCardsQueryTest(unittest.TestCase):
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
             "INSERT INTO task_events VALUES (1,'a','created','{\"creator_task_id\": null}'),"
             " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}'),"
-            " (4,'f','blocked','{}'),(5,'f','gave_up','{}'),(6,'g','gave_up','{}'),(7,'g','blocked','{}');"
+            " (4,'f','blocked','{}'),(5,'f','gave_up','{}'),(6,'g','gave_up','{}'),(7,'g','blocked','{}'),"
+            " (8,'h','gave_up','{}'),(9,'h','unblocked','{}'),(10,'i','gave_up','{}');"
             "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready'),"
-            " ('f','blocked'),('g','blocked');"
+            " ('f','blocked'),('g','blocked'),('h','ready'),('i','running');"
             "INSERT INTO kanban_notify_subs VALUES"
             " ('a','slack','C1','111.000'),('b','slack','C1','111.000'),('c','slack','C1','111.000'),"
             " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000'),"
-            " ('f','slack','C1','111.000'),('g','slack','C1','111.000');"
+            " ('f','slack','C1','111.000'),('g','slack','C1','111.000'),('h','slack','C1','111.000'),"
+            " ('i','slack','C1','111.000');"
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
-        # f's latest stop is a give-up; g gave up, was retried, and blocked on the user.
+        # f's latest stop is a give-up; g gave up, was retried, and blocked on the user;
+        # h gave up and was unblocked; i gave up and was moved back to running without one.
         self.assertEqual(
             sorted(rows),
-            [("a", "running", None, None), ("b", "blocked", "c", 0), ("f", "blocked", None, 1), ("g", "blocked", None, 0)],
+            [
+                ("a", "running", None, 0), ("b", "blocked", "c", 0), ("f", "blocked", None, 1),
+                ("g", "blocked", None, 0), ("h", "ready", None, 0), ("i", "running", None, 0),
+            ],
         )
 
     def _fake_hermes(self, paths, rows, reads, broken=()):

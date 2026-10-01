@@ -250,12 +250,16 @@ def check_board_read(module, root: Path) -> None:
         card(SECOND_BOARD, "open on the second board")
         _, asking = card(kb.DEFAULT_BOARD, "blocked on the user")
         _, parked = card(kb.DEFAULT_BOARD, "gave up")
+        _, revived = card(kb.DEFAULT_BOARD, "gave up, then unblocked")
         conn = kc.connect(board=kb.DEFAULT_BOARD)
         try:
             kb.block_task(conn, asking, reason="which cluster?")
             kb.block_task(conn, parked, reason="first stop")
             # The dispatcher's give-up writes this event; reached here directly.
             kb._append_event(conn, parked, "gave_up", {"failures": 2})
+            kb.block_task(conn, revived, reason="first stop")
+            kb._append_event(conn, revived, "gave_up", {"failures": 2})
+            kb.unblock_task(conn, revived)
         finally:
             conn.close()
         card(kb.DEFAULT_BOARD, "finished", done=True)
@@ -270,8 +274,8 @@ def check_board_read(module, root: Path) -> None:
         made_by = read[(kb.DEFAULT_BOARD, child)].creator
         if made_by != creator or read[(kb.DEFAULT_BOARD, fresh)].creator is not None:
             raise _fail(f"the kanban read does not see which card created a card: {made_by!r}")
-        stops = (read[(kb.DEFAULT_BOARD, asking)], read[(kb.DEFAULT_BOARD, parked)])
-        if [(c.status, c.gave_up) for c in stops] != [("blocked", False), ("blocked", True)]:
+        stops = [read[(kb.DEFAULT_BOARD, task)] for task in (asking, parked, revived)]
+        if [c.gave_up for c in stops] != [False, True, False] or stops[1].status != "blocked":
             raise _fail(f"the kanban read does not tell a give-up from a block on the user: {stops!r}")
     finally:
         for name, value in saved.items():

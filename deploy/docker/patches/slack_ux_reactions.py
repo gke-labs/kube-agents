@@ -86,14 +86,15 @@ DEFAULT_BOARD = "default"
 
 #: Cards subscribed to one Slack thread that have not reached a final status,
 #: with that status and the card whose worker created it, if one did: Hermes
-#: copies the creator's subscriptions onto the new card. ``blocked`` counts as
-#: open: it waits on the user and will run on.
+#: copies the creator's subscriptions onto the new card, and whether it sits
+#: parked by a give-up: still ``blocked``, with a ``gave_up`` as its latest stop.
+#: An unblock, or any move off ``blocked``, revives it, so either clears that.
 OPEN_CARDS_SQL = (
     "SELECT s.task_id, t.status, "
     "(SELECT json_extract(e.payload, '$.creator_task_id') FROM task_events e "
     "WHERE e.task_id = s.task_id AND e.kind = 'created'), "
-    "(SELECT e.kind FROM task_events e WHERE e.task_id = s.task_id "
-    "AND e.kind IN ('blocked', 'gave_up') ORDER BY e.id DESC LIMIT 1) = 'gave_up' "
+    "t.status = 'blocked' AND (SELECT e.kind FROM task_events e WHERE e.task_id = s.task_id "
+    "AND e.kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY e.id DESC LIMIT 1) = 'gave_up' "
     "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"
@@ -339,7 +340,9 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     cards its worker created, and each ask waiting on the card waits on those
     too: a follow-up filed with ``parents=[own id]`` starts only once the card
     completes, so it was not on the board when the turn ended. One blocked on
-    the user is kept and puts ⏸️ on the ask; one parked by a give-up is not. A
+    the user is kept and puts ⏸️ on the ask. One parked by a give-up is not, and
+    leaves the ask ✅ for the work it did: being subscribed to this thread, the
+    follow-up has posted its own "gave up" line in it, which is the failure. A
     give-up holds on nothing more: the card is parked, so a follow-up it gates
     cannot start, and the ask is ❌ whatever the rest do. A failed read settles
     as though there were none. A card filed under this one after its
