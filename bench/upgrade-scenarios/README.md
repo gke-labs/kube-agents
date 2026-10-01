@@ -77,33 +77,33 @@ Verdicts: reproduced 13, partial 4, no break 1, not reproduced 1, symptom reprod
 
 Every insight or recommendation published on a scenario cluster, including ones unrelated to its scenario:
 
-| Cluster              | Subtypes                    | Last refresh         |
-| -------------------- | --------------------------- | -------------------- |
-| `gemma-gpu`          | none                        |                      |
-| `gemma-gpu-upgraded` | none                        |                      |
-| `seeded-a`           | none                        |                      |
-| `upg-01`             | none                        |                      |
-| `upg-02b`            | none                        |                      |
-| `upg-03b`            | none                        |                      |
-| `upg-04b`            | none                        |                      |
-| `upg-05`             | none                        |                      |
-| `upg-06h`            | none                        |                      |
-| `upg-07`             | none                        |                      |
-| `upg-08h`            | none                        |                      |
-| `upg-09`             | none                        |                      |
-| `upg-10`             | none                        |                      |
-| `upg-11b`            | none                        |                      |
-| `upg-12b`            | none                        |                      |
-| `upg-13b`            | none                        |                      |
-| `upg-14b`            | none                        |                      |
-| `upg-15b`            | none                        |                      |
-| `upg-16h`            | none                        |                      |
-| `upg-17b`            | none                        |                      |
-| `upg-18i`            | none                        |                      |
-| `upg-18k`            | NODE_SA_MISSING_PERMISSIONS | 2026-09-30T00:00:00Z |
-| `upg-18m`            | NODE_SA_MISSING_PERMISSIONS | 2026-09-30T00:00:00Z |
-| `upg-19c`            | none                        |                      |
-| `upg-20d`            | none                        |                      |
+| Cluster (zone)                       | Subtypes                    | Last refresh         |
+| ------------------------------------ | --------------------------- | -------------------- |
+| `gemma-gpu-upgraded` (us-central1-a) | none                        |                      |
+| `gemma-gpu` (us-central1-a)          | none                        |                      |
+| `seeded-a` (us-central1-a)           | none                        |                      |
+| `upg-01` (us-central1-a)             | none                        |                      |
+| `upg-02b` (us-central1-a)            | none                        |                      |
+| `upg-03b` (us-central1-a)            | none                        |                      |
+| `upg-04b` (us-central1-a)            | none                        |                      |
+| `upg-05` (us-central1-a)             | none                        |                      |
+| `upg-06h` (us-central1-a)            | none                        |                      |
+| `upg-07` (us-central1-a)             | none                        |                      |
+| `upg-08h` (us-central1-a)            | none                        |                      |
+| `upg-09` (us-central1-a)             | none                        |                      |
+| `upg-10` (us-central1-a)             | none                        |                      |
+| `upg-11b` (us-central1-a)            | none                        |                      |
+| `upg-12b` (us-central1-a)            | none                        |                      |
+| `upg-13b` (us-central1-a)            | none                        |                      |
+| `upg-14b` (us-central1-a)            | none                        |                      |
+| `upg-15b` (us-central1-a)            | none                        |                      |
+| `upg-16h` (us-central1-a)            | none                        |                      |
+| `upg-17b` (us-central1-a)            | none                        |                      |
+| `upg-18i` (us-east1-d)               | none                        |                      |
+| `upg-18k` (us-central1-b)            | NODE_SA_MISSING_PERMISSIONS | 2026-09-30T00:00:00Z |
+| `upg-18m` (us-west1-a)               | NODE_SA_MISSING_PERMISSIONS | 2026-09-30T00:00:00Z |
+| `upg-19c` (us-central1-c)            | none                        |                      |
+| `upg-20d` (us-central1-c)            | none                        |                      |
 
 <!-- END TABLE -->
 
@@ -253,8 +253,9 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 
 1. Creates the cluster at the minor the scenario needs (a minor the channel no longer offers stops the run before
    anything is created, and an upgrade step whose target version cannot be read stops the same way), stops unless the cluster carries the campaign's label and
-   was built for this scenario (its `scenario` label is `NN`, or the base or an earlier lettered leg that `NN` extends;
-   a later or unrelated sibling and another run's hold cluster are refused), and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
+   was built for this scenario (its `scenario` label is `NN`, or the one run the scenario file declares it extends,
+   `EXTENDS=10` for 10b and `EXTENDS=14b` for 14c; every other cluster, lettered siblings and hold clusters included, is
+   refused), and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
    every other scenario writes its manifests inline. If any step of the plant fails, the run stops here, before
    the upgrade, with a "precondition not met" note in the evidence.
@@ -262,7 +263,7 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
    upgrade only the control plane. Scenarios 14 and 15 show the symptom with no upgrade. Of the variants, 13b
    upgrades only a node pool (a patch inside 1.31), 14c upgrades the control plane, asks for the pool upgrade
    and runs the migration GKE demands, and the holds upgrade nothing. A cluster change that fails stops the run;
-   one GKE refuses because another operation is running is retried up to five times first. The refusals 10, 10b
+   one GKE refuses because another operation is running is tried again, five attempts in all. The refusals 10, 10b
    and 14c ask for on purpose are the experiment, and are recorded instead, after any other operation has ended; a
    refusal because one was still running stops the run rather than standing in for the result.
 4. Records the after-state.

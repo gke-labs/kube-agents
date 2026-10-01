@@ -75,7 +75,7 @@ def main():
             "| --- | --- | --- | --- | --- | --- | --- |"]
     caught = documented = 0; errors = []; csv_rows = []
     for n, (title, verdict, efile, quote, located, subtypes) in SCENARIOS.items():
-        clusters = [e.split("@")[0] for e in located]
+        clusters = located   # name@zone, the key recommender.json uses
         epath = f"{H}/{EVIDENCE_DIR}/{efile}"
         if not os.path.exists(epath): errors.append(f"{n}: evidence file missing: {efile}"); continue
         text = open(epath).read()
@@ -84,13 +84,13 @@ def main():
         hits = sorted({s for c in clusters for s in published.get(c, set()) if s in subtypes})
         def cell(c):
             match = sorted(published.get(c, set()) & set(subtypes)); other = sorted(published.get(c, set()) - set(subtypes))
-            return f"`{c}`: " + (", ".join(match) if match else "no matching insight") + (f" (unrelated: {len(other)})" if other else "")
+            return f"`{c.split('@')[0]}`: " + (", ".join(match) if match else "no matching insight") + (f" (unrelated: {len(other)})" if other else "")
         where = "; ".join(cell(c) for c in clusters)
         documented += bool(subtypes); caught += bool(hits)
         verdict_cell = "caught (" + ", ".join(hits) + ")" if hits else ("not yet" if subtypes else "no check exists")
         rows.append("| " + " | ".join(esc(str(c)) for c in (n, title, verdict, proof, ", ".join(subtypes) or "none documented", where, verdict_cell)) + " |")
         csv_rows.append([n, title, verdict, f"{EVIDENCE_DIR}/{efile}", quote.replace("\t", " "), ", ".join(subtypes) or "none documented",
-                         ", ".join(clusters), where.replace("`", ""), verdict_cell])
+                         ", ".join(e.split("@")[0] for e in clusters), where.replace("`", ""), verdict_cell])
     tally = {}
     for v in SCENARIOS.values(): tally[v[1].split(" (")[0]] = tally.get(v[1].split(" (")[0], 0) + 1
     verdicts = "Verdicts: " + ", ".join(f"{k} {c}" for k, c in sorted(tally.items(), key=lambda kv: -kv[1])) + "."
@@ -99,11 +99,11 @@ def main():
                f"(newest refresh {rec.get('newest_refresh', 'n/a')}). **Caught: {caught} of {len(SCENARIOS)}.** "
                f"GKE documents a check for {documented} of the {len(SCENARIOS)}.")
     every = ["", "Every insight or recommendation published on a scenario cluster, including ones unrelated to its scenario:", "",
-             "| Cluster | Subtypes | Last refresh |", "| --- | --- | --- |"]
-    ours = sorted({e.split("@")[0] for v in SCENARIOS.values() for e in v[4]})
+             "| Cluster (zone) | Subtypes | Last refresh |", "| --- | --- | --- |"]
+    ours = sorted({e for v in SCENARIOS.values() for e in v[4]})
     for c in ours:
         items = rec.get("clusters", {}).get(c, [])
-        every.append(f"| `{c}` | {', '.join(sorted({i['subtype'] for i in items})) or 'none'} | {max((i['lastRefreshTime'] for i in items), default='')} |")
+        every.append(f"| `{c.split('@')[0]}` ({c.split('@')[1]}) | {', '.join(sorted({i['subtype'] for i in items})) or 'none'} | {max((i['lastRefreshTime'] for i in items), default='')} |")
     if errors:
         for e in errors: print("ERROR", e, file=sys.stderr)
         return 1

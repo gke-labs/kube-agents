@@ -1,7 +1,7 @@
 {
  "read_at": "2026-10-01T0231Z",
  "newest_refresh": "2026-09-30T00:00:00Z",
- "raw": "recommender/2026-10-01T0231Z",
+ "raw": "evidence/recommender/2026-10-01T0231Z",
  "zones": [
   "asia-east1-a",
   "asia-southeast1-b",
@@ -17,7 +17,7 @@
   "us-west1-b"
  ],
  "clusters": {
-  "upg-18k": [
+  "upg-18k@us-central1-b": [
    {
     "kind": "insight",
     "subtype": "NODE_SA_MISSING_PERMISSIONS",
@@ -35,7 +35,7 @@
     "name": "projects/<PROJECT_NUMBER>/locations/us-central1-b/recommenders/google.container.DiagnosisRecommender/recommendations/7d211e64-afc4-4acc-ad5e-35d49e096d07"
    }
   ],
-  "upg-18m": [
+  "upg-18m@us-west1-a": [
    {
     "kind": "insight",
     "subtype": "NODE_SA_MISSING_PERMISSIONS",

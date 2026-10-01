@@ -25,8 +25,8 @@ def scrub(s):
         if value: s = s.replace(value, placeholder)
     return s
 seen = collections.defaultdict(dict); newest = ""; unmatched = []
-def cluster_of(path):
-    m = re.search(r"/clusters/([^/]+)", path or ""); return m.group(1) if m else None
+def cluster_of(path):   # name@zone: GKE allows the same cluster name in two zones, and the table keys on both
+    m = re.search(r"/locations/([^/]+)/clusters/([^/]+)", path or ""); return f"{m.group(2)}@{m.group(1)}" if m else None
 for kind, pattern, subkey, targets in (("insight", "insights-*.json", "insightSubtype", lambda r: r.get("targetResources", [])),
                                      ("recommendation", "recommendations-*.json", "recommenderSubtype",
                                       lambda r: r.get("targetResources", []) + [o.get("resource", "") for g in r.get("content", {}).get("operationGroups", []) for o in g.get("operations", [])])):
@@ -45,7 +45,7 @@ zones = sorted(re.sub(r"^insights-|\.json$", "", f.rsplit("/", 1)[-1]) for f in 
 result = {"read_at": out_dir.rsplit("/", 1)[-1], "newest_refresh": newest, "raw": out_dir.split("/evidence/", 1)[-1], "zones": zones,
           "clusters": {c: sorted(v.values(), key=lambda x: (x["subtype"], x["kind"])) for c, v in sorted(seen.items())}}
 open(dest, "w").write(json.dumps(result, indent=1) + "\n")
-named = [c for c in result["clusters"] if project_id in c or (project_number and project_number in c)]
+named = [c for c in result["clusters"] if project_id in c.split("@")[0] or (project_number and project_number in c.split("@")[0])]
 print("read at", result["read_at"], "| newest refresh:", newest)
 for c, items in result["clusters"].items(): print(f"{c:22s}", sorted({i["subtype"] for i in items}))
 print(len(unmatched), "records named no cluster and are in no row:")

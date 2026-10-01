@@ -3,7 +3,7 @@
 # 10b: the kubelet skew limit. upg-10 already runs a 1.34 control plane over 1.31 nodes (three minors,
 # the upstream maximum); this asks GKE for a 1.35 control plane over the same nodes (four minors) and,
 # if GKE allows it, checks what still works against the old kubelets. Run as: CLUSTER=upg-10 bash run.sh 10b
-CHANNEL=EXTENDED; START=1.34; POOL_FLAGS=""
+CHANNEL=EXTENDED; START=1.34; POOL_FLAGS=""; EXTENDS=10   # runs on scenario 10's cluster
 [ "$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)' 2>/dev/null)" = 10 ] && pool_exists work-pool ||
   { echo "10b extends scenario 10's cluster, and $CLUSTER is not it (no scenario=10 label or no work-pool); run as: CLUSTER=upg-10 bash run.sh 10b" >&2; exit 1; }
 plant(){ pause_deploy steady 1; }

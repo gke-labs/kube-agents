@@ -14,16 +14,14 @@ NODE_DISK_GB=32   # every pool the harness or a hold creates
 require_scenario_cluster(){ local p; p=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.purpose)' 2>/dev/null) ||
     { echo "refusing: cannot describe $CLUSTER in $ZONE (missing, or its creation failed)" >&2; exit 1; }
   [ "$p" = "$SCENARIO_LABEL" ] || { echo "refusing: $CLUSTER in $ZONE is not labelled purpose=$SCENARIO_LABEL (label: '$p')" >&2; exit 1; }; }
-# require_own_cluster <NN>: the cluster's scenario label (set by run.sh at creation) must be NN itself, or a run that NN
-# extends: the plain base (CLUSTER=upg-10 bash run.sh 10b) or an earlier lettered leg of the same number (CLUSTER=upg-14b
-# bash run.sh 14c). A later or unrelated sibling (upg-13b for run.sh 13, upg-18m for run.sh 18k) is refused, and so is a
-# hold cluster (label ending in h) by anything but its own scenario, since a change there ends the multi-day hold the
-# Recommender waits on.
+# require_own_cluster <NN>: the cluster's scenario label (set by run.sh at creation) must be NN itself, or the one run NN
+# declares it extends (EXTENDS=10 in 10b.sh, EXTENDS=14b in 14c.sh). Letters alone prove nothing: 18i, 18k and 18m are
+# independent runs in other zones, a hold cluster belongs to its own scenario, and any other cluster of the campaign has
+# been through its own upgrade already.
 require_own_cluster(){ local nn=$1 label; label=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)') ||
     { echo "refusing: cannot read $CLUSTER's scenario label" >&2; exit 1; }
-  local base=${nn%%[a-z]*} nsuf=${nn#"${nn%%[a-z]*}"} lbase=${label%%[a-z]*} lsuf=${label#"${label%%[a-z]*}"}
-  [ "$label" = "$nn" ] || { [ -n "$nsuf" ] && [ "$lbase" = "$base" ] && [[ $lsuf != *h ]] && [[ "$lsuf" < "$nsuf" ]]; } ||
-    { echo "refusing: $CLUSTER was built for scenario '$label', which is not $nn or an earlier leg of it that $nn extends" >&2; exit 1; }; }
+  [ "$label" = "$nn" ] || { [ -n "${EXTENDS:-}" ] && [ "$label" = "$EXTENDS" ]; } ||
+    { echo "refusing: $CLUSTER was built for scenario '$label', which is not $nn${EXTENDS:+ or $EXTENDS, the run $nn extends}" >&2; exit 1; }; }
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 in_days(){ date -u -v+"$1"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "+$1 days" +%Y-%m-%dT%H:%M:%SZ; }   # BSD date, then GNU
 # ev returns the command's own exit status, not tee's, so a caller can stop on a failed step.
@@ -43,23 +41,25 @@ require_version(){ case "$1" in ""|"$NO_PATCH_MARKER"*) note final "precondition
 # ops_running prints the operations running on the cluster, or the word "unknown" when the list itself failed (a 429, an
 # expired token), so no caller reads a failed read as an idle cluster: wait_ops keeps waiting through it, and after
 # LIST_FAILURES_MAX failed reads in a row it stops the run rather than guess.
-LIST_FAILURES_MAX=40   # 20 minutes of failed reads at wait_ops's 30 s cadence
+OPS_POLL_INTERVAL=30; OPS_LOG_EVERY=10   # wait_ops polls every 30 s and logs every tenth poll
+LIST_FAILURES_MAX=40   # 20 minutes of failed reads at that cadence
+OP_APPEAR_INTERVAL=5; AVAIL_POLL_INTERVAL=10; API_POLL_INTERVAL=5
 ops_running(){ local out; out=$(G container operations list --zone "$ZONE" --filter="(targetLink~clusters/${CLUSTER}\$ OR targetLink~clusters/${CLUSTER}/) AND status=RUNNING" --format='value(operationType,name)' 2>/dev/null) || { echo unknown; return; }; echo "$out"; }
 wait_ops(){ local n=0 f=0 o; while o=$(ops_running); [ -n "$o" ]; do
     if [ "$o" = unknown ]; then f=$((f+1)); echo "# $(ts) operations list failed ($f); treating the cluster as busy"; [ $f -lt $LIST_FAILURES_MAX ] || { note final "operations list failed $f times in a row; stopping rather than guess whether the upgrade ended"; exit 1; }; else f=0; fi
-    sleep 30; n=$((n+1)); [ $((n%10)) -eq 0 ] && echo "# $(ts) still running: $(echo "$o" | tr '\n' ' ')"; done; }
+    sleep $OPS_POLL_INTERVAL; n=$((n+1)); [ $((n%OPS_LOG_EVERY)) -eq 0 ] && echo "# $(ts) still running: $(echo "$o" | tr '\n' ' ')"; done; }
 # await_op: an --async upgrade can return before its operation is listed; wait up to OP_APPEAR_TIMEOUT seconds for one.
 OP_APPEAR_TIMEOUT=120
-await_op(){ local t=0; while [ -z "$(ops_running)" ] && [ $t -lt $OP_APPEAR_TIMEOUT ]; do sleep 5; t=$((t+5)); done; }
-# poll_avail <scenario> <namespace> <label> <stop-file>: every 10 s until <stop-file> exists, record each pod's
+await_op(){ local t=0; while [ -z "$(ops_running)" ] && [ $t -lt $OP_APPEAR_TIMEOUT ]; do sleep $OP_APPEAR_INTERVAL; t=$((t+OP_APPEAR_INTERVAL)); done; }
+# poll_avail <scenario> <namespace> <label> <stop-file>: every AVAIL_POLL_INTERVAL seconds until <stop-file> exists, record each pod's
 # node, phase, readiness and deletion stamp (node/phase/ready/deleting), so a moment with zero serving
 # replicas is on record even if it lasts 20 s. A terminating pod can still report Ready=True, but a
 # Service has already dropped it, so "serving" is Ready=True with an empty deletion stamp. upgrade_pool creates
 # the stop file once the pool upgrade and every other operation on the cluster have ended, so an operation that
 # was already running (GKE's own default-pool upgrade, say) cannot end the poll before the pool upgrade starts.
 poll_avail(){ local sc=$1 ns=$2 sel=$3 stop=$4; local f="$EVID/$sc-availability.txt"; echo "# $(ts) poll start $ns $sel" >>"$f"
-  until [ -e "$stop" ] || ! kill -0 $$ 2>/dev/null; do echo "$(ts) $(K -n "$ns" get pods -l "$sel" -o jsonpath='{range .items[*]}{.spec.nodeName}/{.status.phase}/{.status.conditions[?(@.type=="Ready")].status}/{.metadata.deletionTimestamp} {end}' 2>&1)" >>"$f"; sleep 10; done; echo "# $(ts) poll end" >>"$f"; }
-# poll_api <scenario> <stop-file>: every 5 s until <stop-file> exists, record whether the API server answers (entry 11).
+  until [ -e "$stop" ] || ! kill -0 $$ 2>/dev/null; do echo "$(ts) $(K -n "$ns" get pods -l "$sel" -o jsonpath='{range .items[*]}{.spec.nodeName}/{.status.phase}/{.status.conditions[?(@.type=="Ready")].status}/{.metadata.deletionTimestamp} {end}' 2>&1)" >>"$f"; sleep $AVAIL_POLL_INTERVAL; done; echo "# $(ts) poll end" >>"$f"; }
+# poll_api <scenario> <stop-file>: every API_POLL_INTERVAL seconds until <stop-file> exists, record whether the API server answers (entry 11).
 # Each probe gives up after API_PROBE_TIMEOUT, not K's 30 s, so a control plane that hangs rather than refuses costs one
 # short sample instead of stretching the interval; the stamp is taken when the probe returns, so a DOWN line is at most
 # that timeout late.
@@ -69,15 +69,17 @@ API_PROBE_TIMEOUT=3s
 # script that started it is gone ($$ is the script's PID even in this background subshell), so an interrupted run
 # leaves no poller behind.
 poll_api(){ local sc=$1 stop=$2; local f="$EVID/$sc-api.txt"; echo "# $(ts) api poll start" >>"$f"
-  until [ -e "$stop" ] || ! kill -0 $$ 2>/dev/null; do if K --request-timeout=$API_PROBE_TIMEOUT get --raw /version >/dev/null 2>&1; then echo "$(ts) up" >>"$f"; else echo "$(ts) DOWN" >>"$f"; fi; sleep 5; done; echo "# $(ts) api poll end" >>"$f"; }
-BUSY_RETRIES=5; BUSY_WAIT=30
+  until [ -e "$stop" ] || ! kill -0 $$ 2>/dev/null; do if K --request-timeout=$API_PROBE_TIMEOUT get --raw /version >/dev/null 2>&1; then echo "$(ts) up" >>"$f"; else echo "$(ts) DOWN" >>"$f"; fi; sleep $API_POLL_INTERVAL; done; echo "# $(ts) api poll end" >>"$f"; }
+BUSY_ATTEMPTS=5; BUSY_WAIT=30   # attempts in all, so four retries
 MASTER_UPGRADE_TIMEOUT=10800   # seconds; gcloud's own default for a blocking upgrade is 3600, which a slow one can pass
 # retry_busy <track> <ev command...>: GKE refuses a cluster change while any other operation runs on the cluster
 # ("incompatible operation"): wait for it, retry. <track> is the ev track the command writes to, where the notes go too.
 # Returns 1 when the command fails for any other reason, or once every retry was refused, so the caller stops instead
 # of recording a change that never happened.
-retry_busy(){ local sc=$1 i; shift; for i in $(seq 1 $BUSY_RETRIES); do wait_ops; "$@" && return 0
-  tail -4 "$EVID/$sc.txt" | grep -q "incompatible operation" || { note "$sc" "the command failed (see $sc.txt); stopping"; return 1; }; note "$sc" "refused while another operation ran; retry $i"; sleep $BUSY_WAIT; done; note "$sc" "gave up after $BUSY_RETRIES refusals; the command did not run"; return 1; }
+retry_busy(){ local sc=$1 i; shift; for i in $(seq 1 $BUSY_ATTEMPTS); do wait_ops; "$@" && return 0
+  tail -4 "$EVID/$sc.txt" | grep -q "incompatible operation" || { note "$sc" "the command failed (see $sc.txt); stopping"; return 1; }
+  [ "$i" -lt "$BUSY_ATTEMPTS" ] || break; note "$sc" "refused while another operation ran (attempt $i of $BUSY_ATTEMPTS); retrying in ${BUSY_WAIT}s"; sleep $BUSY_WAIT; done
+  note "$sc" "gave up after $BUSY_ATTEMPTS refusals; the command did not run"; return 1; }
 # api_summary: the API poller's last block, as up and DOWN counts; upgrade_master records it after every control-plane upgrade.
 api_summary(){ local f="$EVID/zonal-api-api.txt"; echo "samples=$(since_last_start "$f" | grep -vc '^#') down=$(since_last_start "$f" | grep -c DOWN) up=$(since_last_start "$f" | grep -c ' up')"; since_last_start "$f" | grep DOWN | head -3; }
 upgrade_master(){ local v=$1 stop="$KCFG_DIR/$CLUSTER.$TRACK.master-done"; require_version "$v"; rm -f "$stop"; note upgrade "master -> $v"; poll_api zonal-api "$stop" & local p=$!; retry_busy upgrade ev upgrade "master-$v" G container clusters upgrade "$CLUSTER" --master --cluster-version "$v" --zone "$ZONE" --quiet --timeout "$MASTER_UPGRADE_TIMEOUT"; local rc=$?; touch "$stop"; wait $p; rm -f "$stop"; [ $rc -eq 0 ] || exit 1; ev upgrade "master-$v-api" api_summary; wait_ops; ev upgrade "master-$v-version" G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; }

@@ -14,7 +14,7 @@ note cluster "scenario $NN on $CLUSTER: $CHANNEL $START_VERSION"
 describe_exists "cluster $CLUSTER" G container clusters describe "$CLUSTER" --zone "$ZONE" || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=$SCENARIO_LABEL,scenario=$NN --quiet ${CREATE_FLAGS:-}
 require_scenario_cluster
 require_own_cluster "$NN"   # and the scenario's own cluster, never another run's hold cluster (common.sh says the rule)
-if [ -n "${POOL_FLAGS:-}" ]; then pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$START_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --quiet ${POOL_FLAGS} ||
+if [ -n "${POOL_FLAGS:-}" ]; then pool_exists work-pool || retry_busy cluster ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$START_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --quiet ${POOL_FLAGS} ||
   { note final "precondition not met: work-pool was not created; stopping before the plant"; exit 1; }; fi
 G container clusters get-credentials "$CLUSTER" --zone "$ZONE" --quiet >/dev/null 2>&1
 ev baseline nodes K get nodes -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion,POOL:.metadata.labels.cloud\.google\.com/gke-nodepool'
