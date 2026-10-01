@@ -27,11 +27,16 @@ Neither reads versions against a target.
 ```bash
 ./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
   <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
-  [--project <project>]... [--target-version <version>] [--rollout-in-progress] \
+  [--project <project>]... [--cluster <name>]... [--target-version <version>] [--rollout-in-progress] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
+- `--cluster` is repeatable and, when given, restricts the report to those clusters, as
+  `<location>/<name>` or a bare name; every other member of the projects is skipped, reads
+  included, and the rollout record is neither read nor written, since a narrowed read would file
+  every member it did not name as gone. The fleet-audit collector passes the clusters it found
+  behind.
 - `--project` is repeatable and, when given, is the whole scope; on an install with a declared scope each one must be a
   project the `fleet_scope` tool lists and the `collector_args` must be passed beside it, or the script refuses. Otherwise `--scope-projects`, passed once as one
   comma-separated list, is the whole scope: the install's declared scope as the platform_control `fleet_scope`
@@ -63,7 +68,10 @@ It changes nothing in GCP or in any cluster; the only things it writes are its o
 needs, and the `--output` file. A failed or timed-out read is listed under the table and sets
 exit code 1; the other projects, locations and members are still reported. A project whose own Kubernetes
 Engine API is off holds no cluster and is not a failed read; a refusal naming another project,
-such as a quota project, is one.
+such as a quota project, is one. The weekly upgrade audit's collector also runs the script, with
+`--readiness --cluster <location>/<name>`, once per behind cluster: that run writes
+`upgrade-readiness_<project>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
+neither reads nor writes the rollout record, so the record above is untouched by it.
 
 ## Read the table
 
