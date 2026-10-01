@@ -937,9 +937,24 @@ class ReportTest(unittest.TestCase):
         self.assertIn("twice", doc["ended_early"])
         self.assertIn("error", doc["outcomes"][PROJECT])
 
+    def test_a_hand_run_with_one_refused_close_reports_its_closes_and_its_fault(self):
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls, close_errors={2: _http_error(422, body=b'{"message":"Validation Failed"}')})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github)), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"], doc["closed"], doc["failed"]), (1, "failed", 2, 1))
+        self.assertEqual(doc["outcomes"][PROJECT]["closed"], 2)
+        self.assertIn("#2", doc["outcomes"][PROJECT]["error"])
+
     def test_no_report_path_and_no_artifacts_dir_writes_nothing(self):
         with mock.patch.dict(sweeper.os.environ, {}, clear=True):
             self.assertIsNone(sweeper.default_report_path())
+        # And main without a path and without the variable writes nothing:
+        # ExitCodeTest._main asserts write_report is never called on that path.
         with mock.patch.dict(sweeper.os.environ, {sweeper.ARTIFACTS_ENV: "/tmp/artifacts"}):
             self.assertEqual(sweeper.default_report_path(), "/tmp/artifacts/pull-sweep.json")
 
@@ -1156,11 +1171,14 @@ class ExitCodeTest(unittest.TestCase):
         cluster = _Cluster(github or _GitHub(), boskos or _Boskos(["kube-agents-evals-7"]))
         # The handler main() installs is process-wide; patched so the unittest
         # runner keeps its own SIGTERM behaviour after this class.
-        with mock.patch.object(sweeper.urllib.request, "urlopen", cluster), mock.patch.object(
+        # No --report, and no ARTIFACTS from the shell: a run here writes no file.
+        env = {k: v for k, v in sweeper.os.environ.items() if k != sweeper.ARTIFACTS_ENV}
+        with mock.patch.dict(sweeper.os.environ, env, clear=True), mock.patch.object(sweeper.urllib.request, "urlopen", cluster), mock.patch.object(
             sweeper.subprocess, "run", gcloud or _Gcloud()
-        ), mock.patch.object(sweeper.signal, "signal") as installed:
+        ), mock.patch.object(sweeper.signal, "signal") as installed, mock.patch.object(sweeper, "write_report") as written:
             rc = sweeper.main(argv + ["--ci-deploy-script", str(_CI_DEPLOY)])
         installed.assert_called_once_with(sweeper.signal.SIGTERM, sweeper._terminate)
+        written.assert_not_called()
         return rc
 
     def test_a_clean_pool_sweep_exits_zero(self):

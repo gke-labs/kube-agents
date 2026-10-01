@@ -405,7 +405,7 @@ def scoped_token(app_id, project, repo, runner=subprocess.run):
             raise SweepError(
                 "App %s cannot mint %s on %s (HTTP %d). Usually the installation no longer "
                 "holds the permission, and an organisation owner restores it in settings; the "
-                "same code also answers a suspended installation and a secondary rate limit."
+                "same code also answers a suspended installation."
                 % (app_id, sorted(TOKEN_PERMISSIONS), repo, exc.code)
             )
         raise SweepError(
@@ -798,8 +798,12 @@ def _run(args, run):
             return 1, error
         return 0, None
     except (SweepError, boskos_pool.BoskosError) as exc:
-        if args.project and getattr(exc, "closed", 0):
-            run["closed"][args.project] = exc.closed
+        if args.project:
+            # The hand run's one project: its closes and its fault, as the
+            # pool walk records them for each of its projects.
+            if getattr(exc, "closed", 0):
+                run["closed"][args.project] = exc.closed
+            run["failures"][args.project] = str(exc)
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1, str(exc)
     except urllib.error.HTTPError as exc:

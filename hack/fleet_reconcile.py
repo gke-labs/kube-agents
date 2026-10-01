@@ -464,7 +464,13 @@ def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known
         boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True, release_failures=release_failures)
     finally:
         for project, reason in release_failures.items():
-            outcomes[project] = (OUTCOME_FAILED, reason)
+            # A project the termination landed in keeps its interrupted outcome
+            # (and its force-unlock hint); the release failure joins its reason.
+            outcome, detail = outcomes.get(project) or (None, None)
+            if outcome == OUTCOME_INTERRUPTED:
+                outcomes[project] = (OUTCOME_INTERRUPTED, "%s; %s" % (detail, reason))
+            else:
+                outcomes[project] = (OUTCOME_FAILED, reason)
             _line(project, outcomes[project])
     return outcomes
 

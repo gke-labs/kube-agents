@@ -387,6 +387,27 @@ class LeaseTest(unittest.TestCase):
         self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
         self.assertIn("release failed", outcomes[P7][1])
 
+    def test_a_terminated_project_whose_release_also_fails_keeps_its_interrupted_outcome(self):
+        # The force-unlock hint must survive: the release failure joins the
+        # interrupted reason rather than replacing it.
+        def tofu(argv, **_):
+            if "kube-agents-evals-8-tf-state" in " ".join(argv):
+                raise boskos_pool.Terminated("signal 2")
+            if argv[1] == "plan":
+                return subprocess.CompletedProcess(argv, reconcile.PLAN_HAS_CHANGES, "", "")
+            if argv[1] == "show":
+                return subprocess.CompletedProcess(argv, 0, UPDATE_ONLY, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        boskos = _Boskos(free=[P7, P8], release_errors={P8: _http_error(502, BOSKOS)})
+        outcomes = {}
+        with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(boskos_pool.Terminated):
+                reconcile.reconcile_pool(BOSKOS, OWNER, len(KNOWN), runner=tofu, known=KNOWN, outcomes=outcomes)
+        self.assertEqual(outcomes[P8][0], reconcile.OUTCOME_INTERRUPTED)
+        self.assertIn("force-unlock", outcomes[P8][1])
+        self.assertIn("release failed", outcomes[P8][1])
+
     def test_no_lease_asks_boskos_nothing_and_takes_a_project_outside_the_pool(self):
         # The dev-project path: no Boskos, and no mapping check, since the
         # check exists only to stop a typo reading as busy at Boskos.
