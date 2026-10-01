@@ -631,6 +631,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// steer. Text only - a programmatic cancel keeps its intent whatever
 	// its text says.
 	sessionRest, sessionCmd := isSessionCommand(msg.Text)
+	if sessionCmd && g.spawner != nil && g.cfg.DefaultAddressee == RouteSession &&
+		sessionRest != "" && !isSessionOff(sessionRest) {
+		// Post-flip, every conversation is a session already, so
+		// "/session <text>" is <text>: the ordinary turn it would have been
+		// without the prefix, not a confirmation that drops the ask.
+		msg.Text, sessionCmd = sessionRest, false
+	}
 	switch {
 	case msg.Intent == "" && sessionCmd:
 		if !g.sessionCommand(ctx, rec, msg, sessionRest, principal, authority) {
@@ -1038,11 +1045,16 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // when the turn was refused part-way (the cap, or a previous task that could
 // not be closed) and the in-memory route change must not persist.
 func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, rest, principal string, authority []byte) bool {
-	if g.spawner == nil {
+	off := isSessionOff(rest)
+	// The way back is answered even with no spawner: a record left
+	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
+	// shape) would otherwise publish every ask to an addressee nothing
+	// serves, with no user-reachable way out. retireIncarnation tolerates a
+	// nil spawner; only the on-forms need one.
+	if g.spawner == nil && !(off && rec.SessionRouted) {
 		g.post(rec.Key, "🤷 sessions are not enabled on this install")
 		return true
 	}
-	off := isSessionOff(rest)
 	if g.cfg.DefaultAddressee == RouteSession {
 		// Post-flip: every conversation is a session already.
 		if off {
@@ -1058,10 +1070,12 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
 			return true
 		}
-		if running {
-			// The running task may be the platform's (the route was turned on
-			// mid-task), so name it neutrally.
-			g.post(rec.Key, "⚠️ a task is still running — `stop` it first, then `/session off`")
+		if running && rec.AddressedToOwnSession() {
+			// The refusal protects a running SESSION task's pod: retiring it
+			// would delete the pod out from under the task. A platform task
+			// running on a record that was marked mid-task has no pod to
+			// lose and keeps its addressee, so the way back goes through.
+			g.post(rec.Key, "⚠️ a session task is still running — `stop` it first, then `/session off`")
 			return true
 		}
 		if !g.retireIncarnation(ctx, rec, "session off") {
@@ -1160,6 +1174,16 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 	now := time.Now()
 	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
 		return true, now.Add(g.cfg.IdleTTL), nil
+	}
+	if rec.SessionRouted {
+		// A thread bound by /session is a session thread while it is active,
+		// task or no task: the Slack adapter admits an unmentioned reply only
+		// where this says so, and the ack after a bare /session promises the
+		// next message opens the pod. LastActivity is the right clock here
+		// because the binding is the record's own; it clears on /session off.
+		if until := rec.LastActivity.Add(g.cfg.IdleTTL); now.Before(until) {
+			return true, until, nil
+		}
 	}
 	if len(rec.Tasks) > 0 {
 		// The last TASK's activity, not the record's: LastActivity moves on

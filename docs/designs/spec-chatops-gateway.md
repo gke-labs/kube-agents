@@ -293,7 +293,10 @@ either. Without a spawner, and on an install whose default is already the sessio
 forms answer with a note and change nothing; `/session <text>` while a task is still running turns
 the route on and holds the text. On Slack a leading slash belongs to the Slack client, which
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
-stripped before the gateway reads the text. It is a debugging and opt-in door for the transition,
+stripped before the gateway reads the text, and a thread bound by `/session` counts as a session
+thread for the adapter's unmentioned-reply rule while it is active, so the follow-up needs no
+mention. The way back is answered even on an install whose spawner has since been disarmed, so a
+record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
 mint, the relay of the child's events into the conversation, and the wake-up turn on the

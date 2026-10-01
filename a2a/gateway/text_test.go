@@ -104,7 +104,7 @@ func TestIsSessionCommand(t *testing.T) {
 			t.Errorf("isSessionCommand(%q) = (%q, true), want false", in, got)
 		}
 	}
-	for _, rest := range []string{"off", "OFF", " off "} {
+	for _, rest := range []string{"off", "OFF", " off ", "off.", "off!", "Off,"} {
 		if !isSessionOff(rest) {
 			t.Errorf("isSessionOff(%q) = false, want true", rest)
 		}

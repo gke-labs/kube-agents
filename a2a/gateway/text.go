@@ -149,8 +149,10 @@ func isSessionCommand(text string) (string, bool) {
 }
 
 // isSessionOff reports whether a /session argument is the way back.
+// Normalized like isStop, so "off." and "Off!" are the way back too and
+// never a first turn that opens the pod the user meant to leave.
 func isSessionOff(rest string) bool {
-	return strings.EqualFold(strings.TrimSpace(rest), slashOffWord)
+	return normalize(rest) == slashOffWord
 }
 
 var stopWords = map[string]bool{

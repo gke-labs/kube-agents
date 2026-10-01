@@ -1937,3 +1937,117 @@ func TestSessionStatusIsAFirstTurn(t *testing.T) {
 		t.Fatalf("task text = %q", got)
 	}
 }
+
+// TestSessionOffWorksWithoutASpawner: a record left session-routed after the
+// spawner was disarmed (the W4-rollback shape) must still have its way back,
+// or every message in that conversation publishes to an addressee nothing
+// serves until the operator re-arms.
+func TestSessionOffWorksWithoutASpawner(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-s16"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-s16", Kind: "group", SessionRouted: true, Profile: "chat",
+		BusSession: "chat-otter-dead", Addressee: "chat-otter-dead", LastActivity: time.Now().UTC()}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-250", "/session off")
+	waitFor(t, "off ack", postedContaining(r, "session route off"))
+	got, _ := r.g.reg.Get(context.Background(), conv)
+	if got.SessionRouted || got.Addressee != "platform" || got.BusSession != "" {
+		t.Fatalf("record after /session off with no spawner: %+v", got)
+	}
+	sessionRigTurn(r, conv, "s-251", "how is the fleet?")
+	if env := r.awaitTask(t, "platform"); env.To == nil || env.To.Session != "platform" {
+		t.Fatalf("not re-homed: %+v", env.To)
+	}
+	// The on-form stays refused: nothing can spawn.
+	sessionRigTurn(r, conv, "s-252", "/session")
+	waitFor(t, "not enabled", postedContaining(r, "not enabled"))
+}
+
+// TestHasSessionCountsASessionRoutedRecord: the Slack adapter admits an
+// unmentioned thread reply only where hasSession says so; a thread bound by
+// /session is a session thread while it is active, task or no task.
+func TestHasSessionCountsASessionRoutedRecord(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	ctx := context.Background()
+	fresh := &SessionRecord{Key: "slack:channel/C1/1.1", ContextID: "ctx-f", Kind: "group", SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC()}
+	if err := r.g.reg.Put(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	held, until, err := r.g.hasSession(ctx, fresh.Key)
+	if err != nil || !held || until.IsZero() {
+		t.Fatalf("fresh session-routed record: held=%v until=%v err=%v", held, until, err)
+	}
+	stale := &SessionRecord{Key: "slack:channel/C1/2.2", ContextID: "ctx-s", Kind: "group", SessionRouted: true, Profile: "chat",
+		LastActivity: time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)}
+	if err := r.g.reg.Put(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, _ := r.g.hasSession(ctx, stale.Key); held {
+		t.Fatal("a session-routed record idle past the TTL still counts as a session thread")
+	}
+	plain := &SessionRecord{Key: "slack:channel/C1/3.3", ContextID: "ctx-p", Kind: "group", Addressee: "platform",
+		LastActivity: time.Now().UTC()}
+	if err := r.g.reg.Put(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, _ := r.g.hasSession(ctx, plain.Key); held {
+		t.Fatal("a plain record with no task counts as a session thread")
+	}
+}
+
+// TestSessionWithTextOnSessionDefaultRunsTheText: where every conversation
+// is a session already, "/session <text>" is <text>, an ordinary turn - not a
+// confirmation that silently drops the ask.
+func TestSessionWithTextOnSessionDefaultRunsTheText(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/thread-s17"
+	sessionRigTurn(r, conv, "s-260", "/session list the pods in ns x")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "list the pods in ns x" {
+		t.Fatalf("task text = %q, want the command stripped", got)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "already a session") {
+			t.Fatalf("the text form was answered as a bare /session: %q", p)
+		}
+	}
+}
+
+// TestSessionOffDuringAPlatformTaskRehomesWithoutStopping: the off-refusal
+// protects a running SESSION task's pod; a platform task has no pod to lose,
+// so the way back goes through and leaves that task running.
+func TestSessionOffDuringAPlatformTaskRehomesWithoutStopping(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s18"
+	sessionRigTurn(r, conv, "s-270", "check the fleet")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "s-271", "/session")
+	waitFor(t, "ack", postedContaining(r, "after it opens a session pod"))
+	sessionRigTurn(r, conv, "s-272", "/session off")
+	waitFor(t, "off ack", postedContaining(r, "session route off"))
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if rec.SessionRouted || rec.Addressee != "platform" || rec.ActiveTask == nil || rec.ActiveTask.Detached {
+		t.Fatalf("record after /session off during a platform task: %+v", rec)
+	}
+	for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+		if e.EnvelopeID != origin.EnvelopeID {
+			t.Fatalf("/session off reached the platform task as %s", e.Kind)
+		}
+	}
+	if len(spawn.calls()) != 0 {
+		t.Fatal("spawned")
+	}
+}
