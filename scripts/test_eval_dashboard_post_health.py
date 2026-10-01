@@ -177,6 +177,12 @@ def lost_pods(since="2026-09-11T14:05:52+00:00", prs=PRS_0911, nodes=None, windo
     return doc
 
 
+def deadline_kill(since="2026-09-22T19:00:00+00:00", prs=(1826, 1838, 1877), runs=3, window=("2026-09-22T19:40:00+00:00", "2026-09-22T20:00:00+00:00"), evidence=()):
+    doc = health("OUTAGE", f"deadline kills: {runs} runs on {len(prs)} PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC", since=since, condition="deadline_kill", prs=prs, runs=runs, window=window)
+    doc["evidence"] = list(evidence)
+    return doc
+
+
 class FakeResponse:
     def __init__(self, status=200):
         self.status = status
@@ -380,7 +386,7 @@ class Shapes(RunHarness):
         self.tick(slow(), T0)
         self.assertEqual(
             self.opener.texts[0],
-            "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s."
+            "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty records."
             " Not a break, and /retest won't make yours faster.\n"
             f"{URL}#view=agent",
         )
@@ -751,7 +757,7 @@ class Digest(RunHarness):
         self.tick(slow(), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[1].split("\n")[1],
-            "🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s.",
+            "🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty records.",
         )
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
         self.assertEqual(len(self.opener.texts), 3, "clearing is not a message")
@@ -1765,6 +1771,505 @@ class FixtureDrift(RunHarness):
         self.tick(health("GREEN"), T14)
         self.assertEqual(self.opener.texts, [])
         self.assertFalse(self.recorded()["fixture_unknown"])
+
+
+def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet reconcile (weekly)", verdict="FAILED", build="100", finished="2026-09-14T13:40:00+00:00", detail=(), dry_run=False, stale_after_h=192, summary=None):
+    words = post_health.periodics.WATCHED_BY_JOB[job]
+    return {
+        "job": job, "label": label, "verdict": verdict, "since": finished, "build": build, "finished_at": finished, "result": "FAILURE" if verdict == "FAILED" else "SUCCESS",
+        "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "summary": summary, "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{job}",
+        "place": words.place, "absence": words.absence, "does": words.does, "effect": words.effect, "runbook": words.runbook,
+    }
+
+
+class WatchedPeriodics(RunHarness):
+    """A watched Prow periodic that fails or stops is said once per episode
+    and verdict, with the projects it names and its history; its next clean
+    run is said once; no reading is neither."""
+
+    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+
+    def test_a_failed_reconcile_is_said_once_per_build_and_cleared_once(self):
+        failed = health("GREEN")
+        failed["periodics"] = {self.WEEKLY: periodic_note(detail=["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])}
+        failed["periodics_read"] = [self.WEEKLY]
+        self.tick(failed, T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("🟠 *Eval seeded fleet: planted defects are not being re-applied.*\n`ci-kube-agents-fleet-reconcile-all` runs weekly and re-applies the seeded-fleet stack in every free pool project. Its 9:40 AM ET run (build 100) failed."), text)
+        self.assertIn("- kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)", text)
+        self.assertIn("Effect: drifted fixtures stay drifted, and the eval cases that assert on them fail. CI eval infrastructure only.", text)
+        self.assertIn("Runbook: https://github.com/gke-labs/kube-agents/blob/main/docs/ci-pool-projects.md#62-the-scheduled-reconcile · Build: ", text)
+        self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{self.WEEKLY}", text)
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"})
+        self.assertEqual(self.recorded()["state"], "GREEN")
+        self.tick(failed, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "said once")
+        # A newer build that fails the same way is not news; the job stopping
+        # is; a tick with no reading is not a clear.
+        failed["periodics"][self.WEEKLY]["build"] = "101"
+        self.tick(failed, T14 + timedelta(hours=1))
+        self.assertEqual(len(self.opener.texts), 1, "one message per episode, not per build")
+        failed["periodics"][self.WEEKLY]["verdict"] = "STALE"
+        self.tick(failed, T14 + timedelta(hours=2))
+        self.assertEqual(len(self.opener.texts), 2)
+        self.assertTrue(self.opener.texts[-1].startswith("⚪ *Eval seeded fleet: seeded-fleet reconcile (weekly) has stopped running.*"), self.opener.texts[-1])
+        blind = health("GREEN")
+        blind["periodics"], blind["periodics_read"] = {}, []
+        self.tick(blind, T14 + timedelta(hours=2, minutes=30))
+        self.assertEqual(len(self.opener.texts), 2, "no reading is not a recovery")
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "STALE"})
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
+        clean["periodics_runs"] = {self.WEEKLY: {"build": "104", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "3 applied, 9 unchanged"}}
+        self.tick(clean, T14 + timedelta(hours=3))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval seeded fleet: planted defects are being re-applied again.* `ci-kube-agents-fleet-reconcile-all`'s 12:40 PM ET run (build 104): 3 applied, 9 unchanged.")
+        self.assertEqual(self.recorded()["periodics_told"], {})
+        self.assertEqual(self.gh.writes(), [], "nothing is filed for a periodic")
+
+    def test_a_failed_send_is_retried_and_two_jobs_are_one_message(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note(), sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1)}
+        doc["periodics_read"] = [self.WEEKLY, sweep]
+        # A recorded first tick, then the failed send: the first tick records
+        # nothing when every post fails, by design, so it is not the case here.
+        self.tick(health("GREEN"), T14 - timedelta(hours=1))
+        self.tick(doc, T14, opener=FakeOpener(statuses=[500]))
+        self.assertEqual(self.recorded()["periodics_told"], {}, "a failed send is retried next tick")
+        self.tick(doc, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "two jobs, one message")
+        self.assertIn("*Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*", self.opener.texts[0])
+        self.assertIn("*Eval seeded fleet: planted defects are not being re-applied.*", self.opener.texts[0])
+        self.assertEqual(sorted(self.recorded()["periodics_told"]), sorted([self.WEEKLY, sweep]))
+        # A clear for one beside news for the other: the news goes, the clear goes, separately.
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", verdict="STALE", stale_after_h=1)}
+        doc["periodics_runs"] = {self.WEEKLY: {"build": "101", "finished_at": "2026-09-14T14:40:00+00:00", "passed": True, "summary": None}}
+        self.tick(doc, T14 + timedelta(hours=1))
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "STALE"})
+        self.assertEqual(len(self.opener.texts), 3)
+
+    def test_a_new_episode_after_a_clear_whose_send_failed_is_still_news(self):
+        # The poster remembers the clean reading it saw even when the clear
+        # did not go out, so the next failure is a new episode.
+        first = health("GREEN")
+        first["periodics"] = {self.WEEKLY: periodic_note(finished="2026-09-14T13:40:00+00:00")}
+        first["periodics_read"] = [self.WEEKLY]
+        self.tick(first, T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
+        clean["periodics_runs"] = {self.WEEKLY: {"build": "102", "finished_at": "2026-09-14T14:40:00+00:00", "passed": True, "summary": None}}
+        self.tick(clean, T14 + timedelta(hours=1), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"}, "the clear that failed to send is not forgotten")
+        self.assertEqual(self.recorded()["periodics_clean_seen"], [self.WEEKLY])
+        again = health("GREEN")
+        again["periodics"] = {self.WEEKLY: periodic_note(build="103", finished="2026-09-14T16:40:00+00:00")}
+        again["periodics_read"] = [self.WEEKLY]
+        self.tick(again, T14 + timedelta(hours=3))
+        self.assertEqual(len(self.opener.texts), 2, "the new episode is announced")
+        self.assertIn("build 103", self.opener.texts[-1])
+        self.assertEqual(self.recorded()["periodics_clean_seen"], [])
+
+    def test_a_since_stamped_afresh_does_not_re_announce_an_open_note(self):
+        # health.json's `since` restarts when the previous health.json could
+        # not be fetched; the space was told, and hears nothing again.
+        told = health("GREEN")
+        told["periodics"] = {self.WEEKLY: periodic_note(finished="2026-09-14T13:40:00+00:00")}
+        told["periodics_read"] = [self.WEEKLY]
+        self.tick(told, T14)
+        restamped = health("GREEN")
+        restamped["periodics"] = {self.WEEKLY: dict(periodic_note(finished="2026-09-14T13:40:00+00:00"), since="2026-09-14T15:00:00+00:00")}
+        restamped["periodics_read"] = [self.WEEKLY]
+        self.tick(restamped, T14 + timedelta(hours=1))
+        self.assertEqual(len(self.opener.texts), 1, "not re-announced")
+
+    def test_a_job_no_longer_watched_leaves_the_told_map(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note()}
+        doc["periodics_read"] = [self.WEEKLY]
+        self.tick(doc, T14)
+        state = json.loads(self.state.read_text())
+        state["periodics_told"]["ci-kube-agents-retired"] = "FAILED"
+        state["periodics_clean_seen"] = ["ci-kube-agents-retired"]
+        self.state.write_text(json.dumps(state))
+        self.tick(doc, T14 + timedelta(minutes=15))
+        self.assertEqual((self.recorded()["periodics_told"], self.recorded()["periodics_clean_seen"]), ({self.WEEKLY: "FAILED"}, []))
+
+    def test_a_stale_note_without_a_finish_time_does_not_say_nothing_finished(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: dict(periodic_note(verdict="STALE"), finished_at=None)}
+        doc["periodics_read"] = [self.WEEKLY]
+        self.tick(doc, T14)
+        text = self.opener.texts[0]
+        self.assertIn("its finished.json gives no time for it", text)
+        self.assertNotIn("nothing has finished", text)
+
+    def test_a_stopped_job_is_said_in_grey_with_its_last_run(self):
+        stopped = health("GREEN")
+        stopped["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished="2026-09-05T13:40:00+00:00")}
+        stopped["periodics_read"] = [self.WEEKLY]
+        self.tick(stopped, T14)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("⚪ *Eval seeded fleet: seeded-fleet reconcile (weekly) has stopped running.*\n`ci-kube-agents-fleet-reconcile-all` runs weekly"), text)
+        self.assertIn("Its last finished run was", text)
+        self.assertIn("nothing has finished in 192h", text)
+        self.assertIn("Runbook: https://github.com/gke-labs/kube-agents/blob/main/docs/ci-pool-projects.md#62-the-scheduled-reconcile", text)
+
+    def test_a_failed_sweep_says_what_it_does_how_it_failed_and_what_is_left(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        doc = health("GREEN")
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1, summary="failed in 11 of 11 project(s)", detail=["kube-agents-evals-2: HTTP 403 Forbidden: secondary rate limit", "and 6 more", "3 write(s) left for the next run (the run's write budget)"])}
+        doc["periodics_read"] = [sweep]
+        self.tick(doc, T14)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("🟠 *Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*\n`ci-kube-agents-pull-sweep` runs every ten minutes and closes the pull requests the agent opened during eval runs"), text)
+        self.assertIn("Its 9:40 AM ET run (build 100) failed: failed in 11 of 11 project(s).", text)
+        self.assertIn("- 3 write(s) left for the next run (the run's write budget)", text)
+        self.assertIn("Effect: pull requests pile up in those repos, and eval cases that open one can link an old one and fail. CI eval infrastructure only.", text)
+        self.assertIn("#55-the-pull-request-sweep", text)
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [sweep]
+        clean["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"}}
+        self.tick(clean, T14 + timedelta(minutes=15))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* `ci-kube-agents-pull-sweep`'s 9:50 AM ET run (build 101): closed 241 pull request(s) across 12 project(s).")
+
+    def test_a_read_failed_build_under_the_threshold_is_not_a_recovery(self):
+        # The sweep's first failed check writes no note; read and not noted is
+        # not clean, so the told job stays told until a build passes.
+        sweep = "ci-kube-agents-pull-sweep"
+        doc = health("GREEN")
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1)}
+        doc["periodics_read"] = [sweep]
+        self.tick(doc, T14)
+        quiet = health("GREEN")
+        quiet["periodics"], quiet["periodics_read"] = {}, [sweep]
+        quiet["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": False, "summary": "failed in 1 of 9 project(s)"}}
+        self.tick(quiet, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "no recovery for a failed build")
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "FAILED"})
+        passed = health("GREEN")
+        passed["periodics"], passed["periodics_read"] = {}, [sweep]
+        passed["periodics_runs"] = {sweep: {"build": "102", "finished_at": "2026-09-14T14:00:00+00:00", "passed": True, "summary": None}}
+        self.tick(passed, T14 + timedelta(minutes=30))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* `ci-kube-agents-pull-sweep`'s 10:00 AM ET run (build 102) finished clean.")
+
+    def test_the_digest_carries_a_line_per_noted_job(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note(dry_run=True)}
+        doc["periodics_read"] = [self.WEEKLY]
+        rendered = post_health.render_digest(doc, T14)
+        self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed 9:40 AM ET);", rendered)
+
+    def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished=None)}
+        doc["periodics_read"] = [self.WEEKLY]
+        rendered = post_health.render_digest(doc, T14)
+        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (weekly) has stopped running; build 100 finished at a time its finished.json does not give.", rendered)
+        self.assertNotIn("no finished run on record", rendered)
+# --------------------------------------------------------------------------- #
+# Pool drift (#1967): the hourly pool-state scan's condition
+# --------------------------------------------------------------------------- #
+
+FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
+FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
+FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
+POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
+
+
+def pool_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None, unread_units=0):
+    return {"scanned_at": scanned, "projects": projects, "checked": checked, "unread_units": unread_units, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
+
+
+def pool_drift(since=SCAN_AT, findings=(FINDING,), projects=DRIFT_PROJECTS, evidence=()):
+    doc = health("DEGRADED", f"pool drift: {', '.join(findings)} on {len(projects)} pool project(s)", since=since, condition="pool_drift", window=(since, None))
+    doc["incident"].update({
+        "roles": list(findings),
+        "projects": list(projects),
+        "drift": {p: {f: [FINDING_DETAIL.format(project=p)] for f in findings} for p in projects},
+        "repairs": {p: {f: FINDING_REPAIR.format(project=p) for f in findings} for p in projects},
+        "reads": {p: ["iam"] for p in projects},
+    })
+    doc["evidence"] = list(evidence)
+    doc["pool_state"] = pool_block(drifted={p: list(findings) for p in projects})
+    return doc
+
+
+class PoolDrift(RunHarness):
+    """The pool-state scan's condition (#1967): one message naming the
+    findings and the projects, the pool owner's issue once with the repair
+    command per project, a human's issue naming the findings adopted, the
+    digest's line on the latest scan, and a blind scan said once each way."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def test_a_new_drift_condition_posts_once_and_files_the_pool_owner_issue(self):
+        rc, err = self.tick(pool_drift(evidence=[f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"]), T14, environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            self.opener.texts,
+            [
+                (
+                    f"🟡 *Smoke gate: flaky* — pool finding {FINDING} on 3 pool projects since 9:00 AM ET;"
+                    " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code. Retest once the pool owner has run the repair."
+                    " Pool owner: the repair command per project (or, for a check that failed without naming one, what was observed) is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one. Tracking #1300.\n"
+                    f"{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"
+                )
+            ],
+        )
+        method, path, body = self.gh.calls[-1]
+        self.assertEqual((method, path), ("POST", "repos/gke-labs/kube-agents/issues"))
+        self.assertEqual(body["title"], f"Pool drift: {FINDING} on 3 pool projects since Mon 9:00 AM ET")
+        self.assertEqual(body["labels"], ["presubmit-gate"])
+        for expected in (
+            f"- `{FINDING}`",
+            "- `kube-agents-evals-2`",
+            f"    - {FINDING_DETAIL.format(project='kube-agents-evals-2')}",
+            f"      {FINDING_REPAIR.format(project='kube-agents-evals-2')}",
+            "whoever holds the pool should run the repairs",
+            "latest scan 2026-09-14T13:00:00+00:00",
+            "at the 13:00 UTC scan",
+        ):
+            self.assertIn(expected, body["body"])
+        self.assertEqual(self.recorded()["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "pool_drift"})
+        self.tick(pool_drift(), T14 + timedelta(minutes=15), environ=self.environ())
+        self.assertEqual((len(self.opener.texts), len(self.gh.writes())), (1, 1), "the same condition next tick is silence")
+
+    def test_a_human_issue_naming_the_findings_in_its_title_is_adopted_and_a_body_match_is_not(self):
+        gh = FakeGh(open_issues=[{"number": 1290, "html_url": "https://github.com/gke-labs/kube-agents/issues/1290", "title": f"{FINDING} is missing on the pool again", "body": ""}])
+        self.tick(pool_drift(), T14, environ=self.environ(), gh=gh)
+        self.assertTrue(self.opener.texts[0].endswith(f"Tracking #1290.\n{post_health.DASHBOARD_URL}#since=2026-09-14T13:00:00Z&view=gate"))
+        self.assertEqual(gh.writes(), [])
+        self.assertEqual(self.recorded()["issue"]["condition"], "pool_drift")
+        # Every bot-filed body quotes the evidence, which names the finding
+        # whether or not it fired: an outage issue is not the pool's tracker.
+        outage = FakeGh(open_issues=[{"number": 1280, "html_url": "https://github.com/gke-labs/kube-agents/issues/1280", "title": "Smoke gate outage: 2 cases failing on every PR since Mon 8:00 AM ET", "body": f"- {FINDING} found on 1 pool project(s) (kube-agents-evals-9) at the 12:00 UTC scan; not yet repeated or widespread"}])
+        self.setUp()
+        self.tick(pool_drift(), T14, environ=self.environ(), gh=outage)
+        self.assertEqual([call[:2] for call in outage.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
+
+    def test_a_long_title_falls_back_to_the_count(self):
+        many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
+        title = post_health.gate_issue.render_pool_drift_title(pool_drift(findings=tuple(many)), "Mon 9:00 AM ET")
+        self.assertEqual(title, "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET")
+        self.assertLessEqual(len(title), post_health.gate_issue.TITLE_MAX_CHARS)
+        short = post_health.gate_issue.render_pool_drift_title(pool_drift(), "Mon 9:00 AM ET")
+        self.assertEqual(short, f"Pool drift: {FINDING} on 3 pool projects since Mon 9:00 AM ET")
+
+    def test_a_pool_wide_body_is_cut_to_githubs_limit_and_says_so(self):
+        # 35 projects × 5 findings with a repair block each passes 64 KiB; the
+        # body drops whole projects from the end and says how many, keeping
+        # the findings, the marker and the evidence.
+        many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
+        projects = tuple(f"kube-agents-evals-{i}" for i in range(1, 36))
+        evidence_line = f"{many[0]} found on 35 pool project(s) at the 12:00 UTC scan; widespread"
+        body = post_health.gate_issue.render_pool_drift_body(pool_drift(findings=tuple(many), projects=projects, evidence=[evidence_line]), "Mon 9:00 AM ET", "brief")
+        self.assertLessEqual(len(body), post_health.gate_issue.ISSUE_BODY_MAX_CHARS)
+        self.assertIn("more project(s) omitted", body)
+        self.assertIn("- `kube-agents-evals-1`", body)
+        self.assertIn(post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=",".join(many)), body)
+        self.assertIn(evidence_line, body)
+        small = post_health.gate_issue.render_pool_drift_body(pool_drift(), "Mon 9:00 AM ET", "brief")
+        self.assertNotIn("omitted", small)
+
+    def test_a_failed_unit_with_no_repair_says_so_in_the_issue(self):
+        # `iam/failed` is the verifier's fallback for a check that failed
+        # without naming a finding: no command exists, and the issue says so
+        # beside the lines rather than promising one.
+        doc = pool_drift(findings=("iam/failed",))
+        for project in DRIFT_PROJECTS:
+            doc["incident"]["repairs"][project]["iam/failed"] = ""
+            doc["incident"]["drift"][project]["iam/failed"] = ["Failed parsing the IAM policy: Expecting value"]
+        body = post_health.gate_issue.render_pool_drift_body(doc, "Mon 9:00 AM ET", "brief")
+        self.assertIn(post_health.gate_issue.POOL_NO_REPAIR_LINE, body)
+        self.assertIn("Failed parsing the IAM policy: Expecting value", body)
+        self.assertNotIn("```", body, "no empty repair block")
+
+    def test_the_pool_issue_quotes_only_the_pool_scans_evidence(self):
+        # A fixture line in the body would let the fixture tracker adopt the
+        # pool's ticket (it matches its roles against open bodies).
+        fixture_line = "crashloop-workload drifted on 1 pool project(s) (kube-agents-evals-4) at the 12:00 UTC scan; not yet repeated or widespread"
+        pool_line = f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 12:00 UTC scan; repeated"
+        outage_line = "shared break: 2 cases failing on every PR (agent-kanban-smoke, gitops-pr) since 8:00 AM"
+        body = post_health.gate_issue.render_pool_drift_body(pool_drift(evidence=[fixture_line, pool_line, outage_line]), "Mon 9:00 AM ET", "brief")
+        self.assertIn(pool_line, body)
+        self.assertNotIn("crashloop-workload", body)
+        self.assertNotIn("agent-kanban-smoke", body)
+
+    def test_the_bots_own_issue_is_re_found_when_its_title_is_a_count(self):
+        # Four or more ids push the title to its count form, which names no
+        # finding; the body's marker is how the bot re-finds it after a GREEN.
+        many = [f"iam/pool-state-reader/missing/{role}" for role in ("roles/iam.securityReviewer", "roles/container.clusterViewer", "roles/artifactregistry.reader", "roles/cloudkms.viewer", "roles/storage.bucketViewer")]
+        marker = post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=",".join(many))
+        own = {"number": 1295, "html_url": "https://github.com/gke-labs/kube-agents/issues/1295", "title": "Pool drift: 5 findings on 3 pool projects since Mon 9:00 AM ET", "body": marker + "\n**Findings**\n" + "\n".join(f"- `{f}`" for f in many)}
+        gh = FakeGh(open_issues=[own])
+        self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "adopted, not re-filed")
+        self.assertEqual(self.recorded()["issue"]["number"], 1295)
+        # The same body without the marker is somebody else's quote of the
+        # evidence, and is not adopted.
+        quoted = FakeGh(open_issues=[dict(own, number=1296, body=own["body"].replace(marker, ""))])
+        self.setUp()
+        self.tick(pool_drift(findings=tuple(many)), T14, environ=self.environ(), gh=quoted)
+        self.assertEqual([call[:2] for call in quoted.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
+        _, _, body = quoted.calls[-1]
+        self.assertTrue(body["body"].startswith(marker), "the bot's own body carries the marker with the ids that fired")
+        # An old issue of the bot's whose marker names A, and whose evidence
+        # quotes B (seen once, never fired), is not the tracker for B.
+        old = dict(own, number=1297, body=post_health.gate_issue.POOL_DRIFT_MARKER.format(findings=many[0]) + "\n**Evidence:**\n- " + f"{many[1]} found on 1 pool project(s) (kube-agents-evals-9); not yet repeated or widespread")
+        stale = FakeGh(open_issues=[old])
+        self.setUp()
+        self.tick(pool_drift(findings=(many[1],)), T14, environ=self.environ(), gh=stale)
+        self.assertEqual([call[:2] for call in stale.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
+
+    def test_the_recovery_says_the_pool_had_drifted_and_comments(self):
+        self.tick(pool_drift(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["pool_state"] = pool_block()
+        self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (pool projects had drifted, #1300).")
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+
+    def test_the_digest_carries_one_line_on_the_latest_scan(self):
+        def line(block):
+            doc = health("GREEN")
+            if block is not None:
+                doc["pool_state"] = block
+            return [text for text in post_health.render_digest(doc, T14).splitlines() if text.startswith("🧭 *Pool projects:*")]
+
+        self.assertEqual(line(None), [])
+        self.assertEqual(line(pool_block()), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires."])
+        self.assertEqual(line(pool_block(checked=28)), ["🧭 *Pool projects:* 28 of 30 pool projects checked at 9:00 AM ET, every one shaped as the verifier requires, 2 not checked."])
+        self.assertEqual(line(pool_block(unread_units=140)), ["🧭 *Pool projects:* 30 of 30 pool projects checked at 9:00 AM ET, no drift in what was read; 140 checks not read in full."])
+        self.assertEqual(
+            line(pool_block(drifted={"kube-agents-evals-1": [FINDING], "kube-agents-evals-4": [FINDING]})),
+            [f"🧭 *Pool projects:* 2 of 30 checked pool projects drifted at 9:00 AM ET ({FINDING}); a 403 from a run that leased one of them is the pool's, not the code."],
+        )
+        self.assertEqual(line(pool_block(checked=0, unknown=True, reason=POOL_BLIND_REASON)), [f"🧭 *Pool projects:* the 9:00 AM ET scan could check none of 30 pool projects ({POOL_BLIND_REASON})."])
+        self.assertEqual(line(pool_block(stale=True)), ["🧭 *Pool projects:* the last scan (9:00 AM ET) is stale; someone check the scan job."])
+
+    def test_a_blind_scan_is_said_once_each_way_and_is_never_a_change(self):
+        blind = health("GREEN")
+        blind["pool_state"] = pool_block(checked=0, unknown=True, reason=POOL_BLIND_REASON)
+        self.tick(blind, T14, environ=self.environ())
+        self.assertEqual(
+            self.opener.texts,
+            [f"⚪ *Pool-state scan can't read the pool* — the 9:00 AM ET scan checked none of 30 pool projects ({POOL_BLIND_REASON}). Pool drift goes unseen until that is fixed; the bot's project roles are in docs/ci-health.md."],
+        )
+        self.assertEqual((self.recorded()["state"], self.recorded()["pool_state_unknown"]), ("GREEN", True))
+        self.tick(blind, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "said once")
+        seeing = health("GREEN")
+        seeing["pool_state"] = pool_block(scanned="2026-09-14T14:00:00+00:00")
+        self.tick(seeing, T14 + timedelta(hours=1))
+        self.assertEqual(self.opener.texts[-1], "⚪ *Pool-state scan reads the pool again* — the 10:00 AM ET scan checked 30 of 30 pool projects.")
+        self.assertFalse(self.recorded()["pool_state_unknown"])
+        self.assertEqual(self.gh.writes(), [], "nothing is filed for a blind scan")
+
+    def test_a_tick_that_read_no_scan_does_not_announce_the_pool_read_again(self):
+        blind = health("GREEN")
+        blind["pool_state"] = pool_block(checked=0, unknown=True, reason=POOL_BLIND_REASON)
+        self.tick(blind, T14, environ=self.environ())
+        self.assertEqual(len(self.opener.texts), 1)
+        # A failed fetch: no block at all.
+        nothing = health("GREEN")
+        self.tick(nothing, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "no read is not a read")
+        self.assertTrue(self.recorded()["pool_state_unknown"], "the bit is kept, not flipped")
+        # The blind document gone stale: still no read.
+        stale = health("GREEN")
+        stale["pool_state"] = pool_block(checked=0, unknown=True, stale=True, reason=POOL_BLIND_REASON)
+        self.tick(stale, T14 + timedelta(hours=4))
+        self.assertEqual(len(self.opener.texts), 1)
+        self.assertTrue(self.recorded()["pool_state_unknown"])
+        # And a real read again is said once.
+        seeing = health("GREEN")
+        seeing["pool_state"] = pool_block(scanned="2026-09-14T18:00:00+00:00")
+        self.tick(seeing, T14 + timedelta(hours=5))
+        self.assertEqual(len(self.opener.texts), 2)
+        self.assertIn("reads the pool again", self.opener.texts[-1])
+        self.assertFalse(self.recorded()["pool_state_unknown"])
+
+
+class DeadlineKillMessages(RunHarness):
+    """#1894: runs killed at the job deadline with no verdict are an OUTAGE
+    with their own sentence, an issue for the gate's owner, and a recovery
+    line that names what cleared."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def test_the_outage_message_names_the_kills_and_files_an_issue(self):
+        doc = deadline_kill(evidence=["deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC (#1826, #1838, #1877)"])
+        rc, _ = self.tick(doc, T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        self.assertEqual(rc, 0)
+        first = self.opener.texts[0].split("\n")
+        self.assertTrue(first[0].startswith("🔴 *Smoke gate: broken* — 3 runs on 3 PRs were killed at the 360-minute deadline with no verdict"), first[0])
+        self.assertIn("nothing is being graded, so the gate cannot pass anyone.", first[0])
+        self.assertTrue(first[1].startswith("Don't retest yet. Tracking #1300."), first[1])
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        _, _, body = self.gh.calls[-1]
+        self.assertTrue(body["title"].startswith("Smoke gate outage: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict since"), body["title"])
+        self.assertIn("ran to Prow's 360-minute deadline and were killed with no eval verdict", body["body"])
+        self.assertIn("#1826, #1838, #1877", body["body"])
+        # The span of the kills, not the incident's start twice over; and the
+        # opening "since" pairs the first kill's clock time with its own ISO
+        # stamp, not with the tick that declared the state (19:00Z here).
+        self.assertIn("**Window:** 3:40 PM–4:00 PM ET (2026-09-22T19:40:00+00:00 – 2026-09-22T20:00:00+00:00).", body["body"])
+        self.assertIn("since Tue 3:40 PM ET (2026-09-22T19:40:00+00:00), 3 runs on 3 pull requests", body["body"])
+        self.assertNotIn("(2026-09-22T19:00:00+00:00)", body["body"])  # the brief link may carry the tick; the parenthetical must not
+        self.assertIn("presubmit-gate", body["labels"])
+
+    def test_the_body_quotes_the_deadline_evidence_and_no_case_names(self):
+        # health.py's evidence carries a per-case collapse line whenever a case
+        # clears the shared-break floors; quoted here it would make this issue
+        # the tracker of a break that fires later (Tracker.existing matches
+        # bodies for case names).
+        doc = deadline_kill(evidence=[
+            "cost-idle-pool-probe failed all graded reps on 3 runs from 3 PRs (#1, #2, #3)",
+            "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC (#1826, #1838, #1877)",
+        ])
+        self.tick(doc, T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        _, _, body = self.gh.calls[-1]
+        self.assertIn("- deadline kills: 3 runs on 3 PRs", body["body"])
+        self.assertNotIn("cost-idle-pool-probe", body["body"])
+        self.assertIn("The rest of the evidence (any case collapsing underneath the kills) is in the brief.", body["body"])
+
+    def test_a_humans_issue_titled_for_the_deadline_kills_is_adopted(self):
+        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": ""}
+        gh = FakeGh(open_issues=[human])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertIn("Tracking #1894.", self.opener.texts[0])
+
+    def test_a_break_issue_whose_body_quotes_the_kills_is_not_adopted(self):
+        # Every bot-filed body names the job and quotes the evidence block,
+        # which mentions deadline kills whenever one sits in the window; only
+        # the title decides, or a shared-break issue becomes the tracker.
+        bot = {
+            "number": 1793,
+            "html_url": "https://github.com/gke-labs/kube-agents/issues/1793",
+            "title": "Smoke gate outage: 2 cases failing on every PR since Fri 9:00 AM ET",
+            "body": "The smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.\n- deadline kills: 1 runs on 1 PRs killed at the 360-minute deadline with no verdict 12:40–12:40 UTC (#1)",
+        }
+        gh = FakeGh(open_issues=[bot])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        self.assertNotIn("#1793", self.opener.texts[0])
+
+    def test_the_copied_constants_are_healths(self):
+        from eval_dashboard import gate_issue, health
+
+        # post_health derives its copy from health; gate_issue's is written
+        # out (it imports nothing), so it is pinned here.
+        self.assertEqual(gate_issue.DEADLINE_MINUTES, int(health.PROW_JOB_TIMEOUT.total_seconds() // 60))
+        self.assertEqual(gate_issue.RECOVERY_RUNS, health.RECOVERY_GREEN_RUNS)
+
+    def test_the_recovery_names_the_kills(self):
+        self.assertEqual(post_health.short_cause({"condition": "deadline_kill"}), "runs were being killed at the deadline")
+
 
 
 if __name__ == "__main__":

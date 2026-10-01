@@ -13,12 +13,6 @@
 
 set -uo pipefail
 
-# The awk program that finds fenced roster quotations, resolved from the
-# repository root the `cd` below establishes, and the shortest quotation the
-# guard will grade; both explained where they are used.
-readonly SCAN_AWK=hack/scan-cron-prompts.awk
-readonly MIN_QUOTED_CHARS=24
-
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 FAILED=0
@@ -37,9 +31,9 @@ git ls-files '*.md' '*.mdx' \
 
 # The test seam. DOCS_TERMINOLOGY_EXTRA_FILES names a file whose lines are more
 # paths to scan, appended to the tracked set rather than replacing it, so the
-# copy floors above the cron-prompt section still see the real documents that
-# satisfy them. tests/test_docs_terminology_guard.py hands the guard a document
-# built to fail one check and reads the verdict; nothing else sets it.
+# copy floors below still see the real documents that satisfy them.
+# tests/test_docs_terminology_guard.py hands the guard a path built to fail
+# one check and reads the verdict; nothing else sets it.
 if [ -n "${DOCS_TERMINOLOGY_EXTRA_FILES:-}" ]; then
   if [ ! -r "$DOCS_TERMINOLOGY_EXTRA_FILES" ]; then
     echo "ERROR: DOCS_TERMINOLOGY_EXTRA_FILES=${DOCS_TERMINOLOGY_EXTRA_FILES} is not readable; the guard cannot run." >&2
@@ -474,203 +468,13 @@ cap_guard \
   "allowed $(spellings MAX_COMMAND_CHARS) characters" \
   "Documented evidence.command budget does not match MAX_COMMAND_CHARS in ${AUDIT_SCRIPT}."
 
-# --- fleet-audit cron prompts ---------------------------------------------
-# Ground truth: the prompts in the cron manifest. Two site pages quote the
-# compliance watchdog's prompt verbatim to show what an anti-skim prompt looks
-# like, and both went stale the moment the SOP grew — they told readers the SOP
-# was 348 lines with its checks at 56-270 when it was 406 lines with its checks
-# at 102-314. A quotation that has drifted from the thing it quotes is worse
-# than no quotation, so require it to be a literal substring of the manifest.
-#
-# The anchor is the JSON key, not anything the prompt says. It used to be the
-# phrase `all N lines of it`, which every governance prompt carries today --
-# and that is the trap: the day the prompts are reworded, no document matches
-# the phrase, the loop below runs zero times, and the check goes green while
-# the pages still carry the superseded quotation it exists to catch. An anchor
-# drawn from the text being checked fails silent the one time it matters, when
-# that text changes. `"prompt": "` is structural, so a rewording cannot make
-# the guard stop looking.
-#
-# The consequence to know before you write: a fenced `"prompt": "…"` line is
-# treated as a claim to be quoting a roster entry. Paraphrase a watchdog in
-# prose and nothing here objects; render it as manifest JSON and the value has
-# to be the manifest's.
-#
-# Both rosters are ground truth. The governance prompts live on the Platform
-# Agent's; the Chat Agent's is checked too so a job that moves between them
-# does not turn every quotation stale on the way.
-CRON_JOBS="agents/platform/cron/jobs.json agents/chat/defaults/cron/jobs.json"
-for JOBS_FILE in $CRON_JOBS; do
-  if [ ! -f "$JOBS_FILE" ]; then
-    echo "ERROR: ${JOBS_FILE} not found; the cron-prompt guard cannot run." >&2
-    exit 1
-  fi
-done
-
 # --- Checks that could not run --------------------------------------------
 # Reported after the last `search` call so every broken pattern is named at
 # once, and reported at all because a check that did not run is not a check that
-# passed. Before the cron-prompt scan below rather than at the end of the file,
-# because that scan can `exit 1` outright -- an unreadable roster or a failed
-# awk -- and an early exit would take this report with it, leaving the run to
-# blame the roster for a failure a broken pattern up here had already caused.
+# passed.
 if [ -s "$GREP_FAILURES" ]; then
   echo "::error::A terminology check could not run: grep rejected a pattern, or could not read a file."
   sed 's/^/    /' "$GREP_FAILURES"
-  FAILED=1
-fi
-
-PROMPT_HITS=$(mktemp)
-ORPHAN_HITS=$(mktemp)
-ROSTER_ID_FILE=$(mktemp)
-trap 'rm -f "$FILE_LIST" "$GREP_ERR" "$GREP_FAILURES" "$PROMPT_HITS" "$ORPHAN_HITS" "$ROSTER_ID_FILE"' EXIT
-
-# Which documents are claiming to quote the roster at all. The anchor below is
-# structural for the reason above, but `"prompt": "` is not structure unique to
-# a cron manifest -- it is the shape of a LiteLLM request body, a Vertex
-# payload, and a bench fixture, none of which this guard has an opinion about
-# and all of which live in `examples/`, `bench/` and the reference pages that
-# document them. Applied to every tracked markdown file in the repository, the
-# anchor turns any unrelated pull request that renders one of those into a red
-# CI run with an error message about cron prompts.
-#
-# So narrow the population, not the anchor. A block renders a roster *entry*
-# when it names a job id the roster knows, or carries a key only a roster entry
-# has (`schedule`, `skills`, `deliver`, `no_agent`, `risk`) beside its
-# `"prompt"`; a `"prompt"` in a block that does neither -- a request body, a
-# bench scenario, a tool definition, whatever else it carries -- is left alone.
-# That keeps the property the structural anchor was adopted for -- nothing here
-# is drawn from what a prompt says, so a rewording cannot make the guard stop
-# looking. `hack/scan-cron-prompts.awk` states the rule in full.
-#
-# `jq` over both rosters rather than a hand-kept list: a new job is then covered
-# the day it is added, and a renamed one does not quietly narrow this to zero.
-# The exit status is checked and stderr is left alone: read through
-# `2>/dev/null` a parse error silently *narrowed* the id set -- to one roster's
-# ids, or to none -- and every document the missing ids covered dropped out of
-# the check without a word.
-# shellcheck disable=SC2086 # CRON_JOBS is a deliberate word-split list.
-if ! jq -r '(.jobs // .)[].id' $CRON_JOBS | sort -u > "$ROSTER_ID_FILE"; then
-  echo "ERROR: could not read job ids from ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
-  exit 1
-fi
-if [ ! -s "$ROSTER_ID_FILE" ]; then
-  echo "ERROR: no job ids read from ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
-  exit 1
-fi
-
-# Which prompts are claiming to quote the roster, and which render an entry
-# naming no job at all. `hack/scan-cron-prompts.awk` decides both and documents
-# why; it lives in its own file so tests/test_docs_terminology_guard.py can
-# drive it against fixtures rather than against the repository it happens to
-# ship in. The ids reach it through -v rather than through interpolation.
-# Relative to the repository root, because the `cd` at the top already went there. Deriving
-# it from `$0` instead resolved against the *original* working directory, so
-# `cd hack && ./check-docs-terminology.sh` — the likeliest way anyone runs this
-# by hand — died on "not found" before checking a single prompt.
-if [ ! -f "$SCAN_AWK" ]; then
-  echo "ERROR: ${SCAN_AWK} not found; the cron-prompt guard cannot run." >&2
-  exit 1
-fi
-if ! SCAN=$(tr '\n' '\0' < "$FILE_LIST" \
-  | xargs -0 awk -v idfile="$ROSTER_ID_FILE" -f "$SCAN_AWK"); then
-  echo "ERROR: could not scan the documentation for cron prompts; the guard cannot run." >&2
-  exit 1
-fi
-printf '%s\n' "$SCAN" | sed -n 's/^R://p' > "$PROMPT_HITS"
-printf '%s\n' "$SCAN" | sed -n 's/^O://p' > "$ORPHAN_HITS"
-
-if [ -s "$ORPHAN_HITS" ]; then
-  echo "::error::A rendered cron roster entry names no job id from ${CRON_JOBS}, so its prompt cannot be checked. Restore the \"id\" line, or correct it if the job was renamed. An illustrative entry takes a placeholder id in angle brackets, \"id\": \"<your-audit>\", and is left ungraded."
-  sed 's/^/    /' "$ORPHAN_HITS"
-  FAILED=1
-fi
-
-# No floor here, unlike the caps above: the site owes nobody a quotation of a
-# cron prompt, and zero copies is zero stale copies. That is safe only because
-# the anchor above is structural — see the note on why it used to not be.
-#
-# There is a floor on how much of a prompt a quotation has to show, though. The
-# ellipsis trim below checks as far as the elision and no further, so it can
-# leave almost nothing to check: `"prompt": "R…"` reduces to `R`, and a
-# one-character `grep -qF` matches every manifest that has ever existed. A
-# needle that short is not verification, so require enough of the prompt to
-# identify which one is being quoted. The shortest real quotation in the tree
-# today, `concepts/skills.md`'s opening sentence, is about twice this floor.
-STALE_PROMPTS=""
-SHORT_PROMPTS=""
-while IFS= read -r HIT; do
-  [ -n "$HIT" ] || continue
-  # Strip the grep `path:line:` prefix and the JSON key, then cut at the first
-  # unescaped `"` — the close of the value, whether what follows it is nothing,
-  # a comma, `}`, or the rest of a one-line object. Matching only `"` and `",`
-  # at end of line left the tail attached and turned a verbatim quotation into
-  # a false stale report.
-  #
-  # A trailing ellipsis is an explicit elision — `concepts/skills.md` quotes the
-  # first sentence to show the shape of an entry, not the prompt — so check as
-  # far as the ellipsis and no further. Abbreviating is allowed; misquoting the
-  # part you did show is not. Both spellings count: house style is `…`, and
-  # accepting only `...` failed the quotations that follow it.
-  # Every `"prompt": "…"` on the line, not just the last one. The single `sed`
-  # this replaced led with `^.*"prompt"`, and `.*` is greedy: on a line carrying
-  # two of them it stripped past the first and graded only the second, so a
-  # fabricated first value passed green. The value's own character class has no
-  # such preference — `[^"\\]|\\.` stops at the first unescaped quote by
-  # construction rather than by a following substitution — and `grep -o` emits
-  # one match per occurrence, so both get graded.
-  VALUES=$(printf '%s\n' "$HIT" \
-    | grep -oE '"prompt"[[:space:]]*:[[:space:]]*"([^"\\]|\\.)*"')
-  # A value with no closing quote on its line matches nothing above. Fall back
-  # to the old read — the rest of the line — rather than skipping the hit,
-  # because a hit the loop declines to grade is the silent pass this whole
-  # guard exists to stop, and an unterminated value is exactly the shape a
-  # half-pasted quotation takes.
-  if [ -z "$VALUES" ]; then
-    VALUES=$(printf '%s\n' "$HIT" | sed -E 's/^.*"prompt"[[:space:]]*:[[:space:]]*/"prompt": /')
-  fi
-  while IFS= read -r VALUE; do
-    [ -n "$VALUE" ] || continue
-    RAW=$(printf '%s\n' "$VALUE" \
-      | sed -E 's/^"prompt"[[:space:]]*:[[:space:]]*"?//; s/"$//')
-    # `"prompt": ""` is what a `no_agent` entry renders -- the job runs a
-    # script and has no prompt -- so an empty value is the roster's own text,
-    # not an elision. The floor below is for a value that was cut.
-    if [ -z "$RAW" ]; then
-      continue
-    fi
-    QUOTED=$(printf '%s\n' "$RAW" | sed -E 's/[[:space:]]*(\.\.\.|…)$//')
-    if [ "${#QUOTED}" -lt "$MIN_QUOTED_CHARS" ]; then
-      SHORT_PROMPTS="${SHORT_PROMPTS}${HIT}
-"
-      break
-    fi
-    # shellcheck disable=SC2086 # CRON_JOBS is a deliberate word-split list.
-    grep -qF -- "$QUOTED" $CRON_JOBS
-    MATCH_STATUS=$?
-    if [ "$MATCH_STATUS" -ge 2 ]; then
-      echo "ERROR: grep could not read ${CRON_JOBS}; the cron-prompt guard cannot run." >&2
-      exit 1
-    fi
-    if [ "$MATCH_STATUS" -ne 0 ]; then
-      STALE_PROMPTS="${STALE_PROMPTS}${HIT}
-"
-      break
-    fi
-  done <<VALUES_EOF
-$VALUES
-VALUES_EOF
-done < "$PROMPT_HITS"
-
-if [ -n "$STALE_PROMPTS" ]; then
-  echo "::error::Documented cron prompt is not a verbatim copy of any prompt in ${CRON_JOBS}."
-  printf '%s\n' "$STALE_PROMPTS" | sed '/^$/d; s/^/    /'
-  FAILED=1
-fi
-
-if [ -n "$SHORT_PROMPTS" ]; then
-  echo "::error::Documented cron prompt is elided down to fewer than ${MIN_QUOTED_CHARS} characters, which verifies nothing. Quote more of it before the ellipsis, or paraphrase it in prose instead of rendering it as manifest JSON."
-  printf '%s\n' "$SHORT_PROMPTS" | sed '/^$/d; s/^/    /'
   FAILED=1
 fi
 

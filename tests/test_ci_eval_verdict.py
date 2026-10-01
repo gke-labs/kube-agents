@@ -130,6 +130,32 @@ class AnnounceSuiteVerdictTestCase(unittest.TestCase):
         self.assertEqual(match.group("verdict"), "Failed")
         self.assertEqual(match.group("duration"), "7")
 
+    def test_status_2_with_nothing_graded_names_the_transport_not_the_environment(self):
+        """The inject lane's shape (#2039): `not_evaluated` with no lost case
+        and the set-aside cases under `not_graded`. A rerun reproduces it, so
+        the final line must not say rerun."""
+        self.verdict_json.write_text(
+            json.dumps({"outcome": "not_evaluated", "not_evaluated": [], "not_graded": ["a", "b"]}),
+            encoding="utf-8",
+        )
+        result = self.announce(2, None)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("NOT EVALUATED", result.stdout)
+        self.assertIn("not graded on this transport", result.stdout)
+        self.assertNotIn("rerun when the environment is healthy", result.stdout)
+        match = FINAL_LINE.search(result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        self.assertEqual(match.group("verdict"), "Failed")
+
+    def test_status_2_with_lost_cases_beside_not_graded_ones_still_says_rerun(self):
+        self.verdict_json.write_text(
+            json.dumps({"outcome": "not_evaluated", "not_evaluated": ["a"], "not_graded": ["b"]}),
+            encoding="utf-8",
+        )
+        result = self.announce(2, None)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("rerun when the environment is healthy", result.stdout)
+
     def test_status_2_without_the_json_is_the_plain_red(self):
         """argparse's 2, or a `uv run` that never reached bench-gate."""
         result = self.announce(2, None)

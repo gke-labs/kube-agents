@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud)."""
+"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud).
+
+The platform image build runs the shell blocks of every synced SKILL.md through
+deploy/docker/check_skill_commands.py, so a sync that brings in a command Tirith
+refuses, or changes any line of a block listed in its KNOWN_FINDINGS, comments
+included, fails that build until the list is updated. So does a shell block whose Markdown does not parse as one; that
+fix goes in SKILL_SUBSTITUTIONS below.
+"""
 
 import os
 import shutil
@@ -115,6 +122,48 @@ GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_pa
         refuses it.
 """
 
+# gke-basics' cluster credentials example upstream runs `gcloud container clusters get-credentials`
+# without isolating KUBECONFIG, which overwrites the default kubeconfig context and breaks the Platform
+# Agent's ambient host cluster context. The replacement isolates credentials to a per-target KUBECONFIG
+# under $HERMES_HOME/.kubeconfigs/, in the form agents/platform/AGENTS.md ("Cluster Credentials")
+# gives: `export`, so the pin survives to the kubectl calls that follow rather than scoping to the
+# gcloud, and one file per project/cluster/location, the naming _thread_kubeconfig_path in
+# agents/platform/scripts/platform_mcp_server.py builds and is the source of truth for.
+GKE_BASICS_OLD_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials:
+     ```bash
+     gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
+     ```"""
+
+GKE_BASICS_NEW_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
+   - Always explicitly specify the cluster's location (`--region` for regional clusters, `--zone` for zonal, or `--location` for either) when fetching credentials, and `export` a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` first, so the pin survives to every `kubectl` that follows and concurrent reads of different clusters do not race on one `current-context`:
+     ```bash
+     PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request
+     export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+     gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
+     ```"""
+
+# gke-manifest-generation's grounding step upstream prefers Developer Knowledge's `answer_query`,
+# whose default quota is 50 requests per day per project (developers.google.com/knowledge/quota),
+# shared by every agent in an install; once spent, every lookup 429s for the rest of the day.
+# `search_documents` reads the same corpus at 100 requests per minute, so the skill starts there
+# and never calls `answer_query` (#1765). `get_document` is also not the tool's name.
+GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`answer_query`**: Use this to ask direct questions (e.g., *"How to
+            configure GCS Fuse CSI driver in GKE"*). This is the preferred tool
+            for general queries.
+        -   **`search_documents`**: Use this to search for relevant GKE guides
+            or examples when you don't have a specific question.
+        -   **`get_document`**: Use this to fetch full document contents when
+            you have a specific document ID."""
+
+GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET = """        -   **`search_documents`**: Start every lookup here (e.g., *"configure
+            GCS Fuse CSI driver in GKE"*). It takes only `query`.
+        -   **`get_documents`**: Use this to fetch full document contents when
+            a returned chunk needs its surrounding page.
+        -   Do not call **`answer_query`**: its quota is 50 requests per day per
+            project, shared by every agent in the install, and it reads the
+            same corpus as `search_documents`. Never retry its `429`."""
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
 # where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
 # skill only this repository has from a passage upstream cannot know about, or to drop a name this
@@ -140,6 +189,16 @@ SKILL_SUBSTITUTIONS = {
             GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
             GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
         ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_DEVELOPER_KNOWLEDGE_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_DEVELOPER_KNOWLEDGE_SNIPPET,
+        ),
+    ],
+    "gke-basics": [
+        (
+            GKE_BASICS_OLD_CREDENTIALS_SNIPPET,
+            GKE_BASICS_NEW_CREDENTIALS_SNIPPET,
+        ),
     ],
 }
 
@@ -150,11 +209,13 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Three things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Four things need saying today — the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
-# gke-networking must not present `--dns-endpoint` as unconditionally safe, and gke-upgrades must
-# point at this repo's fleet-upgrade-verification skill for executed per-member version checks.
+# gke-networking must not present `--dns-endpoint` as unconditionally safe, gke-upgrades must
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks, and
+# gke-batch-hpc and gke-workload-scaling must preflight GPU/TPU and large-shape requests into
+# capacity-obtainability.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -263,6 +324,30 @@ When the checklist's deprecated-API item comes up, the same skill's `api_depreca
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output`. It reads Git only: point at GKE Deprecation Insights for live client usage.
+""",
+    "gke-batch-hpc": f"""{FOOTER_MARKER}
+
+## Before scheduling a GPU/TPU batch job with a deadline
+
+Before recommending a start time, zone, or capacity path for a GPU/TPU or large-shape batch job —
+especially one that must finish inside a horizon — load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its **Future windows**
+section: verify the regional quota for the exact accelerator metric, probe
+`gcloud beta compute advice calendar-mode` once per candidate region for the job's shape, count,
+duration, and horizon, and rank the returned windows. That skill owns the probe's flags, the
+chips-per-node arithmetic, the ranking rule, and the paired ProvisioningRequest + LocalQueue
+shapes; follow it rather than restating them here.
+""",
+    "gke-workload-scaling": f"""{FOOTER_MARKER}
+
+## Before recommending GPU/TPU or large-shape capacity for a scale-up
+
+Before recommending capacity for a GPU/TPU or large-shape scale-up, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics: the
+regional quota for the exact accelerator metric, then live obtainability advice for the requested
+shape across zones and provisioning models — and, for a deadline-bound batch scale-up, its
+**Future windows** section (`gcloud beta compute advice calendar-mode`). That skill owns what to
+probe and how to report it; follow it rather than restating it here.
 """,
 }
 

@@ -131,6 +131,16 @@ func TestReconcileA2ADeletesSupersededProvisionJobs(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
+			// The current Job's creation waits on a ready callout replica.
+			// The sweep does not wait with it: a superseded Job's Pending
+			// pod can be holding the very quota slot the callout's surge
+			// pod needs, so a sweep that waited for the hold would wait on
+			// itself. The held pass inside theCalloutIsServing is where
+			// that is measured.
+			theCalloutIsServing(t, ctx, cl, r, agent)
+			if _, deleted := rec.propagation[superseded.Name]; !deleted {
+				t.Fatalf("the superseded Job survived the held pass; on a quota at its edge its Pending pod keeps the slot the callout needs, and the hold never lifts")
+			}
 
 			if _, err := r.reconcileA2A(ctx, agent); err != nil {
 				t.Fatalf("reconcileA2A: %v", err)
@@ -226,6 +236,7 @@ func TestReconcileA2ASupersededProvisionJobFailureDoesNotParkThePhase(t *testing
 		t.Fatal("the Failed condition did not persist on the superseded Job; the phase assertion below would be inert")
 	}
 
+	theCalloutIsServing(t, ctx, cl, r, agent) // the current Job's creation waits on it
 	state, err := r.reconcileA2A(ctx, agent)
 	if err != nil {
 		t.Fatalf("reconcileA2A: %v", err)

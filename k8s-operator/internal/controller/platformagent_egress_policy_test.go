@@ -398,9 +398,9 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 				"and cannot run anything",
 		},
 		{
-			name: "litellm on the port this repository's deployments listen on", ns: agent.Namespace,
+			name: "inference gateway on the port this repository's deployments listen on", ns: agent.Namespace,
 			labels: map[string]string{"app": "litellm"}, port: 8080,
-			why: "buildAgentConfig pins model base_url to http://litellm.<ns>.svc.cluster.local/v1 unconditionally, " +
+			why: "buildAgentConfig pins model base_url to http://inference-gateway.<ns>.svc.cluster.local/v1 unconditionally, " +
 				"and the chart, kustomize and example deployments all start LiteLLM with --port 8080 — a " +
 				"Pod-selector peer matches after the ClusterIP translation, so 8080 is the port that carries " +
 				"every model call",

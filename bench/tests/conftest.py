@@ -15,7 +15,7 @@
 """Shared fixtures for the scoring tests.
 
 EVERY failure mode is a MUTATION OF A REAL RECORD, never a hand-written dict.
-The five directories under ``fixtures/runs/`` are captured devops-bench output
+The six directories under ``fixtures/runs/`` are captured devops-bench output
 (see their README for provenance and the one redacted field), and the helpers
 here copy one and change
 exactly the field under test. That discipline is not stylistic: the first draft
@@ -43,6 +43,14 @@ RED_RUNS = ("kanban_red_1", "kanban_red_2", "kanban_red_3")
 
 #: Two captured runs of the local prompt variant that passes honestly at 1.0.
 GREEN_RUNS = ("kanban_green_1", "kanban_green_2")
+
+#: One captured repetition of the current `agent-kanban-smoke` through the
+#: inject transport (the 2026-09-25 next-mode measurement run): a correct
+#: answer, a trajectory that is the transport's envelope and nothing else,
+#: null tokens, and `the-kanban-card-was-actually-filed` failed at
+#: correctness 0.5 because no tool call reaches that record. `results.json`
+#: only: the artifact set carries no manifest or rows.
+INJECT_RUN = "kanban_inject_1"
 
 
 def read_fixture(name: str) -> dict[str, Any]:

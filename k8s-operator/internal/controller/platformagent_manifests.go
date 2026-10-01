@@ -50,14 +50,31 @@ import (
 var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
+	// kindLocation is the spec.harness.location a kind install sets (with
+	// "kind" for projectId and clusterName as well). No GKE location looks like
+	// this. It means: there is no GKE cluster to fetch credentials for, use the
+	// cluster the pod runs in.
+	kindLocation = "kind"
+	// inClusterContextName is the kubectl context the credential proxy and the
+	// agent use on kind.
+	inClusterContextName = "in-cluster"
+	// inClusterAPIServer is the in-cluster API server address; its certificate
+	// carries this name, so no IP has to be read at render time.
+	inClusterAPIServer = "https://kubernetes.default.svc"
+
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
-	// credentialProxyMaxOutputBytes caps each stream a brokered command returns;
-	// the paragraph above its use ties the figure to the proxy container's
-	// memory limit, and the cap test asserts the pair.
-	credentialProxyMaxOutputBytes = "8388608"
+	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
+	// and what the broker keeps of it while the command runs;
+	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
+	// The paragraph above their use ties the two to the proxy container's
+	// memory limit, and the cap test asserts the three from the rendered env.
+	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
+	// move neither, because the limit they are sized against is not a CR field.
+	credentialProxyMaxOutputBytes        = "8388608"
+	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -74,12 +91,38 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
+	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
+	// collector is admitted to a listener that serves counters and nothing
+	// else, and the credentialed port keeps admitting only the sandbox and the
+	// gateway. One constant for the container port, the value of
+	// CREDENTIAL_PROXY_METRICS_PORT the runtime binds, and the collector's
+	// ingress rule; the chart's PodMonitoring scrapes it by number, held to
+	// this one by tests/test_chart_platform_agent_monitoring.py.
+	credentialProxyMetricsPort     int32 = 8766
+	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
+	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyPortEnv tells the runtime the credentialed port, so its
+	// refusal of a metrics port equal to it compares against the number the
+	// operator renders rather than the runtime's own default.
+	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
 	// only kubelet's port-forward can reach.
 	dashboardPort        = 9119
 	tmpScratchVolumeName = "tmp-scratch"
+	// eventWatcherMetricsPort is where the k8s-event-watcher in the agent-api-auth
+	// sidecar serves Prometheus metrics. One constant for the container port, the
+	// EVENT_WATCHER_METRICS_PORT value the entrypoint turns into --metrics-addr,
+	// and the NetworkPolicy rule that admits the managed-Prometheus collector, so
+	// the listener and the declarations that make it reachable cannot name
+	// different ports. The chart's PodMonitoring scrapes it by number, and
+	// tests/test_chart_platform_agent_monitoring.py holds that number to the
+	// golden rendering of this one.
+	eventWatcherMetricsPort     int32 = 9095
+	eventWatcherMetricsPortName       = "event-metrics"
+	eventWatcherMetricsPortEnv        = "EVENT_WATCHER_METRICS_PORT"
 
 	// sandboxUID is the canonical unprivileged 'hermes' runtime user created in
 	// the upstream NousResearch/hermes-agent Dockerfile (line 92). Everything the
@@ -111,6 +154,34 @@ const (
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
+
+	// The drift-detector's environment, read by start_drift_detector in
+	// deploy/shared/start-services.sh and passed on to the binary as flags. Named
+	// here because every one of them also has to be reserved in
+	// mergeCredentialProxyEnv: they are appended after that merge runs, and an
+	// unreserved name would sit beside a same-named entry from spec.deployment.env
+	// rather than shadowing it, which server-side apply rejects outright.
+	//
+	// The harness triple is repeated for the detector rather than read from
+	// GKE_PROJECT_ID, GKE_LOCATION and GKE_CLUSTER_NAME, which buildPodTemplateSpec
+	// sets on the agent container and not on this sidecar.
+	driftDetectorEnabledEnv        = "DRIFT_DETECTOR_ENABLED"
+	driftDetectorProjectEnv        = "DRIFT_DETECTOR_PROJECT_ID"
+	driftDetectorLocationEnv       = "DRIFT_DETECTOR_CLUSTER_LOCATION"
+	driftDetectorClusterNameEnv    = "DRIFT_DETECTOR_CLUSTER_NAME"
+	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
+	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
+
+	// driftDetectorProjectNumberDigits is the character set a GCP project number
+	// is made of, and the whole of the test for one: a project ID must start with
+	// a lowercase letter, so a value that is nothing but digits cannot be an ID.
+	//
+	// Duplicated from projectNumberDigits in cmd/drift-detector/main.go rather
+	// than shared, because the operator does not import the detector's package
+	// and adding the dependency to reuse ten characters is the worse trade. The
+	// two are held in step by TestDriftDetectorGateRejectsAProjectNumber below,
+	// which asserts the gate refuses exactly what the detector refuses.
+	driftDetectorProjectNumberDigits = "0123456789"
 
 	// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
 	// `database.journal_mode`, rendered into the managed scope by renderConfigYAML
@@ -146,6 +217,11 @@ const (
 	// VolumesDropped condition names them. See hostPathVolumes.
 	hostPathExtraVolumesField   = "spec.deployment.extraVolumes"
 	hostPathSidecarVolumesField = "spec.deployment.sidecarVolumes"
+
+	// inferenceGatewayServiceName is the K8s Service name agents resolve to reach
+	// the inference gateway. Decoupled from the backing implementation (LiteLLM,
+	// vLLM, a custom proxy) so swapping the backend does not touch agent configs.
+	inferenceGatewayServiceName = "inference-gateway"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -260,9 +336,13 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present  bool                    `json:"present"`
-	Projects []string                `json:"projects"`
-	Exclude  scopeExcludeDeclaration `json:"exclude"`
+	Present        bool                    `json:"present"`
+	Projects       []string                `json:"projects"`
+	Folders        []string                `json:"folders"`
+	Organizations  []string                `json:"organizations"`
+	SharedVpcHosts []string                `json:"sharedVpcHosts"`
+	MetricsScopes  []string                `json:"metricsScopes"`
+	Exclude        scopeExcludeDeclaration `json:"exclude"`
 }
 
 type scopeExcludeDeclaration struct {
@@ -284,8 +364,12 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
-		Present:  agent.Spec.Scope != nil,
-		Projects: append([]string{}, scope.Projects...),
+		Present:        agent.Spec.Scope != nil,
+		Projects:       append([]string{}, scope.Projects...),
+		Folders:        append([]string{}, scope.Folders...),
+		Organizations:  append([]string{}, scope.Organizations...),
+		SharedVpcHosts: append([]string{}, scope.SharedVpcHosts...),
+		MetricsScopes:  append([]string{}, scope.MetricsScopes...),
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
@@ -296,6 +380,10 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		decl.Exclude.Clusters = append(decl.Exclude.Clusters, scope.Exclude.Clusters...)
 	}
 	sort.Strings(decl.Projects)
+	sort.Strings(decl.Folders)
+	sort.Strings(decl.Organizations)
+	sort.Strings(decl.SharedVpcHosts)
+	sort.Strings(decl.MetricsScopes)
 	sort.Strings(decl.Exclude.Projects)
 	sort.Slice(decl.Exclude.Clusters, func(i, j int) bool {
 		a, b := decl.Exclude.Clusters[i], decl.Exclude.Clusters[j]
@@ -309,9 +397,9 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 	})
 	out, err := json.MarshalIndent(decl, "", "  ")
 	if err != nil {
-		// Three string slices cannot fail to marshal; if they ever do, an empty
-		// scope is the safe render: the reconcile falls back to today's behaviour
-		// rather than acting on a partial declaration.
+		// String slices and a struct of them cannot fail to marshal; if they ever
+		// do, an empty scope is the safe render: the reconcile falls back to today's
+		// behaviour rather than acting on a partial declaration.
 		manifestsLog.Error(err, "rendering spec.scope failed; rendering no scope")
 		return ""
 	}
@@ -1439,26 +1527,65 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// gitopsRefusalWithholdsManaged reports whether a refused gitops repository is
+// keeping accepted managed ones out of managed_repos, as the seed below does.
+func gitopsRefusalWithholdsManaged(resolved *agentv1alpha1.ResolvedIntegration) bool {
+	return resolved != nil && resolved.GitOps() != nil &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps)) == 0 &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged)) > 0
+}
+
 // buildGitopsStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
 func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	data := map[string]string{}
 
-	// Extract primary repository from CR Spec if provided
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
-		if gitRepo != "" && gitRepo != "None" {
-			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
-				if cleanedURL, err := agentv1alpha1.CleanRepoURLWithOrg(gitRepo, org); err == nil {
-					entries := []agentv1alpha1.ManagedRepoEntry{
-						{Type: "github", URL: cleanedURL},
+	// Seed the declared repositories from the CR spec: the GitOps repository and
+	// the managed ones into managed_repos, GitOps first, and the context ones
+	// into context_repos. Each entry's `type` is its forge's provider, which is
+	// how the discriminator reaches the agent — written down rather than
+	// inferred from the URL's text. Only entries Problems accepts are seeded:
+	// with the webhook off, nothing else stops a refused one reaching the
+	// agent and the minter. The token refresh mints for the first
+	// managed_repos entry when no repository is named, so while a declared
+	// gitops repository is refused no managed one is seeded either: it would
+	// take that place.
+	if agent.Spec.Integration != nil {
+		resolved, err := agent.Spec.Integration.ResolveGit()
+		if err != nil {
+			manifestsLog.Info("Skipping initial configmap seed due to conflicting git integration", "error", err)
+		} else {
+			seedEntries := func(repos []*agentv1alpha1.ResolvedRepository) []agentv1alpha1.ManagedRepoEntry {
+				var entries []agentv1alpha1.ManagedRepoEntry
+				for _, repo := range repos {
+					entry, err := repo.ManagedRepoEntry()
+					if err != nil {
+						// By field, not value: a clone URL can carry a token.
+						manifestsLog.Info("Skipping initial configmap seed of an unparseable or invalid repository",
+							"index", repo.Index, "forge", repo.ForgeName, "role", repo.Role)
+						continue
 					}
-					if jsonBytes, err := json.Marshal(entries); err == nil {
-						data["managed_repos"] = string(jsonBytes)
-					}
+					entries = append(entries, entry)
+				}
+				return entries
+			}
+			managed := seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps))
+			if len(managed) == 0 && resolved.GitOps() != nil {
+				if gitopsRefusalWithholdsManaged(resolved) {
+					manifestsLog.Info("Skipping initial configmap seed of the managed repositories: the gitops repository is refused")
 				}
 			} else {
-				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+				managed = append(managed, seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged))...)
+			}
+			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
+				gitopsStateManagedReposKey: managed,
+				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
+			} {
+				if len(entries) == 0 {
+					continue
+				}
+				if jsonBytes, err := json.Marshal(entries); err == nil {
+					data[key] = string(jsonBytes)
+				}
 			}
 		}
 	}
@@ -1474,6 +1601,24 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 		},
 		Data: data,
 	}
+}
+
+// seededGitOpsEntry is the managed_repos entry the CR's GitOps repository
+// seeds, or nil when it declares none or declares an invalid one.
+func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ManagedRepoEntry {
+	if agent.Spec.Integration == nil {
+		return nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return nil
+	}
+	for _, repo := range resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps) {
+		if entry, err := repo.ManagedRepoEntry(); err == nil {
+			return &entry
+		}
+	}
+	return nil
 }
 
 // renderConfigYAML builds the MANAGED config the pod runs under.
@@ -1657,7 +1802,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	cfg.Model.Provider = "custom"
 	cfg.Model.Default = agentModelName
 	cfg.Model.Model = agentModelName
-	cfg.Model.BaseURL = fmt.Sprintf("http://litellm.%s.svc.cluster.local/v1", agent.Namespace)
+	cfg.Model.BaseURL = fmt.Sprintf("http://%s.%s.svc.cluster.local/v1", inferenceGatewayServiceName, agent.Namespace)
 	cfg.Model.APIKey = "none"
 	// What `provider: custom` against a non-OpenAI base_url already resolves to
 	// (_resolve_plain_custom_api_mode in hermes_cli/runtime_provider.py), so this
@@ -2071,6 +2216,9 @@ type renderOptions struct {
 	// otlpEndpoint because empty already means the managed collector, and the two
 	// outcomes need opposite manifests.
 	otlpDisabled bool
+	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
+	// the declaration cannot name the organisation (see heldGitHubOrg).
+	heldGitHubOrg string
 }
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
@@ -2436,7 +2584,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		})
 	}
 
-	if agent.Spec.Harness != nil {
+	if agent.Spec.Harness != nil && harnessOnKind(agent.Spec.Harness) {
+		// The context the credential proxy's bootstrap writes on kind.
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_CONTEXT_NAME",
+			Value: inClusterContextName,
+		})
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_DEFAULT_NAMESPACE",
+			Value: agent.Namespace,
+		})
+	} else if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ProjectID != "" {
 			envVars = append(envVars, corev1.EnvVar{
 				Name:  "GKE_PROJECT_ID",
@@ -2538,22 +2696,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				})
 			}
 		}
-		if github := integration.GitHub; github != nil {
-			org := strings.TrimSpace(github.Org)
-			if org == "" && github.GitRepo != "" {
-				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
-					parts := strings.SplitN(cleaned, "/", 2)
-					if len(parts) == 2 {
-						org = parts[0]
-					}
-				}
-			}
-			if org != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "GITHUB_ORG",
-					Value: org,
-				})
-			}
+		// GITHUB_ORG still names GitHub because that is what the agent reads it
+		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
+		// and doing it here would rename a variable the pod's scripts still spell
+		// the old way. Until then it names the primary GitHub forge's namespace,
+		// and is unset when no GitHub forge is declared. While the declaration
+		// cannot name it, the pod keeps the one it has, as the minter does.
+		org := ""
+		if resolved, err := integration.ResolveGit(); err == nil {
+			org = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+		}
+		if org == "" {
+			org = opts.heldGitHubOrg
+		}
+		if org != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GITHUB_ORG",
+				Value: org,
+			})
 		}
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			allowAll := false
@@ -3414,6 +3574,89 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return true
 }
 
+// driftDetectorEnabled reports whether the credential sidecar should start the
+// drift-detector. Absent means not started — the mirror image of
+// eventWatcherEnabled above, because drift detection reads a Pub/Sub subscription
+// that only exists where the drift-pubsub Terraform module was applied.
+//
+// The harness triple is part of the condition rather than a validation reported
+// elsewhere. The detector requires --project; --cluster-name requires
+// --cluster-location; and it checks that name against the cluster its credentials
+// actually reach, exiting on a mismatch. An install that asks for the detector
+// without naming its cluster would therefore get a restart loop for as long as the
+// pod lives, so the operator reports it as off and leaves the pod quiet.
+//
+// Populated is not sufficient for projectId, which is why isProjectNumber is here
+// and not only a non-empty check. The detector refuses an all-digits --project
+// outright (looksLikeProjectNumber in cmd/drift-detector/main.go), because the
+// join matches it against each audit record's project_id, which is always the ID;
+// start-services.sh always passes --in-cluster and --profiles-dir, so the join is
+// always on and that refusal is always reachable. Nothing else reading the triple
+// minds a number -- the gcloud bootstrap in buildCredentialProxyEnv takes one, and
+// so do GKE_PROJECT_ID and KUBE_CONTEXT_NAME -- so an install can carry a numeric
+// projectId, be healthy in every other respect, and get the restart loop the
+// paragraph above says this gate prevents. The check belongs here rather than as a
+// CRD pattern on HarnessSpec.ProjectID: that field predates the detector and is
+// shared by those other consumers, so constraining it would reject configurations
+// that work today for everything except this one sidecar.
+//
+// The zone-versus-region mismatch is the other half of this class and is not
+// covered, deliberately: deciding whether a location is the one the cluster
+// actually reports needs a GKE API call per reconcile. This half needs no call.
+func driftDetectorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.DriftDetector == nil || harness.DriftDetector.Enabled == nil {
+		return false
+	}
+	if !*harness.DriftDetector.Enabled {
+		return false
+	}
+	if isProjectNumber(harness.ProjectID) {
+		return false
+	}
+	return harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != ""
+}
+
+// isProjectNumber reports whether a project was given as a project number rather
+// than a project ID. Mirrors looksLikeProjectNumber in cmd/drift-detector/main.go.
+func isProjectNumber(project string) bool {
+	return project != "" && strings.TrimLeft(project, driftDetectorProjectNumberDigits) == ""
+}
+
+// driftDetectorSubscription and driftDetectorGitopsManagers read their fields
+// without a nil check at every call site. Both are empty by default and the
+// detector treats empty as "use my own default" and "claim no reconciliation"
+// respectively, so an absent block and an unset field mean the same thing.
+func driftDetectorSubscription(agent *agentv1alpha1.PlatformAgent) string {
+	if harness := agent.Spec.Harness; harness != nil && harness.DriftDetector != nil {
+		return harness.DriftDetector.Subscription
+	}
+	return ""
+}
+
+func driftDetectorGitopsManagers(agent *agentv1alpha1.PlatformAgent) string {
+	if harness := agent.Spec.Harness; harness != nil && harness.DriftDetector != nil {
+		return harness.DriftDetector.GitopsManagers
+	}
+	return ""
+}
+
+// driftDetectorHarness returns the project, location and cluster name the detector
+// is given, empty when the harness does not name them.
+//
+// Deliberately not resolveHarnessClusterName, whose "platform-agent-host" fallback
+// exists so the watcher always has a label to put on a payload. The detector does
+// not label with this value, it verifies against it: handed a made-up name it would
+// find the credentials reach a differently-named cluster and stop. An empty string
+// is the honest answer, and driftDetectorEnabled has already refused to start the
+// detector by the time one can occur.
+func driftDetectorHarness(agent *agentv1alpha1.PlatformAgent) (project, location, clusterName string) {
+	if harness := agent.Spec.Harness; harness != nil {
+		return harness.ProjectID, harness.Location, harness.ClusterName
+	}
+	return "", "", ""
+}
+
 // asNativeSidecar converts a container into a Kubernetes native sidecar: an init
 // container that never exits and that the kubelet keeps running for the life of
 // the pod.
@@ -3437,12 +3680,12 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 
 // buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
 // credential runtime moved out: the authenticated front door for the Hermes API,
-// and the k8s-event-watcher.
+// the k8s-event-watcher, and the drift-detector where an install has enabled it.
 //
-// Neither could follow the credential proxy into its own pod, and for the same
+// None could follow the credential proxy into its own pod, and for the same
 // reason. The API authenticator forwards to 127.0.0.1:8642, which is the Hermes
-// gateway in this pod; the watcher posts its events to the Session KV server on
-// 127.0.0.1:8699, which the agent container starts. Both are loopback peers of
+// gateway in this pod; the watcher and the detector post to the Session KV server
+// on 127.0.0.1:8699, which the agent container starts. All are loopback peers of
 // the agent, not of the credentials.
 //
 // What that leaves behind is a container with no credential path in it. It runs
@@ -3499,6 +3742,43 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// same-named entry in spec.deployment.env, it would sit beside it, and
 	// server-side apply refuses a duplicate key in `env`.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
+	// The port the watcher serves Prometheus metrics on, which the entrypoint
+	// passes as --metrics-addr. From the constant that also declares the
+	// container port below and the collector's ingress rule in
+	// buildNetworkPolicy, so the listener, the declaration and the policy cannot
+	// name three different ports. Appended after mergeCredentialProxyEnv and
+	// reserved there like the three watcher variables above — and for one more
+	// reason: a CR that moved the listener would leave the container port and
+	// the policy pointing at a port nothing answers on.
+	envVars = append(envVars, corev1.EnvVar{Name: eventWatcherMetricsPortEnv, Value: strconv.Itoa(int(eventWatcherMetricsPort))})
+	// The drift-detector's switch, the second peer process in this container.
+	// Written on every reconcile rather than only when on, for the reason the
+	// watcher's block above gives: the pod stays Ready either way, so the Deployment
+	// is the only place a reader can tell a deliberately quiet install from a broken
+	// one.
+	driftEnabled := driftDetectorEnabled(agent)
+	envVars = append(envVars, corev1.EnvVar{Name: driftDetectorEnabledEnv, Value: strconv.FormatBool(driftEnabled)})
+	// Its settings, only when it is on. Every install that has not applied the
+	// drift-pubsub module is off, so writing these unconditionally would put the
+	// harness triple a second time on a container that does not read it — the same
+	// three values, under different names, on every credential proxy in the fleet,
+	// for a process that is not running. All six names are reserved in
+	// mergeCredentialProxyEnv whether or not this branch writes them, so the CR
+	// cannot supply the ones this skips.
+	//
+	// The triple is repeated at all because buildPodTemplateSpec sets GKE_PROJECT_ID,
+	// GKE_LOCATION and GKE_CLUSTER_NAME on the agent container and not on this
+	// sidecar.
+	if driftEnabled {
+		driftProject, driftLocation, driftClusterName := driftDetectorHarness(agent)
+		envVars = append(envVars,
+			corev1.EnvVar{Name: driftDetectorProjectEnv, Value: driftProject},
+			corev1.EnvVar{Name: driftDetectorLocationEnv, Value: driftLocation},
+			corev1.EnvVar{Name: driftDetectorClusterNameEnv, Value: driftClusterName},
+			corev1.EnvVar{Name: driftDetectorSubscriptionEnv, Value: driftDetectorSubscription(agent)},
+			corev1.EnvVar{Name: driftDetectorGitopsManagersEnv, Value: driftDetectorGitopsManagers(agent)},
+		)
+	}
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"})
 	// The plain hardened context, with no UID of its own. The credential runtime
 	// used to sit in this Pod under a second uid, so that the shell could not
@@ -3511,11 +3791,16 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		// Starts two of the image's three peer services — the API authenticator
-		// and the k8s-event-watcher. See deploy/shared/start-services.sh.
+		// Starts three of the image's four peer services — the API authenticator,
+		// the k8s-event-watcher, and the drift-detector where it is enabled. See
+		// deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
-		Ports:   []corev1.ContainerPort{{Name: "proxy-api", ContainerPort: 8643}},
+		Ports: []corev1.ContainerPort{
+			{Name: "proxy-api", ContainerPort: 8643},
+			// The watcher's /metrics, for the chart's PodMonitoring (see eventWatcherMetricsPort).
+			{Name: eventWatcherMetricsPortName, ContainerPort: eventWatcherMetricsPort},
+		},
 		// TCP, not the HTTP probe the credential proxy uses. Every path on this
 		// listener requires the bearer key, so an unauthenticated GET is a 401
 		// whether the pod is healthy or not, and there is no /healthz to ask
@@ -3614,6 +3899,12 @@ func sessionKVSaltSecretRef(agent *agentv1alpha1.PlatformAgent) *corev1.SecretKe
 	return defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
 }
 
+// harnessOnKind reports whether the harness describes a kind install rather
+// than a GKE cluster; see kindLocation.
+func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
+	return harness != nil && harness.Location == kindLocation
+}
+
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
@@ -3629,33 +3920,53 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// collectors' parse gate and drops that whole cluster out of
 		// compliance-audit and ai-security-audit as a coverage gap.
 		//
-		// The cap does not bound the read: `_execute` takes the subprocess to
-		// completion with `communicate()` before it slices, so the full output
-		// is resident whatever this says. What it does bound is the slice that
-		// survives, and that copy is then JSON-escaped and encoded for the
-		// response -- so raising it costs on the order of three times the
-		// increase per in-flight request rather than nothing.
+		// The cap bounds the read as well as the response: credential_proxy.py
+		// reads a command's output as it streams and drops everything past
+		// the cap, and bounds the decoded text to the same size, so what a
+		// command prints beyond it costs the broker nothing and output that is
+		// not UTF-8 (every byte a three-byte replacement character) cannot
+		// cost more than text. (It used to hold the whole output until the
+		// command exited and truncate afterwards, which is what took the
+		// container past its limit under concurrent triage sessions.) What the
+		// broker does hold, per in-flight request and transiently, is about
+		// six times the cap: the two capped stream buffers, their decoded
+		// text, and the JSON body and its encoding -- measured at 48 MiB per
+		// request against this 8 MiB cap for text, 37 MiB for bytes that are
+		// not UTF-8.
 		//
-		// Which is what puts a ceiling on it, and the ceiling is the proxy
-		// container's own memory limit (buildCredentialProxyContainer) rather
-		// than anything about the fleet. Count five live copies of a capped
-		// output per stream -- the subprocess bytes, the slice, the decoded str,
-		// the JSON-escaped str, the encoded response -- and two capped streams
-		// per command, because `_execute` truncates stdout and stderr in two
-		// independent calls, so the cap is a per-stream ceiling. Ten copies,
-		// then, against the five-way kanban fan-out resolveResources sizes the
-		// agent container for, plus the front-door session, each issuing one
-		// command. At 8 MiB that is 480 MiB of burst on top of the 256Mi the
-		// container requests at rest, which its 1Gi limit absorbs; at 16 MiB --
-		// the value this carried while the proxy was a sidecar with a 2Gi limit
-		// -- it does not, and an OOMKill here takes gcloud, kubectl, gh and git
-		// away from every agent the proxy serves. Raising this means raising the
-		// limit with it, and the cap test asserts the pair so the two cannot
-		// drift apart silently -- it is the arithmetic above, so believe it over
-		// this paragraph if they ever disagree again.
+		// Which is what ties this figure to the proxy container's own memory
+		// limit (buildCredentialProxyContainer) rather than to anything about
+		// the fleet. Concurrency is bounded inside the broker at the value set
+		// just below, and a request holds its slot until its response is
+		// written, so the burst is six times the cap times that: at 8 MiB and
+		// eight slots, 384 MiB on top of the 256Mi the container requests at
+		// rest, which its 1Gi limit absorbs. The limit must also hold the
+		// child processes themselves, one kubectl or gcloud per in-flight
+		// request, and a kubectl listing thousands of objects runs to hundreds
+		// of MiB on its own; that term is outside this arithmetic and is what
+		// the rest of the limit is for. Raising either cap means raising the
+		// limit with it, which is why both are set here and so reserved rather
+		// than left to spec.deployment.env: the limit is not a CR field, and a
+		// CR that could raise a cap could not raise what holds it. The cap
+		// test asserts the three from the rendered env, so believe it over
+		// this paragraph if they ever disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
+		// How many brokered commands run at once. The broker's own default is
+		// the same figure; setting it here is what makes it the operator's to
+		// move, together with the limit above.
+		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		// The credentialed port, the same constant the container port and the
+		// policy are rendered from: the runtime refuses a metrics port equal to
+		// it before binding, so its idea of that port has to be the operator's.
+		// Envoy's listener carries the same number in its config, held to this
+		// constant by the runtime's OperatorContractTest.
+		{Name: credentialProxyPortEnv, Value: strconv.Itoa(credentialProxyPort)},
+		// The metrics-only listener's port (see credentialProxyMetricsPort). In
+		// the managed set, so a spec.deployment.env entry cannot move the
+		// listener off the port the container declares and the policy admits.
+		{Name: credentialProxyMetricsPortEnv, Value: strconv.Itoa(int(credentialProxyMetricsPort))},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
@@ -3714,7 +4025,19 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
-	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
+	if harness := agent.Spec.Harness; harnessOnKind(harness) {
+		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
+		// `tokenFile` rather than `--token`, since the kubelet rotates the
+		// projected token. Paths are literal because the bootstrap shell only
+		// receives GKE_* and KUBE_* variables (credential_proxy.py, bootstrap).
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: inClusterContextName}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", Value: fmt.Sprintf(`kubectl config set-cluster "$KUBE_CONTEXT_NAME" --server=%q --certificate-authority=%q >/dev/null &&
+kubectl config set "users.${KUBE_CONTEXT_NAME}.tokenFile" %q >/dev/null &&
+kubectl config set-context "$KUBE_CONTEXT_NAME" --cluster="$KUBE_CONTEXT_NAME" --user="$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null &&
+kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null`, inClusterAPIServer, kubeAPIAccessMountPath+"/ca.crt", kubeAPIAccessMountPath+"/token")},
+		)
+	} else if harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
 			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
@@ -3827,7 +4150,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
-		"CREDENTIAL_PROXY_PORT",
+		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
+		// and so reserved there by the loop above; listed for buildAgentAPIAuthEnv,
+		// whose managed set carries neither, and whose credential_proxy.py parses
+		// CREDENTIAL_PROXY_PORT as an integer before the api-proxy role returns.
+		credentialProxyPortEnv,
+		credentialProxyMetricsPortEnv,
 		"CREDENTIAL_PROXY_ROLE",
 		// Same argument as the authentication settings above, one layer over.
 		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch
@@ -3845,8 +4173,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// All three appended by buildAgentAPIAuthSidecar after this merge runs,
-		// so none is in `managed` above and none reserves its own name.
+		// These ten are appended by buildAgentAPIAuthSidecar after this merge
+		// runs, so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
 		// name. That is not last-wins: `containers[].env` is a listType=map,
@@ -3855,6 +4183,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"EVENT_WATCHER_CLUSTER_NAME",
 		"EVENT_WATCHER_ENABLED",
 		eventWatcherMemoryLimitEnv,
+		eventWatcherMetricsPortEnv,
+		driftDetectorEnabledEnv,
+		driftDetectorProjectEnv,
+		driftDetectorLocationEnv,
+		driftDetectorClusterNameEnv,
+		driftDetectorSubscriptionEnv,
+		driftDetectorGitopsManagersEnv,
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {
@@ -3920,7 +4255,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	allowed := map[string]struct{}{
-		"ALERT_DAILY_LIMIT_CRITICAL":  {},
+		"ALERT_DAILY_LIMIT_CRITICAL": {},
+		// Not a severity, unlike its three neighbours: the drift detector's
+		// records display as Warning and bill a bucket of their own, so
+		// `alert_quota` is keyed on "GitOpsDrift" and this is the variable that
+		// tunes it (DRIFT_QUOTA_KEY in session_kv_server.py). It earns the same
+		// place here for the same reason the others do — it bounds a count of
+		// chat messages and reaches nothing else.
+		"ALERT_DAILY_LIMIT_DRIFT":     {},
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
@@ -4841,7 +5183,27 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
-// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf.
+//
+// Three parser passes run over every line the sidecar tails. gchat_event lifts
+// the chat user and session out of the gateway's own lines. The other two are
+// the audit trail's: hermes_audit_line recognises a line the tool_call_audit
+// plugin or the chat_message_audit hook wrote — Hermes' timestamp, level and
+// logger name, then one JSON object — and captures the object as audit_json;
+// audit_json then decodes it into top-level fields and drops the capture. A
+// line neither parser matches passes through untouched, and the raw line stays
+// under `log` either way, so Cloud Logging carries the record's fields as its
+// own jsonPayload keys (event_type, tool, status, ...) beside the text every
+// existing reader still greps. The lift is what makes an audit record
+// filterable without a regex; the record's shape is common/audit_schema.py's.
+//
+// The line prefix the regex reads is Hermes' own log format, which this
+// repository does not own: `%(asctime)s %(levelname)s%(session_tag)s %(name)s:
+// %(message)s` in the pinned image's hermes_logging.py, where session_tag is
+// ` [<session id>]` on a record emitted on a thread that holds a session
+// context and empty otherwise. Both forms have to match, or the records of
+// tools Hermes runs inline on the turn thread would pass through unlifted and
+// silently. TestFluentBitLiftsAuditRecordsIntoFields carries a sample of each.
 func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -4880,6 +5242,22 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Preserve_Key  On
 
 [FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      log
+    Parser        hermes_audit_line
+    Reserve_Data  On
+    Preserve_Key  On
+
+[FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      audit_json
+    Parser        audit_json
+    Reserve_Data  On
+    Preserve_Key  Off
+
+[FILTER]
     Name              record_modifier
     Match             agent.logs
     Record            app agent
@@ -4894,6 +5272,15 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name    gchat_event
     Format  regex
     Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+[PARSER]
+    Name    hermes_audit_line
+    Format  regex
+    Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+[PARSER]
+    Name    audit_json
+    Format  json
 `,
 		},
 	}
@@ -5090,6 +5477,10 @@ func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 
 // buildFQDNNetworkPolicy generates the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1)
 // for GKE Dataplane V2 clusters when enable-fqdn-network-policy annotation is set.
+//
+// It selects the gateway pod only. The credential broker, which is the pod that
+// actually calls the forge, is not covered by it; how the broker's egress should
+// be narrowed is an open question in docs/designs/version-control-support.md.
 func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
 	patterns := []string{
 		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
@@ -5117,10 +5508,17 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.gcr.io",
 		"pkg.dev",
 		"*.pkg.dev",
-		// GitOps & Source Control
-		"github.com",
-		"*.github.com",
-		"*.githubusercontent.com",
+	}
+	// GitOps & Source Control: derived from the forge declaration, so a forge
+	// at a customer-chosen hostname is reachable without a literal here. Kept
+	// in its old position in the list, so an upgrade re-renders a GitHub
+	// install's policy byte for byte.
+	var integration *agentv1alpha1.IntegrationSpec
+	if agent != nil && agent.Spec.Integration != nil {
+		integration = &agent.Spec.Integration.IntegrationSpec
+	}
+	patterns = append(patterns, agentv1alpha1.ForgeEgressPatterns(integration)...)
+	patterns = append(patterns,
 		// Chat Integrations
 		"slack.com",
 		"*.slack.com",
@@ -5130,7 +5528,7 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.login.microsoftonline.com",
 		"botframework.com",
 		"*.botframework.com",
-	}
+	)
 
 	matches := make([]interface{}, 0, len(patterns))
 	for _, p := range patterns {
@@ -5254,8 +5652,9 @@ func peersNotAlreadyPresent(present, candidates []networkingv1.NetworkPolicyPeer
 	return kept
 }
 
-// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
-// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent:
+// the gateway policy, the one policy an install places on the agent Pod. No static
+// copy of it ships anywhere in the repository.
 //
 // otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
 // collector, so there is no export to allow and the collector egress rule is left out.
@@ -5336,7 +5735,7 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 	// it under, so a grep for that constant finds both places the resolver is
 	// permitted. The grant is IPv4-only on purpose: fd20:ce::254 is documented as
 	// a metadata endpoint rather than as a resolver, and no static copy in
-	// charts/ or deploy/kustomize names it in a DNS rule, so it stays out until a
+	// charts/ names it in a DNS rule, so it stays out until a
 	// dual-stack Cloud DNS cluster is observed naming it in a Pod's resolv.conf.
 	peers = append(peers, formatCIDRPeers([]string{metadataResolverCIDR}, true)...)
 
@@ -5411,6 +5810,26 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			Port:     ptr.To(intstr.FromInt32(dashboardPort)),
 		})
 	}
+
+	// The managed-Prometheus collector, scraping the event watcher's metrics
+	// port on the agent-api-auth sidecar. A rule of its own rather than a port
+	// on the first: that rule admits every pod in the agent's namespace, and the
+	// collector lives in gke-gmp-system, which a bare podSelector never reaches.
+	// The same shape as the LiteLLM policy's scrape rule
+	// (buildLiteLLMNetworkPolicy), for the same collector. Unconditional, like
+	// the container port it pairs with: the chart's PodMonitoring is what an
+	// install switches off, and a policy that admitted nothing on the port
+	// would make this rule the reason a scrape fails rather than that switch.
+	ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{
+			{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+				},
+			},
+		},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(eventWatcherMetricsPort)},
+	})
 
 	dnsPeers := clusterDNSPeers(dnsIPs)
 

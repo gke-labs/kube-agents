@@ -93,12 +93,19 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .evidence_store import EvidenceSource, StoreUnreachable, is_gcs, open_backend
+from .evidence_store import (
+    EvidenceSource,
+    StoreUnreachable,
+    is_gcs,
+    open_backend,
+    scope_of,
+)
 
 __all__ = [
     "ADMISSION_MODES",
@@ -118,6 +125,7 @@ __all__ = [
     "BaselineEvidence",
     "BaselineRecord",
     "BaselineStore",
+    "CaseOutOfScope",
     "RecordVerdict",
     "StoreUnreachable",
     "VersionKey",
@@ -552,6 +560,17 @@ def _parse_source(source: EvidenceSource) -> list[BaselineRecord]:
     return parsed
 
 
+class CaseOutOfScope(LookupError):
+    """A scoped store was asked about a case it never read.
+
+    Not a :class:`ValueError` and not a :class:`~.StoreUnreachable`: the gate
+    catches both of those and carries on, one fatally and one degraded, and
+    neither is what this is. This is a caller bug -- a store loaded with one
+    set of cases and questioned about another -- and it must reach the
+    traceback rather than be absorbed into a verdict.
+    """
+
+
 class BaselineStore:
     """``bench/baselines/<case-id>.jsonl``, one file per case.
 
@@ -560,19 +579,35 @@ class BaselineStore:
     newest to oldest.
     """
 
-    def __init__(self, records: dict[str, list[BaselineRecord]]):
+    def __init__(
+        self,
+        records: dict[str, list[BaselineRecord]],
+        *,
+        scope: Collection[str] | None = None,
+    ):
         self._records = records
+        #: The cases this store was read for, or None for all of them. Every
+        #: lookup is checked against it -- see :meth:`_for`.
+        self.scope = scope_of(scope)
         #: case id -> how many of its oldest objects the read left out. Empty
         #: on the local backend, and empty on GCS until the cap actually binds.
         self.truncated: dict[str, int] = {}
 
     @classmethod
-    def load(cls, location: str | Path) -> BaselineStore:
-        """Read every case's evidence from ``location``.
+    def load(
+        cls, location: str | Path, *, only: Collection[str] | None = None
+    ) -> BaselineStore:
+        """Read evidence from ``location`` -- every case, or just ``only``.
 
         A directory, or ``gs://bucket/prefix``. A missing directory or an empty
         prefix is an empty store, not an error: that is the state this ships in
         and the state a fresh checkout is in before anything has been screened.
+
+        ``only`` exists because reading the whole store is expensive on GCS and
+        no caller has ever needed it: the gate grades one case at a time and
+        the suite grades the cases it just ran. It is remembered as
+        :attr:`scope`, so asking a scoped store about a case outside it raises
+        :class:`CaseOutOfScope` instead of answering "never screened".
 
         Raises :class:`ValueError` on bytes that will not parse and
         :class:`StoreUnreachable` when the store could not be read at all. The
@@ -580,11 +615,28 @@ class BaselineStore:
         """
         backend = open_backend(location)
         records: dict[str, list[BaselineRecord]] = {}
-        for source in backend.sources():
+        for source in backend.sources(only):
             records[source.case_id] = _parse_source(source)
-        store = cls(records)
+        store = cls(records, scope=only)
         store.truncated = dict(getattr(backend, "truncated", {}) or {})
         return store
+
+    def _for(self, case_id: str) -> list[BaselineRecord]:
+        """This case's records, oldest first, and [] when it has none.
+
+        The single door onto ``_records``, so that the scope check cannot be
+        forgotten at one of the seven places that look a case up. A scoped
+        store missing a case means one of two opposite things -- the case has
+        never been screened, or this read never asked for it -- and reporting
+        the second as the first silently de-admits a case that is passing.
+        """
+        if self.scope is not None and case_id not in self.scope:
+            raise CaseOutOfScope(
+                f"{case_id!r} is outside this store's read scope "
+                f"({', '.join(sorted(self.scope)) or 'no cases'}); "
+                "pass it to BaselineStore.load(only=...)"
+            )
+        return self._records.get(case_id, [])
 
     def record_for(self, case_id: str, key: VersionKey | None) -> BaselineRecord | None:
         """The NEWEST screening record for this case at this exact key.
@@ -595,14 +647,14 @@ class BaselineStore:
         """
         if key is None:
             return None
-        for record in reversed(self._records.get(case_id, [])):
+        for record in reversed(self._for(case_id)):
             if record.key == key:
                 return record
         return None
 
     def history_for(self, case_id: str) -> list[BaselineRecord]:
         """Every record for a case, oldest first, across all version keys."""
-        return list(self._records.get(case_id, []))
+        return list(self._for(case_id))
 
     def evidence_for(
         self,
@@ -626,7 +678,7 @@ class BaselineStore:
         """
         if key is None:
             return None
-        matching = [r for r in self._records.get(case_id, []) if r.key == key]
+        matching = [r for r in self._for(case_id) if r.key == key]
         if not matching:
             return None
 
@@ -680,7 +732,7 @@ class BaselineStore:
         if key is None:
             return "the run carries no version key, so no baseline matches it"
         if evidence is None:
-            known = len(self._records.get(case_id, []))
+            known = len(self._for(case_id))
             if known:
                 return (
                     f"stale: {known} baseline record(s) exist for this case but "
@@ -733,7 +785,7 @@ class BaselineStore:
         detail = self._pre_admission_state(case_id, key, evidence, bar)
         if evidence is not None:
             return RecordVerdict(RECORD_COLLECTING, detail, evidence)
-        if key is not None and self._records.get(case_id):
+        if key is not None and self._for(case_id):
             return RecordVerdict(RECORD_STALE, detail)
         return RecordVerdict(RECORD_NONE, detail)
 
@@ -789,7 +841,7 @@ class BaselineStore:
                     reason += "; " + RECORD_WOULD_ADMIT_PREFIX + verdict.detail
                 elif verdict.state == RECORD_WOULD_DEMOTE:
                     reason += "; " + RECORD_WOULD_DEMOTE_PREFIX + verdict.detail
-                elif self._records.get(case_id):
+                elif self._for(case_id):
                     reason += BOOTSTRAP_STATE_PREFIX + verdict.detail
                 return Admission(True, reason, ADMITTED_BY_BOOTSTRAP, verdict.state)
             reason = verdict.detail
@@ -809,7 +861,7 @@ class BaselineStore:
 
         if listed:
             reason = BOOTSTRAP_REASON
-            if self._records.get(case_id):
+            if self._for(case_id):
                 reason += BOOTSTRAP_STATE_PREFIX + verdict.detail
             return Admission(True, reason, ADMITTED_BY_BOOTSTRAP, verdict.state)
 

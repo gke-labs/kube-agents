@@ -60,12 +60,12 @@ data:
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
 _DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2066
+_DEFAULT_REQUESTS_CPU_MILLIS = 2466
 _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8064 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 8320 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 22016 * 1024**2
 _DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
@@ -844,7 +844,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        self.assertIn('"cpu":"2166m"', res.stderr)
+        self.assertIn('"cpu":"2566m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -853,7 +853,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10112Mi"', res.stderr)
+        self.assertIn('"memory":"10368Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1190,16 +1190,19 @@ class DocumentedFootprintTest(unittest.TestCase):
             "stale ephemeral-storage limits",
         )
 
-        # Check schedulable capacity table row.
+        # Check schedulable capacity table row. CPU is quoted to one decimal, like
+        # memory: the total sits between whole cores, and rounding it to one would
+        # understate the request by a fifth.
         m_capacity = re.search(
-            r"requests about\s+(\d+)\s+vCPU and\s+([\d\.]+)\s+GiB across\s+(\d+)\s+pods",
+            r"requests about\s+([\d\.]+)\s+vCPU and\s+([\d\.]+)\s+GiB across\s+(\d+)\s+pods",
             page,
         )
         self.assertIsNotNone(
             m_capacity, "schedulable capacity row not found on prerequisites page"
         )
         self.assertEqual(
-            int(m_capacity.group(1)), round(required["requestsCpu"] / 1000)
+            float(m_capacity.group(1)),
+            math.floor((required["requestsCpu"] / 1000) * 10 + 0.5) / 10,
         )
         self.assertEqual(
             float(m_capacity.group(2)),

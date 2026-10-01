@@ -684,6 +684,16 @@ Mutation(
         "drop the digest and keep the tag, which reads as equivalent",
     ),
     Mutation(
+        "C4-hermes-plugin-ref",
+        "deploy/docker/Dockerfile",
+        (' --ref "${HERMES_OTEL_REF}"', ""),
+        "test_C4_every_hermes_plugin_install_is_pinned_to_a_commit",
+        "drop the ref and install the plugin from whatever the upstream "
+        "default branch holds, which is how the build broke in the first place; "
+        "the SHA itself lives in an ARG, so the ref token is what a careless "
+        "edit removes",
+    ),
+    Mutation(
         "C5-minted-write-verb",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - get\n      - list\n", "      - get\n      - list\n      - patch\n"),
@@ -862,7 +872,8 @@ Mutation(
     Mutation(
         "D1-principal-not-logged",
         "agents/platform/scripts/credential_proxy.py",
-        ("            _sanitize_for_logging(principal.describe(), max_length=512),", "            \"-\","),
+        ("        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)",
+         "        principal_label = \"-\""),
         "test_D1_the_exec_route_records_a_principal",
         "drop the principal from the exec record while refactoring a handler "
         "that does not yet read it",
@@ -919,6 +930,58 @@ Mutation(
         "promote the outage stopgap to a documented chart value, which is how a "
         "global, unscoped, never-expiring autonomy switch actually gets offered "
         "to a customer -- as a helpful comment next to a boolean",
+    ),
+    # The three rows below, and the site row after them, are the other three
+    # surfaces of the same test. Until #1752 the chart row above was the only
+    # attack on it: the CRD halves and the site half were named by nothing.
+    Mutation(
+        "D2-read-only-leaves-the-env-denylist",
+        "k8s-operator/api/v1alpha1/common_types.go",
+        ('\t"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},\n', ""),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "drop the read-only switch from SensitiveEnvVars while tidying the map. "
+        "The webhook stops refusing it and mergeCredentialProxyEnv stops "
+        "dropping it, so a spec.deployment.env entry naming it is admitted and "
+        "reaches the broker: the switch, offered through the CRD one list over "
+        "from where the scan was looking",
+    ),
+    Mutation(
+        "D2-read-only-documented-in-a-crd-field",
+        "k8s-operator/api/v1alpha1/common_types.go",
+        ("type SecuritySpec struct {\n",
+         "type SecuritySpec struct {\n"
+         "\t// EnforceReadOnly renders CREDENTIAL_PROXY_ENFORCE_READ_ONLY on the broker.\n"
+         "\t// Set false to recover from a bad allowlist without an image build.\n"
+         "\t// +optional\n"
+         "\tEnforceReadOnly *bool `json:\"enforceReadOnly,omitempty\"`\n"),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "offer the switch as a CRD field with a helpful description -- the "
+        "shape D2-workflow-mode takes, on the switch that already exists",
+    ),
+    Mutation(
+        "D2-read-only-offered-on-the-crd-root",
+        "k8s-operator/api/v1alpha1/platformagent_types.go",
+        ('type PlatformAgentSpec struct {\n\tAgentSpec `json:",inline"`\n',
+         'type PlatformAgentSpec struct {\n\tAgentSpec `json:",inline"`\n\n'
+         "\t// EnforceReadOnly sets CREDENTIAL_PROXY_ENFORCE_READ_ONLY on the broker.\n"
+         "\t// +optional\n"
+         "\tEnforceReadOnly *bool `json:\"enforceReadOnly,omitempty\"`\n"),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "the same field on the CRD's root type rather than on an embedded spec "
+        "-- the file no registry entry named before #1752, so stubbing it to a "
+        "bare package clause left the suite green",
+    ),
+    Mutation(
+        "D2-read-only-documented-on-the-site",
+        "docs/site/src/content/docs/reference/security-and-iam.md",
+        ("## Configuring read-only (auditing) mode\n",
+         "## Configuring read-only (auditing) mode\n\n"
+         "To lift the credential proxy's gate for every command, set "
+         "`CREDENTIAL_PROXY_ENFORCE_READ_ONLY=false` on the broker.\n"),
+        "test_D2_the_read_only_posture_is_not_a_customer_facing_knob",
+        "write the outage stopgap up on the security page as the way to turn "
+        "the posture off. Documented is offered; this half of the test ran "
+        "behind an `if docs.is_dir():` with no else and was attacked by nothing",
     ),
     Mutation(
         "D5-cross-reference-renamed",
@@ -1058,6 +1121,60 @@ Mutation(
         "entering it costs an argument",
     ),
     Mutation(
+        "A3-inject-door-always-rendered",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("\tif a2aInjectBackendEnabled() {\n\t\tinjectEnv = []corev1.EnvVar{",
+         "\tif true {\n\t\tinjectEnv = []corev1.EnvVar{"),
+        "test_A3_the_inject_door_renders_only_under_the_operator_flag",
+        "render the eval door's env, port and principal-map mount on every "
+        "mode: next gateway rather than only under the operator's flag. The "
+        "door has no customer-facing purpose and maps a principal out of a "
+        "request body, so an install that never asked for it must not carry "
+        "it. The operator's own flag-off render test "
+        "(TestA2AInjectBackendIsOffWithoutTheFlag) would catch it too, but it "
+        "is a Go test this harness does not run; the conformance test is the "
+        "one that has to notice, from the source, that the render consults "
+        "the flag",
+    ),
+    Mutation(
+        "A3-inject-flag-fails-open",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ('\treturn os.Getenv(a2aInjectBackendEnvVar) == "true"',
+         "\treturn os.Getenv(a2aInjectBackendEnvVar) != \"\""),
+        "test_A3_the_inject_flag_is_not_a_field_a_customer_can_set",
+        "make the eval flag true for any non-empty value. A typo, a stray "
+        "\"false\" or a templating artifact would then render a door that "
+        "maps a body-supplied principal, on an install that never asked for "
+        "one, instead of leaving it shut, which is the direction a flag "
+        "guarding this must never relax in",
+    ),
+    Mutation(
+        "A3-inject-principal-unchecked",
+        "a2a/gateway/gchat.go",
+        ("\tif !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {",
+         "\tif false {"),
+        "test_A3_the_inject_door_cannot_assert_a_cloud_principal",
+        "let the eval door's principal map resolve to any principal at all. "
+        "The door takes its author from a request body, so the map is the "
+        "only thing between a token holder and a principal of their "
+        "choosing; without this refusal an entry naming a cloud identity "
+        "would be honoured, which is an identity-minting door the day "
+        "publisher identity arms",
+    ),
+    Mutation(
+        "A3-inject-principal-defaulted",
+        "a2a/gateway/gchat.go",
+        ('\t\t\t"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n\t\treturn ""\n\t}',
+         '\t\t\t"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)\n'
+         "\t\tprincipal = injectEvalPrincipalPrefix + principal\n\t}"),
+        "test_A3_the_inject_door_cannot_assert_a_cloud_principal",
+        "keep the refusal's condition and log line but repair the value into "
+        "the eval namespace instead of dropping it. The check still runs, the "
+        "error is still logged, and a map entry naming a cloud identity is "
+        "still honoured -- so an assertion that only looks for the condition "
+        "passes on a resolver that defaults",
+    ),
+    Mutation(
         "C1-session-fence-selector-drift",
         "a2a/gateway/spawn.go",
         ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
@@ -1127,8 +1244,8 @@ Mutation(
     Mutation(
         "A3-supervisor-terminal-back-on-events",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.supervisor",',
-         '\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.events",'),
+        ('\t\t"a2a.tasks.*.*.in",\n\t\t"a2a.tasks.*.*.supervisor",',
+         '\t\t"a2a.tasks.*.*.in",\n\t\t"a2a.tasks.*.*.events",'),
         "test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject",
         "move the gateway's supervisor publish back onto the executors' events "
         "subject -- the pre-split render, and the change a rollback of the "

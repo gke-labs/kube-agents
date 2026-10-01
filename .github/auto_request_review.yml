@@ -10,6 +10,7 @@ reviewers:
       - jayantid
       - toshiowang
       - dshnayder
+      - bnaylor
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
     # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
     # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request
@@ -45,3 +46,18 @@ options:
   # If it's true, the last matching files-change pattern takes the most precedence (CODEOWNERS-compatible)
   # See https://github.com/necojackarc/auto-request-review/pull/80 for more details.
   last_files_match_only: true
+
+  # Robots that review under an ordinary user account rather than a GitHub
+  # App, so nothing else tells them from a person. Their reviews never count
+  # as a verdict when deciding whether a pull request already has a human
+  # reviewer: one re-reviews every push and files its follow-ups as
+  # COMMENTED, so a CHANGES_REQUESTED it once filed would otherwise stand
+  # for the life of the pull request and the check-run path would never
+  # request a human. A review request outstanding to one of them is not a
+  # reviewer already asked, either. Bare logins, as GitHub shows them: the
+  # comparison is exact, and the script refuses any other shape at load.
+  # Quote a login that is all digits or a YAML word such as yes, no, on or
+  # off, or YAML reads it as a number or a boolean and the script refuses it
+  # by name.
+  robot_accounts:
+    - kyber775

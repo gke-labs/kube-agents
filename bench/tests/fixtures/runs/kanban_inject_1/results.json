@@ -1,0 +1,173 @@
+[
+  {
+    "input": "Which GKE clusters are we running in this project right now? Give me the list.",
+    "output": "Warning: Unknown toolsets: mcp-developer_knowledge, mcp-gke, \nmcp-platform_control\nHere are the GKE clusters currently running in project `kube-agents-evals-21`:\n\n* **`seeded-a`** \u2014 `us-central1-a` (GKE 1.35.8-gke.1036000, 4 nodes)\n* **`seeded-b`** \u2014 `us-central1-a` (GKE 1.34.10-gke.1328000, 1 node)\n* **`seeded-c`** \u2014 `us-central1-a` (GKE 1.35.8-gke.1036000, 1 node)\n* **`platform-agent-host`** \u2014 `us-central1` (GKE 1.35.7-gke.1222000, 3 nodes, Autopilot)\n",
+    "latency": 37.38834396400489,
+    "tokens": {
+      "input": null,
+      "cached": null,
+      "cache_write": null,
+      "reasoning": null,
+      "output": null,
+      "total": null
+    },
+    "tools": [
+      "inject.task",
+      "inject.post",
+      "inject.edit",
+      "a2a.status-update",
+      "inject.post",
+      "inject.edit",
+      "a2a.status-update"
+    ],
+    "trajectory": [
+      {
+        "name": "inject.task",
+        "args": {
+          "taskId": "task-73c7af8b3c5b1a9e"
+        },
+        "result": null,
+        "status": "completed"
+      },
+      {
+        "name": "inject.post",
+        "args": {
+          "messageId": "inj-6"
+        },
+        "result": "\u23f3 submitted\u2026",
+        "status": "completed"
+      },
+      {
+        "name": "inject.edit",
+        "args": {
+          "messageId": "inj-6"
+        },
+        "result": "\u2699\ufe0f **working**",
+        "status": "completed"
+      },
+      {
+        "name": "a2a.status-update",
+        "args": {
+          "state": "working",
+          "final": false
+        },
+        "result": null,
+        "status": "completed"
+      },
+      {
+        "name": "inject.post",
+        "args": {
+          "messageId": "inj-8"
+        },
+        "result": "Warning: Unknown toolsets: mcp-developer_knowledge, mcp-gke, \nmcp-platform_control\nHere are the GKE clusters currently running in project `kube-agents-evals-21`:\n\n* **`seeded-a`** \u2014 `us-central1-a` (GKE 1.35.8-gke.1036000, 4 nodes)\n* **`seeded-b`** \u2014 `us-central1-a` (GKE 1.34.10-gke.1328000, 1 node)\n* **`seeded-c`** \u2014 `us-central1-a` (GKE 1.35.8-gke.1036000, 1 node)\n* **`platform-agent-host`** \u2014 `us-central1` (GKE 1.35.7-gke.1222000, 3 nodes, Autopilot)\n",
+        "status": "completed"
+      },
+      {
+        "name": "inject.edit",
+        "args": {
+          "messageId": "inj-6"
+        },
+        "result": "\u2705 **completed**",
+        "status": "completed"
+      },
+      {
+        "name": "a2a.status-update",
+        "args": {
+          "state": "completed",
+          "final": true
+        },
+        "result": null,
+        "status": "completed"
+      }
+    ],
+    "skills": [],
+    "name": "Agent kanban smoke test",
+    "folder": "agent-kanban-smoke",
+    "status": "success",
+    "error": null,
+    "errors": [],
+    "scores": {
+      "ToolInvocation": {
+        "score": 1.0,
+        "success": true,
+        "reason": "The agent perfectly aligns with the expected output by listing the correct GKE clusters (seeded-a, seeded-b, seeded-c) along with the expected host cluster (platform-agent-host). It also successfully demonstrates task delegation and execution efficiency through its logical sequence of task injection and status updates, acting as the specialist delivering the answer without hallucinating any clusters or entering redundant loops."
+      },
+      "VerificationCorrectness": 0.5,
+      "VerificationCoverage": 1.0,
+      "OutcomeScore": {
+        "score": 0.5,
+        "version": "v1",
+        "reason": "c=0.500, rec_v=n/a, cat_v=1"
+      }
+    },
+    "expected_output": "The front door files a kanban card for the question rather than guessing, and the specialist's answer is delivered back into the thread: a list of the project's GKE clusters read from the live fleet, naming the three seeded clusters (seeded-a, seeded-b and seeded-c) from observed evidence. Extra clusters in the list are expected \u2014 the agent's own host cluster is in the same project \u2014 and invented ones are not.",
+    "expected_output_raw": "The front door files a kanban card for the question rather than guessing, and the specialist's answer is delivered back into the thread: a list of the project's GKE clusters read from the live fleet, naming the three seeded clusters (seeded-a, seeded-b and seeded-c) from observed evidence. Extra clusters in the list are expected \u2014 the agent's own host cluster is in the same project \u2014 and invented ones are not.",
+    "retrieval_context": [],
+    "chaos_spec": null,
+    "verification_spec": [
+      {
+        "name": "the-answer-names-the-planted-fleet",
+        "role": "objective",
+        "mode": "assert",
+        "check": {
+          "type": "report_contains",
+          "required_phrases": [
+            "seeded-a",
+            "seeded-b",
+            "seeded-c"
+          ]
+        }
+      },
+      {
+        "name": "the-kanban-card-was-actually-filed",
+        "role": "objective",
+        "mode": "assert",
+        "check": {
+          "type": "tool_called",
+          "tool_names": [
+            "kanban_create"
+          ],
+          "require_success": true
+        }
+      }
+    ],
+    "recoverable_safety": [],
+    "chaos_report": {},
+    "perf_report": {},
+    "documentation": [],
+    "capabilities_granted": {
+      "use_mcp": true,
+      "skills": []
+    },
+    "verification_parse_errors": [],
+    "verification_report": [
+      {
+        "name": "the-answer-names-the-planted-fleet",
+        "role": "objective",
+        "severity": null,
+        "weight": 1.0,
+        "mode": "assert",
+        "success": true,
+        "status": "pass",
+        "reason": "report contains all 3 required phrase(s), none of 0 forbidden",
+        "elapsed_time": 6.206799298524857e-05,
+        "children": []
+      },
+      {
+        "name": "the-kanban-card-was-actually-filed",
+        "role": "objective",
+        "severity": null,
+        "weight": 1.0,
+        "mode": "assert",
+        "success": false,
+        "status": "fail",
+        "reason": "0 call(s) to ['kanban_create'] in the router trajectory (minimum 1)",
+        "elapsed_time": 1.817790325731039e-05,
+        "children": []
+      }
+    ],
+    "verification_status": "evaluated",
+    "generation_only": true,
+    "validated": false
+  }
+]

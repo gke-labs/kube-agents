@@ -620,7 +620,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
         rather than the absence keeps the grant reviewable: adding a holder is
         a decision someone makes on purpose. The two added on main since this
         suite was written are both that path and both `workflow_dispatch`-only,
-        repo-gated, with the grant job-scoped: nightly-pipeline's
+        repo-gated, with the grant job-scoped: staging-promotion-pipeline's
         promote-to-staging step, and release-publish's publish job.
         """
         holders = set()
@@ -637,7 +637,7 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                 "rc-create-tag.yml",
                 "rc-tag-validated.yml",
                 "rc-release-pipeline.yml",
-                "nightly-pipeline.yml",
+                "staging-promotion-pipeline.yml",
                 "release-publish.yml",
             },
             holders,

@@ -310,7 +310,7 @@ data:
     model:
       api_key: none
       api_mode: chat_completions
-      base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+      base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
       default: model-default
       model: model-default
       provider: custom
@@ -354,6 +354,10 @@ data:
     {
       "present": false,
       "projects": [],
+      "folders": [],
+      "organizations": [],
+      "sharedVpcHosts": [],
+      "metricsScopes": [],
       "exclude": {
         "projects": [],
         "clusters": []
@@ -406,6 +410,22 @@ data:
         Preserve_Key  On
 
     [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      log
+        Parser        hermes_audit_line
+        Reserve_Data  On
+        Preserve_Key  On
+
+    [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      audit_json
+        Parser        audit_json
+        Reserve_Data  On
+        Preserve_Key  Off
+
+    [FILTER]
         Name              record_modifier
         Match             agent.logs
         Record            app agent
@@ -420,6 +440,15 @@ data:
         Name    gchat_event
         Format  regex
         Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+    [PARSER]
+        Name    hermes_audit_line
+        Format  regex
+        Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+    [PARSER]
+        Name    audit_json
+        Format  json
 kind: ConfigMap
 metadata:
   labels:
@@ -615,6 +644,14 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
           name: shell
           ports:
@@ -895,10 +932,16 @@ spec:
               value: /etc/credential-proxy/policy.json
             - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
               value: "8388608"
+            - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+              value: "8"
             - name: CREDENTIAL_PROXY_STATE_DIR
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
               value: /var/run/credential-proxy/backend.sock
+            - name: CREDENTIAL_PROXY_PORT
+              value: "8765"
+            - name: CREDENTIAL_PROXY_METRICS_PORT
+              value: "8766"
             - name: KUBECONFIG
               value: /var/run/event-watcher/watcher.config
             - name: KSA_TOKEN_FILE
@@ -958,6 +1001,8 @@ spec:
           ports:
             - containerPort: 8765
               name: cred-proxy
+            - containerPort: 8766
+              name: cred-metrics
           readinessProbe:
             failureThreshold: 3
             httpGet:
@@ -972,8 +1017,8 @@ spec:
               ephemeral-storage: 2Gi
               memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 500m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1087,6 +1132,13 @@ spec:
               app: platformagent-gateway
       ports:
         - port: 8765
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8766
           protocol: TCP
   podSelector:
     matchLabels:
@@ -1505,6 +1557,10 @@ spec:
                   resource: limits.memory
             - name: EVENT_WATCHER_ENABLED
               value: "true"
+            - name: EVENT_WATCHER_METRICS_PORT
+              value: "9095"
+            - name: DRIFT_DETECTOR_ENABLED
+              value: "false"
             - name: CREDENTIAL_PROXY_ROLE
               value: api-proxy
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:v9.9.9
@@ -1513,6 +1569,8 @@ spec:
           ports:
             - containerPort: 8643
               name: proxy-api
+            - containerPort: 9095
+              name: event-metrics
           readinessProbe:
             failureThreshold: 3
             initialDelaySeconds: 5
@@ -1962,6 +2020,13 @@ spec:
         - port: 8643
           protocol: TCP
         - port: 9119
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9095
           protocol: TCP
   podSelector:
     matchLabels:

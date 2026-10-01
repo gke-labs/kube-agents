@@ -72,6 +72,28 @@ func provision(t *testing.T, url string) {
 	}
 }
 
+// deleteTasksStream takes the task stream away, which is how a test makes the
+// gateway's submission publish fail for real rather than through a fake. The
+// session-state bucket stays, so everything up to the publish still works:
+// the session is minted, the task is announced and the placeholder posted.
+func deleteTasksStream(t *testing.T, url string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := js.DeleteStream(ctx, lib.TasksStream); err != nil {
+		t.Fatalf("delete TASKS: %v", err)
+	}
+}
+
 type fakePost struct {
 	Conversation string
 	MessageID    string
@@ -91,16 +113,30 @@ type fakeAdapter struct {
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
+	// stopped is closed when Run returns, so a test can assert that a
+	// backend was actually told to stop rather than left running.
+	stopped  chan struct{}
+	stopOnce sync.Once
+	// stopDelay is how long Run takes to return once told to stop, for
+	// pinning that a caller waits for it rather than exiting on its own.
+	stopDelay time.Duration
 }
 
 func newFakeAdapter() *fakeAdapter {
-	return &fakeAdapter{inbox: make(chan InboundMessage, 16), roster: []string{"1001"}, complete: true}
+	return &fakeAdapter{
+		inbox:    make(chan InboundMessage, 16),
+		roster:   []string{"1001"},
+		complete: true,
+		stopped:  make(chan struct{}),
+	}
 }
 
 func (a *fakeAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	defer a.stopOnce.Do(func() { close(a.stopped) })
 	for {
 		select {
 		case <-ctx.Done():
+			time.Sleep(a.stopDelay)
 			return nil
 		case msg := <-a.inbox:
 			handler(msg)
@@ -352,6 +388,13 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 	}
 }
 
+// TestUnmappedSenderIsDropped: nothing an unmapped sender types reaches the
+// bus, and the drop is visible — one notice per sender, so a real user's
+// silent drop doesn't become a support ticket while a repeat-typer still
+// can't make the gateway spam the room (chat-adapters card: "say so visibly
+// somewhere"). The second message arrives in a DIFFERENT conversation on
+// purpose: a channel mention mints a fresh conversation every time, so a
+// conversation-scoped dedupe would be no bound at all.
 func TestUnmappedSenderIsDropped(t *testing.T) {
 	r := startRig(t)
 	for i := 0; i < 2; i++ {
@@ -366,10 +409,28 @@ func TestUnmappedSenderIsDropped(t *testing.T) {
 	}
 	posts := r.adapter.postTexts()
 	if len(posts) != 1 {
-		t.Fatalf("drop must be visible exactly once per sender, got %d posts: %v", len(posts), posts)
+		t.Fatalf("drop notice must be once per sender, not once per conversation: one unmapped sender across two conversations produced %d posts: %v", len(posts), posts)
 	}
 	if !strings.Contains(posts[0], "can't verify") {
 		t.Fatalf("drop notice missing: %q", posts[0])
+	}
+}
+
+// TestVerifiedByNamesTheMechanism: the authority block should say what was
+// actually checked, per backend. Google Chat asserted the sender email over
+// a topic only its own service accounts may publish to; Slack's sender is
+// asserted by Slack over the Socket Mode connection and joined by our
+// table; Discord (and anything unlisted) is the test mapping table alone.
+func TestVerifiedByNamesTheMechanism(t *testing.T) {
+	for backend, want := range map[string]string{
+		"gchat":   "chat-event-topic-iam",
+		"slack":   "slack-socket-mode+principal-map",
+		"discord": "principal-map",
+		"":        "principal-map",
+	} {
+		if got := verifiedByFor(backend); got != want {
+			t.Errorf("verifiedByFor(%q) = %q, want %q", backend, got, want)
+		}
 	}
 }
 
@@ -1243,5 +1304,254 @@ func TestAddresseeForStragglerTask(t *testing.T) {
 	}
 	if got := rec.AddresseeFor("task-unknown"); got != "platform" {
 		t.Fatalf("unknown task falls back to the record's addressee, got %q", got)
+	}
+}
+
+// TestTaskEndCountsAsActivity: the idle TTL that bounds a session (the reap,
+// and the Slack adapter's session-thread rule through hasSession) counts
+// from the task's end, not from the ask that started it. Otherwise a long
+// task's thread went quiet the instant its answer posted, and the follow-up
+// right after the result — the most ordinary message a session carries —
+// was dropped. The relay stamps LastActivity when it clears the task.
+func TestTaskEndCountsAsActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-activity"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "a-1", Text: "take your time"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+
+	before, err := r.g.reg.Get(ctx, conv)
+	if err != nil || before == nil || before.ActiveTask == nil {
+		t.Fatalf("no active task on the record after the ask: %+v err=%v", before, err)
+	}
+	asked := before.LastActivity
+	time.Sleep(50 * time.Millisecond) // so the terminal's stamp is measurably later
+
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "done, eventually"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the terminal to release the task", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastActivity.After(asked) {
+		t.Fatalf("the task's end did not count as activity: LastActivity %v is not after the ask's %v", after.LastActivity, asked)
+	}
+	if !after.LastTaskActivity.Equal(after.LastActivity) {
+		t.Fatalf("the executor's terminal must move the task's own clock with the session's: task=%v session=%v", after.LastTaskActivity, after.LastActivity)
+	}
+	held, until, err := r.g.hasSession(ctx, conv)
+	if err != nil || !held || !until.Equal(after.LastTaskActivity.Add(r.g.cfg.IdleTTL)) {
+		t.Fatalf("after the terminal the session must be held until LastTaskActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
+	}
+}
+
+// TestSupervisorTerminalIsNotActivity: the reap closes an idle session's
+// detached task by publishing a supervisor terminal, and that terminal must
+// not re-open the window the reap just closed. Only an executor's end of a
+// live task is activity.
+func TestSupervisorTerminalIsNotActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-sup-terminal"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "s-1", Text: "long one"}
+	origin := r.awaitTask(t, "platform")
+	ctx := context.Background()
+
+	// The session went idle with the task stopped and unconfirmed: what the
+	// reap sees right before it publishes the supervisor's canceled.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("no active task after the ask: %+v err=%v", rec, err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask.Detached = true
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("an idle session with a detached task must not be held before the terminal: held=%v err=%v", held, err)
+	}
+
+	payload, err := json.Marshal(lib.StatusUpdate{TaskID: origin.TaskID, ContextID: origin.ContextID,
+		Status: lib.TaskStatus{State: lib.StateCanceled}, Final: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(gatewayParty, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.bus.Publish(ctx, lib.TaskSupervisorSubject("platform", origin.TaskID), env); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the supervisor's terminal to clear the task", func() bool {
+		got, err := r.g.reg.Get(ctx, conv)
+		return err == nil && got != nil && got.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastTaskActivity.Equal(stale) || !after.LastActivity.Equal(stale) {
+		t.Fatalf("the supervisor's terminal counted as activity: task=%v session=%v, want both %v", after.LastTaskActivity, after.LastActivity, stale)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("the reap's own terminal re-admitted the thread: held=%v err=%v", held, err)
+	}
+}
+
+// TestNoTaskTurnDoesNotReadmitAThread: a verified turn that starts nothing
+// ("stop" with nothing running) moves the reap's clock, as any turn does,
+// but must not move the clock the session-thread rule bounds on. Otherwise
+// one "@bot stop" in a thread whose task ended hours ago re-admits it for a
+// whole idle TTL.
+func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-no-task-turn"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "n-1", Text: "first ask"}
+	r.awaitTask(t, "platform")
+	ctx := context.Background()
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask = nil
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("an idle thread must not be held: held=%v err=%v", held, err)
+	}
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "n-2", Text: "stop"}
+	waitFor(t, "the no-task stop to be answered", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "nothing is running") {
+				return true
+			}
+		}
+		return false
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastActivity.After(stale) {
+		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
+	}
+	if !after.LastTaskActivity.Equal(stale) {
+		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || held {
+		t.Fatalf("a no-task turn re-admitted the thread: held=%v err=%v", held, err)
+	}
+}
+
+// TestExecutorCanceledOnAStoppedTaskCountsAsActivity: the executor's
+// confirmation of a stop is the answer the user was waiting on, so it moves
+// the task's clock like any executor terminal; only the supervisor's (the
+// reap's own) does not.
+func TestExecutorCanceledOnAStoppedTaskCountsAsActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-exec-canceled"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "x-1", Text: "long one"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil || rec.ActiveTask == nil {
+		t.Fatalf("no active task after the ask: %+v err=%v", rec, err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask.Detached = true
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the executor's canceled to clear the task", func() bool {
+		got, err := r.g.reg.Get(ctx, conv)
+		return err == nil && got != nil && got.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastTaskActivity.After(stale) {
+		t.Fatalf("the executor's canceled on a stopped task did not count as activity: %v", after.LastTaskActivity)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
+		t.Fatalf("after the executor confirmed the stop the thread must still be a session thread: held=%v err=%v", held, err)
+	}
+}
+
+// TestHealedExecutorTerminalCountsAsActivity: the heal is the executor's
+// terminal reaching the record by the other route (the relay missed it), and
+// it must move the task's clock the way relayTerminal does, or a healed
+// thread goes quiet the moment its lost answer is posted. Driven with a
+// "stop" after the heal, which starts nothing, so nothing else restamps.
+func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-heal-activity"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ha-1", Text: "summarize the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "normal retire", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	// The stale record a lost render leaves behind: the task still active
+	// on it, both clocks past the TTL.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID, Ask: "summarize the fleet", SubmittedAt: stale}
+	rec.LastActivity, rec.LastTaskActivity = stale, stale
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ha-2", Text: "stop"}
+	waitFor(t, "the heal to post the lost terminal", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, origin.TaskID) && strings.Contains(p, string(lib.StateCompleted)) {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, "the heal's release to be written", func() bool {
+		got, err := r.g.reg.Get(ctx, conv)
+		return err == nil && got != nil && got.ActiveTask == nil
+	})
+	after, err := r.g.reg.Get(ctx, conv)
+	if err != nil || after == nil {
+		t.Fatal(err)
+	}
+	if !after.LastTaskActivity.After(stale) {
+		t.Fatalf("the healed executor terminal did not count as activity: %v", after.LastTaskActivity)
+	}
+	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
+		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)
 	}
 }

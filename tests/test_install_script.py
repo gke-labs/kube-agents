@@ -41,6 +41,9 @@ from tests.testing.release import (
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALL_SH = _REPO_ROOT / "install.sh"
 _PRINT_NO_CHAT_SH = _REPO_ROOT / "scripts" / "installer" / "print_instructions_no_chat.sh"
+# The other two front doors, for the assertion that all three handlers share
+# the subshell rule.
+_FRONT_DOORS = (_INSTALL_SH, _REPO_ROOT / "upgrade.sh", _REPO_ROOT / "uninstall.sh")
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 
 # install.sh sources the shared helpers from the acquired workspace partway
@@ -882,13 +885,8 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "configuration; the probe is authoritative on every run",
         )
 
-    def test_the_installer_no_longer_writes_the_state_file(self):
-        """vars.sh is read as a legacy input and never generated.
-
-        Regenerating it would put the old two-file model back: a derived file
-        that other tools read, drifting from the input that actually decides
-        the install.
-        """
+    def test_the_installer_neither_writes_nor_reads_the_state_file(self):
+        """k8s-operator/scripts/vars.sh is retired and never written, read, or inspected by install.sh."""
         source = _INSTALL_SH.read_text()
         self.assertNotIn(
             "write_state_var",
@@ -896,12 +894,71 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "install.sh must not write vars.sh; install.env is the input and "
             "terraform.tfvars the only derived artifact",
         )
-        self.assertIn(
+        self.assertNotIn(
             "load_legacy_vars_file",
             source,
-            "an existing install's vars.sh must still be read, so upgrading "
-            "needs no action from its owner",
+            "install.sh must not source the legacy state file; install.env "
+            "is the only configuration input",
         )
+        self.assertNotIn(
+            "k8s-operator/scripts/vars.sh",
+            source,
+            "install.sh must not reference k8s-operator/scripts/vars.sh",
+        )
+        # The runtime half does not reproduce a removed failure — there is no
+        # longer any code for it to fail against — so it is a guard against the
+        # lookup coming back: a checkout carrying the retired file, with the
+        # bootstrap pointed at the install.env beside it and the run standing in
+        # it, so a reintroduced read relative to either the target or the
+        # working directory would put CLUSTER_NAME in the environment.
+        #
+        # install.sh is copied into that checkout and sourced from the copy,
+        # rather than sourced from this repository. The source-time bootstrap
+        # resolves install.env against `dirname "${BASH_SOURCE[0]}"` first and
+        # $HOME/kube-agents last, so sourcing the tracked path with no explicit
+        # pointer reads whichever install.env the developer keeps here — the run
+        # would answer differently on different machines, and a real CLUSTER_NAME
+        # would satisfy the assertion below for entirely the wrong reason. HOME
+        # moves with it, for the last arm of the same resolution. The pointer
+        # stays unset on purpose: with KUBE_AGENTS_INSTALL_ENV set, every shape
+        # of this lookup the installer has ever had returned early.
+        #
+        # The read this PR removed was `${_state_repo_dir}/k8s-operator/scripts/
+        # vars.sh`. The copy has no scripts/installer/installer_common.sh beside
+        # it, so _resolve_repo_dir_for_state falls through to $HOME/kube-agents;
+        # the retired file is staged there as well, and the run asserts that is
+        # where the resolver points (_state_repo_dir itself is unset once the
+        # source-time bootstrap is done), so the historical shape is exercised
+        # rather than only reads relative to the script or the working directory.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkout = pathlib.Path(tmpdir) / "checkout"
+            home = pathlib.Path(tmpdir) / "home"
+            checkout.mkdir()
+            home.mkdir()
+            for root in (checkout, home / "kube-agents"):
+                retired = root / "k8s-operator" / "scripts" / "vars.sh"
+                retired.parent.mkdir(parents=True)
+                retired.write_text('export CLUSTER_NAME="from-retired-vars"\n')
+            script_copy = checkout / "install.sh"
+            shutil.copy(_INSTALL_SH, script_copy)
+            missing_env = checkout / "install.env"
+            env = get_isolated_test_env(overrides={"HOME": str(home)})
+            for var in ("KUBE_AGENTS_INSTALL_ENV", "CLUSTER_NAME", "PROJECT_ID", "REGION"):
+                env.pop(var, None)
+            proc = _run_installer_bash(
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{script_copy}"\n'
+                f'INSTALL_ENV_EXPLICIT="false"; bootstrap_install_env "{missing_env}"\n'
+                'echo "STATE_REPO_DIR=$(_resolve_repo_dir_for_state)"\n'
+                'echo "CLUSTER=${CLUSTER_NAME:-<unset>}"\n',
+                env,
+                cwd=checkout,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"STATE_REPO_DIR={home / 'kube-agents'}\n", proc.stdout)
+            self.assertIn("CLUSTER=<unset>", proc.stdout)
+            # The isolation itself, not just its consequence: the bootstrap
+            # announces every file it reads, and this run has none to read.
+            self.assertNotIn("Loaded install configuration from", proc.stderr)
 
     def test_parse_args_enable_google_chat(self):
         """Verifies parse_args captures --enable-google-chat."""
@@ -1361,6 +1418,246 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             r"^([0-9a-f]{40}|[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)$",
             f"Expected valid 40-character SHA or SemVer tag, got: {proc.stdout.strip()}",
         )
+
+    def _release_line_checkout(self, temp_dir):
+        """A kube-agents checkout shaped like a release line: this branch's install.sh
+        stamped 0.2.0 and tagged on A, a backport B on top of it, and an unrelated
+        commit U, carrying the same stamped script, that descends from neither."""
+        repo_path = pathlib.Path(temp_dir)
+        git = lambda *args: subprocess.run(["git", *args], cwd=str(repo_path), check=True, capture_output=True, text=True).stdout.strip()
+
+        def stamped_tree():
+            (repo_path / "scripts" / "installer").mkdir(parents=True, exist_ok=True)
+            (repo_path / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            text = _INSTALL_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+            (repo_path / "install.sh").write_text(text)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        git("config", "commit.gpgsign", "false")
+        stamped_tree()
+        git("add", ".")
+        git("commit", "-q", "-m", "chore(release): stamp release version 0.2.0")
+        stamp = git("rev-parse", "HEAD")
+        git("tag", "0.2.0", stamp)
+        git("switch", "-q", "-c", "release/0.2")
+        (repo_path / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-q", "-m", "fix: backport")
+        backport = git("rev-parse", "HEAD")
+        git("switch", "-q", "--orphan", "elsewhere")
+        stamped_tree()
+        (repo_path / "other.txt").write_text("x\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "chore: unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("switch", "-q", "release/0.2")
+        return repo_path, git, stamp, backport, unrelated
+
+    def _run_fixture_install_func(self, repo_path, func_call):
+        """Source the fixture's own stamped install.sh, so BASH_SOURCE names it: the
+        checkout's script is the one running, as when an operator runs ./install.sh."""
+        setup = f"KUBE_AGENTS_SOURCE_ONLY=true source ./install.sh\n{func_call}\n"
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides), cwd=repo_path)
+
+    def test_a_release_line_checkout_past_its_stamp_defaults_to_its_own_head(self):
+        """The backport carries the previous release's baked version, but it is not that
+        release: run from it, install.sh defaults the way a main checkout does, to its
+        own HEAD, whose images the merge onto the line built, and verification passes on
+        that tag. The stamp's own commit still defaults to the release, and an unrelated
+        commit with the baked version still defaults to it and is refused as a source
+        mismatch."""
+        with tempfile.TemporaryDirectory(prefix="release-line-checkout-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+
+            past = self._run_fixture_install_func(repo_path, 'default_image_tag "."; echo "label=$(default_image_tag_label ".")"')
+            self.assertEqual(past.returncode, 0, past.stderr)
+            lines = past.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("1 commit(s) past release 0.2.0", lines[1])
+
+            resolved = self._run_fixture_install_func(
+                repo_path,
+                'tag=""; resolve_effective_image_tag tag "." "" && echo "tag=$tag" && verify_local_source_ref "." "$tag" && echo "verified"',
+            )
+            self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
+            self.assertIn(f"tag={backport}", resolved.stdout)
+            self.assertIn("verified", resolved.stdout)
+            self.assertNotIn("mismatch", resolved.stdout + resolved.stderr)
+
+            # Asked for the release by name from the backport: refused, and told what the
+            # checkout is rather than that it is unrelated.
+            named = self._run_fixture_install_func(repo_path, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(named.returncode, 0)
+            self.assertIn("mismatch", named.stdout + named.stderr)
+            self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
+            self.assertIn("with no --image-tag and IMAGE_TAG unset", named.stdout + named.stderr)
+            self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
+            self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(at_stamp.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+
+            git("switch", "-q", "--detach", unrelated)
+            off = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(off.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(off.returncode, 0)
+            self.assertIn("mismatch", off.stdout + off.stderr)
+            # Tag present, history complete, own script running: no fetch would change
+            # the answer, and the hint does not name one.
+            self.assertIn("neither that release's commit nor a descendant of it", off.stdout + off.stderr)
+            self.assertNotIn("git fetch", off.stdout + off.stderr)
+
+    def test_a_line_checkout_in_a_release_named_directory_still_defaults_to_its_head(self):
+        """The archive-directory rule (step 3) must not hand the release back once the
+        checkout is recognised as a line past it: a clone named kube-agents-0.2.0, the
+        name the rollback page uses, later moved onto the line, defaults to HEAD."""
+        with tempfile.TemporaryDirectory(prefix="release-line-named-") as temp_dir:
+            named = pathlib.Path(temp_dir) / "kube-agents-0.2.0"
+            named.mkdir()
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(named)
+            proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+
+    def test_a_line_checkouts_install_sh_run_from_inside_another_checkout_still_defaults_to_its_head(self):
+        """The release-line read judges the script's own checkout, which is the tree
+        acquire_source_repo installs from, not the working directory: one checkout's
+        install.sh invoked by path from inside another kube-agents checkout resolves
+        as it would from its own directory, and the source check passes on that tag."""
+        with tempfile.TemporaryDirectory(prefix="release-line-elsewhere-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            other = pathlib.Path(temp_dir) / "other-checkout"
+            (other / "scripts" / "installer").mkdir(parents=True)
+            (other / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            (other / "install.sh").write_text(_INSTALL_SH.read_text())
+            setup = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{repo_path}/install.sh"\n'
+                'default_image_tag "."; echo "label=$(default_image_tag_label ".")"; '
+                f'tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "{repo_path}" "$tag" && echo verified\n'
+            )
+            proc = _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}), cwd=other)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("verified", proc.stdout)
+            self.assertNotIn("--image-tag and IMAGE_TAG unset", proc.stdout + proc.stderr)
+
+    def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
+        """The baked version belongs to the running script. A release's install.sh that is
+        not the checkout's own file (piped, or run from another directory) keeps its release
+        as the default even when the checkout it resolves its sources to is a line past that
+        release, and the source check then fetches or refuses as before."""
+        with tempfile.TemporaryDirectory(prefix="release-line-piped-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            proc = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; default_image_tag "."; default_image_tag_label "."', cwd=repo_path)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+            # The refusal that follows says the running script is not this checkout's,
+            # not to fetch anything: the tags are here.
+            piped = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(piped.returncode, 0)
+            self.assertIn("is not this checkout's", piped.stdout + piped.stderr)
+            self.assertIn("run its own ./install.sh", piped.stdout + piped.stderr)
+            self.assertNotIn("git fetch", piped.stdout + piped.stderr)
+            # Tagless but stamped: the piped installer still leads with "run the checkout's
+            # own install.sh", naming the fetch that would also be needed, rather than a
+            # fetch alone that leaves the piped copy unable to recognise the checkout.
+            git("tag", "-d", "0.2.0")
+            tagless = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("run its own ./install.sh", tagless.stdout + tagless.stderr)
+            self.assertIn("once you fetch the tags (git fetch --tags)", tagless.stdout + tagless.stderr)
+            # Standing in a checkout that lacks the tag and the stamp, the piped installer's
+            # refusal does not tell the operator their checkout's scripts carry the release.
+            (repo_path / "install.sh").write_text(_INSTALL_SH.read_text())
+            refused = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("is not present in the current checkout", refused.stdout + refused.stderr)
+            self.assertNotIn("release line", refused.stdout + refused.stderr)
+            self.assertNotIn("git fetch --tags", refused.stdout + refused.stderr)
+
+    def test_a_line_checkout_without_the_release_tag_is_refused_and_told_to_fetch_it(self):
+        """Without the tag the shape cannot be recognised, so the baked default and the
+        refusal stand; the refusal says why and what to do."""
+        with tempfile.TemporaryDirectory(prefix="release-line-tagless-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            git("tag", "-d", "0.2.0")
+            proc = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(proc.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            self.assertNotIn("--unshallow", proc.stdout + proc.stderr)
+            self.assertIn(f"--image-tag {backport}", proc.stdout + proc.stderr)
+
+    def test_a_shallow_line_clone_is_told_to_unshallow_and_is_recognised_once_it_does(self):
+        """`git fetch --tags` alone does not mend a --depth 1 clone of the line: the tag
+        arrives but HEAD's parents stay behind the graft, so the ancestry walk fails and
+        the run lands in the mismatch refusal. That refusal names the shallow history;
+        after `git fetch --unshallow` the checkout is recognised."""
+        with tempfile.TemporaryDirectory(prefix="release-line-shallow-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            shallow = pathlib.Path(temp_dir) / "shallow"
+            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "release/0.2", f"file://{repo_path}", str(shallow)], check=True)
+            sgit = lambda *args: subprocess.run(["git", *args], cwd=str(shallow), check=True, capture_output=True, text=True).stdout.strip()
+            probe = 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+
+            tagless = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("git fetch --tags", tagless.stdout + tagless.stderr)
+            self.assertIn("git fetch --unshallow", tagless.stdout + tagless.stderr)
+
+            sgit("fetch", "-q", "--tags", "origin")
+            self.assertEqual(sgit("rev-parse", "--is-shallow-repository"), "true")
+            tagged = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagged.returncode, 0)
+            self.assertIn("Source/image version mismatch", tagged.stdout + tagged.stderr)
+            self.assertIn("git fetch --unshallow", tagged.stdout + tagged.stderr)
+            self.assertNotIn("git fetch --tags", tagged.stdout + tagged.stderr)
+
+            sgit("fetch", "-q", "--unshallow", "origin")
+            deep = self._run_fixture_install_func(shallow, 'default_image_tag "."; verify_local_source_ref "." "$(default_image_tag ".")" && echo verified')
+            self.assertEqual(deep.returncode, 0, deep.stdout + deep.stderr)
+            self.assertEqual(deep.stdout.strip().splitlines()[0], backport)
+            self.assertIn("verified", deep.stdout)
+
+            # A shallow clone deep enough to hold the release is recognised, and asked
+            # for the release by name it is told what it is, not to unshallow.
+            enough = pathlib.Path(temp_dir) / "deep-enough"
+            subprocess.run(["git", "clone", "-q", "--depth", "2", "--branch", "release/0.2", f"file://{repo_path}", str(enough)], check=True)
+            subprocess.run(["git", "fetch", "-q", "--tags", "origin"], cwd=str(enough), check=True)
+            self.assertEqual(subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=str(enough), capture_output=True, text=True).stdout.strip(), "true")
+            recognised = self._run_fixture_install_func(enough, 'default_image_tag "."')
+            self.assertEqual(recognised.stdout.strip(), backport)
+            by_name = self._run_fixture_install_func(enough, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(by_name.returncode, 0)
+            self.assertIn("release line 0.2 at", by_name.stdout + by_name.stderr)
+            self.assertNotIn("--unshallow", by_name.stdout + by_name.stderr)
+
+    def test_the_stamp_line_is_read_with_the_same_grammar_as_upgrade_sh(self):
+        """release_version_of_source_tree strips quotes and whitespace; install.sh reads the
+        tree's stamp the same way, so one tree is a line checkout to both front doors."""
+        for spelling in ("BAKED_RELEASE_VERSION='0.2.0'", 'BAKED_RELEASE_VERSION="0.2.0" ', "BAKED_RELEASE_VERSION=0.2.0"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory(prefix="release-line-grammar-") as temp_dir:
+                repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+                text = (repo_path / "install.sh").read_text().replace('BAKED_RELEASE_VERSION="0.2.0"', spelling, 1)
+                (repo_path / "install.sh").write_text(text)
+                git("commit", "-q", "-am", "chore: respell the stamp")
+                head = git("rev-parse", "HEAD")
+                proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), head)
 
     def test_default_image_tag_resolves_semver_when_multiple_tags_present(self):
         """Verifies default_image_tag prefers numeric SemVer tag over rc_*_validated tags on the same commit."""
@@ -1824,6 +2121,78 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
 
+    def test_wait_for_deployment_object_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    def test_wait_for_rollout_passes_context(self):
+        """Context argument must be forwarded as --context to kubectl rollout."""
+        stub = 'case "$*" in *"--context my-ctx"*) exit 0 ;; *) exit 1 ;; esac'
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_rollout dep ns 0 my-ctx || rc=$?; echo "RC=$rc"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    # main() is not callable from here -- reaching step 13 means provisioning a
+    # cluster -- so its context gate is lifted out of the source and run in a
+    # function of its own. The anchors are checked in _context_gate_body, so a
+    # rewrite of the step fails loudly rather than leaving the two tests below
+    # asserting against an empty string.
+    _CONTEXT_GATE_START = '  local expected_ctx\n  expected_ctx="$(gke_context_name)"'
+    _CONTEXT_GATE_END = "    exit 1\n  fi\n"
+
+    def _context_gate_body(self):
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index(self._CONTEXT_GATE_END, start) + len(self._CONTEXT_GATE_END)
+        gate = source[start:end]
+        self.assertIn("kubectl config current-context", gate)
+        return (
+            _SOURCE_INSTALLER_COMMON
+            + '\nPROJECT_ID="a-project"; REGION="a-region"; CLUSTER_NAME="a-cluster"\n'
+            + "context_gate() {\n"
+            + gate
+            + "}\n"
+        )
+
+    def test_the_health_check_refuses_a_kubectl_pointed_elsewhere(self):
+        """Step 13 reads whatever context is current, so a get-credentials that
+        did not take must end the run rather than grade another cluster."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_another-project_another-region_another-cluster"',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("REACHED_HEALTH_CHECKS", proc.stdout)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("gke_another-project_another-region_another-cluster", combined)
+        self.assertIn("gke_a-project_a-region_a-cluster", combined)
+
+    def test_the_health_check_continues_on_the_expected_context(self):
+        """The other half: the gate has to let the matching context through."""
+        proc = self._run_with_kubectl_stub(
+            self._context_gate_body() + 'context_gate; echo "REACHED_HEALTH_CHECKS"',
+            'echo "gke_a-project_a-region_a-cluster"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("REACHED_HEALTH_CHECKS", proc.stdout)
+
+    def test_step_13_namespace_check_passes_context(self):
+        """Step 13's namespace check must forward --context to avoid querying ambient context."""
+        source = _INSTALL_SH.read_text()
+        start = source.index(self._CONTEXT_GATE_START)
+        end = source.index("wait_for_deployment_object", start)
+        body = source[start:end]
+        self.assertIn('kubectl get ns "$namespace" --context "$expected_ctx"', body)
+
     def test_print_generate_only_handoff_renders_required_commands(self):
         """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
         cmd = f"""
@@ -2059,7 +2428,11 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text(contents)
             full_env = get_isolated_test_env(
-                overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}
+                overrides={
+                    "KUBE_AGENTS_INSTALL_ENV": str(env_file),
+                    "MEMORY": "",
+                    "MEMORY_PROVIDER": "",
+                }
             )
             return subprocess.run(
                 ["bash", "-c",
@@ -2130,6 +2503,234 @@ class NonInteractiveRerunInheritanceTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("M=off", proc.stdout)
+
+    # ── whether anybody actually stated a memory mode ───────────────────────
+    #
+    # install.sh's half of the Hindsight guard. The generator's live probe only
+    # fires when install.sh hands it an empty MEMORY_PROVIDER, and it does that
+    # only while PARAM_MEMORY_EXPLICIT is false. A change that sets the flag
+    # unconditionally, or that restores the old unconditional
+    # memory_provider_from_mode / DEFAULT_MEMORY_PROVIDER fallback ahead of the
+    # generator, makes the probe dead code for the front door the guard is
+    # about — and every other test in this file stays green.
+
+    def test_a_configuration_with_no_memory_line_states_no_memory_mode(self):
+        """The run the guard exists for: --non-interactive with an install.env
+        that never mentions memory (or one copied from the example, where the
+        MEMORY line is commented out)."""
+        proc = self._params(
+            "PROJECT_ID=p\n", 'echo "M=[$PARAM_MEMORY] E=$PARAM_MEMORY_EXPLICIT"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("M=[] E=false", proc.stdout)
+
+    def test_either_recorded_spelling_states_a_memory_mode(self):
+        for contents in ("MEMORY=file\n", "MEMORY_PROVIDER=kube_agents_memory\n"):
+            with self.subTest(contents=contents.strip()):
+                proc = self._params(contents, 'echo "E=$PARAM_MEMORY_EXPLICIT"')
+                self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+                self.assertIn("E=true", proc.stdout)
+
+    def test_the_memory_flag_states_a_memory_mode(self):
+        """--memory= wins over a file that says nothing, and has to mark the
+        answer as given: an operator who typed it must not have the cluster
+        consulted behind their back."""
+        proc = self._params(
+            "PROJECT_ID=p\n",
+            'parse_args --memory=file; echo "M=$PARAM_MEMORY E=$PARAM_MEMORY_EXPLICIT"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("M=file E=true", proc.stdout)
+
+    def test_nothing_is_chosen_ahead_of_the_generator_when_no_mode_was_stated(self):
+        """The gate that leaves MEMORY_PROVIDER empty for the generator.
+
+        Pinned against the source because the block sits deep inside main(),
+        after the whole interview. What matters is that the assignment is
+        conditional on PARAM_MEMORY_EXPLICIT and that the generator is told to
+        refuse rather than default when it cannot ask the cluster.
+        """
+        source = _INSTALL_SH.read_text()
+        gate = '  if [ "$PARAM_MEMORY_EXPLICIT" = "true" ]; then\n' \
+               '    memory_provider="$(memory_provider_from_mode "$memory_mode")"\n'
+        self.assertIn(gate, source)
+        self.assertIn("KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \\\n", source)
+        # And the answer the generator reaches is read back, so the summary and
+        # the recorded install.env agree with the tfvars.
+        self.assertIn('    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"', source)
+
+    def test_the_generators_hindsight_answer_is_what_install_env_records(self):
+        """The read-back after write_tfvars_from_state, run rather than pinned.
+
+        bootstrap_install_env_file records MEMORY from PARAM_MEMORY, which until
+        this block still holds DEFAULT_MEMORY (`file`). If the generator's probe
+        found Hindsight and generated kube_agents_memory, but PARAM_MEMORY kept
+        `file`, the next run would read MEMORY=file as an explicit choice, skip
+        the probe, and plan hindsight-postgresql away — the loss the guard
+        exists to prevent, one run later. So the block is lifted out of main()
+        and executed: an unstated mode that the generator resolved to Hindsight
+        is recorded as `hindsight`; any other answer, or a stated mode, leaves
+        PARAM_MEMORY alone.
+        """
+        source = _INSTALL_SH.read_text()
+        opening = (
+            '  if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then\n'
+            '    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"\n'
+        )
+        self.assertEqual(source.count(opening), 1, "the read-back block moved or was duplicated")
+        start = source.index(opening)
+        block = source[start : source.index("\n  fi\n", start) + len("\n  fi\n")]
+        cases = (
+            # (PARAM_MEMORY_EXPLICIT, MEMORY_PROVIDER from the generator, expected PARAM_MEMORY)
+            ("false", "kube_agents_memory", "hindsight"),
+            ("false", "", "file"),
+            ("true", "kube_agents_memory", "file"),
+        )
+        for explicit, generated, expected in cases:
+            with self.subTest(explicit=explicit, generated=generated):
+                proc = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        "set -u\n"
+                        f'PARAM_MEMORY_EXPLICIT="{explicit}"; PARAM_MEMORY="file"; memory_mode="file"\n'
+                        'DEFAULT_MEMORY_PROVIDER="multiuser_memory"\n'
+                        + (f'MEMORY_PROVIDER="{generated}"\n' if generated else "unset MEMORY_PROVIDER\n")
+                        + block
+                        + 'echo "PARAM_MEMORY=${PARAM_MEMORY} MODE=${memory_mode}"\n',
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=get_isolated_test_env(),
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(f"PARAM_MEMORY={expected} MODE={expected}\n", proc.stdout)
+
+    def test_every_generator_call_that_is_followed_by_an_apply_asks_for_an_answer(self):
+        """One call site carrying the opt-in is not the property that matters.
+
+        The assertion above is a substring, so a second call site added without
+        `KUBE_AGENTS_REQUIRE_MEMORY_ANSWER` keeps it green while walking
+        straight into the default the guard exists to prevent — which is what
+        happened to the Day-2 "Save & Apply" panel, whose next statement is a
+        full `terraform apply`. So enumerate the call sites instead.
+
+        `settle_network_policy_acceptance` is the one exemption, and it is not
+        a hole: it re-renders after main()'s guarded call has already exported
+        a settled `MEMORY_PROVIDER`, so the generator takes the explicit branch
+        and never reaches the probe.
+        """
+        lines = _INSTALL_SH.read_text().splitlines()
+        unguarded = []
+        for index, line in enumerate(lines):
+            code_line = line.split("#", 1)[0].strip()
+            if not re.search(r"\bwrite_tfvars_from_state\b", code_line) or code_line.startswith("write_tfvars_from_state()"):
+                continue
+            # Collect the `VAR=value \` continuation lines the call hangs off,
+            # plus the call line itself for single-line `VAR=value fn ...`.
+            prefix, back = [line], index - 1
+            while back >= 0 and lines[back].rstrip().endswith("\\"):
+                prefix.append(lines[back])
+                back -= 1
+            if "KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true" in "\n".join(prefix):
+                continue
+            # Named by the function it sits in, not by a line number an edit
+            # anywhere above would move.
+            enclosing = next(
+                (
+                    lines[back][: lines[back].index("()")]
+                    for back in range(index, -1, -1)
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(\) \{$", lines[back])
+                ),
+                f"<top level, line {index + 1}>",
+            )
+            unguarded.append(enclosing)
+
+        self.assertEqual(
+            unguarded,
+            ["settle_network_policy_acceptance"],
+            "a generator call site gained or lost the memory opt-in; if the new one "
+            "is followed by an apply it needs KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true",
+        )
+
+    def test_accepting_the_memory_prompts_unseeded_default_is_not_an_answer(self):
+        """A bare enter on the memory menu must not count as a stated mode.
+
+        resolve_shared_defaults puts DEFAULT_MEMORY (`file`) into PARAM_MEMORY
+        before the interview, so the menu is seeded on option 1 and carries the
+        "(Default)" tag even when nothing chose it — and prompt_menu returns
+        that same 1 for enter as for a typed "1". Marking the answer explicit
+        there skips live_hindsight_state in the generator, and a Hindsight
+        install whose install.env predates the MEMORY key then has
+        hindsight-postgresql and its database planned away by the apply that
+        follows. Before this branch retired vars.sh, such a checkout seeded the
+        prompt on option 2 out of the MEMORY_PROVIDER that file carried, so
+        enter kept Hindsight; the probe is what replaced that seed, and the
+        interactive path has to be able to reach it.
+
+        Pinned against the source, and by enumeration rather than substring:
+        the block sits inside main()'s interview behind a TTY, where the
+        harness in this file cannot reach it, and a substring assertion stays
+        green when a second, unconditional assignment is added beside the
+        guarded one — which is exactly how the Day-2 panel above slipped
+        through.
+        """
+        lines = _INSTALL_SH.read_text().splitlines()
+        # The only two conditions under which an answer counts as stated.
+        guards = {
+            # Something set PARAM_MEMORY before the interview: install.env's
+            # MEMORY or MEMORY_PROVIDER, or MEMORY in the environment.
+            'if [ -n "$PARAM_MEMORY" ]; then',
+            # The interview: a statement is either one that arrived before it,
+            # or the operator moving off the option the seed put under them.
+            'if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || '
+            '[ "$memory_choice" != "$memory_seed_choice" ]; then',
+        }
+        # Any spelling that sets it true — quoted or not, exported, or sharing
+        # a line with other statements — not only the one this was written
+        # against. One that shares a line has no guard line of its own above
+        # it, so it is reported rather than silently skipped.
+        assignment = re.compile(r"""(?:^|[\s;])(?:export\s+)?PARAM_MEMORY_EXPLICIT=(["']?)true\1(?=\s|;|$)""")
+        unguarded = []
+        seen = 0
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("#") or not assignment.search(line):
+                continue
+            seen += 1
+            if line.strip() != 'PARAM_MEMORY_EXPLICIT="true"':
+                unguarded.append((index + 1, line.strip()))
+                continue
+            preceding = next(
+                (
+                    lines[back].strip()
+                    for back in range(index - 1, -1, -1)
+                    if lines[back].strip()
+                ),
+                "",
+            )
+            if preceding not in guards:
+                unguarded.append((index + 1, preceding))
+
+        self.assertGreater(seen, 0, "the enumerator found no assignment at all")
+        self.assertEqual(
+            unguarded,
+            [],
+            "PARAM_MEMORY_EXPLICIT is set true under a condition this test does not "
+            "know. An answer counts as stated only when something stated it; "
+            "otherwise the generator's live Hindsight probe is skipped on the one "
+            "path it was added for",
+        )
+
+        # And the seed is taken before the menu renders, or the comparison
+        # above compares the answer against itself and is always false.
+        source = "\n".join(lines)
+        self.assertIn('local memory_seed_choice="$memory_choice"', source)
+        self.assertLess(
+            source.index('local memory_seed_choice="$memory_choice"'),
+            source.index(
+                'prompt_menu "Should the agent remember things between conversations?"'
+            ),
+        )
 
     def test_the_dashboard_inherits_through_its_recorded_spelling_too(self):
         proc = self._params(
@@ -3969,7 +4570,7 @@ class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
     """
 
     def _resolved_paths(self, cwd, home, extra_env=None):
-        """What install.sh picks for install.env and the legacy vars.sh.
+        """What install.sh picks for install.env.
 
         Piped into `bash -s` rather than sourced by path, because that is the
         whole point: `source /abs/path/install.sh` sets BASH_SOURCE and the
@@ -3985,9 +4586,7 @@ class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
         full_env = get_isolated_test_env(overrides=overrides)
         if "KUBE_AGENTS_INSTALL_ENV" not in (extra_env or {}):
             full_env.pop("KUBE_AGENTS_INSTALL_ENV", None)
-        script = _INSTALL_SH.read_text() + (
-            '\necho "ENV=$INSTALL_ENV_FILE"\necho "LEGACY=$LEGACY_VARS_FILE"\n'
-        )
+        script = _INSTALL_SH.read_text() + '\necho "ENV=$INSTALL_ENV_FILE"\n'
         return subprocess.run(
             ["bash", "-s"], input=script,
             capture_output=True, text=True, env=full_env, cwd=str(cwd),
@@ -4033,18 +4632,6 @@ class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(f"ENV={named}", proc.stdout)
 
-    def test_the_legacy_vars_file_is_looked_for_in_the_same_checkout(self):
-        """Same root cause, same fix: resolved script-relative, a piped re-run
-        against an existing clone never found the legacy file and silently
-        skipped the migration it exists for."""
-        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as home:
-            legacy = pathlib.Path(home) / "kube-agents" / "k8s-operator" / "scripts"
-            legacy.mkdir(parents=True)
-            (legacy / "vars.sh").write_text("export PROJECT_ID=from-the-legacy-file\n")
-            proc = self._resolved_paths(tmp, home)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn(f"LEGACY={legacy}/vars.sh", proc.stdout)
-
 
 class ServiceAccountOwnershipIsCheckedOnEveryApplyDoorTest(unittest.TestCase):
     """The 409 check has to sit between the generator and each apply, and
@@ -4089,23 +4676,34 @@ class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):
         self.assertLess(cmek, clear)
         self.assertLess(clear, apply)
 
-    def test_it_is_gated_on_the_cluster_existing_and_fetches_its_credentials(self):
+    def test_it_is_gated_on_the_cluster_existing_and_runs_on_the_context_fetched_before_the_summary(self):
         # Existing, not adopted: a cluster this state created on the attempt
         # that died exists with create_cluster = true, and its retry hits the
         # same Helm refusal. The generator fetched credentials on the adoption
-        # path alone, so this branch fetches them itself.
+        # path alone, so main() fetches them itself for any existing cluster,
+        # once, before the step-11 summary (the scope check needs them there
+        # too), and step 12's gate reuses that context rather than fetching
+        # again.
         clear = self.source.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"')
-        gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
+        summary = self.source.index('print_step "11. Pre-Flight Configuration Summary"')
+        gate = self.source.rfind(
+            'if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then',
+            0, summary)
         self.assertGreater(gate, 0)
         credentials = self.source.index('gcloud container clusters get-credentials "$cluster_name"', gate)
-        self.assertLess(credentials, clear)
-        # Nothing else opens between the gate and the call.
-        self.assertNotIn("\n  fi\n", self.source[gate:clear])
+        self.assertLess(credentials, summary)
+        self.assertLess(summary, clear)
         # The fetch reaches a DNS-endpoint-only cluster the way step 13's does;
         # a plain one fails there, and the context gate then skips the check.
         flag = self.source.index('gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id"', gate)
         self.assertLess(flag, credentials)
-        self.assertIn("$GKE_DNS_ENDPOINT_FLAG", self.source[credentials:clear])
+        self.assertIn("$GKE_DNS_ENDPOINT_FLAG", self.source[credentials:summary])
+        # Step 12 still gates the clear on the cluster existing, opens nothing
+        # else before the call, and fetches nothing of its own.
+        step12_gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
+        self.assertGreater(step12_gate, summary)
+        self.assertNotIn("\n  fi\n", self.source[step12_gate:clear])
+        self.assertNotIn("get-credentials", self.source[step12_gate:clear])
 
 
 class TheCloneDirectoryNeedsHomeOnlyWhenCloningTest(unittest.TestCase):
@@ -5251,7 +5849,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._run_func(f'run_lifecycle_apply "{repo_dir}" "{log_file}"')
 
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Error encountered at line", proc.stderr)
+        # on_error names the frame that called it: install.sh itself, in the
+        # dispatcher, since the failure is reported from there.
+        self.assertIn(f"Error encountered at {_INSTALL_SH}:", proc.stderr)
+        self.assertIn(" in handle_pipeline_status (exit code 1): ", proc.stderr)
         self.assertIn("./lifecycle.sh apply -auto-approve -input=false", proc.stderr)
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
@@ -5270,6 +5871,129 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, f"Stderr: {proc.stderr}")
         self.assertTrue(log_file.exists())
         self.assertIn("Apply complete", log_file.read_text())
+
+    def test_a_failure_inside_a_sourced_library_names_its_file_and_function(self):
+        """The abort banner points at the frame that failed.
+
+        $LINENO counts from the top of whichever file the failing command sat
+        in. Printed alone, a failure inside a sourced helper read as a line of
+        install.sh, where that line is unrelated code (#1798). The banner now
+        carries the file and the function; the JSON report is unchanged and
+        still records the status alone.
+        """
+        lib = self._tmp_path / "helper_lib.sh"
+        lib.write_text("library_probe() {\n  false\n}\n")
+        # Same file the other write_json_report tests read, removed first so
+        # the assertions below read this run's report and not the one the
+        # previous test left behind.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
+        proc = self._run_func(f'source "{lib}"\nlibrary_probe\necho "NOT_REACHED"')
+
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertIn(f"Error encountered at {lib}:", proc.stderr)
+        self.assertIn(" in library_probe (exit code 1): false", proc.stderr)
+        # The report the handler wrote on the way out.
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
+        self.assertEqual(report["status"], "FAILED")
+        for absent in ("message", "line", "line_no", "command", "function", "source_file"):
+            self.assertNotIn(absent, report)
+        for value in report.values():
+            self.assertNotIn("library_probe", str(value))
+            self.assertNotIn("Error encountered", str(value))
+
+    def test_a_failure_in_a_piped_script_names_install_sh_not_bash(self):
+        """The curl | bash entry has no file for bash to name a frame after.
+
+        Read from stdin, BASH_SOURCE for this script's own frames is `main` on
+        a modern bash and unset on bash 3.2, and $0 is `bash`. The banner
+        names the script instead, so the line number has a file to belong to.
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "piped_step() {\n  false\n}\n"
+            "piped_step\n"
+        )
+        proc = subprocess.run(
+            ["bash"],
+            input=script,
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+            ),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("Error encountered at install.sh:", proc.stderr)
+        self.assertIn(" in piped_step (exit code 1): false", proc.stderr)
+        self.assertNotIn(" at bash:", proc.stderr)
+        self.assertNotIn(" at main:", proc.stderr)
+
+    def test_a_handled_miss_inside_a_substitution_prints_no_banner_and_no_report(self):
+        """A probe whose miss the caller handles is not an abort.
+
+        `set -E` hands the ERR trap to the `$(...)`, and bash 3.2 fires it
+        there before the caller's `if !` is consulted (#1798). The handler
+        exits the subshell silently and leaves the verdict to the parent, which
+        handles the miss: no banner, no report. bash 4.4 and 5.x never fire the
+        inherited trap in this shape, so there this asserts the contract
+        without exercising the check; the unhandled case below does.
+        """
+        # Same file the other write_json_report tests read.
+        report = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report.unlink(missing_ok=True)
+        proc = self._run_func(
+            "probe() { false; }\n"
+            'step() { if ! x="$(probe)"; then echo "handled"; fi; }\n'
+            "step\n"
+            'echo "done"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("handled", proc.stdout)
+        self.assertIn("done", proc.stdout)
+        self.assertNotIn("Error encountered", proc.stderr)
+        self.assertFalse(report.exists())
+
+    def test_an_unhandled_failure_inside_a_substitution_prints_one_banner_from_the_parent(self):
+        """A real failure inside a `$(...)` is reported once, by the parent.
+
+        Every bash fires the inherited trap inside an unhandled substitution.
+        The subshell's handler exits at the failing command rather than
+        printing: command substitution does not inherit errexit, so a handler
+        that merely returned would let the probe run on past its failure and
+        hand the caller a clean exit. The parent's trap then fires at the
+        assignment and prints the one banner.
+        """
+        # Same file the other write_json_report tests read, removed first so
+        # the report assertion reads this run's and not the previous test's.
+        report_file = pathlib.Path("/tmp/kube-agents-install-report.json")
+        report_file.unlink(missing_ok=True)
+        proc = self._run_func(
+            'probe() { false; echo "NOT_REACHED_IN_PROBE"; }\n'
+            'x="$(probe)"\n'
+            'echo "NOT_REACHED x=[$x]"'
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("NOT_REACHED", proc.stdout)
+        self.assertEqual(proc.stderr.count("Error encountered"), 1, proc.stderr)
+        self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
+        self.assertTrue(report_file.exists(), proc.stderr)
+        report = json.loads(report_file.read_text())
+        self.assertEqual(report["status"], "FAILED")
+
+    def test_each_front_door_handler_exits_a_subshell_silently(self):
+        """The three handlers share the rule, and apply it before they print."""
+        check = 'if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then\n    exit "$exit_code"\n  fi'
+        for path in _FRONT_DOORS:
+            with self.subTest(file=path.name):
+                source = path.read_text()
+                handler = source[source.index("\non_error() {") :]
+                handler = handler[: handler.index("\n}\n")]
+                self.assertIn(check, handler)
+                self.assertLess(handler.index(check), handler.index("echo -e"))
 
     def test_pipeline_status_handles_empty_array_safely_under_set_u(self):
         source = _INSTALL_SH.read_text()
@@ -5797,6 +6521,13 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-allowed-users": ("PARAM_SLACK_ALLOWED_USERS", "U123,U456"),
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
+        "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
+        "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
+        "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
+        "--scope-shared-vpc-hosts": ("PARAM_SCOPE_SHARED_VPC_HOSTS", "shared-net-host"),
+        "--scope-metrics-scopes": ("PARAM_SCOPE_METRICS_SCOPES", "observability-hub"),
+        "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
+        "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
     }
 
     def test_each_value_flag_reaches_its_variable(self):
@@ -6591,6 +7322,61 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         # Not "[]": the empty assignment reaches main() as a well-formed
         # "false", which is what makes it silent.
         self.assertIn("RESOLVED=[false]", proc.stdout)
+
+    def test_an_empty_memory_value_is_refused_against_a_seed(self):
+        """`--memory=` out of a wrapper expanding an unset variable must fail at parse_args.
+
+        Without the parse-time check, `--memory=` sets PARAM_MEMORY="" AND
+        PARAM_MEMORY_EXPLICIT="true", and resolve_shared_defaults then turns ""
+        into DEFAULT_MEMORY ("file") before main()'s validator runs -- both
+        overwriting a recorded MEMORY=hindsight and telling
+        write_tfvars_from_state not to probe the live cluster before planning
+        hindsight-postgresql away.
+        """
+        proc = self._parse_args("--memory=", MEMORY="hindsight")
+        self.assertNotIn("PASSED", proc.stdout)
+        self.assertIn(
+            "--memory= was given an empty value",
+            proc.stdout + proc.stderr,
+        )
+
+    def test_an_empty_memory_value_would_resolve_to_the_default_with_explicit_true(self):
+        """Why the refusal above must live in parse_args and not wait for main().
+
+        Driven through resolve_shared_defaults with PARAM_MEMORY="" and
+        PARAM_MEMORY_EXPLICIT="true": `${PARAM_MEMORY:-$DEFAULT_MEMORY}` turns
+        the empty string into "file", which main()'s validator accepts while
+        PARAM_MEMORY_EXPLICIT stays "true".
+        """
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+            'PARAM_MEMORY=""\n'
+            'PARAM_MEMORY_EXPLICIT="true"\n'
+            "resolve_shared_defaults\n"
+            'echo "RESOLVED=[$PARAM_MEMORY] EXPLICIT=[$PARAM_MEMORY_EXPLICIT]"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_env = pathlib.Path(tmp) / "install.env"
+            empty_env.write_text("", encoding="utf-8")
+            env = get_isolated_test_env(
+                overrides={
+                    "HOME": tmp,
+                    "KUBE_AGENTS_INSTALL_ENV": str(empty_env),
+                    "MEMORY": "hindsight",
+                }
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=tmp,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("RESOLVED=[file] EXPLICIT=[true]", proc.stdout)
+
+
 class InstallerHelpersDetachFromTheTerminalTest(PtyChildTestMixin, unittest.TestCase):
     """The helpers that run install.sh functions must not hand them a terminal.
 
@@ -6824,6 +7610,378 @@ class BannerColourVariablesAreDefinedTest(unittest.TestCase):
             "they come from scripts/installer/common.sh, which it does not source",
         )
 
+
+class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
+    """The scope flags follow the install.env contract every other key does.
+
+    A first install records the five keys, empty included, so the file says
+    where a project is declared. A re-run never rewrites the file, so a flag
+    that disagrees with it gets the same one-run warning --agent-namespace and
+    --enable-gke-backup-plan get, naming the line to add and the consequence:
+    the next full upgrade regenerates from the file and drops the project.
+    """
+
+    def _run(self, script, env=None):
+        return subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             'source scripts/installer/installer_common.sh\n'
+             'resolve_shared_defaults\n'
+             'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n' + script],
+            capture_output=True, text=True,
+            env=get_isolated_test_env(overrides={
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+                **(env or {}),
+            }),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_a_first_install_records_the_seven_keys_even_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "new.install.env"
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("")
+            loaded.chmod(0o600)
+            # Exported after the load, as main() exports the flags' values: the
+            # loader drops an inherited key once an install.env exists.
+            proc = self._run(
+                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_FOLDERS="123456789012" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="shared-net-host" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
+                f'bootstrap_install_env_file "{dest}" some-tag >/dev/null\ncat "{dest}"',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(loaded)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_PROJECTS=payments-prod\\ payments-staging$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_FOLDERS=123456789012$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_ORGANIZATIONS=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_SHARED_VPC_HOSTS=shared-net-host$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_METRICS_SCOPES=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
+
+    def test_an_inherited_scope_key_is_dropped_once_install_env_exists(self):
+        # The hazard load_install_env closes for the other front doors: a
+        # shell-exported value applied for one run over a file that does not
+        # record it is dropped again by the next run. A file that carries the
+        # key sets it; a first install (no file) keeps the environment.
+        probe = ('echo "P=${PARAM_SCOPE_PROJECTS:-unset} F=${PARAM_SCOPE_FOLDERS:-unset} O=${PARAM_SCOPE_ORGANIZATIONS:-unset} '
+                 'H=${PARAM_SCOPE_SHARED_VPC_HOSTS:-unset} M=${PARAM_SCOPE_METRICS_SCOPES:-unset} '
+                 'X=${PARAM_SCOPE_EXCLUDE_PROJECTS:-unset} C=${PARAM_SCOPE_EXCLUDE_CLUSTERS:-unset}"')
+        stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_FOLDERS": "111", "SCOPE_ORGANIZATIONS": "222",
+                 "SCOPE_SHARED_VPC_HOSTS": "stray-host", "SCOPE_METRICS_SCOPES": "stray-scope",
+                 "SCOPE_EXCLUDE_PROJECTS": "*-stray", "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            env_file.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
+            )
+            self.assertIn("P=unset F=unset O=unset H=unset M=unset X=unset C=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
+            )
+            self.assertIn("P=from-the-file F=unset O=unset H=unset M=unset X=unset C=unset", proc.stdout, proc.stderr)
+        # No file: a first install seeds from the environment and records it.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_copy = pathlib.Path(tmp) / "install.sh"
+            script_copy.write_text(_INSTALL_SH.read_text())
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{script_copy}"\n{probe}'],
+                capture_output=True, text=True, cwd=tmp,
+                env=get_isolated_test_env(overrides={"HOME": tmp, **stray}),
+            )
+            self.assertIn("P=stray-project F=111 O=222 H=stray-host M=stray-scope X=*-stray C=s/l/c", proc.stdout, proc.stderr)
+
+    def test_a_flag_that_disagrees_with_the_recorded_file_warns_and_names_the_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_PROJECTS="payments-prod,payments-staging"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            self.assertIn("--scope-projects=payments-prod,payments-staging applies to this run only", out)
+            self.assertIn("records SCOPE_PROJECTS=payments-prod", out)
+            self.assertIn("retired over the reconcile's next two clean runs", out)
+            # Spelled as install.env records it (%q), so the line pastes back as is.
+            self.assertIn("Set SCOPE_PROJECTS=payments-prod\\,payments-staging in", out)
+            self.assertEqual(existing.read_text(), "SCOPE_PROJECTS=payments-prod\n")
+        # A folder flag gets the same warning against a file that records none.
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_FOLDERS="123456789012"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            self.assertIn("--scope-folders=123456789012 applies to this run only", out)
+            self.assertIn("Set SCOPE_FOLDERS=123456789012 in", out)
+
+    def test_the_remedy_for_a_space_separated_flag_pastes_back_as_one_assignment(self):
+        # The scope keys are the first list-valued values through the warning;
+        # printed bare, `Set SCOPE_PROJECTS=a b in ...` would source as the
+        # command `b` with SCOPE_PROJECTS=a in its environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_PROJECTS="payments-prod payments-staging"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            # The value carries a backslash-escaped space, so the remedy is one
+            # assignment, pinned verbatim as printed.
+            remedy = "SCOPE_PROJECTS=payments-prod\\ payments-staging"
+            self.assertIn(f"Set {remedy} in ", out)
+            # And the assignment as printed round-trips through a sourcing shell.
+            check = subprocess.run(
+                ["bash", "-c", f'set -eu; {remedy}; printf "%s" "$SCOPE_PROJECTS"'],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(check.stdout, "payments-prod payments-staging")
+
+    def test_a_run_without_a_scope_flag_over_a_recorded_file_is_silent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\nSCOPE_EXCLUDE_CLUSTERS=p/l/c\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("applies to this run only", proc.stdout + proc.stderr)
+
+    def test_an_empty_scope_flag_is_refused_at_parse_time(self):
+        # Applied, an empty flag would drop every scoped project for one run
+        # while install.env still named them; the file is where a scope is
+        # emptied on purpose.
+        for flag, key in (("--scope-projects", "SCOPE_PROJECTS"),
+                          ("--scope-folders", "SCOPE_FOLDERS"),
+                          ("--scope-organizations", "SCOPE_ORGANIZATIONS"),
+                          ("--scope-shared-vpc-hosts", "SCOPE_SHARED_VPC_HOSTS"),
+                          ("--scope-metrics-scopes", "SCOPE_METRICS_SCOPES"),
+                          ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
+                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
+            for value in ("", ",", " ", " , "):
+                with self.subTest(flag=flag, value=value):
+                    proc = subprocess.run(
+                        ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args {shlex.quote(flag + "=" + value)}\necho REACHED'],
+                        capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                    )
+                    self.assertNotIn("REACHED", proc.stdout)
+                    out = proc.stdout + proc.stderr
+                    self.assertIn(f"{flag}= was given an empty value", out)
+                    # The remedy names the flag's own key: an operator clearing an
+                    # exclusion must not be told to empty the project list.
+                    self.assertIn(f"set {key}= (empty) in install.env", out)
+
+    def test_the_flags_are_in_the_help_text(self):
+        proc = subprocess.run(
+            ["bash", str(_INSTALL_SH), "--help"],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        help_text = proc.stdout + proc.stderr
+        for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
+                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS",
+                     "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+
+class ScopeCheckWiringTest(unittest.TestCase):
+    """install.sh runs the pre-apply scope check where it is about to apply
+    and can read: before the step-11 summary and the confirmation, after its
+    own credentials fetch, for a run that will apply (a first install has no
+    cluster; --dry-run and --generate-only apply nothing); and the Day-2
+    menu's Save & Apply, which fetches a context of its own first. The CRD
+    apply sits at step 12 and in the menu, after the check and before the apply."""
+
+    def setUp(self):
+        self.text = _INSTALL_SH.read_text()
+
+    def test_the_check_runs_after_a_fetch_and_before_the_summary_only_for_an_applying_run(self):
+        ownership = self.text.index("check_service_account_ownership || exit 1\n  # For the same reason")
+        gate = self.text.index('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then')
+        fetch = self.text.index('gcloud container clusters get-credentials "$cluster_name" --location "$region" \\\n      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true\n    refuse_apply_over_undeclared_scope')
+        check = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
+        summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
+        self.assertLess(ownership, gate)
+        self.assertLess(gate, fetch)
+        self.assertLess(fetch, check)
+        self.assertLess(check, summary)
+
+    def test_the_container_preflight_mode_follows_the_route(self):
+        # A first install has no cluster to read a CR from, but it does bind a
+        # declared folder with this identity, so the container preflight is
+        # outside the existing-cluster gate and skipped only by --dry-run. A
+        # run that will apply is refused, a run that hands the apply to
+        # lifecycle.sh only warns, and the interactive run is checked at the
+        # (Y/n/g) prompt, where its route is known, so the g answer is the same
+        # choice as the flag and a Y still refuses before step 12.
+        gate_end = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
+        preflight = self.text.index(
+            'if [ "$PARAM_DRY_RUN" != "true" ]; then\n'
+            '    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n'
+            '      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n'
+            '    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then\n'
+            '      check_scope_container_access || exit 1\n'
+            '    fi\n'
+            '  fi\n')
+        summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
+        self.assertLess(gate_end, preflight)
+        self.assertLess(preflight, summary)
+        prompt = self.text.index('prompt_read "\\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)"')
+        yes = self.text.index('      [Yy])\n', prompt)
+        yes_check = self.text.index('check_scope_container_access || exit 1', yes)
+        g = self.text.index('      [Gg])\n', prompt)
+        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"', g)
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        self.assertLess(summary, prompt)
+        self.assertLess(yes, yes_check)
+        self.assertLess(yes_check, g)
+        self.assertLess(g, g_check)
+        self.assertLess(g_check, step12)
+
+    def test_the_crds_are_applied_at_step_12_before_the_apply_on_the_one_fetched_context(self):
+        # INSTALL.md names a re-run and the menu as the way to change
+        # configuration; Helm never upgrades CRDs, so a field the served schema
+        # lacked would be pruned from the CR, and stay pruned. The context is
+        # the one fetched before the summary: main() fetches once for an
+        # existing cluster, not again at step 12.
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        clear = self.text.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
+        crds = self.text.index('apply_crd_upgrades "$repo_dir"\n  fi\n')
+        apply = self.text.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"')
+        self.assertLess(step12, clear)
+        self.assertLess(clear, crds)
+        self.assertLess(crds, apply)
+        self.assertNotIn("refuse_apply_over_undeclared_scope", self.text[step12:apply])
+        main_fetch = 'gcloud container clusters get-credentials "$cluster_name" --location "$region" \\\n      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true'
+        self.assertEqual(self.text.count(main_fetch), 1)
+
+    def test_the_menu_fetches_a_context_then_checks_then_applies_the_crds_before_its_apply(self):
+        menu = self.text[self.text.index("run_menu_system()"):]
+        fetch = menu.index('gcloud container clusters get-credentials "$cluster_name" --location "$REGION"')
+        check = menu.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
+        preflight = menu.index('check_scope_container_access || exit 1')
+        crds = menu.index('apply_crd_upgrades "$repo_dir"')
+        apply = menu.index('run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-')
+        self.assertLess(fetch, check)
+        self.assertLess(check, preflight)
+        self.assertLess(preflight, crds)
+        self.assertLess(crds, apply)
+
+    def test_the_selector_apis_are_enabled_where_the_apply_is_about_to_run(self):
+        # The plan-time resolution of a Shared VPC host or Metrics Scope reads
+        # three APIs the apply is what enables, so a first install enables
+        # them first: after the generate-only route has left, before the
+        # apply; and in the menu's re-apply, after the checks, before the CRDs.
+        handoff = self.text.index('print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"')
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        enable = self.text.index('enable_scope_selector_apis "$project_id"')
+        apply = self.text.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"')
+        self.assertLess(handoff, step12)
+        self.assertLess(step12, enable)
+        self.assertLess(enable, apply)
+        menu_check = self.text.index('        check_scope_container_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
+        self.assertLess(menu_check, handoff)
+
+    def test_the_dry_run_skips_its_plan_while_a_selector_api_is_off(self):
+        # A dry run enables nothing, so with a selector declared and one of
+        # the three APIs off its plan would be refused for a reason the real
+        # run, which enables them prior to apply, does not have: it skips the
+        # plan with the command instead, beside the other known-postcondition
+        # skips, and a listing that failed lets the plan speak.
+        branch = self.text.index('elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
+        node_pools = self.text.index('elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then')
+        plan = self.text.index('print_info "Previewing the resources a real run would create (terraform plan)..."')
+        self.assertLess(node_pools, branch)
+        self.assertLess(branch, plan)
+        self.assertIn('print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project', self.text[branch:plan])
+        self.assertIn('gcloud services enable ${missing_apis} --project=${project_id}', self.text[branch:plan])
+
+    def test_the_generate_only_handoff_names_the_selector_apis_only_when_a_selector_is_declared(self):
+        cmd_template = """
+{source}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+export SCOPE_METRICS_SCOPES="{scope}"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        # A Metrics Scope alone: the two APIs its reads use, not the Compute API a host's would.
+        line = "gcloud services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com --project=test-proj"
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = pathlib.Path(tmp) / "install.env"
+            empty.write_text("")
+            def run(scope):
+                setup = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n' + cmd_template.format(source=_SOURCE_INSTALLER_COMMON, scope=scope)
+                return _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}), cwd=_REPO_ROOT)
+            proc = run("observability-hub")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(line, proc.stdout)
+            self.assertIn("enable them first, or the plan is refused", proc.stdout)
+            # Above the apply it has to precede, for an operator pasting top to bottom.
+            self.assertLess(proc.stdout.index(line), proc.stdout.index("./lifecycle.sh apply"))
+            proc = run("")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(line, proc.stdout)
+
+    def test_the_menu_refuses_a_scope_flag(self):
+        proc = subprocess.run(
+            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],
+            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+        )
+        self.assertIn("PASSED=true", proc.stdout, proc.stderr)
+        dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
+        refusal = self.text.index("--menu takes no --scope-* flag")
+        run = self.text.index("    run_menu_system\n    exit 0")
+        self.assertLess(dispatch, refusal)
+        self.assertLess(refusal, run)
+
+    def test_the_generate_only_handoff_says_the_check_does_not_run_there(self):
+        # The one applying route with no live-scope check: the sentence is the
+        # only guard, so it names every key the apply renders, not just the
+        # projects, and says what to do.
+        self.assertIn("The live-scope check does not run here", self.text)
+        handoff = self.text[self.text.index("The live-scope check does not run here"):]
+        handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions",
+                       "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, handoff)
+
+    def test_the_generate_only_handoff_applies_the_crds_before_the_apply(self):
+        # lifecycle.sh applies no CRDs; on an existing install a field the
+        # served schema lacks would be pruned from the CR and never re-sent.
+        handoff = self.text[self.text.index('2. Apply via lifecycle.sh'):]
+        fetch = handoff.index("gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}")
+        crds = handoff.index("kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
+        apply = handoff.index("./lifecycle.sh apply")
+        self.assertLess(fetch, crds)
+        self.assertLess(crds, apply)
+        # Never the current context: every CRD apply this change ships names the install's own.
+        self.assertNotIn("\n  kubectl apply --server-side", handoff[:apply])
+
+    def test_python3_is_a_required_tool(self):
+        self.assertIn("for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do", self.text)
 
 
 if __name__ == "__main__":

@@ -450,6 +450,14 @@ func TestTasksGet_FoldsTheSupervisorTerminalInStreamOrder(t *testing.T) {
 		len(replayed.StatusHistory) != len(liveTask.StatusHistory) {
 		t.Errorf("replay and live disagree (assertion 11):\nreplay %+v\n  live %+v", replayed, liveTask)
 	}
+	// And the replay knows whose terminal it folded: the supervisor's, by
+	// its subject -- the one thing the live fold of bare envelopes cannot
+	// say, which is why it rides beside the Task rather than in it.
+	if _, subject, err := reader.TasksGetAttributed(ctx, addressee, taskID); err != nil {
+		t.Fatalf("TasksGetAttributed: %v", err)
+	} else if subject != TaskSupervisorSubject(addressee, taskID) {
+		t.Errorf("terminal subject = %q, want the supervisor subject", subject)
+	}
 }
 
 // A task whose only event is the supervisor's - the spawn-failure shape, where

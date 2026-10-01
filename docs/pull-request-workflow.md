@@ -150,7 +150,8 @@ after merge (#658). CI runs the same check in
 at and why — read it before changing the target.
 
 **Third-party download retries.** A non-piped `curl` that fetches over the network in
-`deploy/docker/Dockerfile`, `deploy/sandbox/Dockerfile` or `hack/ci-env.sh` needs both
+`deploy/docker/Dockerfile`, `deploy/sandbox/Dockerfile`, `hack/ci-env.sh` or
+`.github/workflows/validate.yml` needs both
 `--retry N` and `--retry-all-errors` — the count alone does not survive a connection reset
 mid-transfer, and without either a bad second from the upstream CDN fails a build that has
 nothing to do with the download. `tests/test_third_party_download_retry.py` fails the pull
@@ -182,8 +183,9 @@ for — a chart value, a Dockerfile `ARG` default, a compiled constant in the op
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
 default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
-`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
-manifests; and the kustomize integrations, which it requires to name a variable the file owns
+`k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
+fallback, the NATS and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
+worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
 rather than a literal. Two copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
 `platformAgent.harness.memory.provider`, which no render turns on — so their pins in
@@ -192,17 +194,52 @@ Hindsight's images sit behind `hindsight.enabled` — unset by default, and then
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 
+**CodeQL alerts.** CodeQL runs here through GitHub's default setup, which analyses pushes to `main`
+and the other protected branches, a weekly schedule, and, intermittently, pull requests whose head
+branch lives in this repository; in the repository's history one fork pull request has been
+analysed, and no pull request of any kind since early September. Contributor branches live on
+forks, so a change that closes a code-scanning alert cannot count on CI to show it closing.
+Reproduce it locally instead: install the CLI as a `gh` extension, pin it to the version the
+alert's `tool.version` reports, and build a database over a scratch tree holding the flagged file
+at its repository path, once before the change and once after:
+
+```bash
+gh extension install github/gh-codeql
+gh codeql set-version 2.27.1 # the alert's tool.version
+gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
+gh codeql database analyze /tmp/cq/db \
+  codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
+  --download --format=sarif-latest --output /tmp/cq/out.sarif
+```
+
+An alert names a rule id, not a query. The query is the `.ql` in the pack whose `@id` matches it:
+after the first `--download`,
+`grep -rl '@id py/clear-text-logging-sensitive-data' ~/.codeql/packages/codeql/python-queries/`
+finds `Security/CWE-312/CleartextLogging.ql`, and `CleartextStorage.ql` beside it is the storage
+rule. The before run has to reproduce the alert at `main`'s line, and the SARIF's `codeFlows` names
+the source the flagged line was reached from; the after run reports none. Quote both under
+**Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
+code-scanning tab on the merged head is still the final check.
+
+**Terraform module tests.** If you change a module or composition under `terraform/`, run
+`make terraform-test`. It runs the `terraform test` suite of each directory under
+`terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
+needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
+plugin cache); it needs Terraform 1.7 or newer for `mock_provider`, above the 1.5 floor the modules
+and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
+below includes it.
+
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
-and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
+and test, the Python suites, the conformance suite, the Terraform module tests. The per-area targets it wraps, for a faster
 loop while you work:
 
 - `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
   check; see **Shell scripts** above for the release to install.
 - `make validate` — the structure check in the `Validate Repo Structure` job; fails if skills
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
-- `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suites under
-  `k8s-operator/internal/controller` and `agents/platform/scripts`, then the envtest download and
-  `go test`; what the `Operator Tests` job runs.
+- `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
+  `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints
@@ -426,6 +463,14 @@ gh api repos/gke-labs/kube-agents/branches/main/protection \
   --jq '.required_status_checks.contexts'
 ```
 
+Every workflow behind one of those contexts also runs for a pull request whose base is a `release/`
+branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. A backport
+pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook in
+`scripts/release/README.md` ("Patch releases from a release line") is what happens after it merges.
+Which contexts a `release/` branch _requires_ is a repository setting like `main`'s, read back with
+the same command and the branch substituted, URL-encoded (`release%2F0.8`); no `release/` branch
+carries one today, and a line needs it before its first backport merges.
+
 **A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
 against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
 — so on its own every merge to `main` would invalidate every other pull request's green
@@ -525,7 +570,12 @@ Four states that look like somebody else's problem and are not:
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
 carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
 the changed files has submitted `APPROVED`, and when a human other than the author has submitted
-`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An approval from outside
+`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+`.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
+robot that reviews under a user account re-reviews every push and files its follow-ups as
+`COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
+request and the check-run path would never request a human, and a review request outstanding to it
+is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
 `OWNERS` is not a hand-off: it cannot produce the `approved` label, so it counts no more than a
 comment. Of these reasons, `/request-review` skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when

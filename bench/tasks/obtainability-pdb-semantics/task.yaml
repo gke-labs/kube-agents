@@ -1,5 +1,9 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt, one of the three
-# activations that take the reliability domain to five enabled tasks (#1049).
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-09-22,
+# a presubmit entry from 2026-08-31 until then, one of the three activations
+# that took the reliability domain to five enabled tasks (#1049). The
+# presubmit runs the blocking roster only (#1023) and this case was never
+# admitted (600/685 graded presubmit repetitions 2026-09-15 to 09-22), so
+# it earns its roster seat on the nightly record now.
 # Grades what nothing active grades: PodDisruptionBudget SEMANTICS. The probe
 # asks whether the unbudgeted workload survives a drain; the remediation
 # variation asks for a correct manifest; this one asks what a WRONG budget
@@ -15,7 +19,7 @@
 # in namespace "seeded-reliability" on the seeded fleet, with no
 # PodDisruptionBudget — the same no-pdb-workload role the probe reads.
 # Isolation class: read-only.
-# Eligible tier: presubmit.
+# Eligible tier: presubmit once admitted; nightly since 2026-09-22.
 id: obtainability-pdb-semantics
 name: Reliability what-if explains that minAvailable 2 on two replicas blocks drains
 # The prompt names the workload and namespace but no cluster, and tells the

@@ -5,22 +5,29 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
+import collections
 import contextlib
 import hashlib
 import hmac
 import http.client
 import io
+import functools
 import json
 import logging
 import os
 import queue
 import re
+import select
+import selectors
 import shlex
 import signal
 import shutil
+import socket
 import socketserver
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -31,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping, TextIO
 
 import api_policy
 import command_policy
@@ -41,11 +48,14 @@ import scoped_sa_pool
 import vcs_broker
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
-# file is in its pod and not in this one; these three are the vocabulary both
-# sides share, and importing them keeps the context-name grammar in one place.
-# Nothing else in credential_proxy_client runs on import.
+# file is in its pod and not in this one; these are the vocabulary both sides
+# share, and importing them keeps the context-name grammar -- and where the
+# `--kubeconfig` scan stops -- in one place. Nothing else in
+# credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     API_RELAY_PREFIX,
+    END_OF_FLAGS,
+    KUBECONFIG_FLAG,
     ClusterTarget,
     parse_gke_context,
     read_current_context,
@@ -54,6 +64,128 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
+
+# The cluster this broker runs on, as the operator names it in the pod spec. A
+# request that names no cluster resolves to this rather than to whatever the
+# base kubeconfig currently points at.
+HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
+# control plane that is down, private or firewalled parks a broker worker for
+# five minutes; `_kubectl_runs_long` decides what counts as one-shot.
+DEFAULT_KUBECTL_TIMEOUT_SECONDS = 60
+DEFAULT_KUBECTL_REQUEST_TIMEOUT = "30s"
+ENV_KUBECTL_TIMEOUT_SECONDS = "CREDENTIAL_PROXY_KUBECTL_TIMEOUT_SECONDS"
+
+# kubectl invocations meant to outlast a one-shot read: no injected
+# `--request-timeout`, and the broker-wide deadline. `command_policy` refuses
+# most of these a layer earlier, but this decides a deadline rather than an
+# authorisation, so the list is the wider one. Exempting a verb that did not
+# need it only forgoes a bound; missing one breaks a command the shipped skills
+# tell the agent to run (`logs -f`, `rollout status`, `wait`).
+KUBECTL_LONG_RUNNING_VERBS = (
+    "attach",
+    "debug",
+    "delete",
+    "exec",
+    "port-forward",
+    "proxy",
+    "rollout",
+    "wait",
+)
+# `--follow` streams until the caller stops reading. Only meaningful on `logs`:
+# `-f` is `--filename` everywhere else, so it is matched against the verb rather
+# than against the whole argv.
+KUBECTL_FOLLOW_VERB = "logs"
+KUBECTL_FOLLOW_FLAGS = ("-f", "--follow")
+# `get`/`describe` with a watch flag stream too.
+KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
+# A caller who named their own bound has already answered the question; honour
+# it rather than overriding it with a shorter one.
+KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
+
+# Bounds on what a command's output costs this process while the command runs.
+# Output is read as it streams and only the first `--max-output-bytes` of each
+# stream is kept; the rest is drained and discarded, because the caller was
+# never going to receive it. `Popen.communicate()` would buffer all of it first
+# and truncate afterwards, so one `kubectl get pods -A -o yaml` on a large
+# cluster cost tens of MiB in this process per in-flight command, and a burst
+# of concurrent triage sessions took the broker past its memory limit.
+OUTPUT_READ_CHUNK_BYTES = 64 * 1024
+# The stdin pipe is written in pieces this size, interleaved with the reads, so
+# a request body larger than the pipe buffer cannot deadlock against a child
+# that is already writing. PIPE_BUF because a write no larger than it does not
+# block once `select` has reported the pipe writable; a bigger write to a
+# blocking pipe can, with this process then unable to read the child's output
+# while the child waits for its input to be read -- the same reason
+# `Popen.communicate()` uses this size.
+STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
+# After a command is killed, how long its pipes are given to close before what
+# it had already written is given up on.
+KILLED_COMMAND_DRAIN_SECONDS = 5
+# How often a command that has closed both its pipes but is still running is
+# looked at: nothing can wake that wait, so the deadline and the caller's
+# hang-up are checked in steps this long.
+PIPES_CLOSED_POLL_SECONDS = 0.5
+# How many requests that run commands may be in flight at once. A slot is held
+# from the moment a request is admitted until its response is on the wire,
+# because everything the request costs lives that long: one child process -- a
+# kubectl listing a large cluster runs to hundreds of MiB on its own -- and,
+# in this process, the two capped stream buffers, their decoded strings, and
+# the JSON body and its encoding. For text output that is about six times
+# `--max-output-bytes` at peak, measured at 24 MiB per request against a 4 MiB
+# cap; for output that is not UTF-8 it is more, because every such byte becomes
+# a replacement character (`_bounded_text` says how much more, and bounds it).
+# A long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
+# long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+# from a constant of its own beside the output cap and reserves the name, and
+# its cap test sizes the container's memory limit against the two, so the
+# value an install runs moves with that limit rather than through the CR; this
+# default is for a broker run outside the operator. `CommandExecutor.request_slot`
+# says which routes hold a slot and why the others take none.
+DEFAULT_MAX_CONCURRENT_COMMANDS = 8
+ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# How long a request waits for a slot before it is refused with 503. Long
+# enough to ride out a burst of one-shot reads, short enough that a queue held
+# up by long-running commands answers its callers rather than parking them.
+COMMAND_SLOT_WAIT_SECONDS = 60
+# A wait for a slot this long is worth a log line: it says the broker is
+# queueing, which is what an operator sizing the cap needs to see.
+COMMAND_SLOT_WAIT_LOG_MS = 1000
+# The slot wait is taken in pieces this long so that a caller that hangs up
+# while queued is noticed between attempts and dropped without starting its
+# command -- a fork made only to be killed would cost a live request the slot.
+COMMAND_SLOT_POLL_SECONDS = 0.5
+# How long the write of a response may take before its caller is given up on.
+# A response is written while its request's slot is still held, so a caller
+# that stops reading would otherwise keep the slot for as long as it liked; a
+# 16 MiB body crosses the Pod network in well under a second.
+RESPONSE_WRITE_TIMEOUT_SECONDS = 60
+# The same bound from the other end, for the one route that reads its body
+# after admission: a vcs body, bundle included, has this long to arrive once
+# the request holds a slot, or a caller that stalls mid-send would keep the
+# slot with nothing running in it.
+REQUEST_READ_TIMEOUT_SECONDS = 60
+# What a socket reports once its peer has closed for good. POLLHUP and not
+# EOF, because a peer that has only shut its writing half -- legal after an
+# HTTP request, and still waiting for the response -- reads as EOF too.
+CALLER_GONE_EVENTS = select.POLLHUP | select.POLLERR | select.POLLNVAL
+# A command that has to be ended -- its deadline passed, or its caller went
+# away -- gets SIGTERM and this long to exit before SIGKILL. git removes its
+# lock files on SIGTERM and cannot on SIGKILL, and a lock left behind in a
+# leased workspace fails every later git there until the pod restarts.
+KILL_GRACE_SECONDS = 2
+KILL_POLL_SECONDS = 0.05
+# How long the kill waits, after SIGKILL, for the group to be gone. Sending
+# the signal is asynchronous: killpg returns once it is queued, and each
+# member still has to be scheduled to exit, so a kill that returned at once
+# left "everything the command started is gone" a few milliseconds short of
+# true -- and the slot a command is counted under is released when `execute`
+# returns. A member ordinarily exits within a millisecond or two of the
+# signal; the bound is for the ones no wait would end, a member in
+# uninterruptible sleep or an orphan whose reaper is slow, since a zombie
+# keeps the group's id until it is reaped.
+KILL_SETTLE_SECONDS = 1
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -143,12 +275,134 @@ API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
 # Longer than the default 64 because an API path is caller text that has to be
 # readable in the audit line; the same 256 the exec route gives a `cwd`.
 API_RELAY_PATH_LOG_LENGTH = 256
-# The width a principal is logged at. The value comes from the TokenReview,
-# not from the request, and a ServiceAccount username truncated at the default
-# 64 loses exactly its discriminating part; the exec route's audit line uses
-# the same 512 as a literal.
+# The width a principal is logged at, on the exec route's audit records and
+# the relay's lines alike. The value comes from the TokenReview, not from the
+# request, and a ServiceAccount username truncated at the default 64 loses
+# exactly its discriminating part.
 PRINCIPAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
+
+# The broker's Prometheus surface: a metrics-only TCP listener of its own,
+# beside Envoy's, so that the collector scraping it is admitted to a port that
+# serves counters and nothing else -- the credentialed listener's NetworkPolicy
+# keeps admitting only the sandbox and the gateway. The operator sets the port
+# from the constant that also declares the container port and the collector's
+# ingress rule, so the three cannot name different ports; unset means no
+# listener, which is what an older operator that declares no port gets.
+METRICS_PORT_ENV = "CREDENTIAL_PROXY_METRICS_PORT"
+# The range a value of METRICS_PORT_ENV has to fall in to be bound at all; a
+# value outside it is refused by name in serve(), never handed to bind().
+METRICS_PORT_MIN = 1
+METRICS_PORT_MAX = 65535
+METRICS_PATH = "/metrics"
+HEALTHZ_PATH = "/healthz"
+METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+METRICS_SERVER_HEADER = "credential-proxy-metrics"
+# The metrics listener shares the process with the credentialed handler, so a
+# peer that reaches the port must not be able to spend its threads: at most
+# this many connections are served at once, the rest are closed unserved, and
+# each one is cut off this many seconds after it opened whatever the peer
+# sends -- the bound the gateway's Go listener puts on its header read.
+METRICS_MAX_CONNECTIONS = 16
+METRICS_CONNECTION_DEADLINE_SECONDS = 10
+# Metric names, and the vocabulary of every label value. Nothing served is
+# caller text: a label value is one of these strings or a member of the
+# vocabularies below, so a caller cannot grow the series set by varying what
+# it sends -- the bound the collector's cardinality depends on.
+TOOL_INVOCATIONS_METRIC = "kubeagents_tool_invocations_total"
+TOOL_DURATION_METRIC = "kubeagents_tool_execution_duration_seconds"
+PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
+TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
+TOOL_STATUS_SUCCESS = "success"
+TOOL_STATUS_ERROR = "error"
+TOOL_STATUS_BLOCKED = "blocked"
+# A command whose caller hung up while it was queued or running; a running
+# one is killed. Its own outcome rather than `error`: the command's exit is
+# unknown, and the repeated abandon is the pattern the abandon path exists
+# for, so it has to be visible as itself.
+TOOL_STATUS_ABANDONED = "abandoned"
+# A command the broker never started because its slots stayed full for the
+# whole wait, the 503 the route answers. Its own outcome rather than `error`:
+# under saturation "never started" and "failed" are the two numbers an
+# operator needs apart.
+TOOL_STATUS_BUSY = "busy"
+# What a label reads when the request named nothing in its vocabulary: an
+# executable the broker does not serve, a verb no policy table lists, a path
+# no route claims, an argv whose verb cannot be read past an unknown flag.
+LABEL_OTHER = "other"
+# `subcommand` when the argv names the tool and nothing after it.
+SUBCOMMAND_NONE = "none"
+# The `subcommand` vocabularies the policy tables do not already supply. The
+# kubectl read verbs and the gcloud command groups come from command_policy's
+# tables -- a gcloud command is labelled by its group, `container` or `iam`,
+# never by a verb -- and these add the kubectl write verbs and the gcloud
+# groups a refused command is counted under: "how often does the model try to
+# apply" is the question a blocked-command series answers.
+KUBECTL_WRITE_VERBS = frozenset(
+    {
+        "annotate", "apply", "attach", "autoscale", "cordon", "cp", "create", "debug",
+        "delete", "diff", "drain", "edit", "exec", "expose", "label", "patch",
+        "port-forward", "proxy", "replace", "run", "scale", "set", "taint", "uncordon",
+    }
+)
+GCLOUD_EXTRA_SURFACES = frozenset({"components", "iam", "init", "resource-manager", "services"})
+# The read-only git porcelain the sandbox runs that no gate lists: the lease
+# gate reads GIT_MUTATING_SUBCOMMANDS and the workspace runs
+# content_workspace.WORKSPACE_GIT_SUBCOMMANDS, and the git vocabulary is the
+# union of those two, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's
+# list is labelled by name without a second edit here.
+GIT_READ_SUBCOMMANDS = frozenset({"blame", "describe", "log", "ls-files", "show", "status"})
+FORGE_CLI_SUBCOMMANDS = frozenset(
+    {
+        "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
+        "repo", "run", "search", "secret", "ssh-key", "status", "variable", "version",
+        "workflow",
+    }
+)
+# Which forge CLI reads which vocabulary. broker_executables() grows with the
+# forges an install declares; a CLI with no entry here labels every
+# subcommand `other` rather than being judged against another tool's verbs.
+FORGE_CLI_VOCABULARIES = {"gh": FORGE_CLI_SUBCOMMANDS}
+# The global flags a forge CLI takes a value for ahead of its subcommand, so
+# `gh -R owner/repo pr list` labels `pr` rather than the repository.
+FORGE_CLI_VALUE_FLAGS = {"gh": frozenset({"-R", "--repo"})}
+
+# The broker's log is one JSON object per line (JsonLineFormatter): these are its
+# keys, Cloud Logging's names where it has one. A tool-execution audit record is
+# an ordinary log record carrying an `audit` mapping in `extra`, which the
+# formatter merges in at the top level, so the fields below reach Cloud Logging
+# as jsonPayload keys and the message every existing reader greps for stays.
+AUDIT_EXTRA_KEY = "audit"
+LOG_SEVERITY_KEY = "severity"
+LOG_TIMESTAMP_KEY = "timestamp"
+LOG_LOGGER_KEY = "logger"
+LOG_MESSAGE_KEY = "message"
+LOG_EXCEPTION_KEY = "exception"
+TOOL_EXECUTION_AUDIT_EVENT = "tool_execution_audit"
+# The `status` of a tool-execution audit record: one per outcome the exec route
+# can reach. `completed` says the command ran, whatever its exit code; the
+# code is beside it.
+AUDIT_STATUS_STARTED = "started"
+AUDIT_STATUS_COMPLETED = "completed"
+AUDIT_STATUS_BLOCKED = "blocked"
+AUDIT_STATUS_REJECTED = "rejected"
+AUDIT_STATUS_FAILED = "failed"
+AUDIT_STATUS_ABANDONED = "abandoned"
+AUDIT_STATUS_BUSY = "busy"
+# Rule ids for the refusals the exec route decides itself rather than by a
+# policy rule. The response body and the audit record name the same constant,
+# so the two cannot drift apart.
+RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
+RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
+RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
+RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
+LOG_LEVEL_ENV = "LOG_LEVEL"
+DEFAULT_LOG_LEVEL = "INFO"
+EXIT_STARTUP_FAILURE = 1
+# The record time as Cloud Logging and every log backend parse it without a
+# format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+LOG_MSEC_FORMAT = "%s.%03dZ"
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -222,10 +476,30 @@ def _redacted_fields(exc) -> dict:
     return {"error": redact_credentials(str(exc)), **fields}
 
 
-class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class HandlerErrorsToLog:
+    """Route an exception that escapes a request handler into the log.
+
+    socketserver's default hook prints a plain-text traceback to stderr, and in
+    the broker's container that is the same log as stdout: one such traceback
+    is several lines that a reader expecting one JSON object per line cannot
+    parse. Mixed in ahead of the server class so this hook is the one found.
+    """
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # The address is the peer's: a socket path on the Unix listener, a
+        # host and port on TCP. Neither is an identifier worth a field; the
+        # exception's type and traceback are what a reader needs.
+        LOGGER.exception("request handler failed type=%s", type(sys.exc_info()[1]).__name__)
+
+
+class ThreadingUnixHTTPServer(HandlerErrorsToLog, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
+
+
+class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
+    """ThreadingHTTPServer for the credentialed and API-relay listeners on TCP."""
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +897,25 @@ class AuthenticationError(Exception):
     """
 
 
+class CommandSlotUnavailable(RuntimeError):
+    """A request waited COMMAND_SLOT_WAIT_SECONDS without reaching a free slot.
+
+    Slots go in arrival order, so this is the request that has waited longest,
+    whether the slots never freed or freed only for the requests ahead of it.
+    Answered 503 rather than run anyway: a request past the cap is the one that
+    would take the container over its memory limit, and an OOM kill fails every
+    request in flight for every caller, not just this one.
+    """
+
+
+class CallerHungUp(Exception):
+    """The caller closed its connection while its request waited for a slot.
+
+    Nothing to run and nobody to answer: the route logs it and returns, and the
+    slot goes to a caller that is still there.
+    """
+
+
 @dataclass(frozen=True)
 class Principal:
     """Who the broker believes is on the other end of a request.
@@ -816,9 +1109,9 @@ class ServiceAccountAuthenticator:
         try:
             # Inside the try: a missing or unreadable ca.crt raises
             # FileNotFoundError here, and an OSError escaping this method is
-            # not an AuthenticationError — it would reach
-            # socketserver.handle_error as a traceback and a dropped
-            # connection, where the caller deserves a 401.
+            # not an AuthenticationError — the handler's read guard would end
+            # the request as a dropped connection with no 401, where the
+            # caller deserves one.
             context = ssl.create_default_context(cafile=self.ca_file or None)
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds, context=context
@@ -1024,6 +1317,17 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_port = 8642
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self) -> None:
+        # The guard the credentialed and metrics handlers carry: a peer that
+        # resets while its request line is read, or while a 401 is on its
+        # way, is a debug line and a closed connection, not a handler fault
+        # for the server's error hook to log with a traceback.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("api request not answered type=%s", type(exc).__name__)
 
     def do_GET(self) -> None:  # noqa: N802
         self._proxy()
@@ -1901,6 +2205,9 @@ class ExecutionResult:
     # ran in this one. Empty for every other command. See
     # `_execute_get_credentials`.
     kubeconfig: str = ""
+    # The caller's connection closed while the command ran, and the command was
+    # killed for it. There is nobody to answer; the handler logs and returns.
+    abandoned: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -1932,6 +2239,41 @@ def _is_get_credentials(argv: list[str]) -> bool:
     except ValueError:
         return False
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def _kubectl_runs_long(argv: list[str]) -> bool:
+    """Is this a kubectl that is meant to block, rather than a one-shot read?
+
+    Read off the verb -- resolved through command_policy so global flags with
+    detached values do not hide it -- plus the flags that make an otherwise-
+    bounded verb stream.
+    """
+    verb_tuple, _ = command_policy._kubectl_verb_and_flag(argv)
+    verb = verb_tuple[0] if verb_tuple else ""
+    if not verb:
+        for arg in argv[1:]:
+            if not arg.startswith("-"):
+                verb = arg
+                break
+    if verb in KUBECTL_LONG_RUNNING_VERBS:
+        return True
+    if verb == KUBECTL_FOLLOW_VERB and any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_FOLLOW_FLAGS
+    ):
+        return True
+    if any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_WATCH_FLAGS
+    ):
+        return True
+    return any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in argv[1:]
+        for flag in KUBECTL_TIMEOUT_FLAGS
+    )
 
 
 # Identity stamped on commits the proxy makes on the agent's behalf. `git commit`
@@ -3116,6 +3458,290 @@ def broker_executables() -> tuple[str, ...]:
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 
 
+@dataclass
+class _CapturedOutput:
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
+    timed_out: bool
+    abandoned: bool
+
+
+def _caller_has_gone(caller: Any) -> bool:
+    """Has the connection a command runs for closed for good?
+
+    Decided from the socket's hang-up state, never from EOF: a peer that has
+    only shut its writing half -- legal after an HTTP request, and still
+    waiting for the response -- reads as EOF too, and ending its command would
+    refuse a valid request. On the Unix socket every shipped topology fronts
+    with Envoy, a peer that closed reports POLLHUP and a half-closed one does
+    not. A TCP peer reports neither until a write fails, so a broker spoken to
+    over TCP runs its commands unwatched, the way internal callers do.
+
+    Non-blocking, so it can be asked at any time -- while the command runs,
+    once `select` has reported the socket, and between attempts to take a slot.
+    """
+    try:
+        descriptor = caller.fileno()
+    except (OSError, ValueError):
+        return True
+    if descriptor < 0:
+        return True
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN)
+    flags = dict(poller.poll(0)).get(descriptor, 0)
+    return bool(flags & CALLER_GONE_EVENTS)
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    """End a command and everything it started. Never raises.
+
+    SIGTERM first, so a program that cleans up on it -- git and its lock files
+    above all -- gets KILL_GRACE_SECONDS to do so, then SIGKILL to the whole
+    group `_execute` started if anything in it is still there. `poll` reports
+    the child alone, and a helper it started that ignores SIGTERM would
+    otherwise outlive the kill, holding the pipes and running on outside the
+    slot it was counted under. The grace is the group's, not the child's: the
+    loop waits for the group to empty, so a helper cleaning up after its
+    parent exited gets the same two seconds, and Linux keeps the group's id
+    allocated for as long as any member lives. A group seen empty gets no
+    SIGKILL at all -- with the child reaped its id is free for reuse, and the
+    next new session in this container is the likeliest taker.
+
+    On return the group is empty, or a bound ran out: the grace after SIGTERM,
+    or KILL_SETTLE_SECONDS after SIGKILL. The second wait is what makes the
+    first sentence true when the grace did not: SIGKILL is queued, not
+    delivered, when killpg returns, and a caller that went on at once could
+    find a member still alive for a few milliseconds more.
+    """
+
+    def signal_group(signum: int) -> None:
+        try:
+            os.killpg(process.pid, signum)
+        except OSError:
+            # ESRCH: nothing left to signal. The child is in that group, so
+            # there is no per-process fallback that could reach anything.
+            pass
+
+    def group_is_empty() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def wait_for_group_to_empty(bound_seconds: float) -> bool:
+        deadline = time.monotonic() + bound_seconds
+        while True:
+            # Reap the child if it has exited; a zombie would otherwise keep
+            # the group looking occupied for the whole wait.
+            process.poll()
+            if group_is_empty():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(KILL_POLL_SECONDS)
+
+    signal_group(signal.SIGTERM)
+    if wait_for_group_to_empty(KILL_GRACE_SECONDS):
+        # Nothing left to kill, and once the child is reaped the group's id
+        # is free for reuse -- by another command's new session, most likely
+        # -- so an emptied group is left alone.
+        return
+    signal_group(signal.SIGKILL)
+    if not wait_for_group_to_empty(KILL_SETTLE_SECONDS):
+        # The one case the bound exists for, and the only place it is known:
+        # the slot is released with something still in the group, and an
+        # operator later asking what outlived the command starts here.
+        LOGGER.warning(
+            "process group %d still occupied %ss after SIGKILL; giving up the wait",
+            process.pid,
+            KILL_SETTLE_SECONDS,
+        )
+
+
+def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:
+    """Decode a captured stream so that its UTF-8 form stays within `limit`.
+
+    Decoding with replacement can only grow the text: every byte that is not
+    UTF-8 becomes U+FFFD, three bytes when encoded again and four in memory,
+    so a stream of such bytes at the cap -- a container that logs binary --
+    would cost this process, and then the response, several times the cap
+    the capture was bounded to. Text that decodes cleanly is returned whole;
+    anything else is measured once encoded and cut at the limit on a character
+    boundary, and the cut is reported as truncation.
+    """
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        pass
+    # Piece by piece, so the measuring never holds a second full copy: a
+    # whole-stream decode and re-encode of 8 MiB of such bytes cost 40 MiB of
+    # transients on top of the result.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pieces: list[str] = []
+    budget = limit
+    for offset in range(0, len(raw), OUTPUT_READ_CHUNK_BYTES):
+        end = offset + OUTPUT_READ_CHUNK_BYTES
+        piece = decoder.decode(raw[offset:end], final=end >= len(raw))
+        encoded = piece.encode("utf-8")
+        if len(encoded) > budget:
+            pieces.append(encoded[:budget].decode("utf-8", errors="ignore"))
+            return "".join(pieces), True
+        pieces.append(piece)
+        budget -= len(encoded)
+    return "".join(pieces), False
+
+
+def _capture_output(
+    process: subprocess.Popen,
+    stdin: bytes | None,
+    limit: int,
+    timeout: float,
+    caller: Any = None,
+) -> _CapturedOutput:
+    """Run a started command to completion holding at most `limit` bytes per stream.
+
+    What `Popen.communicate()` does, with three differences that are the point:
+    output past `limit` is read and dropped as it arrives instead of being kept
+    until the end, so the memory a command costs this process does not depend
+    on how much it prints; `caller`, when given, is the socket the command is
+    being run for, and its closing kills the command rather than leaving it to
+    run to its deadline for nobody; and a command that is killed -- for either
+    reason -- still has what it managed to write collected, briefly, so a
+    timed-out kubectl's partial output and stderr reach the caller.
+
+    Returns once the command has exited. `process.returncode` is set.
+    """
+    deadline = time.monotonic() + timeout
+    outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
+    truncated = False
+    pending = memoryview(stdin) if stdin else None
+    written = 0
+    selector = selectors.DefaultSelector()
+    for stream in outputs:
+        selector.register(stream, selectors.EVENT_READ)
+    if process.stdin is not None:
+        if pending is not None:
+            selector.register(process.stdin, selectors.EVENT_WRITE)
+        else:
+            process.stdin.close()
+    if caller is not None:
+        try:
+            selector.register(caller, selectors.EVENT_READ)
+        except (ValueError, OSError):
+            # Already closed, or not a file descriptor at all: run unwatched,
+            # as every internal caller does.
+            caller = None
+
+    def pump(until: float, watch_caller: bool) -> tuple[bool, bool]:
+        """Read until every pipe closes, `until` passes, or the caller leaves.
+
+        Returns (timed_out, abandoned).
+        """
+        nonlocal truncated, written
+        if not watch_caller and caller is not None:
+            with contextlib.suppress(KeyError, ValueError):
+                selector.unregister(caller)
+        # Until every pipe is done, stdin included: a child that closes its
+        # outputs and goes on reading its input still has to be fed, or it
+        # blocks on a pipe nobody writes to until the deadline kills it.
+        while any(not stream.closed for stream in outputs) or (
+            process.stdin is not None and not process.stdin.closed
+        ):
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return True, False
+            for key, _ in selector.select(remaining):
+                stream = key.fileobj
+                if stream is caller:
+                    if _caller_has_gone(caller):
+                        return False, True
+                    # Readable but not hung up: bytes that are not this
+                    # protocol's, or a peer that shut its writing half and is
+                    # waiting for the answer. Either way it is still there;
+                    # stop watching rather than spin, and let the command run.
+                    selector.unregister(caller)
+                    continue
+                if stream is process.stdin:
+                    try:
+                        written += os.write(
+                            stream.fileno(),
+                            pending[written : written + STDIN_WRITE_CHUNK_BYTES],
+                        )
+                    except BrokenPipeError:
+                        # The child stopped reading; what it did not take is
+                        # its business, exactly as it is for communicate().
+                        written = len(pending)
+                    if written >= len(pending):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
+                data = os.read(stream.fileno(), OUTPUT_READ_CHUNK_BYTES)
+                if not data:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                buffer = outputs[stream]
+                room = limit - len(buffer)
+                if room > 0:
+                    buffer += data[:room]
+                if len(data) > room:
+                    truncated = True
+        return False, False
+
+    try:
+        timed_out, abandoned = pump(deadline, watch_caller=True)
+        if timed_out or abandoned:
+            _kill_process_group(process)
+            # What the command wrote before it died is still in the pipes, and
+            # what is left to wait for after that is the reaping.
+            pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
+            try:
+                process.wait(timeout=KILLED_COMMAND_DRAIN_SECONDS)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                process.wait()
+        else:
+            # Every pipe closed but the command is still running -- it handed
+            # them to a child, or closed them itself. Nothing can wake a wait
+            # now, so it is taken in steps: the deadline still applies, and so
+            # does the caller's hang-up, and either gets the command the same
+            # end a command that kept writing gets.
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                elif caller is not None and _caller_has_gone(caller):
+                    abandoned = True
+                else:
+                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
+                    continue
+                _kill_process_group(process)
+                process.wait()
+    except BaseException:
+        # Whatever went wrong in here -- a read or write that raised, the
+        # thread being torn down -- the child does not get to outlive the
+        # capture: it would run on outside the cap, unwatched and unreaped.
+        _kill_process_group(process)
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in (process.stdin, *outputs):
+            if stream is not None and not stream.closed:
+                stream.close()
+    return _CapturedOutput(
+        stdout=bytes(outputs[process.stdout]),
+        stderr=bytes(outputs[process.stderr]),
+        truncated=truncated,
+        timed_out=timed_out,
+        abandoned=abandoned,
+    )
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = broker_executables()
 
@@ -3125,9 +3751,29 @@ class CommandExecutor:
         max_output_bytes: int,
         state_dir: str,
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
+        kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.kubectl_timeout_seconds = kubectl_timeout_seconds
         self.max_output_bytes = max_output_bytes
+        # See DEFAULT_MAX_CONCURRENT_COMMANDS; `parse_args` reads the operator's
+        # value from the environment, the way it does the other bounds.
+        if max_concurrent_commands < 1:
+            raise ValueError(f"{ENV_MAX_CONCURRENT_COMMANDS} must be at least 1")
+        self.max_concurrent_commands = max_concurrent_commands
+        # The slots are handed out in arrival order: a request holds a ticket
+        # in this queue while it waits, and only the ticket at the head may
+        # take a free slot. A semaphore would not do -- a waiter whose timed
+        # acquire lapses rejoins the wait at the back, so under sustained
+        # saturation the caller that had waited longest was as likely to be
+        # refused as one that had just arrived.
+        self._slot_condition = threading.Condition()
+        self._slots_in_use = 0
+        self._slot_queue: collections.deque[object] = collections.deque()
+        # The deadline the commands of the request on this thread share; set by
+        # `request_slot` for as long as the slot is held, read by `_execute`.
+        self._request_budget = threading.local()
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -3316,6 +3962,10 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # Read here rather than forwarded into `self.environment`: this decides
+        # which kubeconfig a request resolves to, and a subprocess has no
+        # business reading it or overriding it.
+        self.host_context = os.environ.get(HOST_CONTEXT_ENV, "").strip()
         # Applied per invocation in `_execute`, and only to git, rather than
         # written once to ~/.gitconfig: the identity then stays scoped to the
         # proxied commands that need it and leaves no ambient state in the
@@ -3346,6 +3996,99 @@ class CommandExecutor:
             LOGGER.info(
                 "scoped service account pool armed scopes=%d", len(self.scoped_pool.scopes)
             )
+
+    @property
+    def slots_in_use(self) -> int:
+        """How many requests hold a slot right now."""
+        with self._slot_condition:
+            return self._slots_in_use
+
+    @property
+    def queued_requests(self) -> int:
+        """How many requests are waiting for a slot right now."""
+        with self._slot_condition:
+            return len(self._slot_queue)
+
+    @contextlib.contextmanager
+    def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
+        """Hold one concurrency slot for the whole of a request.
+
+        Taken by the routes that run agent-selected commands -- `/v1/exec` and
+        `/v1/vcs/*` -- around the command and the response together, because
+        the memory a request costs lives until its response is written: the
+        child, the captured output, the decoded strings, the JSON body and its
+        encoding. Released when the command exited, the slot would let a caller
+        that reads slowly keep its body alive while the next command holds the
+        slot, and the number of bodies in memory would be the number of
+        callers rather than the cap. The other routes take no slot: the forge
+        refresh is a short call to the minter, the content workspace's git is
+        serialised by the store's own lock, and the Cloud API relay answers
+        from a bounded read of its own.
+
+        Slots go in arrival order. The wait is woken every
+        COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
+        checked each time: one that has hung up while queued raises
+        `CallerHungUp` before anything is started, rather than taking the slot
+        a live request is waiting for. A request still queued after
+        COMMAND_SLOT_WAIT_SECONDS raises `CommandSlotUnavailable`; with the
+        queue ordered, that is the request that has waited longest, not
+        whichever one a semaphore happened to pass over.
+
+        While the slot is held, every command run on this thread shares one
+        deadline, the broker-wide `timeout_seconds` counted from admission:
+        `_execute` caps each command to what is left of it. A vcs verb runs
+        several network git commands back to back and a first kubectl on an
+        uncached cluster fetches credentials first, and without the shared
+        deadline a request's silent worst case would be that many deadlines
+        end to end -- longer than the idle time Envoy allows the stream in
+        front of the broker, which is sized against this one.
+        """
+        queued_at = time.monotonic()
+        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        ticket = object()
+        with self._slot_condition:
+            self._slot_queue.append(ticket)
+            try:
+                while not (
+                    self._slot_queue[0] is ticket
+                    and self._slots_in_use < self.max_concurrent_commands
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        # Worded for the queue: slots may well have freed in
+                        # the meantime and gone to earlier arrivals, so "none
+                        # finished" would be false for a request that was
+                        # overtaken rather than starved.
+                        raise CommandSlotUnavailable(
+                            f"the credential proxy is at its limit of "
+                            f"{self.max_concurrent_commands} concurrent commands and this "
+                            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                            f"free slot; retry shortly"
+                        )
+                    self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
+                    if caller is not None and _caller_has_gone(caller):
+                        raise CallerHungUp("the caller disconnected while queued for a slot")
+                self._slots_in_use += 1
+            finally:
+                # Admitted or leaving, the ticket comes out and the next in
+                # line is woken to look again.
+                self._slot_queue.remove(ticket)
+                self._slot_condition.notify_all()
+        self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+        try:
+            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
+            if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
+                LOGGER.info(
+                    "request waited %dms for a slot (all %d slots were busy)",
+                    waited_ms,
+                    self.max_concurrent_commands,
+                )
+            yield
+        finally:
+            self._request_budget.deadline = None
+            with self._slot_condition:
+                self._slots_in_use -= 1
+                self._slot_condition.notify_all()
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -3398,7 +4141,18 @@ class CommandExecutor:
         cwd: str | None = None,
         kubeconfig_context: str | None = None,
         wants_kubeconfig: bool = False,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
+        """Run an agent-selected command.
+
+        `caller` is the connection the command is being run for. While the
+        command runs the connection is watched, and its closing ends the
+        command: a triage session torn down mid-command otherwise leaves its
+        kubectl running to the deadline, holding a slot and buffering output
+        for nobody. The route holds the request's slot around this call and
+        the response (`request_slot`), and watches the same connection while
+        queued. See `_caller_has_gone` for what counts as closing.
+        """
         if (
             not isinstance(argv, list)
             or not argv
@@ -3417,7 +4171,9 @@ class CommandExecutor:
         # kubeconfig, so it is handled separately: it writes, everything else
         # reads.
         if _is_get_credentials(argv):
-            return self._execute_get_credentials(command, stdin, cwd, wants_kubeconfig)
+            return self._execute_get_credentials(
+                command, stdin, cwd, wants_kubeconfig, caller=caller
+            )
 
         # Two ways in, and both have to be covered or the other is a bypass.
         # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
@@ -3433,6 +4189,18 @@ class CommandExecutor:
         # the pool existed -- regenerated on the ambient identity, never
         # selected on.
         scoped = executable == "kubectl"
+        # Bound the one-shot read; a command meant to block keeps kubectl's own
+        # default. Decided here rather than in `_execute` because the argv
+        # arrives there carrying the flag this branch just injected, and reading
+        # it back would conclude the caller had asked for it.
+        kubectl_deadline: int | None = None
+        if executable == "kubectl" and not _kubectl_runs_long(command):
+            kubectl_deadline = self.kubectl_timeout_seconds
+            command = [
+                command[0],
+                f"--request-timeout={DEFAULT_KUBECTL_REQUEST_TIMEOUT}",
+                *command[1:],
+            ]
         command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
         if flag_kubeconfig is not None:
             # The flag beats the environment, because that is the precedence
@@ -3482,12 +4250,21 @@ class CommandExecutor:
             stdin=stdin,
             cwd=cwd,
             kubeconfig_path=kubeconfig_path,
+            timeout_seconds=kubectl_deadline,
+            caller=caller,
         )
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
     ) -> ExecutionResult:
-        """Run a trusted, operator-defined helper that is not agent selectable."""
+        """Run a trusted, operator-defined helper that is not agent selectable.
+
+        Slots are a request's, not a command's (`request_slot`), so a helper
+        takes none of its own: it runs inside whichever request needed it -- a
+        vcs verb refreshing its credential -- or, from the refresh route and
+        the cron behind it, inside none. It is a short call to the minter
+        either way, not a listing.
+        """
         return self._execute(argv, cwd=cwd)
 
     def execute_workspace_git(
@@ -3933,20 +4710,28 @@ class CommandExecutor:
         return scoped
 
     def _ambient_target(self) -> ClusterTarget | None:
-        """The cluster the sidecar's own kubeconfig points at, if any.
+        """The cluster a request that names none resolves to.
 
-        This is the file `bootstrap` asked gcloud to write, so reading it is not
-        the same act as reading one the agent handed over — nothing here is
-        caller-controlled. It matters because `KUBECONFIG` is set in the base
-        environment: a `kubectl` request that names no kubeconfig at all still
-        reaches a cluster, and if the pool did not cover that path it would be
-        the one door left open onto the ambient credential.
+        `KUBECONFIG` is set in the base environment, so a `kubectl` naming no
+        kubeconfig at all still reaches a cluster, and if the pool did not cover
+        this path it would be the one door left open onto the ambient
+        credential.
+
+        The operator names the host cluster in the environment and that wins: it
+        is fixed for the life of the pod, while the kubeconfig's
+        `current-context` is whatever last wrote the file. The file is the
+        fallback, for a broker started outside the operator -- reading it is
+        safe because `bootstrap` wrote it, not the agent.
         """
+        if self.host_context:
+            target = parse_gke_context(self.host_context)
+            if target is not None:
+                return target
         try:
             text = Path(self.environment["KUBECONFIG"]).read_text(
                 encoding="utf-8", errors="replace"
             )
-        except OSError:
+        except (KeyError, OSError):
             return None
         context = read_current_context(text)
         return parse_gke_context(context) if context else None
@@ -3985,22 +4770,31 @@ class CommandExecutor:
         already put its cluster through pool selection, and selecting a *second*
         cluster for the same request is not a second control, it is a bug. The
         last flag wins, the way kubectl reads them.
+
+        Stops at `--`, where the shim's scan stops too. After it the words are
+        the command `kubectl exec` or `kubectl debug` runs in the pod, kubectl
+        does not read them as its own flags, and the shim forwarded any
+        `--kubeconfig` there as the path it was. Resolving that path here would
+        refuse the request as a non-GKE context name; the two sides have to
+        agree on where kubectl's flags end.
         """
         rewritten = list(command)
         resolved_path: Path | None = None
         index = 1
         while index < len(rewritten):
             argument = rewritten[index]
-            if argument == "--kubeconfig" and index + 1 < len(rewritten):
+            if argument == END_OF_FLAGS:
+                break
+            if argument == KUBECONFIG_FLAG and index + 1 < len(rewritten):
                 resolved_path = self._resolve_kubeconfig(rewritten[index + 1], scoped=scoped)
                 rewritten[index + 1] = str(resolved_path)
                 index += 2
                 continue
-            if argument.startswith("--kubeconfig="):
+            if argument.startswith(f"{KUBECONFIG_FLAG}="):
                 resolved_path = self._resolve_kubeconfig(
                     argument.split("=", 1)[1], scoped=scoped
                 )
-                rewritten[index] = f"--kubeconfig={resolved_path}"
+                rewritten[index] = f"{KUBECONFIG_FLAG}={resolved_path}"
             index += 1
         return rewritten, resolved_path
 
@@ -4032,7 +4826,12 @@ class CommandExecutor:
             return []
 
         def run(argv: list[str]) -> tuple[int, str]:
-            result = self._execute([gcloud, *argv[1:]])
+            # The short deadline: this is a control-plane lookup made on the
+            # way to a kubectl, not a command the caller chose, and it runs
+            # silently under the kubeconfig lock. See _ensure_managed_kubeconfig.
+            result = self._execute(
+                [gcloud, *argv[1:]], timeout_seconds=self.kubectl_timeout_seconds
+            )
             return result.exit_code, result.stdout
 
         return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
@@ -4068,6 +4867,12 @@ class CommandExecutor:
                         *self._dns_endpoint_args(gcloud, target),
                     ],
                     kubeconfig_path=scratch,
+                    # The short deadline, as for the describe above. A
+                    # credential fetch takes seconds when the API answers, and
+                    # when it does not, five minutes of silence here -- ahead of
+                    # the kubectl's own deadline, inside the same request --
+                    # would outlast the idle timeout Envoy allows the stream.
+                    timeout_seconds=self.kubectl_timeout_seconds,
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
@@ -4085,6 +4890,7 @@ class CommandExecutor:
         stdin: str | None,
         cwd: str | None,
         wants_kubeconfig: bool,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
         """Run the one command that is allowed to author a kubeconfig.
 
@@ -4100,14 +4906,15 @@ class CommandExecutor:
         Returned rather than written: the destination is a path in the agent's
         pod, which this process cannot see and must not be handed a route into.
         """
-        if not wants_kubeconfig:
-            # No destination asked for, so gcloud updates the broker's own
-            # config as it always has. Nothing agent-authored is involved.
-            return self._execute(command, stdin=stdin, cwd=cwd)
-
+        # Always execute into an isolated scratch file: left to itself gcloud
+        # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
+        # config, moving the `current-context` that every later context-less
+        # kubectl resolves against.
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
-            result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
+            result = self._execute(
+                command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch, caller=caller
+            )
             if result.exit_code == 0 and scratch.is_file():
                 generated = scratch.read_text(encoding="utf-8")
                 context = read_current_context(generated)
@@ -4119,7 +4926,8 @@ class CommandExecutor:
                     # redundant fetch. Taking the lock here would serialise every
                     # scaffold behind every cold read for no benefit.
                     os.replace(scratch, self._managed_kubeconfig(target))
-                result = replace(result, kubeconfig=generated)
+                if wants_kubeconfig:
+                    result = replace(result, kubeconfig=generated)
             return result
         finally:
             scratch.unlink(missing_ok=True)
@@ -4132,6 +4940,8 @@ class CommandExecutor:
         kubeconfig_path: Path | None = None,
         containment_root: Path | None = None,
         extra_config: tuple[tuple[str, str], ...] = (),
+        timeout_seconds: int | None = None,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -4144,9 +4954,19 @@ class CommandExecutor:
         caller. `execute_workspace_git` passes the broker-owned content
         workspace root instead — the two roots are proven disjoint at startup,
         so widening the check here cannot widen the other path.
+
+        `timeout_seconds` overrides the broker-wide deadline for this one
+        command; `execute` passes the shorter kubectl bound through it.
+
+        `caller` is the connection the command answers, if it answers one; see
+        `_capture_output`. Internal callers leave it unset.
+
+        No concurrency slot is taken here. A slot is a request's, held by the
+        route from admission until the response is written (`request_slot`),
+        so every command a request runs -- the kubeconfig cache-fill made under
+        `_kubeconfig_lock` included -- is covered by the one its request holds,
+        and no lock is ever held while waiting for a slot.
         """
-        started = time.monotonic()
-        timed_out = False
         root = containment_root or self.workspace_dir
         command_cwd = root
         if cwd:
@@ -4184,6 +5004,17 @@ class CommandExecutor:
             )
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
+        effective_timeout: float = (
+            timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+        )
+        request_deadline = getattr(self._request_budget, "deadline", None)
+        if request_deadline is not None:
+            # The commands of one request share its deadline (`request_slot`);
+            # a command that starts with nothing left gets nothing, and comes
+            # back timed out rather than running past what the request was
+            # allowed.
+            effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
+        started = time.monotonic()
         process = subprocess.Popen(
             argv,
             cwd=command_cwd,
@@ -4193,29 +5024,37 @@ class CommandExecutor:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        try:
-            stdout_bytes, stderr_bytes = process.communicate(
-                input=stdin.encode("utf-8") if stdin is not None else None,
-                timeout=self.timeout_seconds,
+        captured = _capture_output(
+            process,
+            stdin=stdin.encode("utf-8") if stdin is not None else None,
+            limit=self.max_output_bytes,
+            timeout=effective_timeout,
+            caller=caller,
+        )
+        stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
+        stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
+        if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
+            target_str = (
+                f"target kubeconfig {kubeconfig_path}"
+                if kubeconfig_path
+                else "ambient cluster target"
             )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            stdout_bytes, stderr_bytes = process.communicate()
+            # Appended after the bound, so a stream already at the cap does
+            # not push the one line that explains the exit code off the end.
+            stderr_text += (
+                f"\n[credential-proxy] kubectl command timed out after {effective_timeout:.0f}s "
+                f"({target_str})\n"
+            )
 
-        stdout_bytes, stdout_truncated = self._truncate(stdout_bytes)
-        stderr_bytes, stderr_truncated = self._truncate(stderr_bytes)
         duration_ms = int((time.monotonic() - started) * 1000)
         return ExecutionResult(
-            exit_code=124 if timed_out else process.returncode,
-            stdout=stdout_bytes.decode("utf-8", errors="replace"),
-            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+            exit_code=124 if captured.timed_out else process.returncode,
+            stdout=stdout_text,
+            stderr=stderr_text,
             duration_ms=duration_ms,
-            truncated=stdout_truncated or stderr_truncated,
-            timed_out=timed_out,
+            truncated=captured.truncated or stdout_cut or stderr_cut,
+            timed_out=captured.timed_out,
+            abandoned=captured.abandoned,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -4350,14 +5189,18 @@ def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
     # lines in text-mode consumers.
     #
     # Cs is here for the opposite reason: a lone surrogate does not forge a
-    # record, it deletes one. json.loads turns "\\ud800" into a real lone
-    # surrogate, which no UTF-8 encoder will accept, so the handler raises
-    # UnicodeEncodeError, logging prints "--- Logging error ---" to stderr and
-    # drops the record - while the request it was supposed to describe carries
-    # on and succeeds. An authenticated caller could execute a command and
-    # leave no exec line behind. Verified against a byte-encoding handler; a
-    # StringIO one does not reproduce it, which is why the unit tests below
-    # write through a real UTF-8 encoder.
+    # record, it deletes one under a text formatter. json.loads turns
+    # "\\ud800" into a real lone surrogate, which no UTF-8 encoder will
+    # accept, so a text-formatting handler raises UnicodeEncodeError, logging
+    # prints "--- Logging error ---" to stderr and drops the record - while
+    # the request it was supposed to describe carries on and succeeds. The
+    # deployed JsonLineFormatter escapes a lone surrogate and keeps the record
+    # (FormatterTest in test_credential_proxy_audit_json hands it one); the
+    # strip is what keeps the property under a text formatter a test or a
+    # local run installs.
+    # Verified against a byte-encoding handler; a StringIO one does not
+    # reproduce it, which is why the unit tests below write through a real
+    # UTF-8 encoder.
     filtered = ''.join(
         c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')
     )
@@ -4466,6 +5309,373 @@ def strip_credential_query_keys(query: str) -> str:
     return "&".join(kept)
 
 
+def _endpoint_label(path: str) -> str:
+    """The route family ``path`` falls in, for the request counter.
+
+    Read off ROUTE_ROLES, first match wins, the same walk required_roles makes;
+    the trailing slash is dropped so the label reads `/v1/chat` rather than
+    `/v1/chat/`. Never the path itself: the path is caller text, and a label
+    that carried it would let one caller mint a series per request.
+    """
+    if path == HEALTHZ_PATH:
+        return HEALTHZ_PATH
+    for prefix, _ in ROUTE_ROLES:
+        if path.startswith(prefix):
+            return prefix.rstrip("/")
+    return LABEL_OTHER
+
+
+@functools.lru_cache(maxsize=None)
+def _subcommand_vocabulary(tool: str) -> frozenset[str]:
+    """The ``subcommand`` values ``tool`` may be counted under.
+
+    Built from module constants, so once per tool for the life of the process
+    rather than once per request.
+    """
+    if tool == "kubectl":
+        return frozenset(verb[0] for verb in command_policy.KUBECTL_READ_VERBS) | KUBECTL_WRITE_VERBS
+    if tool == "gcloud":
+        # The group the label reads, past any release track, the way
+        # _tool_labels reads it: `beta monitoring ...` is `monitoring`.
+        surfaces = (command_policy._gcloud_surface(list(command)) for command in command_policy.GCLOUD_READ_COMMANDS)
+        return frozenset(surface for surface in surfaces if surface) | GCLOUD_EXTRA_SURFACES
+    if tool == "git":
+        from content_workspace import WORKSPACE_GIT_SUBCOMMANDS  # local, as every import of it here is
+
+        return VCS_GIT_SUBCOMMANDS | GIT_MUTATING_SUBCOMMANDS | WORKSPACE_GIT_SUBCOMMANDS | GIT_READ_SUBCOMMANDS
+    return FORGE_CLI_VOCABULARIES.get(tool, frozenset())
+
+
+def _forge_subcommand(tool: str, argv: list[str]) -> str | None:
+    """The first bare word after a forge CLI's global flags, or None.
+
+    A flag that takes a value (`-R owner/repo`) is skipped with its value;
+    `--repo=owner/repo` is one token and skips itself.
+    """
+    value_flags = FORGE_CLI_VALUE_FLAGS.get(tool, frozenset())
+    tokens = iter(argv[1:])
+    for token in tokens:
+        if token in value_flags:
+            next(tokens, None)
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def _tool_labels(argv: list[str]) -> tuple[str, str]:
+    """The ``tool`` and ``subcommand`` labels for an exec request.
+
+    The tool is argv[0] when the broker serves it and LABEL_OTHER otherwise, so
+    a refused executable is counted without its name reaching the series. The
+    subcommand is the first bare word after the tool, read with the same
+    parsers the policy uses -- a kubectl or gcloud global flag that takes a
+    value would otherwise hand its value up as the verb -- and kept only when
+    the tool's vocabulary lists it. Unreadable or unlisted reads LABEL_OTHER; a
+    bare tool reads SUBCOMMAND_NONE. A forge CLI's value-taking global flags
+    (`gh -R owner/repo pr list`) are stepped over on the way to the subcommand.
+    """
+    tool = argv[0]
+    if tool not in CommandExecutor.ALLOWED_EXECUTABLES:
+        return LABEL_OTHER, LABEL_OTHER
+    word: str | None
+    if tool == "kubectl":
+        verb, unknown_flag = command_policy._kubectl_verb_and_flag(argv)
+        word = verb[0] if verb else (LABEL_OTHER if unknown_flag else None)
+    elif tool == "gcloud":
+        words, unknown_flag = command_policy._gcloud_words_and_flag(argv)
+        word = LABEL_OTHER if words is None else command_policy._gcloud_surface(words)
+    elif tool == "git":
+        word, _ = _git_plan(argv)
+    else:
+        word = _forge_subcommand(tool, argv)
+    if word is None:
+        return tool, SUBCOMMAND_NONE
+    if word in _subcommand_vocabulary(tool):
+        return tool, word
+    return tool, LABEL_OTHER
+
+
+class JsonLineFormatter(logging.Formatter):
+    """One JSON object per record, on one line, for Cloud Logging and a SIEM behind it.
+
+    `severity` is the level under Cloud Logging's name, `timestamp` the record's
+    time in UTC, `message` the text every existing reader greps for, and an
+    `audit` mapping passed through `extra` is merged in at the top level so a
+    tool-execution record's fields are queryable as jsonPayload.<field> rather
+    than parsed out of the text. json.dumps escapes every newline a traceback or
+    a caller's text could carry, so the one-record-one-line property the audit
+    trail depends on holds by construction rather than by sanitising each site.
+    """
+
+    converter = time.gmtime
+    default_time_format = LOG_TIME_FORMAT
+    default_msec_format = LOG_MSEC_FORMAT
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            LOG_SEVERITY_KEY: record.levelname,
+            LOG_TIMESTAMP_KEY: self.formatTime(record),
+            LOG_LOGGER_KEY: record.name,
+            LOG_MESSAGE_KEY: record.getMessage(),
+        }
+        audit = getattr(record, AUDIT_EXTRA_KEY, None)
+        if isinstance(audit, Mapping):
+            for key, value in audit.items():
+                payload.setdefault(key, value)
+        if record.exc_info:
+            payload[LOG_EXCEPTION_KEY] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, separators=(",", ":"))
+
+
+def _tool_audit(
+    status: str,
+    request_id: str,
+    principal: str,
+    tool: str,
+    subcommand: str,
+    *,
+    exit_code: int | None = None,
+    duration_ms: int | None = None,
+    rule: str | None = None,
+) -> dict[str, Any]:
+    """The `audit` mapping of one tool-execution record.
+
+    Only identifiers and outcomes: the request id, the verified principal, the
+    tool and subcommand as the metrics label them (a closed vocabulary, never the
+    argv), the outcome and, where there is one, the exit code, the duration and
+    the policy rule. No argument, path, stdin or output is ever here, so there is
+    nothing in the record for a `--token` to leak through.
+    """
+    record: dict[str, Any] = {
+        "event_type": TOOL_EXECUTION_AUDIT_EVENT,
+        "request_id": request_id,
+        "principal": principal,
+        "tool": tool,
+        "subcommand": subcommand,
+        "status": status,
+    }
+    if exit_code is not None:
+        record["exit_code"] = exit_code
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+    if rule:
+        record["rule"] = rule
+    return record
+
+
+def _escape_label_value(value: str) -> str:
+    # Every label value today is a static enum or a vocabulary word, none of
+    # which carries these characters. Kept because the exposition format's
+    # correctness should not rest on an invariant held three functions away.
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+class ProxyMetrics:
+    """Two counters and a latency histogram, in the Prometheus text exposition.
+
+    Hand-rolled: prometheus_client is not in the image, and what is needed is
+    small enough that adding a dependency to the one container holding every
+    credential is the worse trade. One lock, because the server is one thread
+    per connection and a counter is read by the scrape while it is written.
+    Series appear on first increment and are rendered in a fixed order, so
+    two scrapes of an idle broker are byte-identical.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tool_invocations: dict[tuple[str, str, str], int] = {}
+        self._requests: dict[tuple[str, str], int] = {}
+        # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
+        # bound, the +Inf bucket being the count), the sum, and the count.
+        self._duration_buckets: dict[str, list[int]] = {}
+        self._duration_sum: dict[str, float] = {}
+        self._duration_count: dict[str, int] = {}
+
+    def record_tool(self, tool: str, subcommand: str, status: str) -> None:
+        key = (tool, subcommand, status)
+        with self._lock:
+            self._tool_invocations[key] = self._tool_invocations.get(key, 0) + 1
+
+    def observe_duration(self, tool: str, seconds: float) -> None:
+        with self._lock:
+            buckets = self._duration_buckets.setdefault(tool, [0] * len(TOOL_DURATION_BUCKETS))
+            for index, bound in enumerate(TOOL_DURATION_BUCKETS):
+                if seconds <= bound:
+                    buckets[index] += 1
+            self._duration_sum[tool] = self._duration_sum.get(tool, 0.0) + seconds
+            self._duration_count[tool] = self._duration_count.get(tool, 0) + 1
+
+    def record_request(self, endpoint: str, status_code: str) -> None:
+        key = (endpoint, status_code)
+        with self._lock:
+            self._requests[key] = self._requests.get(key, 0) + 1
+
+    def render(self) -> str:
+        with self._lock:
+            invocations = sorted(self._tool_invocations.items())
+            requests = sorted(self._requests.items())
+            durations = {
+                tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
+                for tool in sorted(self._duration_buckets)
+            }
+        lines = [
+            f"# HELP {TOOL_INVOCATIONS_METRIC} CLI tool executions brokered, by tool, subcommand and outcome.",
+            f"# TYPE {TOOL_INVOCATIONS_METRIC} counter",
+        ]
+        for (tool, subcommand, status), count in invocations:
+            lines.append(
+                f'{TOOL_INVOCATIONS_METRIC}{{tool="{_escape_label_value(tool)}",'
+                f'subcommand="{_escape_label_value(subcommand)}",status="{_escape_label_value(status)}"}} {count}'
+            )
+        lines += [
+            f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool.",
+            f"# TYPE {TOOL_DURATION_METRIC} histogram",
+        ]
+        for tool, (buckets, total, count) in durations.items():
+            label = _escape_label_value(tool)
+            for bound, cumulative in zip(TOOL_DURATION_BUCKETS, buckets):
+                lines.append(f'{TOOL_DURATION_METRIC}_bucket{{tool="{label}",le="{bound}"}} {cumulative}')
+            lines.append(f'{TOOL_DURATION_METRIC}_bucket{{tool="{label}",le="+Inf"}} {count}')
+            lines.append(f'{TOOL_DURATION_METRIC}_sum{{tool="{label}"}} {total:.6f}')
+            lines.append(f'{TOOL_DURATION_METRIC}_count{{tool="{label}"}} {count}')
+        lines += [
+            f"# HELP {PROXY_REQUESTS_METRIC} HTTP requests answered on the credentialed listener, by route family and status code.",
+            f"# TYPE {PROXY_REQUESTS_METRIC} counter",
+        ]
+        for (endpoint, status_code), count in requests:
+            lines.append(
+                f'{PROXY_REQUESTS_METRIC}{{endpoint="{_escape_label_value(endpoint)}",'
+                f'status_code="{_escape_label_value(status_code)}"}} {count}'
+            )
+        return "\n".join(lines) + "\n"
+
+
+class MetricsHandler(BaseHTTPRequestHandler):
+    """The metrics-only listener: GET /metrics, and nothing else.
+
+    Unauthenticated, like /healthz on the credentialed listener, because the
+    scraper is the managed-Prometheus collector, which holds no caller token;
+    the operator's NetworkPolicy on this pod is what bounds who reaches the
+    port. It serves the registry the credentialed handler writes and holds no
+    route, credential or policy of its own, which is why it may bind a TCP
+    port the credential runtime otherwise refuses to (see serve). Bounded
+    because it shares the process with that handler: MetricsServer admits
+    METRICS_MAX_CONNECTIONS at a time and handle() cuts every connection
+    off at METRICS_CONNECTION_DEADLINE_SECONDS, so a peer that reaches the
+    port cannot spend the threads the credentialed handler needs.
+    """
+
+    server_version = METRICS_SERVER_HEADER
+    sys_version = ""
+    # Per-recv: an idle peer is dropped here. A peer that trickles bytes
+    # resets this on every byte, which is what the timer in handle() is for.
+    timeout = METRICS_CONNECTION_DEADLINE_SECONDS
+
+    def handle(self) -> None:
+        # One absolute deadline per connection, from accept to the last byte
+        # written, whatever the peer sends in between.
+        cutoff = threading.Timer(METRICS_CONNECTION_DEADLINE_SECONDS, self._cut_off)
+        cutoff.daemon = True
+        cutoff.start()
+        try:
+            super().handle()
+        finally:
+            cutoff.cancel()
+
+    def _cut_off(self) -> None:
+        # Shutting the socket makes the blocked read return, and the guard in
+        # handle_one_request turns whatever that raises into a debug line.
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_RDWR)
+
+    def handle_one_request(self) -> None:
+        # One guard for every byte this listener writes, on any path or
+        # method: a peer that hangs up before the reply is on the wire (a
+        # collector's aborted scrape, a probe at a path this listener does not
+        # serve, a method it does not implement) is a debug line and a closed
+        # connection, not a handler fault for the server's error hook to log
+        # with a traceback. The next scrape reads the same counters.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("metrics request not answered type=%s", type(exc).__name__)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != METRICS_PATH:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        body = CredentialProxyHandler.metrics.render().encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", METRICS_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, message: str, *args: Any) -> None:
+        # A scrape every thirty seconds is not an audit event, and the broker's
+        # access log is the credentialed listener's. Errors still surface
+        # through log_error's caller, send_error, which answers the request.
+        return
+
+
+class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
+    """ThreadingHTTPServer with a ceiling on live connections.
+
+    The stdlib server starts one thread per accepted connection with no cap,
+    and the credentialed handler lives in this process: a peer holding
+    thousands of connections open would spend the threads every brokered
+    command needs. Connections past METRICS_MAX_CONNECTIONS are closed
+    unserved before any thread is spent on them; the ones admitted are held
+    to MetricsHandler's deadline.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(METRICS_MAX_CONNECTIONS)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            LOGGER.debug("metrics connection closed unserved: %d already open", METRICS_MAX_CONNECTIONS)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
+    """Open the metrics-only listener on a daemon thread; log, not raise, when it cannot.
+
+    Never fatal: a port that cannot be bound, or that is no port at all (bind
+    raises OverflowError, not OSError, past 65535), costs the broker its
+    metrics, not the commands it exists to broker, and the ALERT line is the
+    signal.
+    """
+    try:
+        server = MetricsServer((host, port), MetricsHandler)
+    except (OSError, OverflowError) as exc:
+        LOGGER.error(
+            "ALERT metrics listener on %s:%d unavailable type=%s; the broker serves no "
+            "/metrics until it restarts, and commands are unaffected",
+            host, port, type(exc).__name__,
+        )
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True, name="metrics").start()
+    LOGGER.info("metrics listening on %s:%d", host, port)
+    return server
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
@@ -4503,6 +5713,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     authenticator: NullAuthenticator | ServiceAccountAuthenticator = NullAuthenticator()
     # Set per request once the caller is identified; read by the policy layer.
     principal: Principal | None = None
+    # What the metrics listener serves. One registry per process; a test that
+    # wants a clean one assigns a fresh ProxyMetrics here.
+    metrics: ProxyMetrics = ProxyMetrics()
 
     def _authenticated(self) -> Principal | None:
         """Identify the caller, or answer 401 and return None.
@@ -4615,7 +5828,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/healthz" and self._authenticated() is None:
+        if self.path != HEALTHZ_PATH and self._authenticated() is None:
             return
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()
@@ -4656,7 +5869,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 LOGGER.warning("chat event pull failed: %s", type(exc).__name__)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
-        if self.path != "/healthz":
+        if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
         self._json(HTTPStatus.OK, {"status": "ok"})
@@ -4736,12 +5949,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         # Sanitized here rather than at each of the eight log sites below, and
-        # sanitized at all because it is caller-supplied text going into a
-        # line-oriented formatter. A newline in it ends the record and starts a
-        # new one, so an unsanitized requestId lets the caller write a whole
-        # forged entry into the audit trail - including one naming a
-        # ServiceAccount that made no request. It is never echoed back to the
-        # client, so narrowing it costs nothing.
+        # sanitized at all because it is caller-supplied text going into the
+        # log. The deployed formatter is JSON and escapes a newline, but the
+        # sanitiser is what bounds the length, strips the control characters,
+        # and holds for a text formatter a test or a local run installs: an
+        # unsanitized requestId under one lets the caller write a whole forged
+        # entry into the audit trail - including one naming a ServiceAccount
+        # that made no request. It is never echoed back to the client, so
+        # narrowing it costs nothing.
         #
         # This is one route into the log, not all of them. The access line goes
         # through log_message above, which had the same defect from an
@@ -4755,29 +5970,41 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # this route and for every other authenticated one by _authenticated —
         # is the value they would read. Today it is what the audit trail
         # records and nothing else.
+        # Decided once, before any gate: every outcome below is counted and
+        # audited under the same two labels, and a refused executable is
+        # counted as `other` rather than under its own name.
+        tool_label, subcommand_label = _tool_labels(argv)
+        # PRINCIPAL_LOG_LENGTH rather than the default 64: this value comes
+        # from the TokenReview, not from the request, and a truncated identity
+        # is an audit line that names the wrong ServiceAccount.
+        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
+
+        def audit(status: str, **fields: Any) -> dict[str, Any]:
+            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, **fields)}
+
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
             request_id,
-            # 512 rather than the default 64: this value comes from the
-            # TokenReview, not from the request, and a truncated identity is
-            # an audit line that names the wrong ServiceAccount.
-            _sanitize_for_logging(principal.describe(), max_length=512),
+            principal_label,
             # Logged before the allowlist check below, so at this point it is
             # arbitrary caller text and gets the same treatment as request_id.
             _sanitize_for_logging(argv[0]),
+            extra=audit(AUDIT_STATUS_STARTED),
         )
         if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,
                 _sanitize_for_logging(argv[0]),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_EXECUTABLE_ALLOWLIST),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "executable.allowlist",
+                    "rule": RULE_EXECUTABLE_ALLOWLIST,
                     "message": "Executable is not supported by the credential proxy.",
                 },
             )
@@ -4785,8 +6012,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
-                "command blocked request_id=%s rule=%s", request_id, rule.rule_id
+                "command blocked request_id=%s rule=%s", request_id, rule.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=rule.rule_id),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -4805,68 +6034,160 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # the lease check because it does not depend on the working directory.
         violation = git_argument_violation(argv)
         if violation is not None:
-            LOGGER.warning("git argument refused request_id=%s", request_id)
+            LOGGER.warning(
+                "git argument refused request_id=%s", request_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.argument.refused",
+                    "rule": RULE_GIT_ARGUMENT_REFUSED,
                     "message": violation,
                 },
             )
-            return
-
-        # Not a policy rule: the policy matches on argv alone, and this refusal
-        # turns on the working directory as well.
-        if hasattr(self.executor, "resolve_git_command"):
-            violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
-        else:
-            violation = self.executor.git_lease_violation(argv, cwd)
-            exec_argv = argv
-        if violation is not None:
-            LOGGER.warning(
-                "git lease refused request_id=%s cwd=%s",
-                request_id,
-                _sanitize_for_logging(cwd or "", max_length=256),
-            )
-            self._json(
-                HTTPStatus.FORBIDDEN,
-                {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.workspace.lease",
-                    "message": violation,
-                },
-            )
-            return
-
-        # Runs after the credential denylist above, so rules like
-        # `kubernetes.token-disclosure` keep their own ids and messages rather
-        # than being reported as read-only refusals. For example, `kubectl create
-        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
-        # be refused by the denylist with that rule id. If the gate ran first, it
-        # would refuse as `kubernetes.read-only`, losing the specific rule.
-        refusal_result = read_only_refusal(argv)
-        if refusal_result is None and exec_argv != argv:
-            refusal_result = read_only_refusal(exec_argv)
-        if refusal_result is not None:
-            refusal, log_hint = refusal_result
-            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
-            LOGGER.warning(
-                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
-            )
-            self._json(HTTPStatus.FORBIDDEN, refusal)
             return
 
         try:
-            result = self.executor.execute(
-                exec_argv,
-                stdin=stdin,
-                cwd=cwd,
-                kubeconfig_context=kubeconfig_context,
-                wants_kubeconfig=wants_kubeconfig,
+            # Not a policy rule: the policy matches on argv alone, and this
+            # refusal turns on the working directory as well. Inside the try
+            # with the command it gates: a cwd no path can hold (an embedded
+            # NUL) raises ValueError out of the resolution below and takes
+            # the containment rejection with the other caller errors, so the
+            # request ends with a response and the trail with a terminal
+            # record rather than an exception out of the handler.
+            try:
+                if hasattr(self.executor, "resolve_git_command"):
+                    violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
+                else:
+                    violation = self.executor.git_lease_violation(argv, cwd)
+                    exec_argv = argv
+            except OSError as exc:
+                # A cwd the broker cannot read -- a directory the agent named
+                # that stat refuses -- is the caller's path to fix, not a
+                # broker fault: the same rejection as a path outside the
+                # workspace, not the 500 an exception out of the command gets.
+                raise ValueError(f"cwd cannot be read: {type(exc).__name__}") from exc
+            if violation is not None:
+                LOGGER.warning(
+                    "git lease refused request_id=%s cwd=%s",
+                    request_id,
+                    _sanitize_for_logging(cwd or "", max_length=256),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_WORKSPACE_LEASE),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": RULE_GIT_WORKSPACE_LEASE,
+                        "message": violation,
+                    },
+                )
+                return
+
+            # Runs after the credential denylist above, so rules like
+            # `kubernetes.token-disclosure` keep their own ids and messages rather
+            # than being reported as read-only refusals. For example, `kubectl create
+            # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+            # be refused by the denylist with that rule id. If the gate ran first, it
+            # would refuse as `kubernetes.read-only`, losing the specific rule.
+            refusal_result = read_only_refusal(argv)
+            if refusal_result is None and exec_argv != argv:
+                refusal_result = read_only_refusal(exec_argv)
+            if refusal_result is not None:
+                refusal, log_hint = refusal_result
+                safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
+                LOGGER.warning(
+                    "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint,
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=refusal["rule"]),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return
+
+            # One slot for the command and its response together; see
+            # CommandExecutor.request_slot for why the response is inside it.
+            with self._request_slot():
+                result = self.executor.execute(
+                    exec_argv,
+                    stdin=stdin,
+                    cwd=cwd,
+                    kubeconfig_context=kubeconfig_context,
+                    wants_kubeconfig=wants_kubeconfig,
+                    # The connection this command answers. Its closing
+                    # mid-command kills the command; see CommandExecutor.execute.
+                    caller=self.connection,
+                )
+                if result.abandoned:
+                    # The connection is gone, so there is no response to write;
+                    # the log line is the record that the command was ended.
+                    LOGGER.info(
+                        "command abandoned request_id=%s duration_ms=%d: the caller "
+                        "disconnected and the command was killed",
+                        request_id,
+                        result.duration_ms,
+                        extra=audit(AUDIT_STATUS_ABANDONED, duration_ms=result.duration_ms),
+                    )
+                    # No response is written, so log_request never counts this
+                    # request; the invocation and its duration are counted here
+                    # or nowhere.
+                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
+                    self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
+                    return
+                LOGGER.info(
+                    "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
+                    request_id,
+                    result.exit_code,
+                    result.duration_ms,
+                    result.truncated,
+                    extra=audit(AUDIT_STATUS_COMPLETED, exit_code=result.exit_code, duration_ms=result.duration_ms),
+                )
+                # A non-zero exit is `error` here even though the response is
+                # `completed`: the response reports that the broker ran the
+                # command, the counter reports how the command went. A
+                # timeout is exit 124 and counts the same way.
+                self.metrics.record_tool(
+                    tool_label,
+                    subcommand_label,
+                    TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
+                )
+                self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
+                response = {
+                    "status": "completed",
+                    "exitCode": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "durationMs": result.duration_ms,
+                    "truncated": result.truncated,
+                    "timedOut": result.timed_out,
+                }
+                # Only `get-credentials` fills this, and only when the caller
+                # asked for the file. It is gcloud's own output, not anything
+                # the agent wrote.
+                if result.kubeconfig:
+                    response["kubeconfig"] = result.kubeconfig
+                self._json(HTTPStatus.OK, response)
+        except CallerHungUp:
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
+            LOGGER.info(
+                "command abandoned request_id=%s: the caller disconnected while queued "
+                "for a slot; the command was not started",
+                request_id,
+                extra=audit(AUDIT_STATUS_ABANDONED),
             )
+            return
+        except CommandSlotUnavailable as exc:
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
+            LOGGER.warning(
+                "command queued too long request_id=%s", request_id,
+                extra=audit(AUDIT_STATUS_BUSY),
+            )
+            self._busy(exc)
+            return
         except scoped_sa_pool.PoolRefusal as exc:
             # A refusal, not a fault and not a caller error: the request was
             # well formed and the deployment holds no credential narrow enough
@@ -4882,13 +6203,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "scoped service account refused request_id=%s reason=%s",
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_SCOPED_SA_UNMAPPED_SCOPE),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "gcp.scoped-sa.unmapped-scope",
+                    "rule": RULE_SCOPED_SA_UNMAPPED_SCOPE,
                     "message": str(exc),
                 },
             )
@@ -4903,7 +6226,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command rejected request_id=%s reason=%s",
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
+                extra=audit(AUDIT_STATUS_REJECTED),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         except Exception as exc:
@@ -4911,33 +6236,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command failed request_id=%s type=%s",
                 request_id,
                 type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "credential proxy command execution failed"},
             )
             return
-        LOGGER.info(
-            "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
-            request_id,
-            result.exit_code,
-            result.duration_ms,
-            result.truncated,
-        )
-        response = {
-            "status": "completed",
-            "exitCode": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "durationMs": result.duration_ms,
-            "truncated": result.truncated,
-            "timedOut": result.timed_out,
-        }
-        # Only `get-credentials` fills this, and only when the caller asked for
-        # the file. It is gcloud's own output, not anything the agent wrote.
-        if result.kubeconfig:
-            response["kubeconfig"] = result.kubeconfig
-        self._json(HTTPStatus.OK, response)
 
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
@@ -5267,6 +6573,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 payload.get("base") or None,
                 payload.get("branch") or None,
                 payload.get("depth"),
+                # Passed as sent: the store treats None and "" as no label
+                # and refuses anything else it cannot read, so a falsy
+                # non-string is a 400 rather than a silently blank label.
+                caller=payload.get("caller"),
             )
             return {
                 "handle": workspace.handle,
@@ -5419,34 +6729,63 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if route is None:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
+        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
-            payload = self._read_json_body(
-                max_bytes=max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
+            # One slot for the whole request: the body, which may carry a
+            # bundle of tens of MiB and is not read until the request is
+            # admitted, the verb's git commands, and the response. See
+            # CommandExecutor.request_slot for why the response is inside it;
+            # the body is inside it for the same reason, from the other end.
+            with self._request_slot():
+                # Read under one deadline for the whole body: the slot is held
+                # from here on, and a caller that stalls or trickles mid-send
+                # would otherwise keep it with nothing running in it. A stalled
+                # peer is not a hang-up -- its socket reports no POLLHUP -- so
+                # the watch that ends an abandoned wait does not cover this.
+                # (A handler the route tests build by hand has no connection;
+                # see _request_slot.)
+                try:
+                    if getattr(self, "connection", None) is None:
+                        payload = self._read_json_body(max_bytes=body_limit)
+                    else:
+                        payload = self._read_json_body_within(
+                            body_limit, REQUEST_READ_TIMEOUT_SECONDS
+                        )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except OSError as exc:
+                    LOGGER.warning(
+                        "request body not received verb=%s type=%s", verb, type(exc).__name__
+                    )
+                    return
+                # The managed-repository control, on the same footing as
+                # `require_managed_workspace` on the content routes: the broker
+                # holds the forge credential, so "is this a repository we write
+                # to" can only be answered here. Nothing downstream answers it
+                # -- a forge is handed a repository and spends the token on it
+                # -- so this is the whole of the check for these routes.
+                #
+                # Resolved rather than compared as given, because the managed
+                # list holds slugs and a caller may name a repository by URL.
+                # Resolving here also rejects a host this install serves no
+                # credential for before the write verb is entered, which is the
+                # same order `/v1/forge/refresh` uses.
+                if verb in vcs_broker.WRITE_VERBS:
+                    try:
+                        _, repository = self.vcs.registry.resolve(payload.get("repository"))
+                    except providers.WorkspaceError as exc:
+                        self._json(HTTPStatus(exc.status), _redacted_fields(exc))
+                        return
+                    if not self._repository_is_permitted(repository):
+                        return
+                result = route(payload)
+                self._json(HTTPStatus.OK, result)
+        except CallerHungUp:
+            LOGGER.info(
+                "vcs %s abandoned: the caller disconnected while queued for a slot", verb
             )
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-        # The managed-repository control, on the same footing as
-        # `require_managed_workspace` on the content routes: the broker holds
-        # the forge credential, so "is this a repository we write to" can only
-        # be answered here. Nothing downstream answers it -- a forge is handed a
-        # repository and spends the token on it -- so this is the whole of the
-        # check for these routes.
-        #
-        # Resolved rather than compared as given, because the managed list holds
-        # slugs and a caller may name a repository by URL. Resolving here also
-        # rejects a host this install serves no credential for before the write
-        # verb is entered, which is the same order `/v1/forge/refresh` uses.
-        if verb in vcs_broker.WRITE_VERBS:
-            try:
-                _, repository = self.vcs.registry.resolve(payload.get("repository"))
-            except providers.WorkspaceError as exc:
-                self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                return
-            if not self._repository_is_permitted(repository):
-                return
-        try:
-            result = route(payload)
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
             # `refresh_forge_credential` raises it: the credential strategy asks
@@ -5480,13 +6819,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
             )
             return
+        except CommandSlotUnavailable as exc:
+            # Raised before the body was read, so nothing is left half-done --
+            # and the body is drained before the answer, or a caller still
+            # sending a large one would see the connection reset in place of
+            # the 503.
+            LOGGER.warning("command queued too long verb=%s", verb)
+            drain_request_body(self, body_limit)
+            self._busy(exc)
+            return
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
             return
-        self._json(HTTPStatus.OK, result)
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -5495,6 +6842,37 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("request exceeds configured size limit")
         payload = json.loads(self.rfile.read(content_length))
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return payload
+
+    def _read_json_body_within(self, max_bytes: int, seconds: float) -> dict[str, Any]:
+        """`_read_json_body` for a body read while a slot is held.
+
+        The whole body has `seconds` to arrive, not each piece of it. A socket
+        timeout bounds one `recv`, so a body that trickles a byte at a time
+        inside that window would never time out; here one deadline is fixed
+        up front and the timeout re-armed with what is left of it before every
+        read, and `read1` takes at most one `recv` per call, so no single call
+        can outlast the deadline either. Raises `TimeoutError` when it passes.
+        """
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0 or content_length > max_bytes:
+            raise ValueError("request exceeds configured size limit")
+        deadline = time.monotonic() + seconds
+        chunks: list[bytes] = []
+        remaining = content_length
+        while remaining:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("the request body did not arrive in time")
+            self.connection.settimeout(left)
+            chunk = self.rfile.read1(min(remaining, OUTPUT_READ_CHUNK_BYTES))
+            if not chunk:
+                raise ConnectionError("the connection closed before the request body was complete")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = json.loads(b"".join(chunks))
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
         return payload
@@ -5633,23 +7011,97 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 body["slack"] = fields
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
+    def handle_one_request(self) -> None:
+        # A peer that resets the connection while its request is being read,
+        # or before an error page is on the wire, is a debug line and a closed
+        # connection, as on the metrics listener; the exception would
+        # otherwise leave the handler and reach the server's error hook. No
+        # audit record is lost: every site logs before its response is
+        # written, and _json guards its own writes.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("request not answered type=%s", type(exc).__name__)
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        # send_response calls this for every response this listener writes --
+        # the 401 an unauthenticated caller gets, the relay's direct writes and
+        # every _json() alike -- so it is the one place the request counter
+        # sees them all. The label is the route family the path falls in,
+        # never the path: the path is caller text. The path is absent when the
+        # request line itself could not be parsed, and that response counts
+        # under LABEL_OTHER like any other unclaimed one.
+        status_code = str(int(code)) if isinstance(code, int) else str(code)
+        self.metrics.record_request(_endpoint_label(getattr(self, "path", "")), status_code)
+        super().log_request(code, size)
+
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler.log_request passes self.requestline through
         # here verbatim, and this runs on every response - including the 401 an
-        # unauthenticated caller gets. A vertical tab in the request line is
-        # enough to end the record and start another, so an unauthenticated
-        # caller could write a whole audit-shaped line of its own. The request
-        # line's own tokenizer stops at whitespace, which limits the shape of
-        # the forgery and does not prevent it.
+        # unauthenticated caller gets. The deployed formatter is JSON and keeps
+        # a vertical tab in the request line inside the one record; the
+        # sanitiser bounds the length, strips the control characters, and
+        # holds for a text formatter a test or a local run installs, under
+        # which that vertical tab would end the record and let an
+        # unauthenticated caller start an audit-shaped line of its own.
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # Not ASCII-escaped: a replacement character standing in for a byte
+        # that was not UTF-8 is three bytes on the wire this way and six as
+        # `�`, and `_bounded_text` sized the text for the former. JSON is
+        # UTF-8 and every caller reads it as such.
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8", errors="replace"
+        )
+        # Written under a deadline: a request's slot is held until its response
+        # is on the wire, and a caller that stops reading must not keep it. A
+        # write that fails is logged rather than raised -- the caller is the
+        # one party that cannot be told.
+        self.connection.settimeout(RESPONSE_WRITE_TIMEOUT_SECONDS)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as exc:
+            LOGGER.warning(
+                "response not delivered status=%d bytes=%d type=%s",
+                int(status),
+                len(body),
+                type(exc).__name__,
+            )
+
+    def _request_slot(self) -> contextlib.AbstractContextManager:
+        """This request's concurrency slot, watched on this connection.
+
+        `serve` always installs a `CommandExecutor`, which has one, and every
+        handler the server builds has a connection. The stand-ins the route
+        tests put in their place predate the slot, as they predate
+        `resolve_git_command` above: an executor without one gets no slot
+        rather than a fault, and a handler without a connection an unwatched
+        wait.
+        """
+        executor = getattr(self, "executor", None)
+        if hasattr(executor, "request_slot"):
+            return executor.request_slot(caller=getattr(self, "connection", None))
+        return contextlib.nullcontext()
+
+    def _busy(self, exc: CommandSlotUnavailable) -> None:
+        """Answer a broker at its concurrency cap, on whichever route asked.
+
+        Not a refusal of what was asked and not a fault: the command past the
+        cap is the one that would take the container over its memory limit.
+        `error` is the key the shim prints, so the agent reads why rather than
+        a bare exit 1, and `code` lets a caller tell "busy, retry" from a
+        failure.
+        """
+        self._json(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
+        )
 
 
 def start_agent_api_proxy() -> ThreadingHTTPServer:
@@ -5669,7 +7121,7 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
+    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
     LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
     return server
 
@@ -5763,6 +7215,12 @@ def serve(args: argparse.Namespace) -> None:
         timeout_seconds=args.timeout_seconds,
         max_output_bytes=args.max_output_bytes,
         state_dir=args.state_dir,
+        kubectl_timeout_seconds=getattr(
+            args, "kubectl_timeout_seconds", DEFAULT_KUBECTL_TIMEOUT_SECONDS
+        ),
+        max_concurrent_commands=getattr(
+            args, "max_concurrent_commands", DEFAULT_MAX_CONCURRENT_COMMANDS
+        ),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
@@ -5851,9 +7309,71 @@ def serve(args: argparse.Namespace) -> None:
             os.umask(previous_umask)
         LOGGER.info("credential proxy listening on unix socket %s", socket_path)
     else:
-        server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)
+        server = ThreadingTCPHTTPServer((args.host, args.port), CredentialProxyHandler)
         LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
+    # Last, once the credentialed server holds its socket: a scrape never sees
+    # a half-configured broker, and a port collision costs the metrics rather
+    # than the commands, whatever the ports are. Exempt from the
+    # reachable-off-pod refusal above on purpose: that rule guards a listener
+    # that hands out credentials, and this one serves counters.
+    metrics_port = int(getattr(args, "metrics_port", 0) or 0)
+    if not metrics_port:
+        raw = os.getenv(METRICS_PORT_ENV)
+        LOGGER.info(
+            "metrics listener disabled: --metrics-port resolved to 0 (%s is %s)",
+            METRICS_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
+        )
+    else:
+        refusal = _metrics_port_refusal(metrics_port, args)
+        if refusal is not None:
+            LOGGER.error(
+                "ALERT %s=%d %s; the broker serves no /metrics until it restarts with "
+                "another, and commands are unaffected",
+                METRICS_PORT_ENV, metrics_port, refusal,
+            )
+        else:
+            start_metrics_listener(args.host, metrics_port)
     server.serve_forever()
+
+
+def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | None:
+    """Why the metrics listener must not open on this port, or None if it may.
+
+    Both are hand-edit cases the operator's managed env never produces, refused
+    by name so the ALERT says what to fix rather than what bind() thought of
+    it. args.port is the operator's credentialProxyPort, set in the broker's
+    managed env, and Envoy's listener carries the same number, held to that
+    constant by OperatorContractTest; so the comparison is against the port
+    that is bound, by this process on the TCP branch or by Envoy in front of
+    the Unix socket. Which of two processes wins a port depends on start
+    order, and the loser must never be the one holding the credentials.
+    """
+    if not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
+        return f"is not a port in {METRICS_PORT_MIN}-{METRICS_PORT_MAX}"
+    if metrics_port == args.port:
+        return f"is the credentialed listener's port {args.port}"
+    return None
+
+
+def _metrics_port_default() -> int:
+    """METRICS_PORT_ENV as an integer, or 0 with an ALERT when it is not one.
+
+    Read eagerly as the flag's default, so this is the one integer variable a
+    hand-edited value must not take the broker down with: the listener is
+    never fatal, and a value it could not have bound costs the metrics alone.
+    """
+    raw = os.getenv(METRICS_PORT_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.error(
+            "ALERT %s=%r is not an integer; the broker serves no /metrics until it "
+            "restarts with a port, and commands are unaffected",
+            METRICS_PORT_ENV, raw,
+        )
+        return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -5872,9 +7392,26 @@ def parse_args() -> argparse.Namespace:
         "--unix-socket", default=os.getenv("CREDENTIAL_PROXY_UNIX_SOCKET", "")
     )
     parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=_metrics_port_default(),
+        help="Port of the metrics-only listener (GET /metrics); 0 or unset opens none",
+    )
+    parser.add_argument(
         "--timeout-seconds",
         type=int,
         default=int(os.getenv("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "300")),
+    )
+    parser.add_argument(
+        "--kubectl-timeout-seconds",
+        type=int,
+        default=int(
+            os.getenv(
+                ENV_KUBECTL_TIMEOUT_SECONDS,
+                str(DEFAULT_KUBECTL_TIMEOUT_SECONDS),
+            )
+        ),
+        help="Timeout in seconds for kubectl execution",
     )
     parser.add_argument(
         "--max-request-bytes",
@@ -5885,6 +7422,14 @@ def parse_args() -> argparse.Namespace:
         "--max-output-bytes",
         type=int,
         default=int(os.getenv("CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", "4194304")),
+    )
+    parser.add_argument(
+        "--max-concurrent-commands",
+        type=int,
+        default=int(
+            os.getenv(ENV_MAX_CONCURRENT_COMMANDS, str(DEFAULT_MAX_CONCURRENT_COMMANDS))
+        ),
+        help="How many requests that run commands may be in flight at once",
     )
     parser.add_argument(
         "--state-dir",
@@ -5900,9 +7445,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_logging(stream: TextIO = sys.stdout) -> None:
+    """One JSON object per line on `stream`, at the level LOG_LEVEL names.
+
+    The audit trail is this container's primary output, and a SIEM behind Cloud
+    Logging reads its fields rather than parsing them out of text
+    (JsonLineFormatter). The GKE log agent reads stdout and stderr alike, so
+    the stream changes nothing for it. A LOG_LEVEL that names no level logs at
+    INFO with a record saying so, rather than leaving a traceback out of
+    basicConfig before any handler exists.
+    """
+    requested = os.getenv(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL).strip().upper() or DEFAULT_LOG_LEVEL
+    level = requested if isinstance(logging.getLevelName(requested), int) else DEFAULT_LOG_LEVEL
+    json_handler = logging.StreamHandler(stream)
+    json_handler.setFormatter(JsonLineFormatter())
+    logging.basicConfig(level=level, handlers=[json_handler], force=True)
+    if level != requested:
+        LOGGER.warning("%s=%r names no log level; logging at %s", LOG_LEVEL_ENV, requested, level)
+
+
+def main(stream: TextIO = sys.stdout) -> int:
+    """Serve, and log a refusal to start as one record.
+
+    Every refusal `serve` makes before it opens a listener -- an unsupported
+    role or authentication mode, a listener reachable off the Pod with no
+    authenticator, a failed bootstrap command -- would otherwise leave the
+    process through the interpreter's default hook as a plain-text traceback
+    on the same container log the JSON records go to, on every restart of a
+    crash-looping broker. Caught here, it is one ERROR record with the
+    traceback inside it, and the exit status still says the start failed.
+    """
+    configure_logging(stream)
+    try:
+        serve(parse_args())
+    except Exception as exc:
+        LOGGER.exception("credential proxy failed to start type=%s", type(exc).__name__)
+        return EXIT_STARTUP_FAILURE
+    return 0
+
+
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    serve(parse_args())
+    sys.exit(main())

@@ -58,11 +58,20 @@ gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
-One provenance note: no build config for the bridge image ships in this repository.
-The image is fork-built for the playground (`FROM` the platform-agent image plus the
-one static binary above) and is not in `images.json` or the release pipeline; it joins
-the release surface at stage-2 graduation or dies before it, whichever the dispatcher
-decides.
+One provenance note: the bridge image is release surface. `a2a/Dockerfile.hermes-bridge`
+builds it (`FROM` the platform-agent image plus the one static binary above), the release
+workflow publishes it as `hermes-bridge` beside the other first-party images, `FROM` the
+platform-agent image the same run pushed under the same commit tag, and `images.json`
+carries it with no operator override, since the operator renders no bridge and the
+sidecar's image is the CR's. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own
+in its `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+platform-agent image that same build produced, by the tag it just pushed and never from a
+registry default; the deploy then declares it on the CR for the eval install
+(`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
+container it shares a pod with are one build. The static `bridge` bus user the next section
+describes is the released mechanism, not scaffolding graduation removes: the password arrives
+as sidecar env from the operator's creds Secret, and it stays a password principal for the
+reason given there.
 
 ## Bus user and grants
 
@@ -91,13 +100,15 @@ is granted.
 
 Note which delete is in that list and which is not: `$JS.API.CONSUMER.DELETE` is granted
 for `KV_runtime-state`, for the watcher, and withheld for TASKS. The bridge calls
-`lib.TasksGet` on every task it dispatches, and a call that finds events creates an ordered
-consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
-`TasksGet` sets on it, which is why the replay costs a consumer slot for the calls of the last
+`lib.TasksGet` on every task it dispatches and `lib.TaskInReplay` on a task a worker is about
+to spawn whose `…in` subject's newest message is neither the submission nor a cancel (the
+cancel look-ahead below; the newest-message read itself is a direct get and opens nothing),
+and a call that finds messages creates an ordered consumer on TASKS; nothing deletes it. It is reaped by the five-second inactive threshold
+both reads set on it, which is why the replay costs a consumer slot for the calls of the last
 five seconds rather than for the last five minutes of them (gke-labs/kube-agents#1739) without
 the bridge needing a destructive verb on TASKS. The slot outlives the call it served: the
 threshold runs from the call returning, not from it starting. A call on a task the retention window no longer holds
-creates no consumer at all -- the horizon read returns `TaskNotFound` before the consumer is
+creates no consumer at all -- the horizon read finds nothing before the consumer is
 created. Either way the call emits no refused publish of its own. One does arrive if the
 ordered consumer resets mid-replay -- a bus reconnect is enough -- because nats.go deletes
 the consumer it replaces: that publish on `$JS.API.CONSUMER.DELETE.TASKS.<name>` is refused,
@@ -178,7 +189,15 @@ returns nothing for entries written after the upgrade.
 Per task: `submitted` on accept (before the consumer ack, so a bridge death before the
 ack just redelivers), `working` when the subprocess spawns, the stdout as a `result`
 artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
-exit is terminal `failed` with the exit code and a stderr tail in the status message. A
+exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
+exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
+and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
+is the last thing the CLI writes before exiting), so the transcript under the profile's session
+store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
+gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
+which the eval harness classes as infrastructure rather than the persona's failure (the image patch
+`apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
+already did). A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it
@@ -200,10 +219,63 @@ is available.
 Honest, never silent. This does not change task state (payload spec assertion 12).
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
-then terminal `canceled`. A task racing to completion may land `completed` first - both
-orders are legal and the terminal event wins. A per-task deadline (default 7200s,
-matching the profile's `activeDeadlineSeconds`) takes the same kill path and lands
-`failed`.
+then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
+land `completed` first - both orders are legal and the terminal event wins. A per-task
+deadline (default 7200s, matching the profile's `activeDeadlineSeconds`) takes the same
+kill path and lands `failed`.
+
+A cancel for a task still queued finalizes it `canceled` with `reason: canceled-before-start`
+and nothing is spawned, and the worker looks for one itself before it spawns. The durable
+delivers serially and acks after the handler, so a cancel already on the task's `…in`
+subject when the bridge binds - the eval harness abandoning a submission nobody took, or any
+cancel inside the stream's retention window - is dispatched only after the submission's
+accept returns, and by then an idle worker, which a freshly bound bridge has, holds the run.
+Between dequeue and spawn the worker therefore reads the task's `…in` subject for a `cancel`
+newer than the submission it holds and, finding one, finalizes `canceled-before-start` and
+spawns nothing. The read is the subject's newest message by direct get (`lib.LastEnvelope`,
+no consumer): a `cancel` there is newer than the submission, and the submission there means
+nothing followed it; only a subject whose newest message is something else, a follow-up
+behind a cancel, is replayed in full (`lib.TaskInReplay`, the one-subject form of the read
+`tasks/get` does on the event subjects, on the same five-second ephemeral). That is what
+keeps a bind over a backlog of abandoned submissions from opening a consumer per task at bus
+speed, and the replay that remains is paced: at most `BRIDGE_CONCURRENCY` of them are in hand
+at once, each held until its ephemeral's five-second threshold has run after it returned, so the
+look-ahead holds that many live consumer slots at most, plus whatever the server has not yet
+reaped at the window's edge. The operator's reserve counts twice the default
+`BRIDGE_CONCURRENCY` of 2 (its tail factor), since the operator leaves the variable unset; a
+bridge started with a higher value, as the eval's sidecar is, can hold more look-ahead consumers
+than the reserve counts. Twice `BRIDGE_CONCURRENCY` is the bound the bridge's own test holds the
+stream to. A run the durable's cancel has already
+ended takes no slot at all. `working` is published only after that read, so a cancelled
+run never shows it. It is
+a read, not a consume: the durable still delivers the cancel to the handler afterwards, and
+it does nothing - the run is normally gone from the bridge's table by then, so the cancel
+takes the orphan path, which reads the newest event the same consumer-free way, finds the
+terminal and acks with a warning like any other in-traffic for a finished task; in the window
+before finalize drops the run it finds it final and returns, finalize being idempotent. A read
+that fails, a bus error or its 10s bound, is logged and the run spawns
+anyway; the cancel still arrives on the durable and kills it, the bound the bridge always
+had, where a read failure that dropped the task would leave it open with no terminal event.
+
+## Sizing against the eval harness
+
+This section is the canonical statement of the sizing; the eval transport design
+([`eval-next-transport.md`](../../docs/designs/eval-next-transport.md), stage 1) summarises it.
+An eval install that declares the bridge sidecar runs it against the presubmit's fan-out, and
+two numbers bound what it can take. `BRIDGE_CONCURRENCY` (default 2, the cap above) is the worker
+count: a task past it is accepted and `submitted` and then queued with no subprocess until a
+worker frees, and the harness classifies a repetition that reaches its budget still
+`submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
+answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
+default 4, the nightly at 8, so the sidecar declares `BRIDGE_CONCURRENCY` at or above that
+value; at the defaults two of every four concurrent units wait for as long as the two ahead of
+them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
+and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also
+infrastructure in the harness's classification. Size the parallelism against both: concurrency
+at or above the parallelism, and the number of submissions a run can have outstanding at once,
+the units in flight plus anything abandoned and not yet cancelled, well under the queue
+capacity. `hack/ci-deploy.sh` declares that sidecar under `EVAL_MODE_NEXT=1` and sets
+`BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`.
 
 ## Supervision
 
@@ -259,8 +331,14 @@ dispatcher, not to scaffolding with a demolition date.
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
 path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
 dispatcher's job when it exists), no heartbeats on `agents.hb.>`, a submission whose
-events lookup fails transiently is dropped with a log line rather than redelivered (the
-lib acks unconditionally after the handler; a nak path is a lib delta if it ever bites),
+events lookup keeps failing is dropped with a log line rather than redelivered (a new
+submission's lookup is answered by the direct horizon gets and opens no consumer, so it gets
+one quick retry for a bus hiccup; an orphan cancel's lookup opens the consumer and can be
+refused at the TASKS cap, so a failure from before the consumer existed is retried over six
+seconds, past the inactive threshold the refusal clears on, and a failure from after it is not,
+since that consumer is live and another attempt would open another; the lib acks
+unconditionally after the handler, so a lookup a shutdown interrupts is also dropped, and a nak
+path is a lib delta if a persistent failure ever bites),
 and a terminal publish that fails outright - a bus outage outlasting the finalize
 budget at exactly that moment - leaves the task in the registry for the NEXT
 incarnation's sweep, which may be far away on a healthy sidecar; until then the bridge

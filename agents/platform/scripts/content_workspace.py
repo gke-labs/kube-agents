@@ -57,10 +57,12 @@ from __future__ import annotations
 
 import base64
 import bisect
+import contextlib
 import logging
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
@@ -86,6 +88,20 @@ DEFAULT_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_CLONE_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_WORKSPACES = 8
 DEFAULT_MAX_ENTRIES = 256
+
+# How long a workspace may sit untouched before `open` reclaims it. The list
+# above is in memory and only `close` ever shortens it, so a worker killed
+# mid-run leaves its entry until the pod restarts; eight of those and every
+# later `open` on the install is refused. Thirty minutes is longer than any
+# verb-to-verb gap a live run has and far shorter than the job that has to
+# survive the outage.
+DEFAULT_WORKSPACE_IDLE_SECONDS = 1800
+# What a caller may label its workspace with: a card or session id, so a full
+# store can be read back to who filled it. The label lands in a log line, so
+# it is a token, never free text.
+CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
+# Enough of a handle to match a log line to a tree on disk, not enough to use it.
+HANDLE_LOG_PREFIX = 8
 
 # Ceilings on a search rather than on a tree. A pattern that matches every line
 # of a vendored directory produces an answer that travels over the socket and
@@ -223,6 +239,13 @@ def max_clone_bytes() -> int:
 
 def max_workspaces() -> int:
     return _limit("CREDENTIAL_PROXY_MAX_WORKSPACES", DEFAULT_MAX_WORKSPACES)
+
+
+def workspace_idle_seconds() -> int:
+    # Through `_limit`, so a zero or negative value means the default rather
+    # than "never reclaim": there is no configuration under which the store
+    # should go back to filling up for good.
+    return _limit("CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS", DEFAULT_WORKSPACE_IDLE_SECONDS)
 
 
 def max_matches() -> int:
@@ -573,6 +596,23 @@ class Workspace:
     # its own -- a managed repository on the ambient credential, or a public
     # one on none -- and never anything a response reports.
     credential: object | None = None
+    # Who opened it, as the caller labelled itself, and when it was opened and
+    # last resolved through `get`, on the store's clock. These are what the
+    # reclaim reads and what the log names when the store is full.
+    caller: str = ""
+    opened_at: float = 0.0
+    last_used: float = 0.0
+
+
+def check_caller_label(value: object) -> str:
+    """The label a caller may attach to its workspace, or "" for none."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str) or not CALLER_LABEL_RE.match(value):
+        raise ContentWorkspaceError(
+            "caller must be a short token of letters, digits, '.', '_', ':' or '-'"
+        )
+    return value
 
 
 GitRunner = Callable[..., object]
@@ -606,6 +646,7 @@ class ContentWorkspaceStore:
         runner: GitRunner,
         base_branch: str = "",
         credential_for: CredentialFor | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -634,6 +675,8 @@ class ContentWorkspaceStore:
             or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
         )
         self._credential_for = credential_for
+        # Monotonic, and injected so a test can drive the idle clock.
+        self._clock = clock
         self._workspaces: dict[str, Workspace] = {}
         # One lock, held across the whole of every public verb.
         #
@@ -662,11 +705,116 @@ class ContentWorkspaceStore:
         # gone. Note that `max_workspaces` advertises a concurrency this
         # forbids: eight may be open, one may be doing anything.
         #
+        # The workspace routes take none of the broker's per-request
+        # concurrency slots (`CommandExecutor.request_slot`): this lock already
+        # serialises them, so they cannot multiply, and a wait for a slot while
+        # holding the lock would stall every verb behind it -- reads that need
+        # no subprocess included -- for the whole of the wait. So the timeout
+        # above really is the bound.
+        #
         # Still the right trade for a single agent Pod publishing one pull
         # request at a time, and a per-workspace lock would still need this one
         # to guard the dict it lives in. Worth revisiting the day a caller has
         # a reason to run two workspaces at once, which nothing does today.
         self._lock = threading.RLock()
+        # Handles with a verb queued behind `_lock`, counted. A verb announces
+        # its handle here before it waits, so a reclaim that wins the lock
+        # first does not read the wait as idleness: the lock is held across
+        # clones and pushes for minutes, and `last_used` cannot advance until
+        # the verb gets in. Its own lock, because the announcement has to
+        # land before `_lock` is taken.
+        self._waiting: dict[str, int] = {}
+        self._waiting_lock = threading.Lock()
+        self._sweep_orphans()
+
+    @contextlib.contextmanager
+    def _announced(self, handle: object):
+        """Count `handle` as waited on for the duration of the block."""
+        key = handle if isinstance(handle, str) else ""
+        with self._waiting_lock:
+            self._waiting[key] = self._waiting.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            with self._waiting_lock:
+                if self._waiting.get(key, 0) <= 1:
+                    self._waiting.pop(key, None)
+                else:
+                    self._waiting[key] -= 1
+
+    @contextlib.contextmanager
+    def _use(self, handle: object):
+        """Resolve `handle` under the lock, announced for the whole verb.
+
+        `get` announces its own wait, so a bare `get` (the broker's
+        managed-repository gate on `commit` and `push`) is covered too; this
+        keeps the announcement up across the verb that follows.
+        """
+        with self._announced(handle):
+            with self._lock:
+                yield self.get(handle)
+
+    def _sweep_orphans(self) -> None:
+        """Remove every tree a previous process minted. Called once, at construction.
+
+        The list of workspaces is memory-only, so after a restart nothing on
+        disk is reachable by any handle: every tree the previous process left
+        is a leak, and it stays one for the life of the emptyDir otherwise.
+        Only handle-named directories, which are the ones this store creates;
+        anything else under the root is not its to remove.
+        """
+        found = [
+            path
+            for path in self.tree_root.iterdir()
+            if path.is_dir() and not path.is_symlink() and _HANDLE_RE.match(path.name)
+        ]
+        if not found:
+            return
+        removed = left = 0
+        for path in found:
+            survivors = _remove_tree(path)
+            left += survivors
+            removed += survivors == 0
+        LOGGER.info(
+            "content workspace start: removed %d of %d orphaned tree(s), %d entries could not be removed",
+            removed,
+            len(found),
+            left,
+        )
+
+    def _describe(self, workspace: Workspace, now: float) -> str:
+        return (
+            f"handle={workspace.handle[:HANDLE_LOG_PREFIX]} repo={workspace.repo} "
+            f"caller={workspace.caller or '-'} "
+            f"age={int(now - workspace.opened_at)}s idle={int(now - workspace.last_used)}s"
+        )
+
+    def _reclaim_idle(self) -> set[str]:
+        """Drop every workspace idle for the limit or longer. Lock held by the caller.
+
+        Returns the handles that were skipped because a verb is queued on
+        them, so the refusal that may follow does not quote one as reclaimable.
+
+        The tree is removed under the lock, as `close` removes it: every verb
+        holds this one lock across its whole run, so an entry that is still in
+        the dict when the lock is taken is not mid-verb, and once popped no verb
+        can find it.
+        """
+        now = self._clock()
+        limit = workspace_idle_seconds()
+        with self._waiting_lock:
+            waiting = set(self._waiting)
+        for workspace in list(self._workspaces.values()):
+            if now - workspace.last_used < limit or workspace.handle in waiting:
+                continue
+            self._workspaces.pop(workspace.handle, None)
+            LOGGER.warning(
+                "content workspace reclaimed after %ds idle: %s",
+                limit,
+                self._describe(workspace, now),
+            )
+            _remove_tree(workspace.tree.parent)
+        return waiting
 
     # -- git -------------------------------------------------------------
 
@@ -791,8 +939,13 @@ class ContentWorkspaceStore:
         base: str | None = None,
         branch: str | None = None,
         depth: int | None = None,
+        caller: str | None = None,
     ) -> Workspace:
         """Clone `repo` into a fresh tree and return its handle.
+
+        `caller` is a label for the log, a card or session id, so that a full
+        store can be read back to who filled it. It is not an identity: the
+        broker still cannot tell two sessions apart, and nothing checks it.
 
         `branch` names the branch this session will commit to, when the caller
         already knows it. It decides what `read` and `list` answer with: a
@@ -829,11 +982,38 @@ class ContentWorkspaceStore:
         # symmetric, and one day a caller will thread it somewhere unprefixed.
         if base is not None:
             base = check_branch_name(base)
+        caller = check_caller_label(caller)
         with self._lock:
+            # Reclaim before counting: the entries a dead worker left are what
+            # the cap would otherwise count against this caller.
+            queued = self._reclaim_idle()
             if len(self._workspaces) >= max_workspaces():
+                now = self._clock()
+                for held in self._workspaces.values():
+                    LOGGER.warning(
+                        "content workspace store full, holding: %s%s",
+                        self._describe(held, now),
+                        " (a verb is queued on it)" if held.handle in queued else "",
+                    )
+                # The holder idle longest is the slot that frees first, so that
+                # is the number a caller times its retry from. One with a verb
+                # queued on it is about to be stamped fresh, not freed, so it
+                # does not count.
+                idle = [
+                    now - held.last_used
+                    for held in self._workspaces.values()
+                    if held.handle not in queued
+                ]
+                soonest = (
+                    f"the least recently used has been idle {int(max(idle))}s"
+                    if idle
+                    else "every one is in use right now"
+                )
                 raise TooLarge(
                     f"{len(self._workspaces)} workspaces are already open, which is "
-                    f"the limit of {max_workspaces()}; close one before opening another"
+                    f"the limit of {max_workspaces()}; one is reclaimed once it has "
+                    f"been idle for {workspace_idle_seconds()}s ({soonest}), so retry "
+                    "later rather than closing a workspace you did not open"
                 )
             handle = os.urandom(16).hex()
             tree = self.tree_root / handle
@@ -881,6 +1061,7 @@ class ContentWorkspaceStore:
                     base_sha="",
                     shallow=depth is not None,
                     credential=credential,
+                    caller=caller,
                 )
                 workspace.default_branch = self._default_branch(workspace)
                 workspace.base = base or workspace.default_branch
@@ -901,6 +1082,9 @@ class ContentWorkspaceStore:
             except BaseException:
                 _remove_tree(tree)
                 raise
+            # Stamped after the clone, so a slow clone does not eat into the
+            # idle allowance of the workspace it produced.
+            workspace.opened_at = workspace.last_used = self._clock()
             self._workspaces[handle] = workspace
             return workspace
 
@@ -944,15 +1128,21 @@ class ContentWorkspaceStore:
     def get(self, handle: object) -> Workspace:
         if not isinstance(handle, str) or not _HANDLE_RE.match(handle):
             raise NoSuchHandle("handle is not a workspace handle")
-        with self._lock:
+        # Announced while it waits for the lock: a caller queued behind
+        # another's clone or push is not idle, and a reclaim that wins the
+        # lock first must not read it that way.
+        with self._announced(handle), self._lock:
             workspace = self._workspaces.get(handle)
+            # Every verb resolves its handle here, so this one stamp is what
+            # "idle" means: time since the caller last named the workspace.
+            if workspace is not None:
+                workspace.last_used = self._clock()
         if workspace is None:
             raise NoSuchHandle("no such workspace; open one first")
         return workspace
 
     def close(self, handle: str) -> None:
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             self._workspaces.pop(workspace.handle, None)
             _remove_tree(workspace.tree.parent)
 
@@ -960,8 +1150,7 @@ class ContentWorkspaceStore:
 
     def read(self, handle: str, path: str) -> bytes:
         """The content of one file in the checkout. A read returns bytes, never a path."""
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             relative = repo_relative(path)
             target = _no_symlink_on_the_way(workspace.tree, relative)
             if not target.is_file():
@@ -999,8 +1188,7 @@ class ContentWorkspaceStore:
                 f"{len(paths)} paths is over the {max_entries()}-path limit for "
                 "one request"
             )
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             wanted = [repo_relative(entry) for entry in paths]
             files: list[dict] = []
             skipped: list[dict] = []
@@ -1065,8 +1253,7 @@ class ContentWorkspaceStore:
         complete — a caller that cannot tell the difference goes on to `read`
         paths it invented.
         """
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             under = repo_relative(prefix).parts if prefix else ()
             cursor = str(repo_relative(after)) if after else ""
             names: list[str] = []
@@ -1132,8 +1319,7 @@ class ContentWorkspaceStore:
             raise ContentWorkspaceError(
                 "pattern must not contain control characters"
             )
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             # -I skips binary files, -n numbers the lines, -z puts a NUL after
             # the name so a file whose name carries a colon cannot be misread.
             argv = ["grep", "--no-color", "-I", "-n", "-z"]
@@ -1190,8 +1376,7 @@ class ContentWorkspaceStore:
         expected_branch_sha: str | None = None,
     ) -> dict:
         """Apply the payload on a fresh branch off the base, and commit it."""
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             if workspace.shallow:
                 # Refused here rather than left to fail at `push`. A shallow
                 # clone has no merge base with the remote branch, so the push
@@ -1399,8 +1584,7 @@ class ContentWorkspaceStore:
         the remote-tracking ref onto whatever landed in the meantime and the
         lease then compares that value against itself.
         """
-        with self._lock:
-            workspace = self.get(handle)
+        with self._use(handle) as workspace:
             branch = check_branch(branch, base_branch=self.base_branch)
             norm_branch = branch.strip()
             if norm_branch.startswith("refs/heads/"):
@@ -1475,7 +1659,14 @@ def is_owner_name(value: str) -> bool:
     return all(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", part) and part not in (".", "..") for part in parts)
 
 
-def _remove_tree(path: Path) -> None:
+def _remove_tree(path: Path) -> int:
+    """Remove `path` and everything under it. Returns how many entries survived.
+
+    Counted and logged rather than swallowed: a tree that will not delete is
+    disk the cap no longer accounts for, and silently it is the leak this
+    module exists to close.
+    """
+    left = 0
     for entry in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
         try:
             if entry.is_dir() and not entry.is_symlink():
@@ -1483,8 +1674,15 @@ def _remove_tree(path: Path) -> None:
             else:
                 entry.unlink()
         except OSError:
-            pass
+            left += 1
     try:
         path.rmdir()
     except OSError:
-        pass
+        left += 1
+    if left:
+        LOGGER.warning(
+            "content workspace tree %s: %d entries could not be removed",
+            path.name[:HANDLE_LOG_PREFIX],
+            left,
+        )
+    return left

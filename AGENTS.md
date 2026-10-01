@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations. It utilizes a Platform Agent to transition from reactive manual management to proactive, intent-driven operations.
+This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a collection of agent configurations, personas, and skills designed to manage Kubernetes/GKE operations.
 
 ## Repository Layout
 
@@ -15,7 +15,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
-- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
+- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
@@ -34,7 +34,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in eleven places here, with different runners and different answers to "does this catch a
+Tests live in many places, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -61,12 +61,12 @@ did not expect, or nowhere at all, and the suite reports green around it.
 - **Yes, and it is the release gate** — `tests/e2e/`, which the release-candidate pipeline runs on a
   schedule. Adding to it holds up releases rather than pull requests.
 
-One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
+One rule holds wherever it lands: a new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
 suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
 deliberately; its README says why.
 
-The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
@@ -164,6 +164,9 @@ Layout). Read the file that covers what you are writing before you write it.
   literal is the expected value.
   [`.agents/rules/core_engineering.md`](.agents/rules/core_engineering.md) gives the form per
   language and why no linter enforces it yet.
+- **Name it for what it holds.** CodeQL reads `secret` or `trusted` in a name as a credential: a
+  directory so named is a false alert, a real key under a bland name a missed one.
+  [`.agents/rules/core_engineering.md`](.agents/rules/core_engineering.md) has the word lists.
 
 ## Documentation Guidelines
 
@@ -245,14 +248,13 @@ Agents with a user in the loop follow this file.
   comment** (`uses: actions/checkout@3d3c42e… # v7.0.1`), and **guard automatically-triggered
   credentialed workflows against forks** with `if: github.repository == 'gke-labs/kube-agents'` on
   every job. A mutable tag lets a retagged release change what CI runs; an unguarded job fails on
-  every fork sync and mails the fork owner. No check in this repository blocks either one, and
-  both have exemptions — local reusable workflows need no pin, a `workflow_call`- or
-  `workflow_dispatch`-only workflow needs no guard, and `docs-deploy.yml` is unguarded on purpose
-  so a fork can publish its own Pages site. Open
+  every fork sync and mails the fork owner. No check in this repository blocks either one; the
+  exemptions are in the rule file. Open
   [`.agents/rules/github_actions.md`](.agents/rules/github_actions.md) whenever you touch a
   `uses:` line or a workflow trigger.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
+  A bug fix must name what stops it recurring.
 - **AI Agent Attribution & Commit Authorship:**
   - Do not add AI agents as git commit co-authors or include `Co-Authored-By:` trailers in commit messages.
   - Note AI assistance in the PR description (e.g. `Generated with the help of <Agent/Model>.`).
@@ -342,8 +344,8 @@ Agents with a user in the loop follow this file.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
   on changed Markdown and YAML, `make shellcheck` on changed shell scripts, a local Docker build of
   the agent runner, the image-layer budget if you added a `RUN` or `COPY` to
-  `deploy/docker/Dockerfile`, and `go build` inside whichever Go module you touched
-  (`k8s-operator/`, `a2a/`).
+  `deploy/docker/Dockerfile`, `go build` inside whichever Go module you touched
+  (`k8s-operator/`, `a2a/`), and `make terraform-test` on a changed Terraform module.
   Each has a constraint that costs a CI run to rediscover — the pinned prettier version, the
   mandatory `--platform linux/amd64`, the layer ceiling that only fails after merge. The
   commands and those reasons are in
@@ -441,8 +443,7 @@ Pushing fixes is also what makes the pull request body stale. Fixes that answer 
 live test you re-ran to confirm them, belong in **Self-Review** and **Live validation** — folded
 into what is already there, per "Keep these sections current, not chronological" above. Do it once
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
-review brings fresh findings, and folding them in twice is the same wasted round. Nothing else in
-this workflow reopens the body.
+review brings fresh findings, and folding them in twice is the same wasted round.
 
 **Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
 merge and keeps the change counted as its author's outstanding work; what belongs here is the

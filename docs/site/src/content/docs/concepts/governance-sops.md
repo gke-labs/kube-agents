@@ -11,29 +11,29 @@ The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kub
 
 ## The nine audit SOPs
 
-Nine SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states its exact command, its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
+Nine SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchdogs/). They share one shape: enumerate the fleet, run read-only checks, write a validated findings file, and hand it to the [`fleet-audit`](/kube-agents/skills/) skill, which owns the stream's ledger issue and any remediation pull requests it spawns. Each check in each SOP states how it is read — its exact command, or the collector script that runs it — its flag-when predicate, an explicit **do NOT flag** list, a severity, an impact sentence, a recommendation, and a remediation kind — so a finding is either reproducible or it is dropped.
 
 ### `compliance_audit_sop.md`
 
-Security & RBAC posture, daily. Eleven checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, and Pod Security `restricted` gaps.
+Security & RBAC posture, daily. Sixteen checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, Pod Security `restricted` gaps, stalled Config Connector objects, image references that name no specific bytes, tokens mounted for ServiceAccounts nothing has granted, LoadBalancer Services publishing a management port to the internet, and bindings whose subject is everyone.
 
 Invoked by the `compliance-audit` watchdog.
 
 ### `obtainability_audit_sop.md`
 
-Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Eleven checks over workload **templates** (not live Pods): missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking PDBs, unscaled and unscalable Deployments, hostname and single-zone pinning, missing spreading, missing readiness and liveness probes, and single-replica Service-backed Deployments.
+Workload reliability, daily — the question "which workloads break when I upgrade a node pool, and which ones cannot scale?" Twenty-three checks, over workload **templates** (not live Pods) and the Services, CronJobs, autoscalers and volumes around them: missing requests and memory limits, multi-replica workloads with no PodDisruptionBudget, drain-blocking and overlapping PDBs, unscaled and unscalable Deployments, autoscalers allowed to reach one replica, hostname and single-zone pinning, missing and unachieved spreading, missing readiness and liveness probes and liveness probes that fire first, single-replica Service-backed Deployments, rollouts and update strategies that drop traffic, `preStop` hooks the grace period cuts short, Services that select no pod or name a port no container declares, CronJobs that never succeed or pile up, and single-node volumes claimed from two nodes.
 
 Invoked by the `obtainability-audit` watchdog. The cron id predates the rename.
 
 ### `security_patch_orchestrator_sop.md`
 
-Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against `gcloud container get-server-config` for each cluster's release channel, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
+Upgrade & patch readiness, weekly. Control-plane and node-pool versions compared against every version `gcloud container get-server-config` still offers at the cluster's location, and against its release channel's default, node skew against GKE's two-minor ceiling, fleet-wide minor spread, clusters on no release channel, `autoUpgrade`/`autoRepair` off, missing maintenance windows, upgrade-blocking maintenance exclusions, deprecated node image variants, and absent upgrade notifications.
 
 The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: there is no vulnerability feed in this environment, so every finding is version currency or upgrade-policy hygiene. Invoked by the `security-patch-orchestrator` watchdog.
 
 ### `fleet_wide_cost_analysis_sop.md`
 
-Fleet waste, weekly. Over-requested workloads (three `kubectl top` samples that must all agree), orphaned PersistentVolumes, unconsumed PVCs, unattached Compute Engine disks, idle reserved IPs, orphaned load-balancer resources, under-allocated node pools, the scale-down blockers pinning them, terminal-pod accumulation, and idle namespaces still holding billable objects.
+Fleet waste, weekly. Fourteen checks, run by a collector script the agent starts: over-requested, under-requested, unsized and idle workloads, judged against a week of Cloud Monitoring usage; orphaned PersistentVolumes, unconsumed PVCs, unattached Compute Engine disks, idle reserved IPs, orphaned load-balancer resources, under-allocated node pools, the scale-down blockers pinning them, terminal-pod accumulation, idle namespaces still holding billable objects, and Artifact Registry repositories with no cleanup policy.
 
 Findings are reported in **resource units — GiB, vCPU, node and object counts — never dollars.** There is no billing export to price against, and the SOP treats a fabricated figure as worse than no figure. No remediation it emits may delete a PV, PVC, namespace, disk, snapshot, or address. Invoked by the `fleet-wide-cost-analysis` watchdog.
 
@@ -51,7 +51,7 @@ Invoked by the `stockout-prevention` watchdog.
 
 ### `ai_security_audit_sop.md`
 
-AI workload security, daily — "who can reach my models, what can rewrite them, and where did their weights come from?" Six checks over the workloads a two-pronged discriminator identifies as AI workloads (a container image naming a known inference runtime, **or** a container requesting an `nvidia.com/gpu` / `google.com/tpu`): inference endpoints on external LoadBalancers, model repositories trusted to execute their own code (`--trust-remote-code`), model weights mounted writable by the serving process, model artifacts pulled from an unpinned source, model-registry credentials in plaintext environment variables, and model-server images on floating tags.
+AI workload security, daily — "who can reach my models, what can rewrite them, and where did their weights come from?" Six checks over the workloads a three-pronged discriminator identifies as AI workloads (a container image naming a known inference runtime, a container requesting an `nvidia.com/gpu` / `google.com/tpu`, **or** a container declaring a named model-provider credential such as `OPENAI_API_KEY` or `HF_TOKEN`): inference endpoints on external LoadBalancers, model repositories trusted to execute their own code (`--trust-remote-code`), model weights mounted writable by the serving process, model artifacts pulled from an unpinned source, model-registry credentials in plaintext environment variables, and model-server images on floating tags.
 
 It deliberately does **not** evaluate the model. Prompt-injection resistance, jailbreak susceptibility, output filtering, and training-data provenance are real AI risks that no `kubectl` read can decide, and the SOP treats an unfalsifiable finding in a public issue as worse than no finding. It also stays off the generic container-hardening surface — privileged containers, host namespaces, RBAC, NetworkPolicy, and Workload Identity on AI workloads all belong to `compliance_audit_sop.md`, which already audits them there, so one object never carries two verdicts in two ledgers. Invoked by the `ai-security-audit` watchdog.
 

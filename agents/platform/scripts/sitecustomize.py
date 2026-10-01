@@ -86,13 +86,26 @@ class PatchOnImport:
     def find_spec(self, fullname, path=None, target=None):
         if self._fired or fullname != TRIGGER_MODULE:
             return None
-        # Latch before recursing, so the nested lookup below falls through to
-        # the real finders instead of back into this one.
         self._fired = True
 
-        import importlib.util
-
-        spec = importlib.util.find_spec(fullname)
+        # Python calls a finder with the global import lock held, so nothing
+        # here may import. ``importlib.util.find_spec`` does: it imports the
+        # parent package to read its ``__path__``, and when another thread is
+        # inside that package's ``__init__`` the two wait on each other for
+        # good -- every kanban worker's plugin-discovery thread met the main
+        # thread's ``gateway`` import exactly there. The import system already
+        # passed the parent's ``__path__`` in as ``path``; hand the question
+        # to the remaining finders with it and import nothing.
+        spec = None
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            spec = find(fullname, path, target)
+            if spec is not None:
+                break
         if spec is None or spec.loader is None:
             return spec
 
@@ -100,9 +113,16 @@ class PatchOnImport:
         module_names = self._module_names
 
         def exec_and_patch(module):
-            exec_module(module)
-            for module_name in module_names:
-                _install(module_name)
+            try:
+                exec_module(module)
+                for module_name in module_names:
+                    _install(module_name)
+            except BaseException:
+                # A failed load leaves nothing in ``sys.modules``, so the next
+                # import of the trigger executes a fresh registry. Re-arm for
+                # it; staying latched would let that one load unpatched.
+                self._fired = False
+                raise
 
         spec.loader.exec_module = exec_and_patch
         return spec

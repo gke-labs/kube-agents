@@ -79,7 +79,11 @@ in UTC so it agrees with the clock the scheduler ticked on.
 Every number comes from one table: `intercepted_events` in `session_kv.db`
 (`/var/lib/kube-agents/session/session_kv.db`), written by the `session_kv_server.py` REST bridge on
 port 8699. It holds one row per event the watcher forwarded, with `notified` recording whether that
-event was announced in chat. [`../docs/session_management.md`](../docs/session_management.md) is
+event was announced in chat. It has a second writer — the drift detector's `gitops-drift` injects
+land in the same table under `reason = 'OutOfBandChange'` — and the generator excludes those rows
+before it counts anything, so every number below is still the watcher's alone. That exclusion is
+load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
+drift record is not an event the watcher forwarded. [`../docs/session_management.md`](../docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage

@@ -1,16 +1,17 @@
 # The third-party imports the modules under `make test-python` actually need.
 # The admin console keeps its application and test dependencies in its own
 # requirements file; the remaining packages below are what the agent scripts
-# import at module scope, so without them the test modules that import those
-# scripts fail to load at all. Everything else in the suite is stdlib unittest.
+# and the image build's checks import at module scope, so without them the test
+# modules that import those scripts fail to load at all. Everything else in the
+# suite is stdlib unittest.
 #
 # This file is the single source of truth for the list. Every installer reads
-# it -- `make test-python-deps` locally, and in CI both
-# .github/workflows/python-tests.yml, which pins its Python, and
-# .github/workflows/k8s-operator-test.yml, which takes the runner's default --
-# because a hand-copied second list is how they drift into a suite that passes
-# on a runner and cannot be run on a laptop. No other workflow installs this
-# file; the ones on other Python versions install pyyaml or
+# it -- `make test-python-deps` locally and, in CI, both sweep jobs of
+# .github/workflows/python-tests.yml, the required one on .python-version and
+# the agent-image one on .agent-python-version -- because a hand-copied second
+# list is how they drift into a suite that passes on a runner and cannot be run
+# on a laptop. No other workflow installs this file: the operator's own Python
+# test imports nothing third-party, and the rest install pyyaml or
 # tests/e2e/requirements.txt, neither of which pulls in anything below.
 #
 # Deliberately unpinned apart from the one constraint that matters. These stand
@@ -21,9 +22,10 @@
 # For mcp that stand-in is checked rather than assumed, and it holds on the
 # major line only: the floor below keeps this file on the same 2.x line as
 # the image, which is what `mcp.server.MCPServer` needs and all it needs. The
-# patch versions differ and nothing makes the two environments identical -- CI
-# runs Python 3.12, the image 3.13 -- so a failure that turns on a patch
-# release or an interpreter version will not reproduce from this file.
+# patch versions differ and nothing makes the two environments identical: the
+# required job runs Python 3.12 and the agent-image job the image's 3.13 line,
+# so an interpreter-version failure reproduces there, but a failure that turns
+# on a patch release of mcp or of Python itself still will not.
 #
 # If the install fails with "No matching distribution found for mcp>=2.2.0", pip is
 # pointed at a mirror that does not carry it -- check `pip config debug`. The
@@ -64,6 +66,12 @@ mcp>=2.2.0
 
 python-dotenv
 pyyaml
+
+# deploy/docker/check_skill_commands.py and tests/test_skill_inline_commands.py
+# parse SKILL.md with markdown-it-py.
+# The image build runs it under /opt/hermes/.venv, which gets the package from
+# hermes-agent through rich; nothing above pulls it in.
+markdown-it-py
 
 # `make coverage`, which the CI `test` job runs. coverage runs the unittest suite
 # under measurement; diff-cover reads the resulting coverage.xml plus the

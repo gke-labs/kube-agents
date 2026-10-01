@@ -7,10 +7,11 @@ paths:
 
 # Pre-PR review mechanics
 
-[`AGENTS.md`](../../AGENTS.md) owns both rules below — that adversarial self-review and live
-validation are required before opening a pull request, and that each is recorded in the pull
-request body. This file holds the mechanics of carrying them out, and what the automated review
-shares with the first of them. Change the rule in `AGENTS.md`; change how it is done here.
+[`AGENTS.md`](../../AGENTS.md) owns the rules below — that adversarial self-review and live
+validation are required before opening a pull request, that each is recorded in the pull request
+body, and that a bug fix must name what stops it recurring. This file holds the mechanics of
+carrying them out, and what the automated review shares with the self-review. Change those rules
+in `AGENTS.md`; change how they are done here.
 
 ## Adversarial self-review
 
@@ -98,3 +99,30 @@ in `AGENTS.md` under Pull Request Hygiene.
 - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
   that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
   section is not an answer.
+
+## Preventing recurrence on a bug fix
+
+The rule is in `AGENTS.md` under Pull Request Hygiene. Which pull requests it covers, and what
+the template's section owes, are here.
+
+A pull request that fixes a bug — every `fix` type, scoped or not, and any other that repairs a
+defect — fills in the template's **Bug Fix: Preventing Recurrence** section. Any other pull
+request writes "Not a bug fix." there. The section answers three questions:
+
+- **Why it shipped.** The test, check, or review step that should have caught the bug, and why it
+  did not.
+- **What catches it now.** The test, eval case, or check that fails if the bug comes back, and
+  that fails without the fix — seen by you, or on record for an `expected_fail` case this change
+  flips ([`eval_driven_development.md`](eval_driven_development.md), "When the fix is not
+  yours"). It need not be new: an existing eval case run red against `main` counts. A case already
+  named under **Live validation** is cited by name, not repeated. "Added a test" without naming it
+  is not an answer.
+- **Where else it lives.** Other places the same mistake could be, and whether you checked them or
+  the guard covers them.
+
+When nothing automated can catch the bug, say why and what stands in for it.
+
+A reviewer holds the section to the tree: the guard it names exists at the head, reaches the path
+the bug took, and fails with the fix reverted. A reviewer without a shell, the automated one
+included, reasons about the last of these and says it did not run it. A `fix` whose section is
+empty or answered "Not a bug fix" is a finding.

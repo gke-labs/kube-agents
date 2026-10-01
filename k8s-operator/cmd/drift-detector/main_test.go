@@ -99,7 +99,7 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	}
 	// nil getter: this test is about the flags reaching the classifier, and a
 	// nil getter keeps the join from being the thing under test.
-	filter, _ := newFilterFromFlags(f, nil)
+	filter, _ := newFilterFromFlags(f, nil, logDriftEvent)
 
 	if !filter.logDropped {
 		t.Error("logDropped did not reach the filter")
@@ -158,7 +158,7 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 	// takes rather than a shortcut around buildClusterSet.
 	stub := &stubGetter{obj: managedFieldsObject()}
 	clusters := buildClusterSet(stub, directClusterIdentity(f), nil)
-	filter, join := newFilterFromFlags(f, clusters)
+	filter, join := newFilterFromFlags(f, clusters, logDriftEvent)
 
 	if got := join.Clusters(); got != 1 {
 		t.Errorf("joiner.Clusters() = %d, want 1 -- the getter did not reach the joiner", got)

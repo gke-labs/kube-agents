@@ -10,9 +10,11 @@
 #
 # A task claims a domain with a top-level `domain: <slug>` field in its
 # task.yaml. It counts as covering the domain only when it also carries a
-# non-empty verification_spec AND is an entry in hack/eval/presubmit-cases.txt.
-# Covered means running on every pull request: a nightly-only task leaves its
-# domain uncovered until its line moves to the presubmit file.
+# non-empty verification_spec AND is a name on hack/eval/blocking-roster.txt.
+# Covered means able to red every pull request: a nightly-only task, or a
+# presubmit seat held out of the roster (the exception section in
+# hack/eval/presubmit-cases.txt), leaves its domain uncovered until its
+# roster line lands.
 #
 # `allowlist` names the domains that are known-uncovered today. Delete entries
 # as Phase 2 ACTIVATES scenarios; the lint refuses both an uncovered domain that
@@ -27,10 +29,12 @@
 # So in presubmit each audit domain is covered by a PROBE -- a targeted
 # question about that domain's planted defect, answered from observed
 # evidence and graded on the reply -- while the audit-SOP machinery itself
-# (dispatch, delegation, token minter, ledger write) is exercised end to end
-# by exactly one audit kept as a canary, under the `fleet-audits` domain.
-# The full audit scenarios run in the nightly tier (hack/eval/nightly-cases.txt);
-# only an entry in hack/eval/presubmit-cases.txt counts as coverage.
+# (dispatch, delegation, token minter, ledger write) was exercised end to end
+# by exactly one audit kept as a canary, under the `fleet-audits` domain,
+# until 2026-09-22, when the presubmit became the blocking roster only and
+# the never-admitted canary moved to the nightly with the other full audits
+# (hack/eval/nightly-cases.txt), and back into the presubmit file, held out,
+# on 2026-09-29 (#2013); only a roster line counts as coverage.
 
 domains:
   - slug: chat-and-routing
@@ -73,25 +77,44 @@ domains:
     # card". Opening it is the remediation domain's journey, one row above.
     journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
 
-# Known-uncovered. Empty, which is Phase 2's exit criterion. The two kanban
-# probes cover chat-and-routing; cluster-debugging came off first among the
-# Phase 2 domains, in #939. Reliability, capacity, security, upgrades,
-# consistency and cost are covered by the six domain probes, and fleet-audits
-# by the compliance-audit canary -- see the header above for why probes rather
-# than six full audits. incident-triage came off last, in #1045, once
-# bench/tf/prebuilt/autoops-incident gave autoops-warning-event-triage an
-# incident to triage; note that gpu-stress-test-diagnosis never covered it,
-# being a chat-prompted post-incident RCA rather than event-fired triage.
+# Known-uncovered. Two entries; empty is Phase 2's exit criterion. The two
+# kanban probes cover chat-and-routing; cluster-debugging came off first
+# among the Phase 2 domains, in #939. Reliability, capacity, security,
+# upgrades, consistency and cost are covered by the six domain probes --
+# see the header above for why probes rather than six full audits.
+# incident-triage came off in #1045, once bench/tf/prebuilt/autoops-incident
+# gave autoops-warning-event-triage an incident to triage (note that
+# gpu-stress-test-diagnosis never covered it, being a chat-prompted
+# post-incident RCA rather than event-fired triage), went back on when that
+# case moved to the nightly (2026-09-03), and came off again on 2026-09-22
+# when incident-triage-oom-event-probe took a roster seat (#1023).
 #
 # An entry goes back on here only alongside a scenario that stopped running.
 allowlist:
-  # incident-triage's presubmit coverage moved to the nightly tier on
-  # 2026-09-03: its only case (autoops-warning-event-triage) is
-  # tofu-provisioned — the wall-clock floor of the presubmit (#1202 trim
-  # addendum). Delete this entry when
-  # a non-tofu incident-triage probe activates in presubmit, or when the
-  # coverage contract formally recognizes the nightly tier (#1175). That
-  # probe is incident-triage-oom-event-probe (#1023), in
-  # hack/eval/nightly-cases.txt since 2026-09-15; moving its line to the
-  # presubmit file is what deletes this entry.
-  - incident-triage
+  # fleet-audits, since 2026-09-22 (#1023): the domain's one case, the
+  # compliance-rbac-overgrant canary, was never admitted (demoted 2026-09-02
+  # on #1171) and moved to the nightly that day. Since 2026-09-29 it is seated
+  # held out in hack/eval/presubmit-cases.txt (#2013 step 2, the documented
+  # exception to the blocking-only rule): it runs on every pull request,
+  # cannot red one on a graded failure, and covers nothing here. Delete this
+  # entry in the pull request that adds its roster line (#2013 step 4, after
+  # three clean days), or when the coverage contract formally recognizes the
+  # nightly tier (#1175). incident-triage sat here from 2026-09-03 to
+  # 2026-09-22 for the same shape of reason.
+  - fleet-audits
+  # remediation, since 2026-09-22 (#1023): the same decision, and neither of
+  # the domain's two writers holds a roster seat. rca-remediation-pr was
+  # demoted 2026-09-02 (#1189) and moved to hack/eval/nightly-cases.txt with
+  # the other held-out cases that day; the promotion of pdb-remediation-pr
+  # proposed the same day was withdrawn before merge, because the record it
+  # cited (12/12 on the four graded nights 2026-09-16 to 09-20) was graded
+  # by report_contains, which #1780 (merged 2026-09-21) replaced with
+  # pull_request_opened, and no graded run of the case under the new check
+  # existed. pdb-remediation-pr is seated held out (seat opened 2026-09-28)
+  # in hack/eval/presubmit-cases.txt (#2016 step 2, the documented exception to
+  # the blocking-only rule): it runs on every pull request, cannot red one
+  # on a graded failure, and covers nothing here. Delete this entry in the
+  # pull request that adds its roster line (#2016 step 4, after three clean
+  # days under pull_request_opened), or when a remediation case is admitted
+  # on such a record otherwise (#1189's bar for rca).
+  - remediation

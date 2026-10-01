@@ -109,19 +109,37 @@ const (
 )
 
 // verifiedByFor names the mechanism that checked the requester at ingress
-// for one backend (authority.requester.verifiedBy).
+// for one backend (authority.requester.verifiedBy) — the authority block
+// should say what was actually checked, not just "the map". Discord (and
+// anything unlisted) is the test mapping table alone.
 func verifiedByFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return gchatVerifiedBy
+	case slackBackend:
+		return slackVerifiedBy
+	case injectBackend:
+		// Its own value, not "principal-map" and deliberately nothing a real
+		// backend stamps. The map is what resolves the author here too, but
+		// what checked the caller is the door's bearer token -- so a reader
+		// of an authority block downstream can tell an eval submission from
+		// a Chat message verified by the IAM-locked topic, which is the
+		// whole point of recording the mechanism rather than the table.
+		return injectVerifiedBy
 	}
 	return "principal-map"
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the mapping table everywhere else.
+// allowlist on gchat, the door's own map on inject, the mapping table
+// everywhere else (Discord's ConfigMap, Slack's a2a-slack-principal-map
+// Secret).
 func unverifiedRemedyFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return "the allowed users list"
+	case injectBackend:
+		return "the inject door's principal map"
 	}
 	return "the principal map"
 }
@@ -523,9 +541,11 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 		// durable publish would be at-least-once, but the dedupe map is
 		// in-memory, so a redelivery after a slow publish and a restart
 		// becomes a DUPLICATE task — a worse failure than a lost ask,
-		// which a user retries by typing again. It also matches every
-		// other backend's ingress semantics: Discord and Slack websockets
-		// redeliver nothing at all.
+		// which a user retries by typing again. It also matches the other
+		// backends' ingress semantics closely enough: the Discord websocket
+		// redelivers nothing, and Slack's Socket Mode, which does redeliver
+		// unacked envelopes, carries its own in-adapter dedupe ring for
+		// exactly that (slackSeenCap in slack.go).
 		a.settle(env.Receipt)
 		if decodeErr != nil {
 			a.log.Warn("gchat event payload did not parse; acked away",
@@ -756,9 +776,12 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // identity mechanism. On gchat the Google-asserted email IS the principal —
 // resolution is the identity function gated by the allowlist (the mapping
 // table other backends need is exactly what this backend exists to not
-// have). Everything else goes through the principal map. Empty means drop.
-func (g *Gateway) resolvePrincipal(authorID string) string {
-	if g.backend != gchatBackend {
+// have). Everything else goes through a principal map. Empty means drop.
+func (g *Gateway) resolvePrincipal(backend, authorID string) string {
+	if backend == injectBackend {
+		return g.resolveInjectPrincipal(authorID)
+	}
+	if backend != gchatBackend {
 		return g.pm.Resolve(authorID)
 	}
 	if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
@@ -770,6 +793,41 @@ func (g *Gateway) resolvePrincipal(authorID string) string {
 		return authorID
 	}
 	return ""
+}
+
+// resolveInjectPrincipal resolves an author the side door delivered, and it
+// is where the door is made structurally incapable of asserting a principal
+// a real backend's sender could hold. Two rules, both refusals.
+//
+// The lookup is prefixed: the key is "inject:<author>", in the door's own
+// map. So an entry admitting a Discord snowflake or a Google-asserted email
+// cannot be reached from here even if someone writes one, and an author id
+// that collides with a real backend's resolves to nothing.
+//
+// And the value must be an eval identity. The door takes its author from a
+// request body, so the map is the only thing standing between a bearer-token
+// holder and a principal of their choosing; a map entry pointing at a cloud
+// identity would hand them one, today advisory and the day publisher identity
+// arms, real. An entry that does not conform is refused here rather than
+// honoured, which makes a mistake in the map a lockout instead of a
+// privilege.
+//
+// Empty means drop, exactly as an unmapped Discord sender drops: logged,
+// noticed once, no task. Nothing is defaulted.
+func (g *Gateway) resolveInjectPrincipal(authorID string) string {
+	if g.injectPM == nil {
+		return ""
+	}
+	principal := g.injectPM.Resolve(injectPrincipalPrefix + authorID)
+	if principal == "" {
+		return ""
+	}
+	if !strings.HasPrefix(principal, injectEvalPrincipalPrefix) {
+		g.log.Error("the inject door's principal map maps an author to a principal that is not an eval identity; refusing it",
+			"author", authorID, "wantPrefix", injectEvalPrincipalPrefix)
+		return ""
+	}
+	return principal
 }
 
 // gchatConversationID mints the session key for one inbound message. space is

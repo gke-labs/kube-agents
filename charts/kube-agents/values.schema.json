@@ -489,6 +489,9 @@
         "annotations": {
           "type": "object"
         },
+        "podMonitoring": {
+          "type": ["boolean", "null"]
+        },
         "harness": {
           "type": "object",
           "additionalProperties": false,
@@ -529,6 +532,21 @@
                 },
                 "userProfileEnabled": {
                   "type": ["boolean", "null"]
+                }
+              }
+            },
+            "driftDetector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": ["boolean", "null"]
+                },
+                "subscription": {
+                  "type": "string"
+                },
+                "gitopsManagers": {
+                  "type": "string"
                 }
               }
             },
@@ -671,6 +689,73 @@
             }
           }
         },
+        "scope": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "projects": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "folders": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "organizations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "sharedVpcHosts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "metricsScopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exclude": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "projects": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "clusters": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["projectId", "location", "clusterName"],
+                    "properties": {
+                      "projectId": {
+                        "type": "string"
+                      },
+                      "location": {
+                        "type": "string"
+                      },
+                      "clusterName": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "credentials": {
           "type": "object",
           "additionalProperties": false,
@@ -693,6 +778,60 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "forges": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name"],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "host": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "credentialsRef": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "repositories": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["forge", "repository", "role"],
+                "properties": {
+                  "forge": {
+                    "type": "string"
+                  },
+                  "repository": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": ["gitops", "managed", "context"]
+                  }
+                }
+              }
+            },
             "github": {
               "type": "object",
               "additionalProperties": false,

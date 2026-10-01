@@ -104,7 +104,12 @@ A release-candidate run does not append either, and it is the case the sentence
 above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
-places. It has to be, because the mistake is not correctable afterwards:
+places. `EVAL_MODE_NEXT=1` is the fourth, for the same reason: the next lane's
+periodic on `main` is also a periodic with no `PULL_NUMBER`, and `VersionKey`
+has no mode field, so its samples would be today's once written. That one is
+enforced in `hack/ci-eval-pr.sh` alone, because `bench-gate record` has no
+notion of the mode; it goes when the key gains one. The third has to be,
+because the mistake is not correctable afterwards:
 `VersionKey` names the setup, the scoring version, the judge and the two content
 versions, and nothing about which build produced a sample, so a candidate's
 record and `main`'s are the same record once written — and the candidate would
@@ -181,6 +186,12 @@ considered everything" when it did not.
 One `cat` per case, and the cases run concurrently — at most
 `EVAL_BASELINE_CAT_WORKERS` (default 16) at once. A read costs one `gcloud`
 process startup per case and little else, so serially it grew with the matrix.
+
+A read also asks only for the cases it is about to grade: `bench-gate case`
+names its one case and lists that case's own prefix, `bench-gate suite` names
+the cases it graded. So the fan-out above is `suite`'s, and every other read is
+one case. Asking a scoped read about a case it did not fetch raises rather than
+answering "never screened", which would de-admit a case that is passing.
 
 A store that cannot be **reached** — no `gcloud`, a timeout, a 403, a 503 —
 degrades to advisory with a banner in the verdict, rather than redding the job.

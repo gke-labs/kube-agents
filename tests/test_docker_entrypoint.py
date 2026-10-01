@@ -622,12 +622,12 @@ class ConfigBackfillTest(unittest.TestCase):
     def test_a_key_the_live_file_lost_is_restored(self):
         """`model: {}` is what a save leaves behind; the template's block goes back in."""
         proc, live, _ = self._fill(
-            {"model": {"base_url": "http://litellm/v1", "api_mode": "chat_completions"}},
+            {"model": {"base_url": "http://inference-gateway/v1", "api_mode": "chat_completions"}},
             {"model": {}},
         )
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(live["model"]["base_url"], "http://litellm/v1")
+        self.assertEqual(live["model"]["base_url"], "http://inference-gateway/v1")
         self.assertEqual(live["model"]["api_mode"], "chat_completions")
         self.assertIn("model.base_url", proc.stdout)
 
@@ -656,7 +656,7 @@ class ConfigBackfillTest(unittest.TestCase):
 
     def test_nothing_missing_leaves_the_file_byte_identical(self):
         """No rewrite when there is nothing to add — that is what keeps the comments."""
-        live = "# the agent's own file\nmodel:\n  base_url: http://litellm/v1\n"
+        live = "# the agent's own file\nmodel:\n  base_url: http://inference-gateway/v1\n"
         proc, _, unchanged = self._fill({"model": {"base_url": "http://other/v1"}}, live)
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -664,7 +664,7 @@ class ConfigBackfillTest(unittest.TestCase):
 
     def test_a_live_file_that_is_not_a_mapping_is_skipped(self):
         """A corrupt config must not take the container down; step 2d only reports."""
-        proc, live, unchanged = self._fill({"model": {"base_url": "http://litellm/v1"}}, "- a\n- b")
+        proc, live, unchanged = self._fill({"model": {"base_url": "http://inference-gateway/v1"}}, "- a\n- b")
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(unchanged)
@@ -950,6 +950,39 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             ],
             f"expected the cluster loop and step 2.6b to be the only callers, found {calls}",
         )
+
+
+class ImageOwnedForceSyncTest(unittest.TestCase):
+    """Step 2a overwrites a PVC copy that `cp -u` would keep because it looks newer.
+
+    The onboarding prompts are graded by the first-install-hello eval cases, and
+    bootstrap_onboarding reads the PVC copy first, so a stale one would be what is graded.
+    """
+
+    def test_a_newer_stale_pvc_copy_of_each_onboarding_prompt_is_replaced(self):
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            for name in names:
+                (image / name).parent.mkdir(parents=True, exist_ok=True)
+                (image / name).write_text("image\n", encoding="utf-8")
+                (pvc / name).parent.mkdir(parents=True, exist_ok=True)
+                (pvc / name).write_text("stale\n", encoding="utf-8")
+                future = time.time() + 3600
+                os.utime(pvc / name, (future, future))
+            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            subprocess.run(
+                ["bash", "-c", block],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            for name in names:
+                self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
 
 class ManagedScopeAssertionTest(unittest.TestCase):
@@ -2000,6 +2033,96 @@ class SandboxMirrorGateTest(unittest.TestCase):
         self.assertFalse(invoked)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("REACHED-EXEC", proc.stdout)
+
+
+_TERMINAL_PIN_ASSIGNMENT = 'TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"'
+_TERMINAL_PIN_OPENER = (
+    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then'
+)
+
+
+class TerminalEnvPinGateTest(unittest.TestCase):
+    """Step 4b pins every profile's scheduled-run terminal, and is fatal.
+
+    The host never has the image path, so every other entrypoint test skips this block.
+    The block is extracted from its `if` so the script path can point at a temp file.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_TERMINAL_PIN_OPENER)
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, argv, script, target)`; `argv` is what the interpreter was called
+        with, or None when it never ran.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            target.mkdir()
+            script = tmp / "terminal_env_pin.py"
+            if install_script:
+                script.write_text("", encoding="utf-8")
+
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                f'#!/bin/sh\necho "$@" >"{marker}"\nexit {rc}\n',
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                    "TERMINAL_ENV_PIN_SCRIPT": str(script),
+                },
+            )
+            argv = marker.read_text(encoding="utf-8").split() if marker.exists() else None
+            return proc, argv, script, target
+
+    def test_a_failed_pin_ends_start_up(self):
+        proc, argv, _, _ = self._run(rc=1)
+        self.assertIsNotNone(argv, "the pin never ran, so this asserts nothing")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+        self.assertIn("refusing to start", proc.stderr)
+
+    def test_a_clean_pin_sweeps_every_profile_and_leaves_start_up_alone(self):
+        """Without --sweep only $TARGET_DIR is pinned, and named profiles stay on local."""
+        proc, argv, script, target = self._run(rc=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertEqual(argv, [str(script), "--hermes-home", str(target), "--sweep"])
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Run with a pin that would fail, so dropping the gate fails loudly."""
+        proc, argv, _, _ = self._run(rc=1, primary="0")
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_host_without_the_script_is_not_a_failure(self):
+        proc, argv, _, _ = self._run(rc=1, install_script=False)
+        self.assertIsNone(argv)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_script_runs_from_the_image_copy(self):
+        """The PVC copy under $TARGET_DIR is writable by the agent; the image copy is not."""
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        opener = lines.index(_TERMINAL_PIN_OPENER)
+        self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
 
 
 class A2AModeProbeTest(unittest.TestCase):

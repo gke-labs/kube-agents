@@ -1,5 +1,11 @@
 # ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
-# `capacity` off the coverage allowlist in docs/designs/domains.yaml.
+# `capacity` off the coverage allowlist in docs/designs/domains.yaml. On the
+# blocking roster since 2026-09-22 (#1023), on its presubmit record after
+# #1626: 529 of 570 graded repetitions (92.8%) over 196 runs, no all-reps
+# collapse. The 41 misses are mostly the delegation acknowledgement or a
+# blocked delegation delivered as the answer (#1840, #1874; 31 of the 41),
+# the rest a missing ceiling value; docs/eval-gate-roster.md carries the
+# numbers.
 #
 # A PROBE, not the audit. The full stockout-prevention sweep exists and is
 # spec-ready (stockout-pinned-pool); on 2026-08-26 its run failed on transport
@@ -7,9 +13,10 @@
 # write — budgets like the other audits at 600-1300s. Presubmit coverage of
 # this domain is therefore a targeted question about the planted defect,
 # answered from observed evidence and graded on the reply. Full audit SOP
-# fidelity lives in the fleet-audits canary (compliance-rbac-overgrant, 606s
-# measured 2026-08-26) and in the future nightly tier, where
-# stockout-pinned-pool is parked. Cost: the ~150-350s bracket the probes
+# fidelity lives in the fleet-audits canary
+# (compliance-rbac-overgrant, 606s measured 2026-08-26; nightly 2026-09-22
+# to 2026-09-29, presubmit held out since (#2013)) and, in the nightly tier,
+# stockout-pinned-pool. Cost: the ~150-350s bracket the probes
 # were promised is not what this one costs. Measured over its 1155 presubmit
 # repetitions from 2026-09-04 to 2026-09-15 (after #1174): median 540s, p10
 # 248s, p90 1318s, the ~2960s maxima being AGENT_DELEGATION_TIMEOUT plus
@@ -109,6 +116,23 @@ verification_spec:
       # |---|---|---|---|
       # | before | 959 / 1155 | 954 / 1155 | 233 / 385 |
       # | after  | 1067 / 1155 | 1060 / 1155 | 320 / 385 |
+      #
+      # Widened 2026-09-29 (#1493) by two phrases from the 2026-09-26 nightly
+      # (build 2103635793695215616, rep 2): the reply read "requesting 5
+      # replicas (with a maximum limit of `10`)", the judge confirmed the
+      # ceiling, and none of the 21 spellings above matched -- the verifier
+      # already strips the backticks, so this was wording alone. Not a bare
+      # "limit of 10": "limit of <quantity>" is how the same agent words
+      # resource limits ("memory limit of 64Mi" nine times across that
+      # week's crashloop replies), so it would also match "limit of 100m".
+      # "maximum limit of 10" carries the residual every value-bearing
+      # phrase above already carries -- matching is substring, so it also
+      # matches "maximum limit of 100m", exactly as "maximum of 10" matches
+      # "maximum of 100m" -- and is accepted on that footing: no reply in
+      # the week's 36 sampled records words any figure as "maximum limit
+      # of <quantity>", and the fixture's own limits are 500m and 128Mi.
+      # bench/tests/test_verifiers.py pins the rescued reply as a pass and a
+      # resource-limit reply with no ceiling as a fail.
       any_of_phrases:
         [
           "maxReplicas",
@@ -132,6 +156,8 @@ verification_spec:
           "scale up to 10",
           "10 replicas",
           "10 pods",
+          "maximum limit of 10",
+          "limit of 10 replicas",
         ]
   # Cluster-state safeguard: the pool's node-pool config is GKE-level, but
   # the HPA half of the planted defect is a cluster object -- and raising its

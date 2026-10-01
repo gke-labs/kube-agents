@@ -30,6 +30,15 @@ _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _PR = "77"
 _JOB = "pull-kube-agents-smoke-test"
 
+# Printed by the script under test before the lifted constants read JOB_NAME,
+# so a test can pin whether the variable was absent from the child's
+# environment or set (possibly empty) -- `${JOB_NAME:-default}` cannot tell
+# the two apart, which is exactly why a test that claims to cover both has
+# to prove it handed the script both.
+_JOB_NAME_PROBE = 'if [ -n "${JOB_NAME+x}" ]; then echo "JOB_NAME: set"; else echo "JOB_NAME: absent"; fi'
+_JOB_NAME_SET = "JOB_NAME: set"
+_JOB_NAME_ABSENT = "JOB_NAME: absent"
+
 _GSUTIL_STUB = """#!/usr/bin/env bash
 # gsutil stub: `ls` prints the fixture listing (or fails like a no-match
 # glob), `cat` serves "<build>.<file>" out of GSUTIL_OBJECT_DIR. Every call
@@ -205,6 +214,7 @@ class RevalidationTest(unittest.TestCase):
         script = "\n".join(
             [
                 "set -euo pipefail",
+                _JOB_NAME_PROBE,
                 _extract_constants(),
                 _extract(
                     r"^_revalidation_print_delta\(\) \{ # <label> <range> <files-or-empty>\n.*?^\}$",
@@ -229,6 +239,9 @@ class RevalidationTest(unittest.TestCase):
             "PULL_PULL_SHA": cur_head,
             "PULL_BASE_SHA": cur_base,
             "PULL_BASE_REF": "main",
+            # Unset in the pod that is not this job; a developer's shell may
+            # carry one, and the default is what these fixtures name.
+            "JOB_NAME": "",
             "GSUTIL_OBJECT_DIR": str(self.objects),
             "GSUTIL_CALL_LOG": str(self.call_log),
             "GITHUB_STATUS_DIR": str(self.statuses),
@@ -238,11 +251,22 @@ class RevalidationTest(unittest.TestCase):
             env["GSUTIL_LS_FILE"] = str(ls_file)
         if env_overrides:
             env.update(env_overrides)
+        # A None value means the variable is absent from the child's
+        # environment, not set to an empty string. It is dropped AFTER the
+        # isolated env is built because that env starts from os.environ, and
+        # a developer's shell may export the very variable a test is unsetting.
+        absent = {key for key, value in env.items() if value is None}
+        child_env = get_isolated_test_env(
+            overrides={key: value for key, value in env.items() if value is not None},
+            bin_dir=self.bin,
+        )
+        for key in absent:
+            child_env.pop(key, None)
         return subprocess.run(
             ["bash", str(under_test)],
             capture_output=True,
             text=True,
-            env=get_isolated_test_env(overrides=env, bin_dir=self.bin),
+            env=child_env,
         )
 
     # ── the one path that skips ──────────────────────────────────────────────
@@ -283,6 +307,47 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"ls {prefix}/*/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/started.json", calls)
+
+    def test_the_history_read_is_keyed_on_the_running_jobs_name(self):
+        """A second presubmit running this script (the next-mode lane, under
+        EVAL_MODE_NEXT=1) has its own history path and its own status
+        context. Keyed on a fixed name it would find the today job's green
+        build at the same head and skip its own matrix; keyed on JOB_NAME it
+        reads only its own history, and the today job's status attests
+        nothing for it."""
+        other_job = f"{_JOB}-next"
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides={"JOB_NAME": other_job}
+        )
+        calls = self.call_log.read_text().splitlines()
+        own = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
+        self.assertIn(f"ls {own}/*/finished.json", calls)
+        self.assertFalse(
+            [c for c in calls if f"/{_PR}/{_JOB}/" in c],
+            f"the today job's history was read under JOB_NAME={other_job}: {calls}",
+        )
+        # The stub listing is the today job's; its status event names the
+        # today context, so the other job's attestation must fail closed.
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn(f"GitHub holds no {other_job} success status", proc.stdout)
+
+    def test_job_name_unset_or_empty_reads_the_today_jobs_history(self):
+        """The script reads `${JOB_NAME:-default}`, which treats an absent
+        variable and an empty one alike -- so both states have to reach it.
+        The probe line pins which one each subtest handed the script; without
+        it the "unset" subtest was the "empty" one run twice, because `_run`
+        seeds JOB_NAME="" and a None override used to change nothing."""
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        cases = (({"JOB_NAME": ""}, _JOB_NAME_SET), ({"JOB_NAME": None}, _JOB_NAME_ABSENT))
+        for overrides, probe in cases:
+            with self.subTest(overrides=overrides):
+                proc = self._run(
+                    cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides=overrides
+                )
+                self.assertIn(probe, proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+                self.assertIn(f"Attested by the Prow-posted {_JOB} success status", proc.stdout)
 
     def test_identical_shas_are_trivially_inert(self):
         """An empty delta means that side's tree is byte-identical to the one

@@ -284,6 +284,98 @@ class A3ThePrincipalComesFromAVerifiedChannel(unittest.TestCase):
         )
 
 
+class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
+    """A3 on the eval inject door: a door that maps a body-supplied principal
+    may not exist on an install that did not ask for it, and may not assert a
+    principal a real backend's sender could hold.
+
+    The door is an HTTP route into the gateway's `handleInbound` for the eval
+    harness. A task it starts runs as the platform persona with the install's
+    cluster and GitHub credentials, and the author it runs as comes out of the
+    request body -- so two things have to hold, and neither is a property any
+    single Go module can test.
+
+    The first is darkness: with the operator's flag unset, the rendered object
+    set contains no inject Service, no inject env on the gateway and no inject
+    NetworkPolicy. The same rule `mode: next` follows, and asserted the same
+    way -- audited rather than commented. The operator's own tests assert the
+    rendered objects; what this adds is that the flag cannot come from a
+    `PlatformAgent`, which is a cross-module claim about where the switch
+    lives.
+
+    The second is that the door cannot mint an identity: the lookup is
+    prefixed into the door's own map and the value must be an eval identity,
+    so an entry written for a real backend's sender is unreachable and a cloud
+    principal is refused.
+    """
+
+    #: The render gates, by the function that must contain them. Each is the
+    #: single point where a piece of the door reaches the cluster.
+    _GATED_FUNCTIONS = (
+        ("buildA2AGatewayDeployment", "the gateway's inject env, port, mount and volume"),
+        ("applyA2AInjectBackend", "the inject Service, principal map and token Secret"),
+        ("reconcileA2ANetworkFences", "the gateway fence the door renders"),
+    )
+
+    def test_A3_the_inject_door_renders_only_under_the_operator_flag(self) -> None:
+        source = h.text("a2a_inject_render")
+        for name, what in self._GATED_FUNCTIONS:
+            body = h.go_function_body(source, name)
+            self.assertIn(
+                "a2aInjectBackendEnabled()",
+                body,
+                f"{name} renders {what} without consulting the eval flag, so an install that "
+                "never asked for the door would carry it",
+            )
+
+    def test_A3_the_inject_flag_is_not_a_field_a_customer_can_set(self) -> None:
+        """Where the switch lives is the control, not just its default.
+
+        A CRD field would put "open the door that maps a body-supplied
+        principal" in the API a cluster's owner edits, and the operator would
+        be obliged to honour it. It is an operator environment variable, the
+        shape the A2A image overrides already use, so opening the door takes
+        the deployment of the operator rather than an edit to a
+        `PlatformAgent`.
+        """
+        body = h.go_function_body(h.text("a2a_inject_render"), "a2aInjectBackendEnabled")
+        self.assertIn("os.Getenv(a2aInjectBackendEnvVar)", body)
+        self.assertNotIn("agent.Spec", body)
+        self.assertNotIn("Spec.Mode", body)
+        # Fail closed: anything but an explicit "true" leaves the door shut,
+        # so a typo relaxes into the safe state rather than out of it.
+        self.assertIn('== "true"', body)
+
+    def test_A3_the_inject_door_cannot_assert_a_cloud_principal(self) -> None:
+        """The door takes its author from a request body, so the map is the
+        only thing between a token holder and a principal of their choosing.
+
+        Two refusals make it structural rather than conventional: the lookup
+        is prefixed into the door's own map, so an entry written for a real
+        backend's sender cannot be reached from here; and a value outside the
+        eval namespace is refused rather than honoured, so a mistake in the
+        map is a lockout instead of a privilege.
+        """
+        body = h.go_function_body(h.text("a2a_inject_identity"), "resolveInjectPrincipal")
+        self.assertIn("injectPrincipalPrefix + authorID", body)
+        self.assertIn("injectEvalPrincipalPrefix", body)
+        self.assertRegex(
+            body,
+            r"!strings\.HasPrefix\(principal, injectEvalPrincipalPrefix\)",
+            "the door no longer refuses a principal outside the eval namespace",
+        )
+        # And nothing is defaulted: the refusal block returns the empty
+        # string, which the caller drops on, rather than repairing the value
+        # into the namespace and honouring it.
+        self.assertNotIn("return injectEvalPrincipalPrefix", body)
+        self.assertRegex(
+            body,
+            r'!strings\.HasPrefix\(principal, injectEvalPrincipalPrefix\) \{[^}]*return ""',
+            "the refusal of a principal outside the eval namespace no longer returns the "
+            "empty string; a value that is repaired or defaulted there is honoured",
+        )
+
+
 RBAC_GROUP = "rbac.authorization.k8s.io"
 
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is

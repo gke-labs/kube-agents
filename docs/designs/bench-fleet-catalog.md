@@ -90,24 +90,26 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
+Every fixture but the project-scoped `orphan-disks` sits on one of the three cluster slots. Every in-cluster fixture is on slot `a`, across the
+seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security`,
+`seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
 only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
 outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
 cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
 from voting on the baseline.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+| Role                       | Slot    | Day | What is planted                                                                                                                                                               |
+| -------------------------- | ------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`           | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                         |
+| `no-pdb-workload`          | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                   |
+| `declared-no-pdb-workload` | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, declared on purpose in the GitOps repository's `knowledge/`                                         |
+| `crashloop-workload`       | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                         |
+| `hpa-saturated`            | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                         |
+| `deprecated-api-caller`    | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight |
+| `idle-nodepool`            | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                           |
+| `orphan-disks`             | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                              |
+| `version-laggard`          | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                    |
+| `drift-outlier`            | c       | 1   | Master authorized networks absent, where a and b carry an open block                                                                                                          |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -128,7 +130,7 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
+`seeded-role=idle-batch` on the idle pool's taint — so two roles are called
 one thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -148,24 +150,30 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Five of the eight are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`crashloop-workload`, `hpa-saturated` and `version-laggard`, covering security, reliability,
-cluster debugging, remediation, capacity and upgrades between them. A corpus that leans on
-these can go green the day the fleet applies.
+Assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`declared-no-pdb-workload`, `crashloop-workload`, `hpa-saturated`, `version-laggard` and
+`deprecated-api-caller`,
+covering security, reliability, cluster debugging, remediation, capacity, upgrades and API
+deprecation between them. A corpus that leans on these can go green the day the fleet
+applies; the caller's first run is a Job the apply itself waits on, so its audit trail
+exists before the apply returns.
 
 `drift-outlier` waits a day. The drift SOP excludes a cluster whose `createTime` is under
 24 hours old from every cohort, so on apply day the `(standard, seeded)` cohort has zero
 members — and §2.4's floor, a cohort of fewer than three clusters produces no findings
 ever, would floor it out even if only one cluster were new.
 
-`idle-nodepool` waits seven, and no agent can satisfy that gate reliably, because the GKE
-node pool has no creation timestamp to read. The cost SOP's idle-nodepool check refuses
-pools created less than seven days ago, but `gcloud container node-pools describe` returns
-no `createTime` and neither does the REST resource; the only age signal is the boot-disk
-creation time of the pool's current nodes, which a rolling recreation resets while the
-pool object is untouched. So the gate is a judgement the agent makes from a proxy, and a
-node upgrade can silently close it. Treat `idle-nodepool` as the least dependable fixture in
-the catalog, and do not build a blocking objective on the age gate itself.
+`idle-nodepool` waits seven, and the GKE node pool has no creation timestamp to read:
+`gcloud container node-pools describe` returns no `createTime` and neither does the REST
+resource. The cost collector dates a pool from its `CREATE_NODE_POOL` operation in
+`gcloud container operations list`. A pool with no such operation arrived with the cluster
+in `CREATE_CLUSTER`, or before the operations the API still keeps, so it is dated from the
+cluster's `createTime` in `clusters list`. Only when the operations read fails does the
+oldest node's age stand in, and the collector then names each pool that stand-in exempted
+in the cluster's `limitations`, because a rolling node recreation resets node age while the
+pool object is untouched. On apply day the seeded pools are days old by either clock, so
+the gate holds; do not build a blocking objective on the age gate itself, since the
+operations the API keeps are finite and an old fixture pool falls back to its cluster's age.
 
 `orphan-disks` waits thirty, and that one is real: the unattached-disk collector filters
 server-side on the immutable `creationTimestamp<-P30D`. It is the longest gate in the
@@ -191,22 +199,23 @@ worth changing.
 
 The fleet's premise is that a correct audit returns the planted findings and the
 documented background ones, and nothing else — that is what lets a case assert an exact
-finding set rather than a substring. One fixture currently breaks it.
+finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
+rule now keeps it intact.
 
-A comment in `bench/tf/fleet/main.tf` argues that branch (a) of upgrade SOP check 3.1,
-"the control plane runs a version the channel does not offer", is "false by construction
-here because the pin is drawn from that very list". It is drawn from the location-wide
-`valid_master_versions` instead, so `seeded-b` sits on `1.34.10-gke.1106000`, a RAPID
-version absent from REGULAR's `validVersions`, and branch (a) fires at critical alongside
-the intended branch (b). An audit that reports it is right; a case that asserts the
-documented finding set is wrong. The fleet README's background-findings table, which
-promises the planted finding "plus the rows below — nothing else", does not list it
-either.
+The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
+rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
+`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
+(a) now fires only when a version is offered by no route at the location: not by the
+cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
+offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
+pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
+correctly.
 
-Until `main.tf` derives the pin from the REGULAR channel's `validVersions` rather than the
-location-wide list, treat the branch (a) critical on slot `b` as expected output. A case
-touching `version-laggard` asserts branch (b) specifically and must not assert that the
-critical count is one, or that branch (a) is absent.
+A case touching `version-laggard` may assert that branch (a) is absent, and
+`upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it
+catches.
 
 ## When a fixture goes away
 
@@ -245,17 +254,16 @@ nightly's, and to the CI health bot, so an apply lets `hack/fleet-kubeconfigs.sh
 impersonate the reader. A
 check on such a project cannot write what it grades.
 
-No pool project is in that state yet. Every one had its fleet applied before that
-default landed, so the impersonation fails, `hack/fleet-kubeconfigs.sh` warns per
-cluster, and the safeguards read under the runner's own credential like everything else.
-gke-labs/kube-agents#903 tracks the per-project re-apply that closes it.
+A project without it does not read the fleet at all: `hack/fleet-kubeconfigs.sh` writes nothing, exits 3, and
+`hack/ci-eval-pr.sh` stops the run at its fleet step rather than grading under the
+runner's own credential.
 
 What is not narrowed is the harness. `hack/ci-eval-pr.sh` runs as
 `prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and eleven other
 project roles in every pool project (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it inside the clusters. That
-is the credential the reader replaces, and until the re-apply it is the one every fleet
-check reads under.
+is the credential the reader replaces; the runner refuses to write a role kubeconfig that
+would carry it.
 
 The agent under test is a different identity, and it is already narrow.
 `kubeagents-platform-gsa@<project>` holds the eight read-only roles in
@@ -269,8 +277,8 @@ also need a GitOps-repo write path — the six audit scenarios and both remediat
 contained by pinning it to a throwaway repository per eval project.
 
 Asserting read-only from inside a case is a state check against the fixture — "the
-planted defect survived the run" — and not `tool_called`, which sees only the delegating
-turn's calls and would be blind to a worker's mutation. On the standing fleet that check
+planted defect survived the run" — and not `tool_called`, which even under `scope: workers`
+sees the call a worker made and not what it changed. On the standing fleet that check
 is `fleet_resource_property`, which resolves the cluster from the fixture role; plain
 `resource_property` reads the ambient kubeconfig and suits only a case whose deployer
 built its own cluster, as `gpu-stress-test-diagnosis` does.

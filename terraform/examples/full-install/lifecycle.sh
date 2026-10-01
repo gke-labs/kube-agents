@@ -54,6 +54,11 @@
 # no state bucket creation, no adoption imports. Pass -detailed-exitcode to get
 # 0 for "in sync" and 2 for "there are changes".
 #
+# `plan`, `apply` and `destroy` hide helm_release's `metadata` block, which
+# may contain secrets, from Terraform's output; an `apply` that will ask for
+# approval at a terminal is left as is, so its prompt shows. A raw
+# `terraform` run on this composition prints the block.
+#
 # Remote state (opt-in): set KUBE_AGENTS_STATE_BUCKET to a GCS bucket name, or
 # to "auto" for <project_id>-kube-agents-tfstate. On `apply` and `destroy` the
 # bucket is created if missing (versioned, uniform access); `plan` creates
@@ -83,6 +88,29 @@ if [[ -r "$INSTALL_DEFAULTS_FILE" ]]; then
 else
   warn "cannot find the install defaults at ${INSTALL_DEFAULTS_FILE}; they ship with the repository (or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy)."
   return 1 2>/dev/null || exit 1
+fi
+
+# gke_dns_endpoint_flag: whether a given cluster is reached over its IP or its
+# DNS control-plane endpoint. Three levels up like the defaults above, and
+# resolved the same way, since this script runs only inside the repository.
+#
+# This is the composition's one dependency on scripts/installer/. The helper is
+# deliberately free of that directory's state file and print helpers so it can
+# be sourced from anywhere — hack/ci-env.sh and scripts/release/common.sh
+# already do — and teardown has to reach a cluster over the same endpoint the
+# install used. A local copy of the predicate would be the alternative, and it
+# would drift.
+#
+# Absent, a stub keeps the pre-helper command rather than stopping the run: the
+# defaults above decide what gets applied, while this only picks an endpoint to
+# dial, and a teardown is the worst place to refuse over the difference.
+GKE_DNS_ENDPOINT_HELPER="../../../scripts/installer/gke_dns_endpoint.sh"
+if [[ -r "$GKE_DNS_ENDPOINT_HELPER" ]]; then
+  # shellcheck source=../../../scripts/installer/gke_dns_endpoint.sh
+  . "$GKE_DNS_ENDPOINT_HELPER"
+else
+  warn "cannot find the control-plane endpoint helper at ${GKE_DNS_ENDPOINT_HELPER}; reaching clusters over their IP endpoint."
+  gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=""; }
 fi
 
 # Remote state, opt-in. The composition ships no backend block — a hand-driven
@@ -135,6 +163,35 @@ readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
+readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
+# The drift-pubsub module's three importable resources, adopted by adopt_kms
+# the way the stockout trio is. Their names are read from the composition's
+# drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink
+# variables, which main.tf passes to the module, so the name adopted is always
+# the name this state would create.
+readonly DRIFT_TOPIC_ADDRESS="module.drift_pubsub[0].google_pubsub_topic.drift_audit"
+readonly DRIFT_SUBSCRIPTION_ADDRESS="module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
+readonly DRIFT_SINK_ADDRESS="module.drift_pubsub[0].google_logging_project_sink.drift_audit"
+# The stockout trio, the other three adopt_kms imports. It is declared at the
+# composition's top level rather than in a module, so its addresses carry no
+# module prefix.
+readonly STOCKOUT_TOPIC_ADDRESS="google_pubsub_topic.stockout_alerts[0]"
+readonly STOCKOUT_SUBSCRIPTION_ADDRESS="google_pubsub_subscription.stockout_alerts[0]"
+readonly STOCKOUT_SINK_ADDRESS="google_logging_project_sink.stockout_alerts[0]"
+
+# Every Pub/Sub subscription this composition can manage, as
+# "<enable flag>|<state address>|<name variable>|<topic variable>|<what a
+# recreate drops>|<install.env name key>|<install.env topic key>".
+#
+# The install.env keys are empty for the drift and stockout trios on purpose:
+# install.env.example carries CHAT_TOPIC_NAME and CHAT_SUB_NAME and nothing for
+# the other four, so subscription_name_advice points those at the TF_VAR_
+# passthrough instead of naming a key that does not exist.
+readonly GUARDED_SUBSCRIPTIONS=(
+  "enable_google_chat|$CHAT_SUBSCRIPTION_ADDRESS|chat_subscription_name|chat_topic_name|unacknowledged Google Chat events|CHAT_SUB_NAME|CHAT_TOPIC_NAME"
+  "enable_drift_pubsub|$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|drift_pubsub_topic|unacknowledged GKE audit records, the out-of-band changes the drift detector exists to report||"
+  "enable_stockout_investigator|$STOCKOUT_SUBSCRIPTION_ADDRESS|stockout_pubsub_subscription|stockout_pubsub_topic|unacknowledged stockout alerts||"
+)
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -237,7 +294,7 @@ tfvar() {
     warn "could not evaluate var.$1 (see the terraform error above)"
     exit 1
   fi
-  value=$(printf '%s\n' "$out" | tail -1 | tr -d '"')
+  value=$(printf '%s\n' "$out" | grep -vE "$STATE_LOCK_MESSAGE_PATTERN" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '"')
   case "$value" in
     null | "tostring(null)") value="" ;;
   esac
@@ -367,9 +424,27 @@ adopt_kms() {
     stockout_sub=$(tfvar stockout_pubsub_subscription)
     stockout_sink=$(tfvar stockout_pubsub_sink)
     targets+=(
-      "google_pubsub_topic.stockout_alerts[0]	pubsub_topic	projects/$project/topics/$stockout_topic"
-      "google_pubsub_subscription.stockout_alerts[0]	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
-      "google_logging_project_sink.stockout_alerts[0]	logging_sink	projects/$project/sinks/$stockout_sink"
+      "$STOCKOUT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$stockout_topic"
+      "$STOCKOUT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
+      "$STOCKOUT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$stockout_sink"
+    )
+  fi
+
+  if [[ "$(tfvar enable_drift_pubsub)" == "true" ]]; then
+    # Adoption is by name, and the names are one fixed default per project,
+    # so an install that shares a project with another one names its own trio
+    # (the README's second-install section); this block cannot tell a
+    # resource an earlier install left behind from one another live install
+    # owns. As with the stockout trio, each variable has a default, so tfvar
+    # never returns empty here.
+    local drift_topic drift_sub drift_sink
+    drift_topic=$(tfvar drift_pubsub_topic)
+    drift_sub=$(tfvar drift_pubsub_subscription)
+    drift_sink=$(tfvar drift_pubsub_sink)
+    targets+=(
+      "$DRIFT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$drift_topic"
+      "$DRIFT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$drift_sub"
+      "$DRIFT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$drift_sink"
     )
   fi
 
@@ -613,56 +688,101 @@ guard_gsa_identity() {
   fi
 }
 
+# Where a reader whose recorded name disagrees with the resolved one records
+# it. The front doors regenerate terraform.tfvars from install.env on every
+# run, so a name written into terraform.tfvars by hand does not survive them,
+# and install.env is the answer either way -- but by two different routes. A
+# name with a key of its own is that key. A name without one reaches Terraform
+# as a TF_VAR_ passthrough, because the generator writes no line for it and so
+# has nothing to overwrite it with; the enable_drift_pubsub description and the
+# composition README's second-install section say the same. Naming the key that
+# does not exist would send the reader nowhere, and so would omitting the
+# passthrough: the likeliest way this guard fires on a front-door install is
+# that TF_VAR_ line having gone missing from install.env, which is a one-line
+# repair.
+subscription_name_advice() { # <noun> <variable> <install.env key, empty when there is none> <recorded value>
+  local noun="$1" variable="$2" env_key="$3" recorded="$4"
+  if [[ -n "$env_key" ]]; then
+    warn "If this install uses an existing $noun, record it in install.env, which the front doors regenerate terraform.tfvars from:"
+    warn "  ${env_key}=\"${recorded}\""
+    warn "A hand-driven apply sets $variable in terraform.tfvars instead."
+    return 0
+  fi
+  warn "No install.env key carries this $noun. Through the front doors it is a passthrough line in install.env, which every front door sources with 'set -a':"
+  warn "  TF_VAR_${variable}=\"${recorded}\""
+  warn "A hand-driven apply sets $variable in terraform.tfvars instead."
+}
+
 # `name` and `topic` are ForceNew on google_pubsub_subscription, and `name` is
 # ForceNew on google_pubsub_topic. The subscription resource carries neither
-# create_before_destroy nor prevent_destroy. If a custom or default subscription
-# is managed in state and chat_subscription_name or chat_topic_name in terraform.tfvars
-# resolves to a different name/topic, the next apply destroys the live subscription
-# (and its topic) and recreates it under -auto-approve, dropping unacknowledged Google Chat events.
+# create_before_destroy nor prevent_destroy. If a subscription is managed in
+# state and its name or topic variable resolves to something else, the next
+# apply destroys the live subscription (and its topic) and recreates it under
+# -auto-approve, dropping whatever it had not acknowledged.
+#
+# Every subscription in GUARDED_SUBSCRIPTIONS is checked, not the chat one
+# alone: the drift and stockout trios are the same resource type with the same
+# ForceNew fields, and the drift one's unacknowledged messages are the audit
+# records of out-of-band changes -- the very thing the detector reports, lost
+# in a way nothing surfaces, because the detector stays Ready either way.
 # Same shape as guard_gsa_identity.
 guard_pubsub_subscription() {
-  [[ "$(tfvar enable_google_chat)" == "true" ]] || return 0
   load_state
-  local addr="$CHAT_SUBSCRIPTION_ADDRESS"
-  in_state "$addr" || return 0
+  local entry flag addr name_variable topic_variable loses name_key topic_key
+  for entry in "${GUARDED_SUBSCRIPTIONS[@]}"; do
+    IFS='|' read -r flag addr name_variable topic_variable loses name_key topic_key <<<"$entry"
 
-  local recorded_name
-  recorded_name=$(state_attr "$addr" name)
-  local recorded_topic
-  recorded_topic=$(state_attr "$addr" topic)
+    # State first: in_state reads the list already in memory, while tfvar is a
+    # `terraform console` round trip, so a feature whose subscription this
+    # state does not manage costs nothing.
+    in_state "$addr" || continue
 
-  local desired_name
-  if ! desired_name=$(tfvar chat_subscription_name 2>/dev/null); then
-    desired_name=""
-  fi
-  [[ -n "$desired_name" ]] || desired_name="$DEFAULT_CHAT_SUB_NAME"
+    # Assigned rather than compared inline. tfvar ends in `exit 1`, which
+    # inside $( ) kills only the subshell, so comparing the substitution
+    # directly reads a failed console as "not enabled" and skips the guard,
+    # while an assignment fails under `set -e` and stops the apply. A guard
+    # that cannot read the configuration has to fail closed. The name is not
+    # written out here as a call: hack/check-tfvar-console.sh greps this file
+    # for `$(tfvar <name>)` and evaluates every name it finds, so one in a
+    # comment is a variable the composition does not declare and reds the
+    # check.
+    local enabled
+    enabled=$(tfvar "$flag")
+    [[ "$enabled" == "true" ]] || continue
 
-  if [[ -n "$recorded_name" && "$recorded_name" != "$desired_name" ]]; then
-    warn "chat_subscription_name resolved to '$desired_name', but this state manages Pub/Sub subscription '$recorded_name' ($addr)."
-    warn "Applying now would plan the subscription's DESTRUCTION and recreation under -auto-approve,"
-    warn "dropping unacknowledged Google Chat events."
-    warn "If this install uses an existing subscription name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
-    warn "  CHAT_SUB_NAME=\"$recorded_name\""
-    warn "A hand-driven apply sets chat_subscription_name in terraform.tfvars instead."
-    exit 1
-  fi
+    local recorded_name recorded_topic desired_name desired_topic stripped_topic
+    recorded_name=$(state_attr "$addr" name)
+    recorded_topic=$(state_attr "$addr" topic)
 
-  local desired_topic
-  if ! desired_topic=$(tfvar chat_topic_name 2>/dev/null); then
-    desired_topic=""
-  fi
-  [[ -n "$desired_topic" ]] || desired_topic="$DEFAULT_CHAT_TOPIC_NAME"
+    # Every one of these variables declares a non-empty default in
+    # variables.tf, so terraform console answers with that default when nothing
+    # sets it and the guard needs no second copy of the name. An empty answer
+    # is therefore a variable someone blanked -- a `TF_VAR_drift_pubsub_subscription=`
+    # line in install.env exports "" through `set -a`, which overrides the
+    # default -- and it is compared like any other mismatch rather than waved
+    # through: the recreate it plans destroys the live subscription and then
+    # fails on the create.
+    desired_name=$(tfvar "$name_variable")
+    if [[ -n "$recorded_name" && "$recorded_name" != "$desired_name" ]]; then
+      warn "$name_variable resolved to '$desired_name', but this state manages Pub/Sub subscription '$recorded_name' ($addr)."
+      warn "Applying now would plan the subscription's DESTRUCTION and recreation under -auto-approve,"
+      warn "dropping $loses."
+      [[ -n "$desired_name" ]] || warn "An empty resolution is a blanked variable rather than a rename, and the recreate would fail after the destroy had run."
+      subscription_name_advice "subscription name" "$name_variable" "$name_key" "$recorded_name"
+      exit 1
+    fi
 
-  local stripped_topic="${recorded_topic##*/}"
-  if [[ -n "$stripped_topic" && "$stripped_topic" != "$desired_topic" ]]; then
-    warn "chat_topic_name resolved to '$desired_topic', but this state's Pub/Sub subscription is attached to topic '$stripped_topic' ($addr)."
-    warn "Applying now would plan the topic and subscription's DESTRUCTION and recreation under -auto-approve,"
-    warn "dropping unacknowledged Google Chat events."
-    warn "If this install uses an existing topic name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
-    warn "  CHAT_TOPIC_NAME=\"$stripped_topic\""
-    warn "A hand-driven apply sets chat_topic_name in terraform.tfvars instead."
-    exit 1
-  fi
+    desired_topic=$(tfvar "$topic_variable")
+    stripped_topic="${recorded_topic##*/}"
+    if [[ -n "$stripped_topic" && "$stripped_topic" != "$desired_topic" ]]; then
+      warn "$topic_variable resolved to '$desired_topic', but this state's Pub/Sub subscription is attached to topic '$stripped_topic' ($addr)."
+      warn "Applying now would plan the topic and subscription's DESTRUCTION and recreation under -auto-approve,"
+      warn "dropping $loses."
+      [[ -n "$desired_topic" ]] || warn "An empty resolution is a blanked variable rather than a rename, and the recreate would fail after the destroy had run."
+      subscription_name_advice "topic name" "$topic_variable" "$topic_key" "$stripped_topic"
+      exit 1
+    fi
+  done
 }
 
 # `name` is ForceNew on google_kms_key_ring and google_kms_crypto_key, neither
@@ -789,8 +909,20 @@ delete_agent_cr() {
   location=$(tfvar location)
   project=$(tfvar project_id)
 
+  # Through the helper, so teardown reaches the cluster over the endpoint the
+  # install used. Without the flag a cluster whose IP endpoint this host cannot
+  # route to gets that IP written into the kubeconfig, and the guard below does
+  # not catch it: get-credentials is a describe plus a file write, neither of
+  # which touches the control plane, so it exits 0. The kubectl after it then
+  # reads an unreachable cluster as a namespace holding no PlatformAgent, and
+  # teardown reports success having left the finalizer's cluster-scoped RBAC
+  # behind — the objects nothing else garbage-collects.
+  GKE_DNS_ENDPOINT_FLAG=""
+  gke_dns_endpoint_flag "$cluster" "$location" "$project" || true
+  # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+  # shellcheck disable=SC2086
   if ! gcloud container clusters get-credentials "$cluster" --location "$location" \
-        --project "$project" >/dev/null 2>&1; then
+        --project "$project" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1; then
     log "cluster unreachable; nothing to delete in-cluster"
     return 0
   fi
@@ -916,6 +1048,88 @@ forget_kms() {
   done
 }
 
+# A helm_release's `metadata` holds the release's full values as JSON, and the
+# helm provider does not mark it sensitive. `values` itself prints as
+# "(sensitive value)", but whenever the release changes (every image-tag bump)
+# metadata turns "(known after apply)" and Terraform prints its OLD value in
+# full -- and on destroy it prints it going to null. Those values can include
+# the chart's credentials (credentials.data), so the metadata block is no place
+# for a log that anyone else may read, a CI log above all.
+#
+# So everything Terraform prints for a plan, an apply, or a destroy
+# goes through this filter: inside a helm_release, an attribute-style
+# `metadata = {` (or `= [`) block is replaced by one line saying it was hidden,
+# up to the bracket that closes it at the attribute's own column. The block is
+# matched with or without a diff symbol before it: `terraform show`, and a
+# plan that imports the release, print it with none. Everything else passes
+# through unchanged. Colour codes and a trailing CR are stripped only for
+# matching; every line that passes through is printed as received.
+# Machine-readable output (`-json`) is not this filter's to parse.
+#
+# It fails closed: a block whose closing bracket never comes hides the rest of
+# the output, and says so at the end, rather than guess where the values stop.
+#
+# Three properties the callers rely on, each easy to lose:
+#
+#   exit status  this is the right-hand side of a pipe under `set -o pipefail`,
+#                so terraform's own code -- including plan's -detailed-exitcode
+#                2 -- is what the pipeline returns.
+#   Ctrl-C       SIGINT goes to the whole foreground process group. Terraform
+#                traps it and shuts down gracefully, writing state and
+#                releasing the lock -- but only if it can still print: with the
+#                filter dead, its next write hits a closed pipe and SIGPIPE
+#                kills it mid-operation. So the filter ignores INT and TERM and
+#                ends, as it always does, when terraform closes the pipe.
+#   streaming    output goes out line by line, so a long helm wait does not
+#                look hung. fflush() covers gawk and BSD awk; mawk also
+#                buffers its INPUT and needs -W interactive, which no other awk
+#                accepts.
+redact_helm_release_metadata() {
+  local awk_cmd=(awk) awk_version
+  # A probe, not a step: an awk that rejects -W just is not mawk, so its
+  # failure is the answer rather than an error. Captured whole, not piped into
+  # `head | grep -q`, whose early exit would SIGPIPE awk and, under pipefail,
+  # read a real mawk as "not mawk".
+  awk_version="$(awk -W version </dev/null 2>&1)" || awk_version=""
+  if [[ "$awk_version" == mawk* ]]; then
+    awk_cmd=(awk -W interactive)
+  fi
+  (
+    trap '' INT TERM
+    exec "${awk_cmd[@]}" '
+      function plain(s) { gsub(/\033\[[0-9;]*m/, "", s); sub(/\r$/, "", s); return s }
+      function indent(s) { match(s, /^ */); return RLENGTH }
+      {
+        p = plain($0)
+        if (skipping) {
+          if (indent(p) == close_col && substr(p, close_col + 1, 1) == closer) {
+            skipping = 0
+          }
+          next
+        }
+        if (p ~ /(resource|data) "/) {
+          in_helm = (p ~ /resource "helm_release"/)
+        }
+        if (in_helm && p ~ /^ *((-\/\+|\+\/-|[~+-]) +)?metadata += *[{[] *$/) {
+          close_col = index(p, "metadata") - 1
+          closer = (p ~ /\[ *$/) ? "]" : "}"
+          print substr(p, 1, close_col) "metadata = (hidden by lifecycle.sh: it repeats every chart value, credentials included)"
+          fflush()
+          skipping = 1
+          next
+        }
+        print
+        fflush()
+      }
+      END {
+        if (skipping) {
+          print "lifecycle.sh: a helm_release metadata block never closed; the rest of this output was hidden with it"
+        }
+      }
+    '
+  )
+}
+
 if [[ "${KUBE_AGENTS_SOURCE_ONLY:-false}" == "true" ]]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -948,7 +1162,7 @@ case "${1:-}" in
     # to treat 2 as a report should ask for it.
     ensure_init readonly
     log "terraform plan"
-    terraform plan -lock=false -input=false "$@"
+    terraform plan -lock=false -input=false "$@" | redact_helm_release_metadata
     ;;
   apply)
     shift
@@ -967,7 +1181,18 @@ case "${1:-}" in
     log "terraform apply"
     # No -input=false: this prompts like plain `terraform apply` does. Pass
     # -auto-approve through ARGS for unattended runs.
-    terraform apply "$@"
+    #
+    # Only an apply that is about to ask someone at a terminal runs unfiltered:
+    # a terminal on stdin and stdout, and no approval given here or in
+    # TF_CLI_ARGS_apply. Its closing "Enter a value: " has no newline and would
+    # wait in the line-based filter until answered. Everything else is
+    # filtered: an approved apply (upgrade.sh passes -auto-approve) prints the
+    # whole diff without asking, and a pipe (`| tee`), a file or CI is a log.
+    if [[ -t 0 && -t 1 && " $* ${TF_CLI_ARGS_apply:-} " != *auto-approve* ]]; then
+      terraform apply "$@"
+    else
+      terraform apply "$@" | redact_helm_release_metadata
+    fi
     ;;
   destroy)
     shift
@@ -1004,8 +1229,9 @@ case "${1:-}" in
     forget_kms
     log "terraform destroy"
     # deletion_protection is passed again because destroy re-evaluates the config,
-    # and the variable's default would otherwise reinstate the guard.
-    terraform destroy -var="deletion_protection=false" "$@"
+    # and the variable's default would otherwise reinstate the guard. Filtered,
+    # since destroy prints every release value going to null.
+    terraform destroy -var="deletion_protection=false" "$@" | redact_helm_release_metadata
     log "done. The KMS key rings remain in the project by design — GCP cannot"
     log "delete them. The next 'lifecycle.sh apply' adopts them automatically."
     ;;
@@ -1013,7 +1239,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,68p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

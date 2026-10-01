@@ -186,11 +186,9 @@ context. A context renamed locally is reached through an `aliases` entry, not by
 
 ## Which installs are protected
 
-Discovered, never hardcoded. The checkout's `install.env` records the install it is pointed at —
-as does a legacy `k8s-operator/scripts/vars.sh`, still read so a checkout from before that change
-stays protected. Both are taken from the first directory up the tree that has either, and where
-both exist their keys are merged with `install.env` winning, matching the order every shell front
-door loads them in. `PROJECT_ID`, `CLUSTER_NAME`, and `REGION` compose the context
+Discovered, never hardcoded. The checkout's `install.env` records the install it is pointed at,
+and it is taken from the first directory up the tree that has one. `PROJECT_ID`, `CLUSTER_NAME`,
+and `REGION` compose the context
 (`gke_<project>_<location>_<cluster>`, the name `installer_common.sh` itself reconstructs);
 `REGISTRY_PREFIX` gives the prefix `docker push` is matched against — the installer always records
 one, so `<REGION>-docker.pkg.dev/<PROJECT_ID>` is a fallback for a hand-written configuration that
@@ -257,7 +255,8 @@ for.
 Once copied, the file is repository-controlled code running on a contributor's machine on every
 Bash tool call, and the script is written for that: it reads the install configuration with a
 regex over an allowlist rather than sourcing it — accepting both `K=V` and `export K=V`, since
-`install.env` is a dotenv and `vars.sh` was generated with `printf %q` — exits before any cluster round-trip when nothing is configured,
+`install.env` is a hand-authored dotenv and a hand may well write `export` — exits before any
+cluster round-trip when nothing is configured,
 and shells out to nothing but `kubectl` and `git`. Read the diff of `scripts/live_test_lease.py`
 before pulling a branch you do not trust, since the copy points at the working tree's script.
 Personal hooks unrelated to the lease belong in `.claude/settings.local.json`, which stays ignored

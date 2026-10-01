@@ -43,11 +43,12 @@ from pathlib import Path
 
 import pytest
 
-from kube_agents_bench import evidence_store
+from kube_agents_bench import evidence_store, gate
+from kube_agents_bench.baselines import CaseOutOfScope
 from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
 
-from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS, read_fixture, write_run
+from conftest import FIXTURE_RUNS, GREEN_RUNS, INJECT_RUN, RED_RUNS, read_fixture, write_run
 from kube_agents_bench.evidence_store import _key_segments
 from test_evidence_store import FakeGcloud
 
@@ -164,6 +165,65 @@ def test_a_partially_passing_case_is_unstable(kanban_task, tmp_path):
     out = tmp_path / "case.json"
     run_case(kanban_task, [FIXTURE_RUNS / GREEN_RUNS[0], FIXTURE_RUNS / RED_RUNS[0]], out)
     assert payload(out)["label"] == "UNSTABLE"
+
+
+def test_an_inject_record_grades_on_the_check_its_transport_can_see(
+    kanban_task, tmp_path, monkeypatch, capsys
+):
+    """The measurement run's agent-kanban-smoke (#2039): a correct answer and
+    a tool_called check blind on the inject transport. Admitted, three such
+    repetitions used to collapse; the lane sets the blind check aside and the
+    grading line says so."""
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    out = tmp_path / "case.json"
+    assert run_case(kanban_task, [FIXTURE_RUNS / INJECT_RUN] * 3, out) == 0
+    printed = capsys.readouterr().out
+    assert "Task agent-kanban-smoke Result: [PASSED]" in printed
+    assert "rep 1: pass -- VerificationCorrectness=1.0 [1 check(s) not applicable on this transport" in printed
+    doc = payload(out)
+    assert doc["passes"] == 3 and doc["scored"] == 3 and doc["not_applicable"] == 0
+    assert doc["reps"][0]["not_applicable_checks"] == ["the-kanban-card-was-actually-filed"]
+
+
+def inject_record_with_only_the_blind_check() -> dict:
+    """The captured inject record as a case declaring the tool_called check
+    and nothing else would have written it."""
+    results = json.loads((FIXTURE_RUNS / INJECT_RUN / "results.json").read_text(encoding="utf-8"))
+    rec = results[0]
+    rec["verification_report"] = [
+        e for e in rec["verification_report"] if e["name"] == "the-kanban-card-was-actually-filed"
+    ]
+    rec["scores"]["VerificationCorrectness"] = 0.0
+    return {"results": results}
+
+
+def test_a_case_the_lane_cannot_grade_gets_its_own_label(write_task, tmp_path, monkeypatch, capsys):
+    task = write_task(
+        "card-only",
+        {
+            "id": "card-only",
+            "name": "Card only",
+            "verification_spec": [
+                {
+                    "name": "the-kanban-card-was-actually-filed",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"]},
+                }
+            ],
+        },
+    )
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "card-only")
+    runs = [write_run(tmp_path / f"run_{i}", inject_record_with_only_the_blind_check()) for i in range(3)]
+    out = tmp_path / "case.json"
+    assert run_case(task, runs, out) == 0
+    printed = capsys.readouterr().out
+    assert "Task card-only Result: [NOT_GRADED_ON_TRANSPORT] not graded on this transport" in printed
+    assert "rep 1: not_applicable -- not applicable on this transport" in printed
+    doc = payload(out)
+    assert doc["label"] == gate.LABEL_NOT_GRADED_ON_TRANSPORT
+    assert doc["blocking"] is False
+    assert doc["rung_name"] == "NOT_GRADED_ON_TRANSPORT"
+    assert doc["scored"] == 0 and doc["not_applicable"] == 3
 
 
 def test_an_expected_fail_case_failing_is_labelled_as_such(write_task, tmp_path, capsys):
@@ -445,6 +505,51 @@ def test_a_green_suite_exits_zero(tmp_path, capsys):
     assert "**GREEN**" in capsys.readouterr().out
 
 
+def not_graded_case_file(tmp_path: Path, name: str, **fields) -> Path:
+    """A hand-off for a case the inject lane could not grade (#2039)."""
+    doc = {
+        "rung": 98,
+        "rung_name": "NOT_GRADED_ON_TRANSPORT",
+        "reason": "not graded on this transport: every objective check (x) is not applicable on this transport",
+        "passes": 0,
+        "scored": 0,
+        "not_applicable": 3,
+        "pass_rate": None,
+    }
+    doc.update(fields)
+    return case_file(tmp_path, name, **doc)
+
+
+def test_a_not_graded_case_beside_a_green_one_is_green_and_named(tmp_path, capsys):
+    md = tmp_path / "verdict.md"
+    js = tmp_path / "verdict.json"
+    rc = main(
+        [
+            "suite",
+            "--case-result", str(case_file(tmp_path, "a")),
+            "--case-result", str(not_graded_case_file(tmp_path, "b")),
+            "--markdown-out", str(md), "--json-out", str(js),
+        ]
+    )
+    assert rc == 0
+    text = md.read_text(encoding="utf-8")
+    assert "**GREEN**" in text
+    assert "_1 case(s) not graded on this transport" in text
+    assert "### Why" not in text, "a not-graded case is not a reason against green"
+    assert "| `b` | obtainability | NOT_GRADED_ON_TRANSPORT (rung 98) | 0/0 |" in text
+    doc = json.loads(js.read_text(encoding="utf-8"))
+    assert doc["not_graded"] == ["b"] and doc["not_evaluated"] == []
+
+
+def test_a_suite_of_only_not_graded_cases_exits_two_with_the_transport_banner(tmp_path, capsys):
+    rc = main(["suite", "--case-result", str(not_graded_case_file(tmp_path, "a"))])
+    assert rc == gate.SUITE_EXIT_NOT_EVALUATED
+    printed = capsys.readouterr().out
+    assert "**NOT EVALUATED**" in printed
+    assert "nothing on this transport could be graded" in printed
+    assert "rerun when the environment is healthy" not in printed
+
+
 def test_a_red_suite_exits_one(tmp_path, capsys):
     path = case_file(
         tmp_path, "a", blocking=True, rung=4, rung_name="COLLAPSE", reason="failed 3/3"
@@ -584,6 +689,25 @@ def test_the_aggregate_is_advisory_until_the_environment_arms_it(
     for spelling in ("1", "true", "YES"):
         monkeypatch.setenv("EVAL_AGGREGATE_ARMED", spelling)
         assert main(args) == 1, spelling
+
+
+def test_the_default_margin_holds_the_worst_measured_green_run(tmp_path, monkeypatch, capsys):
+    """Armed, no EVAL_AGGREGATE_MARGIN in the environment: the CLI's default
+    is the measured 0.10. 31 of 36 against main at 0.924 -- the worst green
+    presubmit run in the 2026-09-29 sample -- stays green; 29 of 36 (the
+    seventh failed repetition at that window) reds, and the verdict prints
+    the margin it applied."""
+    monkeypatch.delenv("EVAL_AGGREGATE_MARGIN", raising=False)
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
+    worst = case_file(tmp_path, "worst", passes=31, scored=36)
+    assert main(["suite", "--case-result", str(worst), "--baseline-rate", "0.924"]) == 0
+    assert "Admitted-case pass rate: 86.1% (main: 92.4%, margin 10.0%)" in capsys.readouterr().out
+    seven_lost = case_file(tmp_path, "seven-lost", passes=29, scored=36)
+    assert main(["suite", "--case-result", str(seven_lost), "--baseline-rate", "0.924"]) == 1
+    printed = capsys.readouterr().out
+    assert "Admitted-case pass rate: 80.6% (main: 92.4%, margin 10.0%)" in printed
+    assert "### Why it is red" in printed
+    assert "below main's 0.924 by more than the 0.100 margin (over 36 scored repetitions)" in printed
 
 
 def test_the_verdict_is_advisory_with_no_baseline(tmp_path, capsys):
@@ -736,6 +860,37 @@ def test_record_skips_a_case_that_produced_no_pass_or_fail(tmp_path, capsys):
     assert list(store.glob("*.jsonl")) == []
 
 
+def test_record_skips_a_case_the_inject_lane_set_aside_whole(tmp_path, capsys):
+    """Every repetition `not_applicable`: nothing scored, and the skip line
+    names that outcome rather than calling it blocked or infrastructure."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY, scored=0, passes=0,
+        reps=[{"outcome": "not_applicable", "not_applicable_checks": ["card"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    printed = capsys.readouterr().out
+    assert "3 of 3 repetition(s) not applicable on this transport" in printed
+    assert "not recorded, the store holds api-lane evidence only" in printed
+    assert "blocked or hit infrastructure" not in printed
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_skips_a_case_graded_with_a_check_set_aside(tmp_path, capsys):
+    """The captured inject shape: three passes, each with the tool_called
+    check set aside. Recording it would file a 3/3 line, graded on half the
+    case's objectives, beside the api lane's record at the same version key
+    -- evidence the api lane would not have produced, and admission reads it."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=KEY,
+        reps=[{"outcome": "pass", "not_applicable_checks": ["the-kanban-card-was-actually-filed"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    assert "not recorded, the store holds api-lane evidence only" in capsys.readouterr().out
+    assert list(store.glob("*.jsonl")) == []
+
+
 def test_record_keeps_blocked_and_infra_out_of_the_rate_but_in_the_line(tmp_path):
     """Dropping them silently would make a case that half-crashes look
     perfectly reliable in its own history."""
@@ -772,6 +927,109 @@ def test_record_says_so_when_a_run_produced_nothing_worth_keeping(tmp_path, caps
     store = store_with(tmp_path)
     assert run_record(store) == 0
     assert "produced no evidence" in capsys.readouterr().out
+
+
+# One run, several calls (module docstring of gate.py): the shell records each
+# case inside its fan-out as soon as the case is graded, then once more after
+# the fan-out for whatever it left. The manifest is what keeps that from
+# appending a case twice; --lines-out appends so the artefact is the whole run.
+
+
+def _store_lines(store: Path, case: str) -> list[dict]:
+    return [json.loads(l) for l in (store / f"{case}.jsonl").read_text().splitlines() if l.strip()]
+
+
+def test_a_manifest_makes_a_second_call_for_the_same_case_a_no_op(tmp_path, capsys):
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    manifest = tmp_path / "artifacts" / "baseline-recorded.jsonl"
+    extra = ["--recorded-manifest", str(manifest)]
+    assert run_record(store, doc, extra=extra) == 0
+    assert run_record(store, doc, extra=extra) == 0
+    assert len(_store_lines(store, "a")) == 1
+    out = capsys.readouterr().out
+    assert out.count("  recorded a: 1/1") == 1
+    assert "already recorded a this run" in out
+    (entry,) = [json.loads(l) for l in manifest.read_text().splitlines()]
+    assert entry["case"] == "a" and entry["key"] == KEY
+    assert entry["written_to"].endswith("a.jsonl")
+
+
+def test_the_manifest_is_keyed_on_the_case_and_its_version_key(tmp_path):
+    """The same case measured at another key is other evidence, not a repeat."""
+    store = store_with(tmp_path)
+    manifest = tmp_path / "baseline-recorded.jsonl"
+    extra = ["--recorded-manifest", str(manifest)]
+    assert run_record(store, case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}]), extra=extra) == 0
+    bumped = dict(KEY, scoring_version="v2")
+    assert run_record(store, case_file(tmp_path, "a", version_key=bumped, reps=[{"outcome": "fail"}]), extra=extra) == 0
+    assert [l["key"]["scoring_version"] for l in _store_lines(store, "a")] == ["v1", "v2"]
+    assert len(manifest.read_text().splitlines()) == 2
+
+
+def test_without_a_manifest_every_call_is_the_only_call(tmp_path):
+    """The flag is opt-in; a caller that never passes it keeps appending."""
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    assert run_record(store, doc) == 0
+    assert run_record(store, doc) == 0
+    assert len(_store_lines(store, "a")) == 2
+
+
+def test_a_half_written_manifest_line_costs_at_most_one_duplicate(tmp_path, capsys):
+    store = store_with(tmp_path)
+    manifest = tmp_path / "baseline-recorded.jsonl"
+    manifest.write_text('{"case": "a", "key": ' + json.dumps(KEY) + ', "written_to": "x"}\n{"case": "b", "ke', encoding="utf-8")
+    docs = [
+        case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}]),
+        case_file(tmp_path, "b", version_key=KEY, reps=[{"outcome": "pass"}]),
+    ]
+    assert run_record(store, *docs, extra=["--recorded-manifest", str(manifest)]) == 0
+    out = capsys.readouterr().out
+    assert "already recorded a this run -> x" in out
+    assert "  recorded b: 1/1" in out
+    assert not (store / "a.jsonl").exists() and len(_store_lines(store, "b")) == 1
+
+
+def test_lines_out_accumulates_across_the_runs_calls(tmp_path):
+    store = store_with(tmp_path)
+    lines_out = tmp_path / "artifacts" / "baseline-append.jsonl"
+    for name in ("a", "b"):
+        doc = case_file(tmp_path, name, version_key=KEY, reps=[{"outcome": "pass"}])
+        assert run_record(store, doc, extra=["--lines-out", str(lines_out)]) == 0
+    assert [json.loads(l)["case"] for l in lines_out.read_text().splitlines()] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------
+# `bench-gate suite --partial`: the table the shell's EXIT trap writes for a
+# run the deadline ended before its suite step. Not the run's verdict.
+# --------------------------------------------------------------------------
+
+
+def test_a_partial_suite_says_so_first_in_the_markdown_and_in_the_json(tmp_path, capsys):
+    md = tmp_path / "eval-verdict.md"
+    js = tmp_path / "eval-verdict.json"
+    note = "this run ended before its verdict; 2 of 41 cases had every repetition graded by then"
+    rc = main([
+        "suite", "--case-result", str(case_file(tmp_path, "a")),
+        "--partial", note, "--markdown-out", str(md), "--json-out", str(js),
+    ])
+    assert rc == 0, "the status of the cases it does cover; the trap warns only when no table landed"
+    text = md.read_text(encoding="utf-8")
+    assert text.startswith("> **PARTIAL — not this run's verdict.** " + note + ". Only the cases graded before the run ended")
+    assert "this table gates nothing" in text
+    assert "**GREEN**" in text
+    assert "PARTIAL" in capsys.readouterr().out
+    doc = json.loads(js.read_text(encoding="utf-8"))
+    assert doc["partial"] is True and doc["partial_note"] == note
+    assert doc["green"] is True
+
+
+def test_a_suite_without_the_flag_carries_no_partial_marker(tmp_path):
+    js = tmp_path / "eval-verdict.json"
+    main(["suite", "--case-result", str(case_file(tmp_path, "a")), "--json-out", str(js)])
+    doc = json.loads(js.read_text(encoding="utf-8"))
+    assert "partial" not in doc and "partial_note" not in doc
 
 
 # --------------------------------------------------------------------------
@@ -838,6 +1096,29 @@ def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
     printed = capsys.readouterr().out
     assert "main: 100.0%" in printed
     assert "advisory" not in printed
+
+
+def test_the_baseline_leaves_out_a_case_the_lane_did_not_grade(tmp_path, capsys):
+    """An admitted case the inject lane could not grade is on neither side
+    of the aggregate: its `scored` is 0 on the run, and main's evidence for
+    it (api-lane, at a key that carries no transport) must not be pooled
+    against a run that graded nothing of it. Here `a` is 14/21 on main and
+    `c` 21/21; pooled the baseline would read 83.3%, and the run's 2/3 on
+    `a` alone would sit below the margin for nothing."""
+    store = store_with(
+        tmp_path,
+        *[baseline_line("a", runs=3, passes=2, at=f"2026-08-0{i + 1}T00:00:00Z") for i in range(7)],
+        *[baseline_line("c", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z") for i in range(7)],
+    )
+    a = case_file(tmp_path, "a", version_key=KEY, passes=2, scored=3, pass_rate=2 / 3)
+    c = not_graded_case_file(tmp_path, "c", version_key=KEY)
+    assert main([
+        "suite", "--case-result", str(a), "--case-result", str(c),
+        "--baseline-dir", str(store), "--min-scored", "1",
+    ]) == 0
+    printed = capsys.readouterr().out
+    assert "main: 66.7%" in printed
+    assert "BELOW the margin" not in printed
 
 
 def test_the_aggregate_reds_when_the_store_says_main_did_better(tmp_path, monkeypatch):
@@ -1184,3 +1465,89 @@ def test_a_capped_read_says_so_in_the_verdict(tmp_path, monkeypatch, gcloud):
     text = md.read_text(encoding="utf-8")
     assert "NOTE — truncated read" in text
     assert "`a`: the 3 oldest" in text
+
+
+# --------------------------------------------------------------------------
+# gcs: reading only the cases being graded
+# --------------------------------------------------------------------------
+
+
+def test_grading_one_case_reads_one_case(kanban_task, tmp_path, monkeypatch, gcloud):
+    """The gate runs `case` once per task and each one read the whole store.
+
+    Eighteen tasks against thirty-eight case prefixes is thirty-seven wasted
+    reads per task, and the verdict never depended on one of them.
+    """
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    seed_gcs(
+        gcloud,
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z",
+            )
+            for i in range(7)
+        ],
+        *[baseline_line(f"other-{i}", runs=3, passes=3) for i in range(5)],
+    )
+
+    out = tmp_path / "case.json"
+    doc = graded_case(
+        kanban_task, [FIXTURE_RUNS / n for n in RED_RUNS], out, store_with(tmp_path)
+    )
+    # Unchanged by the narrowing: same 21/21 window, same admission, same rung.
+    assert doc["admitted"] is True and doc["rung"] == 4
+
+    (listed,) = [c for c in gcloud.calls if c[2] == "ls"]
+    assert listed[3] == "gs://b/evidence/agent-kanban-smoke/**"
+    read = [u for c in gcloud.calls if c[2] == "cat" for u in c[3:]]
+    assert read and not [u for u in read if "/other-" in u]
+
+
+def test_the_suite_reads_the_cases_it_graded_and_no_others(tmp_path, monkeypatch, gcloud):
+    """`suite` pools a baseline rate over the cases in its own inputs, so a
+    case absent from this run can never enter the number."""
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
+    monkeypatch.setenv("EVAL_BASELINE_STORE", "gs://b/evidence")
+    seed_gcs(
+        gcloud,
+        baseline_line("a", runs=20, passes=20),
+        *[baseline_line(f"other-{i}", runs=20, passes=0) for i in range(5)],
+    )
+    doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)
+
+    # Reds on main's 100% against this run's 25% -- the ungraded cases' 0/20
+    # would have dragged the comparator down had they been pooled in.
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store_with(tmp_path)),
+        "--min-scored", "1",
+    ]) == 1
+    read = [u for c in gcloud.calls if c[2] == "cat" for u in c[3:]]
+    assert read and not [u for u in read if "/other-" in u]
+
+
+def test_a_case_outside_the_scope_raises_instead_of_reading_as_unscreened(tmp_path):
+    """The guard that makes the narrowing safe, reached through the gate.
+
+    A scoped store asked about a case it never read would otherwise answer
+    "no evidence", which de-admits a passing case and reds nothing.
+    """
+    store, fatal, degraded = gate._load_store(str(store_with(tmp_path)), only={"a"})
+    assert (fatal, degraded) == (None, None)
+    with pytest.raises(CaseOutOfScope):
+        store.history_for("b")
+
+
+def test_an_unreachable_store_keeps_its_scope(tmp_path, monkeypatch, gcloud):
+    """The degraded path returns an empty store, and it is scoped like the
+    successful one -- otherwise an outage would be the one way a caller bug
+    slipped through."""
+    gcloud.fail = "ERROR: (gcloud.storage.ls) 503 Backend Error"
+    store, fatal, degraded = gate._load_store("gs://b/evidence", only={"a"})
+    assert fatal is None and degraded is not None
+    assert store.history_for("a") == []
+    with pytest.raises(CaseOutOfScope):
+        store.history_for("b")

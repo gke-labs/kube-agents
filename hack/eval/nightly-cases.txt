@@ -9,31 +9,38 @@
 # identically in both. The script refuses to start on a line that names no
 # case directory or that is also in presubmit-cases.txt (it would run twice a
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
-# file as well as the presubmit one; the domain-coverage lint deliberately
-# does not, so an entry here satisfies presubmit domain coverage not at all.
+# file as well as the presubmit one; the domain-coverage lint reads only
+# blocking-roster.txt, so neither an entry here nor a held-out presubmit
+# seat counts as coverage.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
 #
-# WHAT BELONGS HERE. Every registered case that is not in the presubmit and
-# has a fixture -- this is the default home for a new case (decided
-# 2026-09-15 on #1546 and #1564): it lands here, the nightly builds its
-# record in the evidence store, and a presubmit seat is a later pull request
-# that cites that record. Measured cost, presubmit redundancy and grading
-# something outside the core journeys keep a case here for good. The rule
+# WHAT BELONGS HERE. Every registered case that is not on the blocking
+# roster and has a fixture. Since 2026-09-22 (#1023, the eval crew's call)
+# the presubmit runs the blocking roster and nothing else, so this file is
+# where a held-out case lives unless a coverage tracker seats it held out in
+# the presubmit file instead (the exception section at the foot of
+# presubmit-cases.txt: #2013, #2016): the seven cases the presubmit had been
+# running without letting them block moved here that day, each with its
+# hold-out reason as the # line above it (their own section of this file;
+# six remain there). This is
+# the default home for a new case too (decided 2026-09-15 on #1546 and
+# #1564): it lands here, the nightly builds its record in the evidence
+# store -- one data point a night, three repetitions -- and a presubmit
+# seat, which outside the held-out section is a roster seat, is a later
+# pull request that cites that record and edits both presubmit files at
+# once. Measured cost, presubmit
+# redundancy and grading something outside the core journeys keep a case
+# here for good. The rule
 # this file's predecessor carried -- a case that fails on a correct agent
 # stays commented out because the nightly appends to the evidence store --
 # is retired: a case that can only fail appends evidence that keeps it out
 # of the presubmit, which is what the record is for, and the ~10 minutes of
 # matrix it costs a night is bought back by the wider fan-out. The one case
 # that stays out is one whose fixture does not exist at all; it waits in the
-# validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
-# today that is obtainability-declared-intent-no-finding (#1341, needs a
-# second multi-replica workload as a role of its own plus a declaration
-# seeded in each pool project's *-infra repository), vcs-history-only-fact
-# (#1253, needs the git-access-ab/r200 branch pushed to every pool
-# project's GitOps repository) and scope-second-project-denied (#1865, needs
-# a second GCP project in scope per pool project).
+# validator's FIXTURE_NOT_READY allowlist with the issue that plants it;
+# that allowlist is the list, and each entry says what it waits for.
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
@@ -45,28 +52,104 @@
 # ~63min at its 1250s hint) and the nine this decision moved here, of which
 # eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
 # at three) and fleet-cost-idle-pool is a full cost audit priced with the
-# 900s audit band (~45min). 2026-09-16 added incident-triage-oom-event-probe
-# (#1023, ~45min at its measured 737s/599s/1357s). 2026-09-21 added #1103's
-# two tofu cases (ai-security-planted-model-audit ~73min at its 1450s hint,
+# 900s audit band (~45min). 2026-09-16 added three: incident-triage-oom-event-probe
+# (#1023, ~45min at its measured 737s/599s/1357s) and the consumer
+# migration's two (#1246 PR-2), measured on a live install rather than
+# priced: the resolver 1424s and the read-back 546-654s a repetition, ~100min
+# at three. 2026-09-21 added #1103's two tofu cases
+# (ai-security-planted-model-audit ~73min at its 1450s hint,
 # autoops-crashloop-config-triage ~45min at the 900s band; both serialize on
 # the infra lock with the two incumbents) and consistency-no-environment-label
 # (#1818, ~28min at its measured 381s/385s/880s -- a full fleet audit, and the
 # spread is the audit band's, not this case's, so it takes the 900s hint the
-# band uses rather than its mean). Forty-two cases, ~921-941min serial. The
+# band uses rather than its mean). 2026-09-22 moved
+# incident-triage-oom-event-probe from this file to the presubmit one (#1023):
+# the nightly runs both files, so it still runs it at the same price.
+# 2026-09-23 added upgrades-master-behind-offered-elsewhere (~45min at the 900s
+# band; its runs measured 327s-1191s, the audit band's spread again) and
+# gitops-drift-out-of-band-triage (#1827, ~45min at its 900s hint).
+# Forty-six cases, ~1111-1131min serial. 2026-09-25 adds the two
+# obtainability probes (#1841), unhinted and probe-shaped (~200s a
+# repetition, ~10min each at three): forty-eight cases, ~1131-1151min serial.
+# 2026-09-25 also added obtainability-planted-orphan-service (~45min at the
+# 900s band; tofu, so it serializes on the infra lock with the other tofu
+# cases). Forty-nine cases, ~1176-1196min serial. 2026-09-28 adds
+# bootstrap-discovery-fanout (~30min at its 600s hint; tofu, so it too
+# serializes on the infra lock): fifty-two cases across the two files,
+# counted from the lists, since the running totals above had fallen two
+# behind. The
 # periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
-# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
-# at its default 3 (#1491). At the ~1.15x the presubmit realised on
-# whole-job wall clock at parallelism 4 under daytime quota contention that
-# would be ~800-820min, over the deadline; 480m holds only if the nightly,
-# alone on the model quota at that hour and two lanes wider, realises ~1.9x
-# or better. Night one (2026-09-16, build 2100374258805903360, #1491)
+# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=8 (6 from #1491 until
+# oss-test-infra#2707, 2026-09-25; the arithmetic that follows was done at
+# six) and EVAL_REPETITIONS at its default 3. At the ~1.15x the presubmit
+# realised on whole-job wall clock at parallelism 4 under daytime quota
+# contention that would be ~1023-1040min, over the deadline; 480m holds only
+# if the nightly, alone on the model quota at that hour and two lanes
+# wider, realises ~2.4x or better. Night one (2026-09-16, build
+# 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the three additions are priced inside its headroom. The first nights after this change measure it:
+# so the twenty additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
 # means it truncates in-flight units, the EXIT trap still records what
 # completed -- but it is a truncated night.
+#
+# 2026-09-22, the seven held-out cases. The nightly's matrix does NOT grow:
+# it runs both files, and the seven were already in it through the presubmit
+# one, so it is still forty-two cases and 126 units at the same price
+# (counting #1818's drift audit, which landed beside this change). What
+# grows is this file's own share, from twenty-three cases (69 units) to
+# thirty (90), +21 units: at their hints (178s, 200s x4, 700s x2) about
+# 120 serial minutes, at their measured presubmit medians (the canary's is
+# 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
+# 2026-09-29: the canary returned to the presubmit file held out (#2013) and
+# pdb-remediation-pr moved there held out beside it (#2016, seat opened
+# 2026-09-28), so this file's share was thirty-eight cases (114 units) of the
+# fifty-two-case, 156-unit matrix before the declared-intent addition below; the
+# nightly runs both files, so its matrix and its price do not change.
+# fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
+# fifty-three-case, 159-unit matrix, +3 units, and
+# platform-worker-refuses-shipped-skill-edit forty (120) of fifty-four (162),
+# +3 more: one delegation round trip at the 200s default.
+# Counted from the lists, since the totals above had fallen one behind
+# (vcs-spent-branch-reuse's paragraph re-used fifty-two):
+# first-install-hello-running and -done (listed earlier in the file) make
+# it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
+# fixture. chat-voice-ack-names-target (the last entry below) makes it
+# forty-four (132) of fifty-eight (174), +3 more: one front-door turn plus
+# the card round trip.
+# Whether the worst night fits is a question about the whole matrix, and the
+# six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
+# answer it plainly: 1734-2693 serial minutes of work at a realised
+# 5.4-5.8x over parallelism 6, so 5h39m on the lightest night and the Prow
+# deadline on the two heaviest (09-18 and 09-21, 8h00m, nothing recorded).
+# The worst measured night does not fit at parallelism 6 today, and this
+# edit adds nothing to it. oss-test-infra#2707 (merged 2026-09-25) moved the
+# periodic to EVAL_TASK_PARALLELISM=8, at which the worst night's 2693 serial
+# minutes project to ~5.6h of fan-out plus ~20 minutes of build and deploy,
+# inside 480m with about two hours to spare; the nights before it a heavy
+# night was a truncated night, whichever file its cases were listed in.
+# The seven now record one data point a night here where they recorded ten
+# to sixty a day in the presubmit; the admission edit for any of them cites
+# this record, so the record is thinner and the wait is longer by design.
+#
+# 2026-09-23 adds cluster-agent-delegation-profile-lookup (#1840): one case,
+# three units, ~36 serial minutes at its 720s hint (four clean dev-install
+# repetitions measured 710-1325s). With the 2026-09-23 additions above it
+# grows the matrix to fifty cases and 150 units, ~1212-1232 serial
+# minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-29 adds vcs-spent-branch-reuse (#1918): one case, three units,
+# ~50 serial minutes at its 1000s hint (three dev-install repetitions
+# measured 587-1512s, 937s the middle one). It grows the matrix to
+# fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
+# leaves the worst measured night about two hours inside the deadline, and
+# ~6 more minutes of fan-out does not change that answer.
+# 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
+# three units, measured 209-1317s a repetition on its green presubmit run, so
+# this file's share is forty-five cases (135 units) of a fifty-nine-case,
+# 177-unit matrix (with the presubmit file's fourteen).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -109,7 +192,11 @@
 # its citation check was widened) and moved here on 2026-09-09: knowledge
 # grounding is a cross-cutting persona behavior, not one of the core
 # journeys the presubmit gate exists for, so it earns its record in the full
-# catalog instead. Priced at 600s in unit_cost_hint.
+# catalog instead. Priced at 600s in unit_cost_hint. #1765 gave it two
+# measured presubmit builds (2102459327938826240, 2102768495748976640) for
+# its new answer_query safeguard through a temporary seat reverted before
+# merge, the incident-triage-oom-event-probe shape; the seat's record is in
+# that pull request and the case's header.
 ./tasks/knowledge-grounding-sources-probe/task.yaml
 
 # The silence case for the gke-stall-detection skill (#1342), in the
@@ -133,23 +220,22 @@
 #   -- pdb-remediation-pr: 7/9 across the same builds; the two misses are
 #      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
 #      980-1929s a repetition on 2026-09-14; priced at 1250s in
-#      unit_cost_hint.
+#      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
+#      its held-out seat in presubmit-cases.txt opened (#2016 step 2). That
+#      file carries its record under both checks (12/12 under
+#      report_contains on the four graded nights 2026-09-16 to 09-20;
+#      nothing on any graded night under pull_request_opened, #1780) and the
+#      miss shape the seat counts as the case's own; this file never lists a
+#      presubmit case twice. With rca-remediation-pr below still nightly,
+#      the remediation domain has no roster case and sits on the
+#      docs/designs/domains.yaml allowlist until #2016 step 4.
 ./tasks/chat-routing-board-read/task.yaml
-./tasks/pdb-remediation-pr/task.yaml
 
-# #1023's incident-triage second case, nightly from the start (2026-09-15):
-# the presubmit-eligible probe the domains.yaml allowlist entry asks for. The
-# prompt is the watcher's warning payload in the _triage_task_body shape,
-# pointed at the seeded fleet's payments-api crashloop (role
-# crashloop-workload) -- deployer: noop, no infra lock, no watcher or card
-# wait, unlike autoops-warning-event-triage above. It grades the delivery
-# contract (`What to do` plus an option letter or `To authorize:`) that
-# #1101 measured the agent failing and that no presubmit case grades.
-# Measured GREEN 3/3 in the authoring pull request's presubmit (build
-# 2099969322708373504, through a temporary presubmit seat reverted before
-# merge): 737s/599s/1357s a repetition, so it is priced at 700 in
-# unit_cost_hint, not the 200s default.
-./tasks/incident-triage-oom-event-probe/task.yaml
+# #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
+# here from 2026-09-15 until 2026-09-22, when it moved to presubmit-cases.txt
+# on the record it built here (10/12 on the four graded nights 09-16 to
+# 09-20); that file carries the record, and this file never lists a
+# presubmit case twice.
 
 # #1023's fleet-audits and incident-triage second cases (#1103), nightly
 # from the start (2026-09-15; written into this file on 2026-09-21, when the
@@ -181,6 +267,62 @@
 # against the install's own unlabelled host cluster beside the labelled
 # seeded trio. Its domain's presubmit seat stays with the probe.
 ./tasks/consistency-no-environment-label/task.yaml
+
+# The third tofu-provisioned case, and the drift half of incident triage
+# (#1827). It is here for the reason the two above it are, plus one of its
+# own. Cost: its stack takes the infra lock, plants a Deployment whose replica
+# count was taken out of band, hands the Session KV daemon the audit record
+# that change would have produced, and blocks until the resulting triage card
+# is on the board (bounded at 5 minutes) -- then the agent turn waits on the
+# card itself, as autoops does. Hinted at 900s with them, unmeasured.
+#
+# Its own reason is a ceiling the other two do not have. The daemon allows
+# ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install (5 by default) and
+# suppresses the rest, and a suppressed record files no card, so the case
+# cannot run more than that many times a day against one install whatever
+# tier it sits in. Three repetitions a night fit; a presubmit seat, at
+# several pull requests a day against the shared install, does not -- so this
+# case has a reason to stay nightly that no measurement will retire.
+#
+# `validated: false`, in step with every case in this file -- none sets it
+# true. It has been run: three runs against a dev install, all five
+# deterministic checks green in each, and two checks it shipped with were cut
+# because those runs showed they could not hold. What the nightly adds is a
+# record built without anyone watching, on an install nobody prepared for it.
+./tasks/gitops-drift-out-of-band-triage/task.yaml
+
+# Not yet observed in CI (`validated: false`). Delegation's route rather
+# than its answer: the crashloop-debug prompt and fixture, graded on a
+# Cluster Agent profile doing the delegated work (worker_agents) and on the
+# platform worker not running cluster_agent_profile.py, which the shell
+# sandbox stubs, or the deleted kanban_notify_propagate.py.
+./tasks/cluster-agent-delegation-profile-lookup/task.yaml
+
+# The patch stream's second full audit, nightly from the start (2026-09-23):
+# the same shape and 900s band as upgrade-readiness-lagging-cluster, grading
+# §3.1's severity on the version-laggard cluster, whose version has left its
+# channel's roster but is still served at its location. The collector
+# (`patch_readiness.py`) computes the route check.
+./tasks/upgrades-master-behind-offered-elsewhere/task.yaml
+
+# The obtainability stream's collector case, nightly from the start: a per-run
+# plant (`prebuilt/orphan-service`) of a ClusterIP Service whose selector
+# matches no pod, graded on §3.16 `service-selects-nothing` reaching the
+# ledger. The collector (`collect.py`) computes the check. Priced with the
+# 900s audit band.
+./tasks/obtainability-planted-orphan-service/task.yaml
+
+# The obtainability stream's declared-intent case (#1341 criterion 4, #1409):
+# notification-relay in seeded-intent (role declared-no-pdb-workload, a
+# second two-replica workload without a budget, so the declaration silences
+# none of the checkout-gateway cases) plus the knowledge/ note in every
+# pool project's *-infra repository that declares the posture, which
+# scripts/provision_ci_pool_project.sh seeds. Graded on the reply naming the
+# note and closing "missing-PDB findings: 0". Red on the smoke test before
+# the fixture and note existed (build 2104920166281252864, 0/3), green after
+# (build 2104979469071552512, 3/3, 209-1317s), both on this case's bench
+# pull request. deployer: noop, read-only over the seeded fleet.
+./tasks/obtainability-declared-intent-no-finding/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
@@ -250,3 +392,116 @@
 # than a cluster-agent one because AGENT_SERVICE_NAME is a single global
 # target (A2), which shapes what the case asserts rather than blocking it.
 ./tasks/cluster-agent-crashloop-fix-request/task.yaml
+
+# The consumer migration's two cases (#1246 PR-2). Both write to the eval
+# GitOps repository -- an issue apiece for the first, a pull request apiece
+# for the second -- on the same terms rca-remediation-pr already holds a
+# presubmit seat under: a throwaway repository we own and a token scoped to
+# it. Here rather than the presubmit on cost: each drives a full skill
+# procedure (poll, claim, investigate, transition; prepare, two submits, a
+# read-back) rather than a probe. Measured on `dev-vcs2-20260915a`: the
+# resolver 1424s, the read-back 546-654s. Only the read-back is red on main;
+# the resolver passes there too and is kept as a regression guard over the
+# largest consumer this migration rewrites -- each task.yaml header says
+# which it is and shows its run ids. Priced at 1400 and 700 respectively in
+# unit_cost_hint, so the resolver -- the most expensive unit in the nightly --
+# launches in the first cost tier rather than the last.
+./tasks/vcs-issue-resolver-triage/task.yaml
+./tasks/vcs-review-feedback-read-back/task.yaml
+# A second proposal under a spent branch name (#1918): open and close one
+# pull request, then open another on the same branch: two pull requests a
+# repetition on the throwaway repository, one of them left closed. Priced at
+# 1000s in unit_cost_hint.
+./tasks/vcs-spent-branch-reuse/task.yaml
+
+# ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
+# The seven cases the presubmit ran without letting them block, when the
+# eval crew decided the presubmit runs the blocking roster and nothing else.
+# Six remain here; compliance-rbac-overgrant went back to the presubmit file
+# held out on 2026-09-29 (#2013), the documented exception. None was
+# admitted; each # line is the hold-out reason as it stood that day, with
+# the case's presubmit record from #1626's merge to the move (graded
+# repetitions in the dashboard's data.json, 2026-09-15 to 09-22, 734 runs)
+# so the nightly record starts from a known point. The admission edit for any
+# of them moves its line back to presubmit-cases.txt and onto
+# blocking-roster.txt in one pull request, citing the record built here.
+
+# Never admitted: the security prompt variation (#1066, presubmit from
+# 2026-09-01), new and earning its record. 680/688 graded presubmit
+# repetitions in the window (98.8%), the cleanest of the seven; measured
+# 178s a repetition (build 2094466401401049088), the 200s default fits it.
+./tasks/security-overgrant-remediation-proposal/task.yaml
+
+# Never admitted: #1049's three reliability activations (presubmit from
+# 2026-08-31), each grading a behavior nothing else grades -- PDB semantics,
+# fleet-wide discovery, silence on a PDB-clean namespace -- against the same
+# no-pdb-workload fixture, probe-shaped at the 200s default. The window says
+# why none had a roster seat: pdb-semantics 600/685 (87.6%),
+# fleet-exposure-sweep 491/679 (72.3%), healthy-namespace-silence 69/684
+# (10.1%) -- the silence case fails on a correct agent today, and its header
+# carries the #984 history; the record here is what shows a fix landing.
+./tasks/obtainability-pdb-semantics/task.yaml
+./tasks/obtainability-fleet-exposure-sweep/task.yaml
+./tasks/obtainability-healthy-namespace-silence/task.yaml
+
+# Demoted 2026-09-02 on #1189 (rung-4 collapses on six unrelated pull
+# requests in one day; the suite's longest delegation chain integrates over
+# every environment fault in its window). One of the remediation domain's two
+# writers -- it files a pull request through submit-suggestion on every
+# repetition -- and, since #1780 (merged 2026-09-21), graded by
+# pull_request_opened, which rejects a pull request last written before the
+# run started; nothing sweeps the *-infra repositories between runs (#1755
+# item 2), and on #1780's own head it went 0/3 on a leftover. 434/681
+# (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
+./tasks/rca-remediation-pr/task.yaml
+
+# Held out on #1010 (the delegation receipt graded as the answer -- fixed by
+# #1174 on 2026-09-03 for the capacity probe, but this case's record after
+# the fix was never re-derived) since it activated on 2026-08-26 (#982), the
+# third of that pull request's cluster-debugging family; its two siblings
+# hold roster seats. The false-alarm case: nothing is wrong at runtime and
+# the right answer says so. 566/674 (84.0%) in the window; ~220s a
+# repetition, the 200s default. Enters when a re-derived record clears the
+# bar in docs/eval-gate-roster.md.
+./tasks/cluster-agent-healthy-workload-no-finding/task.yaml
+
+# A simple case that can run on kind.
+./tasks/chat-routing-own-cluster-namespaces/task.yaml
+
+# The two obtainability-journey probes: CUJ1's Day-0 design discipline and
+# CUJ3's Day-2 window planning, graded on the report and the worker
+# commands through the eval harness (their live siblings under bench/cuj/
+# need a full install and stay manual). Both probe live GCP advice APIs in
+# the eval project; neither reads the seeded fleet. `validated: false`
+# until their first observed runs.
+./tasks/obtainability-design-quota-vs-capacity/task.yaml
+./tasks/obtainability-window-planning-probe/task.yaml
+
+# The onboarding discovery sweep's fan-out (#1872): re-arms the
+# bootstrap-inventory-scan gate on the install under test and grades the
+# cards the sweep's worker files against the Cluster Agent roster. Nightly
+# rather than presubmit because the fan-out's cards take dispatcher slots
+# from whatever else is running.
+./tasks/bootstrap-discovery-fanout/task.yaml
+
+# The first-install hello, both variants: the greeting's shape (one message,
+# kube-agents, read-only, results in this chat, changes as pull requests, one
+# question) over the bootstrap_onboarding plugin's eval seam, which
+# prebuilt/first-install-hello arms per case. No fixture; the host install only.
+./tasks/first-install-hello-running/task.yaml
+./tasks/first-install-hello-done/task.yaml
+
+# The fleet-audit report store's reader: a user's question about a past
+# audit, graded on the route (the worker queried the store through the
+# fleet-audit-reports skill) and on nothing being run or published. Reads
+# no fixture; the store holds whatever the install's streams last wrote.
+./tasks/fleet-audit-reports-past-run/task.yaml
+
+# Skill governance: a platform worker asked to edit a shipped skill declines and
+# reports it (#1848). Read-only, transcript-graded, one delegation round trip.
+./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
+
+# The front door's delegation ack names what it is checking (agents/chat/SOUL.md
+# §2, step 4). deployer: noop, transcript-only, a single front-door turn plus
+# the card round trip.
+./tasks/chat-voice-ack-names-target/task.yaml

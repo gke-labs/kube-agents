@@ -1,0 +1,99 @@
+# Registered in hack/eval/nightly-cases.txt.
+#
+# Domain: capacity (capacity-obtainability skill, Future windows section).
+# Journey: CUJ3's Day-2 batch window planning through the kanban path — a
+# deadline-bound TPU job must be planned from live
+# `gcloud beta compute advice calendar-mode` evidence: the probe executed per
+# candidate region with the chips-per-node conversion stated, a ranked
+# window recommendation (or an honest per-zone "no window"), and the paired
+# ProvisioningRequest + LocalQueue. The live sibling is
+# bench/cuj/obtainability/test_03_workload_obtainability_planning.py, which
+# needs a full install and grades the portal projection; this case grades
+# the same behavior's report through the eval harness, so a regression
+# shows in the nightly record (a nightly-only case cannot red a presubmit).
+#
+# The window verdict is live capacity weather: the report may honestly find
+# no window in a zone (v5e is a thin pool), so no check here demands one.
+# What is deterministic is the probe running, the chip arithmetic being
+# stated, the manifests being generated, and no guarantee being claimed.
+#
+# Planted defect required: none — the case probes the live advice API in the
+# eval project and grades the report's discipline, not a fixture.
+# Isolation class: read-only (planning only; nothing created or applied).
+# Tier: nightly (new case; presubmit admission is earned on record).
+id: obtainability-window-planning-probe
+name: Batch window plan probes calendar mode and pairs its manifests
+prompt: >-
+  Plan a 16-node TPU v5e training job that must run for 12 hours and finish
+  within the next 48 hours. Evaluate us-central1-a and europe-west4-b using
+  live compute.beta.AdviceService.CalendarMode evidence, rank the predicted
+  capacity windows, and recommend an exact UTC start time and zone — or
+  state honestly, per zone, that no window exists inside the horizon.
+  Generate a Dynamic Workload Scheduler ProvisioningRequest and a paired
+  Kueue LocalQueue targeting the recommendation. This is planning-only: do
+  not apply manifests, submit a provisioning request, create
+  infrastructure, or mutate Kubernetes or cloud state.
+expected_output: >-
+  The agent loads capacity-obtainability's Future windows section and runs
+  `gcloud beta compute advice calendar-mode` once per candidate region with
+  the day-floor duration range and a start-time range that ends the job
+  inside the horizon, converting 16 v5e nodes to 64 chips and saying so. The
+  report ranks the returned windows (or names each zone's status when none
+  returns), recommends an exact UTC start or an honest no-window verdict,
+  claims no guarantee, and carries a queued-provisioning.gke.io
+  ProvisioningRequest and a Kueue LocalQueue paired to the recommendation.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: capacity
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+verification_spec:
+  - name: the-calendar-mode-probe-actually-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        # gcloud enum flags accept lowercase values, and a live run was
+        # observed passing --tpu-version v5e -- the check pins the probe and
+        # its arithmetic, not the letter case of an enum. The two region
+        # patterns pin "once per candidate region": without them, one call
+        # against a single region satisfies the shape patterns and the
+        # dropped-second-region regression ships green.
+        - "gcloud beta compute advice calendar-mode .*--tpu-version[ =][Vv]5[Ee]"
+        - "advice calendar-mode .*--chip-count[ =]64"
+        - "advice calendar-mode .*--region[ =]us-central1"
+        - "advice calendar-mode .*--region[ =]europe-west4"
+  - name: report-states-the-chip-conversion
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # "64" alone is satisfied by the record's own "86400s" duration and
+      # "chips" by the manifest comment; the conversion statement is the
+      # count and the unit together.
+      any_of_phrases:
+        ["64 chips", "64 v5e chips", "64 tpu chips", "= 64", "chip count of 64"]
+  - name: report-delivers-a-window-verdict
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["UTC", "no window", "NO_CAPACITY", "NOT_SUPPORTED"]
+      # Same shape as the design case: the banned word, negated uses allowed.
+      forbidden_patterns:
+        - "(?:^|\\n|[.!?](?=\\s|$))(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$)))*guarant|\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b(?:(?!\\b(?:no|not|never|cannot|can'?t|don'?t|didn'?t|does not|doesn'?t|is not|isn'?t|was not|wasn'?t|were not|weren'?t|aren'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|without|nothing|none|neither|nor|unable to|rather than|non(?=-?guarant))\\b)(?:[^.!?\\n]|[.!?](?!\\s|$))){60,}guarant"
+  - name: report-carries-the-paired-manifests
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        - "ProvisioningRequest"
+        - "queued-provisioning.gke.io"
+        - "LocalQueue"

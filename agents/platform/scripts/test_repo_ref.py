@@ -58,6 +58,12 @@ class ParseTest(unittest.TestCase):
         ref = repo_ref.parse("github.com/acme/toolkit")
         self.assertEqual((ref.host, ref.path), ("github.com", "acme/toolkit"))
 
+    def test_a_doubled_separator_after_a_lifted_host_is_trimmed(self):
+        # As it is after a URL's host; repo_ref.go reads it the same way.
+        for value in ("github.com//acme/toolkit", "github.com//acme/toolkit/"):
+            ref = repo_ref.parse(value)
+            self.assertEqual((ref.host, ref.path, ref.host_inferred), ("github.com", "acme/toolkit", True))
+
     def test_an_unknown_first_segment_stays_in_the_path(self):
         """`my.org` is a legal owner in the bare form; it must not read as a host."""
         ref = repo_ref.parse("my.org/toolkit")
@@ -68,9 +74,9 @@ class ParseTest(unittest.TestCase):
 
         Without the refusal, `file:///github.com/o/r` splits to an empty host
         and a path the lift then reads as a GitHub remote, while
-        `file:///gitlab.com/g/p` yields a hostless ref that
-        `forge.provider_for` maps to `GitHubProvider` — one URL admitted as a
-        forge it is not, and one routed to the wrong provider in silence.
+        `file:///gitlab.com/g/p` yields a hostless ref the broker's registry
+        hands to the install's default forge — one URL admitted as a forge it
+        is not, and one routed to the wrong forge in silence.
         """
         for value in (
             "file:///github.com/acme/toolkit",
@@ -85,6 +91,12 @@ class ParseTest(unittest.TestCase):
         self.assertIsNotNone(repo_ref.SEGMENT_RE.fullmatch(".."))
         with self.assertRaises(repo_ref.RepoRefError):
             repo_ref.parse("../..")
+
+    def test_a_git_segment_is_refused_not_trimmed_away(self):
+        for value in ("acme/.git", ".git", "acme/toolkit/.git", "acme/.git.git"):
+            with self.subTest(value=value), self.assertRaises(repo_ref.RepoRefError):
+                repo_ref.parse(value)
+        self.assertEqual(repo_ref.parse("acme/toolkit.git").path, "acme/toolkit")
 
     def test_leading_dash_would_be_parsed_as_a_flag(self):
         with self.assertRaises(repo_ref.RepoRefError):

@@ -94,8 +94,15 @@ unset in every configuration.
 The broker authenticates every caller. A caller presents an audience-bound projected ServiceAccount
 token (one hour; the audience is per pod, `kubeagents-credential-proxy` for the sandbox and
 `kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the broker verifies
-it with a `TokenReview` before serving any path but `/healthz`; `CREDENTIAL_PROXY_ALLOWED_CALLERS`
-names the ServiceAccounts allowed to call. Three properties do not follow from that. The
+it with a `TokenReview` before serving any path on that listener but `/healthz`;
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP
+listener in the pod is the runtime's metrics-only one on 8766, unauthenticated like
+`/healthz`: it serves Prometheus counters whose label values are static enums and closed
+vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
+time with a ten-second deadline on each, and is the one port the broker's
+NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
+collector runs, and to no other peer
+([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount and the sandbox's and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a
 multi-tenancy control rather than an agent-containment one.
@@ -121,18 +128,15 @@ about the allowlist's own contents.
 **It blocks nothing at all today.** Adding a NetworkPolicy is monotone: policies selecting one Pod
 are unioned, the API has no deny rule, and the agent Pod is already selected for egress by
 `<agent>-gateway-netpol`, which the operator renders whenever `spec.networkPolicy.enabled` is left at
-its default (set it to `false` and the gateway policy is withheld instead — on a Helm install the
-allowlist is then the Pod's only policy and really does default-deny on an enforcing CNI; a Kustomize
-install still carries the static `platform-agent-core-egress` set over the same Pod). So enabling
+its default (set it to `false` and the gateway policy is withheld instead; the allowlist is then the
+Pod's only policy and really does default-deny on an enforcing CNI). So enabling
 `egressPolicy: Allowlist` leaves the Pod's permitted egress a strict superset of what it was — wider
 by the credential broker on TCP 8765, and wider also by the managed collector namespace on 4317/4318
 when the agent is not exporting telemetry, since the gateway policy drops its own OTel rule in that
 case. It cannot take a destination away. The gateway policy permits `169.254.169.254/32` on TCP 80 and on port
 53, plus the discovered metadata-daemon port (`988` by default) to both link-local metadata
 addresses, so the metadata path stays open, and it permits TCP 443 to `0.0.0.0/0` minus the private
-ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half stays open too. A Kustomize
-install adds `platform-agent-core-egress`, which permits the same metadata path; it changes nothing
-either way.
+ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half stays open too.
 
 The field is therefore a rendered, auditable statement of the destinations the agent is supposed to need, plus the refusal rules and the reconcile behaviour that a real control will need — not a control. Narrowing `<agent>-gateway-netpol`, which still permits the metadata path, is what turns it into one. Two conditions the operator will not be able to enforce even then: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and any other policy an administrator adds re-opens whatever it permits. The capability cost — the agent's DuckDuckGo web search, the `browser` toolset, the `gke` and `developer_knowledge` MCP servers, and direct `github.com` access from the sandbox — falls due at that point and not before; none of it is lost today, because the gateway policy still permits every one of those destinations.
 

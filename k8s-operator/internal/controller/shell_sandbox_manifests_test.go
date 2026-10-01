@@ -468,6 +468,34 @@ func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	}
 }
 
+func TestShellSandboxHostContextAndGKEEnv(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID:   "test-project",
+		Location:    "us-central1-c",
+		ClusterName: "test-cluster",
+	}
+
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+	envMap := make(map[string]string)
+	for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+		envMap[env.Name] = env.Value
+	}
+
+	if got := envMap["GKE_PROJECT_ID"]; got != "test-project" {
+		t.Errorf("GKE_PROJECT_ID = %q, want test-project", got)
+	}
+	if got := envMap["GKE_CLUSTER_NAME"]; got != "test-cluster" {
+		t.Errorf("GKE_CLUSTER_NAME = %q, want test-cluster", got)
+	}
+	if got := envMap["GKE_LOCATION"]; got != "us-central1-c" {
+		t.Errorf("GKE_LOCATION = %q, want us-central1-c", got)
+	}
+	if got := envMap["KUBE_CONTEXT_NAME"]; got != "gke_test-project_us-central1-c_test-cluster" {
+		t.Errorf("KUBE_CONTEXT_NAME = %q, want gke_test-project_us-central1-c_test-cluster", got)
+	}
+}
+
 func TestShellSandboxServiceIsHeadlessAndPublishesTheStableName(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	svc := buildShellSandboxService(agent)
@@ -1208,11 +1236,12 @@ func TestSandboxWrappersPostToTheBrokerService(t *testing.T) {
 	}
 }
 
-func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testing.T) {
-	// The standalone pod holds every credential the install has, and its endpoint
-	// authenticates no caller — so this policy is the whole boundary in front of
-	// it. Untested, a refactor can widen it back to the namespace and nothing
-	// fails.
+func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(t *testing.T) {
+	// The standalone pod holds every credential the install has, so this policy
+	// is the whole boundary in front of its credentialed port. Untested, a
+	// refactor can widen it back to the namespace and nothing fails. The one
+	// peer from outside the namespace is the managed-Prometheus collector, and
+	// it is admitted to the metrics-only port alone.
 	agent := shellSandboxTestAgent()
 	np := buildCredentialProxyNetworkPolicy(agent)
 
@@ -1223,8 +1252,8 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testin
 		t.Fatal("an empty podSelector applies the policy to every pod in the namespace")
 	}
 
-	if len(np.Spec.Ingress) != 1 {
-		t.Fatalf("expected exactly one ingress rule, got %d", len(np.Spec.Ingress))
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected exactly two ingress rules (the callers, the collector), got %d", len(np.Spec.Ingress))
 	}
 	in := np.Spec.Ingress[0]
 	if len(in.From) != 2 {
@@ -1249,6 +1278,19 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testin
 
 	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
 		t.Errorf("expected ingress only on %d, got %#v", credentialProxyPort, in.Ports)
+	}
+
+	// The collector, on the metrics-only port and nothing else. A rule of its
+	// own rather than a third peer above: a peer on the first rule would reach
+	// the credentialed port, and that widening is what this test refuses.
+	scrape := np.Spec.Ingress[1]
+	if len(scrape.From) != 1 || scrape.From[0].NamespaceSelector == nil ||
+		scrape.From[0].NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"] != "gke-gmp-system" ||
+		scrape.From[0].PodSelector != nil || scrape.From[0].IPBlock != nil {
+		t.Errorf("expected the second rule to admit every pod in gke-gmp-system and nothing narrower, got %#v", scrape.From)
+	}
+	if len(scrape.Ports) != 1 || scrape.Ports[0].Port.IntValue() != int(credentialProxyMetricsPort) {
+		t.Errorf("expected the collector admitted on %d alone, got %#v", credentialProxyMetricsPort, scrape.Ports)
 	}
 }
 
