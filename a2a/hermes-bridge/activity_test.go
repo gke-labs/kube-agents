@@ -432,6 +432,20 @@ func TestRedactInput(t *testing.T) {
 	}
 }
 
+// The entry's other fields are bounded from the delivery: a long tool name,
+// call id or timestamp cannot make a part the size of the door's body cap.
+func TestActivity_EntryFieldsAreBounded(t *testing.T) {
+	a, _ := newActivityState(false, InputValuesShape)
+	long := strings.Repeat("n", 4096)
+	var d hookDelivery
+	d.Event, d.ToolName, d.Timestamp = hookPostToolCall, long, long
+	d.Extra.ToolCallID, d.Extra.Status = long, "ok"
+	e, ok := a.observe(d)
+	if !ok || len(e.Tool) != activityToolNameCap || len(e.CallID) != activityCallIDCap || len(e.At) != activityWordCap {
+		t.Fatalf("entry fields not bounded: ok=%v tool=%d callId=%d at=%d", ok, len(e.Tool), len(e.CallID), len(e.At))
+	}
+}
+
 // A fractional duration_ms (a Python emitter's 12.5) is one field's shape,
 // not a reason to drop the delivery.
 func TestActivity_FractionalDurationIsRead(t *testing.T) {
@@ -589,15 +603,15 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // name-like fields a grader reads stay, so a tool_call wrapper still names
 // its calls and a terminal command's text is a length.
 func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
-	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"AKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `"}`
+	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"QKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `","tool":"mcp__gke__list_clusters","kind":"PodDisruptionBudget","location":"projects/p/locations/northamerica-northeast1","skill":"QKIAIOSFODNN7EXAMPLE","project":"9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f","agent":"xoxq-1234567890-abcdefghijklmnop"}`
 	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
 		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
-		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "AKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129)} {
+		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "QKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129), "9f3c2a1b7d9f3c2a1b7d", "xoxq-"} {
 			if strings.Contains(out, leaked) {
 				t.Fatalf("mode %q published a free-text value %q: %s", mode, leaked, out)
 			}
 		}
-		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"\u003cstring, 3 chars\u003e"`, `"name":"kanban_create"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
+		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"\u003cstring, 3 chars\u003e"`, `"name":"kanban_create"`, `"tool":"mcp__gke__list_clusters"`, `"kind":"PodDisruptionBudget"`, `"location":"projects/p/locations/northamerica-northeast1"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
 			if !strings.Contains(out, kept) {
 				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
 			}

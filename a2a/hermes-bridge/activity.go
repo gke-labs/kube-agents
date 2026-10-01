@@ -123,6 +123,12 @@ const (
 	// for any argument object a grader would read and small beside the
 	// stream's per-message ceiling.
 	activityInputCap = 2048
+	// The entry's other fields, copied from the delivery, are bounded too:
+	// a part is small beside the stream's ceiling whatever the delivery
+	// carried (the door reads up to activityBodyCap).
+	activityToolNameCap = 256
+	activityCallIDCap   = 128
+	activityWordCap     = 64
 	// activityInputHead is how much of an over-cap input survives, as text.
 	activityInputHead = 1024
 	// hermesToolCallWrapper is hermes's batching tool: one call whose input
@@ -322,14 +328,34 @@ var shapeKeptKeys = map[string]bool{
 }
 
 // shapeKeptValuePattern is the shape a kept value must have to survive:
-// one identifier, no whitespace, no quotes, no ':' or '@' (a user:pass@host
-// is neither), at most shapeKeptValueMax characters. A manifest body under
-// "name", a token-length blob, anything with a space in it is shaped like
+// a resource name, which is lowercase words joined by ._/- (seeded-a,
+// kube-system, mcp__gke__list_clusters, projects/p/locations/l) or a
+// Capitalised word or two (Deployment, PodDisruptionBudget), at most
+// shapeKeptValueMax characters. No ':' or '@' (a user:pass@host is
+// neither), no mixed-case or digit-heavy token: an AKIA... key, a hex
+// secret, an xoxb- token are not names, so shapeTokenRunPattern shapes any
+// value with a long word, a long digit run or an all-hex body. A
+// manifest body under "name", anything with a space in it, is shaped like
 // every other string, so the kept keys are a list of places identifiers
 // live and not a hole.
-var shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+var (
+	shapeKeptValuePattern = regexp.MustCompile(`^(?:[a-z0-9]+(?:[._/-][a-z0-9_]+)*|[A-Z][a-z]+(?:[A-Z][a-z]+)*)$`)
+	// A lowercase word of sixteen or more characters, a run of eight or
+	// more digits, or an all-hex body is a token's shape, not a name's
+	// (xoxb-1234567890-..., a hex secret): the words of a resource name are
+	// short, and a CamelCase kind is several short words.
+	shapeTokenRunPattern = regexp.MustCompile(`[a-z0-9]{16,}|[0-9]{8,}|^[a-f0-9]{20,}$`)
+)
 
 const shapeKeptValueMax = 128
+
+// capRunes cuts s to at most n bytes at a rune boundary.
+func capRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return chunkString(s, n)[0]
+}
 
 // shapeOf is what a free-text value becomes under shape mode.
 func shapeOf(s string) string {
@@ -338,7 +364,8 @@ func shapeOf(s string) string {
 
 // keptUnderShape says whether a string under key is published as it is.
 func keptUnderShape(key, s string) bool {
-	return shapeKeptKeys[strings.ToLower(key)] && len(s) <= shapeKeptValueMax && shapeKeptValuePattern.MatchString(s)
+	return shapeKeptKeys[strings.ToLower(key)] && len(s) <= shapeKeptValueMax &&
+		shapeKeptValuePattern.MatchString(s) && !shapeTokenRunPattern.MatchString(s)
 }
 
 // ActivityEntry is one data part of the activity artifact: one tool
@@ -489,10 +516,10 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			a.openOrder = append(a.openOrder, id)
 		}
 		a.open[id] = ActivityEntry{
-			Tool:   d.ToolName,
+			Tool:   capRunes(d.ToolName, activityToolNameCap),
 			Input:  redactInput(a.inputValues, d.ToolName, d.ToolInput),
-			CallID: d.Extra.ToolCallID,
-			At:     d.Timestamp,
+			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
+			At:     capRunes(d.Timestamp, activityWordCap),
 		}
 		return ActivityEntry{}, false
 	case hookPostToolCall:
@@ -503,15 +530,15 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		a.calls++
 		status := activityStatus(d)
 		e := ActivityEntry{
-			Tool:       d.ToolName,
+			Tool:       capRunes(d.ToolName, activityToolNameCap),
 			Input:      redactInput(a.inputValues, d.ToolName, d.ToolInput),
-			CallID:     d.Extra.ToolCallID,
+			CallID:     capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
-			At:         d.Timestamp,
+			At:         capRunes(d.Timestamp, activityWordCap),
 		}
 		if status == ActivityStatusError {
-			e.ErrorType = activityErrorType(d)
+			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
 		return e, true
 	}
