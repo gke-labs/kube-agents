@@ -213,9 +213,9 @@ jobs:
       # FROM the platform-agent image this same job pushed under this commit's
       # tag, never a registry default (a2a/Dockerfile.hermes-bridge refuses to
       # build without the arg). Hence its place after the platform step. The
-      # operator derives the three it renders from the agent image it resolves
-      # (its registry and tag), so the tags here are what a next install at
-      # this commit pulls.
+      # operator derives the three it renders from its own image, else from
+      # the agent image it resolves (registry and tag), so the tags here are
+      # what a next install at this commit pulls.
       - name: Build and Push A2A Gateway (GHCR)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: build-a2a-gateway

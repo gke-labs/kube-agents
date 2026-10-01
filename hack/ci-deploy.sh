@@ -97,8 +97,8 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # script behaves exactly as it did before the flag existed.
 #
 # What the flag has to do, and where:
-#   - section 2a refuses it on the release-candidate path (no A2A images are
-#     published to point the operator at) and section 2b refuses it on a Prow
+#   - section 2a refuses it on the release-candidate path (that path builds
+#     no bridge sidecar and declares none from the release) and section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the next-lane jobs
 #     named below (a mis-set variable on the nightly or a postsubmit would
 #     otherwise run that job in next mode, recording and publishing nothing,
@@ -744,8 +744,10 @@ else
   # one above. Empty otherwise, so the command below is byte-for-byte what it
   # was. The three references go to the operator through operator.extraEnv
   # in step 5: the operator reads its A2A image overrides from its own
-  # environment and otherwise derives the released images from the agent
-  # image it resolves, which is not this pull request's build. The same
+  # environment; without them it would derive the same three references
+  # from its own image (the operator image is this build's, under the same
+  # repository and tag), so the overrides are belt and braces that keep the
+  # deploy's inputs explicit and byte-pinned by the tests. The same
   # value list arms the gateway's inject door, which the operator likewise
   # reads from its own environment and never from the CR (a2aInjectBackendEnvVar
   # says why): without it there is no Service for the eval's transport to

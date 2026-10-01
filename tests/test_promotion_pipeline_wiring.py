@@ -784,9 +784,13 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
 
     _RELEASE_COMMON = _REPO_ROOT / "scripts" / "release" / "common.sh"
     # Both jobs tag through the downcased repository variable, so one shape
-    # reads every step's name.
-    _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([a-z0-9-]+):\$\{\{ github\.sha \}\}")
-    _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([a-z0-9-]+)@\$")
+    # reads every step's name. The name classes admit any repository-legal
+    # name (dots and underscores included), so an entry cannot slip out of
+    # all three lists at once by its spelling; the array's own entries are
+    # counted against the parsed names for the same reason.
+    _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([^/:\s]+):\$\{\{ github\.sha \}\}")
+    _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([^/@\s]+)@\$")
+    _ARRAY_ENTRY_RE = re.compile(r"^\s*\"([^\"\s]+)\"\s*$", re.M)
 
     def test_the_workflow_builds_and_signs_exactly_the_required_release_images(self):
         """The three lists this workflow and the release ladder share are kept by
@@ -798,7 +802,10 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         common = self._RELEASE_COMMON.read_text()
         block = re.search(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", common, re.S)
         self.assertIsNotNone(block, "REQUIRED_RELEASE_IMAGES not found in common.sh")
-        required = set(re.findall(r'"([a-z0-9-]+)"', block.group(1)))
+        entries = [line for line in block.group(1).splitlines() if line.strip()]
+        required = set(self._ARRAY_ENTRY_RE.findall(block.group(1)))
+        self.assertEqual(len(required), len(entries), "an entry of REQUIRED_RELEASE_IMAGES was not read (unquoted, or two on one line)")
+        self.assertTrue(required)
         built = set()
         signed = []
         for job in self.jobs.values():
