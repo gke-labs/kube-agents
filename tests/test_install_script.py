@@ -7678,13 +7678,21 @@ class DomainScopedFlagsTest(unittest.TestCase):
     def test_a_spelling_only_bash_sees_still_counts_as_recorded(self):
         """One reader decides both "does the file record it" and "as what".
 
-        These three lines all assign the key, and none of them match the
+        These three lines all assign the key. Two of them defeat the
         `^[[:space:]]*(export[[:space:]]+)?KEY=` pattern the guard used to test
-        presence with. While the value came from sourcing and presence came
-        from that pattern, a file recording exactly the flagged value earned
-        `records no ENABLE_DRIFT_DETECTOR` on every flagless run, followed by
-        the destroyed-ingress consequence for a reversal the next run cannot
-        perform — it re-reads the same line.
+        presence with: the key second on one `export`, and a plain assignment
+        after a `;`. While the value came from sourcing and presence came from
+        that pattern, a file spelled either way and recording exactly the
+        flagged value earned `records no ENABLE_DRIFT_DETECTOR` on every
+        flagless run, followed by the destroyed-ingress consequence for a
+        reversal the next run cannot perform — it re-reads the same line.
+
+        The third, a leading-whitespace assignment, does match that pattern:
+        `^[[:space:]]*` admits it. It is in the list anyway, because the claim
+        is that one reader answers both halves for every spelling bash accepts
+        — which has to include the spellings the grep already got right. A
+        reader that bought the first two by losing this one would not be an
+        improvement, and nothing else here would catch that.
 
         Three spellings are deliberately not in the list, for three reasons.
         `declare -x` assigns a local inside the function both live readers
