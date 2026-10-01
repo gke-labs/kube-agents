@@ -646,6 +646,11 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
 			}
 		}
 	}
+	// Under any other tool a calls[].name is the model's text, not a tool name.
+	other := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"calls":[{"name":"admin:hunter2@db"},{"name":"kanban_create"}]}`)))
+	if strings.Contains(other, "hunter2") || !strings.Contains(other, `"name":"kanban_create"`) {
+		t.Fatalf("calls[].name under a tool that is not the wrapper: free text must be shaped, an identifier may stay: %s", other)
+	}
 	full := string(redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(in)))
 	if !strings.Contains(full, `"note":"free text"`) || strings.Contains(full, "hunter2") {
 		t.Fatalf("full mode: %s", full)

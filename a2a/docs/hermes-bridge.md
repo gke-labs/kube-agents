@@ -332,7 +332,9 @@ all-caps-and-digits body, so an `AKIA...` key, a `ghp_` token or a hex secret un
 length like any other string while `mcp__gke__listClusters` or `PodDisruptionBudget` stays), which is all the graders read (a tool's name, a `tool_call`
 wrapper's `calls[].name`), so no free text rides the trace under any key; `full` publishes
 the values after the scrub described next, for a debug install that wants them, and is where
-the scrub's best-effort reach matters. In either mode `input` is capped (2 KiB): over the cap it becomes
+the scrub's best-effort reach matters. The door reads a delivery of at most 1 MiB; a larger one is refused and logged, and since the
+cut body cannot be verified the call it was for is absent from the trace (its `pre_tool_call`,
+if that arrived, ends `interrupted`). In either mode `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,

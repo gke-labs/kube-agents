@@ -694,7 +694,7 @@ func redactInput(mode, tool string, raw json.RawMessage) json.RawMessage {
 	}
 	red := redactValue(v)
 	if mode != InputValuesFull {
-		red = shapeValue(red, "")
+		red = shapeValue(red, tool)
 	}
 	out, err := json.Marshal(red)
 	if err != nil {
@@ -778,32 +778,33 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 // string becomes its shape unless its key is kept, with the structure,
 // numbers, booleans and nulls left as they are. A "[redacted]" marker stays
 // a marker, so the trace still says a secret-looking key was there.
-func shapeValue(v any, key string) any {
-	return shapeValueIn(v, key, "")
+func shapeValue(v any, tool string) any {
+	return shapeValueIn(v, "", "", tool == hermesToolCallWrapper)
 }
 
-// shapeValueIn is shapeValue with the enclosing key, so a tool name is known
-// as one: the "name" of an element of a "calls" array (hermes's tool_call
-// wrapper) is what a tool_called check reads and is kept whatever its
-// spelling, bounded like the entry's own tool; the identifier grammar is
-// for every other kept key.
-func shapeValueIn(v any, key, parent string) any {
+// shapeValueIn is shapeValue with the enclosing key and whether this input
+// is hermes's tool_call wrapper, so a tool name is known as one: in the
+// wrapper, the "name" of an element of the top-level "calls" array is what
+// a tool_called check reads and is kept whatever its spelling, bounded like
+// the entry's own tool. Under any other tool a "calls[].name" is the
+// model's text and is shaped; the identifier grammar is for the kept keys.
+func shapeValueIn(v any, key, parent string, wrapper bool) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			t[k] = shapeValueIn(val, k, key)
+			t[k] = shapeValueIn(val, k, key, wrapper)
 		}
 		return t
 	case []any:
 		for i := range t {
-			t[i] = shapeValueIn(t[i], key, parent)
+			t[i] = shapeValueIn(t[i], key, parent, wrapper)
 		}
 		return t
 	case string:
 		if t == redactedValue || keptUnderShape(key, t) {
 			return t
 		}
-		if key == "name" && parent == wrapperCallsKey {
+		if wrapper && key == "name" && parent == wrapperCallsKey {
 			return capRunes(t, activityToolNameCap)
 		}
 		return shapeOf(t)
@@ -1053,6 +1054,11 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, activityBodyCap+1))
 	if err != nil || len(body) > activityBodyCap {
+		// Cut at the cap, so the signature cannot verify and the task is
+		// not known here; the call this was for is absent from the trace
+		// (its pre, if it arrived, ends interrupted). Said in the log, since
+		// nothing else can say it.
+		b.cfg.Logger.Warn("activity delivery refused: over the body cap or unreadable", "bytes", len(body), "cap", activityBodyCap, "err", err)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

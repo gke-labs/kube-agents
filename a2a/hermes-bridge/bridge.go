@@ -737,7 +737,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
 			return
 		}
-		defer os.RemoveAll(scope)
+		defer func() {
+			// The scope holds the managed .env; a removal that fails leaves
+			// it in the shared scratch dir until the next start's sweep.
+			if err := os.RemoveAll(scope); err != nil {
+				b.cfg.Logger.Warn("child scope not removed", "task", run.origin.TaskID, "scope", scope, "err", err)
+			}
+		}()
 		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
 	}
 

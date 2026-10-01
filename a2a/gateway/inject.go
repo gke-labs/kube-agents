@@ -178,9 +178,10 @@ const (
 	// holds. It applies to what the GATEWAY posts, never to the prompt: the
 	// inbound text goes to the bus, not into this transcript.
 	injectMaxEntryBytes = 64 * 1024
-	// injectMaxEntryToolBytes bounds the tool name kept when an activity
-	// entry's bulk is not its input.
-	injectMaxEntryToolBytes = 256
+	// injectMaxEntryToolBytes and injectMaxEntryFieldBytes bound an activity
+	// entry's fields beside its input when the entry is over the bound.
+	injectMaxEntryToolBytes  = 256
+	injectMaxEntryFieldBytes = 128
 	// injectMaxActivityEntries bounds the trace a probe carries: the read
 	// route runs before and after every wait on the harness's hot loop, and
 	// a long run's trace would otherwise ride every poll whole. The newest
@@ -437,7 +438,8 @@ type probeReport struct {
 	Reason         string `json:"reason,omitempty"`
 	// Activity is the task's tool-call trace as its stream holds it, final
 	// or not: the data part of every part of the activity artifact, in
-	// stream order, each the executor's own JSON record of one invocation
+	// arrival order (stream order for an executor that appends to one
+	// artifact id), each the executor's own JSON record of one invocation
 	// (tool, input, callId, status, durationMs, at). The relay never posts
 	// it, so this is the one place a caller sees what a run called. The
 	// key is present -- as [] when the executor called nothing -- whenever
@@ -1896,9 +1898,24 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		return json.RawMessage(`{"tool":"","input":{"truncated":true,"bytes":` + strconv.Itoa(len(raw)) + `,"head":""}}`)
 	}
-	// A wrapper keeps its nested names, each call's arguments replaced by
-	// the bridge's own stand-in shape with that call's size, so a reader
-	// sees the cut per call rather than a wrapper of argument-less calls.
+	// First the fields beside the input, each to a small bound: an entry
+	// whose bulk is a callId or a timestamp keeps its input untouched and
+	// claims no cut of it.
+	for key, limit := range map[string]int{"tool": injectMaxEntryToolBytes, "callId": injectMaxEntryFieldBytes, "status": injectMaxEntryFieldBytes, "errorType": injectMaxEntryFieldBytes, "at": injectMaxEntryFieldBytes} {
+		if v, ok := entry[key].(string); ok {
+			entry[key] = truncateRunes(v, limit)
+		}
+	}
+	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
+		return out
+	}
+	// The input is the bulk. A wrapper keeps its nested names, each call's
+	// arguments replaced by the bridge's own stand-in shape with that call's
+	// size; any other input becomes the stand-in with the input's own size.
+	inputSize := 0
+	if b, err := json.Marshal(entry["input"]); err == nil {
+		inputSize = len(b)
+	}
 	names := []any{}
 	if in, ok := entry["input"].(map[string]any); ok {
 		if calls, ok := in["calls"].([]any); ok {
@@ -1919,7 +1936,7 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 			}
 		}
 	}
-	stand := map[string]any{"truncated": true, "bytes": len(raw), "head": ""}
+	stand := map[string]any{"truncated": true, "bytes": inputSize, "head": ""}
 	if len(names) > 0 {
 		entry["input"] = map[string]any{"calls": names}
 	} else {
@@ -1928,19 +1945,9 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
 		return out
 	}
-	// The bulk was not the input: keep what a grader reads and nothing
-	// else, the tool (bounded) and the nested names (bounded), then the
-	// tool alone.
+	// Still over (very many nested names): the tool and the stand-in alone.
 	tool, _ := entry["tool"].(string)
-	minimal := map[string]any{"tool": truncateRunes(tool, injectMaxEntryToolBytes), "input": stand}
-	if len(names) > 0 {
-		minimal["input"] = map[string]any{"calls": names}
-		if out, err := json.Marshal(minimal); err == nil && len(out) <= injectMaxEntryBytes {
-			return out
-		}
-		minimal["input"] = stand
-	}
-	out, err := json.Marshal(minimal)
+	out, err := json.Marshal(map[string]any{"tool": tool, "input": stand})
 	if err != nil {
 		return raw[:0]
 	}
