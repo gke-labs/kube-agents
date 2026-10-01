@@ -252,7 +252,7 @@ check_operator_pin() {
   local name=$1 gofile=$2 constant=$3
   local want got
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
   [ "$(normalise "$got")" = "$want" ] ||
     fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
 }
@@ -264,12 +264,15 @@ check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_m
 # A compiled image name for a release image the operator renders: the
 # constant must be the inventory entry's name, and the entry's repository
 # must be that name beside platform-agent's, since the operator derives the
-# registry from the agent image and never from the constant.
+# registry from the agent image and never from the constant. Each capture
+# below takes a lone string literal (a trailing comment allowed) and nothing
+# else, so a constant built by concatenation reads as unset rather than as
+# its first piece.
 check_compiled_image_name() {
   local name=$1 gofile=$2 constant=$3
   local want_repo got
   want_repo="$(dirname "$(repo_of platform-agent)")/${name}"
-  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
   [ "$got" = "$name" ] ||
     fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY names the image '$name'."
   [ "$(repo_of "$name")" = "$want_repo" ] ||
@@ -284,7 +287,7 @@ check_compiled_repository() {
   local name=$1 gofile=$2 constant=$3
   local want got
   want="$(repo_of "$name")"
-  got="$(sed -n "s/^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$gofile" | head -n1)"
+  got="$(sed -n "s|^[[:space:]]*${constant}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\"[[:space:]]*\(//.*\)\{0,1\}\$|\1|p" "$gofile" | head -n1)"
   [ "$got" = "$want" ] ||
     fail "$gofile: $constant is '${got:-<unset>}', but $INVENTORY has repository '$want' for '$name'."
 }

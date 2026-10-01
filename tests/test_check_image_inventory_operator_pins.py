@@ -65,6 +65,10 @@ _NAME_CASES = (
     (f'\t{_NAME_CONSTANT} = "gateway"\n', f"ghcr.io/gke-labs/kube-agents/{_NAME}", False, "is 'gateway'"),
     (f'\treturn {_NAME_CONSTANT}\n', f"ghcr.io/gke-labs/kube-agents/{_NAME}", False, "<unset>"),
     (f'\t{_NAME_CONSTANT} = "{_NAME}"\n', f"registry.example/elsewhere/{_NAME}", False, "the operator renders it as"),
+    # A constant that is not a lone literal renders something else than its
+    # first piece, so it reads as unset rather than passing on that piece.
+    (f'\t{_NAME_CONSTANT} = "{_NAME}" + suffix\n', f"ghcr.io/gke-labs/kube-agents/{_NAME}", False, "<unset>"),
+    (f'\t{_NAME_CONSTANT} = "{_NAME}" + "-" + x // comment\n', f"ghcr.io/gke-labs/kube-agents/{_NAME}", False, "<unset>"),
 )
 
 # The repository check's own cases (the gateway binary's worker repository):
@@ -79,6 +83,7 @@ _REPO_CASES = (
     (f'\tdefaultWorkerTag        = "latest"\n\t{_REPO_CONSTANT} = "{_REPO}" // the published repository\n', True, ""),
     (f'\t{_REPO_CONSTANT} = "{_REPO}:latest"\n', False, f"is '{_REPO}:latest'"),
     (f'\t{_REPO_CONSTANT} = "registry.example/mirror/a2a-worker"\n', False, "is 'registry.example/mirror/a2a-worker'"),
+    (f'\t{_REPO_CONSTANT} = "{_REPO}" + "-next"\n', False, "<unset>"),
     (f'\treturn {_REPO_CONSTANT}\n', False, "<unset>"),
 )
 
@@ -103,6 +108,7 @@ _CASES = (
     (f'\ta2aNATSImageEnvVar      = "A2A_NATS_IMAGE"\n\t{_CONSTANT}     = "nats:2.10-alpine"\n', True, ""),
     (f'\t{_CONSTANT} = "nats:2.11-alpine"\n', False, f"{_CONSTANT} is 'nats:2.11-alpine'"),
     (f'\t{_CONSTANT} = "ghcr.io/other/nats:2.10-alpine"\n', False, "is 'ghcr.io/other/nats:2.10-alpine'"),
+    (f'\t{_CONSTANT} = "nats:2.10-alpine" + tag\n', False, "<unset>"),
     (f'\tsomeOtherImage = "nats:2.10-alpine"\n', False, "<unset>"),
     ("", False, "<unset>"),
 )
