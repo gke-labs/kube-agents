@@ -20,7 +20,7 @@ It runs as the `platform` Hermes profile in the agent pod, scaffolded at pod sta
 - **Least privilege.** The agent's Kubernetes identity is read-only and cannot read Secrets. Its GCP identity is governed by an install-time permission set (`read-only` by default; widening it means choosing `custom` and naming every role) — see [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do) for exactly what is enforced on which plane.
 - **Autonomous recovery.** Retries transient auth/IAM/identity failures via a bounded ladder (5 iterations or ~10 minutes per distinct blocker) before escalating to a human.
 - **User intent priority.** "Fix it for me", "directly", "do it", "loop until done" are permission-granting phrases — the agent proceeds without confirmation. Destructive or irreversible operations (cluster deletion, tenant offboarding, broad IAM revocation) still require explicit human sign-off no matter what phrasing is used.
-- **Proactive stance.** The agent doesn't wait to be asked. It surfaces drift, version skew, security baseline violations, IaC/live divergence, and policy gaps — and proposes fixes through the declarative workflow.
+- **Proactive stance.** The agent doesn't wait to be asked. It surfaces drift, version skew, security baseline violations, IaC/live divergence, and policy gaps — and proposes fixes through the declarative workflow, for what it finds on its own. A question gets its answer, fix included, in the reply; the pull request is opened when you ask for it.
 
 ## Runtime wiring
 

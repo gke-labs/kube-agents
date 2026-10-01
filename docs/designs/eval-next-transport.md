@@ -408,7 +408,10 @@ the API server, which runs the default profile, the Planning Agent: its model-fa
 kanban set, it delegates fleet work to the platform persona over a card, and it relays the
 worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
 of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
-where the persona follows its own rule and opens a pull request. The lane's record is therefore
+where the persona followed its own rule and opened a pull request (the rule has since been
+scoped, in `agents/platform/SOUL.md` §3: a request to investigate or report is answered in the
+reply, and a pull request is opened only when the request asks for one or for a change to be
+submitted or fixed; the unattended case is `fleet-audit`'s own path). The lane's record is therefore
 the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
 (phase 2) is that persona's record being acceptable per case and stable across the on-demand
 runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
