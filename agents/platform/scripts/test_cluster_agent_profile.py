@@ -558,40 +558,25 @@ class CreateProfileTest(unittest.TestCase):
 
 
 class ResolveProfilesBaseTest(unittest.TestCase):
-    def test_resolves_when_platform_agent_home_is_set(self):
-        with mock.patch.dict(
-            os.environ,
-            {"HERMES_HOME": "/custom/profiles/platform", "PLATFORM_AGENT_HOME": "/srv/agent"},
-            clear=True,
-        ):
-            self.assertEqual(cap.agent_home(), "/srv/agent")
-            self.assertEqual(cap.profiles_base(Path(cap.agent_home())), Path("/srv/agent/profiles"))
-
-    def test_resolves_default_when_no_env_set(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(cap.agent_home(), "/opt/data")
-            self.assertEqual(cap.profiles_base(Path(cap.agent_home())), Path("/opt/data/profiles"))
-
-    def test_ignores_hermes_home_deliberately(self):
-        # In the agent container HERMES_HOME names the profile home
-        # (<agent home>/profiles/platform) and points too deep; agent_home()
-        # deliberately ignores it.
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/mnt/profiles/platform"}, clear=True):
-            self.assertEqual(cap.agent_home(), "/opt/data")
-            self.assertEqual(cap.profiles_base(Path(cap.agent_home())), Path("/opt/data/profiles"))
-
-    def test_module_load_wires_hermes_home_and_profiles_base(self):
+    def test_resolves_when_hermes_home_is_set(self):
         import importlib
         try:
-            with mock.patch.dict(
-                os.environ,
-                {"PLATFORM_AGENT_HOME": "/srv/agent"},
-                clear=True,
-            ):
+            with mock.patch.dict(os.environ, {"HERMES_HOME": "/custom/data"}, clear=True):
                 reloaded = importlib.reload(cap)
-                self.assertEqual(reloaded.HERMES_HOME, Path("/srv/agent"))
-                self.assertEqual(reloaded.PROFILES_BASE, Path("/srv/agent/profiles"))
-                self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/srv/agent")
+                self.assertEqual(reloaded.HERMES_HOME, Path("/custom/data"))
+                self.assertEqual(reloaded.PROFILES_BASE, Path("/custom/data/profiles"))
+                self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/custom/data")
+        finally:
+            importlib.reload(cap)
+
+    def test_resolves_default_when_no_env_set(self):
+        import importlib
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                reloaded = importlib.reload(cap)
+                self.assertEqual(reloaded.HERMES_HOME, Path("/opt/data"))
+                self.assertEqual(reloaded.PROFILES_BASE, Path("/opt/data/profiles"))
+                self.assertEqual(reloaded._run_env()["HERMES_HOME"], "/opt/data")
         finally:
             importlib.reload(cap)
 
@@ -941,6 +926,22 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "timeout 60 python3 -c 'import cluster_agent_profile'",
             "PYTHONPATH=/opt/data/scripts /opt/hermes/.venv/bin/python3 -m cluster_agent_profile",
             "env FOO=bar timeout 10 python3 -m cluster_agent_profile",
+            # Escaped compound-command and stdin contexts
+            "for c in a b; do python3 -m cluster_agent_profile list; done",
+            "if ...; then python3 -c 'import cluster_agent_profile'; fi",
+            "{ python3 -m cluster_agent_profile; }",
+            "x=`python3 -m cluster_agent_profile`",
+            "x=$(python3 -m cluster_agent_profile)",
+            'bash -c "python3 -m cluster_agent_profile list"',
+            "xargs python3 -m cluster_agent_profile",
+            "sudo python3 -m cluster_agent_profile",
+            "watch python3 -m cluster_agent_profile",
+            "find . -exec python3 -m cluster_agent_profile {} +",
+            "echo 'import cluster_agent_profile' | python3",
+            'echo "import cluster_agent_profile" | python',
+            "echo 'from cluster_agent_profile import list_profiles' | python3",
+            "printf 'import cluster_agent_profile\n' | python3",
+            "echo 'import kanban_notify_propagate' | python3",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -999,6 +1000,10 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat <<'EOF' > /tmp/test.txt",
             "cat <<EOF > /tmp/test.txt",
             "cat <<< 'test string'",
+            # The mirror defect from review
+            'echo "(python3 -m cluster_agent_profile)"',
+            "echo '(python3 -m cluster_agent_profile)'",
+            'echo "(python3 -c \'import cluster_agent_profile\')"',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):

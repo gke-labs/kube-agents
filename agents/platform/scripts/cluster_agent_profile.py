@@ -27,7 +27,6 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from gitops_workspace import agent_home
 from profile_scaffold import (
     HERMES_BIN,
     backfill_cron_file,
@@ -39,10 +38,7 @@ from profile_scaffold import (
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
-# Uses gitops_workspace.agent_home() which reads PLATFORM_AGENT_HOME (or /opt/data),
-# intentionally ignoring HERMES_HOME because in an agent container HERMES_HOME points
-# to the profile home (<agent home>/profiles/platform) rather than the data PVC root.
-HERMES_HOME = Path(agent_home())
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 # Operator-rendered config overlays and profile-targeted plugin image volumes. The
 # entrypoint applies both at pod startup; a profile scaffolded here appears later, so it
 # has to pick them up itself (see create_profile steps 2c/2d).
