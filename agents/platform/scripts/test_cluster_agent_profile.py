@@ -910,6 +910,32 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'python3 -c "import sys; import cluster_agent_profile"',
             'python3 -c "import kanban_notify_propagate"',
             "python3 -c 'from kanban_notify_propagate import notify'",
+            # Attached -c syntax (Thread 1)
+            "python3 -c'import cluster_agent_profile'",
+            'python3 -c"import cluster_agent_profile"',
+            "python3 -uc'import cluster_agent_profile'",
+            'python3 -uc"import cluster_agent_profile"',
+            "python3 -c'from cluster_agent_profile import list_profiles'",
+            "python3 -c'import kanban_notify_propagate'",
+            'python3 -c"import kanban_notify_propagate"',
+            # Stdin execution forms (Thread 1)
+            "python3 - <<'EOF'",
+            "python3 - <<EOF",
+            "python3 <<'EOF'",
+            "python3 <<EOF",
+            "python3 -u - <<'EOF'",
+            "python3 -u <<'EOF'",
+            "python - <<'EOF'",
+            "python3 <<< 'import cluster_agent_profile'",
+            'python3 <<< "import cluster_agent_profile"',
+            "python3 - <<< 'import cluster_agent_profile'",
+            "python3 <<< 'import kanban_notify_propagate'",
+            "echo 'import cluster_agent_profile' | python3",
+            'echo "import cluster_agent_profile" | python3',
+            "echo 'from cluster_agent_profile import list_profiles' | python3",
+            "printf 'import cluster_agent_profile' | python3",
+            "echo 'import kanban_notify_propagate' | python3",
+            "echo 'from kanban_notify_propagate import notify' | python3",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -936,6 +962,21 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'python3 -c "print(1)" && grep cluster_agent_profile /opt/data',
             "python3 -c 'print(1)' ; echo cluster_agent_profile",
             'python3 -c "print(1)" | grep cluster_agent_profile',
+            # Thread 2: Harmless mentions in redirect targets or CLI arguments after closed -c code string
+            "python3 -c 'print(1)' > /tmp/cluster_agent_profile.log",
+            'python3 -c "print(1)" > /tmp/cluster_agent_profile.log',
+            "python3 -c'print(1)' > /tmp/cluster_agent_profile.log",
+            'python3 -c"print(1)" > /tmp/cluster_agent_profile.log',
+            'python3 -c "print(sys.argv)" cluster_agent_profile',
+            "python3 -c 'print(sys.argv)' cluster_agent_profile",
+            'python3 -c "print(1)" < cluster_agent_profile.txt',
+            "python3 -c 'print(1)' < cluster_agent_profile.txt",
+            "python3 -c 'print(1)' > /tmp/kanban_notify_propagate.log",
+            'python3 -c "print(sys.argv)" kanban_notify_propagate',
+            # Non-python heredocs or redirects
+            "cat <<'EOF' > /tmp/test.txt",
+            "cat <<EOF > /tmp/test.txt",
+            "cat <<< 'test string'",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
