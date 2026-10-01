@@ -64,12 +64,11 @@ def test_the_prompts_example_passes_every_check(case):
 
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
-    "close", [" \u2014", " -", ";", ":", "\u2026", " \U0001f64c", " \u2b50", ", and"]
+    "close",
+    [" \u2014", " -", " --", ";", ":", "\u2026", " \U0001f64c", " \u2b50", ", and", ", then"],
 )
 def test_the_invitation_is_a_statement_however_it_ends(case, close):
     reply = _example(case).replace(INVITATION, INVITATION.removesuffix(".") + close)
-    if close == ", and":
-        reply = reply.replace(", and Is", ", and is").replace(", and Want", ", and want")
     assert _failing(case, reply) == []
 
 
@@ -89,10 +88,22 @@ def test_the_greeting_without_the_invitation_fails_only_on_it(case):
         " Any runbooks I should know about?",
         " Any runbooks I should know about \U0001f642?",
         " Do you have run books I should know about?",
+        " Do you have runbooks, and where do they live?",
+        " Could you share your runbooks - the main ones?",
+        " Any runbooks - or conventions - I should know about?",
     ],
 )
 def test_asking_for_runbooks_is_a_stacked_ask(case, ask):
     reply = _example(case).replace(INVITATION, ask)
+    assert "no-stacked-asks" in _failing(case, reply)
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_a_runbook_question_joined_to_the_closing_one_is_a_stacked_ask(case):
+    example = _example(case)
+    question = example[example.index(INVITATION) + len(INVITATION) :].strip()
+    joined = " Could you share your runbooks here, and " + question[0].lower() + question[1:]
+    reply = example[: example.index(INVITATION)] + joined
     assert "no-stacked-asks" in _failing(case, reply)
 
 
@@ -105,6 +116,7 @@ def test_asking_for_runbooks_is_a_stacked_ask(case, ask):
         " Share the runbooks here once you have them.",
         " Share your runbooks here when it suits you.",
         " Drop your runbooks here after the scan.",
+        " Runbooks are welcome, post them here anytime.",
     ],
 )
 def test_the_invitation_does_not_stand_in_for_where_results_appear(invitation):
@@ -140,6 +152,13 @@ def test_the_invitation_does_not_stand_in_for_the_summary_being_here():
         "I'll share them here as soon as it's done",
         "I'll post the summary in this chat",
         "I'll post results in this chat once it's done",
+        "I'll post the results to this chat when it's done",
+        "I'll post an update here when done",
+        "I'll share what I find with you here",
+        "I'll post an update here once it's finished",
+        "I'll let you know here when it's ready",
+        "I'll post the picture in this chat once complete",
+        "I'll post the report here once I'm done",
     ],
 )
 def test_other_ways_of_saying_results_land_here_pass(results):
@@ -156,6 +175,9 @@ def test_other_ways_of_saying_results_land_here_pass(results):
         "the summary\u2019s in this chat",
         "you'll find the summary in this chat",
         "the summary landed in this chat",
+        "the summary is now in this chat",
+        "the summary is waiting in this chat",
+        "the summary is already here in this chat",
     ],
 )
 def test_other_ways_of_saying_the_summary_is_here_pass(summary):

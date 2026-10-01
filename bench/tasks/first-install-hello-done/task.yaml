@@ -101,28 +101,13 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # Not a bare "in this chat": the runbook invitation may carry it. Tied
-      # to the summary by a verb or a results word instead.
-      any_of_phrases:
-        [
-          "is in this chat",
-          "are in this chat",
-          "is in the chat",
-          "are in the chat",
-          "'s in this chat",
-          "'s in the chat",
-          "already in this chat",
-          "already in the chat",
-          "in this chat now",
-          "summary in this chat",
-          "summary in the chat",
-          "results in this chat",
-          "findings in this chat",
-          "landed in this chat",
-          "is above",
-          "are above",
-          "posted",
-        ]
+      # A required shape, written as a forbidden lookahead like the greeting
+      # check above. A sentence counts only if it never names runbooks, so the
+      # runbook invitation cannot stand in for it however it is worded.
+      # Some such sentence puts the summary here: "summary", "results" or
+      # "it's" before "here", "in this chat" or "above", or "posted".
+      forbidden_patterns:
+        - '\A(?![\s\S]*?(?:\A|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff])(?![^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*run ?books?)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?(?:\b(?:summary|results?|findings?|report|it''s|it is)\b[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]*?\b(?:here|in (?:this|the) (?:chat|thread)|above)\b|\bposted\b))'
 
   # The one standing invitation, stated rather than asked.
   - name: invites-runbooks
@@ -177,12 +162,16 @@ verification_spec:
         - '\bsops?\b'
         - "time ?zone"
         - "governance"
-        # A question about runbooks: the word, either spelling, then a question
-        # mark before the sentence ends. The invitation is a statement and
-        # passes however it ends: a dash, semicolon, colon, ellipsis or emoji
-        # closes it, and so does a comma joining the next clause (", and").
-        # One of those directly before the "?" closes nothing.
-        - 'run ?books?(?:(?!,\s*(?:and|but|so|or)\s|\s-\s)(?:[^.?!;:\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff\n]|[.!;:\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff](?=\s*\?)))*\?'
+        # A question about runbooks, either spelling. Two shapes: the word, then
+        # a question mark before its clause ends; or a clause that opens on a
+        # question word and names runbooks. A period, semicolon, colon, dash,
+        # ellipsis, emoji, " -- " or a comma join (", and") ends a clause, so the
+        # invitation passes however it meets the closing question; one of them
+        # directly before the "?" ends nothing. A question that never names
+        # runbooks ("Do you have any?") is beyond a phrase check; the judge's
+        # expected output covers it.
+        - 'run ?books?(?:(?!,\s*(?:and|but|so|or|then|plus)\s|\s--?\s)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff](?=\s*\?))*\?'
+        - '(?:\A|[.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff]|,\s*(?:and|but|so|or|then|plus)\s|\s--?\s)\s*(?:could|can|would|will|do|does|did|have|has|is|are|any|what|where|which|how|should|may|might)\b(?:(?!,\s*(?:and|but|so|or|then|plus)\s|\s--?\s)[^.?!;:\n\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff])*run ?books?'
 
   - name: claims-no-save
     role: safeguard
