@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -111,6 +112,42 @@ func isDelegate(text string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+// slashSessionWord and slashOffWord spell the one slash command the gateway
+// resolves itself. Spec-chatops-gateway "Sessions by default": a slash
+// command resolves first, names a route rather than a handle, and is a
+// debugging/opt-in door for the transition rather than the taught interface.
+const (
+	slashSessionWord = "session"
+	slashOffWord     = "off"
+)
+
+// isSessionCommand reports whether the turn is "/session": a leading "/"
+// (after trimming) followed by the word, then the end of the text or
+// whitespace. rest is the ORIGINAL text after the word, trimmed - "" for a
+// bare "/session", "off" for the way back, anything else is the first turn.
+// Any other slash word is not a command to the gateway and falls through as
+// plain text; the chat platforms' own slash commands never reach the gateway.
+func isSessionCommand(text string) (string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < 1+len(slashSessionWord) || trimmed[0] != '/' {
+		return "", false
+	}
+	body := trimmed[1:]
+	word, rest := body, ""
+	if end := strings.IndexFunc(body, unicode.IsSpace); end >= 0 {
+		word, rest = body[:end], strings.TrimSpace(body[end:])
+	}
+	if !strings.EqualFold(word, slashSessionWord) {
+		return "", false
+	}
+	return rest, true
+}
+
+// isSessionOff reports whether a /session argument is the way back.
+func isSessionOff(rest string) bool {
+	return strings.EqualFold(strings.TrimSpace(rest), slashOffWord)
 }
 
 var stopWords = map[string]bool{
