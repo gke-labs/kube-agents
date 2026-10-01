@@ -283,9 +283,9 @@ managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually
 carries) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
 (the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
 exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent, each copy removed when
-its child exits, the ones a previous incarnation left (its direct `task-`-named subdirectories
-that hold a managed `config.yaml`, nothing else in it and never the directory itself) removed
-when the bridge starts, and
+its child exits, the ones a previous incarnation left (its direct subdirectories that carry the
+bridge's own marker file, whatever their name, nothing else in it and never the directory
+itself) removed when the bridge starts, and
 none written at all when the source exists but cannot be read, since a child on a hook-only
 scope would run without the operator's pins). The
 hook therefore exists only in processes the bridge spawned: a kanban worker or cron tick
@@ -326,9 +326,10 @@ where each nested call's `arguments` is capped on its own so the nested tool nam
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
 `api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `passphrase` or `credential` as a
 whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`,
-`SecretAccessKey`; not `tokenizer` or lowerCamel `secretName`) are replaced before
+`SecretAccessKey`, `secretAccessKey`; not `tokenizer`, and not a key that opens with the word
+and goes on as a name, reference or location, `secretName`, `tokenPath`) are replaced before
 publishing, and so are the credential shapes a value can carry under an innocent key (a
-bearer value, an `Authorization` header of any scheme, a Google OAuth or API key, a GitHub token, a `key=value`
+bearer value, an `Authorization` header of any scheme, a PEM private-key block, a Google OAuth or API key, a GitHub token, a `key=value`
 pair or `--flag value` whose key looks like a secret, curl's `-u user:password` with the rest
 of the command kept, a quoted value taken whole to its closing quote) — a terminal
 command is one string, so this is best-effort, and anything else the model pastes into a

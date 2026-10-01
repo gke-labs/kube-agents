@@ -340,8 +340,9 @@ type ConversationState struct {
 	Grace time.Duration
 	// TaskID is the task this read describes: the one the caller named,
 	// else the record's active task. Active is whether the record holds
-	// that task as its active one; the three fields after it describe the
-	// active task and are zero for a named task the record has released.
+	// that task as its active one; SubmittedAt and the active-task fields
+	// after it describe the active task and are zero for a named task the
+	// record has released.
 	// Detached is one the gateway has already published a cancel for.
 	Active      bool
 	TaskID      string

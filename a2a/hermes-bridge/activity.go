@@ -86,7 +86,11 @@ const (
 	// is unset, read only when the directory exists.
 	DefaultManagedDir = "/etc/hermes"
 	managedConfigFile = "config.yaml"
-	managedEnvFile    = ".env"
+	// scopeMarkerFile is written first into every child scope and is what
+	// the start-time sweep keys on: a directory in the scratch dir is the
+	// bridge's to remove when it carries this file, whatever its name.
+	scopeMarkerFile = ".a2a-bridge-scope"
+	managedEnvFile  = ".env"
 	// The hooks.outbound entry the bridge writes for its child. The timeout
 	// is longer than activityPublishTimeout: the door publishes on the
 	// delivery, and a timed-out delivery is retried, which would be a
@@ -212,11 +216,6 @@ var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // test can observe the order the two files are written in.
 var writeScopeFile = os.WriteFile
 
-// scopeDirPattern is the shape of a scope the start-time sweep may remove
-// and so the only shape childManagedScope writes: the gateway's task-<hex>
-// (tests use task-<word>), never a bare word.
-var scopeDirPattern = regexp.MustCompile(`^task-[A-Za-z0-9_-]{1,123}$`)
-
 var (
 	// A key is secret-looking when one of the words is a whole component of
 	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key, private_key, and in camelCase
@@ -228,13 +227,18 @@ var (
 	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
 	// starts a component when any letter or digit precedes its capital (so
 	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
-	// ends one at the end, a separator or the next capital; a PascalCase key
-	// that starts with the word and goes on in a further component
-	// (SecretAccessKey, TokenValue) is blanked too, which takes SecretName
-	// with it, the accepted price, while lowerCamel secretName stays a name.
+	// ends one at the end, a separator or the next capital. A key that opens
+	// with the word is handled apart (redactedCamelHeadPattern below).
 	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:$|[_.-])`)
-	redactedCamelKeyPattern = regexp.MustCompile(`(?:[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])|^(?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?[A-Z])`)
-	redactedValuePatterns   = []*regexp.Regexp{
+	redactedCamelKeyPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])`)
+	// A camelCase key that opens with the word and goes on in another
+	// component (secretAccessKey, SecretKey, tokenValue, passwordHash) is a
+	// credential unless the next component says it is a name, a reference
+	// or a location of one: secretName, SecretRef, tokenPath, credentialsFile,
+	// passwordId stay.
+	redactedCamelHeadPattern = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?[A-Z]`)
+	camelHeadNamePattern     = regexp.MustCompile(`^(?i:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:Name|Names|Ref|Refs|Path|Paths|File|Files|Id|Ids|Key|Keys)?$`)
+	redactedValuePatterns    = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
@@ -252,8 +256,14 @@ var (
 		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
 		// quoted value runs to its closing quote, spaces included, so a
 		// passphrase does not leave its tail behind the marker; an unquoted
-		// or unterminated one stops at whitespace as before.
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?[^"'\s,}]+)`),
+		// or unterminated one runs to whitespace, punctuation included, so a
+		// generated password's comma or brace does not split it (what follows
+		// on the same word goes with it, the lesser cost).
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
+		// A PEM private-key block, banner to banner: the one credential with
+		// a fixed marker, however it arrived (a heredoc, a file tool's
+		// content, a kubeconfig body under an innocent key).
+		regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
 		// --flag value, the word a component of the flag (--token, --secret-access-key);
 		// a quoted value runs to its closing quote as above.
 		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
@@ -263,9 +273,11 @@ var (
 // curl's -u user:password: the command is found whole (so "date -u 12:30"
 // and "sort -u a:b" are not read), and only the credential inside it is
 // replaced, the URL and headers around it kept. A quoted value runs to its
-// closing quote and the attached form (-uuser:pass) is read too.
+// closing quote and the attached form (-uuser:pass) is read too. The
+// command runs to a separator (;, |, &&, newline), not to a lone & inside a
+// quoted password.
 var (
-	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*`)
+	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n]|&[^&\n])*`)
 	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`)
 )
 
@@ -535,6 +547,16 @@ func activityStatus(d hookDelivery) string {
 	return ActivityStatusCompleted
 }
 
+// secretLookingKey says whether a value under this key never goes on the
+// bus: a secret word as a whole component in any spelling, or a camelCase
+// key that opens with the word and goes on in something other than a name.
+func secretLookingKey(k string) bool {
+	if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) {
+		return true
+	}
+	return redactedCamelHeadPattern.MatchString(k) && !camelHeadNamePattern.MatchString(k)
+}
+
 // redactInput returns the tool input fit for the bus: secret-looking keys
 // blanked at every depth, and the whole thing capped. Over the cap the entry
 // carries the size and a rune-safe head rather than a JSON fragment; for
@@ -640,7 +662,7 @@ func redactValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			if redactedKeyPattern.MatchString(k) || redactedCamelKeyPattern.MatchString(k) {
+			if secretLookingKey(k) {
 				t[k] = redactedValue
 			} else {
 				t[k] = redactValue(val)
@@ -673,12 +695,6 @@ func redactValue(v any) any {
 func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	if !taskIDPattern.MatchString(taskID) {
 		return "", fmt.Errorf("task id %q is not a path segment", taskID)
-	}
-	// The sweep reclaims only task--named scopes, so no other id gets one:
-	// a scope the writer makes and the sweeper never reads is a credential
-	// copy that outlives a hard kill.
-	if !scopeDirPattern.MatchString(taskID) {
-		return "", fmt.Errorf("task id %q is not a scope name the start-time sweep reclaims", taskID)
 	}
 	scratch, err := filepath.Abs(b.cfg.ScratchDir)
 	if err != nil {
@@ -745,9 +761,13 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("child scope config: %w", err)
 	}
-	// config.yaml first, .env second: the start-time sweep takes a scope by
-	// its config.yaml, so a kill between the two writes leaves a scope the
-	// next start removes rather than a credential copy it never sees.
+	// The marker first, then config.yaml, then .env: the start-time sweep
+	// takes a scope by its marker, so a kill between any two writes leaves a
+	// scope the next start removes rather than a credential copy it never
+	// sees.
+	if err := writeScopeFile(filepath.Join(dir, scopeMarkerFile), nil, childScopeFileMode); err != nil {
+		return "", fmt.Errorf("child scope marker: %w", err)
+	}
 	if err := writeScopeFile(filepath.Join(dir, managedConfigFile), out, childScopeFileMode); err != nil {
 		return "", fmt.Errorf("child scope config: %w", err)
 	}
@@ -800,12 +820,13 @@ func (b *Bridge) listenActivity() error {
 }
 
 // sweepTaskScopes removes the direct children of dir that are the bridge's
-// own scopes: a directory named the way the gateway mints a task id
-// (task-<...>) that holds the managed config childManagedScope writes. Both
-// marks, because BRIDGE_SCRATCH_DIR may name a directory the bridge shares,
-// and a name alone - cache, data, work - is the shape of most directories. A
-// file, a directory with another name, or a task-named directory with no
-// config in it is not the bridge's and stays. A scope that cannot be removed
+// own scopes: a directory that carries scopeMarkerFile, which only
+// childManagedScope writes, and which it writes first. The marker rather
+// than a name shape, because BRIDGE_SCRATCH_DIR may name a directory the
+// bridge shares (cache, data, work are the shape of most directories) and
+// because the bus accepts any DNS-1123 label as a task id, so no name
+// shape is the bridge's to require. A file, or a directory without the
+// marker, is not the bridge's and stays. A scope that cannot be removed
 // is logged and left: the scratch dir is a shared emptyDir, any same-uid
 // process in the pod can plant an unremovable directory in it, and the
 // executor must not stay down for that. Only an unreadable scratch dir is
@@ -816,11 +837,11 @@ func sweepTaskScopes(dir string, log *slog.Logger) error {
 		return err
 	}
 	for _, e := range entries {
-		if !e.IsDir() || !scopeDirPattern.MatchString(e.Name()) {
+		if !e.IsDir() {
 			continue
 		}
 		scope := filepath.Join(dir, e.Name())
-		if _, err := os.Stat(filepath.Join(scope, managedConfigFile)); err != nil {
+		if _, err := os.Stat(filepath.Join(scope, scopeMarkerFile)); err != nil {
 			continue
 		}
 		if err := os.RemoveAll(scope); err != nil && log != nil {

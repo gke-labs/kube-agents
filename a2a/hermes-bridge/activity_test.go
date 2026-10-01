@@ -339,10 +339,10 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	})
 }
 
-// The scope's config.yaml is written before its .env, so a scope cut short
-// between the two is one the sweep removes (it keys on config.yaml) rather
-// than a credential copy it never sees. Observed through the write seam,
-// since two back-to-back writes share a file-time tick.
+// The scope's marker is written first, its .env last, so a scope cut short
+// between any two writes is one the sweep removes (it keys on the marker)
+// rather than a credential copy it never sees. Observed through the write
+// seam, since back-to-back writes share a file-time tick.
 func TestChildManagedScope_WritesTheConfigBeforeTheEnv(t *testing.T) {
 	src := t.TempDir()
 	for name, body := range map[string]string{managedConfigFile: "model: {default: m}\n", managedEnvFile: "K=v\n"} {
@@ -366,8 +366,8 @@ func TestChildManagedScope_WritesTheConfigBeforeTheEnv(t *testing.T) {
 	if _, err := b.childManagedScope("task-order"); err != nil {
 		t.Fatal(err)
 	}
-	if len(order) != 2 || order[0] != managedConfigFile || order[1] != managedEnvFile {
-		t.Fatalf("scope files written in order %v, want [%s %s]", order, managedConfigFile, managedEnvFile)
+	if len(order) != 3 || order[0] != scopeMarkerFile || order[1] != managedConfigFile || order[2] != managedEnvFile {
+		t.Fatalf("scope files written in order %v, want [%s %s %s]", order, scopeMarkerFile, managedConfigFile, managedEnvFile)
 	}
 }
 
@@ -571,9 +571,9 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // twin, while a name that merely starts with the word (secretName,
 // tokenizer) still ships.
 func TestRedactInput_CamelCaseKeys(t *testing.T) {
-	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"blanked-too"}`
+	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"a-name","secretAccessKey":"w4","secretKey":"w5","passwordHash":"h1","tokenPath":"/t","credentialsFile":"/c","SecretRef":"r-name"}`
 	out := string(redactInput("http_request", json.RawMessage(in)))
-	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, "blanked-too"} {
+	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, `"w4"`, `"w5"`, `"h1"`} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -582,9 +582,10 @@ func TestRedactInput_CamelCaseKeys(t *testing.T) {
 	if !strings.Contains(out, `"accessTokenExpiry":"[redacted]"`) {
 		t.Fatalf("component rule not applied to a camelCase suffix: %s", out)
 	}
-	// A word at the front of a camelCase key is a name (secretName,
-	// credentialsPath), as the pattern's comment says.
-	for _, kept := range []string{`"secretName":"db-creds"`, `"tokenizer":"cl100k"`, `"credentialsPath":"/x"`} {
+	// A key that opens with the word is a name only when it goes on as a
+	// name, reference or location (secretName, SecretRef, tokenPath,
+	// credentialsFile); otherwise it is a credential (secretAccessKey).
+	for _, kept := range []string{`"secretName":"db-creds"`, `"tokenizer":"cl100k"`, `"credentialsPath":"/x"`, `"SecretName":"a-name"`, `"tokenPath":"/t"`, `"credentialsFile":"/c"`, `"SecretRef":"r-name"`} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("name %q was scrubbed: %s", kept, out)
 		}
@@ -594,14 +595,14 @@ func TestRedactInput_CamelCaseKeys(t *testing.T) {
 // A quoted secret with spaces in it is scrubbed whole: the tail of a
 // passphrase must not ship behind a marker that says it was redacted.
 func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
-	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z", "plain": "kubectl get pods -h db"}`
+	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z; export DB_PASSWORD=p@ss,w0rd; echo token=ab}cd; curl -u 'admin:p&ss' https://w && echo done", "plain": "kubectl get pods -h db"}`
 	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8"} {
+	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8", "w0rd", "}cd", "p&ss"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
 	}
-	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`, "https://y", "https://z"} {
+	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`, "https://y", "https://z", "https://w ", "echo done"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("text after the secret was lost: %q missing in %s", kept, out)
 		}
@@ -616,9 +617,9 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 // The scheme token is case-insensitive, and a credential can arrive under a
 // key outside the first list of words: a private key, a passphrase.
 func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
-	in := `{"command": "curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	in := `{"content": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7\nabc\n-----END RSA PRIVATE KEY-----\n", "command": "cat > id_rsa <<EOF\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXkt\n-----END OPENSSH PRIVATE KEY-----\nEOF; curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
 	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
+	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", "MIIEowIBAAKCAQEA7", "b3BlbnNzaC1rZXkt", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -756,9 +757,6 @@ print("done")
 	}
 }
 
-// The heartbeat shares the budget: a short interval under a long run cannot
-// spend the subject either. Past the budget it simply stops, and the marker
-// counts calls, not heartbeats.
 // The trace stops short of the budget by the heartbeat's reserve, so the
 // heartbeat runs to the terminal on a looping run: with a budget of 4 and a
 // reserve of 2, three calls become two parts and a marker while the
@@ -797,7 +795,10 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	}
 }
 
-func TestActivity_HeartbeatSharesTheBudget(t *testing.T) {
+// The heartbeat has a share of its own, the reserve: a short interval under
+// a long run cannot spend the subject either. Past its share it stops, and
+// the marker counts calls, not heartbeats.
+func TestActivity_HeartbeatStopsAtItsShare(t *testing.T) {
 	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
 	activityEntryBudget, activityHeartbeatReserve = 2, 2
 	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
@@ -828,17 +829,18 @@ func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
 			t.Fatalf("task id %q accepted: %s", bad, dir)
 		}
 	}
-	// A legal path segment that is not a scope name the sweep reclaims is
-	// refused too, by its own reason: a scope under it would be a credential
-	// copy no start removes after a hard kill.
-	for _, bad := range []string{"nottask", "t1", "tasks-1", "Task-1"} {
-		dir, err := b.childManagedScope(bad)
-		if err == nil {
-			t.Fatalf("task id %q accepted: %s", bad, dir)
+	// Any legal path segment the bus accepts as a task id gets a scope: the
+	// sweep keys on the marker, not on a name shape, so no id is refused
+	// for its spelling.
+	for _, ok := range []string{"smoke-1", "abc", "t1"} {
+		dir, err := b.childManagedScope(ok)
+		if err != nil {
+			t.Fatalf("task id %q refused: %v", ok, err)
 		}
-		if !strings.Contains(err.Error(), "sweep reclaims") {
-			t.Fatalf("task id %q refused for the wrong reason: %v", bad, err)
+		if _, err := os.Stat(filepath.Join(dir, scopeMarkerFile)); err != nil {
+			t.Fatalf("scope for %q carries no marker: %v", ok, err)
 		}
+		_ = os.RemoveAll(dir)
 	}
 	entries, _ := os.ReadDir(scratch)
 	if len(entries) != 0 {
@@ -859,18 +861,27 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	if err := os.MkdirAll(leftover, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{managedConfigFile: "model: {}\n", managedEnvFile: "SECRET=x\n"} {
+	for name, body := range map[string]string{scopeMarkerFile: "", managedConfigFile: "model: {}\n", managedEnvFile: "SECRET=x\n"} {
 		if err := os.WriteFile(filepath.Join(leftover, name), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// A scope under any task id goes too, by its marker: the bus accepts
+	// any DNS-1123 label, so the name shape is not the mark.
+	bareName := filepath.Join(scratch, "smoke-1")
+	if err := os.MkdirAll(bareName, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bareName, scopeMarkerFile), nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	foreignFile := filepath.Join(scratch, "notes")
 	if err := os.WriteFile(foreignFile, []byte("not the bridge's\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// BRIDGE_SCRATCH_DIR may name a directory the bridge shares: plainly
-	// named directories, and a task-named one that holds no managed config,
-	// are not scopes the bridge wrote.
+	// BRIDGE_SCRATCH_DIR may name a directory the bridge shares: a directory
+	// without the marker, however it is named, is not a scope the bridge
+	// wrote.
 	foreignDirs := []string{filepath.Join(scratch, "lost+found", "inner"), filepath.Join(scratch, "cache", "inner"), filepath.Join(scratch, "data"), filepath.Join(scratch, "task-foreign", "inner")}
 	for _, d := range foreignDirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -884,7 +895,7 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(stuck, "inner"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(stuck, managedConfigFile), []byte("model: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stuck, scopeMarkerFile), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if os.Geteuid() != 0 {
@@ -900,8 +911,10 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = b.activityLn.Close() })
 
-	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
-		t.Fatalf("a previous incarnation's scope survived the start: stat err = %v", err)
+	for _, gone := range []string{leftover, bareName} {
+		if _, err := os.Stat(gone); !os.IsNotExist(err) {
+			t.Fatalf("a previous incarnation's scope %s survived the start: stat err = %v", gone, err)
+		}
 	}
 	for _, kept := range append([]string{scratch, foreignFile}, foreignDirs...) {
 		if _, err := os.Stat(kept); err != nil {
@@ -913,7 +926,7 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	if err := os.MkdirAll(again, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(again, managedConfigFile), []byte("model: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(again, scopeMarkerFile), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	closed := &Bridge{cfg: Config{ScratchDir: scratch, ActivityListen: "", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
