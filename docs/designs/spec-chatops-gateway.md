@@ -835,7 +835,14 @@ of stale asks for the legacy consumer to drain on a rollback. The per-install ch
 different pairing is the mode switch's per-component override, sketched and not built; the
 predicate the operator consults (`a2aChatArmed`) is where it would be read. What this costs:
 under `next` the Hermes platform is off, so cron findings addressed to the Chat home channel
-have no target until the bus carries them.
+have no target until the bus carries them. And the handover is not instantaneous: the pass
+that flips a Chat install to `next` turns the Hermes consumer off while the gateway may still
+be held (the callout gate, a provisioning Job, an image pull), so until the gateway is up
+nobody consumes the subscription - messages wait in it rather than being lost, and the CR
+reads `Provisioning` naming the gateway, which is the signal. In the other direction, a
+message Hermes pulled and had not acked before its pod rolled is redelivered to the A2A
+relay after the subscription's ack deadline; if Hermes replied before acking, that one
+message is answered by both brains, once.
 
 **`verifiedBy: "chat-event-topic-iam"`, and what was actually verified.** The gateway
 verified that the event arrived through the credential proxy from a subscription on the
