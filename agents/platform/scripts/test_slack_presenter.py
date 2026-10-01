@@ -146,6 +146,27 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(headline, "payments-api keeps crashing: secret payments-db-creds is missing.")
         self.assertEqual(body, ["Since 14:02.\n- one"])
 
+    def test_a_fence_under_the_first_line_is_not_joined_into_the_headline(self):
+        md = "payments-api is crashlooping with:\n```\nOOMKilled. Exit 137\n```\nSince 14:02."
+        headline, body = sp.split_answer(md)
+        self.assertEqual(headline, "payments-api is crashlooping with:")
+        self.assertEqual(body, ["```\nOOMKilled. Exit 137\n```\nSince 14:02."])
+
+    def test_a_leading_code_span_is_not_a_fence(self):
+        md = "```payments-api``` is crashlooping on OOM.\n\nRaise the limit."
+        headline, body = sp.split_answer(md)
+        self.assertEqual(headline, "payments-api is crashlooping on OOM.")
+        self.assertEqual(body, ["Raise the limit."])
+
+    def test_a_period_inside_a_code_span_does_not_end_the_headline(self):
+        headline, body = sp.split_answer("The pod logs `connection refused. Retrying` on every start. Since 14:02.")
+        self.assertEqual(headline, "The pod logs connection refused. Retrying on every start.")
+        self.assertEqual(body, ["Since 14:02."])
+
+    def test_fallback_text_keeps_a_plain_headline_as_given(self):
+        headline, _body = sp.split_answer("`__init__.py` is missing.")
+        self.assertEqual(sp.fallback_text(headline), "*__init__.py is missing.*")
+
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))

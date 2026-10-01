@@ -103,8 +103,6 @@ OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
-#: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 #: How many edited alerts this process remembers.
 EDITED_MAX = 512
 
@@ -118,19 +116,8 @@ def enabled() -> bool:
 
 
 def _next_fence(line: str, fence: str | None) -> str | None:
-    """The fence open after ``line``, given the one open before it.
-
-    As in CommonMark, only a line of the opener's character, at least as long, closes it, an
-    unclosed fence runs to the end, and a backtick run followed by another backtick is a code span.
-    """
-    match = FENCE.match(line)
-    if not match:
-        return fence
-    mark = match.group(1)
-    if fence is None:
-        return None if mark[0] == "`" and "`" in line[match.end():] else mark
-    closes = mark[0] == fence[0] and len(mark) >= len(fence) and not line.strip().strip(mark[0])
-    return None if closes else fence
+    """The presenter's fence rule, so the sections and the headline read fences alike."""
+    return _presenter.next_fence(line, fence)
 
 
 def _sections(report: str) -> list[tuple[str, str]]:

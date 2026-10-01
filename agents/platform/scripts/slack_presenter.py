@@ -130,7 +130,8 @@ CHOICE_ACTION_ID_PATTERN = re.compile(r"\.choice\.\d+$")
 CHOICES_LEAD = "Reply with one of: "
 CHOICE_SEPARATOR = " · "
 
-CODE_FENCES = ("```", "~~~")
+#: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 HEADING = re.compile(r"^\s{0,3}#{1,6}\s+")
 LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
 MD_BOLD = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
@@ -139,7 +140,8 @@ MD_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: ``*italic*`` and ``_italic_``; a ``*`` inside a word (``2*3``) or unpaired (``*.tmp``) is text.
 MD_ITALIC = re.compile(r"(?<![\w*])\*(?=[^\s.])([^*\n]+?)(?<=\S)\*(?![\w*])|(?<![\w_])_(?=[^\s.])([^_\n]+?)(?<=\S)_(?![\w_])")
 #: Inline code.
-MD_CODE = re.compile(r"`([^`\n]+)`")
+#: A code span: a backtick run, then content, then a run of the same length (CommonMark).
+MD_CODE = re.compile(r"(?<!`)(`+)([^\n]+?)(?<!`)\1(?!`)")
 #: Holds a code span's place while the other markup is stripped; NUL never appears in an answer.
 CODE_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
@@ -198,15 +200,34 @@ def settle_for_kanban_kind(kind: str) -> str | None:
 # --- markdown --------------------------------------------------------------
 
 
+def next_fence(line: str, fence: str | None) -> str | None:
+    """The fence open after ``line``, given the one open before it.
+
+    As in CommonMark, only a line of the opener's character, at least as long, closes it, an
+    unclosed fence runs to the end, and a backtick run followed by another backtick is a code span.
+    """
+    match = FENCE.match(line)
+    if not match:
+        return fence
+    mark = match.group(1)
+    if fence is None:
+        return None if mark[0] == "`" and "`" in line[match.end():] else mark
+    closes = mark[0] == fence[0] and len(mark) >= len(fence) and not line.strip().strip(mark[0])
+    return None if closes else fence
+
+
+def _opens_fence(line: str) -> bool:
+    return next_fence(line, None) is not None
+
+
 def _paragraphs(markdown: str) -> list[str]:
     """Blank-line separated blocks, never splitting inside a fenced code block."""
     out: list[str] = []
     current: list[str] = []
-    in_fence = False
+    fence = None
     for line in markdown.split("\n"):
-        if line.strip().startswith(CODE_FENCES):
-            in_fence = not in_fence
-        if not in_fence and not line.strip():
+        fence = next_fence(line, fence)
+        if fence is None and not line.strip():
             if current:
                 out.append("\n".join(current).strip("\n"))
                 current = []
@@ -222,19 +243,29 @@ def _plain(markdown: str) -> str:
 
     Code spans are held out first, as a renderer resolves them first, so ``__init__`` in one stays.
     """
-    spans: list[str] = []
-
-    def hold(match: re.Match) -> str:
-        spans.append(match.group(1))
-        return f"\x00{len(spans) - 1}\x00"
-
-    text = MD_CODE.sub(hold, markdown.strip())
+    text, spans = _hold_code(markdown.strip())
     text = HEADING.sub("", text)
     text = LIST_MARKER.sub("", text)
     text = MD_LINK.sub(r"\1", text)
     text = MD_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
     text = MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
-    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))], text).strip()
+    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))].group(2).strip(), text).strip()
+
+
+def _hold_code(text: str) -> tuple[str, list[re.Match]]:
+    """``text`` with each code span swapped for a placeholder, and the spans."""
+    spans: list[re.Match] = []
+
+    def hold(match: re.Match) -> str:
+        spans.append(match)
+        return f"\x00{len(spans) - 1}\x00"
+
+    return MD_CODE.sub(hold, text), spans
+
+
+def _restore_code(text: str, spans: list[re.Match]) -> str:
+    """``text`` with each placeholder put back as its code span, backticks included."""
+    return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))].group(0), text)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -274,17 +305,21 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     if not paragraphs:
         return "", []
     first, rest = paragraphs[0], paragraphs[1:]
-    if first.lstrip().startswith(CODE_FENCES):
+    if _opens_fence(first.split("\n", 1)[0]):
         return "", paragraphs
-    # A soft-wrapped sentence continues onto the next line; a list item or heading does not.
+    # A soft-wrapped sentence continues onto the next line; a list item, heading or fence does not.
     lines = first.split("\n")
     wrapped = 1
-    while wrapped < len(lines) and not (LIST_MARKER.match(lines[wrapped]) or HEADING.match(lines[wrapped])):
+    while wrapped < len(lines) and not (
+        LIST_MARKER.match(lines[wrapped]) or HEADING.match(lines[wrapped]) or _opens_fence(lines[wrapped])
+    ):
         wrapped += 1
     joined = " ".join(line.strip() for line in lines[:wrapped])
     more_lines = "\n".join(lines[wrapped:])
     # The list marker goes first, or "1. Checkout is down." would end at "1.".
-    sentence, remainder = _first_sentence(LIST_MARKER.sub("", joined))
+    # A period inside a code span does not end the sentence.
+    held, spans = _hold_code(LIST_MARKER.sub("", joined))
+    sentence, remainder = (_restore_code(part, spans) for part in _first_sentence(held))
     headline = _clip(_plain(sentence), HEADLINE_MAX)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest
@@ -331,11 +366,13 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
     """The same layout as plain mrkdwn, with no buttons.
 
     Used as the ``text`` of a blocks message (notifications, screen readers).
-    Links become inline ``<url|label>``; choices become one "Reply with one
-    of:" line. Every label is escaped, so none can mention anyone.
+    ``headline`` is already plain, as :func:`split_answer` gives it; a second
+    plain pass would strip markup a code span had kept. Links become inline
+    ``<url|label>``; choices become one "Reply with one of:" line. Every label
+    is escaped, so none can mention anyone.
     """
     parts: list[str] = []
-    title = _clip(_plain(headline or ""), HEADLINE_MAX)
+    title = _clip((headline or "").strip(), HEADLINE_MAX)
     if title:
         parts.append(f"*{_escape(title)}*")
     pairs = _link_pairs(links)

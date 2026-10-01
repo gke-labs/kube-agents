@@ -283,6 +283,13 @@ class RuntimeTest(unittest.TestCase):
                 report = REPORT.replace("- **Option B", cut + "- **Option B")
                 self.assertEqual([rec for _label, rec in runtime.parse_triage(report)["choices"]], [False, True])
 
+    def test_a_whats_wrong_opening_with_a_code_span_still_gives_the_headline(self):
+        lines = REPORT.split("\n")
+        at = next(i for i, line in enumerate(lines) if "What's wrong" in line) + 1
+        lines.insert(at, "```payments-api``` is crashlooping on OOM.\n")
+        triage = runtime.parse_triage("\n".join(lines))
+        self.assertEqual(triage["headline"], "payments-api is crashlooping on OOM.")
+
     def test_a_line_opening_with_a_code_span_is_not_a_fence(self):
         report = REPORT.replace("- ✅ **Recommended", "```kubectl rollout undo``` is the command.\n- ✅ **Recommended")
         triage = runtime.parse_triage(report)
