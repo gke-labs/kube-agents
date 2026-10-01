@@ -454,7 +454,10 @@ if [ ! -r "$AUTHORIZED_KEYS_SRC" ]; then
   log "Mount the sandbox key secret there, or set SANDBOX_AUTHORIZED_KEYS."
   exit 1
 fi
-install -m 0600 -o agent -g agent "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
+# Root-owned, like the home and the .ssh above it (deploy/sandbox/Dockerfile):
+# a file the agent owns is one the model can add a key of its own to. 0644
+# because sshd reads it as the user it is authenticating.
+install -m 0644 -o root -g root "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
 # The same key also authorises `hermes`, the principal trusted agent-pod code
 # connects as instead of `agent`. The Dockerfile comment on that account says
 # why the two cannot be the same login. Nothing else here needs changing: the

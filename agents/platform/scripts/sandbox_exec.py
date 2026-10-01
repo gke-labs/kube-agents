@@ -27,12 +27,12 @@ sides: `sandbox_enabled()` is false over there.
 Two things about this module are load-bearing and easy to undo by accident.
 
 It connects as `hermes`, not as `terminal.ssh_user`. That setting is the login
-Hermes gives the model's shell, and it owns its own home directory in the
-sandbox; bash sources `~/.bashrc` even for a non-interactive `ssh host cmd`, so
-a caller authenticating as it would run the model's startup file before its own
-command and could be handed forged output as a trusted tool result. Debian's
-stock non-interactive guard at the top of `.bashrc` hides this, and the model
-can delete the guard. `deploy/sandbox/Dockerfile` creates the second account.
+Hermes gives the model's shell: a caller authenticating as it shares a uid with
+every process the model starts and works in directories the model owns, so it
+could be handed forged output as a trusted tool result. The first route found
+was `~/.bashrc`, which bash sources even for a non-interactive `ssh host cmd`;
+current images make the home root-owned, but sandbox images built before that
+let the model write it. `deploy/sandbox/Dockerfile` creates the second account.
 
 It does not build the ssh subprocess environment from `os.environ`. The agent
 pod holds `API_SERVER_KEY` and `SESSION_KV_API_KEY`, and `_run_env()` in
@@ -96,7 +96,8 @@ TERMINAL_PRINCIPAL = "agent"
 
 # The marker `read_bytes` prints before its payload, so a login shell that
 # writes to stdout cannot corrupt the file. `agent` sources ~/.bashrc even for
-# `ssh host cmd`, and the model owns that file: anything it echoes lands in
+# `ssh host cmd`, and in sandbox images built before the home was root-owned the
+# model owns that file: anything it echoes lands in
 # front of the base64 and turns a readable report into a decode error. Slicing
 # at the marker discards the chatter instead. A model that echoes the marker
 # itself only truncates its own file, which is a paste it could have corrupted

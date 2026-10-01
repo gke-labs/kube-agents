@@ -76,8 +76,9 @@ const (
 	shellSandboxRepositoryName = "agent-sandbox"
 
 	// The login the agent ssh's in as, created by deploy/sandbox/Dockerfile as uid
-	// 1000, with an ephemeral home and a durable /opt/data. Not root, and not the
-	// agent pod's own uid 10000 — the two pods share nothing but a public key.
+	// 1000, with a root-owned ephemeral home and a durable /opt/data. Not root, and
+	// not the agent pod's own uid 10000 — the two pods share nothing but a public
+	// key.
 	shellSandboxUser = "agent"
 
 	// shellSandboxUser's uid, from the same useradd. Named here because the
@@ -122,12 +123,12 @@ const (
 	shellSandboxSshdPath = "/var/lib/sandbox-sshd"
 
 	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It
-	// is writable alongside the data volume — see HERMES_WRITE_SAFE_ROOT in
-	// buildPodTemplateSpec — but it is on the container filesystem and does not
-	// survive a restart. That is deliberate: the model owns ~/.bashrc, bash
-	// sources it for a non-interactive `ssh host cmd`, and a hijack planted there
-	// should not outlive the pod. Durable work goes to the data volume, which is
-	// what TERMINAL_CWD points at.
+	// is on the container filesystem, and the image makes it root-owned with no
+	// dotfiles: every session in the pod shares it, and bash and python3 load
+	// code from it unasked, so a file one session planted there would run in
+	// every later one. Durable work goes to the data volume, which is what
+	// TERMINAL_CWD points at. HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec still
+	// names it; a write there fails on the mode instead.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect
@@ -135,17 +136,17 @@ const (
 	// the agent pod's Hermes home. Skills live in that tree, so a file written
 	// here would land in the gateway's skills/ as instructions the next session
 	// loads. deploy/sandbox/Dockerfile makes the directory root-owned and 0555 to
-	// stop that, and on its own that is not enough: /home/agent is owned by uid
-	// 1000 on a writable container filesystem, and removing a directory needs
-	// write on the parent rather than on the directory. `rmdir ~/.hermes && mkdir
-	// ~/.hermes` hands the model a writable one back.
+	// stop that. The mode alone does not bind the name: removing a directory needs
+	// write on the parent rather than on the directory, and in sandbox images
+	// whose /home/agent is still owned by uid 1000, `rmdir ~/.hermes && mkdir
+	// ~/.hermes` hands the model a writable one back. Current images make the
+	// home root-owned, which stops that rmdir; an operator can still run an older
+	// image through shellSandbox.image.
 	//
-	// An empty read-only volume over the path closes it from the other side. The
-	// mount cannot be removed — rmdir on a mount point is EBUSY — and cannot be
-	// written whatever it is replaced by, and undoing it needs CAP_SYS_ADMIN,
-	// which this container does not have. Leaving /home/agent itself
-	// agent-writable keeps ~/.bashrc and the rest of the home working the way the
-	// comment above describes.
+	// An empty read-only volume over the path closes it from the other side,
+	// whatever the image. The mount cannot be removed — rmdir on a mount point is
+	// EBUSY — and cannot be written whatever it is replaced by, and undoing it
+	// needs CAP_SYS_ADMIN, which this container does not have.
 	shellSandboxHermesHomeVolume = "hermes-sync-block"
 	shellSandboxHermesHomePath   = shellSandboxHomePath + "/.hermes"
 

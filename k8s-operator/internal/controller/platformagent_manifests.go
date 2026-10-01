@@ -2893,12 +2893,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
 	// own home while the shell is local. agent/file_safety.py checks the path prefix in
 	// the agent process before the write is routed anywhere, so with the shell in the
-	// sandbox this has to name the sandbox's writable directories or write_file and
-	// patch return "Write denied" for everything — which is how the earlier value was
-	// found wrong on a live install. The sandbox's data volume carries the same
-	// /opt/data path deliberately, so the interesting half of this is the ephemeral
-	// home; the value is written out rather than left to the image default so the
-	// policy is visible in the pod spec. It gives up no isolation: with backend: ssh
+	// sandbox this has to name sandbox paths or write_file and patch return "Write
+	// denied" for everything — which is how the earlier value was found wrong on a
+	// live install. The sandbox's data volume carries the same /opt/data path
+	// deliberately. /home/agent is listed too, but current sandbox images make it
+	// root-owned (deploy/sandbox/Dockerfile), so a write there passes this check and
+	// then fails on the directory's mode. The value is written out rather than left
+	// to the image default so the policy is visible in the pod spec. It gives up no
+	// isolation: with backend: ssh
 	// the file tools cannot reach the agent's own filesystem to begin with.
 	//
 	// TERMINAL_CWD is what stops the agent working in a directory that does not
