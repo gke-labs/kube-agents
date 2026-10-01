@@ -669,7 +669,7 @@ Flags for AI Agents & Automation:
   --enable-drift-detector[=true|false]
                                 Report cluster changes made outside git. Exports this
                                 project's GKE audit log to Pub/Sub and starts the
-                                detector that reads it (default: false)
+                                detector that reads it (default: true)
   --google-chat-allowed-users=EMAILS
                                 Comma-separated user emails allowed to talk to the
                                 agent over Google Chat. Empty allows all users

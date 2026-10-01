@@ -56,7 +56,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
 | `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
-| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription no stock install creates. See below.                                                                                                         |
+| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
 | `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
 | `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
@@ -187,7 +187,10 @@ watcher posts to — so a change someone made to a cluster by hand arrives on th
 control plane, CI, and every service account are dropped alike; on a busy cluster that is the
 overwhelming majority of the stream.
 
-**It is on unless you turn it off, like the watcher.** It is not free, though, and what it costs is
+**Through `install.sh` it is on unless you turn it off; the field itself still defaults to
+`false`.** The two layers differ on purpose — the field is what a hand-written CR or a Helm-only
+install sets, and neither of those creates a subscription for the detector to read, so the API
+default stays off and the installer is what turns it on. It is not free either, and what it costs is
 GCP resources rather than cluster resources: the subscription it reads comes with an audit log sink
 and a Pub/Sub topic, all three from the `drift-pubsub` Terraform module, and the sink exports the
 admin-activity audit records of every GKE cluster in the project. The

@@ -179,7 +179,10 @@ the hazard is a hand edit that deletes a line rather than setting it to `false`.
 configuration first and real drift second.
 
 `ENABLE_DRIFT_DETECTOR` has the same sharp edge pointing the other way, because it is the
-one key here whose default is `true`. Absent, it provisions rather than destroys: a full
+one key here whose absence provisions. Other keys default to `true` in
+`install.defaults.env` — `ENABLE_GVISOR` is one, four paragraphs up — but
+`write_tfvars_from_state` falls back to `false` for those, which is what makes a missing
+line destroy. This key is the one it resolves against `install.defaults.env` instead. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
 Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it

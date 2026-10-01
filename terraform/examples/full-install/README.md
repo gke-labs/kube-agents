@@ -782,11 +782,11 @@ name and cannot tell a leftover from another install's live trio, so a second
 install in the same project that turns the flag on sets its own three names
 first ([Remote state](#remote-state)).
 
-Through the installer front doors the two variables are one `install.env` key.
-`ENABLE_DRIFT_DETECTOR=true` (also `install.sh --enable-drift-detector`) writes
-both into the generated `terraform.tfvars`, which is the only order the
-precondition accepts. Off, it writes neither — the one boolean in that
-generated file omitted rather than written `false`. `enable_drift_pubsub` is
+Through the installer front doors the two variables are one `install.env` key,
+`ENABLE_DRIFT_DETECTOR`, and it defaults to `true`: an install that says nothing
+about it writes both into the generated `terraform.tfvars`, which is the only
+order the precondition accepts. `ENABLE_DRIFT_DETECTOR=false` writes neither —
+the one boolean in that generated file omitted rather than written `false`. `enable_drift_pubsub` is
 reachable on its own as a `TF_VAR_enable_drift_pubsub=true` line in
 `install.env`, the same channel `agent_ksa_name` uses (every front door sources
 that file with `set -a`, and Terraform reads `TF_VAR_*` where the generated file
@@ -796,15 +796,19 @@ of retained audit records nothing has acknowledged — for removal under
 `-auto-approve`, from a release note nobody read. Omission is what leaves it
 alone.
 
-Which makes turning the key off two different things. On an install that has
-only ever had the key, dropping it returns both variables to their `false`
+Which makes turning the key off two different things — and note that dropping
+the line is not one of them. Absence resolves to the shipped `true`, so a
+deleted `ENABLE_DRIFT_DETECTOR` line provisions the trio rather than destroying
+it, the opposite of every other key in that file. Only an explicit
+`ENABLE_DRIFT_DETECTOR=false` turns the feature off. On an install that has only
+ever had the key, writing that `false` returns both variables to their `false`
 defaults and the next apply destroys the sink, topic and subscription, retained
 messages included — the ordinary teardown the other flags get, and the same
 `-auto-approve` destroy the paragraph above describes, arriving this time
 because it was asked for. Nothing refuses it: `guard_pubsub_subscription`
 checks the name only while the flag is on, because switching the feature off is
 a teardown it reads as deliberate rather than the rename it guards against. On
-an install carrying the `TF_VAR_` line, dropping the key stops the detector and
+an install carrying the `TF_VAR_` line, that same `false` stops the detector and
 leaves the ingress running, still exporting and still billing.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
