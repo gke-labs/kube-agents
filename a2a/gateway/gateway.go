@@ -694,36 +694,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			rec.Addressee = rec.BusSession
 			msg.Text = rest
 		} else if rec.SessionRouted {
-			// Every new task on the session route gets a fresh incarnation.
-			// The worker adapter is one task per process, so a lingering
-			// PodName names an executor that can never serve this task -
-			// publishing toward it wedges the conversation with a task
-			// nothing will run and nothing will terminate (S9 review
-			// finding). Retire it the way Delegate does: supervisor
-			// terminal for a detached task first, then the delete, then
-			// the successor. The cap holds here too, or Delegate refusals
-			// just push the flood one affordance over.
-			if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
+			// Every new task on the session route gets a fresh incarnation;
+			// freshIncarnation says why and holds the cap.
+			if !g.freshIncarnation(ctx, rec) {
 				return
 			}
-			if rec.PodName != "" {
-				if !g.closeDetachedBeforeDelete(ctx, rec) {
-					g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
-					return
-				}
-				// Spawner-nil is the W4-rollback shape: the record is
-				// session-routed but nothing can manage pods. Clear the
-				// binding and degrade the way this path always did.
-				if g.spawner != nil {
-					if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
-						g.log.Warn("previous incarnation delete failed; pod may linger",
-							"pod", rec.PodName, "err", err)
-					}
-				}
-				rec.PodName = ""
-			}
-			rec.BusSession = mintSessionName(rec.Profile)
-			rec.Addressee = rec.BusSession
 		} else {
 			// Re-home after a delegated task: a plain ask on a fixed-route
 			// conversation always goes to the configured addressee, never
@@ -1001,6 +976,43 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		return state, fmt.Errorf("reading task %s on %s: %w", taskID, addressee, terr)
 	}
 	return state, nil
+}
+
+// freshIncarnation retires the previous session pod, if any, and mints the
+// next incarnation's name as the record's addressee. The worker adapter is
+// one task per process, so a lingering PodName names an executor that can
+// never serve the next task; publishing toward it wedges the conversation
+// (S9 review finding). Retire it the way Delegate does: supervisor terminal
+// for a detached task first, then the delete, then the successor. The cap
+// holds here too, or Delegate refusals just push the flood one affordance
+// over.
+//
+// False means the turn was refused - at the cap, or because the previous
+// task could not be closed on the bus - and a post has already said so. The
+// record is left as it was: every mutation below follows the last refusal.
+func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool {
+	if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
+		return false
+	}
+	if rec.PodName != "" {
+		if !g.closeDetachedBeforeDelete(ctx, rec) {
+			g.post(rec.Key, "⚠️ not started: could not close the previous task on the bus; try again in a moment")
+			return false
+		}
+		// Spawner-nil is the W4-rollback shape: the record is
+		// session-routed but nothing can manage pods. Clear the
+		// binding and degrade the way this path always did.
+		if g.spawner != nil {
+			if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+				g.log.Warn("previous incarnation delete failed; pod may linger",
+					"pod", rec.PodName, "err", err)
+			}
+		}
+		rec.PodName = ""
+	}
+	rec.BusSession = mintSessionName(rec.Profile)
+	rec.Addressee = rec.BusSession
+	return true
 }
 
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
