@@ -454,17 +454,26 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
         self.assertEqual(runtime._deferred, {})
 
-    def test_a_card_under_an_open_follow_up_is_held_from_the_first_completion(self):
-        # t_g, filed by t_b's worker, is held from t_a's completion, so its
-        # give-up makes the ask ❌ although t_b completes afterwards.
+    def test_a_card_under_an_open_follow_up_waits_for_that_follow_up(self):
+        # t_g, filed by t_b's worker, is t_b's to carry: t_a's completion holds
+        # t_b alone, and t_g's give-up before t_b completes leaves t_g parked.
         adapter = self._turn("fix it", {}, _cards("t_a"))
         self.boards[:] = [{**_cards("t_b", creator="t_a"), **_cards("t_g", creator="t_b")}]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
         _run(runtime.settle_delegated(adapter, self._sub("t_g"), "gave_up"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
-        self.boards[:] = [{}]
+        self.boards[:] = [_cards("t_g", status="blocked", creator="t_b", gave_up=True)]
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
-        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+
+    def test_a_card_under_an_open_follow_up_blocked_on_the_user_pauses_at_that_follow_up(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_b", creator="t_a"), **_cards("t_g", status="blocked", creator="t_b")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        self.boards[:] = [_cards("t_g", status="blocked", creator="t_b")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
 
     def test_a_card_past_the_depth_cap_does_not_hold_the_settle(self):
         depth = runtime.LINEAGE_DEPTH
@@ -500,7 +509,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(runtime._descendants(("default", "t_a"), cycle), {("default", "t_a"), ("default", "t_b")})
         # Another board's card of the same id is not a descendant.
         self.assertEqual(runtime._descendants(("default", "t_a"), {("b2", "t_b"): "t_a"}), set())
-        # Nor is anything under a parked card, which is itself still found.
+        # Nor is anything under a card still open, which is itself still found.
         under = {("default", "t_b"): "t_a", ("default", "t_c"): "t_b"}
         self.assertEqual(runtime._descendants(("default", "t_a"), under, frozenset({("default", "t_b")})), {("default", "t_b")})
 
