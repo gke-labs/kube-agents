@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -459,8 +460,13 @@ func TestSessionLocksPrunedWhenIdle(t *testing.T) {
 		l2.Unlock()
 	}()
 
-	// Brief pause to ensure goroutine calls lockSession
-	time.Sleep(20 * time.Millisecond)
+	// Wait until the second acquirer has registered in the map
+	waitFor(t, "second acquirer to register", func() bool {
+		r.g.mu.Lock()
+		defer r.g.mu.Unlock()
+		entry, ok := r.g.sessionLocks[conv]
+		return ok && entry != nil && entry.refcount == 2
+	})
 	r.g.mu.Lock()
 	refAfterSecond := r.g.sessionLocks[conv].refcount
 	r.g.mu.Unlock()
@@ -480,6 +486,55 @@ func TestSessionLocksPrunedWhenIdle(t *testing.T) {
 	if stillExists || afterRelease != initialCount {
 		t.Fatalf("lock entry was not pruned from map after release: count=%d, exists=%v",
 			afterRelease, stillExists)
+	}
+}
+
+// TestMintSessionLostRaceErrorWrapping verifies that mintSession wraps
+// winner-read errors with %w so callers (such as isMaxBytes) can unwrap down
+// to the root error and do not match false-positive patterns in conversation keys.
+func TestMintSessionLostRaceErrorWrapping(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+
+	// Seed an invalid JSON payload into the session-state KV bucket for a conversation key
+	// that intentionally embeds "max bytes" in its name.
+	conv := "discord:g1/conv-max-bytes-race-test"
+	kv, err := r.g.reg.kv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, kvKey(conv), []byte("{invalid json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Calling mintSession for this conversation loses the mint race (key already exists in KV),
+	// and the subsequent Get fails to unmarshal the invalid JSON.
+	rec, err := r.g.mintSession(ctx, InboundMessage{
+		Conversation: conv,
+		Kind:         "group",
+	})
+	if rec != nil {
+		t.Fatalf("expected nil record on mint failure, got %+v", rec)
+	}
+	if err == nil {
+		t.Fatal("expected error from mintSession on unreadable winner, got nil")
+	}
+
+	// Verify error message prefix
+	if !strings.Contains(err.Error(), "lost the mint race but cannot read the winner") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// The error must wrap the underlying json.SyntaxError via %w
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) {
+		t.Fatalf("expected error to wrap *json.SyntaxError via %%w, got: %v", err)
+	}
+
+	// Because gerr is wrapped with %w, isMaxBytes must unwrap through to the root syntax error
+	// and reject the false-positive "max bytes" token embedded in the conversation key.
+	if isMaxBytes(err) {
+		t.Fatalf("isMaxBytes falsely matched on conversation key %q for error: %v", conv, err)
 	}
 }
 

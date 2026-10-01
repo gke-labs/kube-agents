@@ -103,13 +103,6 @@ func (g *Gateway) reapSession(ctx context.Context, rec *SessionRecord) {
 					delete(g.taskSessions, fresh.ActiveTask.TaskID)
 					g.mu.Unlock()
 				}
-				for _, t := range fresh.Tasks {
-					_ = g.reg.DropTask(ctx, t.ID)
-					g.mu.Lock()
-					delete(g.relays, t.ID)
-					delete(g.taskSessions, t.ID)
-					g.mu.Unlock()
-				}
 			}
 			l.Unlock()
 			return
