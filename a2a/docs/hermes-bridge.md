@@ -325,10 +325,10 @@ nothing of it follows the final event. `input` is capped (2 KiB): over the cap i
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
 `api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `passphrase` or `credential` as a
-whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`; not `tokenizer`
-or `secretName`) are replaced before
+whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`,
+`SecretAccessKey`; not `tokenizer` or lowerCamel `secretName`) are replaced before
 publishing, and so are the credential shapes a value can carry under an innocent key (a
-bearer or basic authorization value, a Google OAuth or API key, a GitHub token, a `key=value`
+bearer value, an `Authorization` header of any scheme, a Google OAuth or API key, a GitHub token, a `key=value`
 pair or `--flag value` whose key looks like a secret, curl's `-u user:password` with the rest
 of the command kept, a quoted value taken whole to its closing quote) — a terminal
 command is one string, so this is best-effort, and anything else the model pastes into a

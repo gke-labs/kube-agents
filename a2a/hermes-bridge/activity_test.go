@@ -571,9 +571,9 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // twin, while a name that merely starts with the word (secretName,
 // tokenizer) still ships.
 func TestRedactInput_CamelCaseKeys(t *testing.T) {
-	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9"}`
+	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9","SecretAccessKey":"w3","TokenValue":"t3","SecretName":"blanked-too"}`
 	out := string(redactInput("http_request", json.RawMessage(in)))
-	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`} {
+	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`, `"w3"`, `"t3"`, "blanked-too"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -616,9 +616,9 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 // The scheme token is case-insensitive, and a credential can arrive under a
 // key outside the first list of words: a private key, a passphrase.
 func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
-	in := `{"command": "curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	in := `{"command": "curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; curl -H 'Authorization: Token 0123456789abcdef0123' https://api; curl -H \"Authorization: Bearer abc123def456\" https://b; curl -H 'Authorization: Digest username=\"u\"' https://d; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
 	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "BEGIN PRIVATE KEY", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
+	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "0123456789abcdef0123", "abc123def456", `username=\"u\"`, "BEGIN PRIVATE KEY", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -626,7 +626,7 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 	// A short word after "basic" is not a credential, and a camelCase key
 	// that starts with the word is a name, as for secretName.
 	// The curl command's URL and method survive its credential.
-	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]"} {
+	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("expected %q in %s", kept, out)
 		}

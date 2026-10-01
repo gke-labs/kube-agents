@@ -228,9 +228,12 @@ var (
 	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
 	// starts a component when any letter or digit precedes its capital (so
 	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
-	// ends one at the end, a separator or the next capital.
+	// ends one at the end, a separator or the next capital; a PascalCase key
+	// that starts with the word and goes on in a further component
+	// (SecretAccessKey, TokenValue) is blanked too, which takes SecretName
+	// with it, the accepted price, while lowerCamel secretName stays a name.
 	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:$|[_.-])`)
-	redactedCamelKeyPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedCamelKeyPattern = regexp.MustCompile(`(?:[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])|^(?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?[A-Z])`)
 	redactedValuePatterns   = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
@@ -240,10 +243,11 @@ var (
 		// and long enough to be a credential, so "basic refactoring" in a
 		// commit message is not one: the word after it is too short.
 		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
-		// The Basic header by its own key, however short the credential:
-		// root:toor encodes to twelve characters, under the floor the bare
-		// form below needs to stay out of prose.
-		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?basic\s+[A-Za-z0-9+/]+={0,2}`),
+		// An Authorization header by its own key, whatever the scheme and
+		// however short the credential (Basic root:toor is twelve characters,
+		// a Token or Digest value has no shape of its own): scheme and
+		// value, the two words after the key.
+		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?[A-Za-z][A-Za-z0-9-]*\s+[^\s"']+`),
 		// key=value / key: value / "key": "value", where a secret word is a
 		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
 		// quoted value runs to its closing quote, spaces included, so a
