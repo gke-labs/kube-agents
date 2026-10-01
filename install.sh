@@ -1781,17 +1781,24 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
-    # Four consequence strings, unlike every other call here, which take one.
-    # This key is the only one whose consequence varies, and it varies on two
-    # things at once.
+    # Five consequence strings, unlike every other call here, which take one.
+    # This key is the only one whose consequence varies, and it varies on
+    # three things at once.
     #
     # Direction. Turning it ON leaves the loss for a later run; turning it OFF
-    # over a file that records it on does the destroying now, and the later run
-    # re-reads the file and puts it back. The wrong one of those tells the
-    # operator the destruction is deferred at the moment it is about to happen.
+    # over something that asks for it on does the destroying now, and the later
+    # run re-reads that source and puts it back. The wrong one of those tells
+    # the operator the destruction is deferred at the moment it is about to
+    # happen.
     #
     # Whether anything is destroyed at all, which the TF_VAR_ block below
     # explains.
+    #
+    # And whether the source a later run restores from is the shipped default
+    # rather than the file or the shell, which is the fifth string and the one
+    # the flipped default added: it is the only case where nothing ever asked
+    # for the trio, so it is the only one that cannot assert the trio is there
+    # to destroy.
     #
     # A string that covered every case would say nothing an operator could act
     # on, and each of these is read by someone about to be surprised.
@@ -1801,31 +1808,57 @@ bootstrap_install_env_file() {
     # reads below and the guard's own presence test share it.
     read_recorded_install_env_values "$destination" ENABLE_DRIFT_DETECTOR TF_VAR_enable_drift_pubsub
     drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
-    # What a later run that passes no flag reads the key back from. The file
-    # when it records one; otherwise, with the file silent, this shell's own
-    # export -- PARAM_ENABLE_DRIFT_DETECTOR is seeded from the environment
-    # before parse_args overwrites it, so that export is what the next run
-    # from this shell chooses and what an upgrade.sh from it regenerates on.
+    # What a later run that passes no flag resolves the key to, and where it
+    # reads it back from. One cascade, because the guard's whole question is
+    # whether this run differs from that run, and a value and a source that
+    # disagree would name one thing and warn about another.
+    #
+    # The file when it records one; otherwise this shell's own export --
+    # PARAM_ENABLE_DRIFT_DETECTOR is seeded from the environment before
+    # parse_args overwrites it, so that export is what the next run from this
+    # shell chooses and what an upgrade.sh from it regenerates on.
     # SHELL_ENABLE_DRIFT_DETECTOR rather than ENABLE_DRIFT_DETECTOR because
     # main() has already overwritten the latter with this run's choice; the
     # comment beside the capture has the consequence of reading the wrong one.
-    local drift_detector_restorer="${destination}"
-    if [ -z "$drift_detector_recorded" ] && is_truthy "${SHELL_ENABLE_DRIFT_DETECTOR:-false}"; then
+    # Otherwise the shipped default, which is the arm that carries the weight
+    # now that DEFAULT_ENABLE_DRIFT_DETECTOR is true: saying nothing is on, so
+    # the file being silent no longer means a later run leaves the detector
+    # alone -- it means a later run turns it on.
+    #
+    # Emptiness decides each step, not truthiness, which it did not have to
+    # before. With the default false an unset export and an exported `false`
+    # both resolved to off, so conflating them was harmless; with the default
+    # true only the second is off, and reading a set-but-falsy export as
+    # "absent" would fall through to the default and claim a later run turns
+    # the detector on when that shell turns it off.
+    local drift_detector_restorer drift_detector_later drift_detector_later_is_default=""
+    if [ -n "$drift_detector_recorded" ]; then
+      drift_detector_later="$drift_detector_recorded"
+      drift_detector_restorer="$destination"
+    elif [ -n "${SHELL_ENABLE_DRIFT_DETECTOR:-}" ]; then
+      drift_detector_later="$SHELL_ENABLE_DRIFT_DETECTOR"
       drift_detector_restorer="the ENABLE_DRIFT_DETECTOR=${SHELL_ENABLE_DRIFT_DETECTOR} this shell exports"
+    else
+      drift_detector_later="$DEFAULT_ENABLE_DRIFT_DETECTOR"
+      drift_detector_restorer="the shipped ENABLE_DRIFT_DETECTOR default (${DEFAULT_ENABLE_DRIFT_DETECTOR})"
+      drift_detector_later_is_default="true"
     fi
-    if [ -n "$drift_detector_chosen" ] && ! is_truthy "$drift_detector_chosen"; then
-      if is_truthy "${drift_detector_recorded:-false}" || is_truthy "${SHELL_ENABLE_DRIFT_DETECTOR:-false}"; then
-        # Off over something that asks for it on: the file, or -- with the file
-        # silent -- the shell. The second is a reversal too, and the one this
-        # guard exists to catch: the =false applies to this run, and the next
-        # run from the same shell re-reads the export, writes both keys and
-        # provisions the ingress again, empty and billing, with nothing said.
+    # Warn only on a disagreement, in either direction. Both arms of this
+    # swapped when the default did. `--enable-drift-detector` over a file that
+    # records nothing used to be the reversal worth announcing and is now what
+    # the install does anyway, so it says nothing; `--enable-drift-detector=false`
+    # over that same file used to be the harmless one and is now the reversal,
+    # because the flag applies to this run and the next run reads the default
+    # and turns the detector back on. Getting this backwards is silent either
+    # way: a warning nobody needs, or an opt-out that expires without a word.
+    if [ -n "$drift_detector_chosen" ]; then
+      if is_truthy "$drift_detector_chosen"; then
+        if is_truthy "$drift_detector_later"; then
+          drift_detector_chosen=""
+        fi
+      elif is_truthy "$drift_detector_later"; then
         drift_detector_turning_off="true"
       else
-        # Off over a file that does not ask for it on, from a shell that does
-        # not either. This run writes neither key and so would every later run,
-        # so there is no reversal to announce -- and the helper's unrecorded
-        # branch would announce one.
         drift_detector_chosen=""
       fi
     fi
@@ -1859,11 +1892,18 @@ bootstrap_install_env_file() {
     # an upgrade.sh from a clean shell that regenerates tfvars with neither
     # key, falls to the variable's false default and destroys the trio;
     # promising them a sink that survives is the same discounting in the
-    # other direction. The export is still worth naming where it holds, which
-    # is why the turning-off branch carries the caveat rather than dropping
-    # the distinction. This function never rewrites an existing file, so a
+    # other direction. This function never rewrites an existing file, so a
     # line read here is a line that is still there after.
-    local drift_ingress_recorded drift_ingress_caveat=""
+    #
+    # There is no caveat on the turning-off branch any more, and the default
+    # is why. It used to read "the first run from a shell exporting neither
+    # destroys them", which was true while a clean-shell run that found the
+    # file silent wrote neither tfvars key. Such a run now falls to
+    # DEFAULT_ENABLE_DRIFT_DETECTOR, writes both and provisions the trio, so
+    # on every path that could still reach the caveat the sentence is false --
+    # and it was spliced in front of a clause saying a later run starts the
+    # detector again, which it would now flatly contradict.
+    local drift_ingress_recorded
     drift_ingress_recorded="$(recorded_install_env_value "$destination" TF_VAR_enable_drift_pubsub 2>/dev/null || true)"
     local drift_ingress_keeper_file="" drift_ingress_keeper_now=""
     if is_truthy "${drift_ingress_recorded:-false}"; then
@@ -1871,41 +1911,27 @@ bootstrap_install_env_file() {
       drift_ingress_keeper_now="$drift_ingress_keeper_file"
     elif is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
       drift_ingress_keeper_now="TF_VAR_enable_drift_pubsub in this shell's environment"
-      # Only when the file does not record the detector on. With
-      # ENABLE_DRIFT_DETECTOR=true in the file, the run from a clean shell this
-      # caveat warns about re-reads that line and writes both drift tfvars keys,
-      # which provisions the ingress -- so the trio stands whether or not the
-      # export came along, and the caveat would contradict the sentence it is
-      # spliced into, which says in the next breath that a later run starts the
-      # detector again. A recorded `false`, or no line at all, leaves the shell
-      # as the only thing holding the trio up, and then it is the whole warning.
-      #
-      # Both exports, not the TF_VAR_ one alone. Reaching here means
-      # drift_detector_turning_off was set on a file that records no detector,
-      # which by the test above means SHELL_ENABLE_DRIFT_DETECTOR is on -- so
-      # every operator who sees this sentence is exporting both, and either one
-      # alone keeps the trio standing. TF_VAR_enable_drift_pubsub because
-      # Terraform reads it straight out of the environment; ENABLE_DRIFT_DETECTOR
-      # because write_tfvars_from_state writes `enable_drift_pubsub = true` from
-      # it, which test_tfvars_writes_both_drift_keys_when_the_detector_is_on in
-      # tests/test_installer_common.py pins. Naming one export promises
-      # destruction to a shell that kept the other, and contradicts the clause
-      # this is spliced in front of, which says a later run re-reads the export
-      # this shell holds and starts the detector again.
-      if ! is_truthy "${drift_detector_recorded:-false}"; then
-        drift_ingress_caveat=" ${destination} records neither key as on, so they stand on this shell's exports: keeping either ENABLE_DRIFT_DETECTOR or TF_VAR_enable_drift_pubsub keeps them, and the first run from a shell exporting neither destroys them along with the audit records retained there."
-      fi
     fi
     if [ -n "$drift_detector_turning_off" ]; then
       if [ -n "$drift_ingress_keeper_now" ]; then
-        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; ${drift_ingress_keeper_now} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads.${drift_ingress_caveat} A later run without the flag re-reads ${drift_detector_restorer} and starts the detector again."
+        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; ${drift_ingress_keeper_now} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads. A later run without the flag re-reads ${drift_detector_restorer} and starts the detector again."
+      elif [ -n "$drift_detector_later_is_default" ]; then
+        # The default arm hedges the destroy where the other two assert it,
+        # and the file being silent is the reason. A recorded or exported
+        # value means some earlier run was told to provision the trio; the
+        # default means nothing was ever told anything, so the trio exists
+        # only if a run since this release already applied it -- which, for
+        # the first run after an upgrade, it has not. Asserting a destroy
+        # there would promise the operator the loss of audit records they do
+        # not have, and a warning that over-claims once is discounted after.
+        drift_detector_consequence="This run writes neither drift tfvars key, so the detector is off for it, and this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there if a run since the detector became the default provisioned them -- with -auto-approve and no plan shown first. A later run without the flag re-reads ${drift_detector_restorer} and provisions them again, empty."
       else
         drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads ${drift_detector_restorer} and provisions them again, empty."
       fi
     elif [ -n "$drift_ingress_keeper_file" ]; then
-      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and stops the detector; ${drift_ingress_keeper_file} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it re-reads ${drift_detector_restorer}, writes neither and stops the detector; ${drift_ingress_keeper_file} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
     else
-      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it re-reads ${drift_detector_restorer}, writes neither, and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
     fi
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
       "$drift_detector_chosen" \

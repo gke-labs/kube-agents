@@ -187,17 +187,27 @@ watcher posts to — so a change someone made to a cluster by hand arrives on th
 control plane, CI, and every service account are dropped alike; on a busy cluster that is the
 overwhelming majority of the stream.
 
-**It is off unless you ask for it, the opposite of the watcher.** The subscription it reads does not
-exist in a stock install: the audit log sink, topic, and subscription come from the
-`drift-pubsub` Terraform module, which the
+**It is on unless you turn it off, like the watcher.** It is not free, though, and what it costs is
+GCP resources rather than cluster resources: the subscription it reads comes with an audit log sink
+and a Pub/Sub topic, all three from the `drift-pubsub` Terraform module, and the sink exports the
+admin-activity audit records of every GKE cluster in the project. The
 [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)
-composition instantiates only when you set `enable_drift_pubsub = true`, and the field below is
-written only when you set `enable_drift_detector = true` alongside it. Asking for the second
-without the first is refused by a precondition rather than applied. If you installed with
-`install.sh`, ask for both at once with `ENABLE_DRIFT_DETECTOR=true` in `install.env` (or
-`install.sh --enable-drift-detector`), which writes both variables together; the front doors
-regenerate `terraform.tfvars` on every run, so a value written into that file by hand does not
-survive the next one.
+composition instantiates the module when you set `enable_drift_pubsub = true`, and writes the field
+below when you set `enable_drift_detector = true` alongside it. Asking for the second without the
+first is refused by a precondition rather than applied.
+
+If you installed with `install.sh`, one key covers both: `ENABLE_DRIFT_DETECTOR` in `install.env`
+writes the two variables together, and it defaults to `true`, so an install that says nothing gets
+the sink, topic, subscription and detector. To go without them, set `ENABLE_DRIFT_DETECTOR=false`
+in `install.env`. Put it in the file rather than passing `install.sh --enable-drift-detector=false`:
+the flag applies to the run you pass it to and is recorded nowhere, so the next run resolves the
+default and provisions the three resources again, and `upgrade.sh` takes no such flag at all. The
+front doors regenerate `terraform.tfvars` on every run, so a value written into that file by hand
+does not survive the next one either.
+
+This reaches an install created before the key existed. Its `install.env` records no choice, so the
+next `install.sh` or `upgrade.sh` run resolves the default and provisions the three resources —
+`upgrade.sh --plan` shows them as additions before you apply.
 
 An install that has neither provisioned the ingress nor applied the module by hand has nothing for
 the detector to pull. Setting this field there anyway — which now takes a hand-edited CR or chart

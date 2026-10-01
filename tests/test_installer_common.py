@@ -221,9 +221,11 @@ class InstallerCommonTest(unittest.TestCase):
                     # Same reasoning, and the same ${VAR:-} read in
                     # write_tfvars_from_state. get_isolated_test_env filters
                     # the CI names and nothing else, so without this a shell
-                    # exporting ENABLE_DRIFT_DETECTOR=true reaches every case
+                    # exporting ENABLE_DRIFT_DETECTOR=false reaches every case
                     # that does not set it -- including the arm below that
-                    # asserts the drift keys are omitted when nobody asks.
+                    # asserts the drift keys are written when nobody asks.
+                    # Blanking it is "unset", which that arm wants: `:-` takes
+                    # the default for an empty value as well as an absent one.
                     "ENABLE_DRIFT_DETECTOR": "",
                     **(env or {}),
                 },
@@ -427,18 +429,42 @@ class InstallerCommonTest(unittest.TestCase):
         audit-log ingress that way, and the next upgrade would destroy its
         sink, topic and subscription under -auto-approve.
 
-        The None arm is the key absent from what the case passes in. It only
-        means "unset" because _run blanks ENABLE_DRIFT_DETECTOR in the
-        isolated environment it builds; get_isolated_test_env copies the rest
-        of os.environ through, so without that blank this arm would assert
-        against whatever the developer's shell happened to export.
+        Every arm here is an explicit opt-out, because that is the only way to
+        reach the off branch now that DEFAULT_ENABLE_DRIFT_DETECTOR is true.
+        The companion below owns the arms that say nothing.
         """
-        for value in ("false", "False", "no", "0", "off", "", None):
+        for value in ("false", "False", "no", "0", "off"):
+            with self.subTest(value=value):
+                content = self._drift_tfvars(ENABLE_DRIFT_DETECTOR=value)
+                self.assertNotIn("enable_drift_pubsub", content)
+                self.assertNotIn("enable_drift_detector", content)
+
+    def test_tfvars_writes_both_drift_keys_when_nobody_says_anything(self):
+        """Saying nothing provisions the trio, which is what flipping
+        DEFAULT_ENABLE_DRIFT_DETECTOR to true means and the one arm that
+        proves the generator reads the default rather than a literal.
+
+        Both arms are "unset" to the `${ENABLE_DRIFT_DETECTOR:-...}` the gate
+        expands: `:-` takes the default for an empty value as well as an
+        absent one, so an install.env carrying `ENABLE_DRIFT_DETECTOR=` gets
+        the detector, not the off branch. The None arm only means "absent"
+        because _run blanks ENABLE_DRIFT_DETECTOR in the isolated environment
+        it builds; get_isolated_test_env copies the rest of os.environ
+        through, so without that blank this arm would assert against whatever
+        the developer's shell happened to export.
+
+        This is also what an install predating the key gets: its install.env
+        records no choice, so the next run of either front door reads the
+        default here and provisions the sink, topic and subscription. That is
+        the intended behaviour -- running an installer is the consent -- and
+        this case is where it is pinned.
+        """
+        for value in ("", None):
             with self.subTest(value=value):
                 env = {} if value is None else {"ENABLE_DRIFT_DETECTOR": value}
                 content = self._drift_tfvars(**env)
-                self.assertNotIn("enable_drift_pubsub", content)
-                self.assertNotIn("enable_drift_detector", content)
+                self.assertIn("enable_drift_pubsub   = true", content)
+                self.assertIn("enable_drift_detector = true", content)
 
     def test_an_exported_value_survives_the_file_load_into_the_tfvars(self):
         """install.env is not this generator's only input, and no front door makes it one.
