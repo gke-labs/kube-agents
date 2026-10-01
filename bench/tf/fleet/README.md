@@ -441,6 +441,9 @@ roll and trip 3.3 `fleet-spread`), 3.2 `pool-skew` is clean because
 (any skew between them is the transient mid-reconcile lag 3.2 explicitly does
 not flag), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly
 does not flag, and pools run default auto-upgrade/auto-repair on COS_CONTAINERD.
+One upgrade-audit finding is planted by design: 3.11 `upgrade-blocked` on `seeded-b`, joined
+from the `pinned-batch-runner` budget above and the version lag, which is the finding the
+`upgrades-audit-reports-upgrade-blocked` case asserts on.
 
 Implication for the scenarios (`feat/domain-scenarios`): each objective must
 assert the planted finding specifically — `debug-binding`, `cluster-admin` —

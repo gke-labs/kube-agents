@@ -1119,10 +1119,10 @@ ledger_reset_token() { # <owner/repo> [permissions JSON; issues: write when omit
 }
 
 # The audit id a case grades its ledger under: the `audit:` key of its
-# ledger_issue_contains checks in task.yaml (each of the ten audit cases
-# carries one; two consistency cases share fleet-consistency-drift, two
+# ledger_issue_contains checks in task.yaml (each of the eleven audit cases
+# carries one; two consistency cases share fleet-consistency-drift, three
 # patch cases share security-patch-orchestrator and two obtainability cases
-# share obtainability-audit, and the reset is per stream, so each pair
+# share obtainability-audit, and the reset is per stream, so each group
 # retires one ledger). Empty for a case that writes no ledger.
 ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
   local file="$1"
@@ -1278,8 +1278,8 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
 # repetition whose worker dies between the two -- max_turns, a pod restart,
 # a dispatcher that never served the card's retry -- leaves the note, and
 # inside one run the next repetition of the case starts inside that TTL
-# and is refused at `start`; on a stream two cases share (the
-# consistency pair, the patch pair) so is the sibling case's first
+# and is refused at `start`; on a stream several cases share (the
+# consistency pair, the three patch cases) so is a sibling case's first
 # repetition, which waits on the stream lock and starts right after. That is
 # a 0/3 that reads as agent failure and was the harness's. The note is the
 # run's, not the ledger's, so the ledger reset above cannot clear it; this
@@ -2470,7 +2470,7 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
-    upgrades-master-behind-offered-elsewhere) echo 900 ;;
+    upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
@@ -2575,7 +2575,7 @@ unit_delegation_timeout() {
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
     consistency-no-environment-label) echo 3000 ;;
-    upgrades-master-behind-offered-elsewhere) echo 3000 ;;
+    upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
@@ -2963,7 +2963,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: two cases on
-  # one stream (the consistency pair, the patch pair, the obtainability pair)
+  # one stream (the consistency pair, the three patch cases, the obtainability pair)
   # must not reset and rewrite each other's ledger mid-run. A unit holds every
   # stream task_streams names, in its sorted order, the declared ones too,
   # and then waits out a run the install started on one of them.

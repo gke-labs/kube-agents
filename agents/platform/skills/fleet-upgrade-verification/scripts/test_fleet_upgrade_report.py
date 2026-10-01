@@ -300,6 +300,39 @@ class RunCmdTest(unittest.TestCase):
 
 
 class ProjectFailureTest(unittest.TestCase):
+    def test_a_cluster_filter_skips_the_other_members(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["b"])
+        self.assertEqual([m["cluster"] for m in result["members"]], ["b"])
+        with patch.object(report, "run_cmd", fake):
+            everything = report.build_report(["p"], target)
+        self.assertEqual([m["cluster"] for m in everything["members"]], ["a", "b"])
+
+    def test_a_location_qualified_filter_leaves_a_same_named_twin_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("prod", "us-central1", target, [("p", target)]), cluster("prod", "europe-west1", target, [("p", target)])]}, {})
+        with patch.object(report, "run_cmd", fake):
+            result = report.build_report(["p"], target, clusters=["us-central1/prod"])
+        self.assertEqual([(m["location"], m["cluster"]) for m in result["members"]], [("us-central1", "prod")])
+        with patch.object(report, "run_cmd", fake):
+            both = report.build_report(["p"], target, clusters=["prod"])
+        self.assertEqual(len(both["members"]), 2)
+
+    def test_a_narrowed_run_leaves_the_rollout_record_alone(self):
+        target = "1.31.0-gke.1"
+        fake = FakeGcloud({"p": [cluster("a", "us-central1", target, [("p", target)]), cluster("b", "us-central1", target, [("p", target)])]}, {})
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()) as out:
+            rc = report.main(["--project", "p", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            path = report.state_path(state_dir, target)
+            before = open(path, encoding="utf-8").read()
+            rc = report.main(["--project", "p", "--cluster", "us-central1/b", "--target-version", target, "--state-dir", state_dir])
+            self.assertEqual(rc, report.EXIT_OK)
+            self.assertEqual(open(path, encoding="utf-8").read(), before)
+            self.assertIn(report.NARROWED_RUN_NOTE, out.getvalue())
+
     def test_one_failed_project_does_not_abort_the_others(self):
         target = "1.31.0-gke.1"
         fake = FakeGcloud(

@@ -245,6 +245,7 @@ READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 # not abort the run; the exit code only says whether every requested read succeeded.
 EXIT_OK = 0
 EXIT_PARTIAL = 1
+NARROWED_RUN_NOTE = "Narrowed by --cluster: the rollout record was neither read nor written."
 EXIT_USAGE = 2
 
 
@@ -631,12 +632,23 @@ def assess_readiness(cluster: dict, member: dict, items: list | None, read_error
     }
 
 
-def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None) -> dict:
+def _wanted(cluster: dict, wanted: set[tuple[str, str]]) -> bool:
+    name = cluster.get("name", "")
+    location = cluster.get("location", "")
+    return (location, name) in wanted or ("", name) in wanted
+
+
+def build_report(projects: list[str], explicit_target: str | None, readiness_options: dict | None = None, clusters: list[str] | None = None) -> dict:
     """Enumerates every project and grades every member; one failure never aborts the rest.
 
     `readiness_options` (`at`, `kubeconfig_dir`) turns on the per-member readiness read and
-    grade; None leaves the report as the version table alone.
+    grade; None leaves the report as the version table alone. `clusters`, when given, is the
+    names to grade; every other cluster in the projects is skipped, so a caller that wants a
+    few members' readiness does not pay for the others' reads.
     """
+    # `<location>/<name>` pins one cluster; a bare name admits that name in
+    # every location of the projects (GKE names are unique per location).
+    wanted = {spec.partition("/")[::2] if "/" in spec else ("", spec) for spec in clusters} if clusters else None
     cache = ServerConfigCache()
     members: list[dict] = []
     errors: list[dict] = []
@@ -653,6 +665,8 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             continue
         for cluster in clusters:
             if not isinstance(cluster, dict):
+                continue
+            if wanted is not None and not _wanted(cluster, wanted):
                 continue
             member = grade_member(cluster, project, explicit_target, cache)
             if readiness_options is not None:
@@ -1030,6 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
+    parser.add_argument("--cluster", action="append", help="Cluster to grade, as <location>/<name> or a bare name; repeatable. With it, other clusters in the projects are skipped and the rollout record is neither read nor written (a narrowed read is not a rollout observation). Default: every cluster.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
@@ -1063,28 +1078,32 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("no project: pass --project, or set MONITORED_PROJECT_IDS or GCP_PROJECT_ID\n")
         return EXIT_USAGE
 
-    report = build_report(projects, args.target_version, readiness_options)
+    report = build_report(projects, args.target_version, readiness_options, clusters=args.cluster)
     report["errors"][:0] = [
         {"project": PROJECTS_LIST_ERROR_SCOPE, "location": None, "message": error} for error in listing_errors
     ]
-    path = state_path(args.state_dir, args.target_version)
-    previous, state_error = load_state(path)
-    state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
     print(render_table(report))
     if readiness_options is not None:
         print()
         print(render_readiness(report))
-    print()
-    print(render_progress(report, previous))
-    if state_error:
-        sys.stderr.write(state_error + "\n")
-
     write_failed = False
-    try:
-        save_state(path, state)
-    except OSError as e:
-        sys.stderr.write(f"failed to write the record {path}: {e}\n")
-        write_failed = True
+    if args.cluster:
+        # A narrowed read is not a rollout observation: the record would file
+        # every member it did not name as gone. Leave the record alone.
+        print(f"\n{NARROWED_RUN_NOTE}")
+    else:
+        path = state_path(args.state_dir, args.target_version)
+        previous, state_error = load_state(path)
+        state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
+        print()
+        print(render_progress(report, previous))
+        if state_error:
+            sys.stderr.write(state_error + "\n")
+        try:
+            save_state(path, state)
+        except OSError as e:
+            sys.stderr.write(f"failed to write the record {path}: {e}\n")
+            write_failed = True
 
     if args.output:
         try:
