@@ -28,6 +28,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_ATTRIBUTION_SALT", "")
 	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
 	t.Setenv("A2A_ASK_TTL", "")
+	t.Setenv("A2A_SESSION_TTL", "")
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
@@ -343,8 +344,43 @@ func TestFromEnvBackendSelection(t *testing.T) {
 	}
 }
 
-// TestFromEnvBackendCombinations walks every combination of the three
-// backends' credentials and the inject door, because with three backends the
+// TestFromEnvSessionTTL: the bound on idle session records in session-state —
+// absent means 7 days (well past TASKS 72h retention), and a sub-72h
+// value or invalid format refuses at boot.
+func TestFromEnvSessionTTL(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionTTL != 7*24*time.Hour {
+		t.Fatalf("default SessionTTL = %v, want 168h", cfg.SessionTTL)
+	}
+
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionTTL != 96*time.Hour {
+		t.Fatalf("SessionTTL = %v, want 96h", cfg.SessionTTL)
+	}
+
+	for _, bad := range []string{"71h", "48h", "30m", "junk"} {
+		t.Setenv("A2A_SESSION_TTL", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_SESSION_TTL=%q accepted", bad)
+		}
+	}
+
+	// Refusal when SessionTTL <= TaskDeadline
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	t.Setenv("A2A_TASK_DEADLINE_SECONDS", fmt.Sprintf("%d", int((100*time.Hour).Seconds())))
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected refusal when SessionTTL <= TaskDeadline, got nil")
+	}
+}
 // pairs are exactly what a hand-enumerated switch leaves a hole in — the
 // two-backend switch this merged from only knew about one pair, and a fourth
 // backend must not be addable with a combination nobody checked. Exactly one

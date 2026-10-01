@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence; and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env, its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; nor yet the pieces "Sessions by default" names as transition work: the `/session` opt-in, the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, and the default flip
 
 ## Purpose
 
@@ -23,7 +23,8 @@ The declarative subagent framework (its own doc) owns profile-addressed delegati
 the dispatcher, Jobs, `AgentProfile`s. This doc stops at the session boundary, with one
 amendment (8/31): the Delegate flow below hands a single task to a fresh
 gateway-spawned session worker, which stays inside the session model - the worker is an
-incarnation of the conversation's own session, not a profile executor.
+incarnation of the conversation's own session, not a profile executor - and a second
+(9/25): "Sessions by default" below, where the session itself delegates.
 
 ## The gateway holds no model
 
@@ -46,8 +47,9 @@ pod at a time.** Concretely:
 - The session key is the backend-qualified conversation id - a DM, or a thread in a
   group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
   space is not a session; a conversation in it is.
-- `contextId` is minted at first contact with a conversation and never changes. It is
-  the durable name of the conversation on the bus. Minting MUST be create-only (a KV
+- `contextId` is minted at first contact with a conversation and persists across pod
+  incarnations for the lifetime of the session record (until pruned after `A2A_SESSION_TTL`
+  of inactivity). It is the durable name of the conversation on the bus. Minting MUST be create-only (a KV
   `Create`, compare-and-swap semantics), so that two replicas or a rehydrate racing
   first contact cannot fork a conversation - the loser reads and adopts the winner's
   value. The stage 1 gateway runs a single replica and serializes per conversation
@@ -55,7 +57,8 @@ pod at a time.** Concretely:
   race re-reads and adopts the winner's record before the contextId reaches any
   envelope.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
-  and the bus session name; `contextId` persists across every incarnation.
+  and the bus session name; `contextId` persists across every incarnation during the
+  session record's retention horizon.
 - In a group thread, everyone in the room shares the one session. Attribution is per
   turn, in the envelope, not per pod.
 
@@ -221,6 +224,82 @@ Two rules keep the conversation's route coherent:
   task's terminal is published first. The state is that rule's to name, not this
   section's. With that done, the delete is what reap or sweep would have done anyway.
 
+## Sessions by default (added 9/25)
+
+The routing judgment lives in the session, not the gateway. "The gateway holds no model"
+above says where the demo gateway's judgment went: into the session pods. For a while the
+plan carried one narrow exception, a model call the gateway itself would make to pick a
+destination for free text. That exception is withdrawn (2026-09-25). A model in the routing
+path does not scale well and produces results a user cannot predict, and the gateway is the
+one component every human message passes through. The gateway stays deterministic code.
+
+What does the free-text work instead is the conversation's own session: a pod per
+conversation (thread or DM), as "What a session is" defines it, running the session worker
+(the `chat` profile on the worker image) with skills, built as part of this, that let it know
+the system - discover agents, clusters and topics; answer from standing state; delegate to the
+platform agent or to a profile and receive what comes back. The gateway relays into the chat as it does for
+any task; the session posts nothing itself. It is the same machinery as the session route
+and the Delegate flow above, made the default rather than an affordance. To its user a
+session-routed conversation is a persistent agent session tied to the chat, as durable as
+the conversation and resumed by a fresh incarnation when one is reaped.
+
+The resolution order does not change ([architecture 02](../architecture/02-agent-personas.md),
+"Chat entrypoints"): a slash command first, an explicit handle second, and the session for free
+text on a thread nothing has bound. Thread affinity stands as the
+architecture docs state it: a thread a slash command or a handle routed to an agent keeps
+its unaddressed follow-ups on that agent until re-addressed, and inside a session, affinity
+to whatever the session last delegated to is the session's own to keep. The gateway spends
+no inference in any of the three. The third hands the turn to the session, and the session's
+judgment, like all model output, is never an authorization signal: the gateway's own sender
+verification runs before dispatch exactly as before, and the `authority` block is stamped at
+ingress as before (advisory today; see "Requester identity on the bus").
+
+Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
+A session does not mint a child task itself: it asks the gateway to, over the same local
+channel its turns arrive on, naming the addressee and the task text. The gateway is the only
+party that holds what the check needs - the plaintext requester the turn came in with (the bus
+carries a pseudonym), the target agent's `AllowedUsers`, and the `.in` credential - so it
+enforces the target's allowlist against that requester, mints the child with the `authority`
+block stamped as at ingress, and relays the child's events into the conversation as it does
+for any task. This is the Delegate flow above with the session, rather than a "delegate:"
+prefix, as the one asking; the machinery is the same. The session's routing judgment never
+becomes an authorization decision, because the session never writes an `authority` block and
+never holds a credential to publish on anyone's `in`: a session cannot reach an agent for a
+person who could not have addressed that agent directly, and the worst-case bound the
+architecture docs state for a mis-route (an agent the human is already allowed to reach)
+holds for a delegation too. The audit record for a session-routed turn names the mode and the
+session at the gateway; the child task's envelope names the target, the session that asked,
+and the same requester.
+
+Delegation ends the turn. A session's turn is a conversation turn, bounded at thirty minutes
+by the `chat` profile's own deadline, and the executors it delegates to run to two hours; the
+two do not nest. When the session delegates, its turn completes with a reply that says so
+("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
+thread as it does for any task, and the child's terminal wakes the session for one more turn
+with the child's result as its input, so the session can synthesize or follow up. A follow-up
+the human sends while the child runs steers the child, through the gateway, as follow-ups do
+today. A session pod is therefore busy for seconds per turn, not for the life of the work it
+delegated, which is also what keeps the per-conversation pod cost small.
+
+Transition. `platform` remains the default addressee until the session can hand platform
+topics on to the platform agent without the user noticing. The route is a deploy-time
+setting today (`A2A_DEFAULT_ADDRESSEE`), and the Delegate flow covers one task; a
+per-conversation opt-in - a `/session` command, deterministic, resolved with the other
+slash commands and naming a route rather than a handle - is not implemented and lands
+with the transition. The default flips when the delegation primitive lands: the session's request to
+the gateway to mint a child task to a named addressee, the gateway's allowlist check and
+mint, the relay of the child's events into the conversation, and the wake-up turn on the
+child's terminal. The session's bus grants do not change for it (its only subscribe grant is
+its inbox, and it publishes only on its own task); what is new is the request shape between
+session and gateway and the gateway's record of which conversation a child belongs to. Working
+state richer than the transcript primer rehydrate builds today - what the session has
+discovered and decided, keyed by `contextId` - is part of the same work, so a resumed
+conversation is a resumed agent. A warm pool of ready pods is deferred; the cold start is
+paid.
+
+What this costs is pods: one per live conversation, bounded by the session cap and the
+idle TTL. That is the figure to measure before the default flips.
+
 ## Session lifecycle
 
 The session manager is the demo's chatops code generalized from one-shot workers to
@@ -254,7 +333,18 @@ that translation lives in the shim, next to the process it translates for.
 **Reap.** Idle TTL since the last user message (30 minutes, config-backed). Reaping is
 deleting the pod. Nothing is saved first, because
 the stream already has everything - that's the whole point of the transcript of record.
-The KV entry stays, holding the `contextId`. Reap never deletes a pod out from under a
+The KV entry stays while active, holding the `contextId`. To bound bucket growth, an
+idle session whose pod has been reaped and whose last activity is older than `A2A_SESSION_TTL`
+(7 days by default, sitting well beyond the TASKS stream's 72-hour retention) has its
+KV session record pruned by the reaper. Pruning deletes the session record from KV,
+bounding bucket growth to a ~100-byte tombstone marker per conversation (under the
+bucket's `--history=1` limit) rather than accumulating multi-KB session records, rosters,
+and task histories. (Reclaiming markers completely requires `STREAM.PURGE`, which the gateway's
+restricted data-plane permissions deliberately refuse and which can be handled by administrative
+maintenance or bucket TTL in future work.) Pruning also drops any associated task routing even
+if an active task was left uncompleted (e.g. an executor that died without a terminal or an
+abandoned turn), since the retention horizon guarantees that stream retention and task deadlines
+have long elapsed. Reap never deletes a pod out from under a
 live task: an active task that has not detached (see Stop above) exempts the session
 from the idle TTL. The exemption is safe because the pod's end has owners. The session
 worker's adapter enforces a task deadline (30 minutes default, config-backed): at the
@@ -530,7 +620,7 @@ entirely - a path identical under both modes, so a run through it says nothing a
 **Why it is a backend rather than a bus client.** The harness could publish a submission
 straight to `a2a.tasks.platform.{taskId}.in`, and that proves the bus, the callout, the streams
 and the executor. It leaves out the gateway: its routing, its session registry, the relay back,
-and whatever the router becomes in round 3. It also needs a bus identity, and the only static
+and the session agent's routing once conversations are session-routed by default. It also needs a bus identity, and the only static
 user whose grants fit a requester is the gateway's own - handing a second process the one
 credential that may publish on `.in`. Going through the gateway instead means the gateway keeps
 that credential, mints the ids and the `authority` block itself, and the harness needs neither a
@@ -677,8 +767,8 @@ install with no executor. It also carries the executor's reason verbatim - the
 terminal status message the bridge and the worker adapter write as `reason: <token>[ - detail]` -
 because a failed terminal is not always the persona's failure: the harness reads the token and
 classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow`,
-`bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `worker-evicted`,
-`bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
+`bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
+`worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install that
 declares the bridge sidecar sets `BRIDGE_CONCURRENCY` to at least the harness's parallelism
@@ -1014,9 +1104,11 @@ and an unescaped `<!channel>` in a result would ping the room.
 - The `authority` block, populated at ingress, advisory.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, `grants`, and anything that
-makes `authority` decision-grade. (The gchat and slack adapters were on this list until
-9/5 and 9/4 respectively; each now has its own section above.)
+Not in stage 2: the classifier, the LCD permissions tool, `grants`, anything that makes
+`authority` decision-grade, and the transition work "Sessions by default" names (the
+`/session` opt-in, the gateway-minted child task, the `chat` profile's skills, the warm
+pool). (The gchat and slack adapters were on this list until 9/5 and 9/4 respectively;
+each now has its own section above.)
 
 ## Inherited from the kanban retirement (added 8/24)
 

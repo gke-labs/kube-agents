@@ -1,12 +1,13 @@
 # The Hermes bridge sidecar image: the platform-agent image plus the one static
 # hermes-bridge binary (a2a/docs/hermes-bridge.md, "Where it runs").
 #
-# CI-ONLY, and deliberately so. deploy/docker/cloudbuild-ci.yaml builds it in
-# its `a2a-bridge` step when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, FROM the
-# platform-agent image the same build just produced, so the sidecar and the
-# agent container it shares a pod with are one build. It is not in images.json
-# (hack/check-image-inventory.sh says why) and not release surface: it joins at
-# stage-2 graduation or dies before it, whichever the dispatcher decides.
+# Release surface: .github/workflows/docker-publish-ghcr.yml builds it as
+# hermes-bridge beside the other first-party images, FROM the platform-agent
+# image the same run pushed under the same commit tag, and images.json carries
+# it. deploy/docker/cloudbuild-ci.yaml builds the presubmit's own in its
+# `a2a-bridge` step under EVAL_MODE_NEXT=1 on the same rule, FROM that build's
+# platform-agent image. Either way the sidecar and the agent container it
+# shares a pod with are one build.
 #
 # PLATFORM_AGENT_IMAGE has no default on purpose. A registry default would let
 # a build quietly pair a bridge with some other run's agent image; with none,

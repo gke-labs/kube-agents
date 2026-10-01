@@ -68,6 +68,13 @@ spec:
             # sandbox does not: it is a separate repository, so it is named.
             - name: PLATFORM_AGENT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
+            {{- /* The operator's own image, the same expression as the
+                   container's. The manager discovers it from its pod spec only
+                   when PLATFORM_AGENT_IMAGE is unset too, which the line above
+                   rules out; the A2A next-stack images it renders derive their
+                   registry and tag from it, so the chart says it. */}}
+            - name: OPERATOR_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.operator.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
             {{- /* `| default dict` and the repository fallback because
                    agentSandbox is a key this chart gained: a caller that
                    renders it against an older release's values -- `helm upgrade

@@ -38,6 +38,16 @@ const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
 // the inject: prefix and a colon is not a legal ConfigMap key.
 const defaultInjectPrincipalMapPath = "/etc/a2a/inject-principal-map/principals"
 
+// The session-pod image when A2A_WORKER_IMAGE is unset, which is only a
+// gateway run outside the operator: the operator renders that env from its
+// own resolution (a2aWorkerImage in platformagent_a2a_manifests.go), and
+// hack/check-image-inventory.sh holds this repository to images.json's
+// a2a-worker entry.
+const (
+	defaultWorkerRepository = "ghcr.io/gke-labs/kube-agents/a2a-worker"
+	defaultWorkerTag        = "latest"
+)
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -52,6 +62,10 @@ const defaultTaskDeadline = 30 * time.Minute
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
+
+// defaultSessionTTL is what SessionTTL means when unset (7 days, sitting
+// comfortably beyond TASKS stream's 72h retention).
+const defaultSessionTTL = 7 * 24 * time.Hour
 
 // defaultFirstEventGrace is what FirstEventGrace means when unset; the
 // field's comment carries the sizing rationale.
@@ -201,6 +215,19 @@ type Config struct {
 	// a status card can echo the ask.
 	AskTTL time.Duration
 
+	// SessionTTL bounds the lifetime of idle session records in session-state
+	// (A2A_SESSION_TTL). The session record holds contextId across pod
+	// incarnations. Once a session has no active pod and has seen no activity
+	// for longer than SessionTTL, its record is deleted from KV (leaving a
+	// ~100-byte tombstone marker under the bucket's --history=1 limit),
+	// bounding session-state growth to a marker per conversation rather than
+	// accumulating multi-KB session records, rosters, and task histories
+	// (including sessions with stale or abandoned active tasks whose executors
+	// never completed, while preserving tasks actively running within
+	// TaskDeadline). Unset means 7 days (168h), sitting comfortably past
+	// TASKS' 72h retention horizon.
+	SessionTTL time.Duration
+
 	// FirstEventGrace bounds how long an active task with NOTHING on its
 	// events subject may hold a conversation's serialization
 	// (A2A_FIRST_EVENT_GRACE). Every other bound assumes a pod: the adapter's
@@ -323,7 +350,7 @@ func FromEnv() (*Config, error) {
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
-		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
+		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
 
 		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
@@ -454,6 +481,19 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_ASK_TTL %q is under the 1m floor; it would erase the ask from status cards while the task runs", askTTL)
 	}
 	cfg.AskTTL = at
+
+	sessionTTL := envOr("A2A_SESSION_TTL", defaultSessionTTL.String())
+	st, err := time.ParseDuration(sessionTTL)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q: %w", sessionTTL, err)
+	}
+	if st < 72*time.Hour {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q is under the 72h floor; it must sit beyond TASKS stream retention (72h)", sessionTTL)
+	}
+	if st <= cfg.TaskDeadline {
+		return nil, fmt.Errorf("A2A_SESSION_TTL %q must exceed A2A_TASK_DEADLINE_SECONDS (%v)", sessionTTL, cfg.TaskDeadline)
+	}
+	cfg.SessionTTL = st
 
 	grace := envOr("A2A_FIRST_EVENT_GRACE", defaultFirstEventGrace.String())
 	fg, err := time.ParseDuration(grace)

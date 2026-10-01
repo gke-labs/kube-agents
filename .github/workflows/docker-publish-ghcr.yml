@@ -208,6 +208,64 @@ jobs:
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/gke-stockout-investigator:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:${{ github.sha }}
 
+      # The A2A next stack: three images built from the a2a/ module root (each
+      # Dockerfile's header says so) and the Hermes bridge sidecar, which is
+      # FROM the platform-agent image this same job pushed under this commit's
+      # tag, never a registry default (a2a/Dockerfile.hermes-bridge refuses to
+      # build without the arg). Hence its place after the platform step. The
+      # operator derives the three it renders from its own image, else from
+      # the agent image it resolves (registry and tag), so the tags here are
+      # what a next install at this commit pulls.
+      - name: Build and Push A2A Gateway (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-a2a-gateway
+        with:
+          context: a2a
+          file: a2a/Dockerfile.gateway
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-gateway:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-gateway:${{ github.sha }}
+
+      - name: Build and Push A2A Worker (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-a2a-worker
+        with:
+          context: a2a
+          file: a2a/Dockerfile.worker
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-worker:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-worker:${{ github.sha }}
+
+      - name: Build and Push A2A Auth Callout (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-a2a-authcallout
+        with:
+          context: a2a
+          file: a2a/Dockerfile.authcallout
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-authcallout:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-authcallout:${{ github.sha }}
+
+      - name: Build and Push Hermes Bridge (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-hermes-bridge
+        with:
+          context: a2a
+          file: a2a/Dockerfile.hermes-bridge
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/hermes-bridge:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/hermes-bridge:${{ github.sha }}
+          build-args: |
+            PLATFORM_AGENT_IMAGE=ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -219,6 +277,10 @@ jobs:
           AGENT_SANDBOX_DIGEST: ${{ steps.build-agent-sandbox.outputs.digest }}
           PUBSUB_PLATFORM_DIGEST: ${{ steps.build-pubsub-platform.outputs.digest }}
           STOCKOUT_INVESTIGATOR_DIGEST: ${{ steps.build-stockout-investigator.outputs.digest }}
+          A2A_GATEWAY_DIGEST: ${{ steps.build-a2a-gateway.outputs.digest }}
+          A2A_WORKER_DIGEST: ${{ steps.build-a2a-worker.outputs.digest }}
+          A2A_AUTHCALLOUT_DIGEST: ${{ steps.build-a2a-authcallout.outputs.digest }}
+          HERMES_BRIDGE_DIGEST: ${{ steps.build-hermes-bridge.outputs.digest }}
         run: |
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/platform-agent@$PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/replay-proxy@$REPLAY_PROXY_DIGEST"
@@ -226,3 +288,7 @@ jobs:
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/agent-sandbox@$AGENT_SANDBOX_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-gateway@$A2A_GATEWAY_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-worker@$A2A_WORKER_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-authcallout@$A2A_AUTHCALLOUT_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/hermes-bridge@$HERMES_BRIDGE_DIGEST"

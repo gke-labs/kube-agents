@@ -809,13 +809,27 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertNotRegex(dockerfile, r"(?m)^ENTRYPOINT")
         self.assertRegex(dockerfile, r'(?m)^CMD \["/usr/local/bin/hermes-bridge"\]$')
 
-    def test_the_inventory_check_pins_its_builder_and_states_the_exclusion(self) -> None:
+    def test_the_inventory_check_pins_its_builder_and_the_inventory_carries_it(self) -> None:
         script = text(_INVENTORY_CHECK)
         # The go-directive call site is pinned by test_check_image_inventory_go_directive.
         self.assertIn("check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION", script)
-        self.assertIn("a2a/Dockerfile.hermes-bridge) is deliberately NOT", script)
+        # The bridge is release surface: a first-party entry the release
+        # workflow publishes, with no operator override since the operator
+        # renders no bridge and the sidecar's image is the CR's.
         inventory = json.loads(text(_REPO_ROOT / "images.json"))
-        self.assertNotIn("hermes-bridge", [image["name"] for image in inventory["images"]])
+        by_name = {image["name"]: image for image in inventory["images"]}
+        self.assertIn("hermes-bridge", by_name)
+        bridge = by_name["hermes-bridge"]
+        self.assertEqual(bridge["origin"], "first-party")
+        self.assertEqual(bridge["tagPolicy"], "release")
+        self.assertNotIn("override", bridge)
+        for name, override in (
+            ("a2a-gateway", "A2A_GATEWAY_IMAGE"),
+            ("a2a-worker", "A2A_WORKER_IMAGE"),
+            ("a2a-authcallout", "A2A_CALLOUT_IMAGE"),
+        ):
+            self.assertEqual(by_name[name]["override"], override)
+            self.assertEqual(by_name[name]["tagPolicy"], "release")
 
     def test_the_a2a_step_starts_at_once_and_builds_the_three_in_order(self) -> None:
         """The three A2A images do not depend on the platform image, so their

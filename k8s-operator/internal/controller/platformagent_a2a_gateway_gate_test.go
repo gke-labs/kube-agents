@@ -145,7 +145,13 @@ func completeTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client
 			t.Fatalf("create provision Job %s for the rig: %v", name, err)
 		}
 	}
-	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	// The shape the Job controller writes in one status update: the
+	// succeeded count and the completion time land with the condition, and
+	// the provision report reader (a2aProvisionPodVanished) reads all three.
+	now := metav1.Now()
+	job.Status.Succeeded = 1
+	job.Status.CompletionTime = &now
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: now}}
 	if err := cl.Status().Update(ctx, job); err != nil {
 		t.Fatalf("update provision Job status: %v", err)
 	}
@@ -180,7 +186,7 @@ func a2aGateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent, ext
 		WithScheme(scheme).
 		WithObjects(append([]client.Object{agent, sandboxKeysSecret(agent), discordBotSecret(agent)}, extra...)...).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		WithInterceptorFuncs(assigningUIDsOnCreate(fakeServerSideApplyInterceptors())).
 		Build()
 	return &PlatformAgentReconciler{Client: cl, Scheme: scheme}, cl,
 		ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}

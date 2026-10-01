@@ -977,6 +977,107 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 // without the others is the failure this PR's scoping exists to avoid: the
 // flag without the verbs is a gateway that refuses every delegation, and the
 // verbs without the flag are a standing pod-lifecycle grant with no caller.
+// The first-party next-stack images follow the operator image, else the
+// agent image the operator resolves for itself, so a chart install at X.Y.Z
+// pulls them at X.Y.Z, an install that mirrored the operator has mirrored
+// them, and a flip to next pulls nothing from a registry no operator input
+// can redirect.
+func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
+	resolvers := map[string]struct {
+		envVar  string
+		resolve func() string
+		name    string
+	}{
+		"gateway": {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
+		"worker":  {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
+		"callout": {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
+	}
+	for label, r := range resolvers {
+		t.Run(label, func(t *testing.T) {
+			t.Setenv(r.envVar, "")
+			t.Setenv(platformAgentImageEnvVar, "")
+			t.Setenv(operatorImageEnvVar, "")
+			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":"+DefaultPlatformAgentVersion; got != want {
+				t.Errorf("no env: %q, want the published repository at the fallback tag %q", got, want)
+			}
+			// The chart's install: PLATFORM_AGENT_IMAGE pinned to the release.
+			t.Setenv(platformAgentImageEnvVar, "ghcr.io/gke-labs/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("PLATFORM_AGENT_IMAGE set: %q, want the release tag %q", got, want)
+			}
+			// A mirrored chart install.
+			t.Setenv(platformAgentImageEnvVar, "mirror.corp.internal:5000/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("mirrored PLATFORM_AGENT_IMAGE: %q, want the mirror's prefix %q", got, want)
+			}
+			// OPERATOR_IMAGE outranks the agent image: the bus components'
+			// version contract is with the operator that renders their
+			// config, so an agent redeploy that moves PLATFORM_AGENT_IMAGE
+			// alone does not move them.
+			t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator:0.3.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("OPERATOR_IMAGE and PLATFORM_AGENT_IMAGE set: %q, want the operator's registry and tag %q", got, want)
+			}
+			// A kustomize install with neither set, where the operator
+			// discovers its own image at boot.
+			t.Setenv(platformAgentImageEnvVar, "")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("OPERATOR_IMAGE set: %q, want the operator's registry and tag %q", got, want)
+			}
+			// A digest-only operator reference names no tag, so it falls
+			// through to the agent image rather than sending these to
+			// :latest beside a release-tagged agent.
+			t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111")
+			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":latest"; got != want {
+				t.Errorf("digest-pinned operator, no agent image: %q, want %q", got, want)
+			}
+			t.Setenv(platformAgentImageEnvVar, "mirror.corp.internal:5000/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("digest-pinned operator beside a tagged agent: %q, want the agent's tag %q", got, want)
+			}
+			t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator:0.3.0@sha256:1111111111111111111111111111111111111111111111111111111111111111")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("tag-and-digest operator: %q, want the operator's tag %q", got, want)
+			}
+			t.Setenv(platformAgentImageEnvVar, "")
+			t.Setenv(r.envVar, "registry.example/pinned/"+r.name+":v9")
+			if got, want := r.resolve(), "registry.example/pinned/"+r.name+":v9"; got != want {
+				t.Errorf("override set: %q, want the override %q", got, want)
+			}
+		})
+	}
+}
+
+// Every image a next render pulls follows the mirror when only the agent
+// image names it (a chart install that set no OPERATOR_IMAGE): no
+// public-registry reference leaks on the air-gapped path, the rule
+// TestNoPublicRegistryWhenMirrored states for the agent Deployment.
+func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
+	const mirror = "mirror.corp.internal:5000/kube-agents"
+	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, operatorImageEnvVar} {
+		t.Setenv(v, "")
+	}
+	t.Setenv(platformAgentImageEnvVar, mirror+"/platform-agent:0.3.0")
+	agent := a2aTestAgent()
+	gw := buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0]
+	if gw.Image != mirror+"/a2a-gateway:0.3.0" {
+		t.Errorf("gateway image %q does not follow the agent image's mirror", gw.Image)
+	}
+	workerEnv := ""
+	for _, e := range gw.Env {
+		if e.Name == "A2A_WORKER_IMAGE" {
+			workerEnv = e.Value
+		}
+	}
+	if workerEnv != mirror+"/a2a-worker:0.3.0" {
+		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
+	}
+	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
+	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
+		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
+	}
+}
+
 func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	agent := a2aTestAgent()
 
