@@ -1012,6 +1012,18 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cd /opt/data/scripts && python3 -m kanban_notify_propagate list # don't ask the user",
             "python3 - <<< 'import cluster_agent_profile'",
             "python3 - <<< 'import kanban_notify_propagate'",
+            # Module, inline, and stdin invocations with option arguments containing colons, dots, slashes, or equals (Thread 3)
+            "python3 -W ignore::DeprecationWarning -m cluster_agent_profile list",
+            "python3 -W error::UserWarning -m cluster_agent_profile list",
+            'python3 -W "ignore::DeprecationWarning" -m cluster_agent_profile list',
+            "python3 -X importtime=/tmp/time.txt -m cluster_agent_profile list",
+            "python3 -W ignore::DeprecationWarning -m kanban_notify_propagate list",
+            'python3 -W ignore::DeprecationWarning -c "import cluster_agent_profile"',
+            'python3 -W ignore::DeprecationWarning -c "import kanban_notify_propagate"',
+            'echo "import cluster_agent_profile" | python3 -W ignore::DeprecationWarning',
+            'echo "import kanban_notify_propagate" | python3 -W ignore::DeprecationWarning',
+            'python3 -W ignore::DeprecationWarning - <<< "import cluster_agent_profile"',
+            'python3 -W ignore::DeprecationWarning - <<< "import kanban_notify_propagate"',
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1141,7 +1153,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "timeout --foreground 60 python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "env FOO=bar python3 " + " ".join(f"--flag{i}" for i in range(50)) + " script.py",
             # Verify double-quoted -c commands with backslash-escaped quotes and no whitespace do not backtrack
-            "python3 -c \"print({\" + \",\".join(f\"\\\"k{i}\\\":\\\"v{i}\\\"\" for i in range(10)) + \"})\"",
+            'python3 -c "print({' + ",".join(f'\\"k{i}\\":\\"v{i}\\"' for i in range(10)) + '})"',
             # Verify wrapper-chain alternation does not backtrack exponentially (Thread 4)
             "env " * 26 + "x",
         ]
