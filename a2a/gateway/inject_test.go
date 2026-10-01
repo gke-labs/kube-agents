@@ -3679,6 +3679,18 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["result"]`) {
 		t.Fatalf("bulk under an extra key: %d bytes %s", len(out), out[:min(len(out), 200)])
 	}
+	// Bulk made of many small extra keys: the input stays whole and
+	// unclaimed, the first names are kept and the rest are a count.
+	var many strings.Builder
+	many.WriteString(`{"tool":"x","input":{"a":1},"status":"completed"`)
+	for i := 0; i < 4000; i++ {
+		fmt.Fprintf(&many, `,"extra_%04d":"v"`, i)
+	}
+	many.WriteString(`}`)
+	out = capActivityEntry(json.RawMessage(many.String()))
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"input":{"a":1}`) || strings.Contains(string(out), `"truncated"`) || !strings.Contains(string(out), `"droppedKeys":["extra_0000",`) || !strings.Contains(string(out), `"+`+strconv.Itoa(4000-injectMaxDroppedKeys)+` more"]`) {
+		t.Fatalf("bulk of many extra keys: %d bytes %s", len(out), out[:min(len(out), 300)])
+	}
 	plain := json.RawMessage(`{"tool":"terminal","input":{"command":"` + big + `"},"status":"completed"}`)
 	out = capActivityEntry(plain)
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"truncated":true`) || !strings.Contains(string(out), `"bytes":`+strconv.Itoa(len(`{"command":"`+big+`"}`))) {

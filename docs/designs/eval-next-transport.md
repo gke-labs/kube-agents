@@ -324,7 +324,8 @@ was present at all; a probe without the key leaves the record with no marker and
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
 harness asks neither and grades on what the probe carried. Both executors publish it: the
-worker adapter from the harness's `tool_use` blocks, the Hermes bridge from hermes's outbound
+worker adapter from the `tool_use` content blocks in the stream of the coding agent it runs,
+the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads

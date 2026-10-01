@@ -190,6 +190,10 @@ const (
 	// injectWrapperTool is hermes's tool_call wrapper, the one entry whose
 	// input the probe's cap reads into rather than replaces whole.
 	injectWrapperTool = "tool_call"
+	// injectMaxDroppedKeys is how many of an over-size entry's extra keys
+	// are named in droppedKeys; the rest are a count, so the list that says
+	// what was cut is itself bounded and the input is never charged for it.
+	injectMaxDroppedKeys = 32
 	// injectMaxActivityEntries bounds the trace a probe carries: the read
 	// route runs before and after every wait on the harness's hot loop, and
 	// a long run's trace would otherwise ride every poll whole. The newest
@@ -1925,7 +1929,10 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	}
 	// Then any key outside the entry's shape (an executor's extra field, a
 	// result some adapter attached): dropped, and named, so a cut there is
-	// not charged to the input.
+	// not charged to the input. The names are bounded too (the first
+	// injectMaxDroppedKeys, each to a field's length, then a count), so an
+	// entry whose bulk is many small extra keys ends here with its input
+	// whole and claims no cut of it.
 	var dropped []string
 	for key := range entry {
 		if !activityEntryKeys[key] {
@@ -1937,7 +1944,14 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 		for _, key := range dropped {
 			delete(entry, key)
 		}
-		entry["droppedKeys"] = dropped
+		named := make([]string, 0, min(len(dropped), injectMaxDroppedKeys+1))
+		for _, key := range dropped[:min(len(dropped), injectMaxDroppedKeys)] {
+			named = append(named, truncateRunes(key, injectMaxEntryFieldBytes))
+		}
+		if rest := len(dropped) - injectMaxDroppedKeys; rest > 0 {
+			named = append(named, "+"+strconv.Itoa(rest)+" more")
+		}
+		entry["droppedKeys"] = named
 		if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
 			return out
 		}
