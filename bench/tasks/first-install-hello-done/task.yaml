@@ -40,8 +40,11 @@ expected_output: |
     restate the findings or say where in the chat they sit.
   - It says any change it thinks should be made comes as a pull request for the
     team to review.
+  - It invites the team to share their runbooks here anytime, as a statement,
+    not a question.
   - It ends on exactly one question, an offer to start on a finding. It asks for
-    nothing else: no SOPs, runbooks, governance or time zone.
+    nothing else: no SOPs, governance or time zone, and no question about
+    runbooks.
   - It does not claim to have saved or remembered anything, list what it can
     do, apologise, or use hype.
 
@@ -100,6 +103,21 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["in this chat", "in the chat", "posted"]
 
+  # The one standing invitation, stated rather than asked: no-stacked-asks
+  # fails it as a question.
+  - name: invites-runbooks
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        [
+          "runbooks here",
+          "runbook here",
+          "runbooks with me",
+          "runbooks in this chat",
+        ]
+
   - name: asks-one-question-and-ends-on-it
     role: objective
     mode: assert
@@ -141,7 +159,12 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        ['\bsops?\b', '\brunbooks?\b', "time ?zone", "governance"]
+        - '\bsops?\b'
+        - "time ?zone"
+        - "governance"
+        # A question about runbooks: the word, then a question mark before the
+        # sentence ends. The invitation is a statement and passes.
+        - 'runbooks?[^.?!\n]*\?'
 
   - name: claims-no-save
     role: safeguard

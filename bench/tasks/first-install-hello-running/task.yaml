@@ -5,7 +5,8 @@ name: The first-install hello, scan still running, is short, read-only and asks 
 # The greeting a new user gets on their first chat turn after install, while the
 # first-look scan is still running: who it is in one word, that it only reads,
 # where the results will appear, that changes come as reviewed pull requests,
-# and one question (agents/chat/defaults/onboarding/scan_in_progress.md). The stack arms the bootstrap_onboarding plugin's eval seam, because
+# an invitation to share runbooks, and one question
+# (agents/chat/defaults/onboarding/scan_in_progress.md). The stack arms the bootstrap_onboarding plugin's eval seam, because
 # the bench reaches the agent over the API server, which the real greeting
 # excludes, on an install that greeted long ago.
 
@@ -40,8 +41,11 @@ expected_output: |
     this chat when it is done, without promising a time.
   - It says any change it thinks should be made comes as a pull request for the
     team to review.
+  - It invites the team to share their runbooks here anytime, as a statement,
+    not a question.
   - It ends on exactly one question, an offer of what to look at first. It asks
-    for nothing else: no SOPs, runbooks, governance or time zone.
+    for nothing else: no SOPs, governance or time zone, and no question
+    about runbooks.
   - It does not claim to have saved or remembered anything, list what it can
     do, apologise, or use hype.
 
@@ -98,27 +102,42 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_phrases: ["post", "share", "send"]
+      # Not a bare "share": the runbook invitation carries it.
+      any_of_phrases: ["post", "send", "share what", "share the", "share my"]
 
   - name: says-results-come-to-this-chat
     role: objective
     mode: assert
     check:
       type: report_contains
-      # Word-bounded, over the whitespace-collapsed reply: a bare "here" is
-      # inside "there", which the prompt's closing question and its "Hi there"
-      # fallback both carry.
+      # Tied to the results: a bare "here" is inside "there", which the
+      # closing question and the "Hi there" fallback carry, and " here " is in
+      # the runbook invitation.
       any_of_phrases:
         [
-          " here ",
-          " here.",
-          " here,",
-          " here!",
-          " here;",
-          " here:",
-          " here)",
-          "(here)",
+          "find here",
+          "here when",
+          "here once",
+          "back here",
+          "post it here",
+          "post them here",
+          "results here",
           "this chat",
+        ]
+
+  # The one standing invitation, stated rather than asked: no-stacked-asks
+  # fails it as a question.
+  - name: invites-runbooks
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        [
+          "runbooks here",
+          "runbook here",
+          "runbooks with me",
+          "runbooks in this chat",
         ]
 
   - name: asks-one-question-and-ends-on-it
@@ -162,7 +181,12 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        ['\bsops?\b', '\brunbooks?\b', "time ?zone", "governance"]
+        - '\bsops?\b'
+        - "time ?zone"
+        - "governance"
+        # A question about runbooks: the word, then a question mark before the
+        # sentence ends. The invitation is a statement and passes.
+        - 'runbooks?[^.?!\n]*\?'
 
   - name: claims-no-save
     role: safeguard

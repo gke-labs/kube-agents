@@ -104,7 +104,7 @@ Both cases converge on the same delivery path: the `no_agent` delivery job posts
    - touches `/opt/data/.user_aligned`;
    - calls `trigger_job("bootstrap-inventory-delivery")` so it fires on the next tick;
    - writes `.bootstrap_greeted` so no later session repeats any of the above;
-   - injects `defaults/onboarding/scan_in_progress.md` (a short kube-agents greeting: read-only, "I'll post what I find here when it's done", changes come as pull requests, one closing question). It does **not** inject the inventory.
+   - injects `defaults/onboarding/scan_in_progress.md` (a short kube-agents greeting: read-only, "I'll post what I find here when it's done", changes come as pull requests, an invitation to share runbooks, one closing question). It does **not** inject the inventory.
 
    If the turn is not from a supported durable chat adapter, or no chat origin can be bound, the plugin writes **no** markers and returns `None`: that turn has nowhere to deliver a later report, so onboarding stays armed for the next durable chat turn. An API-server turn matching an eval seam request (Rule 5) is greeted but still writes no marker. `DURABLE_CHAT_PLATFORMS` is a positive allowlist; new adapters must opt in only after implementing persistent delivery.
 
