@@ -890,6 +890,26 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 -W error -mkanban_notify_propagate",
             "python3 -X dev -m kanban_notify_propagate",
             "python -m cluster_agent_profile",
+            # Module execution via runpy
+            "python3 -m runpy cluster_agent_profile",
+            "python3 -um runpy cluster_agent_profile",
+            "python3 -m 'runpy' cluster_agent_profile",
+            'python3 -m "runpy" cluster_agent_profile',
+            "python3 -m runpy 'cluster_agent_profile'",
+            'python3 -m runpy "cluster_agent_profile"',
+            "python3 -m runpy kanban_notify_propagate",
+            # Inline -c execution / imports
+            'python3 -c "import cluster_agent_profile"',
+            "python3 -c 'import cluster_agent_profile'",
+            'python3 -c "from cluster_agent_profile import list_profiles"',
+            "python3 -c 'from cluster_agent_profile import list_profiles'",
+            'python3 -uc "import cluster_agent_profile"',
+            'python3 -W ignore -c "import cluster_agent_profile"',
+            'python -c "import cluster_agent_profile"',
+            'python3 -c import\\ cluster_agent_profile',
+            'python3 -c "import sys; import cluster_agent_profile"',
+            'python3 -c "import kanban_notify_propagate"',
+            "python3 -c 'from kanban_notify_propagate import notify'",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -913,6 +933,9 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat notes/kubectl.md",
             "curl http://localhost:8080",
             "hermes profile list",
+            'python3 -c "print(1)" && grep cluster_agent_profile /opt/data',
+            "python3 -c 'print(1)' ; echo cluster_agent_profile",
+            'python3 -c "print(1)" | grep cluster_agent_profile',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
