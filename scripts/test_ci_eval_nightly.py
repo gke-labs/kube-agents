@@ -263,6 +263,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
+            "upgrades-audit-reports-upgrade-blocked",
         ):
             with self.subTest(audit=audit):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {audit}")

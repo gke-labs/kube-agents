@@ -374,7 +374,7 @@ streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
 §3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2) and the
 stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3).
-The compliance, stockout and cost collectors may also give a target `checks_unevaluated`,
+The compliance, stockout, cost and upgrade collectors may also give a target `checks_unevaluated`,
 `{check, reason}` for a check whose own read failed: it did not run and is not inapplicable, so it
 goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
@@ -594,7 +594,8 @@ field, and publishes nothing:
     "2.6" and not prose). An unknown slug or a duplicate is rejected.
   - **`command`** — the literal invocation you issued on that cluster for that check, with its
     `--context`/`--project` and the namespace or resource it targeted. It must name one of
-    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; `echo`, `cat`, `python3 -c`, a call back
+    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`, or the upgrade audit's readiness reporter
+    `fleet_upgrade_report.py`; `echo`, `cat`, `python3 -c`, a call back
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
 
