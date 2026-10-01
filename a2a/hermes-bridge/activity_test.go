@@ -1301,3 +1301,46 @@ func TestRedactInput_TokenShapedKeys(t *testing.T) {
 		}
 	}
 }
+
+// The child's config is the operator's as written: an id above 2^53 keeps
+// its digits, the operator's own outbound hooks stay ahead of the door's
+// entry, and a hooks or hooks.outbound of another shape fails the spawn
+// like an unreadable file rather than being replaced.
+func TestChildManagedScope_KeepsLargeIntegersAndRefusesMisshapenHooks(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("channel_id: 123456789012345678\nhooks:\n  outbound:\n    - name: theirs\n      url: https://audit.example/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bridge{cfg: Config{ScratchDir: t.TempDir(), ManagedScopeDir: src}}
+	dir, err := b.childManagedScope("task-ints")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(filepath.Join(dir, managedConfigFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "channel_id: 123456789012345678\n") || !strings.Contains(string(out), "name: theirs") || !strings.Contains(string(out), "name: "+hookEntryName) || strings.Index(string(out), "name: theirs") > strings.Index(string(out), "name: "+hookEntryName) {
+		t.Fatalf("child config rewrote the operator's: %s", out)
+	}
+	for _, bad := range []string{"hooks:\n  outbound:\n    name: theirs\n", "hooks: 3\n", "hooks:\n  outbound: theirs\n"} {
+		if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte(bad), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		scratch := t.TempDir()
+		b := &Bridge{cfg: Config{ScratchDir: scratch, ManagedScopeDir: src}}
+		if dir, err := b.childManagedScope("task-bad"); err == nil {
+			t.Fatalf("misshapen hooks %q accepted: %s", bad, dir)
+		}
+		if entries, _ := os.ReadDir(scratch); len(entries) != 0 {
+			t.Fatalf("a refused scope left files: %v", entries)
+		}
+	}
+	// A null hooks is an absence, not a shape.
+	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("hooks:\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Bridge{cfg: Config{ScratchDir: t.TempDir(), ManagedScopeDir: src}}).childManagedScope("task-null"); err != nil {
+		t.Fatalf("null hooks refused: %v", err)
+	}
+}

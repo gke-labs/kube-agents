@@ -292,7 +292,8 @@ listener on 8643; `off` closes the door) and hands each child the entry through 
 managed scope: before spawning, it writes a per-task directory holding the operator's
 managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually bound,
 `secret_env: A2A_ACTIVITY_SECRET`, appended to any entry the operator's own managed config
-carries) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
+carries; a `hooks` or `hooks.outbound` of another shape fails the spawn like an unreadable file, and
+the copy keeps the operator's numbers as written) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
 (the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
 exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent while the door is open, and
 with the door closed a scratch dir that cannot be made or read is logged and the bridge starts,

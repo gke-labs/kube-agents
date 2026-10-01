@@ -488,6 +488,12 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// useNumber is the yaml decoder option that keeps numbers as literals.
+func useNumber(d *json.Decoder) *json.Decoder {
+	d.UseNumber()
+	return d
+}
+
 // lenientString is a JSON string's value, a number's or boolean's literal,
 // and "" for anything else (absent, null, an object, an array).
 func lenientString(raw json.RawMessage) string {
@@ -1029,7 +1035,10 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile))
 		switch {
 		case rerr == nil:
-			if err := yaml.Unmarshal(raw, &cfg); err != nil {
+			// UseNumber: the copy has to carry the operator's pins as written,
+			// and a float64 round trip rewrites an id above 2^53 (a chat
+			// channel's) into a neighbouring integer with nothing logging it.
+			if err := yaml.Unmarshal(raw, &cfg, useNumber); err != nil {
 				return "", fmt.Errorf("managed config %s: %w", src, err)
 			}
 			if cfg == nil {
@@ -1046,11 +1055,26 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 			return "", fmt.Errorf("managed env %s: %w", src, rerr)
 		}
 	}
-	hooks, _ := cfg[hooksKey].(map[string]any)
-	if hooks == nil {
-		hooks = map[string]any{}
+	// The operator's hooks are kept and the door's entry appended. A hooks
+	// or hooks.outbound of another shape (a mapping where a list belongs)
+	// is the same fault as an unreadable file: silently replacing it would
+	// start the child without the operator's hooks.
+	hooks := map[string]any{}
+	if v, present := cfg[hooksKey]; present && v != nil {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return "", fmt.Errorf("managed config %s: %s is %T, not a mapping", src, hooksKey, v)
+		}
+		hooks = m
 	}
-	outbound, _ := hooks[hooksOutboundKey].([]any)
+	var outbound []any
+	if v, present := hooks[hooksOutboundKey]; present && v != nil {
+		l, ok := v.([]any)
+		if !ok {
+			return "", fmt.Errorf("managed config %s: %s.%s is %T, not a list", src, hooksKey, hooksOutboundKey, v)
+		}
+		outbound = l
+	}
 	outbound = append(outbound, map[string]any{
 		"name":       hookEntryName,
 		"url":        b.ActivityURL(),

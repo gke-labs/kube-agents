@@ -195,8 +195,8 @@ the adapter's side of the door and is not a sixth backend operation: a pure read
 conversation's state that mutates nothing. It returns what the session record holds for the key,
 the active task with its `SubmittedAt`, from which the age in the nobody-took-it outcome is
 computed, and `Detached`, which the harness reads after its own cancel so it never sends a
-second one and grades the timeout from a detached record (a `task=` read of a finished task
-carries neither), the fold of the task's stream, its
+second one and grades the timeout from a detached record (a `task=` read of a task the record
+no longer holds as active carries neither), the fold of the task's stream, its
 state none, `submitted`, `working` or a terminal with the result text, and the last posted
 message, plus the gateway's configured grace and the backend the gateway armed; the
 infrastructure paragraph below says what the harness does with it.

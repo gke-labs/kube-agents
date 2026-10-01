@@ -684,7 +684,8 @@ not be silent about it.
   the release), which mutates nothing - no
   heal, no lock, no post, no publish, no write. It returns the id of the task it was asked about
   (the active one when none was named), with its `submittedAt`, age and `detached` flag when that
-  task is the record's active one (a `task=` read of a finished task carries none of the three), the latest executor state the stream shows (none,
+  task is the record's active one (a `task=`
+  read of a task the record no longer holds as active carries none of the three), the latest executor state the stream shows (none,
   `submitted`, `working`, or a terminal, with `final`), whether `working` was ever on the stream
   (`reachedWorking`, read off the fold's history, because two events can land between a
   caller's reads and the latest state alone would hide the one that says a model ran) and, when

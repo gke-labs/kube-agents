@@ -414,9 +414,10 @@ type conversationResponse struct {
 // probeReport is ConversationState on the wire, plus the door's own two
 // additions: the conversation's last post, which the gateway's record does
 // not hold and this transcript does, and an error for "could not look".
-// Beside the record and the terminal it carries the two artifacts the relay
-// keeps off the chat: the tool-call trace (activity) and the progress line,
-// as the stream holds them at the read.
+// Beside the record and the terminal it carries the tool-call trace
+// (activity), which the relay never posts, and the progress line, which
+// the relay renders into the chat and this returns as the stream holds it
+// at the read.
 //
 // Nothing here is a verdict. A caller decides "nobody took this task" from
 // active, executorState "" and ageSeconds past graceSeconds; "queued and
