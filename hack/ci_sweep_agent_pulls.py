@@ -71,11 +71,15 @@ USER_AGENT = "kube-agents-pull-sweep"
 REQUEST_TIMEOUT_SECONDS = 30
 # GitHub's secondary limits for one App: at least a second between writes, and
 # no more than 500 content-generating requests an hour, answered otherwise with
-# a 429 or a marked 403 for every call for some minutes. A close and its branch delete are two
-# writes; six runs an hour at this budget stay under 500, and a backlog drains
-# across runs instead of in one burst. What a run leaves is logged and reported.
+# a 429 or a marked 403 for every call for some minutes. The App is the eval
+# agent's own (EVAL_GITHUB_APP_ID): the eval runs open their remediation pull
+# requests and write their ledger issues through the same installation, so the
+# sweep takes a share of that hour, not the whole of it. A close and its branch
+# delete are two writes; six runs an hour at this budget are 240 of the 500,
+# and a backlog drains across runs instead of in one burst. What a run leaves
+# is logged and reported.
 WRITE_PAUSE_SECONDS = 1.0
-WRITE_BUDGET_PER_RUN = 80
+WRITE_BUDGET_PER_RUN = 40
 # A pull request left unclosed will cost its close and its branch delete.
 WRITES_PER_PULL_REQUEST = 2
 # GitHub answers a limit with a 429, or with a 403 it marks: a Retry-After, a
