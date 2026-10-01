@@ -139,10 +139,16 @@ const (
 	ActivityStatusTruncated = "truncated"
 	// The door's HTTP timeouts: a client on loopback that has not sent its
 	// headers or body in these is broken, and the response is one status
-	// line. activityShutdownTimeout bounds Serve's drain on bridge exit.
+	// line. The write deadline is armed when the headers are read, not when
+	// the handler writes, and the handler publishes on the delivery under
+	// run.mu, behind another delivery's publish or finalize's drain, result
+	// and terminal; so it is longer than all of that put together, else a
+	// slow publish closes the connection with no status and hermes retries
+	// the delivery that the hook's own timeout was set long to avoid.
+	// activityShutdownTimeout bounds Serve's drain on bridge exit.
 	activityReadHeaderTimeout = 5 * time.Second
 	activityReadTimeout       = 10 * time.Second
-	activityWriteTimeout      = 5 * time.Second
+	activityWriteTimeout      = 60 * time.Second
 	activityShutdownTimeout   = 2 * time.Second
 
 	hookPreToolCall     = "pre_tool_call"
@@ -182,8 +188,16 @@ const (
 // and working events and read as never started. One counter for both
 // artifacts keeps the sum under the cap whatever the knobs say; 3000 leaves
 // room for the four lifecycle events, a chunked result and the truncation
-// marker. A variable only so a test can lower it.
-var activityEntryBudget = 3000
+// marker. Trace parts stop activityHeartbeatReserve short of it, so the
+// heartbeat keeps going to the terminal on exactly the looping run the
+// budget exists for: 120 is the default interval under the default
+// deadline (one a minute for two hours). A heartbeat interval set short
+// enough to spend that alone still goes quiet at the budget, which the doc
+// says. Variables only so a test can lower them.
+var (
+	activityEntryBudget      = 3000
+	activityHeartbeatReserve = 120
+)
 
 // taskIDPattern is what a task id may look like before it becomes a path
 // segment under ScratchDir: the gateway mints task-<hex>, tests use words.
@@ -192,9 +206,13 @@ var activityEntryBudget = 3000
 // the sink that writes files does not lean on that.
 var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// scopeDirPattern is the shape of a scope the start-time sweep may remove:
+// the gateway's task-<hex> (tests use task-<word>), never a bare word.
+var scopeDirPattern = regexp.MustCompile(`^task-[A-Za-z0-9_-]{1,123}$`)
+
 var (
 	// A key is secret-looking when one of the words is a whole component of
-	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key, and in camelCase
+	// it (access_token, AWS_SECRET_ACCESS_KEY, api-key, private_key, and in camelCase
 	// accessToken, clientSecret, dbPassword), not a substring (tokenizer,
 	// secretName): the latter are names, and blanking them would put
 	// "[redacted]" where the worker adapter's trace carries the value.
@@ -203,17 +221,17 @@ var (
 	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
 	// starts a component when a lowercase letter or digit precedes its
 	// capital, and ends one at the end, a separator or the next capital.
-	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|authorization|api[_-]?key|credential)s?(?:$|[_.-])`)
-	redactedCamelKeyPattern = regexp.MustCompile(`[a-z0-9](?:Token|Secret|Password|Passwd|Authorization|Api[_-]?Key|APIKey|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:$|[_.-])`)
+	redactedCamelKeyPattern = regexp.MustCompile(`[a-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])`)
 	redactedValuePatterns   = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
 		regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
 		regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-		// The header form, capitalised as HTTP writes it and long enough to
-		// be a credential, so "basic refactoring" in a commit message is
-		// not one.
-		regexp.MustCompile(`Basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
+		// The header form, in any case (the scheme token is case-insensitive)
+		// and long enough to be a credential, so "basic refactoring" in a
+		// commit message is not one: the word after it is too short.
+		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
 		// curl's -u user:password, on a curl command: "date -u 12:30" and
 		// "sort -u a:b" are not.
 		regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*\s(?:-u|--user)[\s=]+\S+:\S+`),
@@ -222,10 +240,10 @@ var (
 		// quoted value runs to its closing quote, spaces included, so a
 		// passphrase does not leave its tail behind the marker; an unquoted
 		// or unterminated one stops at whitespace as before.
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?[^"'\s,}]+)`),
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|["']?[^"'\s,}]+)`),
 		// --flag value, the word a component of the flag (--token, --secret-access-key);
 		// a quoted value runs to its closing quote as above.
-		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|api[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
+		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
 	}
 )
 
@@ -434,13 +452,14 @@ func (a *activityState) progressLine(now time.Time) string {
 }
 
 // underBudget says whether the next trace part may go out, counting it
-// either way: past the budget the call is counted as dropped and reported
-// once by the marker finalize publishes. Caller holds run.mu, which is what
-// orders this against finalize's drain.
+// either way: past the trace's share of the budget (the whole minus the
+// heartbeat's reserve) the call is counted as dropped and reported once by
+// the marker finalize publishes. Caller holds run.mu, which is what orders
+// this against finalize's drain.
 func (a *activityState) underBudget() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.published < activityEntryBudget {
+	if a.published < activityEntryBudget-activityHeartbeatReserve {
 		a.published++
 		return true
 	}
@@ -448,8 +467,9 @@ func (a *activityState) underBudget() bool {
 	return false
 }
 
-// heartbeatUnderBudget is underBudget for a progress part: past the budget
-// the heartbeat simply stops, uncounted - the marker counts calls.
+// heartbeatUnderBudget is underBudget for a progress part, against the whole
+// budget: the reserve is what the trace leaves it. Past that the heartbeat
+// stops, uncounted - the marker counts calls.
 func (a *activityState) heartbeatUnderBudget() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -741,20 +761,27 @@ func (b *Bridge) listenActivity() error {
 	return nil
 }
 
-// sweepTaskScopes removes the direct children of dir that are directories
-// named like a task id, which is the only shape childManagedScope writes.
-// A file, or a directory whose name is not a task id, is not the bridge's
-// and stays.
+// sweepTaskScopes removes the direct children of dir that are the bridge's
+// own scopes: a directory named the way the gateway mints a task id
+// (task-<...>) that holds the managed config childManagedScope writes. Both
+// marks, because BRIDGE_SCRATCH_DIR may name a directory the bridge shares,
+// and a name alone - cache, data, work - is the shape of most directories. A
+// file, a directory with another name, or a task-named directory with no
+// config in it is not the bridge's and stays.
 func sweepTaskScopes(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		if !e.IsDir() || !taskIDPattern.MatchString(e.Name()) {
+		if !e.IsDir() || !scopeDirPattern.MatchString(e.Name()) {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		scope := filepath.Join(dir, e.Name())
+		if _, err := os.Stat(filepath.Join(scope, managedConfigFile)); err != nil {
+			continue
+		}
+		if err := os.RemoveAll(scope); err != nil {
 			return err
 		}
 	}

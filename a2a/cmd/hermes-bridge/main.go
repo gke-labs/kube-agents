@@ -32,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -99,6 +100,22 @@ func run() int {
 // realMain is the bridge from environment to shutdown. Every failure is
 // logged where it is found and then returned; a missing NATS_URL returns
 // errUsage before anything is dialed.
+// managedScopeDir is hermes's managed scope as this process sees it, the
+// source each child's scope is copied from: HERMES_MANAGED_DIR when set, else
+// /etc/hermes when it is a directory, else none (the child gets a hook-only
+// scope). Resolved here with the rest of the environment, so the library's
+// defaults stay environment-free and a test's bridge copies nothing from
+// the machine it runs on.
+func managedScopeDir() string {
+	if v := strings.TrimSpace(os.Getenv(hermesbridge.ManagedDirEnv)); v != "" {
+		return v
+	}
+	if st, err := os.Stat(hermesbridge.DefaultManagedDir); err == nil && st.IsDir() {
+		return hermesbridge.DefaultManagedDir
+	}
+	return ""
+}
+
 func realMain(ctx context.Context, log *slog.Logger) error {
 	url := os.Getenv("NATS_URL")
 	if url == "" {
@@ -116,6 +133,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		// each child is handed whatever address the door bound.
 		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
 		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
+		ManagedScopeDir:  managedScopeDir(),
 		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
 		Logger:           log,
 	}

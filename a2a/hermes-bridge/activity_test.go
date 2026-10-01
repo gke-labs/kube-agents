@@ -329,9 +329,12 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}
 	}
-	if _, err := os.Stat(want); !os.IsNotExist(err) {
-		t.Fatalf("child scope %s not removed after the task (err=%v)", want, err)
-	}
+	// The terminal is on the stream before runTask's deferred removal runs,
+	// so poll rather than stat once.
+	waitFor(t, 5*time.Second, "child scope removal", func() bool {
+		_, err := os.Stat(want)
+		return os.IsNotExist(err)
+	})
 }
 
 // Without a source scope the child still gets one, holding only the hook.
@@ -576,6 +579,25 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 	}
 }
 
+// The scheme token is case-insensitive, and a credential can arrive under a
+// key outside the first list of words: a private key, a passphrase.
+func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
+	in := `{"command": "curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	out := string(redactInput("terminal", json.RawMessage(in)))
+	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "BEGIN PRIVATE KEY", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("leaked %q in %s", leaked, out)
+		}
+	}
+	// A short word after "basic" is not a credential, and a camelCase key
+	// that starts with the word is a name, as for secretName.
+	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("expected %q in %s", kept, out)
+		}
+	}
+}
+
 // hermes's tool_call wrapper over the cap keeps its nested tool names: each
 // call's arguments is capped on its own, so a tool_called check on a nested
 // tool still sees it, and the wrapper is not the whole-input stand-in.
@@ -665,9 +687,9 @@ func TestChildManagedScope_FailsOnAnUnreadableSourceAndLeavesNothing(t *testing.
 // Past the budget, calls are counted, not published, and one marker at the
 // terminal says how many; the lifecycle events keep their room on the subject.
 func TestActivity_CallsPastTheBudgetBecomeOneMarker(t *testing.T) {
-	prev := activityEntryBudget
-	activityEntryBudget = 3
-	t.Cleanup(func() { activityEntryBudget = prev })
+	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
+	activityEntryBudget, activityHeartbeatReserve = 3, 0
+	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 for i in range(5):
@@ -697,6 +719,35 @@ print("done")
 // The heartbeat shares the budget: a short interval under a long run cannot
 // spend the subject either. Past the budget it simply stops, and the marker
 // counts calls, not heartbeats.
+// The trace stops short of the budget by the heartbeat's reserve, so the
+// heartbeat runs to the terminal on a looping run: with a budget of 4 and a
+// reserve of 2, three calls become two parts and a marker while the
+// heartbeat still gets its two.
+func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
+	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
+	activityEntryBudget, activityHeartbeatReserve = 4, 2
+	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
+	a, _ := newActivityState(false)
+	got := 0
+	for i := 0; i < 3; i++ {
+		if a.underBudget() {
+			got++
+		}
+	}
+	if got != 2 || a.dropped != 1 {
+		t.Fatalf("trace parts = %d, dropped = %d; want 2 and 1", got, a.dropped)
+	}
+	beats := 0
+	for i := 0; i < 3; i++ {
+		if a.heartbeatUnderBudget() {
+			beats++
+		}
+	}
+	if beats != 2 {
+		t.Fatalf("heartbeats = %d, want the reserve (2)", beats)
+	}
+}
+
 func TestActivity_HeartbeatSharesTheBudget(t *testing.T) {
 	prev := activityEntryBudget
 	activityEntryBudget = 2
@@ -747,16 +798,23 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	if err := os.MkdirAll(leftover, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(leftover, ".env"), []byte("SECRET=x\n"), 0o600); err != nil {
-		t.Fatal(err)
+	for name, body := range map[string]string{managedConfigFile: "model: {}\n", managedEnvFile: "SECRET=x\n"} {
+		if err := os.WriteFile(filepath.Join(leftover, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	foreignFile := filepath.Join(scratch, "notes")
 	if err := os.WriteFile(foreignFile, []byte("not the bridge's\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	foreignDir := filepath.Join(scratch, "lost+found")
-	if err := os.MkdirAll(filepath.Join(foreignDir, "inner"), 0o755); err != nil {
-		t.Fatal(err)
+	// BRIDGE_SCRATCH_DIR may name a directory the bridge shares: plainly
+	// named directories, and a task-named one that holds no managed config,
+	// are not scopes the bridge wrote.
+	foreignDirs := []string{filepath.Join(scratch, "lost+found", "inner"), filepath.Join(scratch, "cache", "inner"), filepath.Join(scratch, "data"), filepath.Join(scratch, "task-foreign", "inner")}
+	for _, d := range foreignDirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	b := &Bridge{cfg: Config{ScratchDir: scratch, ActivityListen: "127.0.0.1:0"}}
@@ -768,7 +826,7 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
 		t.Fatalf("a previous incarnation's scope survived the start: stat err = %v", err)
 	}
-	for _, kept := range []string{scratch, foreignFile, filepath.Join(foreignDir, "inner")} {
+	for _, kept := range append([]string{scratch, foreignFile}, foreignDirs...) {
 		if _, err := os.Stat(kept); err != nil {
 			t.Fatalf("the sweep took %s, which is not a task scope: %v", kept, err)
 		}

@@ -87,9 +87,11 @@ type Config struct {
 	ActivityListen string
 	// ManagedScopeDir is hermes's managed scope as this process sees it:
 	// the directory whose config.yaml and .env each child's own scope is
-	// copied from before the hook is added (activity.go). Empty takes
-	// $HERMES_MANAGED_DIR, else /etc/hermes when it exists, else nothing
-	// to copy.
+	// copied from before the hook is added (activity.go). Empty means
+	// nothing to copy and a hook-only scope; the daemon resolves it from
+	// $HERMES_MANAGED_DIR, else /etc/hermes (cmd/hermes-bridge), so the
+	// library reads no environment and a test's bridge copies nothing from
+	// the machine it runs on.
 	ManagedScopeDir string
 	// ScratchDir holds the per-task managed scopes (default: hermes-bridge
 	// under the temp dir). Each is removed when its child exits.
@@ -130,13 +132,6 @@ func (c *Config) defaults() {
 	}
 	if c.ProgressInterval == 0 {
 		c.ProgressInterval = DefaultProgressInterval
-	}
-	if c.ManagedScopeDir == "" {
-		if v := strings.TrimSpace(os.Getenv(ManagedDirEnv)); v != "" {
-			c.ManagedScopeDir = v
-		} else if st, err := os.Stat(DefaultManagedDir); err == nil && st.IsDir() {
-			c.ManagedScopeDir = DefaultManagedDir
-		}
 	}
 	if c.ScratchDir == "" {
 		c.ScratchDir = filepath.Join(os.TempDir(), "hermes-bridge")

@@ -283,8 +283,9 @@ managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually
 carries) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
 (the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
 exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent, each copy removed when
-its child exits, the ones a previous incarnation left (its direct subdirectories named like a
-task id, nothing else in it and never the directory itself) removed when the bridge starts, and
+its child exits, the ones a previous incarnation left (its direct `task-`-named subdirectories
+that hold a managed `config.yaml`, nothing else in it and never the directory itself) removed
+when the bridge starts, and
 none written at all when the source exists but cannot be read, since a child on a hook-only
 scope would run without the operator's pins). The
 hook therefore exists only in processes the bridge spawned: a kanban worker or cron tick
@@ -323,18 +324,22 @@ nothing of it follows the final event. `input` is capped (2 KiB): over the cap i
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
-`api_key`/`api-key` or `credential` as a whole component (`access_token`, `SECRET_KEY`,
-`accessToken`, `clientSecret`; not `tokenizer` or `secretName`) are replaced before
+`api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `passphrase` or `credential` as a
+whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`; not `tokenizer`
+or `secretName`) are replaced before
 publishing, and so are the credential shapes a value can carry under an innocent key (a
 bearer token, a Google OAuth or API key, a GitHub token, a `key=value` pair or `--flag value`
 whose key looks like a secret, a quoted value taken whole to its closing quote) — a terminal
 command is one string, so this is best-effort, and anything else the model pastes into a
 command line ships. Tool results are not published: no check
 reads them and they are the riskiest payload in the pod. One task publishes at most 3000
-trace parts: the task's events subject is capped at 4096 messages, and a looping persona
-publishing without bound would evict its own `submitted` and `working`. Past the budget,
-calls are counted and one entry, `tool` `activity-budget` with `status` `truncated` and
-`dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
+trace and progress parts together: the task's events subject is capped at 4096 messages, and
+a looping persona publishing without bound would evict its own `submitted` and `working`. The
+trace stops 120 short of that, the heartbeat's reserve (one a minute for the default two-hour
+deadline), so the heartbeat keeps going on exactly the run that spends the budget; an
+interval set short enough to spend the reserve itself goes quiet at the budget. Past the
+trace's share, calls are counted and one entry, `tool` `activity-budget` with `status`
+`truncated` and `dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
