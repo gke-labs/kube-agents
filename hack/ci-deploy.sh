@@ -107,8 +107,9 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout and worker images from
 #     a2a/Dockerfile.* (the pull request's own builds, the same way the four
-#     images above are; the operator would otherwise derive released images
-#     from the agent image it resolves) and the Hermes bridge sidecar image, FROM the
+#     images above are; the operator would derive these same references from
+#     its own image, and step 5 names them anyway so the deploy's inputs are
+#     explicit) and the Hermes bridge sidecar image, FROM the
 #     platform-agent image of the same build;
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides, and

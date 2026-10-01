@@ -689,7 +689,10 @@ func a2aWorkerImage() string {
 // gateway, the callout and the worker consume what the operator renders (the
 // identity map, the env, the spawn spec), so their version contract is with
 // the operator, and OPERATOR_IMAGE is set once per install by whoever
-// installed it (the chart, or main.go's discovery from the pod spec); else
+// installed it: the chart sets it, and main.go discovers it from the pod
+// spec only when PLATFORM_AGENT_IMAGE is unset too, so a kustomize install
+// that sets the agent image and not the operator's skips this rung (the
+// sample manifest names both for that reason); else
 // the same swap on the agent image the operator resolves for itself
 // (defaultPlatformAgentImage: PLATFORM_AGENT_IMAGE, which the chart pins to
 // the release or the mirror, else the published default at the fallback
