@@ -340,7 +340,8 @@ Artifact names are data, so the set can grow without touching the envelope; only
 four carry reserved semantics. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
-publishes in place of calls past its budget, with `dropped` counting them), `errorType` (the executor's own word for
+publishes in place of the calls missing from the trace, past its budget, failed to publish, or
+unreported at its drain, with `dropped` counting them), `errorType` (the executor's own word for
 an error), `durationMs` and `at`; the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 

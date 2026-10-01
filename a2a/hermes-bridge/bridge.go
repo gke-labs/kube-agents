@@ -726,11 +726,8 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	cmd.Stderr = stderr
 	// The activity door's side of this task: a signing key in the child's
 	// environment when the door is open, and the heartbeat either way.
-	act, err := newActivityState(b.activityLn != nil, b.cfg.ActivityInputValues)
-	if err != nil {
-		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
-		return
-	}
+	act := newActivityState(b.activityLn != nil, b.cfg.ActivityInputValues)
+	var err error
 	if b.activityLn != nil {
 		scope, err := b.childManagedScope(taskID)
 		if err != nil {

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1889,6 +1890,11 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 	return report
 }
 
+// activityEntryKeys are the keys of an activity entry as both executors
+// publish it (ActivityEntry in the bridge, the worker adapter's record);
+// anything else on an over-size entry is dropped before the input is.
+var activityEntryKeys = map[string]bool{"tool": true, "input": true, "callId": true, "status": true, "errorType": true, "durationMs": true, "at": true, "dropped": true}
+
 // capActivityEntry replaces an over-size activity entry with a stand-in that
 // keeps what a grader reads (the tool, and a tool_call wrapper's nested
 // names) and says what was cut, in the bridge's own stand-in shape: the
@@ -1908,6 +1914,25 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	}
 	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
 		return out
+	}
+	// Then any key outside the entry's shape (an executor's extra field, a
+	// result some adapter attached): dropped, and named, so a cut there is
+	// not charged to the input.
+	var dropped []string
+	for key := range entry {
+		if !activityEntryKeys[key] {
+			dropped = append(dropped, key)
+		}
+	}
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		for _, key := range dropped {
+			delete(entry, key)
+		}
+		entry["droppedKeys"] = dropped
+		if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
+			return out
+		}
 	}
 	// The input is the bulk. A wrapper keeps its nested names, each call's
 	// arguments replaced by the bridge's own stand-in shape with that call's

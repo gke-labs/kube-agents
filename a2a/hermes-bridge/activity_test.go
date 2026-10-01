@@ -270,18 +270,12 @@ print("slow answer")
 // is there from the first line.
 func TestActivity_HeartbeatWithTheDoorClosedSaysTheTraceIsOff(t *testing.T) {
 	now := time.Now()
-	closed, err := newActivityState(false, InputValuesFull)
-	if err != nil {
-		t.Fatal(err)
-	}
+	closed := newActivityState(false, InputValuesFull)
 	closed.startedAt = now.Add(-5 * time.Minute)
 	if got := closed.progressLine(now); got != "running 5m0s, tool trace off" {
 		t.Fatalf("door-closed heartbeat = %q", got)
 	}
-	open, err := newActivityState(true, InputValuesFull)
-	if err != nil {
-		t.Fatal(err)
-	}
+	open := newActivityState(true, InputValuesFull)
 	open.startedAt = now.Add(-5 * time.Minute)
 	if got := open.progressLine(now); got != "running 5m0s, 0 tool call(s)" {
 		t.Fatalf("door-open heartbeat = %q", got)
@@ -441,7 +435,7 @@ func TestRedactInput(t *testing.T) {
 // The entry's other fields are bounded from the delivery: a long tool name,
 // call id or timestamp cannot make a part the size of the door's body cap.
 func TestActivity_EntryFieldsAreBounded(t *testing.T) {
-	a, _ := newActivityState(false, InputValuesShape)
+	a := newActivityState(false, InputValuesShape)
 	long := strings.Repeat("n", 4096)
 	var d hookDelivery
 	d.Event, d.ToolName, d.Timestamp = hookPostToolCall, long, long
@@ -456,7 +450,7 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 // trace will not carry: it counts on the marker rather than vanishing.
 func TestActivity_UnreadableSignedDeliveryCountsDropped(t *testing.T) {
 	b := &Bridge{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: map[string]*taskRun{}}
-	a, _ := newActivityState(true, InputValuesShape)
+	a := newActivityState(true, InputValuesShape)
 	run := &taskRun{origin: &lib.Envelope{TaskID: "task-bad", ContextID: "ctx", CorrelationID: "corr"}}
 	run.act.Store(a)
 	b.tasks["task-bad"] = run
@@ -488,7 +482,7 @@ func TestActivity_FractionalDurationIsRead(t *testing.T) {
 	if got := durationMillis(json.Number("40")); got != 40 {
 		t.Fatalf("durationMillis(40) = %d", got)
 	}
-	for _, out := range []string{"9223372036854775807.0", "9.223372036854775808e18", "9223372036854775808", "-5.5", "1e400"} {
+	for _, out := range []string{"9223372036854775807.0", "9.223372036854775808e18", "9223372036854775808", "-5.5", "-5", "1e400"} {
 		if got := durationMillis(json.Number(out)); got != 0 {
 			t.Fatalf("durationMillis(%s) = %d, want 0", out, got)
 		}
@@ -594,7 +588,7 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 		d.Extra.Status, d.Extra.ErrorType = status, errType
 		return d
 	}
-	a, _ := newActivityState(false, InputValuesFull)
+	a := newActivityState(false, InputValuesFull)
 	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
 		t.Fatalf("blocked -> %+v", e)
 	}
@@ -745,7 +739,7 @@ func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
 	t.Cleanup(func() { activityDrainBudget = prev })
 	_, url := startServer(t)
 	b := startBridgeCfg(t, url, []string{"true"}, nil)
-	a, _ := newActivityState(false, InputValuesFull)
+	a := newActivityState(false, InputValuesFull)
 	for _, id := range []string{"c1", "c2"} {
 		var d hookDelivery
 		d.Event, d.ToolName, d.Extra.ToolCallID = hookPreToolCall, "terminal", id
@@ -973,7 +967,7 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
 	activityEntryBudget, activityHeartbeatReserve = 4, 2
 	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
-	a, _ := newActivityState(false, InputValuesFull)
+	a := newActivityState(false, InputValuesFull)
 	got := 0
 	for i := 0; i < 3; i++ {
 		if a.underBudget() {
@@ -994,7 +988,7 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	}
 	// And the other way: a heartbeat that spent its share took nothing from
 	// the trace's.
-	b, _ := newActivityState(false, InputValuesFull)
+	b := newActivityState(false, InputValuesFull)
 	for i := 0; i < 5; i++ {
 		b.heartbeatUnderBudget()
 	}

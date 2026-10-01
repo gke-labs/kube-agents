@@ -486,7 +486,7 @@ type activityState struct {
 	done     chan struct{}
 }
 
-func newActivityState(withKey bool, inputValues string) (*activityState, error) {
+func newActivityState(withKey bool, inputValues string) *activityState {
 	if inputValues != InputValuesFull {
 		inputValues = InputValuesShape
 	}
@@ -501,12 +501,12 @@ func newActivityState(withKey bool, inputValues string) (*activityState, error) 
 	}
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
-		if _, err := rand.Read(raw); err != nil {
-			return nil, fmt.Errorf("activity key: %w", err)
-		}
+		// crypto/rand.Read does not fail (it crashes the program if the
+		// source is unusable), so there is no error to carry.
+		_, _ = rand.Read(raw)
 		a.key = hex.EncodeToString(raw)
 	}
-	return a, nil
+	return a
 }
 
 // childEnv is what the door adds to the hermes child's environment: the
@@ -705,6 +705,9 @@ func activityStatus(d hookDelivery) string {
 // is not a reason to drop the delivery.
 func durationMillis(n json.Number) int64 {
 	if i, err := n.Int64(); err == nil {
+		if i < 0 {
+			return 0
+		}
 		return i
 	}
 	// Strict on the upper side: math.MaxInt64 rounds to 2^63 as a float,

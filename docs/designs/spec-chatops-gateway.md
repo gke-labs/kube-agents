@@ -603,7 +603,8 @@ not be silent about it.
   the gateway's own source, which says it could not publish the task at all), the result
   artifact's text and the terminal's status message; whenever the stream was read, final or
   not, the task's tool-call trace (`activity`, the data parts of the activity artifact in
-  stream order, present as `[]` when the executor called nothing and absent when no stream was
+  arrival order per artifact, which is stream order for an executor that appends to one artifact
+  id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
   and the progress artifact's latest line (`progress`); plus the conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
