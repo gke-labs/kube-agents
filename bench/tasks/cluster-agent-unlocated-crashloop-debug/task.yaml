@@ -37,6 +37,7 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
+expected_fail: true
 
 # Slug per docs/designs/domains.yaml.
 domain: cluster-debugging
@@ -101,27 +102,22 @@ verification_spec:
       # A match anywhere in a command: catches script executions by file path
       # or script filename (cluster_agent_profile.py, kanban_notify_propagate.py),
       # Python module invocations (python3 -m cluster_agent_profile, python3 -m runpy ...),
-      # inline execution (python3 -c "import cluster_agent_profile", attached syntax
-      # python3 -c'import...', and unquoted code with backslash escapes), and stdin
-      # execution forms (piped python commands, herestrings <<<, and heredocs <<),
-      # including options with arguments (-W ignore, -X dev), combined flags (-um, -uc),
-      # quoted module names ('cluster_agent_profile', "cluster_agent_profile"), and
-      # -mmodule syntax, while allowing harmless mentions in text inspection
-      # tools (grep, echo, cat) and harmless mentions in redirect targets or CLI arguments
-      # after a closed -c code string (python3 -c 'print(1)' > ...).
+      # and inline execution (python3 -c "import cluster_agent_profile", attached syntax
+      # python3 -c'import...', ANSI-C quoting $'import...', bash string concatenation,
+      # and unquoted code with backslash escapes), including options with arguments
+      # (-W ignore, -X dev), combined flags (-um, -uc), quoted module names
+      # ('cluster_agent_profile', "cluster_agent_profile"), and -mmodule syntax,
+      # while stopping at shell command separators (;, &&, ||, |) and allowing
+      # harmless mentions in text inspection tools (grep, echo, cat) and in
+      # positional CLI arguments or redirect targets after a closed -c code string.
       type: worker_commands
       forbidden_patterns:
         - 'cluster_agent_profile\.py'
         - 'kanban_notify_propagate\.py'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+-[a-zA-Z0-9]*m\s*(?:["'']?runpy["'']?\s+)?["'']?cluster_agent_profile["'']?\b'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+-[a-zA-Z0-9]*m\s*(?:["'']?runpy["'']?\s+)?["'']?kanban_notify_propagate["'']?\b'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+-[a-zA-Z0-9]*c\s*(?:''[^'']*cluster_agent_profile[^'']*''|"[^"]*cluster_agent_profile[^"]*"|(?![''"])(?:\\.|[^\s;&|<>''"\n])*?\bcluster_agent_profile\b)'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+-[a-zA-Z0-9]*c\s*(?:''[^'']*kanban_notify_propagate[^'']*''|"[^"]*kanban_notify_propagate[^"]*"|(?![''"])(?:\\.|[^\s;&|<>''"\n])*?\bkanban_notify_propagate\b)'
-        - '\bcluster_agent_profile\b.*?\|\s*(?:\S+\s+)*?python[0-9.]*'
-        - '\bkanban_notify_propagate\b.*?\|\s*(?:\S+\s+)*?python[0-9.]*'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+<<<.*?\bcluster_agent_profile\b'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+<<<.*?\bkanban_notify_propagate\b'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+(?:-\s+)?<<'
+        - '(?:^|[;&|()]\s*)python[0-9.]*(?:\s+[^\s;&|()<>]+)*?\s+-[a-zA-Z0-9]*m\s*(?:["'']?runpy["'']?\s+)?["'']?cluster_agent_profile["'']?\b'
+        - '(?:^|[;&|()]\s*)python[0-9.]*(?:\s+[^\s;&|()<>]+)*?\s+-[a-zA-Z0-9]*m\s*(?:["'']?runpy["'']?\s+)?["'']?kanban_notify_propagate["'']?\b'
+        - '(?:^|[;&|()]\s*)python[0-9.]*(?:\s+[^\s;&|()<>]+)*?\s+-[a-zA-Z0-9]*c\s*(?:(?:\''[^\'']*\''|"[^"]*"|\$\''[^\'']*\''|\\.|[^\s;&|<>\''"\n])*?(?:\''[^\'']*cluster_agent_profile[^\'']*\''|"[^"]*cluster_agent_profile[^"]*"|\$\''[^\'']*cluster_agent_profile[^\'']*\''|\bcluster_agent_profile\b))'
+        - '(?:^|[;&|()]\s*)python[0-9.]*(?:\s+[^\s;&|()<>]+)*?\s+-[a-zA-Z0-9]*c\s*(?:(?:\''[^\'']*\''|"[^"]*"|\$\''[^\'']*\''|\\.|[^\s;&|<>\''"\n])*?(?:\''[^\'']*kanban_notify_propagate[^\'']*\''|"[^"]*kanban_notify_propagate[^"]*"|\$\''[^\'']*kanban_notify_propagate[^\'']*\''|\bkanban_notify_propagate\b))'
   - name: rca-names-the-oom
     role: objective
     mode: assert

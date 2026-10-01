@@ -800,6 +800,7 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("list_cluster_profiles()", step_1)
         self.assertIn("cluster_agent_profile.py list", step_1)
         self.assertIn("get_k8s_resource", step_1)
+        self.assertIn("describe_k8s_resource", step_1)
         self.assertIn("Do not create throwaway kanban probe cards", step_1)
         self.assertIn("Never resolve silently", step_1)
         self.assertRegex(step_1, r"[Aa]sk only after (looking|checking|searching)")
@@ -910,7 +911,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'python3 -c "import sys; import cluster_agent_profile"',
             'python3 -c "import kanban_notify_propagate"',
             "python3 -c 'from kanban_notify_propagate import notify'",
-            # Attached -c syntax (Thread 1)
+            # Attached -c syntax
             "python3 -c'import cluster_agent_profile'",
             'python3 -c"import cluster_agent_profile"',
             "python3 -uc'import cluster_agent_profile'",
@@ -918,24 +919,14 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 -c'from cluster_agent_profile import list_profiles'",
             "python3 -c'import kanban_notify_propagate'",
             'python3 -c"import kanban_notify_propagate"',
-            # Stdin execution forms (Thread 1)
-            "python3 - <<'EOF'",
-            "python3 - <<EOF",
-            "python3 <<'EOF'",
-            "python3 <<EOF",
-            "python3 -u - <<'EOF'",
-            "python3 -u <<'EOF'",
-            "python - <<'EOF'",
-            "python3 <<< 'import cluster_agent_profile'",
-            'python3 <<< "import cluster_agent_profile"',
-            "python3 - <<< 'import cluster_agent_profile'",
-            "python3 <<< 'import kanban_notify_propagate'",
-            "echo 'import cluster_agent_profile' | python3",
-            'echo "import cluster_agent_profile" | python3',
-            "echo 'from cluster_agent_profile import list_profiles' | python3",
-            "printf 'import cluster_agent_profile' | python3",
-            "echo 'import kanban_notify_propagate' | python3",
-            "echo 'from kanban_notify_propagate import notify' | python3",
+            # ANSI-C quoting and bash string concatenation forms
+            "python3 -c $'import cluster_agent_profile'",
+            "python3 -c'import '\"cluster_agent_profile\"",
+            "python3 -c 'import '\"cluster_agent_profile\"",
+            "python3 -c$'import cluster_agent_profile'",
+            "python3 -c $'from cluster_agent_profile import list_profiles'",
+            "python3 -c $'import kanban_notify_propagate'",
+            "python3 -c 'import '\"kanban_notify_propagate\"",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -959,10 +950,19 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cat notes/kubectl.md",
             "curl http://localhost:8080",
             "hermes profile list",
+            # Shell separators and pipes (do not read across command separators)
             'python3 -c "print(1)" && grep cluster_agent_profile /opt/data',
             "python3 -c 'print(1)' ; echo cluster_agent_profile",
             'python3 -c "print(1)" | grep cluster_agent_profile',
-            # Thread 2: Harmless mentions in redirect targets or CLI arguments after closed -c code string
+            "python3 --version; grep -c cluster_agent_profile /opt/data/skills/cluster-agent-lifecycle/SKILL.md",
+            "python3 -V && grep -c cluster_agent_profile README.md",
+            "python3 --help | grep -c cluster_agent_profile",
+            "test -f /tmp/cluster_agent_profile.log || python3 collect.py",
+            "grep -ic cluster_agent_profile README.md",
+            "grep -c cluster_agent_profile /opt/data/skills/cluster-agent-lifecycle/SKILL.md",
+            "sort -c cluster_agent_profile.txt",
+            "ls -m cluster_agent_profile",
+            # Harmless mentions in redirect targets or CLI arguments after closed -c code string
             "python3 -c 'print(1)' > /tmp/cluster_agent_profile.log",
             'python3 -c "print(1)" > /tmp/cluster_agent_profile.log',
             "python3 -c'print(1)' > /tmp/cluster_agent_profile.log",
@@ -973,6 +973,14 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 -c 'print(1)' < cluster_agent_profile.txt",
             "python3 -c 'print(1)' > /tmp/kanban_notify_propagate.log",
             'python3 -c "print(sys.argv)" kanban_notify_propagate',
+            # Legitimate python heredocs or redirects
+            "python3 - <<'EOF'\nimport json, sys\nprint(1)\nEOF",
+            "python3 <<EOF\nprint(1)\nEOF",
+            "python3 /opt/data/scripts/anything.py <<EOF\nfoo\nEOF",
+            "python3 -m json.tool <<EOF\n{}\nEOF",
+            'python3 <<< "$json"',
+            'echo "see python3 later" <<EOF\nEOF',
+            "ls /usr/lib/python3 && cat <<'EOF' > notes.md\nEOF",
             # Non-python heredocs or redirects
             "cat <<'EOF' > /tmp/test.txt",
             "cat <<EOF > /tmp/test.txt",

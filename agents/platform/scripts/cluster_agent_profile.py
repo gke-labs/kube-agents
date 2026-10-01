@@ -67,8 +67,6 @@ PROFILES_BASE = profiles_base(HERMES_HOME)
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
 
-CLUSTER_PROFILE_PREFIX = "cluster-"
-IDENTITY_FILE = "USER.md"
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
 # managed as Cluster Agents: the front-door router (`default`) and the Platform
 # Agent itself (`platform`). Reconciliation must never touch these.
@@ -469,7 +467,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # It stays informational even so: the pin the runtime honours is KUBECONFIG
     # in the profile's .env (step 3b), not this line. Repointing an agent means
     # re-running this scaffold, not editing USER.md.
-    (home / IDENTITY_FILE).write_text(
+    (home / USER_MD_NAME).write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
@@ -536,7 +534,7 @@ def is_ready_profile(home: Path) -> bool:
     identity before it fetches the credential and writes USER.md, so a scaffold that
     stopped in between is registered, and its worker blocks at preflight.
     """
-    return is_scaffolded(home) and (home / IDENTITY_FILE).is_file()
+    return is_scaffolded(home) and (home / USER_MD_NAME).is_file()
 
 
 def list_ready_profiles() -> list[str]:

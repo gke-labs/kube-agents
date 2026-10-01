@@ -333,8 +333,22 @@ class ToolCalledVerifier(BaseVerifier):
     @classmethod
     def _agent_pattern_compile(cls, pattern: str | None) -> str | None:
         if pattern is not None:
+            if not pattern:
+                raise ValueError("agent selector pattern cannot be empty")
             re.compile(pattern)
         return pattern
+
+    @model_validator(mode="after")
+    def _validate_agent_scope(self) -> ToolCalledVerifier:
+        if self.agent is not None:
+            if not self.agent:
+                raise ValueError("agent selector pattern cannot be empty")
+            if self.scope == "router":
+                raise ValueError(
+                    "agent selector cannot be used with scope: router "
+                    "(router trajectory entries have no agent tag)"
+                )
+        return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -373,7 +387,7 @@ class ToolCalledVerifier(BaseVerifier):
         ]
         count = len(calls)
         ok = count >= self.minimum_calls
-        agent_str = f" for agent {self.agent!r}" if self.agent else ""
+        agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
         return VerificationResult(
             success=ok,
             elapsed_time=time.monotonic() - start,

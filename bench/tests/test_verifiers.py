@@ -1041,6 +1041,18 @@ def test_tool_called_rejects_an_unknown_scope():
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], scope="fleet")
 
 
+def test_tool_called_rejects_empty_agent_pattern():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent="", scope="workers")
+
+
+def test_tool_called_rejects_agent_filter_under_router_scope():
+    with pytest.raises(ValidationError):
+        ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_create"], scope="router", agent="platform"
+        )
+
+
 def test_a_workers_scope_none_safeguard_trips_on_the_workers_attempt():
     transcript.set("done", _WORKER_TAGGED)
     entry = VerificationEntry(
