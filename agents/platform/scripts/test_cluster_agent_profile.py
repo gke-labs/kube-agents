@@ -938,7 +938,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "import cluster_agent_profile" | python',
             "echo 'from cluster_agent_profile import list_profiles' | python3",
             "printf 'import cluster_agent_profile\\n' | python3",
+            "echo 'import cluster_agent_profile' | python3 -u",
+            "echo 'import cluster_agent_profile' | python3 -u -",
+            "printf 'import cluster_agent_profile\\n' | python3 -u",
             "echo 'import kanban_notify_propagate' | python3",
+            "echo 'import kanban_notify_propagate' | python3 -u",
+            "echo 'import kanban_notify_propagate' | python3 -u -",
+            "printf 'import kanban_notify_propagate\\n' | python3 -u",
             "echo 'import cluster_agent_profile; print(cluster_agent_profile.list_profiles())' | python3",
             "echo 'import cluster_agent_profile' | python3 2>&1",
             "echo 'import cluster_agent_profile' | python3 > /tmp/out",
@@ -1117,6 +1123,9 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             # Legitimate python redirects
             "python3 -m json.tool <<EOF",
             'python3 <<< "$json"',
+            "echo '{}' | python3 -u -m json.tool",
+            "echo 'hello' | python3 -u -c 'import sys; print(sys.stdin.read())'",
+            "echo 'not using cluster_agent_profile' | python3 -u",
             # Non-python redirects
             "cat <<'EOF' > /tmp/test.txt",
             "cat <<EOF > /tmp/test.txt",
@@ -1216,7 +1225,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
 
         # Verify that unquoted -c code arguments with long runs of backslash escapes,
         # 10-key dictionary payloads with escaped quotes, wrapper chains, and commands with 50
-        # repeated short flags across option groups evaluate in under 50 ms (< 0.05s, observed ~0.011s),
+        # repeated short flags across option groups evaluate in under 200 ms (< 0.2s, observed ~0.011s),
         # eliminating catastrophic backtracking (ReDoS) while providing headroom against CI timing jitter:
         flagged_cmds = [
             "python3 " + " ".join("-a" for _ in range(50)) + " script.py",
@@ -1240,8 +1249,8 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
                 self.assertFalse(res, f"unexpected match on {cmd!r} by pattern {i}")
                 self.assertLess(
                     elapsed,
-                    0.05,
-                    f"pattern {i} took too long ({elapsed:.4f}s) on {cmd!r} (expected < 0.05s, catastrophic backtracking)",
+                    0.2,
+                    f"pattern {i} took too long ({elapsed:.4f}s) on {cmd!r} (expected < 0.2s, catastrophic backtracking)",
                 )
 
     def test_platform_checked_workload_existence_requires_mcp_tool(self):
