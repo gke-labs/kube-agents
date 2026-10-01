@@ -9,7 +9,7 @@ set -u; NN=${1:?scenario number, two digits}; TRACK=$NN; CLUSTER=${CLUSTER:-upg-
 . "$(dirname "$0")/common.sh"; . "$H/scenarios/$NN.sh"
 START_VERSION=$(newest_patch "$CHANNEL" "$START") || { note final "precondition not met: $CHANNEL offers no $START patch in $ZONE (the scenario's start minor has left the channel, or the version read failed); nothing created"; exit 1; }
 note cluster "scenario $NN on $CLUSTER: $CHANNEL $START_VERSION"
-G container clusters describe "$CLUSTER" --zone "$ZONE" >/dev/null 2>&1 || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=$SCENARIO_LABEL,scenario=$NN --quiet ${CREATE_FLAGS:-}
+describe_exists "cluster $CLUSTER" G container clusters describe "$CLUSTER" --zone "$ZONE" || ev cluster create G container clusters create "$CLUSTER" --zone "$ZONE" --release-channel "$(echo $CHANNEL | tr A-Z a-z)" --cluster-version "$START_VERSION" --num-nodes 1 --machine-type "$DEFAULT_POOL_MACHINE" --disk-size "$NODE_DISK_GB" --workload-pool="$PROJECT.svc.id.goog" --labels=purpose=$SCENARIO_LABEL,scenario=$NN --quiet ${CREATE_FLAGS:-}
 require_scenario_cluster
 require_own_cluster "$NN"   # and the scenario's own cluster, never another run's hold cluster (common.sh says the rule)
 if [ -n "${POOL_FLAGS:-}" ]; then pool_exists work-pool || ev cluster work-pool G container node-pools create work-pool --cluster "$CLUSTER" --zone "$ZONE" --node-version "$START_VERSION" --node-labels=role=work --disk-size "$NODE_DISK_GB" --quiet ${POOL_FLAGS} ||
