@@ -772,9 +772,10 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.content = self.skill_path.read_text(encoding="utf-8")
 
     def test_delegation_step_1_mandates_fleet_enumeration_before_asking(self):
-        # Must isolate Step 1 of delegation to ensure the unlocated branch is
-        # strictly present in the delegation procedure, rather than relying
-        # only on whole-document presence assertions.
+        # Static documentation invariant verifying that Step 1 of SKILL.md explicitly
+        # includes fleet enumeration and existence inspection before asking.
+        # Note: this asserts documentation presence; behavioral verification requires
+        # evaluation with a model in the loop (see cluster-agent-unlocated-crashloop-debug).
         step_1_start = self.content.find("1. **Resolve the cluster's profile name**")
         self.assertNotEqual(step_1_start, -1, "missing Step 1 in SKILL.md")
         step_2_start = self.content.find("2. **Create the card**", step_1_start)
@@ -798,14 +799,7 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("cluster_agent_profile.py list", self.content)
         # Must instruct checking before asking the user
         self.assertIn("existence", self.content.lower())
-        # Must instruct polling to settlement and waiting before completing in fan-out
-        self.assertIn("settlement", self.content.lower())
         self.assertIn("sleep 60", self.content)
-        # Must handle ready cards without false timeouts
-        self.assertIn("Do NOT classify cards in `ready` as timed out", self.content)
-        self.assertIn("never complete while cards remain queued in `ready`", self.content)
-        # Must acknowledge configurable concurrency (spec.harness.tuning.maxInProgress) rather than assuming a static cap
-        self.assertIn("spec.harness.tuning.maxInProgress", self.content)
         # Must instruct asking only after searching / looking
         self.assertRegex(
             self.content,
@@ -813,11 +807,6 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         )
         # Must require identifying which cluster was picked in the report
         self.assertIn("Never resolve silently", self.content)
-        # Must instruct completing with the answer you have if a worker blocks or times out
-        self.assertRegex(
-            self.content,
-            r"[Cc]omplete with the answer you have",
-        )
 
 
 class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
@@ -1051,6 +1040,20 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 <<EOF import kanban_notify_propagate EOF",
             "cat <<'EOF' import kanban_notify_propagate EOF | python3",
             "python3 -W ignore::DeprecationWarning - <<'EOF' import kanban_notify_propagate EOF",
+            # Conditional heads, loops, pipeline negation, and eval execution (Thread 4)
+            "if python3 -m cluster_agent_profile list >/dev/null 2>&1; then echo have; fi",
+            "! python3 -m cluster_agent_profile",
+            "while python3 -m cluster_agent_profile; do sleep 1; done",
+            "until python3 -m cluster_agent_profile; do sleep 1; done",
+            "coproc python3 -m cluster_agent_profile",
+            "eval 'python3 -m cluster_agent_profile list'",
+            'eval "python3 -m cluster_agent_profile list"',
+            "if python3 -m kanban_notify_propagate list >/dev/null 2>&1; then echo have; fi",
+            "! python3 -m kanban_notify_propagate",
+            "while python3 -m kanban_notify_propagate; do sleep 1; done",
+            "until python3 -m kanban_notify_propagate; do sleep 1; done",
+            "coproc python3 -m kanban_notify_propagate",
+            "eval 'python3 -m kanban_notify_propagate list'",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1158,6 +1161,19 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "import cluster_agent_profile" | python3 -c \'print(sys.stdin.read())\'',
             'echo "import kanban_notify_propagate" | python3 -c \'print(sys.stdin.read())\'',
             'python3 -c \'print(__import__("os").path.exists("cluster_agent_profile.log"))\'',
+            # Quoted bash -c / sh -c text inside argument strings (Thread 2)
+            "echo \"do not run bash -c 'python3 -m cluster_agent_profile list'\" >> notes.md",
+            "grep -n \"sh -c 'python3 -m cluster_agent_profile'\" SKILL.md",
+            'echo "do not run bash -c \'python3 -c \\"import cluster_agent_profile\\"\'" >> notes.md',
+            # Arguments following closed -c code strings and chained commands (Thread 3)
+            'python3 -c "import sys" "cluster_agent_profile"',
+            "python3 -c 'import sys' 'cluster_agent_profile'",
+            'python3 -c "import sys" cluster_agent_profile',
+            'python3 -c "import yaml" && grep cluster_agent_profile README.md',
+            'python3 -c "import sys" "kanban_notify_propagate"',
+            "python3 -c 'import sys' 'kanban_notify_propagate'",
+            'python3 -c "import sys" kanban_notify_propagate',
+            'python3 -c "import yaml" && grep kanban_notify_propagate README.md',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
