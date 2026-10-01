@@ -1025,6 +1025,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "do not run python3 -m cluster_agent_profile"',
             'echo "else python3 -m cluster_agent_profile"',
             'echo "elif python3 -m cluster_agent_profile"',
+            # Harmless mentions in echo/here-strings that do not cross command boundaries into subsequent python/commands
+            'echo "cluster_agent_profile is stubbed here" >> notes.md; kubectl get deploy -A -o json | python3 -m json.tool',
+            'python3 <<< "$json"; grep cluster_agent_profile README.md',
+            'echo "cluster_agent_profile" | $JQ',
+            'echo "cluster_agent_profile is stubbed here" >> notes.md\nkubectl get deploy -A -o json | python3 -m json.tool',
+            "python3 - <<'EOF'\nimport json\nEOF\ngrep cluster_agent_profile README.md",
+            "cat <<'EOF' | python3\nimport json\nEOF\ngrep cluster_agent_profile README.md",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
