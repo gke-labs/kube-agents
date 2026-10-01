@@ -147,7 +147,7 @@
 #
 # 2026-10-01 adds cluster-agent-unlocated-crashloop-debug (#1670): one case,
 # three units, ~36 serial minutes at its 720s hint. It makes this file's share
-# forty-four cases (132 units) of a fifty-three-case, 159-unit matrix (+3 units).
+# forty-four cases (132 units) of a fifty-eight-case, 174-unit matrix (+3 units).
 # At parallelism 8 the 2026-09-22 paragraph leaves the worst measured night
 # inside the deadline, and ~4.5 more minutes of fan-out does not change that.
 
