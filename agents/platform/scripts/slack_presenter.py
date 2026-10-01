@@ -140,9 +140,13 @@ LIST_MARKER = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
 BOLD_MARKERS = ("**", "__")
 BOLD_OPEN = r"(?<!\w){0}(?=\S)"
 BOLD_CLOSE = r"(?<=\S){0}(?!\w)"
-MD_BOLD = re.compile(
-    "|".join(BOLD_OPEN.format(re.escape(m)) + "(.+?)" + BOLD_CLOSE.format(re.escape(m)) for m in BOLD_MARKERS)
-)
+#: As in CommonMark, ``**`` may also bold part of a word (``**Pod**s``, ``re**start**ed``),
+#: but only a run without spaces when the opener is in-word, so ``2**20 and 2**30`` stays text.
+#: ``__`` keeps the word-boundary rule.
+STAR_BOLD = BOLD_OPEN.format(re.escape("**")) + r"(.+?)(?<=\S)\*\*"
+STAR_BOLD_IN_WORD = r"(?<=\w)\*\*([^\s*]+)\*\*"
+UNDERSCORE_BOLD = BOLD_OPEN.format(re.escape("__")) + "(.+?)" + BOLD_CLOSE.format(re.escape("__"))
+MD_BOLD = re.compile(f"{STAR_BOLD}|{STAR_BOLD_IN_WORD}|{UNDERSCORE_BOLD}")
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]]+)\]\(([^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: ``*italic*`` and ``_italic_``; a ``*`` inside a word (``2*3``) or unpaired (``*.tmp``) is text.
@@ -262,7 +266,7 @@ def _plain(markdown: str) -> str:
     text = HEADING.sub("", text)
     text = LIST_MARKER.sub("", text)
     text = MD_LINK.sub(r"\1", text)
-    text = MD_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
+    text = MD_BOLD.sub(lambda m: next(g for g in m.groups() if g is not None), text)
     text = MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
     return CODE_PLACEHOLDER.sub(lambda m: spans[int(m.group(1))].group(2).strip(), text).strip()
 

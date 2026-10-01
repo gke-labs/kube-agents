@@ -195,6 +195,16 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(sp._plain("2**20 and 2**30 bytes"), "2**20 and 2**30 bytes")
         self.assertEqual(sp._plain("**Checkout** and __payments__ are down"), "Checkout and payments are down")
 
+    def test_plain_strips_in_word_star_bold_but_not_underscore_bold(self):
+        self.assertEqual(sp._plain("**Pod**s are down"), "Pods are down")
+        self.assertEqual(sp._plain("It re**start**ed twice"), "It restarted twice")
+        self.assertEqual(sp._plain("**3**x faster"), "3x faster")
+        self.assertEqual(sp._plain("snake__case__name"), "snake__case__name")
+        self.assertEqual(sp._plain("x**2 and y**2"), "x**2 and y**2")
+        headline, body = sp.split_answer("**Pod**s are down. Restart them.")
+        self.assertEqual(headline, "Pods are down.")
+        self.assertEqual(body, ["Restart them."])
+
     def test_more_abbreviations_do_not_end_the_headline(self):
         for line in ("Node pool np-1 at rev. 7 is cordoned.", "Certs expired Sept. 30 on seeded-a."):
             self.assertEqual(sp.split_answer(line), (line, []))
