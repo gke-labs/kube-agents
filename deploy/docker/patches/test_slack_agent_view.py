@@ -219,6 +219,19 @@ class FlagOnTest(unittest.TestCase):
         for row in got:
             self.assertLessEqual(len(row["title"]), 75)
 
+    def test_the_three_asks_are_the_documented_ones(self):
+        # Literals, not SUGGESTED_PROMPTS: these are the strings chatops.md documents.
+        with flag("true"):
+            got = prompts(load(self.root, ADAPTER), {})
+        self.assertEqual(
+            [row["message"] for row in got],
+            [
+                "is anything unhealthy in my clusters right now?",
+                "what's on the board?",
+                "which clusters are behind their release channel?",
+            ],
+        )
+
     def test_configured_prompts_win(self):
         configured = [{"title": "t", "message": "m"}]
         with flag("true"):
