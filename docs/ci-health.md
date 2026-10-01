@@ -379,7 +379,13 @@ running), keeps the job's report when the build wrote one (the reconcile's
 to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
-latest finished build failed is a `FAILED` note; one whose latest finished
+latest finished build failed is a `FAILED` note, once it is news: the sweep runs
+every ten minutes, so one failed build followed by a green one is a flap, and
+its note waits until one project has failed in three consecutive builds (half
+an hour, past the reaper's reset and the next run) or the run itself has failed
+two in a row; the reconciles' first failed build is the news. The counts are
+`periodics_streaks` in `health.json`, advanced once per new build and carried
+across ticks, a project the build did not reach keeping its count. One whose latest finished
 build is older than its stale window (an hour for the sweep, three for the
 hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the

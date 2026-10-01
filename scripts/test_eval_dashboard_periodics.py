@@ -397,6 +397,53 @@ class WorkflowWiring(unittest.TestCase):
             self.assertTrue(periodic.runbook.startswith(periodics.RUNBOOK_ROOT + "docs/ci-pool-projects.md#"), periodic.runbook)
             self.assertIn(periodic.runbook.split("#", 1)[1], slugs, f"{periodic.job}'s runbook anchor names no heading")
 
+    def test_streaks_count_consecutive_failed_builds_per_project_and_per_run(self):
+        def reading(build, passed, outcomes):
+            return {"job": SWEEP.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE",
+                    "artifact": {"projects": len(outcomes), "closed": 0, "failed": 0, "left_for_next_run": 0, "outcomes": outcomes}}
+        fail = {"error": "HTTP 401 Unauthorized: owner mismatch"}
+        ok = {"closed": 1}
+        one = periodics.streaks({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail, "kube-agents-evals-4": ok})}, None)
+        self.assertEqual(one[SWEEP.job], {"build": "1", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        # The same build read again on the next tick counts nothing twice.
+        same = periodics.streaks({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, one)
+        self.assertEqual(same[SWEEP.job], one[SWEEP.job])
+        # A new build: evals-3 fails again (2), evals-5 fails (1), evals-4 was not reached and keeps nothing to keep.
+        two = periodics.streaks({SWEEP.job: reading("2", False, {"kube-agents-evals-3": fail, "kube-agents-evals-5": fail})}, one)
+        self.assertEqual(two[SWEEP.job], {"build": "2", "projects": {"kube-agents-evals-3": 2, "kube-agents-evals-5": 1}, "runs": 2})
+        # A passed build: evals-3 swept resets it, evals-5 not reached keeps its count, the run streak resets.
+        three = periodics.streaks({SWEEP.job: reading("3", True, {"kube-agents-evals-3": ok})}, two)
+        self.assertEqual(three[SWEEP.job], {"build": "3", "projects": {"kube-agents-evals-5": 1}, "runs": 0})
+        # No reading keeps everything.
+        self.assertEqual(periodics.streaks({}, three)[SWEEP.job], three[SWEEP.job])
+
+    def test_a_single_failed_sweep_build_is_not_news_and_a_streak_is(self):
+        def reading(build, passed, outcomes):
+            return {"job": SWEEP.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE",
+                    "artifact": {"projects": len(outcomes), "closed": 0, "failed": sum(1 for o in outcomes.values() if "error" in o), "left_for_next_run": 0, "outcomes": outcomes}}
+        fail = {"error": "HTTP 401 Unauthorized: owner mismatch request by x, currently owned by "}
+        readings = {SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}
+        streaks = periodics.streaks(readings, None)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {}, "one flap is not news")
+        # The run failing twice in a row is.
+        readings = {SWEEP.job: reading("2", False, {"kube-agents-evals-4": fail})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertIn(SWEEP.job, periodics.assess(readings, NOW, None, streaks=streaks))
+        # A project unswept three builds in a row is, even with green runs between.
+        streaks = None
+        for build, passed in (("10", False), ("11", True), ("12", False), ("13", False)):
+            readings = {SWEEP.job: reading(build, passed, {"kube-agents-evals-9": fail, "kube-agents-evals-2": {"closed": 1}})}
+            streaks = periodics.streaks(readings, streaks)
+        note = periodics.assess(readings, NOW, None, streaks=streaks)[SWEEP.job]
+        self.assertEqual(note["detail"][0], "kube-agents-evals-9: failed in 4 consecutive run(s) (HTTP 401 Unauthorized: owner mismatch request by x, currently owned by )")
+        # A reconcile's first failed build is news, with its own lines untouched.
+        weekly = {"job": WEEKLY.job, "build": "7", "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
+                  "artifact": {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}}}
+        streaks = periodics.streaks({WEEKLY.job: weekly}, None)
+        self.assertEqual(periodics.assess({WEEKLY.job: weekly}, NOW, None, streaks=streaks)[WEEKLY.job]["detail"], ["kube-agents-evals-3: refused (delete x)"])
+        # Without streaks (a caller that has none), a failed build is a note as before.
+        self.assertIn(SWEEP.job, periodics.assess({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, NOW, None))
+
     def test_the_watched_jobs_are_the_three_periodics(self):
         # The names are the Prow job names in oss-test-infra, which nothing here
         # can check; a rename there is a rename here.

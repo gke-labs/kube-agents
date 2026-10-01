@@ -73,6 +73,20 @@ REPORT_EXIT_FAILED = "failed"
 RUNBOOK_ROOT = "https://github.com/gke-labs/kube-agents/blob/main/"
 # The scope line every message carries: none of this reaches a user cluster.
 SCOPE_LINE = "CI eval infrastructure only."
+# When a failing job is news. The sweep runs every ten minutes, so one failed
+# build followed by a green one is a flap: it is said when one project has not
+# been swept in this many consecutive builds (thirty minutes, past the reaper's
+# reset and the next run), or when the run itself has failed this many builds
+# in a row. The reconciles run hourly and weekly: their first failed build is
+# the news.
+SWEEP_PROJECT_ALERT_AFTER = 3
+SWEEP_RUN_ALERT_AFTER = 2
+FIRST_FAILURE = 1
+# health.json's `periodics_streaks`, per job: the last build counted, each
+# project's consecutive failed builds, and the run's consecutive failed builds.
+KEY_STREAK_BUILD = "build"
+KEY_STREAK_PROJECTS = "projects"
+KEY_STREAK_RUNS = "runs"
 RECONCILE_NAMED_OUTCOMES = ("refused", "failed", "interrupted")
 # gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
 # settled on for the Prow archive; the same wording here. Never a bare 404,
@@ -147,6 +161,10 @@ class Periodic:
     does: str
     effect: str
     runbook: str
+    # A failed build is a note once one project has failed this many builds in
+    # a row, or the run has; FIRST_FAILURE for a job whose every run is news.
+    project_alert_after: int = FIRST_FAILURE
+    run_alert_after: int = FIRST_FAILURE
 
 
 SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
@@ -160,6 +178,7 @@ WATCHED = (
         "leftover pull requests from eval runs are being cleaned up again",
         f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-pull-request-sweep",
+        SWEEP_PROJECT_ALERT_AFTER, SWEEP_RUN_ALERT_AFTER,
     ),
     Periodic(
         "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT,
@@ -456,10 +475,59 @@ def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
     return out
 
 
-def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED) -> dict[str, dict]:
+def _project_failed(periodic: Periodic, entry) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    if periodic.artifact == SWEEP_ARTIFACT:
+        return bool(entry.get(REPORT_KEY_ERROR))
+    return entry.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES
+
+
+def streaks(readings: dict[str, dict], prev_streaks: dict | None, watched=WATCHED) -> dict[str, dict]:
+    """Per job, how many builds in a row each project has failed in and how
+    many the run has, carried from the previous health.json and advanced once
+    per new build: a project that failed again counts up, one that succeeded
+    drops out, one the build did not reach (busy, or the run stopped before
+    it) keeps its count; a job with no reading keeps everything."""
+    out = {}
+    for periodic in watched:
+        before = (prev_streaks or {}).get(periodic.job) or {}
+        projects = {p: n for p, n in (before.get(KEY_STREAK_PROJECTS) or {}).items() if isinstance(n, int) and n > 0}
+        runs = before.get(KEY_STREAK_RUNS) if isinstance(before.get(KEY_STREAK_RUNS), int) else 0
+        build = before.get(KEY_STREAK_BUILD)
+        reading = readings.get(periodic.job)
+        if isinstance(reading, dict) and reading.get(KEY_BUILD) != build:
+            build = reading.get(KEY_BUILD)
+            artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
+            outcomes = artifact.get(REPORT_KEY_OUTCOMES) if artifact else None
+            if isinstance(outcomes, dict):
+                for project, entry in outcomes.items():
+                    if _project_failed(periodic, entry):
+                        projects[project] = projects.get(project, 0) + 1
+                    else:
+                        projects.pop(project, None)
+            runs = 0 if reading.get(KEY_PASSED) else runs + 1
+        out[periodic.job] = {KEY_STREAK_BUILD: build, KEY_STREAK_PROJECTS: projects, KEY_STREAK_RUNS: runs}
+    return out
+
+
+def _streak_lines(periodic: Periodic, over: dict, artifact: dict | None) -> list[str]:
+    outcomes = (artifact or {}).get(REPORT_KEY_OUTCOMES)
+    outcomes = outcomes if isinstance(outcomes, dict) else {}
+    lines = []
+    for project in sorted(over):
+        entry = outcomes.get(project)
+        last = (entry.get(REPORT_KEY_ERROR) or entry.get(REPORT_KEY_DETAIL)) if isinstance(entry, dict) else None
+        lines.append(f"{project}: failed in {over[project]} consecutive run(s) ({last or 'not reached this run'})")
+    return lines
+
+
+def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, watched=WATCHED, streaks: dict | None = None) -> dict[str, dict]:
     """The notes this tick: one per watched job whose latest finished build
     failed, or is older than the job's stale window. `prev_notes` carries each
-    open note's `since`. A job with no reading writes no note and ends none."""
+    open note's `since`. With `streaks` (from streaks()), a failed build is a
+    note only once one project's or the run's consecutive failures reach the
+    job's thresholds. A job with no reading writes no note and ends none."""
     notes = {}
     for periodic in watched:
         reading = readings.get(periodic.job)
@@ -474,6 +542,12 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             continue
         before = (prev_notes or {}).get(periodic.job) or {}
         artifact = reading.get(KEY_ARTIFACT) if isinstance(reading.get(KEY_ARTIFACT), dict) else None
+        over = {}
+        if verdict == VERDICT_FAILED and streaks is not None:
+            streak = streaks.get(periodic.job) or {}
+            over = {p: n for p, n in (streak.get(KEY_STREAK_PROJECTS) or {}).items() if n >= periodic.project_alert_after}
+            if not over and (streak.get(KEY_STREAK_RUNS) or 0) < periodic.run_alert_after:
+                continue
         notes[periodic.job] = {
             KEY_JOB: periodic.job,
             KEY_LABEL: periodic.label,
@@ -484,7 +558,9 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_RESULT: reading.get(KEY_RESULT),
             KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR),
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
-            KEY_DETAIL: detail_lines(periodic, artifact) if verdict == VERDICT_FAILED else [],
+            # A job whose first failure is news keeps the report's own lines; a
+            # thresholded job leads with the projects over the threshold.
+            KEY_DETAIL: ((_streak_lines(periodic, over, artifact) + [line for line in detail_lines(periodic, artifact) if not any(line.startswith(p + ":") for p in over)]) if periodic.project_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact)) if verdict == VERDICT_FAILED else [],
             KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))) if verdict == VERDICT_FAILED else None,
             KEY_HISTORY_URL: history_url(periodic.job),
             KEY_DOC: periodic.doc,

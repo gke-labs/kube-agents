@@ -1269,8 +1269,19 @@ class PeriodicNote(unittest.TestCase):
         self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
         # What each read job's latest build did, for the recovery message.
         self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
+
         self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
         self.assertIsNone(result["periodics_runs"][self.SWEEP]["summary"], "no report, no summary")
+
+    def test_the_sweeps_single_failed_build_is_no_note_and_its_streak_carries(self):
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)})
+        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
+        self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
+        self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
         stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})

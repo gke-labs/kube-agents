@@ -21,7 +21,7 @@ periodics' readings (`--periodics-dir`, scripts/eval_dashboard/periodics.py)
 
     {state, since, cause, failing_cases, evidence, advice, slow, pool,
      fixture_state, pool_state, periodics, periodics_read, periodics_runs,
-     periodics_since,
+     periodics_streaks, periodics_since,
      metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
@@ -2230,7 +2230,10 @@ def adjudicate(
     # The wall clock, as the pool note's: a job that stopped is measured
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
-    watched = periodics.assess(readings, pool_clock, prev_notes)
+    # Per job and project, consecutive failed builds, so a ten-minute job's
+    # single flap is not news and a project unswept for half an hour is.
+    streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2266,6 +2269,7 @@ def adjudicate(
         "periodics": watched,
         "periodics_read": sorted(readings),
         "periodics_runs": periodics.runs(readings),
+        "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,

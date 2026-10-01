@@ -937,7 +937,11 @@ unclosed counts its close and its delete). `periodics_read` names the jobs a
 reading arrived for this tick, whether or not they are noted; the poster clears
 a told job only on a reading that shows it clean. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary}` of its latest finished build, what
-the recovery message says. `periodics_since` is each open note's start, kept
+the recovery message says. `periodics_streaks` is, per watched job, `{build,
+projects{project: n}, runs}`: the last build counted, each project's
+consecutive failed builds (dropped at zero), and the run's; a failed build is
+a note only once a project's count reaches the job's threshold (three for the
+sweep, one for the reconciles) or the run's does (two, one). `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note
 (`scripts/eval_dashboard/periodics.py` owns the notes).
