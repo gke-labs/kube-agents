@@ -1123,8 +1123,10 @@ install, the console is the only chat backend and runs without a mux.
 
 The inject door, when armed, sits beside the mux rather than inside it, for the reason in "A
 side door, not a fourth backend" above: the gateway finds the door's probe and observers by
-type assertion on the top of the adapter stack, and the mux implements none of them. The
-console runs whenever the gateway runs, so an inject-only gateway also exits when the console
+type assertion on the top of the adapter stack, and the mux has no probe and no key for an
+`inject:` conversation. The mux does pass the task observer calls and the session lookup on to
+the backend that owns the conversation, since the Slack adapter learns its session threads
+from them. The console runs whenever the gateway runs, so an inject-only gateway also exits when the console
 adapter does.
 
 **The console outlives the chat backend.** The console is the way in when chat is broken, so

@@ -8,6 +8,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+var (
+	_ TaskObserver      = (*MultiAdapter)(nil)
+	_ SessionLookupSink = (*MultiAdapter)(nil)
 )
 
 type runErrAdapter struct {
@@ -218,6 +225,32 @@ func TestMultiAdapterRestartBackoff(t *testing.T) {
 		if delays[i] != d {
 			t.Fatalf("delays = %v, want %v", delays[:len(want)], want)
 		}
+	}
+}
+
+// observingAdapter records the conversations TaskStarted named.
+type observingAdapter struct {
+	fakeAdapter
+	started []string
+}
+
+func (a *observingAdapter) TaskStarted(conversation, _ string) {
+	a.started = append(a.started, conversation)
+}
+func (a *observingAdapter) TaskTerminal(string, string, lib.TaskState, TerminalSource, string) {}
+func (a *observingAdapter) TaskAccepted(string, string)                                        {}
+func (a *observingAdapter) CancelPublished(string, string)                                     {}
+
+// Observer calls go to the backend that owns the conversation's prefix, and
+// a backend that is not a TaskObserver is simply told nothing.
+func TestMultiAdapterRoutesObserverCallsOnThePrefix(t *testing.T) {
+	obs := &observingAdapter{fakeAdapter: *newFakeAdapter()}
+	m := newTestMux(t, map[string]Adapter{"discord": newFakeAdapter(), "console": obs})
+	m.TaskStarted("discord:g1/c1", "t1")
+	m.TaskStarted("noprefix", "t2")
+	m.TaskStarted("console:tab-1", "t3")
+	if len(obs.started) != 1 || obs.started[0] != "console:tab-1" {
+		t.Errorf("console observer saw %v, want only console:tab-1", obs.started)
 	}
 }
 

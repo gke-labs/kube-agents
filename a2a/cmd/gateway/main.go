@@ -80,8 +80,10 @@ func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats
 // than inside it. The order matters. The gateway finds the door's
 // ProbeSink, TaskObserver and InboundObserver by type assertion on the top
 // of the stack, and the side door implements them for exactly that reason
-// (sidedoor.go); MultiAdapter implements none of them, and its prefix
-// dispatch has no key for an inject: conversation.
+// (sidedoor.go). MultiAdapter has no ProbeSink or InboundObserver and its
+// prefix dispatch has no key for an inject: conversation. It does pass
+// TaskObserver and SessionLookupSink on to the chat backend, which is how
+// the Slack adapter below it learns its session threads.
 func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, door *gateway.InjectAdapter, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
 	chat, err := buildAdapters(cfg, primary, natsOpts, log)
 	if err != nil {

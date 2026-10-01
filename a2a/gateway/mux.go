@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
@@ -176,4 +178,55 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
 	return m.byPrefix[m.primary].OpenDirect(userID)
+}
+
+// The gateway finds TaskObserver and SessionLookupSink by type assertion on
+// the top of the adapter stack, and with a real chat backend the mux is that
+// top (or the primary under the inject door, which asserts on it in turn).
+// So the mux implements both unconditionally and passes each call on: the
+// observer calls to the backend that owns the conversation's prefix, when it
+// implements TaskObserver, and the session lookup to every backend that
+// implements SessionLookupSink. A backend that implements neither is told
+// nothing, as it would be alone. The Slack adapter is the one that needs
+// both: without them it never learns which threads are sessions and drops
+// every unmentioned reply.
+func (m *MultiAdapter) observerFor(conversation string) (TaskObserver, bool) {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return nil, false
+	}
+	observer, ok := a.(TaskObserver)
+	return observer, ok
+}
+
+func (m *MultiAdapter) TaskStarted(conversation, taskID string) {
+	if observer, ok := m.observerFor(conversation); ok {
+		observer.TaskStarted(conversation, taskID)
+	}
+}
+
+func (m *MultiAdapter) TaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	if observer, ok := m.observerFor(conversation); ok {
+		observer.TaskTerminal(conversation, taskID, state, source, reason)
+	}
+}
+
+func (m *MultiAdapter) TaskAccepted(conversation, taskID string) {
+	if observer, ok := m.observerFor(conversation); ok {
+		observer.TaskAccepted(conversation, taskID)
+	}
+}
+
+func (m *MultiAdapter) CancelPublished(conversation, taskID string) {
+	if observer, ok := m.observerFor(conversation); ok {
+		observer.CancelPublished(conversation, taskID)
+	}
+}
+
+func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(SessionLookupSink); ok {
+			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
 }
