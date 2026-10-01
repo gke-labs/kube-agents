@@ -1046,6 +1046,28 @@ def test_tool_called_rejects_empty_agent_pattern():
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent="", scope="workers")
 
 
+@pytest.mark.parametrize("pattern", [".*", "platform|", "(cluster-.+)?", "^$"])
+def test_tool_called_rejects_empty_matching_agent_pattern(pattern):
+    with pytest.raises(ValidationError, match="matches empty string"):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], agent=pattern, scope="workers")
+
+
+def test_tool_called_all_scope_agent_filter_ignores_untagged_router_entries():
+    transcript.set("done", _WORKER_TAGGED)
+    # kanban_create was called by the router (untagged), but NOT by agent 'platform'.
+    # Under scope: all with agent: platform, it must not count the router turn.
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_create"], scope="all", agent="platform"
+    ).verify(5.0)
+    assert res.status == "fail" and res.raw == {"matching_calls": 0}
+
+    # kanban_complete was called by agent 'platform'. It passes.
+    res_platform = ToolCalledVerifier(
+        type="tool_called", tool_names=["kanban_complete"], scope="all", agent="platform"
+    ).verify(5.0)
+    assert res_platform.status == "pass" and res_platform.raw == {"matching_calls": 1}
+
+
 def test_tool_called_rejects_agent_filter_under_router_scope():
     with pytest.raises(ValidationError):
         ToolCalledVerifier(

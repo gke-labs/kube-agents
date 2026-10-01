@@ -335,7 +335,12 @@ class ToolCalledVerifier(BaseVerifier):
         if pattern is not None:
             if not pattern:
                 raise ValueError("agent selector pattern cannot be empty")
-            re.compile(pattern)
+            compiled = re.compile(pattern)
+            if compiled.fullmatch(""):
+                raise ValueError(
+                    f"agent selector pattern {pattern!r} matches empty string "
+                    "(router entries have no agent tag)"
+                )
         return pattern
 
     @model_validator(mode="after")
@@ -373,7 +378,7 @@ class ToolCalledVerifier(BaseVerifier):
             entries = [
                 entry
                 for entry in entries
-                if re.fullmatch(self.agent, entry.get("agent") or "")
+                if entry.get("agent") and re.fullmatch(self.agent, entry["agent"])
             ]
         wanted = set(self.tool_names)
         calls = [

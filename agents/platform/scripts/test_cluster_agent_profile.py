@@ -956,6 +956,14 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "nice python3 -c 'import cluster_agent_profile'",
             "'/opt/hermes/.venv/bin/python3' -c 'import cluster_agent_profile'",
             "$PY -c 'import cluster_agent_profile'",
+            # Wrappers with arbitrary flags, long options, and compound commands
+            "uv run python3 -m cluster_agent_profile list",
+            "command python3 -m cluster_agent_profile",
+            "stdbuf -oL python3 -c 'import cluster_agent_profile'",
+            "timeout --foreground 60 python3 -m cluster_agent_profile",
+            "sudo -u hermes python3 -m cluster_agent_profile",
+            "uv run python3 -m kanban_notify_propagate",
+            "sudo -u hermes python3 -c 'import kanban_notify_propagate'",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1032,6 +1040,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "cluster_agent_profile is stubbed here" >> notes.md\nkubectl get deploy -A -o json | python3 -m json.tool',
             "python3 - <<'EOF'\nimport json\nEOF\ngrep cluster_agent_profile README.md",
             "cat <<'EOF' | python3\nimport json\nEOF\ngrep cluster_agent_profile README.md",
+            # Quoted shell delimiters inside arguments must not be treated as command boundaries
+            'echo "stub refused; python3 -m cluster_agent_profile fails" >> notes.md',
+            "echo 'stub refused; python3 -m cluster_agent_profile fails' >> notes.md",
+            'echo "stub refused & python3 -m cluster_agent_profile fails" >> notes.md',
+            'echo "stub refused | python3 -m cluster_agent_profile fails" >> notes.md',
+            'echo "stub refused; python3 -c \'import cluster_agent_profile\' fails" >> notes.md',
+            'echo "stub refused; python3 -m kanban_notify_propagate fails" >> notes.md',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
