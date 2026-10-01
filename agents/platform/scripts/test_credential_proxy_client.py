@@ -1273,34 +1273,24 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         # Exit 126 was annotated with:
         #   "Exit 126: the file was found but is not executable — `chmod +x` it..."
         # Exit 77 must not trigger any runtime hint on the refusal output.
-        terminal_hints = None
         try:
             import importlib
             terminal_hints = importlib.import_module("tools.terminal_hints")
         except ImportError:
-            try:
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(
-                    "terminal_hints",
-                    "/home/kyber/.hermes/hermes-agent/tools/terminal_hints.py",
-                )
-                if spec and spec.loader:
-                    terminal_hints = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(terminal_hints)
-            except Exception:
-                pass
-
-        if terminal_hints is not None:
-            output = "Command blocked for security reasons.\npolicy rule: kubernetes.read-only\n"
-            hint = terminal_hints.annotate_failure("kubectl delete pod mypod", 77, output)
-            self.assertIsNone(
-                hint,
-                f"Exit 77 must not produce an execution/file-permission hint, got: {hint!r}",
+            raise unittest.SkipTest(
+                "tools.terminal_hints is provided by the hermes-agent runtime and not vendored in kube-agents"
             )
-            # Verify sabotage: 126 WOULD have produced the misleading hint
-            hint_126 = terminal_hints.annotate_failure("kubectl delete pod mypod", 126, output)
-            self.assertIsNotNone(hint_126)
-            self.assertIn("chmod +x", hint_126)
+
+        output = "Command blocked for security reasons.\npolicy rule: kubernetes.read-only\n"
+        hint = terminal_hints.annotate_failure("kubectl delete pod mypod", 77, output)
+        self.assertIsNone(
+            hint,
+            f"Exit 77 must not produce an execution/file-permission hint, got: {hint!r}",
+        )
+        # Verify sabotage: 126 WOULD have produced the misleading hint
+        hint_126 = terminal_hints.annotate_failure("kubectl delete pod mypod", 126, output)
+        self.assertIsNotNone(hint_126)
+        self.assertIn("chmod +x", hint_126)
 
 
 class TestConnectTimeout(unittest.TestCase):
