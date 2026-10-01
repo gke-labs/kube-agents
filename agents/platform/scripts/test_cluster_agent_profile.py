@@ -927,6 +927,20 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 -c $'from cluster_agent_profile import list_profiles'",
             "python3 -c $'import kanban_notify_propagate'",
             "python3 -c 'import '\"kanban_notify_propagate\"",
+            # Prefixed interpreter invocations (env vars, wrappers, interpreter paths)
+            "PYTHONPATH=/opt/data/scripts python3 -m cluster_agent_profile list",
+            "PYTHONPATH=/opt/data/scripts python3 -m kanban_notify_propagate",
+            "/opt/hermes/.venv/bin/python3 -m cluster_agent_profile",
+            "/usr/bin/env python3 -m cluster_agent_profile",
+            "env python3 -c 'import cluster_agent_profile'",
+            "env python3 -c 'import kanban_notify_propagate'",
+            "exec python3 -m cluster_agent_profile",
+            "time python3 -m cluster_agent_profile",
+            "nohup python3 -m cluster_agent_profile",
+            "timeout 60 python3 -m cluster_agent_profile",
+            "timeout 60 python3 -c 'import cluster_agent_profile'",
+            "PYTHONPATH=/opt/data/scripts /opt/hermes/.venv/bin/python3 -m cluster_agent_profile",
+            "env FOO=bar timeout 10 python3 -m cluster_agent_profile",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):

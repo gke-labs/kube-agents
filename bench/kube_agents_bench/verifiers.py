@@ -340,14 +340,11 @@ class ToolCalledVerifier(BaseVerifier):
 
     @model_validator(mode="after")
     def _validate_agent_scope(self) -> ToolCalledVerifier:
-        if self.agent is not None:
-            if not self.agent:
-                raise ValueError("agent selector pattern cannot be empty")
-            if self.scope == "router":
-                raise ValueError(
-                    "agent selector cannot be used with scope: router "
-                    "(router trajectory entries have no agent tag)"
-                )
+        if self.agent is not None and self.scope == "router":
+            raise ValueError(
+                "agent selector cannot be used with scope: router "
+                "(router trajectory entries have no agent tag)"
+            )
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
