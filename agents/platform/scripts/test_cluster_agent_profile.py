@@ -1074,6 +1074,25 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'python3 "-c" "import cluster_agent_profile"',
             'python3 \'-c\' "import kanban_notify_propagate"',
             'python3 "-c" "import kanban_notify_propagate"',
+            # Backslash-split module names, variable dynamic imports, and alternative interpreters (Thread 2)
+            r"python3 -m cluster_agent_pro\file list",
+            r"python3 -m \cluster_agent_profile list",
+            r"python3 -m kanban_notify_propa\gate list",
+            r"python3 -m \kanban_notify_propagate list",
+            "python3 -c \"m=\x27cluster_agent_profile\x27; __import__(m).main()\"",
+            "python3 -c \x27m=\"cluster_agent_profile\"; __import__(m).main()\x27",
+            "python3 -c \"m=\x27kanban_notify_propagate\x27; __import__(m).main()\"",
+            "python3 -c \x27m=\"kanban_notify_propagate\"; __import__(m).main()\x27",
+            "pypy3 -m cluster_agent_profile",
+            "pypy3 -m cluster_agent_profile list",
+            "pypy3 -m kanban_notify_propagate",
+            "pypy3 -m kanban_notify_propagate list",
+            "pypy -m cluster_agent_profile",
+            "pypy -m kanban_notify_propagate",
+            'pypy3 -c "import cluster_agent_profile"',
+            'pypy3 -c "import kanban_notify_propagate"',
+            "pypy3 -c \"m=\x27cluster_agent_profile\x27; __import__(m).main()\"",
+            "pypy3 -c \"m=\x27kanban_notify_propagate\x27; __import__(m).main()\"",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
