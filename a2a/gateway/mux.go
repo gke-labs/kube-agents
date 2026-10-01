@@ -2,9 +2,22 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	// A chat backend that stops is run again after a delay that doubles
+	// from muxRestartBase up to muxRestartMax. A run that lasted at least
+	// muxRestartMax before stopping starts the doubling over, so a backend
+	// that drops once a day comes back in a second, and one with a bad
+	// token settles into one attempt a minute.
+	muxRestartBase = time.Second
+	muxRestartMax  = time.Minute
 )
 
 // MultiAdapter presents several backends to the gateway as one Adapter.
@@ -12,22 +25,43 @@ import (
 // console:…), so every per-conversation operation dispatches on the prefix.
 // OpenDirect takes a user id with no prefix and goes to the primary backend,
 // the one the process was configured for.
+//
+// One backend is essential: when it stops, Run returns and the process
+// restarts. Every other backend is contained: when it stops, Run logs it and
+// runs it again after a backoff while the rest keep going. The console is
+// the essential one, because it is the way in when chat is broken, and a
+// chat backend that cannot connect (a bad token, a relay that is down) must
+// not take it down with it.
 type MultiAdapter struct {
-	primary  string
-	byPrefix map[string]Adapter
+	primary   string
+	essential string
+	byPrefix  map[string]Adapter
+	log       *slog.Logger
+
+	restartBase, restartMax time.Duration
 }
 
-// NewMultiAdapter builds the mux. primary must be a key of byPrefix.
-func NewMultiAdapter(primary string, byPrefix map[string]Adapter) (*MultiAdapter, error) {
+// NewMultiAdapter builds the mux. primary and essential must both be keys of
+// byPrefix.
+func NewMultiAdapter(primary, essential string, byPrefix map[string]Adapter, log *slog.Logger) (*MultiAdapter, error) {
 	if _, ok := byPrefix[primary]; !ok {
 		return nil, fmt.Errorf("multi adapter: primary backend %q is not configured", primary)
+	}
+	if _, ok := byPrefix[essential]; !ok {
+		return nil, fmt.Errorf("multi adapter: essential backend %q is not configured", essential)
 	}
 	for name, a := range byPrefix {
 		if a == nil {
 			return nil, fmt.Errorf("multi adapter: backend %q is nil", name)
 		}
 	}
-	return &MultiAdapter{primary: primary, byPrefix: byPrefix}, nil
+	if log == nil {
+		log = slog.Default()
+	}
+	return &MultiAdapter{
+		primary: primary, essential: essential, byPrefix: byPrefix, log: log,
+		restartBase: muxRestartBase, restartMax: muxRestartMax,
+	}, nil
 }
 
 // backendPrefix returns the backend name a conversation id carries, or "".
@@ -48,34 +82,71 @@ func (m *MultiAdapter) pick(conversation string) (Adapter, error) {
 	return a, nil
 }
 
-// Run runs every backend. The first to return an error ends the others via
-// ctx and that error is returned: a gateway with one dead backend restarts
-// rather than running half-deaf.
+// Run runs every backend until ctx is done or the essential backend stops.
+// It returns nil on ctx, and otherwise the essential backend's error. A
+// backend that returns nil while ctx is still live has stopped all the same,
+// and is treated as a failure: an essential one that returned nil would
+// otherwise leave the process running with its door shut.
 func (m *MultiAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	errs := make(chan error, len(m.byPrefix))
+	essentialDone := make(chan error, 1)
 	var wg sync.WaitGroup
 	for name, a := range m.byPrefix {
 		wg.Add(1)
 		go func(name string, a Adapter) {
 			defer wg.Done()
-			if err := a.Run(ctx, handler); err != nil {
-				errs <- fmt.Errorf("%s adapter: %w", name, err)
+			if name == m.essential {
+				essentialDone <- stopped(ctx, name, a.Run(ctx, handler))
 				return
 			}
-			errs <- nil
+			m.runContained(ctx, name, a, handler)
 		}(name, a)
 	}
-	var first error
-	for range m.byPrefix {
-		if err := <-errs; err != nil && first == nil {
-			first = err
-			cancel()
-		}
+	var err error
+	select {
+	case <-ctx.Done():
+	case err = <-essentialDone:
 	}
+	cancel()
 	wg.Wait()
-	return first
+	return err
+}
+
+// stopped names why a backend's Run returned: nil if ctx ended it, its own
+// error otherwise, and an error of our own if it returned nil early.
+func stopped(ctx context.Context, name string, err error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err == nil {
+		err = errors.New("stopped while running")
+	}
+	return fmt.Errorf("%s adapter: %w", name, err)
+}
+
+// runContained runs one non-essential backend until ctx is done, running it
+// again after a backoff whenever it stops.
+func (m *MultiAdapter) runContained(ctx context.Context, name string, a Adapter, handler func(InboundMessage)) {
+	delay := m.restartBase
+	for {
+		start := time.Now()
+		err := stopped(ctx, name, a.Run(ctx, handler))
+		if err == nil {
+			return
+		}
+		if time.Since(start) >= m.restartMax {
+			delay = m.restartBase
+		}
+		m.log.Error(fmt.Sprintf("%s backend stopped; the %s backend stays up and %s retries", name, m.essential, name),
+			"err", err, "retryIn", delay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, m.restartMax)
+	}
 }
 
 func (m *MultiAdapter) Post(conversation, text string) (string, error) {

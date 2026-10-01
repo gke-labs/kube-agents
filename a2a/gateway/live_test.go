@@ -91,7 +91,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 		}
 		defer console.Close()
 		inProcConsole = console
-		gwAdapter, err = NewMultiAdapter("discord", map[string]Adapter{"discord": adapter, "console": console})
+		gwAdapter, err = NewMultiAdapter("discord", "console", map[string]Adapter{"discord": adapter, "console": console}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

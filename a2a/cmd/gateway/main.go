@@ -69,10 +69,10 @@ func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats
 	if primary == nil {
 		return console, nil
 	}
-	return gateway.NewMultiAdapter(cfg.Backend(), map[string]gateway.Adapter{
+	return gateway.NewMultiAdapter(cfg.Backend(), "console", map[string]gateway.Adapter{
 		cfg.Backend(): primary,
 		"console":     console,
-	})
+	}, log)
 }
 
 // composeAdapters is the whole stack the gateway drives: the chat backends

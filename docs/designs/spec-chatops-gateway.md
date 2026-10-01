@@ -1127,6 +1127,13 @@ type assertion on the top of the adapter stack, and the mux implements none of t
 console runs whenever the gateway runs, so an inject-only gateway also exits when the console
 adapter does.
 
+**The console outlives the chat backend.** The console is the way in when chat is broken, so
+the two do not share a fate. When the console adapter stops, the gateway exits and restarts.
+When the chat backend stops (a bad token, a relay that is down, a Socket Mode give-up), the mux
+logs it at error and runs that backend again after a delay that doubles from one second to a
+one-minute cap, while the console keeps serving. A backend that returns without an error while
+the gateway is still running has stopped all the same and is handled the same way.
+
 **Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
 naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a
 frame whose `kind` is anything but `text`. A NATS render that predates the console identity,
