@@ -224,6 +224,12 @@ def test_a_short_answer_shaped_like_an_ack_is_kept():
         "checking that cluster found 3 stale nodes.",
         "reviewing that rollout shows 4 restarts.",
         "checking which pods were evicted is done.",
+        "scaling done.",
+        "looking stable.",
+        "provisioning complete.",
+        "upgrading ready.",
+        "restarting clears alerts.",
+        "draining frees capacity.",
     ):
         assert substantive_output({"output": report}) == report, report
 

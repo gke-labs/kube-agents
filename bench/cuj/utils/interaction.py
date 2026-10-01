@@ -116,7 +116,8 @@ _ACK_VERBS = frozenset(
 _ACK_VERDICTS = frozenset(
     {
         "good", "fine", "great", "healthy", "ok", "okay", "well", "bad", "better",
-        "worse", "normal", "clean",
+        "worse", "normal", "clean", "done", "complete", "ready", "stable",
+        "unstable", "broken", "stuck", "slow",
     }
 )
 #: Finite verbs and auxiliaries an answer's clause carries and a target does
@@ -133,7 +134,9 @@ _ACK_FINDING_VERBS = frozenset(
         "made", "helps", "became", "becomes", "needs", "requires", "costs",
         "causes", "fixes", "breaks", "fails", "works", "succeeds", "remains",
         "stays", "means", "lacks", "uses", "restores", "evicts", "kills",
-        "crashes", "exceeds", "hits",
+        "crashes", "exceeds", "hits", "clears", "frees", "resolves", "solves",
+        "improves", "reduces", "increases", "drops", "triggers", "stops",
+        "finishes", "passes",
     }
 )
 _ACK_CLAUSE_OPENERS = frozenset(
