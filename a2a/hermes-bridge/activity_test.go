@@ -573,9 +573,9 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // twin, while a name that merely starts with the word (secretName,
 // tokenizer) still ships.
 func TestRedactInput_CamelCaseKeys(t *testing.T) {
-	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x"}`
+	in := `{"accessToken":"eyJhbGciOi","clientSecret":"GOCSPX-abc","dbPassword":"hunter1","authToken":"t1","xApiKey":"k1","gcpAPIKey":"k2","awsSecretAccessKey":"w1","refreshTokens":["r1"],"accessTokenExpiry":3600,"secretName":"db-creds","tokenizer":"cl100k","apiKey":"k3","credentialsPath":"/x","AWSSecretAccessKey":"w2","DBPassword":"hunter9","IDToken":"i1","TLSPassphrase":"p9"}`
 	out := string(redactInput("http_request", json.RawMessage(in)))
-	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`} {
+	for _, leaked := range []string{"eyJhbGciOi", "GOCSPX-abc", "hunter1", `"t1"`, `"k1"`, `"k2"`, `"w1"`, `"r1"`, `"k3"`, `"w2"`, "hunter9", `"i1"`, `"p9"`} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -603,7 +603,7 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
 	}
-	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`} {
+	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`, "https://y", "https://z"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("text after the secret was lost: %q missing in %s", kept, out)
 		}
@@ -618,16 +618,17 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 // The scheme token is case-insensitive, and a credential can arrive under a
 // key outside the first list of words: a private key, a passphrase.
 func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
-	in := `{"command": "curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
+	in := `{"command": "curl -H 'authorization: basic dXNlcjpodW50ZXIy' https://x; curl -sS https://api.example.com/v1/clusters -H 'Authorization: Basic cm9vdDp0b29y' -u admin:pw; ssh-keygen -N 'my long pass' ; tool --private-key /dev/stdin --passphrase hunter7; echo ssh_key=AAAAB3NzaC1yc2E", "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE", "passphrase": "p1", "sshKey": "k1", "signing_key_id": "s1", "privateKeyPath": "/x", "basic": "basic refactoring"}`
 	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "BEGIN PRIVATE KEY", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
+	for _, leaked := range []string{"dXNlcjpodW50ZXIy", "cm9vdDp0b29y", "admin:pw", "BEGIN PRIVATE KEY", `"p1"`, `"k1"`, `"s1"`, "hunter7", "AAAAB3NzaC1yc2E", "/dev/stdin"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
 	}
 	// A short word after "basic" is not a credential, and a camelCase key
 	// that starts with the word is a name, as for secretName.
-	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`} {
+	// The curl command's URL and method survive its credential.
+	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("expected %q in %s", kept, out)
 		}
@@ -639,7 +640,7 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 // tool still sees it, and the wrapper is not the whole-input stand-in.
 func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	big := strings.Repeat("x", activityInputCap)
-	in := `{"calls":[{"name":"kanban_create","arguments":{"title":"a","body":"` + big + `","token":"s1"}},{"name":"kanban_comment","arguments":{"body":"` + big + `"}},{"name":"kanban_list"}]}`
+	in := `{"calls":[{"name":"kanban_create","arguments":{"title":"a","body":"` + big + `","token":"s1"}},{"name":"kanban_comment","arguments":{"body":"` + big + `"}},{"name":"kanban_list"},{"name":"kanban_get","arguments":{"id":7}}]}`
 	out := redactInput(hermesToolCallWrapper, json.RawMessage(in))
 	if len(out) > activityInputCap {
 		t.Fatalf("wrapper still over the cap: %d bytes", len(out))
@@ -654,8 +655,13 @@ func TestRedactInput_WrapperOverTheCapKeepsNestedNames(t *testing.T) {
 	if err := json.Unmarshal(out, &v); err != nil || v.Truncated != nil {
 		t.Fatalf("wrapper became the whole stand-in: %s (%v)", out, err)
 	}
-	if len(v.Calls) != 3 || v.Calls[0].Name != "kanban_create" || v.Calls[1].Name != "kanban_comment" || v.Calls[2].Name != "kanban_list" {
+	if len(v.Calls) != 4 || v.Calls[0].Name != "kanban_create" || v.Calls[1].Name != "kanban_comment" || v.Calls[2].Name != "kanban_list" || v.Calls[3].Name != "kanban_get" {
 		t.Fatalf("nested names lost: %s", out)
+	}
+	// A small sibling of a large call stays verbatim: no stand-in that is
+	// larger than what it replaces and says truncated of nothing.
+	if v.Calls[3].Args["id"] != float64(7) || v.Calls[3].Args["truncated"] != nil {
+		t.Fatalf("small nested arguments were replaced: %s", out)
 	}
 	for i := 0; i < 2; i++ {
 		if v.Calls[i].Args["truncated"] != true || v.Calls[i].Args["bytes"] == nil {
@@ -782,12 +788,21 @@ func TestActivity_TraceLeavesTheHeartbeatItsReserve(t *testing.T) {
 	if beats != 2 {
 		t.Fatalf("heartbeats = %d, want the reserve (2)", beats)
 	}
+	// And the other way: a heartbeat that spent its share took nothing from
+	// the trace's.
+	b, _ := newActivityState(false)
+	for i := 0; i < 5; i++ {
+		b.heartbeatUnderBudget()
+	}
+	if !b.underBudget() || !b.underBudget() || b.underBudget() {
+		t.Fatalf("the trace's share moved with the heartbeat's spend: published=%d dropped=%d", b.published, b.dropped)
+	}
 }
 
 func TestActivity_HeartbeatSharesTheBudget(t *testing.T) {
-	prev := activityEntryBudget
-	activityEntryBudget = 2
-	t.Cleanup(func() { activityEntryBudget = prev })
+	prev, prevReserve := activityEntryBudget, activityHeartbeatReserve
+	activityEntryBudget, activityHeartbeatReserve = 2, 2
+	t.Cleanup(func() { activityEntryBudget, activityHeartbeatReserve = prev, prevReserve })
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 time.sleep(1.0)
@@ -882,6 +897,21 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 		if _, err := os.Stat(kept); err != nil {
 			t.Fatalf("the sweep took %s, which is not a task scope: %v", kept, err)
 		}
+	}
+	// With the door closed the sweep still runs: a fresh leftover goes.
+	again := filepath.Join(scratch, "task-again")
+	if err := os.MkdirAll(again, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(again, managedConfigFile), []byte("model: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	closed := &Bridge{cfg: Config{ScratchDir: scratch, ActivityListen: "", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	if err := closed.listenActivity(); err != nil {
+		t.Fatalf("listenActivity (door closed): %v", err)
+	}
+	if _, err := os.Stat(again); !os.IsNotExist(err) {
+		t.Fatalf("a door-closed start left a scope behind: stat err = %v", err)
 	}
 	// A directory still has to be a directory to go: a file named like a
 	// task id is not a scope the bridge wrote.

@@ -111,10 +111,10 @@ const (
 	// hermesToolCallWrapper is hermes's batching tool: one call whose input
 	// is {"calls":[{"name":...,"arguments":{...}},...]}. The verifier
 	// unwraps the nested names, so an over-cap wrapper is capped per nested
-	// call - each arguments object becomes its own stand-in with
-	// activityInputCallHead of text - and the names survive; only a wrapper
-	// still over the cap with every head dropped falls back to the whole
-	// stand-in.
+	// call - each arguments object over activityInputCallHead becomes its
+	// own stand-in with that much text, smaller ones stay - and the names
+	// survive; only a wrapper still over the cap with every head dropped
+	// falls back to the whole stand-in.
 	hermesToolCallWrapper = "tool_call"
 	wrapperCallsKey       = "calls"
 	wrapperCallArgsKey    = "arguments"
@@ -208,8 +208,9 @@ var (
 // the sink that writes files does not lean on that.
 var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
-// scopeDirPattern is the shape of a scope the start-time sweep may remove:
-// the gateway's task-<hex> (tests use task-<word>), never a bare word.
+// scopeDirPattern is the shape of a scope the start-time sweep may remove
+// and so the only shape childManagedScope writes: the gateway's task-<hex>
+// (tests use task-<word>), never a bare word.
 var scopeDirPattern = regexp.MustCompile(`^task-[A-Za-z0-9_-]{1,123}$`)
 
 var (
@@ -221,10 +222,11 @@ var (
 	// A count or a path that ends in the word (max_tokens, credentials_file,
 	// accessTokenExpiry) is blanked too; that is the accepted price of
 	// catching SECRET_KEY. The camelCase form is case-sensitive: the word
-	// starts a component when a lowercase letter or digit precedes its
-	// capital, and ends one at the end, a separator or the next capital.
+	// starts a component when any letter or digit precedes its capital (so
+	// an acronym prefix counts: AWSSecretAccessKey, DBPassword, IDToken), and
+	// ends one at the end, a separator or the next capital.
 	redactedKeyPattern      = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:$|[_.-])`)
-	redactedCamelKeyPattern = regexp.MustCompile(`[a-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])`)
+	redactedCamelKeyPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Credential)s?(?:$|[_.-]|[A-Z])`)
 	redactedValuePatterns   = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}`),
 		regexp.MustCompile(`ya29\.[A-Za-z0-9._-]{20,}`),
@@ -234,10 +236,10 @@ var (
 		// and long enough to be a credential, so "basic refactoring" in a
 		// commit message is not one: the word after it is too short.
 		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
-		// curl's -u user:password, on a curl command: "date -u 12:30" and
-		// "sort -u a:b" are not. A quoted value runs to its closing quote and
-		// the attached form (-uuser:pass) is read too.
-		regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`),
+		// The Basic header by its own key, however short the credential:
+		// root:toor encodes to twelve characters, under the floor the bare
+		// form below needs to stay out of prose.
+		regexp.MustCompile(`(?i)authorization["']?\s*[:=]\s*["']?basic\s+[A-Za-z0-9+/]+={0,2}`),
 		// key=value / key: value / "key": "value", where a secret word is a
 		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
 		// quoted value runs to its closing quote, spaces included, so a
@@ -248,6 +250,15 @@ var (
 		// a quoted value runs to its closing quote as above.
 		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
 	}
+)
+
+// curl's -u user:password: the command is found whole (so "date -u 12:30"
+// and "sort -u a:b" are not read), and only the credential inside it is
+// replaced, the URL and headers around it kept. A quoted value runs to its
+// closing quote and the attached form (-uuser:pass) is read too.
+var (
+	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*`)
+	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`)
 )
 
 // ActivityEntry is one data part of the activity artifact: one tool
@@ -294,16 +305,17 @@ type activityState struct {
 	// so the hex string is the key, not the bytes it spells.
 	key string
 
-	mu        sync.Mutex
-	open      map[string]ActivityEntry // calls started and not yet ended
-	openOrder []string                 // their ids, in start order
-	seen      map[string]struct{}      // delivery ids, so a hermes retry is one call
-	calls     int
-	published int // trace and heartbeat parts sent; the budget counts these
-	dropped   int // calls past the budget, reported once at the terminal
-	lastTool  string
-	startedAt time.Time
-	appended  map[string]bool // artifact name -> a first part went out
+	mu         sync.Mutex
+	open       map[string]ActivityEntry // calls started and not yet ended
+	openOrder  []string                 // their ids, in start order
+	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
+	calls      int
+	published  int // trace parts sent, against the budget less the reserve
+	heartbeats int // progress parts sent, against the reserve
+	dropped    int // calls past the trace's share, reported once at the terminal
+	lastTool   string
+	startedAt  time.Time
+	appended   map[string]bool // artifact name -> a first part went out
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -470,14 +482,15 @@ func (a *activityState) underBudget() bool {
 	return false
 }
 
-// heartbeatUnderBudget is underBudget for a progress part, against the whole
-// budget: the reserve is what the trace leaves it. Past that the heartbeat
-// stops, uncounted - the marker counts calls.
+// heartbeatUnderBudget is underBudget for a progress part, against the
+// heartbeat's own share: the reserve, and nothing of the trace's, so a short
+// interval under a long deadline silences the heartbeat and never the trace.
+// Past it the heartbeat stops, uncounted - the marker counts calls.
 func (a *activityState) heartbeatUnderBudget() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.published < activityEntryBudget {
-		a.published++
+	if a.heartbeats < activityHeartbeatReserve {
+		a.heartbeats++
 		return true
 	}
 	return false
@@ -595,9 +608,14 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 		}
 		args = append(args, nested{call: call, raw: raw})
 	}
+	// Only an arguments object that is itself large becomes a stand-in; a
+	// small sibling stays verbatim, since a stand-in is larger than it and
+	// says truncated of nothing.
 	for _, headLen := range []int{activityInputCallHead, 0} {
 		for _, n := range args {
-			n.call[wrapperCallArgsKey] = truncatedStandIn(n.raw, headLen)
+			if len(n.raw) > activityInputCallHead {
+				n.call[wrapperCallArgsKey] = truncatedStandIn(n.raw, headLen)
+			}
 		}
 		out, err := json.Marshal(m)
 		if err != nil {
@@ -630,6 +648,9 @@ func redactValue(v any) any {
 		for _, re := range redactedValuePatterns {
 			t = re.ReplaceAllString(t, redactedValue)
 		}
+		t = curlCommandPattern.ReplaceAllStringFunc(t, func(cmd string) string {
+			return curlUserPattern.ReplaceAllString(cmd, redactedValue)
+		})
 		return t
 	}
 	return v
@@ -644,6 +665,12 @@ func redactValue(v any) any {
 func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	if !taskIDPattern.MatchString(taskID) {
 		return "", fmt.Errorf("task id %q is not a path segment", taskID)
+	}
+	// The sweep reclaims only task--named scopes, so no other id gets one:
+	// a scope the writer makes and the sweeper never reads is a credential
+	// copy that outlives a hard kill.
+	if !scopeDirPattern.MatchString(taskID) {
+		return "", fmt.Errorf("task id %q is not a scope name the start-time sweep reclaims", taskID)
 	}
 	scratch, err := filepath.Abs(b.cfg.ScratchDir)
 	if err != nil {
@@ -736,14 +763,17 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 // anything else in it are left alone, since BRIDGE_SCRATCH_DIR is whatever
 // the manifest says and may name a mount the bridge does not own.
 func (b *Bridge) listenActivity() error {
-	if b.cfg.ActivityListen == "" {
-		return nil
-	}
+	// The sweep runs whether or not the door opens: a previous incarnation
+	// with the door open may have left a scope, and this one closing the
+	// door is not a reason to leave its credential copy behind.
 	if err := os.MkdirAll(b.cfg.ScratchDir, childScopeDirMode); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
 	if err := sweepTaskScopes(b.cfg.ScratchDir, b.cfg.Logger); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
+	}
+	if b.cfg.ActivityListen == "" {
+		return nil
 	}
 	ln, err := net.Listen("tcp", b.cfg.ActivityListen)
 	if err != nil {
