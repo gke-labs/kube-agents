@@ -1230,13 +1230,16 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         assert no_stubbed is not None
         forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
 
-        # Verify that commands with many short flags do not cause exponential backtracking (ReDoS)
+        # Verify that unquoted -c code arguments with long runs of backslash escapes,
+        # 10-key dictionary payloads with escaped quotes, wrapper chains, and commands with 50
+        # repeated short flags across option groups evaluate in under 50 ms (< 0.05s, observed ~0.011s),
+        # eliminating catastrophic backtracking (ReDoS) while providing headroom against CI timing jitter:
         flagged_cmds = [
             "python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "timeout --foreground 60 python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "env FOO=bar python3 " + " ".join(f"--flag{i}" for i in range(50)) + " script.py",
             # Verify double-quoted -c commands with backslash-escaped quotes and no whitespace do not backtrack
-            'python3 -c "print({' + ",".join(f'\\"k{i}\\":\\"v{i}\\"' for i in range(10)) + '})"',
+            'python3 -c "print({' + ",".join(f'\"k{i}\":\"v{i}\"' for i in range(10)) + '})"',
             # Verify wrapper-chain alternation does not backtrack exponentially (Thread 4)
             "env " * 26 + "x",
             # Verify unquoted -c code arguments with long runs of backslash escapes do not backtrack exponentially (Thread 3)
@@ -1253,8 +1256,8 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
                 self.assertFalse(res, f"unexpected match on {cmd!r} by pattern {i}")
                 self.assertLess(
                     elapsed,
-                    0.5,
-                    f"pattern {i} took too long ({elapsed:.4f}s) on {cmd!r} (catastrophic backtracking)",
+                    0.05,
+                    f"pattern {i} took too long ({elapsed:.4f}s) on {cmd!r} (expected < 0.05s, catastrophic backtracking)",
                 )
 
     def test_platform_checked_workload_existence_requires_mcp_tool(self):
