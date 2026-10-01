@@ -33,7 +33,7 @@ The SOP forbids the words "vulnerable", "unpatched", and "CVE" in its findings: 
 
 ### `fleet_wide_cost_analysis_sop.md`
 
-Fleet waste, weekly. Over-requested workloads (three `kubectl top` samples that must all agree), orphaned PersistentVolumes, unconsumed PVCs, unattached Compute Engine disks, idle reserved IPs, orphaned load-balancer resources, under-allocated node pools, the scale-down blockers pinning them, terminal-pod accumulation, and idle namespaces still holding billable objects.
+Fleet waste, weekly. Fourteen checks, run by a collector script the agent starts: over-requested, under-requested, unsized and idle workloads, judged against a week of Cloud Monitoring usage; orphaned PersistentVolumes, unconsumed PVCs, unattached Compute Engine disks, idle reserved IPs, orphaned load-balancer resources, under-allocated node pools, the scale-down blockers pinning them, terminal-pod accumulation, idle namespaces still holding billable objects, and Artifact Registry repositories with no cleanup policy.
 
 Findings are reported in **resource units — GiB, vCPU, node and object counts — never dollars.** There is no billing export to price against, and the SOP treats a fabricated figure as worse than no figure. No remediation it emits may delete a PV, PVC, namespace, disk, snapshot, or address. Invoked by the `fleet-wide-cost-analysis` watchdog.
 

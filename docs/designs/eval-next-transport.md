@@ -290,7 +290,8 @@ faults as well as the persona's. The reason rides as the terminal's status messa
 takes the token up to the next space, so `bus-publish-failed at working` reads as
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
-`spawn-failed` and `bridge-died-without-terminal-event` and the worker adapter's `worker-evicted`
+`spawn-failed`, `bridge-died-without-terminal-event` and `hermes-rate-limited` (a turn that gave
+up on the provider's rate limit or billing, Hermes's exit 75) and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
@@ -363,7 +364,7 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a sidecar declared on the CR
-through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds, CI-only. A
+through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
 with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
@@ -384,9 +385,10 @@ Dockerfiles: the platform-agent image plus the bridge binary, built in the same 
 the A2A images (a step of its own, after the platform image) and tagged per pull request into the
 pool project's registry,
 `FROM` the platform-agent image that build produced by the tag it just pushed and never a
-registry default, so the sidecar and the agent container it shares a pod with are one build;
-CI-only, outside `images.json`, with the exclusion stated in `hack/check-image-inventory.sh`
-and the bridge doc's provenance paragraph saying the same. `hack/ci-deploy.sh` under the flag
+registry default, so the sidecar and the agent container it shares a pod with are one build.
+The bridge was CI-only until the executor question was settled; the release workflow
+publishes it as `hermes-bridge`, on the same `FROM`-the-same-commit rule, and `images.json`
+carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deploy.sh` under the flag
 declares the sidecar on the CR through `spec.deployment.sidecars` once the bus is up (a bridge
 that starts before NATS resolves crash-loops the agent's pod), with that image, the bus URL and
 the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
@@ -623,9 +625,10 @@ owner, which executor answers `platform` and whether delegation becomes a child 
 were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
 reaches the operator (The CI flag). Whether the bridge image build lands in this repository, and
 the bridge look-ahead with it, was the A2A owner's and was answered on 2026-09-18 on
-gke-labs/kube-agents#1661: both yes, the build CI-only and `FROM` the same run's platform-agent
-image, outside `images.json` with the exclusion written into the inventory check, and the
-look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. What
+gke-labs/kube-agents#1661: both yes, the build `FROM` the same run's platform-agent image and
+the look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. The
+build was CI-only and outside `images.json` at first; with the executor settled (the bridge
+graduates) the release workflow publishes it and the inventory carries it. What
 remains is the eval crew's:
 
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat

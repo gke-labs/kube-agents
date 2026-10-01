@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
@@ -46,6 +47,15 @@ const (
 	messageIDHexWidth     = 8
 	contextIDHexWidth     = 12
 	correlationIDHexWidth = 12
+)
+
+// JetStream storage capacity error codes and patterns.
+const (
+	// jsErrCodeStorageResourcesExceeded is nats-server's JSStorageResourcesExceededErr (10047),
+	// returned when account or server storage resources are exhausted.
+	jsErrCodeStorageResourcesExceeded jetstream.ErrorCode = 10047
+	maxBytesErrPattern                                    = "max bytes"
+	maximumBytesErrPattern                                = "maximum bytes"
 )
 
 // gatewayParty is the gateway's own identity in from. Never the source of
@@ -106,8 +116,15 @@ type Gateway struct {
 	mu sync.Mutex
 	// sessionLocks serializes work per conversation; tasks serialize per
 	// session by construction (a message during a running task is a steer,
-	// never a second task).
-	sessionLocks map[string]*sync.Mutex
+	// never a second task). Entries are refcounted and pruned when idle.
+	sessionLocks map[string]*sessionLockEntry
+	// reapCursor tracks the scan position in session-state across reap passes,
+	// so a scan that hits reapPassTimeout resumes from where it left off
+	// rather than restarting from the beginning.
+	reapCursor string
+	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
+	// Returning false halts the reap scan early.
+	reapScanHook func(rec *SessionRecord) bool
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
@@ -252,6 +269,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.FirstEventGrace <= 0 {
 		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
+	if o.Config.SessionTTL <= 0 {
+		o.Config.SessionTTL = defaultSessionTTL
+	}
 	g := &Gateway{
 		turnBudget:     turnTimeout,
 		cfg:            o.Config,
@@ -262,7 +282,7 @@ func New(o Options) (*Gateway, error) {
 		ps:             NewPseudonymizer(o.Config.AttributionSalt),
 		log:            log,
 		runCtx:         context.Background(),
-		sessionLocks:   map[string]*sync.Mutex{},
+		sessionLocks:   map[string]*sessionLockEntry{},
 		taskSessions:   map[string]string{},
 		relays:         map[string]*relayState{},
 		backend:        backend,
@@ -348,16 +368,50 @@ func (g *Gateway) Run(ctx context.Context) error {
 	return g.adapter.Run(ctx, func(msg InboundMessage) { g.inbox.enqueue(msg.Conversation, msg) })
 }
 
-// lockSession returns the per-conversation mutex, minting it on first use.
-func (g *Gateway) lockSession(key string) *sync.Mutex {
+type sessionLockEntry struct {
+	mu       sync.Mutex
+	refcount int
+}
+
+// sessionLockHandle pairs a session lock with its release hook, refcounting
+// the entry so idle locks are pruned from memory when no longer referenced.
+type sessionLockHandle struct {
+	g        *Gateway
+	key      string
+	entry    *sessionLockEntry
+	unlocked bool
+}
+
+func (h *sessionLockHandle) Lock() {
+	h.entry.mu.Lock()
+}
+
+func (h *sessionLockHandle) Unlock() {
+	if h.unlocked {
+		return
+	}
+	h.unlocked = true
+	h.entry.mu.Unlock()
+	h.g.mu.Lock()
+	h.entry.refcount--
+	if h.entry.refcount <= 0 {
+		delete(h.g.sessionLocks, h.key)
+	}
+	h.g.mu.Unlock()
+}
+
+// lockSession returns the per-conversation mutex handle, refcounting the entry
+// so idle locks are pruned from memory when no longer referenced.
+func (g *Gateway) lockSession(key string) *sessionLockHandle {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	l, ok := g.sessionLocks[key]
+	entry, ok := g.sessionLocks[key]
 	if !ok {
-		l = &sync.Mutex{}
-		g.sessionLocks[key] = l
+		entry = &sessionLockEntry{}
+		g.sessionLocks[key] = entry
 	}
-	return l
+	entry.refcount++
+	return &sessionLockHandle{g: g, key: key, entry: entry}
 }
 
 // handleInbound is one user turn: verify the sender, resolve the session,
@@ -494,7 +548,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	if rec == nil {
 		rec, err = g.mintSession(ctx, msg)
 		if err != nil {
-			g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			if isMaxBytes(err) {
+				g.log.Error("session mint failed: session-state bucket is full (max bytes reached)",
+					"conversation", msg.Conversation, "err", err)
+			} else {
+				g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			}
 			return
 		}
 	}
@@ -1119,10 +1178,47 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 		return nil, err
 	}
 	winner, gerr := g.reg.Get(ctx, msg.Conversation)
-	if gerr != nil || winner == nil {
-		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %v", gerr)
+	if gerr != nil {
+		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %w", gerr)
+	}
+	if winner == nil {
+		return nil, errors.New("lost the mint race but winner record not found")
 	}
 	return winner, nil
+}
+
+// isMaxBytes reports whether err represents a NATS JetStream max_bytes limit
+// or storage capacity refusal (e.g. JSStorageResourcesExceededErr, ErrMaxBytesExceeded,
+// or maximum bytes exceeded). It checks typed jetstream.APIError fields and the
+// innermost unwrapped root error to ensure conversation keys (which may embed arbitrary
+// digit sequences like Discord snowflakes) cannot trigger false positives.
+func isMaxBytes(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, jetstream.ErrMaxBytesExceeded) {
+		return true
+	}
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode == jsErrCodeStorageResourcesExceeded {
+			return true
+		}
+		desc := strings.ToLower(apiErr.Description)
+		if strings.Contains(desc, maxBytesErrPattern) || strings.Contains(desc, maximumBytesErrPattern) {
+			return true
+		}
+	}
+	root := err
+	for {
+		if unwrapped := errors.Unwrap(root); unwrapped != nil {
+			root = unwrapped
+		} else {
+			break
+		}
+	}
+	msg := strings.ToLower(root.Error())
+	return strings.Contains(msg, maxBytesErrPattern) || strings.Contains(msg, maximumBytesErrPattern)
 }
 
 // startTask mints the identifiers, publishes the submission, and posts the

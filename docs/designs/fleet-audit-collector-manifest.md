@@ -1,10 +1,12 @@
 # Fleet Audit — The Collector Manifest
 
-> **STATUS — design of record; the `finish` side is implemented, three collectors ship.**
+> **STATUS — design of record; the `finish` side is implemented, five collectors ship.**
 > `audit_report.py finish` accepts a manifest through `--manifest-file` and applies every rule in
 > §3. `agents/platform/skills/fleet-audit/scripts/fleet_drift.py` emits one for the
-> `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`, and
-> `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`;
+> `fleet-consistency-drift` stream, `patch_readiness.py` one for `security-patch-orchestrator`,
+> `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
+> `fleet_waste.py` one for `fleet-wide-cost-analysis`, and `fleet_stockout.py` one for
+> `stockout-prevention`;
 > each stream's SOP runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 
@@ -94,6 +96,7 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].commands[]`                    | **read**         | One record per check per target: the check slug, the literal command, its exit code. `rc == 0` is what makes a check "run" for the rules below. `duration_s` and `output_sha256` are carried, not read.                                                                                                                                                                              |
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                        |
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                            |
+| `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                   |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read by `finish`: the stream's SOP says whether the model copies it or re-judges it against fleet context. |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                     |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.       |
@@ -115,11 +118,13 @@ narrowed reads as a complete one and lets `finish` resolve every finding outside
 within the manifest and stable between runs, so a collector sweeping clusters names each one
 `<project>/<location>/<name>` — a GKE name is unique only inside one project and location, and a
 name qualified only where it collides today moves when the rest of the fleet changes, which is a
-finding announced resolved and refiled as new. The drift, patch and `collect.py` collectors do this, and their SOPs carry
+finding announced resolved and refiled as new. Every shipped collector does this, and its SOP carries
 the qualified form into `scope.clusters[].name`, which is the key §3.1 matches on. The qualification stops at the
 target name: a candidate's `object` names the bare resource, because the identity tuple
 already carries the qualified cluster and `_shorten_id` spends a duplicate on the segment it
-then truncates.
+then truncates. The exception is a project-scoped resource whose name is unique only per zone,
+region or location — a disk, address, forwarding rule, target pool, backend service or Artifact
+Registry repository, and stockout's reservation and quota — which reads `<Kind>/<location>:<name>`.
 
 ## 3. What `finish` does with it
 
@@ -150,6 +155,10 @@ before any `gh` call:
   inapplicable there, or the document's `checks_not_applicable` names a check the manifest ran to
   `rc == 0` without itself declaring inapplicable. Applicability is corroborated, never prohibited:
   a check the collector never reached still takes the model's judgement.
+- A target carries `clusters_listed` and its manifest entry does not carry the same value. The
+  marker takes the cluster kind out of the coverage count (§5), so a hand-written one would turn a
+  run that lost its clusters clean. `validate_findings` accepts it only on a `project/<id>` entry and
+  only as the literal `0` (a bool is rejected), and `finish` rejects it without `--manifest-file`.
 - A target's `checks_run` or `checks_not_applicable` names a check the manifest lists in that
   target's `checks_unevaluated`, or the manifest lists any there and the target carries no
   `limitations`. The check's own read failed, so it neither ran nor was found inapplicable; naming it
@@ -252,7 +261,7 @@ fleet-authored free text as `&lt;!--` (§3.3), so a run over a document whose te
 opener renders that text differently from main; none of the five recorded transcripts carries an
 opener in free text. A marker minted under another identity scheme is deliberately not this case:
 the stamp is refreshed only by the rewrite, so a scheme bump rewrites the body as it always has; the
-holds survive it by re-derivation from their rows (below), and only ids with no row are lost. And
+holds survive it by re-derivation from their rows (below), and only ids with no row, or whose object the bump re-spelled, are lost. And
 the set is capped at `MAX_HELD_IDS` in sorted id order — the ids are a monotone term in the marker
 that no SOP-side edit can shrink. An id past the cap leaves the marker for good: the ledger stops
 tracking it, it stays on each run's JSON line as an unpublished candidate while the collector flags
@@ -340,9 +349,15 @@ naming the bare cluster, so on the manifest path a row is also spelled with each
 qualify it — from the previous body's Scope table, or, for a cluster past its `MAX_SCOPE_ROWS`
 rows, from this run's manifest clusters — and the spelling the collector flags is used when it does
 not flag the bare one. A name two clusters share takes the one the collector flags, and the first by
-id when it flags both: either keeps the ledger open over a finding the collector reports. Only held ids with no row — the note and fourth tiers write none — are
-the residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
-naming their count. That residual is the cost of a
+id when it flags both: either keeps the ledger open over a finding the collector reports. Held ids with no row — the note and fourth tiers write none — are
+the counted residual: they leave the ledger unheld with the bump run's rewrite, and the run logs a warning
+naming their count. A bump that re-spells an object rather than a cluster name loses those rows the
+same way, because the re-derived id keeps the old object and matches nothing the collector emits:
+scheme 6 re-spells the stockout stream's quota (`Quota/<region>:<metric>`), autoscaler
+(`ScaleUpError/<message-id>`) and reservation (`Reservation/<zone>:<name>`) objects, and the cost
+stream's project-scoped disks, addresses, forwarding rules, target pools, backend services and
+repositories (`Disk/<zone>:<name>` and the like, since each name is unique only per location), which
+leave the ledger unheld on the bump run and are not in the warning's count. That residual is the cost of a
 bump, which is rare and operator-initiated.
 
 ### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_marked_findings`
@@ -420,10 +435,13 @@ Coverage is measured per target, not per stream: `audit_target_checks(audit_id, 
 roster subset a `scope.clusters` entry owes, chosen by the kind its name encodes (`project/<id>`, a
 `<project>/<region>/<subnet>` path, or a bare cluster name). A stream declares the partition in
 `AuditSpec.scopes`; an empty `scopes` measures every target against the whole roster, and a kind
-the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. No
-shipped roster declares `scopes` yet; the field, the per-target denominator in `coverage_gaps` and
-the scope table, and the test that the partition covers the roster exactly are in place for the
-first SOP that does.
+the run enumerated none of is reported as a stream-wide gap naming the checks it stranded. The cost
+and stockout streams declare a `cluster` and a `project` kind. A fleet that holds no cluster is not
+a run that lost them, so their collectors write `clusters_listed: 0` on a `project/<id>` entry whose
+`clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
+API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs
+carry it onto `scope.clusters`. The `cluster` kind's gap is lifted only when every `project/<id>`
+target carries it; §3.1 holds each copy to the manifest.
 
 ## 6. Testing
 

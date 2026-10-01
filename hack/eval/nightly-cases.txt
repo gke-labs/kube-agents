@@ -93,7 +93,7 @@
 # wider, realises ~2.4x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the thirteen additions since are priced inside its headroom. The first nights after this change measure it:
+# so the nineteen additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -115,8 +115,15 @@
 # nightly runs both files, so its matrix and its price do not change.
 # fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
 # fifty-three-case, 159-unit matrix, +3 units, and
-# platform-worker-refuses-shipped-skill-edit (the last entry below) forty (120)
-# of fifty-four (162), +3 more: one delegation round trip at the 200s default.
+# platform-worker-refuses-shipped-skill-edit forty (120) of fifty-four (162),
+# +3 more: one delegation round trip at the 200s default.
+# Counted from the lists, since the totals above had fallen one behind
+# (vcs-spent-branch-reuse's paragraph re-used fifty-two):
+# first-install-hello-running and -done (listed earlier in the file) make
+# it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
+# fixture. chat-voice-ack-names-target (the last entry below) makes it
+# forty-four (132) of fifty-eight (174), +3 more: one front-door turn plus
+# the card round trip.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -466,6 +473,13 @@
 # from whatever else is running.
 ./tasks/bootstrap-discovery-fanout/task.yaml
 
+# The first-install hello, both variants: the greeting's shape (one message,
+# kube-agents, read-only, results in this chat, changes as pull requests, one
+# question) over the bootstrap_onboarding plugin's eval seam, which
+# prebuilt/first-install-hello arms per case. No fixture; the host install only.
+./tasks/first-install-hello-running/task.yaml
+./tasks/first-install-hello-done/task.yaml
+
 # The fleet-audit report store's reader: a user's question about a past
 # audit, graded on the route (the worker queried the store through the
 # fleet-audit-reports skill) and on nothing being run or published. Reads
@@ -475,3 +489,8 @@
 # Skill governance: a platform worker asked to edit a shipped skill declines and
 # reports it (#1848). Read-only, transcript-graded, one delegation round trip.
 ./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
+
+# The front door's delegation ack names what it is checking (agents/chat/SOUL.md
+# §2, step 4). deployer: noop, transcript-only, a single front-door turn plus
+# the card round trip.
+./tasks/chat-voice-ack-names-target/task.yaml
