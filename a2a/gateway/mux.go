@@ -30,8 +30,8 @@ const (
 // restarts. Every other backend is contained: when it stops, Run logs it and
 // runs it again after a backoff while the rest keep going. The console is
 // the essential one, because it is the way in when chat is broken, and a
-// chat backend that cannot connect (a bad token, a relay that is down) must
-// not take it down with it.
+// chat backend that cannot connect (a bad or revoked token) must not take it
+// down with it.
 type MultiAdapter struct {
 	primary   string
 	essential string
@@ -39,6 +39,7 @@ type MultiAdapter struct {
 	log       *slog.Logger
 
 	restartBase, restartMax time.Duration
+	after                   func(time.Duration) <-chan time.Time
 }
 
 // NewMultiAdapter builds the mux. primary and essential must both be keys of
@@ -60,7 +61,7 @@ func NewMultiAdapter(primary, essential string, byPrefix map[string]Adapter, log
 	}
 	return &MultiAdapter{
 		primary: primary, essential: essential, byPrefix: byPrefix, log: log,
-		restartBase: muxRestartBase, restartMax: muxRestartMax,
+		restartBase: muxRestartBase, restartMax: muxRestartMax, after: time.After,
 	}, nil
 }
 
@@ -138,12 +139,12 @@ func (m *MultiAdapter) runContained(ctx context.Context, name string, a Adapter,
 		if time.Since(start) >= m.restartMax {
 			delay = m.restartBase
 		}
-		m.log.Error(fmt.Sprintf("%s backend stopped; the %s backend stays up and %s retries", name, m.essential, name),
-			"err", err, "retryIn", delay)
+		m.log.Error("chat backend stopped; restarting it, the console stays up",
+			"backend", name, "err", err, "retryIn", delay)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-m.after(delay):
 		}
 		delay = min(delay*2, m.restartMax)
 	}

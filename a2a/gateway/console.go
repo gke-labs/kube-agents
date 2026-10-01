@@ -193,11 +193,11 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 		}),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			// Wake Run either way, and let only the log line distinguish
-			// our own Close. MultiAdapter.Run cancels its siblings on a
-			// non-nil error and on nothing else (mux.go), so a Run still
-			// parked in its select - or one that returned nil - leaves the
-			// process up with a shut console door, which is the state this
-			// handler exists to prevent. That applies to a deliberate early
+			// our own Close. The console is the mux's essential backend:
+			// its Run returning is what ends the process (mux.go), so a
+			// Run still parked in its select leaves the process up with a
+			// shut console door, which is the state this handler exists
+			// to prevent. That applies to a deliberate early
 			// Close too: Close's own doc offers it for an adapter that
 			// needs closing early, and an early close that never ends Run
 			// is the same half-deaf gateway by another route.
@@ -284,9 +284,9 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 	select {
 	case <-ctx.Done():
 	case <-a.closedCh:
-		// Returning is the whole point: MultiAdapter.Run takes the first
-		// backend error and ends the process, which is how a dead console
-		// becomes a restart rather than a half-deaf gateway.
+		// Returning is the whole point: MultiAdapter.Run ends the process
+		// when its essential backend, the console, returns, which is how a
+		// dead console becomes a restart rather than a half-deaf gateway.
 		switch last := a.nc.LastError(); {
 		case a.closingFlag.Load():
 			runErr = errors.New("console adapter: closed while running")

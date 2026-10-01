@@ -490,9 +490,9 @@ func TestConsoleCloseDoesNotLogAsALostConnection(t *testing.T) {
 
 // Close's doc offers it for an adapter that "needs closing early". A caller
 // taking that at its word, then waiting on Run (or on MultiAdapter.Run, which
-// waits for every backend), must not hang: the mux cancels its siblings on a
-// non-nil error and on nothing else, so a Run left parked here is the same
-// half-deaf gateway the ClosedHandler exists to prevent.
+// waits for every backend), must not hang: the mux ends the process only when
+// the console's Run returns, so a Run left parked here is the same half-deaf
+// gateway the ClosedHandler exists to prevent.
 func TestConsoleCloseWhileRunningEndsRun(t *testing.T) {
 	srv := startServer(t)
 	a, err := NewConsoleAdapter(srv.ClientURL(), nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
@@ -545,7 +545,7 @@ func TestConsoleDropsAnOversizeMessageIDWithoutLoggingIt(t *testing.T) {
 
 // A connection nats.go has given up on leaves the adapter subscribed to
 // nothing, with no reconnect coming. Run has to surface that: MultiAdapter
-// turns a backend error into a process restart, and a gateway that instead
+// turns the console's return into a process restart, and a gateway that instead
 // stays Running drops every console frame with no log line after the
 // (by then false) "reconnecting" one.
 func TestConsoleRunReturnsWhenTheConnectionIsClosedForGood(t *testing.T) {

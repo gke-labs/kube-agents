@@ -1129,10 +1129,13 @@ adapter does.
 
 **The console outlives the chat backend.** The console is the way in when chat is broken, so
 the two do not share a fate. When the console adapter stops, the gateway exits and restarts.
-When the chat backend stops (a bad token, a relay that is down, a Socket Mode give-up), the mux
-logs it at error and runs that backend again after a delay that doubles from one second to a
-one-minute cap, while the console keeps serving. A backend that returns without an error while
-the gateway is still running has stopped all the same and is handled the same way.
+When the chat backend stops (a bad or revoked Discord or Slack token, a Socket Mode give-up),
+the mux logs `chat backend stopped` at error with the backend in a `backend` field, and runs
+that backend again after a delay that doubles from one second to a one-minute cap, while the
+console keeps serving. A run that lasted at least the cap starts the doubling over. A backend
+that returns without an error while the gateway is still running has stopped all the same and is
+handled the same way. Google Chat never takes this path, since its adapter retries pulls itself.
+A dead chat backend therefore shows as that log line on a Running pod, not as a restart.
 
 **Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
 naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a

@@ -169,6 +169,58 @@ func TestMultiAdapterRestartsAChatBackendAndKeepsTheConsole(t *testing.T) {
 	}
 }
 
+// slowOnceAdapter stops right away on every Run but the slowRun'th, which
+// lasts slowFor first.
+type slowOnceAdapter struct {
+	fakeAdapter
+	slowRun int32
+	slowFor time.Duration
+	runs    atomic.Int32
+}
+
+func (a *slowOnceAdapter) Run(context.Context, func(InboundMessage)) error {
+	if a.runs.Add(1) == a.slowRun {
+		time.Sleep(a.slowFor)
+	}
+	return errors.New("down")
+}
+
+// The restart delay doubles to the cap, and a run that lasted the cap starts
+// the doubling over.
+func TestMultiAdapterRestartBackoff(t *testing.T) {
+	chat := &slowOnceAdapter{slowRun: 6, slowFor: 20 * time.Millisecond}
+	m := newTestMux(t, map[string]Adapter{"discord": chat, "console": newFakeAdapter()})
+	ms := time.Millisecond
+	want := []time.Duration{ms, 2 * ms, 4 * ms, 4 * ms, 4 * ms, ms, 2 * ms, 4 * ms}
+	var mu sync.Mutex
+	var delays []time.Duration
+	ctx, cancel := context.WithCancel(context.Background())
+	m.after = func(d time.Duration) <-chan time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		delays = append(delays, d)
+		if len(delays) >= len(want) {
+			cancel()
+		}
+		ch := make(chan time.Time, 1)
+		ch <- time.Time{}
+		return ch
+	}
+	if err := m.Run(ctx, func(InboundMessage) {}); err != nil {
+		t.Fatalf("Run returned %v on shutdown, want nil", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delays) < len(want) {
+		t.Fatalf("delays = %v, want at least %v", delays, want)
+	}
+	for i, d := range want {
+		if delays[i] != d {
+			t.Fatalf("delays = %v, want %v", delays[:len(want)], want)
+		}
+	}
+}
+
 func TestMultiAdapterOpenDirectGoesToThePrimary(t *testing.T) {
 	d, c := newFakeAdapter(), newFakeAdapter()
 	m := newTestMux(t, map[string]Adapter{"discord": d, "console": c})

@@ -154,11 +154,11 @@ func TestSideDoorObservesOnlyItsOwnTasks(t *testing.T) {
 	}
 }
 
-// TestSideDoorStopsWhenEitherHalfDoes: a gateway that kept running with its
-// chat backend dead would look healthy while consuming nothing, which is the
-// failure the one-backend guard exists to prevent; one that kept running with
-// a dead door would hang every eval on a listener nothing answers. Either
-// half returning ends Run, so the Deployment restarts both.
+// TestSideDoorStopsWhenEitherHalfDoes: the primary returns only when the
+// console does, and a gateway without its console has lost the way in when
+// chat is broken; one that kept running with a dead door would hang every
+// eval on a listener nothing answers. Either half returning ends Run, so the
+// Deployment restarts both.
 func TestSideDoorStopsWhenEitherHalfDoes(t *testing.T) {
 	primary, door, composite := newSideDoorRig(t)
 	// A door that cannot bind fails Run at once, which is the half this case
