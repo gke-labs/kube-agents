@@ -1005,8 +1005,10 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 	return false, time.Time{}, nil
 }
 
-// artifactParts is every part under one reserved artifact name, in stream
-// order, across every artifact the fold holds under it -- not the first
+// artifactParts is every part under one reserved artifact name, artifact by
+// artifact in first-appearance order and each artifact's parts in arrival
+// order (which is stream order for an executor that appends to one
+// artifact id, as both executors do), across every artifact the fold holds under it -- not the first
 // alone (Task.Artifact). The fold keys on artifactId when an update carries
 // one, so an executor that gives each activity update its own id leaves the
 // fold holding several artifacts named activity, and the trace is all of

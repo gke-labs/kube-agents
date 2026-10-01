@@ -1,9 +1,15 @@
 package hermesbridge
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -446,6 +452,29 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 	}
 }
 
+// A delivery signed for a task that the door cannot decode is a call the
+// trace will not carry: it counts on the marker rather than vanishing.
+func TestActivity_UnreadableSignedDeliveryCountsDropped(t *testing.T) {
+	b := &Bridge{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: map[string]*taskRun{}}
+	a, _ := newActivityState(true, InputValuesShape)
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-bad", ContextID: "ctx", CorrelationID: "corr"}}
+	run.act.Store(a)
+	b.tasks["task-bad"] = run
+	body := []byte(`{"hook_event_name":"post_tool_call","extra":"not an object"`)
+	mac := hmac.New(sha256.New, []byte(a.key))
+	mac.Write(body)
+	req := httptest.NewRequest(http.MethodPost, ActivityPath, bytes.NewReader(body))
+	req.Header.Set(hookSignatureHeader, hookSignaturePrefix+hex.EncodeToString(mac.Sum(nil)))
+	rec := httptest.NewRecorder()
+	b.handleActivity(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if m, ok := a.truncationMarker(); !ok || m.Dropped != 1 {
+		t.Fatalf("marker after an unreadable delivery = %+v, %v", m, ok)
+	}
+}
+
 // A fractional duration_ms (a Python emitter's 12.5) is one field's shape,
 // not a reason to drop the delivery.
 func TestActivity_FractionalDurationIsRead(t *testing.T) {
@@ -603,7 +632,7 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 // name-like fields a grader reads stay, so a tool_call wrapper still names
 // its calls and a terminal command's text is a length.
 func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
-	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"QKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `","tool":"mcp__gke__list_clusters","kind":"PodDisruptionBudget","location":"projects/p/locations/northamerica-northeast1","skill":"QKIAIOSFODNN7EXAMPLE","calls2":[{"name":"mcp__gke__listClusters"},{"name":"createPullRequest"},{"name":"mcp__kubernetesdiagnostics__inspect"}],"region":"ValidatingAdmissionPolicy","namespace2":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345","project":"9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f","agent":"xoxq-1234567890-abcdefghijklmnop"}`
+	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}},{"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"QKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `","tool":"mcp__gke__list_clusters","kind":"PodDisruptionBudget","location":"projects/p/locations/northamerica-northeast1","skill":"QKIAIOSFODNN7EXAMPLE","calls2":[{"name":"mcp__gke__listClusters"},{"name":"createPullRequest"},{"name":"mcp__kubernetesdiagnostics__inspect"}],"region":"ValidatingAdmissionPolicy","namespace2":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345","project":"9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f","agent":"xoxq-1234567890-abcdefghijklmnop"}`
 	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
 		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
 		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "QKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129), "9f3c2a1b7d9f3c2a1b7d", "xoxq-", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"} {
@@ -631,7 +660,7 @@ func TestActivity_DrainSkippedCallsAreCountedDropped(t *testing.T) {
 	activityDrainBudget = 0
 	t.Cleanup(func() { activityDrainBudget = prev })
 	_, url := startServer(t)
-	b := startBridgeCfg(t, url, hermesStub(t, "pass"), nil)
+	b := startBridgeCfg(t, url, []string{"true"}, nil)
 	a, _ := newActivityState(false, InputValuesFull)
 	for _, id := range []string{"c1", "c2"} {
 		var d hookDelivery

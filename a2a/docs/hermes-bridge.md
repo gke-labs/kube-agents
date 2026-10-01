@@ -318,7 +318,8 @@ worker adapter's `{"tool","input"}` so one fold reads both executors:
 `errorType` keeps hermes's word for it (`blocked`, `cancelled`, `timeout`, `tool_error`),
 so a guardrail refusal stays distinguishable from a tool failure. hermes retries a delivery
 that timed out, so each is remembered by its id and a retry is one call. A call still open when the
-task finalizes — deadline, cancel, a crash mid-tool — is flushed as `interrupted` inside
+task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the door could not
+read, which also counts on the marker — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
 nothing of it follows the final event. What of the input is published is a setting,
 `BRIDGE_ACTIVITY_INPUT_VALUES`: unset (the default) publishes the input's **shape**, its
@@ -335,8 +336,8 @@ the scrub's best-effort reach matters. In either mode `input` is capped (2 KiB):
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,
-`passwd`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `key_data`,
-`cookie` or `credential` as a whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`,
+`passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`, `signing_key`, `key_data`, `cookie`
+or `credential` as a whole component (`access_token`, `SECRET_KEY`, `accessToken`, `clientSecret`,
 `SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`, `client-key-data`, `Cookie`; not
 `tokenizer`, and not a key that opens with the word and goes on as a name, reference or
 location, `secretName`, `tokenPath`) are replaced before

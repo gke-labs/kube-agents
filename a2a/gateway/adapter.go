@@ -374,7 +374,8 @@ type ConversationState struct {
 	Result         string
 	Reason         string
 	// Activity is the task's tool-call trace as the stream holds it: the
-	// data part of every part of the activity artifact, in stream order,
+	// data part of every part of the activity artifact, in arrival order
+	// (stream order for an executor that appends to one artifact id),
 	// each one the executor's own JSON record of one tool invocation. Set
 	// whenever the task's stream was read, final or not, and non-nil then
 	// even with no calls -- nil means the stream was not read (no active

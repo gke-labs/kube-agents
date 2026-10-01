@@ -722,9 +722,12 @@ func truncatedStandIn(out []byte, headLen int) map[string]any {
 	return map[string]any{"truncated": true, "bytes": len(out), "head": head}
 }
 
-// capWrapperCalls caps a tool_call wrapper per nested call in two passes
-// (below). False when the wrapper still does not fit, or when the input is
-// not the wrapper's shape, and the caller falls back to the whole stand-in.
+// capWrapperCalls caps a tool_call wrapper per nested call in two passes:
+// first the large arguments objects become stand-ins with a short head,
+// then every arguments object becomes a head-less one, so a wrapper of many
+// small calls still keeps its names. False when the wrapper still does not
+// fit, or when the input is not the wrapper's shape, and the caller falls
+// back to the whole stand-in.
 func capWrapperCalls(red any) (json.RawMessage, bool) {
 	m, ok := red.(map[string]any)
 	if !ok {
@@ -754,13 +757,6 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 		}
 		args = append(args, nested{call: call, raw: raw})
 	}
-	// On the first pass only an arguments object that is itself large
-	// becomes a stand-in, so a small sibling stays verbatim; on the second
-	// every one does, names kept, since that is still more than the whole
-	// stand-in keeps.
-	// First pass: the large arguments objects become stand-ins with a short
-	// head. Second pass: every arguments object becomes a head-less
-	// stand-in, so a wrapper of many small calls still keeps its names.
 	for _, headLen := range []int{activityInputCallHead, 0} {
 		for _, n := range args {
 			if headLen == 0 || len(n.raw) > activityInputCallHead {
@@ -783,20 +779,32 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 // numbers, booleans and nulls left as they are. A "[redacted]" marker stays
 // a marker, so the trace still says a secret-looking key was there.
 func shapeValue(v any, key string) any {
+	return shapeValueIn(v, key, "")
+}
+
+// shapeValueIn is shapeValue with the enclosing key, so a tool name is known
+// as one: the "name" of an element of a "calls" array (hermes's tool_call
+// wrapper) is what a tool_called check reads and is kept whatever its
+// spelling, bounded like the entry's own tool; the identifier grammar is
+// for every other kept key.
+func shapeValueIn(v any, key, parent string) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			t[k] = shapeValue(val, k)
+			t[k] = shapeValueIn(val, k, key)
 		}
 		return t
 	case []any:
 		for i := range t {
-			t[i] = shapeValue(t[i], key)
+			t[i] = shapeValueIn(t[i], key, parent)
 		}
 		return t
 	case string:
 		if t == redactedValue || keptUnderShape(key, t) {
 			return t
+		}
+		if key == "name" && parent == wrapperCallsKey {
+			return capRunes(t, activityToolNameCap)
 		}
 		return shapeOf(t)
 	}
@@ -1055,7 +1063,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	var d hookDelivery
 	if err := json.Unmarshal(body, &d); err != nil {
+		// Signed for this task and unreadable: a call the trace will not
+		// carry (and whose pre, if any, will end interrupted), so the
+		// marker says the trace is short.
 		b.cfg.Logger.Warn("activity delivery unparseable", "task", run.origin.TaskID, "err", err)
+		if act := run.act.Load(); act != nil {
+			act.countDropped(1)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
