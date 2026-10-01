@@ -875,10 +875,11 @@ func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // a2aGchatAllowlist reads the CR's allowed-users list the way the gateway's
 // FromEnv reads the env it becomes, with the gateway's own grammar: the
 // entries joined on commas and split again, each piece trimmed, the empty
-// ones dropped. The operator decides allow-all on the result, so a list that
-// holds only whitespace or commas is an empty list on both sides rather than
-// a restriction to nobody on one of them, and an entry carrying a comma is
-// the two entries the gateway would read.
+// ones dropped - so the list the gateway sees is the one it would have
+// parsed, and an entry carrying a comma is the two entries it would read.
+// The allow-all decision is NOT made on the result: it is the legacy rule on
+// the raw list (allowAllUsers), so a degenerate list restricts to nobody in
+// both modes instead of widening to everyone in one of them.
 func a2aGchatAllowlist(users []string) []string {
 	var out []string
 	for _, u := range strings.Split(strings.Join(users, ","), ",") {
@@ -3139,14 +3140,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
 			// The allowed-users gate, carried as environment because
 			// environment is what the agent cannot rewrite, from the same
-			// CR list the legacy pin uses, normalized the way the gateway
-			// reads it (a2aGchatAllowlist) and with the same empty-means-all
-			// rule (allowAllUsers) applied to what is left. With an empty
-			// list and allow-all off the gateway starts and drops every
-			// message at verification, so the two sides must agree on what
-			// an empty list is.
+			// CR list the legacy pin uses. The list is normalized the way
+			// the gateway reads it (a2aGchatAllowlist); the allow-all flag
+			// is the legacy consumer's rule on the RAW list (allowAllUsers:
+			// absent, or a single empty string), so one CR means one thing
+			// in both modes. A degenerate list - whitespace or commas only -
+			// is therefore a restriction to nobody here as it is under
+			// today, and the gateway says so at boot (an empty allowlist
+			// with allow-all off is the one shape it warns about), rather
+			// than becoming allow-all on the flip to next.
 			{Name: a2aGchatAllowedUsersEnvVar, Value: strings.Join(allowed, ",")},
-			{Name: a2aGchatAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(allowed))},
+			{Name: a2aGchatAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(gchat.AllowedUsers))},
 			{Name: a2aChatDisplayModeEnvVar, Value: a2aChatDisplayMode(gchat.Mode)},
 			// Rendered explicitly at the gateway's default, like
 			// A2A_MAX_SESSIONS: the path and the mount below are one fact.
