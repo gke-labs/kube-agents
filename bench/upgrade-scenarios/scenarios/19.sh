@@ -44,10 +44,15 @@ Y
 before(){ ev csi addon-default csi_state; sleep 60; ev csi pod-with-driver K -n scen get pods -l app=pd-user -o wide
   disable_driver || { note csi "precondition not met: the PD CSI driver is not confirmed off after $DISABLE_TRIES tries; stopping before the upgrade"; exit 1; }
   sleep 60; ev csi addon-disabled csi_state; ev csi pod-still-running K -n scen get pods -l app=pd-user -o wide; }
-# An empty state reads as off, but only from a describe that succeeded: a failed one also prints nothing.
-disable_driver(){ local i s; for i in $(seq 1 $DISABLE_TRIES); do
-    ev csi disable-driver G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=GcePersistentDiskCsiDriver=DISABLED --quiet; wait_ops
-    if s=$(csi_state); then case $s in *enabled=True*) note csi "driver still on after try $i; retrying in ${DISABLE_WAIT}s" ;; *) return 0 ;; esac
+# An empty state reads as off, but only from a describe that succeeded: a failed one also prints nothing. The update itself
+# is tried DISABLE_TRIES times because the one failure seen in the campaign was a Compute Engine stockout (19b), which
+# passes; a busy refusal is waited out; any other refusal is final and stops the run with the error on record.
+disable_driver(){ local i s; for i in $(seq 1 $DISABLE_TRIES); do wait_ops
+    if ! ev csi disable-driver G container clusters update "$CLUSTER" --zone "$ZONE" --update-addons=GcePersistentDiskCsiDriver=DISABLED --quiet; then
+      if tail -4 "$EVID/csi.txt" | grep -q "incompatible operation"; then note csi "refused while another operation ran (try $i); retrying in ${BUSY_WAIT}s"; sleep $BUSY_WAIT; continue; fi
+      tail -4 "$EVID/csi.txt" | grep -Eq "STOCKOUT|RESOURCE_POOL_EXHAUSTED" || { note csi "the disable failed for a reason that will not clear (see csi.txt); stopping"; return 1; }
+      note csi "the disable hit a Compute Engine stockout (try $i); retrying in ${DISABLE_WAIT}s"; sleep $DISABLE_WAIT; continue; fi
+    wait_ops; if s=$(csi_state); then case $s in *enabled=True*) note csi "driver still on after try $i; retrying in ${DISABLE_WAIT}s" ;; *) return 0 ;; esac
     else note csi "could not read the add-on state after try $i; retrying in ${DISABLE_WAIT}s"; fi; sleep $DISABLE_WAIT; done; return 1; }
 break_it(){ V=$(newest_patch REGULAR 1.35); upgrade_master "$V"; upgrade_pool work-pool "$V" csi:scen:app=pd-user; }
 after(){ sleep 120; ev csi pod-after-upgrade K -n scen get pods -l app=pd-user -o wide; ev csi events-after-upgrade pd_events

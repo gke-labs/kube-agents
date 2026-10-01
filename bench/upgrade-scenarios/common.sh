@@ -15,7 +15,8 @@ require_scenario_cluster(){ local p; p=$(G container clusters describe "$CLUSTER
     { echo "refusing: cannot describe $CLUSTER in $ZONE (missing, or its creation failed)" >&2; exit 1; }
   [ "$p" = "$SCENARIO_LABEL" ] || { echo "refusing: $CLUSTER in $ZONE is not labelled purpose=$SCENARIO_LABEL (label: '$p')" >&2; exit 1; }; }
 # require_own_cluster <NN>: the cluster's scenario label (set by run.sh at creation) must be NN itself, or the one run NN
-# declares it extends (EXTENDS=10 in 10b.sh, EXTENDS=14b in 14c.sh). Letters alone prove nothing: 18i, 18k and 18m are
+# declares it extends (EXTENDS=10 in 10b.sh, EXTENDS=14 in 14c.sh; the label is the number run.sh was given, whatever the
+# cluster is called). Letters alone prove nothing: 18i, 18k and 18m are
 # independent runs in other zones, a hold cluster belongs to its own scenario, and any other cluster of the campaign has
 # been through its own upgrade already.
 require_own_cluster(){ local nn=$1 label; label=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)') ||

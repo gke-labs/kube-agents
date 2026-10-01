@@ -33,7 +33,7 @@ UPGRADE_NODES     DONE    2026-09-29T13:59:14.089422087Z  2026-09-29T15:02:11.65
 2026-09-29T15:00:09.594752Z	service-<PROJECT_NUMBER>@container-engine-robot.iam.gserviceaccount.com
 ## exit 0
 
-## 2026-09-29T15:04:31Z [budget/recapture-pending] the replacement pod after GKE reported UPGRADE_NODES DONE at 15:02:11Z; this first-wave pool is one e2-small node
+## 2026-09-29T15:04:31Z [budget/by-hand] kubectl get events and kubectl describe node, run outside the harness during the run, pasted here: the replacement pod after GKE reported UPGRADE_NODES DONE at 15:02:11Z; this first-wave pool is one e2-small node
 T                      R                   M
 2026-09-29T15:01:07Z   FailedScheduling    0/3 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) were unschedulable. no new claims to deallocate, preemption: 0/3 nodes are available: 1 No preemption victims found for incoming pod, 2 Preemption is not helpful for scheduling.
 2026-09-29T15:00:16Z   NotTriggerScaleUp   Pod didn't trigger scale-up: 
@@ -47,4 +47,4 @@ Allocated resources:
   ephemeral-storage  0 (0%)            0 (0%)
   hugepages-1Gi      0 (0%)            0 (0%)
   hugepages-2Mi      0 (0%)            0 (0%)
-## exit 0
+

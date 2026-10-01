@@ -3,7 +3,7 @@
 # 14c: the full cgroup v1 -> v2 path. A JVM that predates cgroup v2 support runs correctly on a v1 pool;
 # the pool then moves to v2 (GKE's 1.35 upgrade, or the migration GKE requires first) and the same JVM
 # sizes its heap from the host and is OOM-killed. Run as: CLUSTER=upg-14b bash run.sh 14c
-CHANNEL=REGULAR; START=1.34; POOL_FLAGS=""; EXTENDS=14b   # may run on scenario 14's re-run cluster, which carries the fill ConfigMap
+CHANNEL=REGULAR; START=1.34; POOL_FLAGS=""; EXTENDS=14   # may run on scenario 14's cluster (upg-14b was built by CLUSTER=upg-14b bash run.sh 14, so its label is 14), which carries the fill ConfigMap
 V1_POOL=v1-pool; LEGACY_IMAGE=eclipse-temurin:11.0.15_10-jdk; JVM_LIMIT=256Mi
 plant(){ printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V1\n' >"$EVID/cgroup-v1.yaml"; printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V2\n' >"$EVID/cgroup-v2.yaml"
   pool_exists "$V1_POOL" || retry_busy cgroup ev cgroup v1-pool G container node-pools create "$V1_POOL" --cluster "$CLUSTER" --zone "$ZONE" --num-nodes 1 --machine-type e2-standard-2 --disk-size "$NODE_DISK_GB" --node-labels=role=v1 --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet

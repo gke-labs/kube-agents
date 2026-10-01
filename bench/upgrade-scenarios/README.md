@@ -127,7 +127,9 @@ runs and are not in the repository.
    operation read DONE at 15:02:11 while the replacement was still Pending. Only the last three 429s are on
    record, because the audit query was limited to three rows, so the hour-long refusal is inferred from the
    operation's timeline. The replacement stayed Pending for lack of CPU on an e2-small node, a confound that is
-   separate from the budget.
+   separate from the budget. That run used the first-wave e2-small work pool and was not repeated; the committed
+   `01.sh` creates e2-standard-2 like every other scenario, so a re-run's replacement schedules at once and only the
+   refusal and the force-kill, which do not depend on the node's size, repeat.
 2. The pool was one node with `maxSurge 0`. The drained replica was Pending for about four minutes (22 samples,
    14:45:24 to 14:49:25) and came back only on the rebuilt node. No surge node appeared.
 3. Two replicas were pinned to one node; the one-zone case was not planted. GKE stopped both in the same second, and nothing served for 18 of 44
@@ -269,7 +271,11 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 4. Records the after-state.
 
 Every observation goes through `ev()` in `common.sh`, which appends the command, its full output, its exit code
-and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. The
+and a UTC timestamp to `evidence/<track>/<step>.txt`. Setup steps (credentials, manifest applies) do not. Two
+records are the exception and are headed `by-hand`: a `kubectl` read in `01/budget.txt` (the replacement pod's
+events and the node's allocation after the force-kill) and one in `06/removed-api.txt` (the caller's second first
+run, after the first hit DNS before kube-dns was up). Both were taken outside the harness during the run and pasted
+in the same format, without an exit line; item 1's Pending confound and item 6's first successful write rest on them. The
 availability pollers write `<step>-availability.txt` and `zonal-api-api.txt` directly, and scenario 11's own probes
 `zonal-api-1s.txt` and `zonal-probe.txt`. After a pool upgrade, `upgrade.txt` also carries the operation's final
 status and status message, which is where a stockout shows while the operation reads DONE, and after a
@@ -350,7 +356,8 @@ the scripts that only served it (the other GPU zones, for example) are in this d
 | `20-attempt1-push-failed`, `20-attempt2-crane-dyld`                                                                 | the image copy failed: Cloud Build could not push, then the released crane binary aborted on macOS                                                                                                                      |
 | `20-attempt3-pool-small-and-already-upgraded`                                                                       | the pool was e2-small and already on the target version, so there was nothing to upgrade                                                                                                                                |
 
-`19` and `20` hold attempts that ran to the end without their precondition: in `19` the PD CSI driver stayed
+`01` is the one first-wave run whose verdict stands: its pool was e2-small, which only affected the replacement after
+the force-kill, and its script was moved to e2-standard-2 with the rest. `19` and `20` hold attempts that ran to the end without their precondition: in `19` the PD CSI driver stayed
 on, and in `20` the old node never cached the image. No verdict rests on them. `10`, `11`, `13` and `14` are earlier legs that the lettered runs extend: three-minor
 skew, a read-only probe, a runtime already on containerd 2.0, and the symptom without the v1 pool.
 

@@ -58,7 +58,7 @@ urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resol
 ## 2026-09-29T13:52:41Z [removed-api/audit] G logging read resource.type=k8s_cluster AND resource.labels.cluster_name=upg-06 AND labels."k8s.io/removed-release"="1.32" --freshness 1h --limit 2 --format=value(timestamp,protoPayload.methodName,protoPayload.requestMetadata.callerSuppliedUserAgent)
 ## exit 0
 
-## 2026-09-29T13:54:57Z [removed-api/before-retry] first-run-2 (the first run hit DNS before kube-dns was up)
+## 2026-09-29T13:54:57Z [removed-api/by-hand] kubectl logs of Job first-run-2 and the cluster's version and status, run outside the harness and pasted here (the first run hit DNS before kube-dns was up)
 ok 2026-09-29T13:54:19Z: created FlowSchema legacy-batch-lane via flowcontrol.apiserver.k8s.io/v1beta3 on server v1.31.14-gke.2759000 (HTTP 201)
 1.31.14-gke.2759000	RECONCILING
 
