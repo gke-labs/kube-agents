@@ -911,7 +911,10 @@ main() {
   # cluster's shape and each container ID, and terraform evaluates the scope variable's validations
   # on a destroy too, and a teardown must not be refusable on a typo's
   # account. The destroy removes the bindings in state whatever these say.
-  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  # Blanking the two selectors also means the destroy makes none of the
+  # plan-time lookups, so a host or scope this identity can no longer read
+  # cannot refuse the teardown either.
+  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

@@ -9,8 +9,11 @@ plugin's side effects (origin binding, delivery trigger, presence marker) and
 the greeting context it returns.
 """
 
+import json
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +21,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import plugin  # noqa: E402
+
+# The one bench stack that writes the eval seam's marker.
+EVAL_STACK_DIR = "bench/tf/prebuilt/first-install-hello/"
 
 
 def _fake_session_env(**values):
@@ -213,6 +219,148 @@ class PreLlmCallTest(unittest.TestCase):
         # ...and a real chat turn afterwards still gets its greeting.
         self.assertIsNotNone(self._call())
         self.assertTrue((self.data_dir / ".user_aligned").exists())
+
+    # --- the eval seam ----------------------------------------------------
+
+    def _plant(self, variant="in_progress", phrase="just installed you", suffix="-running", age=0):
+        marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
+        request = {"variant": variant, "phrase": phrase, "written_at": time.time() - age}
+        marker.write_text(json.dumps(request), encoding="utf-8")
+        return marker
+
+    def _eval_call(self, **overrides):
+        kwargs = {"platform": "api_server", "user_message": "hi! priya here, just installed you"}
+        kwargs.update(overrides)
+        return self._call(**kwargs)
+
+    def test_eval_marker_greets_on_a_platform_the_allowlist_excludes(self):
+        self._plant()
+        result = self._eval_call()
+        self.assertIsNotNone(result)
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertIn("IN-PROGRESS-INSTRUCTIONS", result["context"])
+
+    def test_eval_marker_variant_picks_the_completed_instructions(self):
+        self._plant(variant="completed")
+        result = self._eval_call()
+        self.assertIn("SCAN COMPLETED", result["context"])
+        self.assertIn("COMPLETED-INSTRUCTIONS", result["context"])
+
+    def test_eval_marker_touches_no_onboarding_state(self):
+        self._plant()
+        self.assertIsNotNone(self._eval_call())
+        self.update_job.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
+    def test_eval_marker_greets_even_after_onboarding_happened(self):
+        (self.data_dir / plugin.GREETED_MARKER).touch()
+        (self.data_dir / ".bootstrap_completed").touch()
+        self._plant()
+        self.assertIsNotNone(self._eval_call())
+
+    def test_eval_marker_survives_a_retried_opening_turn(self):
+        # The harness re-sends the opening turn in the same conversation after
+        # a dropped connection; by then the first attempt is in the history.
+        marker = self._plant()
+        self.assertIsNotNone(self._eval_call())
+        result = self._eval_call(is_first_turn=False)
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertTrue(marker.exists())
+
+    def test_eval_marker_waits_for_its_phrase(self):
+        marker = self._plant()
+        self.assertIsNone(self._eval_call(user_message="list my clusters"))
+        self.assertTrue(marker.exists())
+
+    def test_eval_marker_is_not_taken_by_another_turn_or_cron(self):
+        marker = self._plant()
+        self.assertIsNone(self._eval_call(is_first_turn=False, user_message="what is its status?"))
+        self.assertIsNone(self._eval_call(platform="cron"))
+        self.assertIsNone(self._eval_call(session_id="cron_abc"))
+        self.assertTrue(marker.exists())
+
+    def test_eval_marker_is_not_consulted_on_a_chat_platform(self):
+        (self.data_dir / plugin.GREETED_MARKER).touch()
+        self._plant()
+        self.assertIsNone(self._eval_call(platform="google_chat"))
+        self.assertIsNone(self._eval_call(platform="slack"))
+
+    def test_eval_marker_with_a_short_phrase_is_ignored(self):
+        for suffix, phrase in (("-blank", " "), ("-hi", "hi"), ("-padded", "   priya   ")):
+            self._plant(phrase=phrase, suffix=suffix)
+        self.assertIsNone(self._eval_call())
+
+    def test_eval_marker_with_a_padded_phrase_matches_it_trimmed(self):
+        self._plant(phrase="  just installed you ")
+        result = self._eval_call(user_message="hi! priya here, just installed you")
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+
+    def test_eval_marker_past_its_age_is_ignored_with_a_warning(self):
+        # A request a failed destroy left behind, or one stamped by a skewed clock.
+        for age in (plugin.EVAL_REQUEST_MAX_AGE_SECONDS + 60, -plugin.EVAL_REQUEST_MAX_AGE_SECONDS - 60):
+            with self.subTest(age=age):
+                self._plant(age=age)
+                with self.assertLogs(plugin.logger, level="WARNING") as logs:
+                    self.assertIsNone(self._eval_call())
+                self.assertIn("written_at", logs.output[0])
+
+    def test_eval_marker_without_a_readable_written_at_is_ignored(self):
+        for suffix, written_at in (
+            ("-none", None),
+            ("-text", "now"),
+            ("-bool", True),
+            ("-nan", float("nan")),
+            ("-huge", 10**400),
+        ):
+            request = {"variant": "in_progress", "phrase": "just installed you"}
+            if written_at is not None:
+                request["written_at"] = written_at
+            marker = self.data_dir / f".bootstrap_greet_eval{suffix}"
+            marker.write_text(json.dumps(request), encoding="utf-8")
+        self.assertIsNone(self._eval_call())
+
+    def test_unreadable_eval_marker_is_ignored(self):
+        (self.data_dir / ".bootstrap_greet_eval-a").write_text("not json", encoding="utf-8")
+        (self.data_dir / ".bootstrap_greet_eval-b").write_text("[]", encoding="utf-8")
+        (self.data_dir / ".bootstrap_greet_eval-c").write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+        self.assertIsNone(self._eval_call())
+
+    def test_concurrent_eval_markers_are_each_taken_by_their_own_phrase(self):
+        running = self._plant(phrase="just installed you", suffix="-running")
+        done = self._plant(variant="completed", phrase="just set you up", suffix="-done")
+        result = self._eval_call(user_message="hey, priya here, just set you up")
+        self.assertIn("SCAN COMPLETED", result["context"])
+        result = self._eval_call(user_message="hi! priya here, just installed you")
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.assertTrue(running.exists())
+        self.assertTrue(done.exists())
+
+    def test_only_the_hello_stack_and_this_plugin_name_the_eval_marker(self):
+        repo = Path(__file__).resolve().parents[5]
+        try:
+            listed = subprocess.run(
+                ["git", "grep", "-l", "--fixed-strings", plugin.EVAL_GREET_MARKER],
+                cwd=repo, capture_output=True, text=True, check=False,
+            )
+        except FileNotFoundError:
+            self.skipTest("git is not installed")
+        if listed.returncode > 1:
+            self.skipTest(f"git grep failed: {listed.stderr.strip()}")
+        plugin_dir = Path(__file__).resolve().parent.relative_to(repo).as_posix() + "/"
+        strays = [
+            path for path in listed.stdout.splitlines()
+            if not (path.startswith(EVAL_STACK_DIR) or path.startswith(plugin_dir))
+        ]
+        self.assertEqual(strays, [], "only the bench stack may write the eval seam's marker")
+
+    def test_absent_eval_marker_leaves_the_real_flow_unchanged(self):
+        self.assertIsNone(self._eval_call())
+        result = self._call(user_message="hi! priya here, just installed you")
+        self.assertIn("SCAN IN PROGRESS", result["context"])
+        self.update_job.assert_called_once()
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
 
 
 if __name__ == "__main__":

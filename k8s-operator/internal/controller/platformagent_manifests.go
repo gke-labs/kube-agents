@@ -91,6 +91,21 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
+	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
+	// collector is admitted to a listener that serves counters and nothing
+	// else, and the credentialed port keeps admitting only the sandbox and the
+	// gateway. One constant for the container port, the value of
+	// CREDENTIAL_PROXY_METRICS_PORT the runtime binds, and the collector's
+	// ingress rule; the chart's PodMonitoring scrapes it by number, held to
+	// this one by tests/test_chart_platform_agent_monitoring.py.
+	credentialProxyMetricsPort     int32 = 8766
+	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
+	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyPortEnv tells the runtime the credentialed port, so its
+	// refusal of a metrics port equal to it compares against the number the
+	// operator renders rather than the runtime's own default.
+	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -3942,6 +3957,16 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		// The credentialed port, the same constant the container port and the
+		// policy are rendered from: the runtime refuses a metrics port equal to
+		// it before binding, so its idea of that port has to be the operator's.
+		// Envoy's listener carries the same number in its config, held to this
+		// constant by the runtime's OperatorContractTest.
+		{Name: credentialProxyPortEnv, Value: strconv.Itoa(credentialProxyPort)},
+		// The metrics-only listener's port (see credentialProxyMetricsPort). In
+		// the managed set, so a spec.deployment.env entry cannot move the
+		// listener off the port the container declares and the policy admits.
+		{Name: credentialProxyMetricsPortEnv, Value: strconv.Itoa(int(credentialProxyMetricsPort))},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
@@ -4125,7 +4150,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
-		"CREDENTIAL_PROXY_PORT",
+		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
+		// and so reserved there by the loop above; listed for buildAgentAPIAuthEnv,
+		// whose managed set carries neither, and whose credential_proxy.py parses
+		// CREDENTIAL_PROXY_PORT as an integer before the api-proxy role returns.
+		credentialProxyPortEnv,
+		credentialProxyMetricsPortEnv,
 		"CREDENTIAL_PROXY_ROLE",
 		// Same argument as the authentication settings above, one layer over.
 		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch
@@ -5153,7 +5183,27 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
-// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf.
+//
+// Three parser passes run over every line the sidecar tails. gchat_event lifts
+// the chat user and session out of the gateway's own lines. The other two are
+// the audit trail's: hermes_audit_line recognises a line the tool_call_audit
+// plugin or the chat_message_audit hook wrote — Hermes' timestamp, level and
+// logger name, then one JSON object — and captures the object as audit_json;
+// audit_json then decodes it into top-level fields and drops the capture. A
+// line neither parser matches passes through untouched, and the raw line stays
+// under `log` either way, so Cloud Logging carries the record's fields as its
+// own jsonPayload keys (event_type, tool, status, ...) beside the text every
+// existing reader still greps. The lift is what makes an audit record
+// filterable without a regex; the record's shape is common/audit_schema.py's.
+//
+// The line prefix the regex reads is Hermes' own log format, which this
+// repository does not own: `%(asctime)s %(levelname)s%(session_tag)s %(name)s:
+// %(message)s` in the pinned image's hermes_logging.py, where session_tag is
+// ` [<session id>]` on a record emitted on a thread that holds a session
+// context and empty otherwise. Both forms have to match, or the records of
+// tools Hermes runs inline on the turn thread would pass through unlifted and
+// silently. TestFluentBitLiftsAuditRecordsIntoFields carries a sample of each.
 func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -5192,6 +5242,22 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Preserve_Key  On
 
 [FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      log
+    Parser        hermes_audit_line
+    Reserve_Data  On
+    Preserve_Key  On
+
+[FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      audit_json
+    Parser        audit_json
+    Reserve_Data  On
+    Preserve_Key  Off
+
+[FILTER]
     Name              record_modifier
     Match             agent.logs
     Record            app agent
@@ -5206,6 +5272,15 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name    gchat_event
     Format  regex
     Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+[PARSER]
+    Name    hermes_audit_line
+    Format  regex
+    Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+[PARSER]
+    Name    audit_json
+    Format  json
 `,
 		},
 	}

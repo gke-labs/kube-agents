@@ -13,7 +13,7 @@ nothing answers on that subject yet - the worker adapter (W4) fast-follows, and 
 dispatcher is stage 3. The bridge is the stand-in executor: a small Go daemon on
 `a2a/lib` that consumes tasks addressed to `platform`, runs
 `hermes -p platform chat -Q -q <prompt>` per task, and publishes the lifecycle events with
-the output as the `result` artifact. It is scaffolding with a planned demolition date:
+the output as the `result` artifact and the persona's tool calls as `activity`. It is scaffolding with a planned demolition date:
 when the dispatcher and worker adapter land, the bridge retires. Nothing here is
 protocol - the wire contract is the payload spec's, unchanged.
 
@@ -58,16 +58,20 @@ gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
-One provenance note: the bridge image is CI-only. `a2a/Dockerfile.hermes-bridge` builds it
-(`FROM` the platform-agent image plus the one static binary above), and
-`deploy/docker/cloudbuild-ci.yaml` builds it in its `a2a-bridge` step when `hack/ci-deploy.sh`
-runs under `EVAL_MODE_NEXT=1`, `FROM` the platform-agent image that same build produced,
-by the tag it just pushed and never from a registry default, so the sidecar and the agent
-container it shares a pod with are one build; the deploy then declares it on the CR for
-the eval install (`docs/designs/eval-next-transport.md`, "The CI flag"). It is not in
-`images.json` (`hack/check-image-inventory.sh` states the exclusion) and not release
-surface; it joins the release surface at stage-2 graduation or dies before it, whichever
-the dispatcher decides.
+One provenance note: the bridge image is release surface. `a2a/Dockerfile.hermes-bridge`
+builds it (`FROM` the platform-agent image plus the one static binary above), the release
+workflow publishes it as `hermes-bridge` beside the other first-party images, `FROM` the
+platform-agent image the same run pushed under the same commit tag, and `images.json`
+carries it with no operator override, since the operator renders no bridge and the
+sidecar's image is the CR's. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own
+in its `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+platform-agent image that same build produced, by the tag it just pushed and never from a
+registry default; the deploy then declares it on the CR for the eval install
+(`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
+container it shares a pod with are one build. The static `bridge` bus user the next section
+describes is the released mechanism, not scaffolding graduation removes: the password arrives
+as sidecar env from the operator's creds Secret, and it stays a password principal for the
+reason given there.
 
 ## Bus user and grants
 
@@ -183,9 +187,19 @@ returns nothing for entries written after the upgrade.
 ## Lifecycle, steering, cancel
 
 Per task: `submitted` on accept (before the consumer ack, so a bridge death before the
-ack just redelivers), `working` when the subprocess spawns, the stdout as a `result`
-artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
-exit is terminal `failed` with the exit code and a stderr tail in the status message. A
+ack just redelivers), `working` when the subprocess spawns, the persona's tool calls as
+an `activity` artifact and a heartbeat as a `progress` artifact while it runs ("Activity"
+below), the stdout as a `result` artifact (chunked if large), one terminal
+`status-update` with `final: true`. A nonzero
+exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
+exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
+and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
+is the last thing the CLI writes before exiting), so the transcript under the profile's session
+store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
+gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
+which the eval harness classes as infrastructure rather than the persona's failure (the image patch
+`apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
+already did). A
 submission with no text parts is terminal `rejected`. New-task detection is the
 dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
 alone (profiles spec). The bridge satisfies that without a change of its own, because it
@@ -265,6 +279,109 @@ the units in flight plus anything abandoned and not yet cancelled, well under th
 capacity. `hack/ci-deploy.sh` declares that sidecar under `EVAL_MODE_NEXT=1` and sets
 `BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`.
 
+## Activity: the persona's tool calls, and a heartbeat
+
+Under `-Q` hermes writes nothing to stdout until the final response, so the pipe the
+bridge holds says nothing about tool calls while the run is on. What hermes does offer is
+its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs every
+`pre_tool_call` and `post_tool_call` to a URL, fire-and-forget through a bounded queue,
+HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
+for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
+`127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
+listener on 8643; `off` closes the door) and hands each child the entry through hermes's
+managed scope: before spawning, it writes a per-task directory holding the operator's
+managed `config.yaml` with a `hooks.outbound` entry added (URL the door actually bound,
+`secret_env: A2A_ACTIVITY_SECRET`, appended to any entry the operator's own managed config
+carries; a `hooks` or `hooks.outbound` of another shape fails the spawn like an unreadable file, and
+the copy keeps the operator's numbers as written) and the managed `.env` verbatim, and names it in the child's `HERMES_MANAGED_DIR`
+(the source is `$HERMES_MANAGED_DIR` as the sidecar sees it, else `/etc/hermes` when it
+exists; `BRIDGE_SCRATCH_DIR` is where the copies live: made if absent while the door is open, and
+with the door closed a scratch dir that cannot be made or read is logged and the bridge starts,
+since nothing is written there; each copy removed when
+its child exits, the ones a previous incarnation left (its direct subdirectories that carry the
+bridge's own marker file, whatever their name, nothing else in it and never the directory
+itself) removed when the bridge starts, and
+none written at all when the source exists but cannot be read, since a child on a hook-only
+scope would run without the operator's pins). The
+hook therefore exists only in processes the bridge spawned: a kanban worker or cron tick
+under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
+and nothing about the profile's shipped config or the image changes for it.
+
+Nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
+fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
+does not expand environment variables. So the bridge gives each child a random key in its
+environment under `A2A_ACTIVITY_SECRET` (and the door's URL under `A2A_ACTIVITY_URL`, for
+the record; hermes reads the URL from its config), and a delivery belongs to whichever in-flight
+task's key verifies its signature — at most `BRIDGE_CONCURRENCY` keys to try. Unsigned or
+unmatched deliveries are answered 204 and dropped.
+
+What goes on the bus, one `data` part per invocation at `post_tool_call`, a superset of the
+worker adapter's `{"tool","input"}` so one fold reads both executors:
+
+```json
+{
+  "tool": "mcp__gke__list_clusters",
+  "input": { "project": "p" },
+  "callId": "call_01",
+  "status": "completed",
+  "durationMs": 2130,
+  "at": "2026-09-25T20:01:02Z"
+}
+```
+
+`status` is `completed` or `error` from the hook's own verdict, and on `error` an
+`errorType` keeps hermes's word for it (`blocked`, `cancelled`, `timeout`, `tool_error`),
+so a guardrail refusal stays distinguishable from a tool failure. hermes retries a delivery
+that timed out, so each is remembered by its id (the most recent 8192 per task) and a retry is one call. A call still open when the
+task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the door could not
+read (logged, not counted, since the call is then in the trace; an unreadable `pre_tool_call`
+costs nothing, its `post` carries the record whole) — is flushed as `interrupted` inside
+the finalize lock, ahead of the result and the terminal, so the trace is complete and
+nothing of it follows the final event. What of the input is published is its **shape**: its
+structure with every string value replaced by `<string, N chars>` and every key that is not
+shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
+`<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
+wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
+name, a wrapper's nested names). No grammar tells a resource name from a credential under the
+same key, so none is attempted, no string value rides the trace under any key, and there is no
+value scrub to have a reach: a credential a model pastes into a terminal command is one string
+under `command` and ships as a length. Values under keys with `token`, `secret`, `password`,
+`passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,
+`signing_key`, `key_data`, `cookie` or `credential` as a whole component (`access_token`,
+`SECRET_KEY`, `accessToken`, `clientSecret`, `SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`,
+`client-key-data`, `Cookie`; not `tokenizer`, and not a key that opens with the word and goes on
+as a name, reference or location, `secretName`, `tokenPath`) are replaced by `[redacted]` before
+the shaping, so the trace still says a secret-looking key was there. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
+large file write is a few MiB); a larger one is refused and logged, and since the cut body cannot
+be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
+over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
+small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
+terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. `input` is capped (2 KiB): over the cap it becomes
+`{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
+where each nested call's `arguments` is capped on its own so the nested tool names stay
+readable. Tool results are not published: no check
+reads them and they are the riskiest payload in the pod. One task publishes at most 3000
+trace and progress parts together: the task's events subject is capped at 4096 messages, and
+a looping persona publishing without bound would evict its own `submitted` and `working`. The
+two have shares of their own: the heartbeat 120 (one a minute for the default two-hour
+deadline), the trace the rest, so the heartbeat keeps going on exactly the run that spends the
+trace's share, and an interval short enough to spend the heartbeat's share silences the
+heartbeat and never the trace. Past the trace's share, calls are counted and one entry, `tool` `activity-budget` with `status`
+`truncated` and `dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
+part; the relay drops the artifact on purpose (debug and audit views never render to
+chat), and the inject door's probe is where a reader sees it.
+
+The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
+60; 0 turns it off, and a count a duration cannot hold is refused with a log line and the
+default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed
+the count has nothing to move it, so the line says so instead: `running 1m30s, tool trace off`.
+The relay renders progress as one edited rolling line, so this is one chat edit per minute,
+and it is what tells a stuck task from a slow one from outside the pod.
+
+Trust boundary, stated: everything in the pod is reachable from the persona's own terminal
+tool, its environment included. The trace is "as reported by the executor's process", the
+worker adapter's posture too; the key rejects cross-talk, not adversaries.
+
 ## Supervision
 
 The bridge finalizes its own orphans, which is not the same as being their supervisor.
@@ -318,9 +435,17 @@ dispatcher, not to scaffolding with a demolition date.
 
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
 path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
-dispatcher's job when it exists), no heartbeats on `agents.hb.>`, a submission whose
-events lookup fails transiently is dropped with a log line rather than redelivered (the
-lib acks unconditionally after the handler; a nak path is a lib delta if it ever bites),
+dispatcher's job when it exists), no heartbeats on `agents.hb.>` (the `progress` heartbeat
+above is on the task's own subject, for its readers, not a liveness signal for a
+supervisor), a submission whose
+events lookup keeps failing is dropped with a log line rather than redelivered (a new
+submission's lookup is answered by the direct horizon gets and opens no consumer, so it gets
+one quick retry for a bus hiccup; an orphan cancel's lookup opens the consumer and can be
+refused at the TASKS cap, so a failure from before the consumer existed is retried over six
+seconds, past the inactive threshold the refusal clears on, and a failure from after it is not,
+since that consumer is live and another attempt would open another; the lib acks
+unconditionally after the handler, so a lookup a shutdown interrupts is also dropped, and a nak
+path is a lib delta if a persistent failure ever bites),
 and a terminal publish that fails outright - a bus outage outlasting the finalize
 budget at exactly that moment - leaves the task in the registry for the NEXT
 incarnation's sweep, which may be far away on a healthy sidecar; until then the bridge

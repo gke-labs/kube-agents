@@ -187,7 +187,8 @@ true
 {{- end }}
 
 {{/*
-Whether the gateway PodMonitoring renders. platformAgent.podMonitoring is a
+Whether the agent's PodMonitorings render, the gateway's and the credential
+broker's. platformAgent.podMonitoring is a
 tri-state: true and false are answers, and null (the default) follows the
 cluster — the PodMonitoring API is served where GKE Managed Prometheus is
 installed and nowhere else, so an install on a cluster without it takes no

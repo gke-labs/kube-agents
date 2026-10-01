@@ -231,8 +231,19 @@ func TaskReplaySubjects(addressee, taskID string) []string {
 // wherever the stream put it, and whichever came second is the post-final
 // drop.
 func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task, error) {
-	task, _, err := c.tasksGet(ctx, addressee, taskID)
+	task, _, _, err := c.tasksGet(ctx, addressee, taskID)
 	return task, err
+}
+
+// TasksGetOpened is TasksGet plus whether the read opened an ordered consumer
+// on the TASKS stream, reported on an error as well as on success, the way
+// TaskInReplay reports it: a caller that retries a failed read needs to know
+// whether the failure came before the consumer existed (a creation refusal,
+// such as the stream's consumer cap, which clears) or after (a consumer is
+// now live for the inactive threshold, and a retry would open another).
+func (c *Client) TasksGetOpened(ctx context.Context, addressee, taskID string) (*Task, bool, error) {
+	task, _, opened, err := c.tasksGet(ctx, addressee, taskID)
+	return task, opened, err
 }
 
 // TasksGetAttributed is TasksGet plus the subject the terminal arrived on:
@@ -242,23 +253,27 @@ func (c *Client) TasksGet(ctx context.Context, addressee, taskID string) (*Task,
 // bare envelopes and the live fold and the replay must stay equal (assertion
 // 11); which subject carried the terminal is a fact about the replay.
 func (c *Client) TasksGetAttributed(ctx context.Context, addressee, taskID string) (*Task, string, error) {
-	return c.tasksGet(ctx, addressee, taskID)
+	task, subject, _, err := c.tasksGet(ctx, addressee, taskID)
+	return task, subject, err
 }
 
-func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, string, error) {
+// tasksGet's third result is replay's found: true from the moment the
+// ordered consumer was created, which is also when a later error leaves a
+// consumer live for the inactive threshold.
+func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task, string, bool, error) {
 	events, eventSubjects, found, err := c.replay(ctx, TaskReplaySubjects(addressee, taskID), taskID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", found, err
 	}
 	if !found {
 		// No events in the retention window: the A2A answer is
 		// TaskNotFound, not an empty Task indistinguishable from a broken
 		// one.
-		return nil, "", &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
+		return nil, "", false, &A2AError{Code: CodeTaskNotFound, Message: fmt.Sprintf("task %q has no events in the retention window", taskID)}
 	}
 	task, err := FoldTask(taskID, events)
 	if err != nil {
-		return nil, "", err
+		return nil, "", true, err
 	}
 	terminalSubject := ""
 	if task.Final {
@@ -281,7 +296,7 @@ func (c *Client) tasksGet(ctx context.Context, addressee, taskID string) (*Task,
 		c.log.Warn("a2a task replayed without its submitted event",
 			"task", taskID, "events", len(events), "opensAt", opensAt)
 	}
-	return task, terminalSubject, nil
+	return task, terminalSubject, true, nil
 }
 
 // TaskInReplay replays a task's `…in` subject in stream order — the

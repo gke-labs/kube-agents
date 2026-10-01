@@ -27,6 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EVENT_NAME="${EVENT_NAME:-workflow_dispatch}"
 MODE="${SCHEDULE_GATE:-bypass}"
 TARGET_COMMIT="${TARGET_COMMIT:-}"
+RELEASE_LINE="${RELEASE_LINE:-}"
 
 if [ "${EVENT_NAME}" = "schedule" ]; then
   MODE="evaluate"
@@ -44,6 +45,24 @@ if [ -n "${TARGET_COMMIT}" ] && { [ "${MODE}" = "evaluate" ] || [ "${MODE}" = "d
   echo "   target_commit '${TARGET_COMMIT}' cannot be set alongside it. Use schedule_gate" >&2
   echo "   'bypass' to release a named commit, or clear target_commit to run the gate." >&2
   exit 1
+fi
+
+# A release line is a hand-dispatched patch from its own branch. The resolver
+# reads main's staging graph and the cron never cuts a line, so the two
+# resolver-consulting modes have nothing to say about one; and the line names
+# its own candidate, so a target commit beside it is the same two-questions
+# shape as above.
+if [ -n "${RELEASE_LINE}" ]; then
+  if [ "${MODE}" = "evaluate" ] || [ "${MODE}" = "dry-run" ]; then
+    echo "❌ ERROR: release_line '${RELEASE_LINE}' is a dispatched patch release; schedule_gate '${MODE}'" >&2
+    echo "   reads main's gate and cannot decide it. Use schedule_gate 'bypass'." >&2
+    exit 1
+  fi
+  if [ -n "${TARGET_COMMIT}" ]; then
+    echo "❌ ERROR: release_line '${RELEASE_LINE}' releases the line's own head; target_commit" >&2
+    echo "   '${TARGET_COMMIT}' cannot be named alongside it." >&2
+    exit 1
+  fi
 fi
 
 emit() {

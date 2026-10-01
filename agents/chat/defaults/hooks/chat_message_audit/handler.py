@@ -12,6 +12,7 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[2] / "plugins")
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
+from common.audit_schema import envelope  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
 logger = logging.getLogger("hermes.hook.chat_message_audit")
@@ -28,14 +29,19 @@ def _truncate(value: Any) -> str:
 
 def _emit(audit_event: str, context: Dict[str, Any]) -> None:
     ctx = context or {}
-    record = {
-        "audit_event": audit_event,
-        "platform": ctx.get("platform", ""),
-        # On Google Chat this field is the user's address, so it needs the same
-        # pseudonymisation the tool-call audit applies.
-        "user_id": AuditRedactor.pseudonymise_identity(ctx.get("user_id", "")),
-        "session_id": ctx.get("session_id", ""),
-    }
+    # On Google Chat the user field is the user's address, so it needs the same
+    # pseudonymisation the tool-call audit applies; `principal` is the same
+    # pseudonym under the structured schema's name.
+    principal = AuditRedactor.pseudonymise_identity(ctx.get("user_id", ""))
+    record = envelope(
+        audit_event,
+        {
+            "platform": ctx.get("platform", ""),
+            "user_id": principal,
+            "principal": principal,
+            "session_id": ctx.get("session_id", ""),
+        },
+    )
     if "message" in ctx:
         record["message"] = _truncate(ctx.get("message"))
     if "response" in ctx:

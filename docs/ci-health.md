@@ -3,7 +3,8 @@
 Every 15 minutes `.github/workflows/ci-health.yml` refreshes the eval dashboard
 (the incremental collect → render → publish that `hack/ci-dashboard-refresh.sh`
 runs, split across two identities: `github-actions@kube-agents-prow` reads the
-Prow archive, `eval-dashboard-publisher@kube-agents-prow` writes the bucket),
+Prow archive and the log buckets kube-agents owns,
+`eval-dashboard-publisher@kube-agents-prow` writes the bucket),
 then `scripts/eval_dashboard/health.py` reads the `data.json` just collected,
 decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 **OUTAGE** and why, and writes `health.json` next to it — before the render, so
@@ -19,7 +20,9 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
 ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
-one when they stop ([below](#a-backed-up-pool)).
+one when they stop ([below](#a-backed-up-pool)), plus, for the watched Prow
+periodics, one when a run fails or a job stops and one when it passes again
+([below](#the-watched-periodics)).
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
@@ -70,7 +73,8 @@ that say the pool check itself is not reporting — `wait unknown` and `pool
 check stopped` — link to the periodic's job history instead, the one place
 that shows whether it has started running again. `queue clear` and the two
 data-freshness messages carry no link: what they report is the absence of
-something to show. The scope rides in the URL
+something to show. The watched-periodic messages link to the job's Deck
+history; the passed-again one carries no link. The scope rides in the URL
 fragment because the host's login redirect drops a query string and a browser
 carries the fragment through the redirect.
 The contract, and the older `?cases=…#gate` form the pages still read (it
@@ -357,6 +361,73 @@ of the note while it lasts. The Brief's lede carries the same numbers. There
 is no tile for it: the tiles recompute for the reader's date range, and the
 wait is a fixed 24-hour figure that is not in the run data.
 
+## The watched periodics
+
+Three Prow periodics keep the pool in shape from outside any run, and until this
+rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
+(the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
+reconcile, hourly against the drifted projects and weekly against every free
+one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+per job with its label, its stale window, the report it writes, and the words
+its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
+latest builds` step reads each job's `latest-build.txt` from
+`gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
+identities cannot write the Prow archive),
+walks back to a build with a `finished.json` (the newest is often still
+running), keeps the job's report when the build wrote one (the reconcile's
+`fleet-reconcile.json`, the sweep's `pull-sweep.json`), and hands the readings
+to `health.py --periodics-dir`.
+
+Like the pool note it rides beside the state and never becomes one. A job whose
+latest finished build failed is a `FAILED` note, once it is news: the sweep runs
+every ten minutes and this tick reads its latest finished build every fifteen,
+so the unit is the check, not the build (one sweep build in three is never
+read), and one failed check followed by a clean one is a flap. The sweep's note
+waits until two consecutive checks have failed; the reconciles' first failed
+build is the news. Any project's failure fails a sweep run, so a per-project
+threshold could never fire before the run's; the per-project counts name, in
+the message, the projects that failed in this check and the ones before it.
+The counts are `periodics_streaks` in `health.json`, advanced once per newly
+read build and carried across ticks; a failed build that did not reach a
+project (busy) keeps its count, and a clean build clears every count. A tick
+that could not fetch the previous `health.json` has no counts to carry, so it
+notes any failed build rather than hide one already told. A
+recovery needs a build that passed: a failed check under the threshold writes
+no note and is not one. One whose latest finished
+build is older than its stale window (an hour for the sweep, three for the
+hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
+verdict, measured on the wall clock rather than data.json's horizon, as the
+pool note is. The note carries the build, when it finished, `since` (kept for
+the job across ticks through the previous `health.json`, ticks with no reading
+for that job included), the job's history link, the runbook link, the words the
+message is built from (where the job acts, what stops happening when it fails
+and resumes when it recovers, what it does and how often, what a failure costs),
+a one-line summary of what the run did from its report, and the report's detail
+lines, up to five: for the reconcile the projects it refused, failed or was
+interrupted in with each one's reason; for the sweep the projects whose sweep
+failed with GitHub's answer, what the run left for the next one under its write
+budget, the projects it did not reach after stopping, and why it stopped if it
+did. `periodics_runs` carries every read
+job's latest build and its summary, which is what the recovery message says. A
+job with no reading writes no note and ends none: that is the bot losing sight
+of the job, not the job recovering.
+
+The poster sends one message per episode and verdict: a job's first failing
+build (in orange; a newer build that fails the same way is not news, and the
+digest carries it daily), a job that has stopped (in grey, whether or not its
+last build failed; the same grey when its latest build carries no readable
+finish time, since the window cannot be measured), and one when a job the space
+was told about passes again, on a reading only. The failed and stopped
+messages are four lines, the failed one with the report's detail lines under its
+second: a headline naming where and what stopped happening ("Eval GitOps repos:
+leftover pull requests from eval runs are not being cleaned up"); the job, what
+it does and how often, which run and how it failed; the effect and the scope
+("CI eval infrastructure only"); the runbook link and the build link. The
+recovery is one line naming the run and what it did ("closed 241 pull request(s)
+across 12 project(s)"). The digest carries one line per open note. Nothing here
+files an issue: the recovery is a person's, and the failed and stopped messages
+link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
+
 ## The comment on a red pull request
 
 Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
@@ -616,12 +687,12 @@ line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
 instead. The recovery comments on it as on any other.
-Once its `oss-test-infra` entry exists, the hourly `ci-kube-agents-fleet-reconcile`
+The hourly `ci-kube-agents-fleet-reconcile`
 periodic re-applies the stack in the projects the scan names
 (`docs/ci-pool-projects.md` §6.2), and the
 recovery comment follows the first scan after that apply, one to two hours
-after the report. No recovery by then is a drift the re-apply did not fix, a
-plan it refused, an apply that failed, or a project leased each time the
+after the report. No recovery by then is the periodic still in `--dry-run`
+(its first week), a drift the re-apply did not fix, a plan it refused, an apply that failed, or a project leased each time the
 hourly ran; the periodic's own log says which.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
@@ -647,8 +718,8 @@ The verifier is the one implementation; the scan runs it and reads its report.
 `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
-Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the two GitHub checks
-that need a credential the bot must not hold (an org member's `gh`, the ledger App's key), the mapping (about the checkout).
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
+(`github_repo_and_app`, `gitops_declaration`, `ledger_read_credential`; each needs a credential the bot must not hold), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,
@@ -724,8 +795,10 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `metrics`,
-`dashboard_url`, `generated_at` — plus `tick`, the ISO 8601 UTC time the line
+`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
+`pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
+`periodics_since`, `metrics`, `dashboard_url`,
+`generated_at` — plus `tick`, the ISO 8601 UTC time the line
 was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled
 refresh shows as many ticks sharing one `generated_at`. GCS has no append: the

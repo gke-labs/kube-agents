@@ -31,4 +31,30 @@ spec:
     - port: 9095
       path: /metrics
       interval: 30s
+---
+{{- /*
+The credential broker's metrics-only listener (credentialProxyMetricsPort in the
+operator): brokered tool invocations by tool, subcommand and outcome, their
+latency, and the credentialed listener's request counts. Its own PodMonitoring
+because the broker is its own pod with its own labels; the same switch, because
+an install scrapes the agent's pods or none of them. The selector is the
+operator's broker selector and the port is the metrics-only one, never 8765:
+the credentialed listener admits no collector.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  endpoints:
+    - port: 8766
+      path: /metrics
+      interval: 30s
 {{- end }}

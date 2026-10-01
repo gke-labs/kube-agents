@@ -554,6 +554,9 @@ the remote's default branch, the broker enforces protected branch policy on
 `/v1/vcs/publish`: `main`, `master`, `production`, any operator-configured base
 override (`CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH`), and any `run/**`
 branch are strictly refused without a pull request (`PROTECTED_BRANCH`, status 409).
+`/v1/vcs/branch-delete` refuses to remove any of them, whatever proposals exist:
+outside `platform-agent/` as `BRANCH_NOT_OURS`, inside it (a default branch or
+base override under the prefix) as `PROTECTED_BRANCH`.
 Across the broker's other write doors, protected branch policy is enforced under
 their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
 with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
@@ -799,8 +802,10 @@ another for no property gained.
 | `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                         |
 | `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                |
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                 |
+| `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                     |
+| `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                    |
 
-The rows down to `issue-create` are the version-control skill's. The rest are the union of
+The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
@@ -825,9 +830,61 @@ authenticated — a CLI reads its login out of its credential store, an HTTP
 client asks the current-user route — and the other half, `canWrite`, is the
 forge's normalised answer to a question every forge spells differently.
 
+`branch-view` and `branch-delete` exist because a branch name outlives its
+proposal. A squash merge or a close leaves the source branch on the remote at a
+revision the base does not contain — on GitHub by default, and on somebody
+else's repository not a setting this install controls — so a branch cut afresh
+under the same name does not build on it and its publish is refused as
+`BRANCH_DIVERGED`. Every flow that derives a branch name from what it is fixing
+(one name per workload, so a repeat alert finds the earlier pull request) meets
+this on its second run. `branch-view` answers whether the remote holds the
+branch and at what revision; `branch-delete` removes a spent one. Both are broker
+verbs — the question is `ls-remote` and the delete is a push, identical on every
+forge — but the delete's gate needs `proposal-list`, so a forge without it does
+not list `branch-delete` in `capabilities` and is refused `FORGE_UNSUPPORTED`. The skill spells them `remote-branch view|delete`,
+because `branch` is already the local verb.
+
+The delete is held to exactly that one case. The branch must be under the
+install's own prefix (`BRANCH_NOT_OURS` otherwise); it must not be protected, by
+the rule `publish` applies (`PROTECTED_BRANCH`); no proposal from it may be open
+(`OPEN_PROPOSAL`), and no open proposal may target it, since deleting a
+proposal's target closes it (`BRANCH_NOT_OURS`); and its tip must be the revision some merged or closed
+proposal from it carried (`NOT_SPENT`), so a branch that moved on after its
+proposal closed keeps the revisions no proposal holds. The comparison is sound
+only because GitHub freezes that revision when the proposal closes rather than
+following the branch; a forge whose closed proposals keep tracking their branch
+cannot serve `branch-delete` until it reports the revision at close. The prefix is a convention anyone who can push
+can use, so the proposal that carried the tip must also be this install's —
+opened from this repository by the credential's own login — and no proposal
+from it may be anybody else's, or the delete is `BRANCH_NOT_OURS` too — a
+history that fills the one page the broker reads (the largest one call
+returns) included, since that page cannot show the rest; a
+credential that cannot name itself leaves the prefix and the same-repository
+rule as the bar, as it does for `advance`. That bar holds against a mistake,
+not against the caller itself, which can open and close a proposal on a branch
+with `proposal-create` to make its tip carried. It still cannot lose work that
+way: the revision stays reachable from the proposal it opened, and a branch a
+person proposed from stays refused. `revision` is the tip the
+caller read, and the push is conditional on it: a sibling that published to the
+name in between wins, and the delete is refused `BRANCH_MOVED`. A branch already
+gone is answered `deleted: false`, not refused — the caller wanted it gone.
+A remote that answers the delete with a refusal of its own — a branch rule or
+hook, or a credential without the right — is `DELETE_REFUSED`, not
+`GIT_FAILED`: it answers every attempt alike, so the name is not usable and a
+retry is pointless.
+The gate does not know which flow kept a branch on purpose: fleet-audit leaves a
+closed remediation pull request's branch in place so the fix can be proposed
+again on it, and that branch passes every check above. Keeping it is that skill's
+instruction, not the broker's refusal.
+`submit-suggestion prepare` makes this call itself whenever a spent proposal's
+tip is not in the fresh copy, so no caller has to know which setting the
+repository has.
+
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
-`TARGET_IS_BRANCH`, `CLONED_BRANCH` and `PROTECTED_BRANCH`, 502 `GIT_FAILED`.
+`TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `BRANCH_NOT_OURS`,
+`OPEN_PROPOSAL`, `BRANCH_MOVED`, `NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
 is written for the reader it has. That reader is a model choosing its next tool
@@ -2404,13 +2461,18 @@ that question.
 read of a large upstream repository, and there is no shallow option to make it
 cheaper.
 
-Throttling is legible to the agent and not to an operator.
+Throttling is legible to the agent and only partly to an operator.
 [Where the error contract splits](#where-the-error-contract-splits) puts the
-counters on the broker, but there is no Python metrics surface in this
-repository for them to join — the only convention that exists belongs to a
-single Go binary — so what they are called and what scrapes them is settled
-elsewhere, and until it is, an install approaching its token quota is visible in
-the broker's logs and nowhere else. The refusal is also thinner than it could
+counters on the broker, which now has a metrics surface for them to join: the
+`kubeagents_*` families the credential-proxy Pod serves and the chart's
+`<name>-credential-proxy-monitoring` scrapes
+([Concepts → Observability](../site/src/content/docs/concepts/observability.md)).
+The per-provider throttle counters that section assigns to the broker have not
+been added to it, so until they are, an install approaching its token quota is
+visible in the broker's logs and, by status code alone, as `429`s under
+`endpoint="/v1/vcs"` in `kubeagents_credential_proxy_requests_total`, the route
+family every forge verb travels (`/v1/forge` reaches only the credential
+refresh, which spends no quota). The refusal is also thinner than it could
 be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
 telling it when, and the `Retry-After` and `RateLimit-*` values both forges
 return are read to classify the failure and then dropped rather than carried
@@ -2431,8 +2493,8 @@ other path to a credential is not this design's question to answer, and
 [`../credential-isolation-design.md`](../credential-isolation-design.md) is where
 it is answered. What it does not buy
 is protection against the model being talked into an action it is allowed to
-take. `publish`, `proposal create` and `issue create` are reachable to any agent that
-can reach the read verbs, so an install that wants an agent to read history
+take. `publish`, `proposal create`, `issue create` and `branch-delete` are reachable
+to any agent that can reach the read verbs, so an install that wants an agent to read history
 without being able to write to a forge has no way to say so. A read-only mode is
 the smallest thing that would fix it, and it is not designed here.
 

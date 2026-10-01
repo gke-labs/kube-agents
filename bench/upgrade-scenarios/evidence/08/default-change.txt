@@ -1,0 +1,36 @@
+
+## 2026-09-29T13:51:54Z [default-change/before] K -n scen get pods -l app=gitrepo -o wide
+NAME                              READY   STATUS    RESTARTS   AGE   IP          NODE                                 NOMINATED NODE   READINESS GATES
+gitrepo-legacy-7b58df69db-b76lg   1/1     Running   0          91s   10.52.1.5   gke-upg-08-work-pool-db34e5e8-lwqg   <none>           <none>
+## exit 0
+
+## 2026-09-29T13:51:55Z [default-change/before-events] K -n scen get events --sort-by=.lastTimestamp -o custom-columns=T:.lastTimestamp,R:.reason,M:.message
+T                      R                   M
+<nil>                  Scheduled           Successfully assigned scen/gitrepo-legacy-7b58df69db-b76lg to gke-upg-08-work-pool-db34e5e8-lwqg
+2026-09-29T13:50:24Z   SuccessfulCreate    Created pod: gitrepo-legacy-7b58df69db-b76lg
+2026-09-29T13:50:24Z   ScalingReplicaSet   Scaled up replica set gitrepo-legacy-7b58df69db from 0 to 1
+2026-09-29T13:50:28Z   Pulling             Pulling image "busybox:1.36"
+2026-09-29T13:50:44Z   Pulled              Successfully pulled image "busybox:1.36" in 1.486s (16.256s including waiting). Image size: 2217006 bytes.
+2026-09-29T13:50:44Z   Created             Created container: reader
+2026-09-29T13:50:44Z   Started             Started container reader
+## exit 0
+
+## 2026-09-29T14:05:39Z [default-change/after] K -n scen get pods -l app=gitrepo -o wide
+NAME                              READY   STATUS              RESTARTS   AGE     IP       NODE                                 NOMINATED NODE   READINESS GATES
+gitrepo-legacy-7b58df69db-w6p9n   0/1     ContainerCreating   0          3m15s   <none>   gke-upg-08-work-pool-db34e5e8-dedt   <none>           <none>
+## exit 0
+
+## 2026-09-29T14:05:39Z [default-change/after-events] K -n scen get events --sort-by=.lastTimestamp -o custom-columns=T:.lastTimestamp,R:.reason,M:.message
+T                      R                   M
+<nil>                  Scheduled           Successfully assigned scen/gitrepo-legacy-7b58df69db-b76lg to gke-upg-08-work-pool-db34e5e8-lwqg
+<nil>                  Scheduled           Successfully assigned scen/gitrepo-legacy-7b58df69db-w6p9n to gke-upg-08-work-pool-db34e5e8-dedt
+2026-09-29T13:50:24Z   SuccessfulCreate    Created pod: gitrepo-legacy-7b58df69db-b76lg
+2026-09-29T13:50:24Z   ScalingReplicaSet   Scaled up replica set gitrepo-legacy-7b58df69db from 0 to 1
+2026-09-29T13:50:28Z   Pulling             Pulling image "busybox:1.36"
+2026-09-29T13:50:44Z   Pulled              Successfully pulled image "busybox:1.36" in 1.486s (16.256s including waiting). Image size: 2217006 bytes.
+2026-09-29T13:50:44Z   Created             Created container: reader
+2026-09-29T13:50:44Z   Started             Started container reader
+2026-09-29T14:02:24Z   Killing             Stopping container reader
+2026-09-29T14:02:24Z   SuccessfulCreate    Created pod: gitrepo-legacy-7b58df69db-w6p9n
+2026-09-29T14:04:33Z   FailedMount         MountVolume.SetUp failed for volume "repo" : git-repo volume plugin has been disabled; if necessary, it may be re-enabled by enabling the feature-gate `GitRepoVolumeDriver`
+## exit 0

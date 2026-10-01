@@ -11,8 +11,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the state changes plus one digest a day (scripts/eval_dashboard/
 # post_health.py). docs/ci-health.md explains the states, the rules and the
 # advice each one carries. The data and the verdict are fresh together; the
-# one input fetched outside that collect is pool-pressure's hourly artifact
-# (#1607), and it is optional -- its absence just drops the queue-wait note.
+# inputs fetched outside that collect -- pool-pressure's hourly artifact
+# (#1607), the watched periodics' latest builds and the rest -- are optional;
+# an absence just drops its note.
 # The order is adjudicate ->
 # upload health.json -> append history -> render -> publish -> post ->
 # comment, so the Brief a reader opens from a message already shows the
@@ -26,7 +27,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
 #      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
-#      (kube-agents-owned; it holds objectViewer there too, and whichever
+#      and the watched periodics' gs://kube-agents-periodic-logs (both
+#      kube-agents-owned; it holds objectViewer on each, and whichever
 #      account replaces it needs the same), the eval evidence store
 #      gs://kube-agents-evals-bench (objectViewer, for the Trend page;
 #      best-effort, and incremental against the store.json the last tick
@@ -411,6 +413,21 @@ jobs:
               > work/pool-pressure.json
           fi
 
+      # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
+      # the pull sweep and the two seeded-fleet reconciles): their latest
+      # finished build each, for the note health.py carries and the poster
+      # sends once when one fails or stops running. Best-effort like the
+      # read above: a job that has never run writes nothing, a denied read
+      # warns, and neither fails the tick.
+      - name: Fetch the watched periodics' latest builds
+        continue-on-error: true
+        # Bounded: a hung read here would otherwise run into the job's
+        # 30-minute timeout, which cancels the verdict, the render and the post.
+        timeout-minutes: 5
+        run: |
+          mkdir -p work/periodics
+          python3 scripts/eval_dashboard/periodics.py fetch --out-dir work/periodics
+
       # The Trend page's input, still as the reader (step A). Best-effort by
       # construction: whatever stops the read (a failed listing, store.py
       # killed by its timeout or crashed, no wall clock left after the
@@ -516,7 +533,8 @@ jobs:
           # the bot filed so health.json can cite it, and for the pool
           # episode's start across a tick that read no artifact.
           # --fixture-state and --pool-state are the hourly scans' documents,
-          # for the fixture_drift and pool_drift conditions.
+          # for the fixture_drift and pool_drift conditions. --periodics-dir is
+          # what the step above fetched of the watched Prow periodics.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
@@ -524,6 +542,7 @@ jobs:
             --pool-pressure work/pool-pressure.json \
             --fixture-state work/fixture-state.json \
             --pool-state work/pool-state.json \
+            --periodics-dir work/periodics \
             --out work/health.json
           python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
 

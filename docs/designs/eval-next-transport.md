@@ -78,7 +78,7 @@ direct-bus transport the first draft of this document proposed proves the bus, t
 streams and the executor, but it leaves out the gateway's routing, its session registry and the
 relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
-the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
+the gateway**, a backend beside Discord, Google Chat and Slack, HTTP on localhost or a ClusterIP
 Service, off by default, rendered by the operator only under the eval flag. Its design text is
 the gateway spec's "The inject backend" section; this document records what the harness does
 with it. The direct-bus transport survives as a diagnostic, below.
@@ -195,7 +195,8 @@ the adapter's side of the door and is not a sixth backend operation: a pure read
 conversation's state that mutates nothing. It returns what the session record holds for the key,
 the active task with its `SubmittedAt`, from which the age in the nobody-took-it outcome is
 computed, and `Detached`, which the harness reads after its own cancel so it never sends a
-second one and grades the timeout from a detached record, the fold of the task's stream, its
+second one and grades the timeout from a detached record (a `task=` read of a task the record
+no longer holds as active carries neither), the fold of the task's stream, its
 state none, `submitted`, `working` or a terminal with the result text, and the last posted
 message, plus the gateway's configured grace and the backend the gateway armed; the
 infrastructure paragraph below says what the harness does with it.
@@ -289,7 +290,8 @@ faults as well as the persona's. The reason rides as the terminal's status messa
 takes the token up to the next space, so `bus-publish-failed at working` reads as
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
-`spawn-failed` and `bridge-died-without-terminal-event` and the worker adapter's `worker-evicted`
+`spawn-failed`, `bridge-died-without-terminal-event` and `hermes-rate-limited` (a turn that gave
+up on the provider's rate limit or billing, Hermes's exit 75) and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
@@ -322,7 +324,12 @@ a trajectory item in the api path's shape, and writes one `a2a.activity` marker 
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
-harness asks neither and grades on what the probe carried. `worker_commands` reads
+harness asks neither and grades on what the probe carried. Both executors publish it: the
+worker adapter from the `tool_use` content blocks in the stream of the coding agent it runs,
+the Hermes bridge from hermes's outbound
+webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
+its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
+`progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
@@ -357,7 +364,7 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a sidecar declared on the CR
-through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds, CI-only. A
+through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
 with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
@@ -378,9 +385,10 @@ Dockerfiles: the platform-agent image plus the bridge binary, built in the same 
 the A2A images (a step of its own, after the platform image) and tagged per pull request into the
 pool project's registry,
 `FROM` the platform-agent image that build produced by the tag it just pushed and never a
-registry default, so the sidecar and the agent container it shares a pod with are one build;
-CI-only, outside `images.json`, with the exclusion stated in `hack/check-image-inventory.sh`
-and the bridge doc's provenance paragraph saying the same. `hack/ci-deploy.sh` under the flag
+registry default, so the sidecar and the agent container it shares a pod with are one build.
+The bridge was CI-only until the executor question was settled; the release workflow
+publishes it as `hermes-bridge`, on the same `FROM`-the-same-commit rule, and `images.json`
+carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deploy.sh` under the flag
 declares the sidecar on the CR through `spec.deployment.sidecars` once the bus is up (a bridge
 that starts before NATS resolves crash-loops the agent's pod), with that image, the bus URL and
 the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
@@ -617,9 +625,10 @@ owner, which executor answers `platform` and whether delegation becomes a child 
 were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
 reaches the operator (The CI flag). Whether the bridge image build lands in this repository, and
 the bridge look-ahead with it, was the A2A owner's and was answered on 2026-09-18 on
-gke-labs/kube-agents#1661: both yes, the build CI-only and `FROM` the same run's platform-agent
-image, outside `images.json` with the exclusion written into the inventory check, and the
-look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. What
+gke-labs/kube-agents#1661: both yes, the build `FROM` the same run's platform-agent image and
+the look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. The
+build was CI-only and outside `images.json` at first; with the executor settled (the bridge
+graduates) the release workflow publishes it and the inventory carries it. What
 remains is the eval crew's:
 
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat

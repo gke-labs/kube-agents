@@ -711,6 +711,18 @@
                 "type": "string"
               }
             },
+            "sharedVpcHosts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "metricsScopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
             "exclude": {
               "type": "object",
               "additionalProperties": false,

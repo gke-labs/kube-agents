@@ -41,7 +41,17 @@ echo "Release Version: ${RELEASE_VERSION}"
 echo "Registry Prefix: ${REGISTRY_PREFIX}"
 echo "======================================================================"
 
-for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+# The list to sign is the release's own: scripts/release/common.sh as the
+# version's tag commit carries it (required_release_images_for_release says why
+# that is the candidate's list, and what happens without the tag).
+release_images=()
+while IFS= read -r img; do release_images+=("${img}"); done < <(required_release_images_for_release "${RELEASE_VERSION}")
+if [ "${#release_images[@]}" -eq 0 ]; then
+  echo "❌ ERROR: no required release images resolved for release ${RELEASE_VERSION}; nothing signed." >&2
+  exit 1
+fi
+
+for img in "${release_images[@]}"; do
   local_target="${REGISTRY_PREFIX}/${img}:${RELEASE_VERSION}"
   echo "  • Signing ${local_target}..."
   if ! cosign sign --yes "${local_target}"; then
@@ -51,4 +61,4 @@ for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
   echo "    ✅ Signed ${local_target}"
 done
 
-echo "✅ Successfully signed all ${#REQUIRED_RELEASE_IMAGES[@]} container images for release ${RELEASE_VERSION}."
+echo "✅ Successfully signed all ${#release_images[@]} container images for release ${RELEASE_VERSION}."

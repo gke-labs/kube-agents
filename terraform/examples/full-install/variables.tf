@@ -177,7 +177,11 @@ variable "scope" {
     runs. `exclude.projects` takes project IDs or shell-style globs;
     `exclude.clusters` names single clusters by the full triple, because a
     cluster name is unique only within a project and location. Neither
-    exclusion changes IAM. `folders` and `organizations` are numeric Resource
+    exclusion changes IAM, except that an `exclude.projects` entry naming a
+    Shared VPC service project by ID, or a monitored project by its project
+    number, withholds its grant (a monitored project excluded by ID keeps
+    it, for the reconcile's naming call); a glob is the reconcile's alone. `folders`
+    and `organizations` are numeric Resource
     Manager IDs: each is bound on the container itself with the same allowlist
     plus roles/cloudasset.viewer, so every project beneath it inherits the
     grant and a project created under a declared folder later is discovered
@@ -185,12 +189,23 @@ variable "scope" {
     cloudasset.googleapis.com in project_id, which the reconcile's container
     search calls. An organisation binding reaches every project in the
     organisation; the design recommends folders until the scoped service
-    account pool grants authority.
+    account pool grants authority. `shared_vpc_hosts` and `metrics_scopes`
+    are project IDs, of a Shared VPC host and of a Metrics Scope's scoping
+    project: the module resolves each to the projects it reaches at plan
+    time, as the identity Terraform plans with, and binds the allowlist in
+    every one (and in each scoping project, and roles/compute.viewer alone in
+    a host not otherwise in scope, for the reconcile's lookups),
+    because nothing is inherited through either; a project attached or
+    linked after the apply reads denied until the next one. A lookup the
+    planning identity cannot make fails the plan with the selector named,
+    before anything is applied.
   EOT
   type = object({
-    projects      = optional(list(string), [])
-    folders       = optional(list(string), [])
-    organizations = optional(list(string), [])
+    projects         = optional(list(string), [])
+    folders          = optional(list(string), [])
+    organizations    = optional(list(string), [])
+    shared_vpc_hosts = optional(list(string), [])
+    metrics_scopes   = optional(list(string), [])
     exclude = optional(object({
       projects = optional(list(string), [])
       clusters = optional(list(object({
@@ -597,7 +612,7 @@ variable "stockout_pubsub_sink" {
 }
 
 variable "enable_drift_pubsub" {
-  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which this composition leaves to extra_helm_values; with the flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write no value for this variable into terraform.tfvars; through them it is a TF_VAR_enable_drift_pubsub line in install.env, as agent_ksa_name is."
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The three names are the drift_pubsub_topic, drift_pubsub_subscription and drift_pubsub_sink variables below; the module's retention, backoff and cluster_names knobs are not re-exposed here. Provisions the detector's input only: k8s-operator/cmd/drift-detector ships in the images and starts when the PlatformAgent sets spec.harness.driftDetector.enabled, which is the enable_drift_detector variable below; with this flag on it passes the subscription's name into that block, so a renamed subscription is the one the detector reads (docs/designs/drift-detection.md). The installer front doors write this variable into terraform.tfvars only when ENABLE_DRIFT_DETECTOR is true, so that an install already turning the ingress on through a TF_VAR_enable_drift_pubsub line in install.env keeps it: a tfvars key beats TF_VAR_, and writing false unconditionally would destroy that install's sink, topic and subscription on its next upgrade."
   type        = bool
   default     = false
 }
@@ -618,6 +633,12 @@ variable "drift_pubsub_sink" {
   description = "Log Router sink exporting mutating GKE audit-log calls to the drift topic. Only used when enable_drift_pubsub is true. Adopted by name the way drift_pubsub_topic is, so a second install in the project names its own."
   type        = string
   default     = "platform-agent-drift-audit-sink"
+}
+
+variable "enable_drift_detector" {
+  description = "Start the drift detector. Sets spec.harness.driftDetector.enabled on the PlatformAgent, which is what makes k8s-operator/cmd/drift-detector run: the binary ships in the images and stays stopped until this is true. Requires enable_drift_pubsub, which a helm_release precondition enforces: the harness block carrying this field is written only when the ingress is on, so without it the composition would accept this variable and render nothing — an apply that succeeds, provisions nothing and starts nothing. Also requires project_id to be the project ID rather than the project number, a second precondition, because the operator refuses to start the detector on a numeric one (driftDetectorEnabled in k8s-operator/internal/controller/platformagent_manifests.go) and the ingress would bill for a stream nothing reads. The installer front doors turn this and enable_drift_pubsub on together from one ENABLE_DRIFT_DETECTOR key; the two variables are separate so that a hand-driven apply can still provision the audit-log ingress on its own."
+  type        = bool
+  default     = false
 }
 
 variable "extra_helm_values" {
