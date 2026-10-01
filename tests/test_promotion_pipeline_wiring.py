@@ -783,8 +783,9 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
                         self.assertIn("github.ref == 'refs/heads/main'", line)
 
     _RELEASE_COMMON = _REPO_ROOT / "scripts" / "release" / "common.sh"
+    # Both jobs tag through the downcased repository variable, so one shape
+    # reads every step's name.
     _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([a-z0-9-]+):\$\{\{ github\.sha \}\}")
-    _OPERATOR_SHA_TAG_RE = re.compile(r"ghcr\.io/[^/\s]+/([a-z0-9-]+):\$\{\{ github\.sha \}\}")
     _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([a-z0-9-]+)@\$")
 
     def test_the_workflow_builds_and_signs_exactly_the_required_release_images(self):
@@ -805,7 +806,6 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
                 if str(step.get("uses", "")).startswith("docker/build-push-action@"):
                     tags = str(step["with"]["tags"])
                     built.update(self._SHA_TAG_RE.findall(tags))
-                    built.update(self._OPERATOR_SHA_TAG_RE.findall(tags))
                 if "cosign sign" in str(step.get("run", "")):
                     signed.extend(self._COSIGN_RE.findall(str(step["run"])))
         self.assertEqual(built, required, "workflow build steps and REQUIRED_RELEASE_IMAGES disagree")

@@ -242,8 +242,9 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 // commit, so an install that mirrored the operator has mirrored it too, and
 // reaching ghcr.io for it on a private-registry install is the same failure
 // this derivation exists to avoid for the agent. The three A2A next-stack
-// images are the third, through a2aReleaseImage, which passes the resolved
-// agent image rather than the operator's; the substitution is the same.
+// images are the third, through a2aReleaseImage, which passes OPERATOR_IMAGE
+// when set and the resolved agent image otherwise; the substitution is the
+// same.
 func deriveImageFromOperator(operatorImage, repository string) string {
 	lastSlash := strings.LastIndex(operatorImage, "/")
 	prefix := ""

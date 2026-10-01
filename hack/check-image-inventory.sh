@@ -40,8 +40,9 @@ readonly LABEL_MIRRORED="a mirrored install"
 # slash and a colon in it — cannot tell an image from any other reference-like
 # value: githubMinter's ISSUER_ALLOWLIST is two https:// URLs joined by a comma
 # and matches that shape exactly, so it was reported as an image rendered
-# outside the mirror (#1139). The chart emits three names the pattern below
-# catches: PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and FLUENT_BIT_IMAGE.
+# outside the mirror (#1139). The chart emits four names the pattern below
+# catches: OPERATOR_IMAGE, PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and
+# FLUENT_BIT_IMAGE.
 readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
 readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
 
