@@ -17,6 +17,7 @@ plain text, on any platform.
 """
 
 import logging
+import os
 import re
 from typing import Any, Dict, Optional
 
@@ -37,6 +38,16 @@ _LEADING_MENTION_RE = re.compile(r"^<@[UWB][A-Z0-9]+>\s*")
 # plain text, which SOUL.md §1 tells it to answer with "there is no undo".
 _DISABLED_UNDO_RE = re.compile(r"^/undo(?:@\S+)?(?=\s|$)", re.IGNORECASE)
 _DISABLED_UNDO_TEXT = "undo"
+
+# The disable belongs to the Planning Agent, whose SOUL.md carries the answer. The operator
+# also enables this plugin on the platform profile under `experimental.platformFrontDoor`,
+# where the gateway runs with HERMES_HOME pointed at `<root>/profiles/platform`; the
+# Planning Agent's home is the root itself. That layout is the operator's convention
+# (k8s-operator/internal/controller/platformagent_manifests.go), and the other bundled
+# plugins resolve their state from HERMES_HOME the same way.
+_HERMES_HOME_ENV = "HERMES_HOME"
+_DEFAULT_HERMES_HOME = "/opt/data"
+_PROFILES_DIR_NAME = "profiles"
 
 
 def _subcommand_map() -> Dict[str, str]:
@@ -97,9 +108,19 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
     return f"{target} {args}".strip()
 
 
+def on_planning_agent_profile() -> bool:
+    """True unless HERMES_HOME is a named profile under ``profiles/`` (the front-door flag)."""
+    home = os.environ.get(_HERMES_HOME_ENV, _DEFAULT_HERMES_HOME).rstrip("/")
+    parent = os.path.basename(os.path.dirname(home))
+    return parent != _PROFILES_DIR_NAME
+
+
 def disable_undo_command(text: str) -> Optional[str]:
-    """Return the plain text ``/undo …`` should dispatch as, or ``None`` to leave it alone."""
-    if not isinstance(text, str) or not text:
+    """Return the plain text ``/undo …`` should dispatch as, or ``None`` to leave it alone.
+
+    Only on the Planning Agent profile; elsewhere the gateway keeps the command.
+    """
+    if not isinstance(text, str) or not text or not on_planning_agent_profile():
         return None
     stripped = _LEADING_MENTION_RE.sub("", text.strip(), count=1).strip()
     match = _DISABLED_UNDO_RE.match(stripped)

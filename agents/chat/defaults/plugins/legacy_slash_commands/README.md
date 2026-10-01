@@ -60,6 +60,12 @@ with "there is no undo, what do you want changed?". Dropping the message
 (`{"action": "skip"}`) would leave the user with no reply at all; a plain-text
 rewrite is the only hook result that produces one.
 
+The disable applies on the Planning Agent profile only. The operator also enables
+this plugin on the platform profile under `experimental.platformFrontDoor`, whose
+persona has no such answer, so there `/undo` passes through to the gateway. The
+plugin tells the two apart by `HERMES_HOME`: a named profile's home sits under
+`profiles/`, the Planning Agent's is the root.
+
 ## How it is wired
 
 `pre_gateway_dispatch` fires once per inbound user message, after the

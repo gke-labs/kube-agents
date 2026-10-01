@@ -7,6 +7,7 @@ Run: python3 -m unittest agents/chat/defaults/plugins/legacy_slash_commands/test
 returns (bare subcommand name -> real gateway command).
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -81,6 +82,19 @@ class DisableUndoCommandTest(unittest.TestCase):
     def test_other_text_is_left_alone(self):
         for text in ("/undone", "undo", "please /undo that", "/help", "", None):
             self.assertIsNone(plugin.disable_undo_command(text))
+
+    def test_only_the_planning_agent_profile_disables_undo(self):
+        # The operator's front-door flag runs the gateway with HERMES_HOME under
+        # profiles/<name>; the Planning Agent's home is the root itself.
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"}):
+            self.assertFalse(plugin.on_planning_agent_profile())
+            self.assertIsNone(plugin.disable_undo_command("/undo"))
+        for home in ("/opt/data", "/opt/data/", "/home/hermes/.hermes"):
+            with mock.patch.dict(os.environ, {"HERMES_HOME": home}):
+                self.assertTrue(plugin.on_planning_agent_profile())
+                self.assertEqual(plugin.disable_undo_command("/undo"), "undo")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(plugin.on_planning_agent_profile())
 
 
 class PreGatewayDispatchHookTest(unittest.TestCase):
