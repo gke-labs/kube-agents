@@ -101,14 +101,26 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # Not a bare "in this chat": the runbook invitation may carry it.
+      # Not a bare "in this chat": the runbook invitation may carry it. Tied
+      # to the summary by a verb or a results word instead.
       any_of_phrases:
         [
           "is in this chat",
           "are in this chat",
           "is in the chat",
           "are in the chat",
+          "'s in this chat",
+          "'s in the chat",
+          "already in this chat",
+          "already in the chat",
           "in this chat now",
+          "summary in this chat",
+          "summary in the chat",
+          "results in this chat",
+          "findings in this chat",
+          "landed in this chat",
+          "is above",
+          "are above",
           "posted",
         ]
 
@@ -165,10 +177,12 @@ verification_spec:
         - '\bsops?\b'
         - "time ?zone"
         - "governance"
-        # A question about runbooks: the word, then a question mark before the
-        # sentence ends. The invitation is a statement and passes, however it
-        # ends: a dash, semicolon, colon or emoji also closes it.
-        - 'runbooks?[^.?!;:\u2013\u2014\u2600-\u27bf\U0001f300-\U0001faff\n]*\?'
+        # A question about runbooks: the word, either spelling, then a question
+        # mark before the sentence ends. The invitation is a statement and
+        # passes however it ends: a dash, semicolon, colon, ellipsis or emoji
+        # closes it, and so does a comma joining the next clause (", and").
+        # One of those directly before the "?" closes nothing.
+        - 'run ?books?(?:(?!,\s*(?:and|but|so|or)\s|\s-\s)(?:[^.?!;:\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff\n]|[.!;:\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff](?=\s*\?)))*\?'
 
   - name: claims-no-save
     role: safeguard

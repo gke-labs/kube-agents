@@ -63,9 +63,13 @@ def test_the_prompts_example_passes_every_check(case):
 
 
 @pytest.mark.parametrize("case", CASES)
-@pytest.mark.parametrize("close", [" \u2014", ";", ":", " \U0001f64c"])
+@pytest.mark.parametrize(
+    "close", [" \u2014", " -", ";", ":", "\u2026", " \U0001f64c", " \u2b50", ", and"]
+)
 def test_the_invitation_is_a_statement_however_it_ends(case, close):
     reply = _example(case).replace(INVITATION, INVITATION.removesuffix(".") + close)
+    if close == ", and":
+        reply = reply.replace(", and Is", ", and is").replace(", and Want", ", and want")
     assert _failing(case, reply) == []
 
 
@@ -83,6 +87,8 @@ def test_the_greeting_without_the_invitation_fails_only_on_it(case):
         " Do you have runbooks you'd like to share?",
         " Could you share your team's runbooks here?",
         " Any runbooks I should know about?",
+        " Any runbooks I should know about \U0001f642?",
+        " Do you have run books I should know about?",
     ],
 )
 def test_asking_for_runbooks_is_a_stacked_ask(case, ask):
@@ -96,6 +102,9 @@ def test_asking_for_runbooks_is_a_stacked_ask(case, ask):
         INVITATION,
         " Share your team's runbooks here whenever you like.",
         " Share your team's runbooks in this chat anytime.",
+        " Share the runbooks here once you have them.",
+        " Share your runbooks here when it suits you.",
+        " Drop your runbooks here after the scan.",
     ],
 )
 def test_the_invitation_does_not_stand_in_for_where_results_appear(invitation):
@@ -124,11 +133,32 @@ def test_the_invitation_does_not_stand_in_for_the_summary_being_here():
     [
         "I'll share results here when it's done",
         "I'll post my findings here as soon as it's done",
-        "I'll post a summary here after",
+        "I'll post my findings here once the scan finishes",
+        "I'll post the findings here",
+        "I'll post a summary here when done",
+        "I'll share it here when it's done",
+        "I'll share them here as soon as it's done",
+        "I'll post the summary in this chat",
+        "I'll post results in this chat once it's done",
     ],
 )
 def test_other_ways_of_saying_results_land_here_pass(results):
     case = "first-install-hello-running"
     example = _example(case)
     reply = example.replace("I'll post what I find here when it's done", results)
+    assert _failing(case, reply) == []
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "the summary is already in this chat",
+        "the summary\u2019s in this chat",
+        "you'll find the summary in this chat",
+        "the summary landed in this chat",
+    ],
+)
+def test_other_ways_of_saying_the_summary_is_here_pass(summary):
+    case = "first-install-hello-done"
+    reply = _example(case).replace("the summary is in this chat", summary)
     assert _failing(case, reply) == []

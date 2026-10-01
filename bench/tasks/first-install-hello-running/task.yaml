@@ -108,11 +108,15 @@ verification_spec:
           "post",
           "send",
           "share what",
-          "share the",
+          "share it",
+          "share them",
           "share my",
           "share result",
           "share find",
           "share a summary",
+          "share the result",
+          "share the find",
+          "share the summary",
         ]
 
   - name: says-results-come-to-this-chat
@@ -120,29 +124,56 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # Tied to the results: a bare "here" is inside "there", which the
-      # closing question and the "Hi there" fallback carry, and " here " is in
-      # the runbook invitation, which may also say "in this chat".
+      # Tied to the results, by a results word or the scan finishing: a bare
+      # "here" is inside "there", which the closing question and the "Hi there"
+      # fallback carry, and the runbook invitation says " here " and may say
+      # "in this chat" or "here once you have them".
       any_of_phrases:
         [
           "find here",
-          "here when it",
-          "here when i",
-          "here when the",
-          "here once",
-          "here as soon",
-          "here after",
-          "back here",
+          "findings here",
+          "results here",
+          "summary here",
           "post it here",
           "post them here",
-          "results here",
+          "share it here",
+          "share them here",
+          "post here",
+          "back here",
+          "here when it's done",
+          "here when it is done",
+          "here when it finishes",
+          "here when the scan",
+          "here when i'm done",
+          "here when i finish",
+          "here once it's done",
+          "here once it is done",
+          "here once it finishes",
+          "here once the scan",
+          "here as soon as it",
+          "here as soon as the scan",
           "find in this chat",
-          "in this chat when",
-          "in this chat once",
-          "to this chat",
+          "findings in this chat",
+          "results in this chat",
+          "summary in this chat",
           "post it in this chat",
           "post them in this chat",
-          "this thread",
+          "share it in this chat",
+          "share them in this chat",
+          "post in this chat",
+          "in this chat when it's done",
+          "in this chat when it is done",
+          "in this chat when it finishes",
+          "in this chat when the scan",
+          "in this chat when i'm done",
+          "in this chat when i finish",
+          "in this chat once it's done",
+          "in this chat once it is done",
+          "in this chat once it finishes",
+          "in this chat once the scan",
+          "in this chat as soon as it",
+          "in this chat as soon as the scan",
+          "in this thread",
         ]
 
   # The one standing invitation, stated rather than asked.
@@ -198,10 +229,12 @@ verification_spec:
         - '\bsops?\b'
         - "time ?zone"
         - "governance"
-        # A question about runbooks: the word, then a question mark before the
-        # sentence ends. The invitation is a statement and passes, however it
-        # ends: a dash, semicolon, colon or emoji also closes it.
-        - 'runbooks?[^.?!;:\u2013\u2014\u2600-\u27bf\U0001f300-\U0001faff\n]*\?'
+        # A question about runbooks: the word, either spelling, then a question
+        # mark before the sentence ends. The invitation is a statement and
+        # passes however it ends: a dash, semicolon, colon, ellipsis or emoji
+        # closes it, and so does a comma joining the next clause (", and").
+        # One of those directly before the "?" closes nothing.
+        - 'run ?books?(?:(?!,\s*(?:and|but|so|or)\s|\s-\s)(?:[^.?!;:\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff\n]|[.!;:\u2026\u2013\u2014\u2190-\u2bff\U0001f000-\U0001faff](?=\s*\?)))*\?'
 
   - name: claims-no-save
     role: safeguard
