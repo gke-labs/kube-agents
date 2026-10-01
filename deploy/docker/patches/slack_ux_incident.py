@@ -183,6 +183,9 @@ def parse_triage(report: str) -> dict | None:
     if not set(OPTION_NAMED.findall(named)) <= seen:
         # A button row missing an option the report offers would misstate it.
         return None
+    if choices and any(map(PROPOSED_FIX_LINE.match, lines)):
+        # So would lettered buttons beside a "Proposed fix" bullet that has none.
+        return None
     if not choices:
         single = next((m for m in map(PROPOSED_FIX_LINE.match, lines) if m), None)
         if single:
@@ -197,7 +200,7 @@ def parse_triage(report: str) -> dict | None:
         "choices": choices,
         # A clipped url is a dead one, so an overlong link is dropped; the fold still has it.
         "links": [
-            (label, url) for line in lines if LINKS_LINE.match(line)
+            (_presenter._plain(label), url) for line in lines if LINKS_LINE.match(line)
             for label, url in MD_LINK.findall(line) if len(url) <= BUTTON_URL_MAX
         ],
         "fold_title": FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE,
@@ -257,8 +260,10 @@ def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
 
 
 def fallback_text(triage: dict) -> str:
-    """The edited message's ``text``: the headline and the choices, as mrkdwn."""
-    return _presenter.fallback_text(triage["headline"], choices=[label for label, _ in triage["choices"]])
+    """The edited message's ``text``: the headline, the links and the choices, as mrkdwn."""
+    return _presenter.fallback_text(
+        triage["headline"], links=triage["links"], choices=[label for label, _ in triage["choices"]]
+    )
 
 
 def _db_path() -> str:

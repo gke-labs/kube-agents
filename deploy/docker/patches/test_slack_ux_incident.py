@@ -35,6 +35,7 @@ import kanban_notifier
 import slack_ux_clicks as clicks
 import slack_ux_incident as runtime
 from apply_kanban_progress_lines import SEND_PATCHED
+import kanban_progress_lines
 
 CHANNEL = "C0KAGE"
 ALERT_TS = "1700000000.000100"
@@ -173,6 +174,37 @@ class RuntimeTest(unittest.TestCase):
         self.assertIsNot(wrapped, adapter)
         res = asyncio.run(wrapped.send(CHANNEL, "the report", metadata={"thread_id": ALERT_TS}))
         return wrapped, res
+
+    def test_flag_on_the_patched_notifier_edits_the_alert_through_the_real_deliver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "gateway").mkdir()
+            (root / applier.RELATIVE).write_text(NOTIFIER)
+            applier.apply(root)
+            patched = (root / applier.RELATIVE).read_text()
+        namespace = {}
+        with mock.patch.dict(sys.modules, {"gateway.slack_ux_incident": runtime}):
+            exec(compile(patched, "notifier", "exec"), namespace)  # noqa: S102 — the fixture under test
+        namespace["_progress_deliver"] = kanban_progress_lines.deliver
+        adapter = _Adapter()
+        sub = {"chat_id": CHANNEL, "thread_id": ALERT_TS, "task_id": "t1", "platform": "slack"}
+        watcher = namespace["Watcher"](adapter, SimpleNamespace(result=REPORT), sub)
+        watcher.runner = SimpleNamespace()  # the real deliver keeps its rolling-message map on it
+        asyncio.run(watcher._send_event(SimpleNamespace(kind="completed", id=1), "the report"))
+        self.assertEqual([e[0] for e in adapter.log], ["chat_update"])
+        self.assertEqual(adapter.log[0][1]["ts"], ALERT_TS)
+
+    def test_a_proposed_fix_beside_lettered_options_keeps_the_threaded_reply(self):
+        report = REPORT.replace("- ✅ **Recommended", "- **Proposed fix (Restart):** Restart the pods.\n- ✅ **Recommended")
+        self.assertIsNone(runtime.parse_triage(report))
+
+    def test_link_labels_are_plain_and_reach_the_fallback_text(self):
+        report = REPORT.replace("[GKE Workloads]", "[**GKE Workloads**]")
+        triage = runtime.parse_triage(report)
+        self.assertEqual(triage["links"][0][0], "GKE Workloads")
+        text = runtime.fallback_text(triage)
+        self.assertIn("|GKE Workloads>", text)
+        self.assertIn("|Cloud Logs>", text)
 
     def test_flag_off_returns_the_adapter(self):
         adapter = _Adapter()

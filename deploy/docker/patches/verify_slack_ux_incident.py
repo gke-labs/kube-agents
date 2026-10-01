@@ -13,7 +13,8 @@ Two things are checked:
 2. The runtime module, loaded by path from ``gateway/``: flag off,
    ``adapter_for`` returns the notifier's own adapter; flag on, a triage
    report for an open alert thread edits the alert with one button per
-   option, the recommended one primary, and sends nothing else.
+   option, the recommended one primary, and the report folded as the Slack
+   plugin's own ``block_kit`` renders it, and sends nothing else.
 
 A wrong adapter here raises nothing at runtime: the report is posted under
 the alert as before. The build is where it is caught.
@@ -35,6 +36,7 @@ from types import SimpleNamespace
 
 NOTIFIER = "gateway/kanban_watchers_notifier.py"
 RUNTIME = "gateway/slack_ux_incident.py"
+BLOCK_KIT = "plugins/platforms/slack/block_kit.py"
 FLAG_ENV = "KAGE_SLACK_UX"
 DB_PATH_ENV = "SESSION_KV_DB_PATH"
 
@@ -137,7 +139,15 @@ def _seed(db_path: str) -> None:
         conn.commit()
 
 
-async def _drive(module, db_path: str) -> None:
+def _plugin_fold(root: Path) -> list[dict]:
+    """``REPORT`` as the Slack plugin's block_kit renders it, loaded apart from the runtime's copy."""
+    spec = importlib.util.spec_from_file_location("slack_ux_incident_verify_block_kit", root / BLOCK_KIT)
+    block_kit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(block_kit)
+    return block_kit.sanitize_blocks(block_kit.render_blocks(REPORT.strip(), mrkdwn_fn=None))
+
+
+async def _drive(module, db_path: str, expected_fold: list[dict]) -> None:
     adapter = _StubAdapter()
     event = SimpleNamespace(kind="completed")
     task = SimpleNamespace(result=REPORT)
@@ -164,7 +174,7 @@ async def _drive(module, db_path: str) -> None:
         if buttons[1].get("style") != "primary" or "style" in buttons[0]:
             raise _fail("the recommended option is not the primary button")
         fold = update["blocks"][-1]
-        if fold.get("type") != "container" or not fold.get("child_blocks"):
+        if fold.get("type") != "container" or not expected_fold or fold.get("child_blocks") != expected_fold:
             raise _fail("the report was not folded through the Slack plugin's block_kit")
     finally:
         os.environ.pop(FLAG_ENV, None)
@@ -179,7 +189,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         db_path = os.path.join(tmp, "session_kv.db")
         _seed(db_path)
-        asyncio.run(_drive(module, db_path))
+        asyncio.run(_drive(module, db_path, _plugin_fold(root)))
     print(
         "slack_ux_incident verify: the notifier's deliver takes adapter_for()'s adapter; "
         "off it is the notifier's own, on an open alert's triage edits the alert with its options"
