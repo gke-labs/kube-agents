@@ -8,7 +8,7 @@
 # playground, not the product.
 #
 # Build from the a2a/ module root:
-#   docker build -f Dockerfile.gateway -t <registry>/gateway:<tag> .
+#   docker build -f Dockerfile.gateway -t <registry>/a2a-gateway:<tag> .
 
 # Bases come from images.json, the repo's image inventory, spelled the way
 # k8s-operator/Dockerfile spells them so `make mirror-images` and the pinning

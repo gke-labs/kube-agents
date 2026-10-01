@@ -323,6 +323,13 @@ def test_github_target_repository_configuration(
         )
 
 
+def _collector_waiver(audit_id: str, collector_audits: frozenset) -> List[str]:
+    """`finish` on a collector stream requires a manifest or a waiver; these runs have no collector."""
+    if audit_id not in collector_audits:
+        return []
+    return ["--no-collector-manifest", "e2e fixture document; no collector ran"]
+
+
 @pytest.mark.parametrize(
     "audit_id,human_name",
     AUDIT_STREAMS,
@@ -359,7 +366,7 @@ def test_audit_report_ledger_dryrun_all_streams(
     if platform_scripts_dir not in sys.path:
         sys.path.insert(0, platform_scripts_dir)
 
-    from audit_report import AUDITS
+    from audit_report import AUDITS, COLLECTOR_AUDITS
 
     assert audit_id in AUDITS, f"Audit stream '{audit_id}' not found in audit_report.AUDITS"
     roster = AUDITS[audit_id].checks
@@ -433,6 +440,7 @@ def test_audit_report_ledger_dryrun_all_streams(
                 f"--audit={audit_id}",
                 f"--findings-file={temp_path}",
                 "--dry-run",
+                *_collector_waiver(audit_id, COLLECTOR_AUDITS),
             ],
             capture_output=True,
             text=True,
@@ -508,6 +516,9 @@ def test_audit_report_github_api_lifecycle_mocked(
     original_run_cmd = audit_report.run_cmd
     original_refresh = audit_report.refresh_credentials
     original_resolve = audit_report.resolve_repo
+    # The report store's root is read from the environment at call time, and
+    # left alone it is the agent's volume on whatever host runs this.
+    original_reports_dir = os.environ.get("FLEET_AUDIT_REPORTS_DIR")
 
     calls: list[list[str]] = []
 
@@ -542,6 +553,7 @@ def test_audit_report_github_api_lifecycle_mocked(
     try:
         audit_report.GITOPS_WORKSPACE = str(tmp_path)
         audit_report.SCRATCH_DIR = str(tmp_path)
+        os.environ["FLEET_AUDIT_REPORTS_DIR"] = str(tmp_path / "reports")
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
         audit_report.refresh_credentials = lambda *args, **kwargs: None
@@ -585,7 +597,14 @@ def test_audit_report_github_api_lifecycle_mocked(
         findings_file = tmp_path / f"findings_{audit_id}.json"
         findings_file.write_text(json.dumps(doc), encoding="utf-8")
 
-        exit_code = audit_report.main(["finish", f"--audit={audit_id}", f"--findings-file={findings_file}"])
+        exit_code = audit_report.main(
+            [
+                "finish",
+                f"--audit={audit_id}",
+                f"--findings-file={findings_file}",
+                *_collector_waiver(audit_id, audit_report.COLLECTOR_AUDITS),
+            ]
+        )
         assert exit_code == 0, f"Expected finish exit code 0 for '{audit_id}', got {exit_code}"
 
         all_commands = [" ".join(c) for c in calls]
@@ -617,4 +636,8 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.repo_root = original_repo_root
         audit_report.GITOPS_WORKSPACE = original_workspace
         audit_report.SCRATCH_DIR = original_scratch
+        if original_reports_dir is None:
+            os.environ.pop("FLEET_AUDIT_REPORTS_DIR", None)
+        else:
+            os.environ["FLEET_AUDIT_REPORTS_DIR"] = original_reports_dir
         audit_report.set_workspace(None)

@@ -1,0 +1,85 @@
+
+## 2026-09-29T15:49:53Z [registry/push] push_image
+2026/09/29 11:49:54 logged in via ~/.docker/config.json
+2026/09/29 11:49:54 Copying from registry.k8s.io/pause:3.9 to us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9
+2026/09/29 11:49:57 existing manifest: sha256:d9815368e0c7e55f30425cf0dc8fded3dc91437167803eef5cf12f71d3d9f075
+2026/09/29 11:49:57 existing manifest: sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10
+2026/09/29 11:49:57 existing manifest: sha256:cad97be0e860c5499b2970d7dd163c43cd08150b8551d3b7cbfa5f760ca69757
+2026/09/29 11:49:57 existing manifest: sha256:3ec98b8452dc8ae265a6917dfb81587ac78849e520d5dbba6de524851d20eca6
+2026/09/29 11:49:57 existing manifest: sha256:313c244fbd9e5c29d41089a388c5768112a74cb02ce3328f2424b43981bd7602
+2026/09/29 11:49:57 existing manifest: sha256:4e2a8276ec1b1ecb4e43de739b18877964e3ed5cf89da1628f4a056b05941aec
+2026/09/29 11:49:58 existing manifest: sha256:4fe1c6e55770c9fe3b57c6d3467d4a7d2a319f30a4c10b76ebdcf0eb550f428a
+2026/09/29 11:49:58 us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9: digest: sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097 size: 2405
+sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097
+## exit 0
+
+## 2026-09-29T15:49:59Z [registry/grant-pull] grant_pull
+Updated IAM policy for repository [upg-scenarios].
+bindings:
+- members:
+  - serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com
+  role: roles/artifactregistry.reader
+## exit 0
+
+## 2026-09-29T15:50:27Z [registry/cached] cached_images
+gke-upg-20d-work-pool-aed7b542-7x40
+## exit 0
+
+## 2026-09-29T15:51:29Z [registry/before] K -n scen get pods -l app=retired-image -o wide
+NAME                             READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+retired-image-5b5c57c885-7crtn   1/1     Running   0          85s   10.11.65.6   gke-upg-20d-work-pool-aed7b542-7x40   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:51:29Z [registry/delete-image] G artifacts docker images delete us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9 --delete-tags --quiet
+Digests:
+- us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097
+
+Tags:
+- us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9
+Delete request issued.
+Waiting for operation [projects/<PROJECT_ID>/locations/us-central1/operations/17210b17-1c84-49ff-baf4-388dcfed55ad] to complete...
+......done.
+## exit 0
+
+## 2026-09-29T15:52:03Z [registry/gone] G artifacts docker images list us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios --include-tags
+Listing items under project <PROJECT_ID>, location us-central1, repository upg-scenarios.
+
+IMAGE                                                               DIGEST                                                                   TAGS  CREATE_TIME          UPDATE_TIME          SIZE
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:313c244fbd9e5c29d41089a388c5768112a74cb02ce3328f2424b43981bd7602        2026-09-29T10:38:54  2026-09-29T10:38:54  254159
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:3ec98b8452dc8ae265a6917dfb81587ac78849e520d5dbba6de524851d20eca6        2026-09-29T10:38:54  2026-09-29T10:38:54  265120
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:4e2a8276ec1b1ecb4e43de739b18877964e3ed5cf89da1628f4a056b05941aec        2026-09-29T10:38:54  2026-09-29T10:38:54  269509378
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:4fe1c6e55770c9fe3b57c6d3467d4a7d2a319f30a4c10b76ebdcf0eb550f428a        2026-09-29T10:38:55  2026-09-29T10:38:55  307636494
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10        2026-09-29T10:38:53  2026-09-29T10:38:53  318589
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:cad97be0e860c5499b2970d7dd163c43cd08150b8551d3b7cbfa5f760ca69757        2026-09-29T10:38:53  2026-09-29T10:38:53  205370
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause       sha256:d9815368e0c7e55f30425cf0dc8fded3dc91437167803eef5cf12f71d3d9f075        2026-09-29T10:38:53  2026-09-29T10:38:53  356347
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:313c244fbd9e5c29d41089a388c5768112a74cb02ce3328f2424b43981bd7602        2026-09-29T10:37:48  2026-09-29T10:37:48  254159
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:3ec98b8452dc8ae265a6917dfb81587ac78849e520d5dbba6de524851d20eca6        2026-09-29T10:37:46  2026-09-29T10:37:46  265120
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:4e2a8276ec1b1ecb4e43de739b18877964e3ed5cf89da1628f4a056b05941aec        2026-09-29T10:38:17  2026-09-29T10:38:17  269509378
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:4fe1c6e55770c9fe3b57c6d3467d4a7d2a319f30a4c10b76ebdcf0eb550f428a        2026-09-29T10:38:19  2026-09-29T10:38:19  307636494
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:8d4106c88ec0bd28001e34c975d65175d994072d65341f62a8ab0754b0fafe10        2026-09-29T10:37:46  2026-09-29T10:37:46  318589
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:cad97be0e860c5499b2970d7dd163c43cd08150b8551d3b7cbfa5f760ca69757        2026-09-29T10:37:46  2026-09-29T10:37:46  205370
+us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause-test  sha256:d9815368e0c7e55f30425cf0dc8fded3dc91437167803eef5cf12f71d3d9f075        2026-09-29T10:37:47  2026-09-29T10:37:47  356347
+## exit 0
+
+## 2026-09-29T15:52:04Z [registry/still-running] K -n scen get pods -l app=retired-image -o wide
+NAME                             READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+retired-image-5b5c57c885-7crtn   1/1     Running   0          2m    10.11.65.6   gke-upg-20d-work-pool-aed7b542-7x40   <none>           <none>
+## exit 0
+## 2026-09-29T15:52:05Z [registry/note] control: restart the pod on the old node, which still holds the image in its cache
+
+## 2026-09-29T15:52:08Z [registry/restarted-from-cache] K -n scen get pods -l app=retired-image -o wide
+NAME                             READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+retired-image-5b5c57c885-2tdgp   1/1     Running   0          2s    10.11.65.7   gke-upg-20d-work-pool-aed7b542-7x40   <none>           <none>
+## exit 0
+
+## 2026-09-29T16:06:37Z [registry/after] K -n scen get pods -l app=retired-image -o wide
+NAME                             READY   STATUS             RESTARTS   AGE     IP            NODE                                  NOMINATED NODE   READINESS GATES
+retired-image-5b5c57c885-kzjq8   0/1     ImagePullBackOff   0          3m22s   10.11.66.12   gke-upg-20d-work-pool-aed7b542-n79e   <none>           <none>
+## exit 0
+
+## 2026-09-29T16:06:37Z [registry/pull-events] K -n scen get events --field-selector reason=Failed -o custom-columns=T:.lastTimestamp,O:.involvedObject.name,M:.message
+T                      O                                M
+2026-09-29T16:06:37Z   retired-image-5b5c57c885-kzjq8   Failed to pull image "us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9": rpc error: code = NotFound desc = failed to pull and unpack image "us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9": failed to resolve reference "us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9": us-central1-docker.pkg.dev/<PROJECT_ID>/upg-scenarios/pause:3.9: not found
+2026-09-29T16:06:37Z   retired-image-5b5c57c885-kzjq8   Error: ErrImagePull
+2026-09-29T16:06:23Z   retired-image-5b5c57c885-kzjq8   Error: ImagePullBackOff
+## exit 0

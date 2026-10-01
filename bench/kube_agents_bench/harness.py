@@ -17,7 +17,7 @@ symptoms and the remedies.
 
 The platform agent delegates substantive work to subagents by filing a kanban
 card and ending its turn -- there is no synchronous await tool, by design. Its
-first reply is therefore an acknowledgement carrying a task id, not the answer.
+first reply is therefore an acknowledgement, not the answer.
 Returning that would have the eval harness grade the acknowledgement and delete
 the workspace while the subagent is still running, so a turn that files a card
 is followed by status turns on the same conversation until every card settles

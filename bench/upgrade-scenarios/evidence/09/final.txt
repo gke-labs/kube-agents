@@ -1,0 +1,53 @@
+
+## 2026-09-29T14:05:46Z [final/pods] K -n scen get pods -o wide
+NAME                       READY   STATUS      RESTARTS   AGE     IP           NODE                                    NOMINATED NODE   READINESS GATES
+after-jk8gv                0/1     Completed   0          41s     10.36.0.27   gke-upg-09-default-pool-fe728fe4-9p8n   <none>           <none>
+ep-writer-29844840-rrpsd   0/1     Completed   0          5m47s   10.36.0.15   gke-upg-09-default-pool-fe728fe4-9p8n   <none>           <none>
+ep-writer-29844845-8w6mw   0/1     Completed   0          47s     10.36.0.25   gke-upg-09-default-pool-fe728fe4-9p8n   <none>           <none>
+## exit 0
+
+## 2026-09-29T14:05:47Z [final/events] K -n scen get events --sort-by=.lastTimestamp -o custom-columns=T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message
+T                      R                  O                          M
+2026-09-29T13:53:37Z   SuccessfulCreate   first                      Created pod: first-b5k4k
+2026-09-29T13:53:37Z   Scheduled          first-b5k4k                Successfully assigned scen/first-b5k4k to gke-upg-09-default-pool-fe728fe4-9p8n
+2026-09-29T13:53:39Z   Pulling            first-b5k4k                Pulling image "python:3.14-slim"
+2026-09-29T13:54:09Z   Created            first-b5k4k                Created container: w
+2026-09-29T13:54:09Z   Pulled             first-b5k4k                Successfully pulled image "python:3.14-slim" in 7.691s (29.747s including waiting). Image size: 43505726 bytes.
+2026-09-29T13:54:10Z   Started            first-b5k4k                Started container w
+2026-09-29T13:54:26Z   Completed          first                      Job completed
+2026-09-29T13:54:26Z   UnexpectedJob      ep-writer                  Saw a job that the controller did not create or forgot: first
+2026-09-29T13:55:00Z   SuccessfulCreate   ep-writer                  Created job ep-writer-29844835
+2026-09-29T13:55:00Z   Scheduled          ep-writer-29844835-wdjtl   Successfully assigned scen/ep-writer-29844835-wdjtl to gke-upg-09-default-pool-fe728fe4-9p8n
+2026-09-29T13:55:00Z   SuccessfulCreate   ep-writer-29844835         Created pod: ep-writer-29844835-wdjtl
+2026-09-29T13:55:06Z   Pulled             ep-writer-29844835-wdjtl   Container image "python:3.14-slim" already present on machine
+2026-09-29T13:55:08Z   Created            ep-writer-29844835-wdjtl   Created container: w
+2026-09-29T13:55:09Z   Started            ep-writer-29844835-wdjtl   Started container w
+2026-09-29T13:55:33Z   SawCompletedJob    ep-writer                  Saw completed job: ep-writer-29844835, condition: Complete
+2026-09-29T13:55:33Z   Completed          ep-writer-29844835         Job completed
+2026-09-29T14:00:00Z   Scheduled          ep-writer-29844840-rrpsd   Successfully assigned scen/ep-writer-29844840-rrpsd to gke-upg-09-default-pool-fe728fe4-9p8n
+2026-09-29T14:00:00Z   SuccessfulCreate   ep-writer-29844840         Created pod: ep-writer-29844840-rrpsd
+2026-09-29T14:00:00Z   Pulled             ep-writer-29844840-rrpsd   Container image "python:3.14-slim" already present on machine
+2026-09-29T14:00:00Z   SuccessfulCreate   ep-writer                  Created job ep-writer-29844840
+2026-09-29T14:00:01Z   Started            ep-writer-29844840-rrpsd   Started container w
+2026-09-29T14:00:01Z   Created            ep-writer-29844840-rrpsd   Created container: w
+2026-09-29T14:00:04Z   Completed          ep-writer-29844840         Job completed
+2026-09-29T14:00:04Z   SawCompletedJob    ep-writer                  Saw completed job: ep-writer-29844840, condition: Complete
+2026-09-29T14:05:00Z   Scheduled          ep-writer-29844845-8w6mw   Successfully assigned scen/ep-writer-29844845-8w6mw to gke-upg-09-default-pool-fe728fe4-9p8n
+2026-09-29T14:05:00Z   SuccessfulCreate   ep-writer                  Created job ep-writer-29844845
+2026-09-29T14:05:00Z   SuccessfulCreate   ep-writer-29844845         Created pod: ep-writer-29844845-8w6mw
+2026-09-29T14:05:02Z   Created            ep-writer-29844845-8w6mw   Created container: w
+2026-09-29T14:05:02Z   Pulled             ep-writer-29844845-8w6mw   Container image "python:3.14-slim" already present on machine
+2026-09-29T14:05:03Z   Started            ep-writer-29844845-8w6mw   Started container w
+2026-09-29T14:05:06Z   SuccessfulCreate   after                      Created pod: after-jk8gv
+2026-09-29T14:05:06Z   Scheduled          after-jk8gv                Successfully assigned scen/after-jk8gv to gke-upg-09-default-pool-fe728fe4-9p8n
+2026-09-29T14:05:07Z   Created            after-jk8gv                Created container: w
+2026-09-29T14:05:07Z   Pulled             after-jk8gv                Container image "python:3.14-slim" already present on machine
+2026-09-29T14:05:08Z   Started            after-jk8gv                Started container w
+2026-09-29T14:05:12Z   SuccessfulDelete   ep-writer                  Deleted job first
+2026-09-29T14:05:12Z   SawCompletedJob    ep-writer                  Saw completed job: ep-writer-29844845, condition: Complete
+2026-09-29T14:05:12Z   Completed          ep-writer-29844845         Job completed
+2026-09-29T14:05:15Z   SuccessfulDelete   ep-writer                  Deleted job ep-writer-29844835
+2026-09-29T14:05:15Z   UnexpectedJob      ep-writer                  Saw a job that the controller did not create or forgot: after
+2026-09-29T14:05:15Z   Completed          after                      Job completed
+## exit 0
+## 2026-09-29T14:05:47Z [final/note] scenario 09 done

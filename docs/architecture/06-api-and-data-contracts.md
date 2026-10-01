@@ -200,8 +200,9 @@ read-only scope.
 ## 2b. ChatOps addressing & routing contract
 
 How a human names the agent they want ([02](02-agent-personas.md) §2.4). The **ChatOps gateway**
-(C15, [05](05-system-architecture.md)) resolves every inbound chat message to exactly one
-`(tier, scope)` **`Agent` CR** via three modes, deterministic first. _(This is v1-compatible: it
+(C15, [05](05-system-architecture.md)) resolves every inbound chat message, deterministic first, either to exactly
+one `(tier, scope)` **`Agent` CR** (a slash command or a handle) or to the conversation's session
+(free text), which reaches an `Agent` CR only by asking the gateway to mint a child task to it. _(This is v1-compatible: it
 enforces the existing trusted-human allowlist, adds no per-request authorization, and dispatches to
 the separate per-tier pods — it is **not** the deferred co-located multiplexer or the deferred authz
 gateway C14, [08](08-agent-runtime-and-identity.md) §3.)_
@@ -222,15 +223,20 @@ dispatches directly to the named agent — constant-time, no inference. On Googl
 carries a numeric `commandId`; on Slack it is a registered `/command`. Both map to the handle table
 above; the gateway normalizes them to a single dispatch path.
 
-**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) NL inference (fallback; low
-confidence → clarify, not guess). Modes 1–2 spend no inference; mode 3 spends one router call.
+**Resolution order:** (1) slash command → (2) explicit `@handle` → (3) the conversation's session agent
+(fallback for a thread nothing has bound; unsure → clarify, not guess). The gateway spends no inference
+in any mode; mode 3's inference is the session agent's, which the gateway hands the turn to. A `/session`
+command that opts a conversation onto the session route is a slash command that names a route rather
+than a handle; it is planned, not built.
 
 **Attribution (extends §8).** Every chat turn's audit record adds the **resolved agent** (`tier`,
-`scope`) and the **routing mode** (`slash` | `handle` | `inference`) alongside the requester +
-trace/session IDs. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
+`scope`) and the **routing mode** (`slash` | `handle` | `session`) alongside the requester +
+trace/session IDs; for mode 3 the gateway records the session, and the target of any delegation the
+session makes is on the child task's envelope, with the same requester. Thread affinity (sticky routing) is keyed on the session store's `thread_id`
 (§6). Routing is **never** an authz signal ([03](03-security-model.md) §4a): the gateway checks the
-target agent's `AllowedUsers` before dispatch, and the NL router (model output) is never trusted for
-authorization.
+target agent's `AllowedUsers` before dispatch, and when a session delegates, the gateway mints the child task on the
+session's request and checks the target's `AllowedUsers` against the turn's requester before it does; the session agent's routing
+choice (model output) is never trusted for authorization.
 
 **Allowlist source & enforcement.** The gateway resolves the **target** agent's trusted-human allowlist
 by reading that `(tier, scope)` **`Agent` CR's** `integration.{googleChat,slack}.allowedUsers` (§1.1) —
@@ -239,7 +245,9 @@ the same field each agent pod's own Hermes gateway already reads (today rendered
 pod's own gateway enforces its allowlist; as the central router fronts multiple per-tier pods it resolves
 the target CR and checks `allowedUsers` **before** dispatch, with the target pod's gateway remaining a
 defense-in-depth backstop. An empty/absent `allowedUsers` means "all authenticated users" (today's
-default) — a closed allowlist must be set explicitly.
+default) — a closed allowlist must be set explicitly. A session-routed turn has no target CR at the
+door: it is gated by the gateway's own ingress allowlist (the adapter's allowed-users setting), and
+the target CR's `allowedUsers` is read when the session asks the gateway to mint a child task to it.
 
 ## 3. GitOps repository layout & propose/apply contract
 

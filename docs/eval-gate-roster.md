@@ -285,6 +285,71 @@ eval crew took that trade with the policy; what makes a break on a GitHub-write 
 a roster line for one of these seats (#2013 step 4, #2016 step 4), and until one lands a pull
 request that touches that path should still say what it ran by hand.
 
+## The whole-suite rate
+
+Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
+pass rate of every roster case's scored repetitions — twelve cases × three = 36 units, `infra`
+repetitions left out — against `main`'s rate over the same cases from the evidence store (the
+newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
+which made several cases a little worse without making any one of them fail three times. The
+verdict prints it on every run today:
+
+```
+Admitted-case pass rate: 91.7% (main: 92.4%, margin 10.0%)
+```
+
+The margin is `EVAL_AGGREGATE_MARGIN`, default 0.10, measured on 2026-09-29 against 94 green
+presubmit runs since 2026-09-26 and the four clean nightlies: the worst unchanged run fell 0.063
+below `main` (five failed repetitions of 36; the 0.05 the rule shipped with would have redded it),
+and 0.10 reds none of them while redding the seventh failed repetition at `main`'s rate that day,
+the sixth once `main` sits near 0.94. The measurement and the two-proportion alternative are in
+[the scorer design](designs/eval-scorer.md#sizing-the-aggregate-margin-measured-2026-09-29).
+
+**It is advisory until armed, and arming is one line in Prow.** With `EVAL_AGGREGATE_ARMED`
+unset — the script's default, pinned by `bench/tests/test_gate.py` — a rate below the margin is a
+note in the verdict, not a red. To arm it, add one line to `pull-kube-agents-smoke-test`'s
+script in `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml` of
+`GoogleCloudPlatform/oss-test-infra`, beside the existing `export EVAL_BASELINE_STORE=...` line
+(the job has no `env:` block; every `EVAL_*` setting is an `export` in its `bash -c` script):
+
+```bash
+export EVAL_AGGREGATE_ARMED="1"
+```
+
+Nothing in this repository changes for the flip, and the same line removed disarms it. The nightly
+periodic does not get the line: it records `main` and grades itself against a window that already
+holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
+window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
+sample contains); the eval dashboard's Trend page draws that window from the same store, per case
+and per domain, so it is the place to watch for it.
+
+**What an author sees when it fires.** No case is marked blocking; the failures are spread. The
+job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,
+and `eval-verdict.md` opens:
+
+```
+**RED**
+
+Admitted-case pass rate: 80.6% (main: 92.4%, margin 10.0%)
+
+### Why it is red
+
+- suite pass rate 0.806 is below main's 0.924 by more than the 0.100 margin (over 36 scored repetitions)
+```
+
+followed by the per-case table, where the failed repetitions sit under `Passes` as `2/3` on
+several rows and each failing repetition's reason and the agent's report are quoted below it.
+Because the sample said seven failed repetitions of 36 is beyond what an unchanged pull request
+produces, the first move is the same as for any red: read the quoted reasons. If they are the
+familiar phrase-match misses spread over unrelated probes, rerun once; a second red at the same
+rate is a finding against the change. `main`'s side of the line is the same number the eval
+dashboard's Trend page draws from the store (`docs/ci-health.md`), so a rate that looks wrong can
+be checked there, and a `main` window that has itself slipped is a nightly problem to fix on
+`main`, not a reason to widen the margin. A case that is dragging both sides down (on
+2026-09-29 `upgrades-lagging-master-probe` was 52 of the sample's 116 failed repetitions) is
+handled under [Demoting a flaky case](#demoting-a-flaky-case), which raises `main`'s rate and
+tightens this rule at the same time.
+
 ## The inject lane
 
 When a run's matrix goes through the A2A gateway's inject door — the harness's

@@ -45,6 +45,7 @@ import pytest
 from kube_agents_bench import scoring
 from kube_agents_bench.cases import CaseSpec, load_case
 from kube_agents_bench.scoring import (
+    DEFAULT_AGGREGATE_MARGIN,
     DEFAULT_JUDGED_MARGIN,
     DELEGATION_CEILING_MARKER,
     INFRA_FAILURE_MARKER,
@@ -1166,6 +1167,30 @@ def test_the_aggregate_is_advisory_unless_armed():
     assert verdict.green is True
     assert verdict.reasons == []
     assert any("below main's 0.900" in n and "not armed" in n for n in verdict.notes)
+
+
+def test_the_default_margin_is_the_measured_one():
+    """0.10, sized 2026-09-29 on 94 green presubmit runs and four clean nights.
+
+    The worst unchanged run in that sample lost five repetitions of 36
+    against a main window at 0.924 (a deficit of 0.063, which the old 0.05
+    would have redded). The default holds it and, at that window, reds the
+    seventh failure; no run in the sample reached six. Pinned so a change to
+    the number is a change to this test, with the measurement to re-do
+    beside it.
+    """
+    assert DEFAULT_AGGREGATE_MARGIN == 0.10
+    five_lost = grade_suite(
+        [_case(passes=31, scored=36)], baseline_rate=230 / 249, min_scored=30, armed=True
+    )
+    assert five_lost.green is True
+    assert five_lost.notes == []
+    assert five_lost.margin == DEFAULT_AGGREGATE_MARGIN
+    seven_lost = grade_suite(
+        [_case(passes=29, scored=36)], baseline_rate=230 / 249, min_scored=30, armed=True
+    )
+    assert seven_lost.green is False
+    assert any("by more than the 0.100 margin" in r for r in seven_lost.reasons)
 
 
 def test_the_aggregate_tolerates_movement_inside_the_margin():

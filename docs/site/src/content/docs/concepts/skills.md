@@ -91,7 +91,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 1. Create `agents/platform/skills/<your-skill>/SKILL.md` — or `agents/cluster/skills/<your-skill>/SKILL.md` if it is a read-only, single-cluster runtime-debugging procedure that belongs to the Cluster Agents.
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
-3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
+3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions. The image build passes each `bash`, `sh`, `shell` and `zsh` block in the skill's `SKILL.md`, whole, to the Tirith command scanner the agent itself runs under, and fails on any block holding a command it would refuse: call a program by its literal path, never through a shell variable. A block too long for the scanner to finish analysing fails the same way, so split a long block. It also fails on a shell block whose Markdown does not parse as one, such as a fence left unclosed inside a list item, since it cannot read that block. It does not read the files under `references/`.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.
 5. Test locally: DM the agent in Chat with a prompt that should trigger the skill, and verify it loads and follows the procedure. (The DM lands at the Planning Agent front door; the skill itself loads in the delegated Platform Agent worker.)
 6. If the skill should also run on schedule, add an entry to `agents/platform/cron/jobs.json` — see [Adding a watchdog](/kube-agents/concepts/autonomous-watchdogs/#adding-a-watchdog).
@@ -100,7 +100,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 The agent discovers skills from **two** locations at startup:
 
-- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing writes runtime state under them — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. (One mode-gated overlay rides that replace — see [`a2a/persona/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/persona/README.md).) The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`, and a Cluster Agent's identity-stamped `config.yaml`, save for the one image-owned value the entrypoint repairs in it, the remote MCP `User-Agent`) is untouched.
+- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing durable lives under them, and the agent's own tools refuse to write it: `skill_manage` refuses a skill the image ships for its profile, and the file tools refuse any path under the profile's `skills/` or `scripts/` ([`deploy/docker/patches/skill_manage_image_owned.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/skill_manage_image_owned.py)) — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. (One mode-gated overlay rides that replace — see [`a2a/persona/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/persona/README.md).) The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`, and a Cluster Agent's identity-stamped `config.yaml`, save for the one image-owned value the entrypoint repairs in it, the remote MCP `User-Agent`) is untouched.
 - **The profile's runtime workspace** at `$HERMES_HOME/profiles/<profile>/skills` — `HERMES_HOME` defaults to `/opt/data`, so the Platform Agent's is `/opt/data/profiles/platform/skills`. This path is backed by the agent's persistent volume. Note it is _not_ `/opt/data/skills`: that is the `default` profile's home, which belongs to the Planning Agent, and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml) disables the `skills` toolset there — a skill dropped in that directory is loaded by nothing.
 
 That gives you two ways to bring in additional skills — for example from the upstream [`google/skills`](https://github.com/google/skills/tree/main/skills/cloud) catalog.
@@ -117,6 +117,8 @@ Reproducible and immutable: the skill ships inside the container.
      -t my-registry/kube-agents/platform-agent:v1.1.0 .
    docker push my-registry/kube-agents/platform-agent:v1.1.0
    ```
+
+   The build fails if a shell command in the copied skill's `SKILL.md` is one the agent's command scanner would refuse, as in step 3 of [Adding a new skill](#adding-a-new-skill).
 
 3. Point the `PlatformAgent` CR at the new image and apply it:
 
@@ -156,7 +158,7 @@ kubectl exec -n kubeagents-system -it $AGENT_POD -c platform-agent -- \
   ls -la /opt/data/profiles/platform/skills/<skill-dir>
 ```
 
-The runtime discovers the skill on its next relevant turn. It does **not** survive a pod restart: the entrypoint replaces each specialist profile's `skills/` from the baked template on every start, so an injected skill lasts only as long as the pod. That is the point of Method 2 — it is an iteration loop, not a deployment mechanism. Bake the skill into the image (Method 1) to keep it.
+The runtime discovers the skill on its next relevant turn. It does **not** survive a pod restart: the entrypoint replaces each specialist profile's `skills/` from the baked template on every start, so an injected skill lasts only as long as the pod — and so does a skill the agent authors for itself through `skill_manage`, which is why a gap in a shipped skill is something the agent reports rather than patches. That is the point of Method 2 — it is an iteration loop, not a deployment mechanism. Bake the skill into the image (Method 1) to keep it.
 
 ## Skill vs. governance SOP vs. cron job
 

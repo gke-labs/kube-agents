@@ -50,6 +50,25 @@ SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
 SETUP_DEATH_BUILD = "2097273589702070272"
 SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
+# The poll-timing tests run the page's setInterval this many times faster, so
+# two polls fit in a budget of a few virtual seconds (see fast_timers_page).
+TIMER_SPEEDUP = 100
+# A bare integer literal only: `60 * 1000`, `60_000` or `6e4` would otherwise
+# read as 60 or 6 and shrink the budget below to almost nothing.
+_REFRESH_MATCH = re.search(r"^\s*refreshMs:\s*(\d+)\s*(?:,|\}|$)", PAGES_JS.read_text(), re.MULTILINE)
+if _REFRESH_MATCH is None:
+    raise RuntimeError(f"{PAGES_JS}: PAGE.refreshMs is not a bare integer literal; the poll-timing tests cannot derive their budget")
+PAGE_REFRESH_MS = int(_REFRESH_MATCH.group(1))
+# Boot, then two polls, then half an interval of slack, on the sped-up clock.
+TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEEDUP
+# Below this the page may not finish booting inside the budget, and the
+# scroll-once test would pass or fail on load time rather than on the poll.
+MIN_TWO_POLLS_BUDGET_MS = 1000
+if TWO_POLLS_BUDGET_MS < MIN_TWO_POLLS_BUDGET_MS:
+    raise RuntimeError(
+        f"two polls of PAGE.refreshMs={PAGE_REFRESH_MS} at TIMER_SPEEDUP={TIMER_SPEEDUP} give a "
+        f"{TWO_POLLS_BUDGET_MS} ms budget, under {MIN_TWO_POLLS_BUDGET_MS} ms; lower TIMER_SPEEDUP"
+    )
 
 
 # The scorer's marker-led reason for a delegation-ceiling repetition (#1874);
@@ -151,6 +170,20 @@ def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
     shim = ("<script>Element.prototype.scrollIntoView = function () {"
             " document.body.dataset.scrolls = String(Number(document.body.dataset.scrolls || 0) + 1); };</script>")
     copy = page.with_name(page.stem + "-scrolls" + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
+
+
+def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
+    """A copy of the rendered page whose setInterval runs TIMER_SPEEDUP
+    times faster, so the poll every PAGE.refreshMs fires inside a short
+    virtual-time budget. A budget spanning real polls (130 s) on a URL whose
+    fragment names an element on the page (#gate) intermittently stalled
+    headless Chrome's virtual clock on CI until the wall-clock timeout;
+    bare anchors on short budgets have a clean record."""
+    shim = ("<script>(() => { const native = window.setInterval;"
+            f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
+    copy = page.with_name(page.stem + "-fast" + page.suffix)
     copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
     return copy
 
@@ -1027,14 +1060,14 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('href="index.html#view=agent"', app, "the footer link is the fragment form")
 
     def test_a_view_scrolls_once_on_navigation_and_not_on_the_poll(self):
-        # 130 s of virtual time: boot, the refresh after it, and two polls.
-        # The section is scrolled to once; the polls, which re-render the
-        # page, must not pull a reader back to it.
-        page = scroll_counting_page(self.index)
+        # Boot, the refresh after it, and two polls, on a clock sped up so
+        # they fit in a short budget. The section is scrolled to once; the
+        # polls, which re-render the page, must not pull a reader back to it.
+        page = fast_timers_page(scroll_counting_page(self.index))
         scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
-        self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=130000)).group(1), "1")
-        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=130000)).group(1), "1", "the bare anchor, the same way")
-        self.assertIsNone(scrolls(dom_html(page, budget_ms=130000)), "no view, no scroll")
+        self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1")
+        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1", "the bare anchor, the same way")
+        self.assertIsNone(scrolls(dom_html(page, budget_ms=TWO_POLLS_BUDGET_MS)), "no view, no scroll")
 
     def test_hostile_parameters_never_reach_the_dom(self):
         for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):

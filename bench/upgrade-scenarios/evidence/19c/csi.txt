@@ -1,0 +1,65 @@
+
+## 2026-09-29T15:49:54Z [csi/addon-default] csi_state
+enabled=True
+## exit 0
+
+## 2026-09-29T15:50:55Z [csi/pod-with-driver] K -n scen get pods -l app=pd-user -o wide
+NAME                       READY   STATUS    RESTARTS   AGE    IP          NODE                                  NOMINATED NODE   READINESS GATES
+pd-user-5f66bd9f9b-mllqq   1/1     Running   0          2m2s   10.92.1.5   gke-upg-19c-work-pool-bcd1809d-s4xh   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:50:56Z [csi/disable-driver] G container clusters update upg-19c --zone us-central1-c --update-addons=GcePersistentDiskCsiDriver=DISABLED --quiet
+Updating upg-19c...
+...............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................done.
+Updated [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-c/clusters/upg-19c].
+To inspect the contents of your cluster, go to: https://console.cloud.google.com/kubernetes/workload_/gcloud/us-central1-c/upg-19c?project=<PROJECT_ID>
+## exit 0
+
+## 2026-09-29T16:01:10Z [csi/addon-disabled] csi_state
+
+## exit 0
+
+## 2026-09-29T16:01:11Z [csi/pod-still-running] K -n scen get pods -l app=pd-user -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP          NODE                                  NOMINATED NODE   READINESS GATES
+pd-user-5f66bd9f9b-mllqq   1/1     Running   0          12m   10.92.1.5   gke-upg-19c-work-pool-bcd1809d-s4xh   <none>           <none>
+## exit 0
+
+## 2026-09-29T16:24:03Z [csi/pod-after-upgrade] K -n scen get pods -l app=pd-user -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP       NODE     NOMINATED NODE   READINESS GATES
+pd-user-5f66bd9f9b-v6kmc   0/1     Pending   0          12m   <none>   <none>   <none>           <none>
+## exit 0
+
+## 2026-09-29T16:24:04Z [csi/events-after-upgrade] pd_events
+2026-09-29T15:48:54Z   FailedScheduling         pd-user-5f66bd9f9b-mllqq   0/2 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/2 nodes are available: 2 Preemption is not helpful for scheduling.
+2026-09-29T15:48:54Z   NotTriggerScaleUp        pd-user-5f66bd9f9b-mllqq   Pod didn't trigger scale-up: 
+2026-09-29T15:49:10Z   Scheduled                pd-user-5f66bd9f9b-mllqq   Successfully assigned scen/pd-user-5f66bd9f9b-mllqq to gke-upg-19c-work-pool-bcd1809d-s4xh
+2026-09-29T15:49:18Z   SuccessfulAttachVolume   pd-user-5f66bd9f9b-mllqq   AttachVolume.Attach succeeded for volume "intree-pd" 
+2026-09-29T16:12:03Z   Killing                  pd-user-5f66bd9f9b-mllqq   Stopping container c
+2026-09-29T16:22:40Z   TaintManagerEviction     pd-user-5f66bd9f9b-mllqq   Cancelling deletion of Pod scen/pd-user-5f66bd9f9b-mllqq
+2026-09-29T16:20:52Z   FailedScheduling         pd-user-5f66bd9f9b-v6kmc   0/3 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) were unschedulable. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.
+2026-09-29T16:22:11Z   NotTriggerScaleUp        pd-user-5f66bd9f9b-v6kmc   Pod didn't trigger scale-up: 
+## exit 0
+## 2026-09-29T16:24:04Z [csi/note] fix: enable the PD CSI driver add-on
+
+## 2026-09-29T16:24:04Z [csi/enable-driver] G container clusters update upg-19c --zone us-central1-c --update-addons=GcePersistentDiskCsiDriver=ENABLED --quiet
+Updating upg-19c...
+............................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................done.
+Updated [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-c/clusters/upg-19c].
+To inspect the contents of your cluster, go to: https://console.cloud.google.com/kubernetes/workload_/gcloud/us-central1-c/upg-19c?project=<PROJECT_ID>
+## exit 0
+
+## 2026-09-29T16:36:30Z [csi/pod-after-fix] K -n scen get pods -l app=pd-user -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+pd-user-5f66bd9f9b-v6kmc   1/1     Running   0          24m   10.92.2.14   gke-upg-19c-work-pool-bcd1809d-b5ny   <none>           <none>
+## exit 0
+
+## 2026-09-29T16:36:31Z [csi/events-after-fix] pd_events
+2026-09-29T16:20:52Z   FailedScheduling         pd-user-5f66bd9f9b-v6kmc   0/3 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) didn't match Pod's node affinity/selector, 1 node(s) were unschedulable. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.
+2026-09-29T16:27:20Z   NotTriggerScaleUp        pd-user-5f66bd9f9b-v6kmc   Pod didn't trigger scale-up: 
+2026-09-29T16:31:11Z   FailedScheduling         pd-user-5f66bd9f9b-v6kmc   0/2 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/2 nodes are available: 2 Preemption is not helpful for scheduling.
+2026-09-29T16:33:28Z   FailedScheduling         pd-user-5f66bd9f9b-v6kmc   0/2 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity, 1 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/2 nodes are available: 2 Preemption is not helpful for scheduling.
+2026-09-29T16:32:56Z   NotTriggerScaleUp        pd-user-5f66bd9f9b-v6kmc   Pod didn't trigger scale-up: 
+2026-09-29T16:33:35Z   Scheduled                pd-user-5f66bd9f9b-v6kmc   Successfully assigned scen/pd-user-5f66bd9f9b-v6kmc to gke-upg-19c-work-pool-bcd1809d-b5ny
+2026-09-29T16:34:20Z   FailedAttachVolume       pd-user-5f66bd9f9b-v6kmc   AttachVolume.Attach failed for volume "intree-pd" : csinode.storage.k8s.io "gke-upg-19c-work-pool-bcd1809d-b5ny" not found
+2026-09-29T16:34:53Z   SuccessfulAttachVolume   pd-user-5f66bd9f9b-v6kmc   AttachVolume.Attach succeeded for volume "intree-pd" 
+## exit 0

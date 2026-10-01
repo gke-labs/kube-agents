@@ -129,19 +129,9 @@
    "--state",
    "open",
    "--json",
-   "number,url",
+   "number,url,body",
    "--limit",
    "20"
-  ],
-  [
-   "gh",
-   "issue",
-   "view",
-   "42",
-   "-R",
-   "acme/fleet",
-   "--json",
-   "body"
   ],
   [
    "gh",
@@ -196,11 +186,9 @@
   null,
   null,
   null,
-  null,
   null
  ],
  "bodies": [
-  null,
   null,
   null,
   null,

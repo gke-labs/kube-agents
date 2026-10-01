@@ -205,7 +205,8 @@ def scratch_lane_file(tmp_path: Path, requesting: dict[str, int]) -> Path:
 
 def test_the_real_requesting_list_is_well_formed():
     # Its contents are pinned by scripts/test_eval_rosters.py, which also
-    # fails an entry whose case's own checks already request one.
+    # fails an entry whose count does not exceed what the case's own checks
+    # already request.
     listed = lane.load_lane_requesting(LANE_FILE)
     assert all(isinstance(case, str) and count >= 1 for case, count in listed.items())
     assert READ_ONLY_CASE not in listed

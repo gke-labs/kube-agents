@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
@@ -45,6 +46,15 @@ const (
 	messageIDHexWidth     = 8
 	contextIDHexWidth     = 12
 	correlationIDHexWidth = 12
+)
+
+// JetStream storage capacity error codes and patterns.
+const (
+	// jsErrCodeStorageResourcesExceeded is nats-server's JSStorageResourcesExceededErr (10047),
+	// returned when account or server storage resources are exhausted.
+	jsErrCodeStorageResourcesExceeded jetstream.ErrorCode = 10047
+	maxBytesErrPattern                                    = "max bytes"
+	maximumBytesErrPattern                                = "maximum bytes"
 )
 
 // gatewayParty is the gateway's own identity in from. Never the source of
@@ -105,8 +115,15 @@ type Gateway struct {
 	mu sync.Mutex
 	// sessionLocks serializes work per conversation; tasks serialize per
 	// session by construction (a message during a running task is a steer,
-	// never a second task).
-	sessionLocks map[string]*sync.Mutex
+	// never a second task). Entries are refcounted and pruned when idle.
+	sessionLocks map[string]*sessionLockEntry
+	// reapCursor tracks the scan position in session-state across reap passes,
+	// so a scan that hits reapPassTimeout resumes from where it left off
+	// rather than restarting from the beginning.
+	reapCursor string
+	// reapScanHook is an optional test hook invoked during reap passes on each visited record.
+	// Returning false halts the reap scan early.
+	reapScanHook func(rec *SessionRecord) bool
 	// taskSessions caches taskId -> session key; the KV task index is the
 	// durable copy a restart falls back to. Entries retire with the task.
 	taskSessions map[string]string
@@ -134,7 +151,11 @@ type Gateway struct {
 	gchatAllowed  map[string]bool
 	gchatAllowAll bool
 	// droppedNotices records which unverifiable senders have been told so —
-	// the drop is visible once per sender, not once per message.
+	// the drop is visible once per sender, not once per message. Per
+	// sender, NOT per conversation: a channel mention mints a fresh
+	// conversation every time, so a conversation-scoped key would be no
+	// bound at all. Bounded by droppedNoticesCap, so an unverified sender
+	// cannot grow it without bound either.
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
@@ -192,14 +213,17 @@ func New(o Options) (*Gateway, error) {
 		// like this, but a `mode: next` install whose relay URL failed to
 		// render looks exactly the same, and the difference between the
 		// two must not be silence.
-		log.Warn("the gateway is running on the inject door alone: no Discord token and no Chat relay are armed, " +
+		log.Warn("the gateway is running on the inject door alone: no Discord token, Slack pair or Chat relay is armed, " +
 			"so nothing but the eval door can reach this install (inject-only)")
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
-	// map — an empty map is only a lockout on the backends that use one, and
-	// a gateway whose only ingress is the side door uses the door's map
-	// below instead of this one.
-	if backend == discordBackend && pm.Len() == 0 {
+	// map — an empty map is only a lockout on the backends that use one
+	// (Discord's test table and Slack's user_id join alike), and a gateway
+	// whose only ingress is the side door uses the door's map below instead
+	// of this one. Slack is the case that matters operationally: nothing
+	// renders its map yet (#2099), so a Slack gateway whose map path is
+	// missing would otherwise pass boot silently and drop every sender.
+	if (backend == discordBackend || backend == slackBackend) && pm.Len() == 0 {
 		log.Warn("principal map is empty; every inbound message will be dropped at verification",
 			"path", o.Config.PrincipalMapPath)
 	}
@@ -244,6 +268,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.FirstEventGrace <= 0 {
 		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
+	if o.Config.SessionTTL <= 0 {
+		o.Config.SessionTTL = defaultSessionTTL
+	}
 	g := &Gateway{
 		turnBudget:     turnTimeout,
 		cfg:            o.Config,
@@ -254,7 +281,7 @@ func New(o Options) (*Gateway, error) {
 		ps:             NewPseudonymizer(o.Config.AttributionSalt),
 		log:            log,
 		runCtx:         context.Background(),
-		sessionLocks:   map[string]*sync.Mutex{},
+		sessionLocks:   map[string]*sessionLockEntry{},
 		taskSessions:   map[string]string{},
 		relays:         map[string]*relayState{},
 		backend:        backend,
@@ -275,6 +302,15 @@ func New(o Options) (*Gateway, error) {
 	// backend does not implement ProbeSink and is offered nothing.
 	if sink, ok := o.Adapter.(ProbeSink); ok {
 		sink.SetProbe(g.probeConversation)
+	}
+	// The session registry as a read, for an adapter that has to decide on
+	// its own goroutine whether a conversation is one the gateway is in (the
+	// Slack adapter's session-thread rule, and the side door composite in
+	// front of it), with the idle TTL the read is bounded by so the adapter
+	// can expire its own positive cache on the same bound. See
+	// SessionLookup.
+	if sink, ok := o.Adapter.(SessionLookupSink); ok {
+		sink.SetSessionLookup(g.hasSession, o.Config.IdleTTL)
 	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
@@ -331,16 +367,50 @@ func (g *Gateway) Run(ctx context.Context) error {
 	return g.adapter.Run(ctx, func(msg InboundMessage) { g.inbox.enqueue(msg.Conversation, msg) })
 }
 
-// lockSession returns the per-conversation mutex, minting it on first use.
-func (g *Gateway) lockSession(key string) *sync.Mutex {
+type sessionLockEntry struct {
+	mu       sync.Mutex
+	refcount int
+}
+
+// sessionLockHandle pairs a session lock with its release hook, refcounting
+// the entry so idle locks are pruned from memory when no longer referenced.
+type sessionLockHandle struct {
+	g        *Gateway
+	key      string
+	entry    *sessionLockEntry
+	unlocked bool
+}
+
+func (h *sessionLockHandle) Lock() {
+	h.entry.mu.Lock()
+}
+
+func (h *sessionLockHandle) Unlock() {
+	if h.unlocked {
+		return
+	}
+	h.unlocked = true
+	h.entry.mu.Unlock()
+	h.g.mu.Lock()
+	h.entry.refcount--
+	if h.entry.refcount <= 0 {
+		delete(h.g.sessionLocks, h.key)
+	}
+	h.g.mu.Unlock()
+}
+
+// lockSession returns the per-conversation mutex handle, refcounting the entry
+// so idle locks are pruned from memory when no longer referenced.
+func (g *Gateway) lockSession(key string) *sessionLockHandle {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	l, ok := g.sessionLocks[key]
+	entry, ok := g.sessionLocks[key]
 	if !ok {
-		l = &sync.Mutex{}
-		g.sessionLocks[key] = l
+		entry = &sessionLockEntry{}
+		g.sessionLocks[key] = entry
 	}
-	return l
+	entry.refcount++
+	return &sessionLockHandle{g: g, key: key, entry: entry}
 }
 
 // handleInbound is one user turn: verify the sender, resolve the session,
@@ -477,7 +547,12 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	if rec == nil {
 		rec, err = g.mintSession(ctx, msg)
 		if err != nil {
-			g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			if isMaxBytes(err) {
+				g.log.Error("session mint failed: session-state bucket is full (max bytes reached)",
+					"conversation", msg.Conversation, "err", err)
+			} else {
+				g.log.Error("session mint failed", "conversation", msg.Conversation, "err", err)
+			}
 			return
 		}
 	}
@@ -741,6 +816,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	addressee := rec.AddresseeFor(active.TaskID)
 	task, terminalSubject, err := g.client.TasksGetAttributed(ctx, addressee, active.TaskID)
 	healed := false
+	var healedSource TerminalSource
 	switch {
 	case err == nil && task.Final:
 		g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
@@ -764,7 +840,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			source = TerminalFromSupervisor
 		}
 		g.observeTaskTerminal(rec.Key, active.TaskID, task.State, source, finalMessageText(task))
-		healed = true
+		healed, healedSource = true, source
 	case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
 		time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
 		g.log.Info("healing an active task with no first event inside the grace",
@@ -779,10 +855,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// the install's. Nothing is published: as handleInbound's comment
 		// says, age is not evidence.
 		g.observeTaskTerminal(rec.Key, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
-		healed = true
+		healed, healedSource = true, TerminalNeverStarted
 	}
 	if healed {
 		rec.ActiveTask = nil
+		// The same rule as relayTerminal's, for the same terminal reaching
+		// the record by the other route: an executor's end of the task is
+		// activity, and the idle window opens at the answer. Without this a
+		// healed thread went quiet the moment its lost answer was posted.
+		if healedSource == TerminalFromExecutor {
+			now := time.Now().UTC()
+			rec.LastActivity = now
+			rec.LastTaskActivity = now
+		}
 		// Write the release now, not at the end of the turn: a turn that
 		// returns early — a cap refusal, on exactly the Delegate that
 		// follows a wedge — would otherwise announce a release it never
@@ -861,10 +946,74 @@ func (g *Gateway) probeConversation(ctx context.Context, key string) (Conversati
 	return state, nil
 }
 
+// hasSession is the SessionLookup the gateway offers a SessionLookupSink:
+// whether the gateway has started a task in the conversation and the
+// session is not idle past the idle TTL, read from the registry and
+// reported with nothing changed, plus the moment that answer stops being
+// trustworthy. A pure read, as SessionLookup requires -- no lock, no heal,
+// no post, no publish, no write.
+//
+// A record alone is not the answer. mintSession creates one for ANY verified
+// turn before the text is dispatched, so a mapped user's "@bot stop" with
+// nothing running, or an ask refused at the session cap, leaves a record
+// behind and starts nothing; answering true on that would adopt the thread
+// the way TaskStarted never did, and the two sources would disagree. A
+// started task is what startTask writes -- ActiveTask while it runs, and a
+// TaskRef in Tasks for the record's life -- so that is what this reads.
+//
+// Nor is a record with a past task the answer forever. A running task keeps
+// the conversation a session however long it runs (reapOnce never touches a
+// pod under one, and a thread whose task is still working must carry the
+// "stop"). Running is the reap's own predicate -- an ActiveTask that is not
+// Detached -- so this read and the reap share one definition of it: a task
+// the user has stopped, whose terminal never arrived (cancelTask sets
+// Detached and leaves ActiveTask in place), is not running here any more
+// than it exempts the pod there. Otherwise the conversation is a session
+// only while it has had activity within the idle TTL: LastTaskActivity is
+// written by routeTurn on every turn and persisted, and the TTL is the same
+// g.cfg.IdleTTL reapOnce reads. The record itself is not the bound --
+// reapOnce deletes the pod and keeps the record, Tasks and all, and nothing
+// else deletes it -- so a read keyed on the record's existence would answer
+// true for any thread a task ever started in, for good. Activity is the
+// bound; the record merely carries it.
+//
+// The until returned with a true is the registry's own bound, not the
+// adapter's: for the idle case it is LastTaskActivity + IdleTTL, the instant the
+// registry itself would start answering false, so a cache that expires on
+// it cannot outlive the answer it was given (a message the gateway refuses,
+// an unmapped sender's, moves nothing, and a cache stamped from its own
+// clock would hold a true the registry had already withdrawn). For a
+// running task there is no bound to hand over, so it is now + IdleTTL: the
+// adapter asks again then, and a task still running is answered again.
+func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, time.Time, error) {
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil || rec == nil {
+		return false, time.Time{}, err
+	}
+	now := time.Now()
+	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
+		return true, now.Add(g.cfg.IdleTTL), nil
+	}
+	if len(rec.Tasks) > 0 {
+		// The last TASK's activity, not the record's: LastActivity moves on
+		// every verified turn, a "@bot stop" with nothing running included,
+		// and a turn that starts nothing must not re-admit a thread whose
+		// last task ended hours ago. LastTaskActivity moves only when a task
+		// starts (startTask) or an executor ends a live one (relayTerminal).
+		if until := rec.LastTaskActivity.Add(g.cfg.IdleTTL); now.Before(until) {
+			return true, until, nil
+		}
+	}
+	return false, time.Time{}, nil
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
-// TaskObserver about a task's two ends. Both are no-ops for every chat
-// backend, which does not implement the interface: a human reads the chat, so
-// the rendered text is the whole of what a chat backend needs.
+// TaskObserver about a task's two ends. Both are no-ops for an adapter that
+// does not implement the interface -- Discord and gchat, for which a human
+// reads the chat and the rendered text is the whole interface. The Slack
+// adapter implements it for TaskStarted and TaskTerminal: a task starting in a thread is
+// what makes that thread a session thread, and the adapter learns it here
+// rather than inferring it from a mention it has not yet seen verified.
 func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskStarted(conversation, taskID)
@@ -953,10 +1102,47 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 		return nil, err
 	}
 	winner, gerr := g.reg.Get(ctx, msg.Conversation)
-	if gerr != nil || winner == nil {
-		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %v", gerr)
+	if gerr != nil {
+		return nil, fmt.Errorf("lost the mint race but cannot read the winner: %w", gerr)
+	}
+	if winner == nil {
+		return nil, errors.New("lost the mint race but winner record not found")
 	}
 	return winner, nil
+}
+
+// isMaxBytes reports whether err represents a NATS JetStream max_bytes limit
+// or storage capacity refusal (e.g. JSStorageResourcesExceededErr, ErrMaxBytesExceeded,
+// or maximum bytes exceeded). It checks typed jetstream.APIError fields and the
+// innermost unwrapped root error to ensure conversation keys (which may embed arbitrary
+// digit sequences like Discord snowflakes) cannot trigger false positives.
+func isMaxBytes(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, jetstream.ErrMaxBytesExceeded) {
+		return true
+	}
+	var apiErr *jetstream.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode == jsErrCodeStorageResourcesExceeded {
+			return true
+		}
+		desc := strings.ToLower(apiErr.Description)
+		if strings.Contains(desc, maxBytesErrPattern) || strings.Contains(desc, maximumBytesErrPattern) {
+			return true
+		}
+	}
+	root := err
+	for {
+		if unwrapped := errors.Unwrap(root); unwrapped != nil {
+			root = unwrapped
+		} else {
+			break
+		}
+	}
+	msg := strings.ToLower(root.Error())
+	return strings.Contains(msg, maxBytesErrPattern) || strings.Contains(msg, maximumBytesErrPattern)
 }
 
 // startTask mints the identifiers, publishes the submission, and posts the
@@ -1013,6 +1199,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
 		Ask: truncateRunes(msg.Text, askCap), SubmittedAt: time.Now()}
 	rec.Tasks = append(rec.Tasks, TaskRef{ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID})
+	rec.LastTaskActivity = time.Now().UTC()
 	if len(rec.Tasks) > taskHistoryCap {
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 	}
