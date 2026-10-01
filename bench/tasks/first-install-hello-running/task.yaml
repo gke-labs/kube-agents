@@ -108,7 +108,18 @@ verification_spec:
       # Word-bounded, over the whitespace-collapsed reply: a bare "here" is
       # inside "there", which the prompt's closing question and its "Hi there"
       # fallback both carry.
-      any_of_phrases: [" here ", " here.", " here,", " here!", "this chat"]
+      any_of_phrases:
+        [
+          " here ",
+          " here.",
+          " here,",
+          " here!",
+          " here;",
+          " here:",
+          " here)",
+          "(here)",
+          "this chat",
+        ]
 
   - name: asks-one-question-and-ends-on-it
     role: objective
