@@ -392,7 +392,7 @@ table quotes are checked in, so most of these are named for the record rather th
   and left `work-pool` at 1.31 (`10`, `10b`). It did move `default-pool` to 1.34 on its own between the two
   runs, so it may still auto-upgrade a skewed pool later.
 - A cgroup v1 pool can still be created on a cluster created at 1.34, but it cannot be upgraded to 1.35 (`14`,
-  `14c`). This contradicts the test plan's note that such pools are refused after 1.26.
+  `14c`). A pool pinned to cgroup v1 can still be created on a cluster built at 1.34; it is the upgrade past 1.34 that GKE refuses until the pool is migrated.
 - The default compute service account on a node pool has no read on a new Artifact Registry repository (`20`).
 - On e2-small nodes, GKE's system pods preempt workload pods (the first wave, above). Test pools need
   e2-standard-2 or larger.
