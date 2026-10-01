@@ -1003,6 +1003,19 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "sudo -u hermes python3 -m cluster_agent_profile",
             "uv run python3 -m kanban_notify_propagate",
             "sudo -u hermes python3 -c 'import kanban_notify_propagate'",
+            # Module name variable indirection, command substitutions, and internal quotes (Threads 2 & 3)
+            'python3 -m cluster_agent_"profile"',
+            'python3 -m "cluster_agent"_profile',
+            "python3 -m 'cluster_agent'_profile",
+            'python3 -m kanban_notify_"propagate"',
+            'python3 -m "$MOD" list',
+            "python3 -m $MODULE list",
+            'python3 -m "${MOD}" list',
+            'python3 -m "$(cat mod.txt)"',
+            'MOD=cluster_agent_profile python3 -m "$MOD" list',
+            "MOD=cluster_agent_profile python3 -m $MOD list",
+            'MOD="cluster_agent_profile" python3 -m "${MOD}" list',
+            'MOD=kanban_notify_propagate python3 -m "$MOD"',
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1124,6 +1137,8 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "timeout --foreground 60 python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "env FOO=bar python3 " + " ".join(f"--flag{i}" for i in range(50)) + " script.py",
+            # Verify double-quoted -c commands with backslash-escaped quotes and no whitespace do not backtrack
+            "python3 -c \"print({" + ",".join(f"\\\"k{i}\\\":\\\"v{i}\\\"" for i in range(10)) + "})\"",
         ]
         for cmd in flagged_cmds:
             for i, pat in enumerate(forbidden):
