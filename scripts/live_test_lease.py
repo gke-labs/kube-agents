@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Mutual exclusion for a kube-agents install that several agents share.
 
-`AGENTS.md` requires every pull request to be live-tested against a running
-installation, and standing one up per contributor is not realistic -- so a team
-shares one. Concurrent agents then clobber each other: two sessions patching the
-operator env, pushing the same image tag, or re-running the installer produce a
-last-writer-wins install and two live-validation sections that both describe
-something that is no longer true. Nothing fails loudly; the losing agent reads
-back the winner's state and reports success.
+Standing up a GKE cluster per contributor is not always practical -- so a team
+or set of agents shares a dev installation. Concurrent agents then clobber each
+other: two sessions patching the operator env, pushing the same image tag, or
+re-running the installer produce a last-writer-wins install. Nothing fails
+loudly; the losing agent reads back the winner's state.
 
 So a mutating command takes a lease first. The lease is a ConfigMap named
 `live-test-lease` in the install's own namespace, which is what makes it work

@@ -4,23 +4,21 @@
 > `.claude/settings.json.example` are what the repository ships.
 
 **Scope:** How several agents share one running kube-agents installation without overwriting each
-other's live validation.
+other's deploys or eval runs.
 **Owns:** the `live-test-lease` ConfigMap, `scripts/live_test_lease.py`, and the command
-classification that decides which Bash commands need the lease. The live-validation requirement
-itself belongs to [`AGENTS.md`](../../AGENTS.md), "Pull Request Hygiene". Leasing GitOps clones
-inside the agent pod is the same idea one layer down and belongs to
+classification that decides which Bash commands need the lease. Leasing GitOps clones inside the
+agent pod is the same idea one layer down and belongs to
 [`gitops-workspace-leases.md`](gitops-workspace-leases.md).
 
 ---
 
 ## The problem
 
-Every pull request here must be exercised against a real installation, and standing up a GKE
-cluster per contributor is not realistic — so a team shares one. Then two agents work at once. One
-patches the `PlatformAgent` env while the other rolls a new image tag into the same Deployment;
-each reads back a pod that has both changes, or neither, and writes a **Live validation** section
-describing an install that no longer exists. The loser's evidence is not wrong-looking. It is a
-successful `kubectl get` against state somebody else produced.
+Standing up a GKE cluster per contributor is not always practical — so a team or set of agents
+shares a dev installation. When two agents work against it at once, one patches the `PlatformAgent`
+env while the other rolls a new image tag into the same Deployment; each reads back a pod that has
+both changes, or neither. The loser's observation is not wrong-looking: it is a successful
+`kubectl get` or eval run against state somebody else produced.
 
 Nothing in the toolchain notices. The unit tests pass, `make docs-check` passes, and the failure
 surfaces days later as a change that never worked.

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """Classify a pull request's risk tier from its diff, as a non-blocking signal.
 
-Reviewers get no signal about which pull requests are safe to clear quickly:
-the only risk information on a pull request is the template's Risk & Rollout
-section, author-asserted prose that nothing verifies (#818). This script
-computes a `low` / `medium` / `high` tier from the diff itself against the
-rules in `.github/risk-rules.yml`, then surfaces it three ways:
+This script computes a `low` / `medium` / `high` tier from the diff itself
+against the rules in `.github/risk-rules.yml`, then surfaces it three ways:
 
   - a `Risk Classification` check run, always concluding `success` -- the tier
     lives in the title, the triggered rules in the summary, and a fenced JSON
     block carries the machine-readable contract for later consumers;
   - a `risk:low|medium|high` label, swapped idempotently;
-  - a declared-vs-computed note when the Risk & Rollout section says "low
-    risk" and the rules say high -- the same contract reviewers apply to
-    Self-Review, where a claim the diff does not support is itself a finding.
+  - a declared-vs-computed note when a `Risk & Rollout` section is present and
+    claims "low risk" while the rules say high.
 
 The tier is computed from the diff and the rules alone. The pull request's
 title, labels, and body are inputs only to the declared-vs-computed check,

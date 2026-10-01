@@ -22,5 +22,5 @@ refreshed in a week, and §1 says why that is the failure it exists to stop.
 
 Report before you act: the merged disposition list, which passes ran and which you skipped, and
 anything the passes said they could not cover. Then fix what the passes confirmed, per
-`review-preflight` §6 — the reading order is the point, not a freeze. Leave the PR body until after
-I have read the list.
+`review-preflight` §6 — the reading order is the point, not a freeze. Do not paste the disposition
+list into the PR body.

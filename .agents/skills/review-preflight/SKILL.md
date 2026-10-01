@@ -6,7 +6,7 @@ description: Runs the review passes required before a pull request is opened —
 # Task
 
 Get every pre-PR review pass into a context that did not write the change, then merge what comes
-back into the list that becomes the pull request's **Self-Review** section.
+back into one disposition list for the author (do not paste the report into the pull request body).
 
 This skill is plumbing. It holds no review method — [`review-adversarial`](../review-adversarial/SKILL.md)
 and [`review-docs-drift`](../review-docs-drift/SKILL.md) own that — and it does not state the
@@ -67,7 +67,7 @@ branch wrote them.
 
 Both, on every change. Neither has a trigger to evaluate and there is no third pass, so this step is
 a checklist rather than a judgment — but say which ran anyway, and say it when one of them did not.
-A pass nobody ran is a gap in the section, not an absence of findings.
+A pass nobody ran is a gap in the report, not an absence of findings.
 
 ## 3. Run the mechanical gate first, in the main loop
 
@@ -128,8 +128,7 @@ If none of those is available to you, **you are blocked, and the pull request wa
 are blocked on. [`.agents/rules/pre_pr_review.md`](../../rules/pre_pr_review.md) is explicit that
 an approval you could not get blocks this step rather
 than waiving it, so the authoring context is not the fallback — running the pass there and
-disclosing it is what you do when a human, told the above, tells you to proceed anyway. Then
-**Self-Review** says which context ran the pass, in those words.
+disclosing it is what you do when a human, told the above, tells you to proceed anyway.
 
 ## 5. What to hand each pass, and what to withhold
 
@@ -183,14 +182,12 @@ request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not
 finding as CONFIRMED to make one column of it; the pass did not do the verification that word
 claims.
 
-Every survivor gets a disposition either way, to the bar
-[`.agents/rules/pre_pr_review.md`](../../rules/pre_pr_review.md) sets: fixed, or deliberately
-not, with a reason that argues about this change.
+Every survivor gets a disposition either way: fixed, or deliberately not, with a reason that argues
+about this change.
 
 Report what a pass only suspects rather than acting on it. A finding it could not pin down is an
-open question for the pull request's **Self-Review** section, not a licence to rewrite working code
-— chasing an uncertain finding on your own change is how a self-review makes it worse than it
-started.
+open question to surface to the user, not a licence to rewrite working code — chasing an uncertain
+finding on your own change is how a self-review makes it worse than it started.
 
 ## 7. Re-runs
 
@@ -198,7 +195,7 @@ A fix changes the shared range, so re-run whatever the fix invalidated — not w
 the finding. They are rarely the same set: rewriting a paragraph to answer an adversarial finding is
 exactly how the prose starts contradicting another document, which is docs-drift's question and not
 one `make docs-check` can answer. Work that still holds stays, and is not re-run just to have been
-run against the new head; `AGENTS.md` states that rule and this restates it.
+run against the new head.
 
 New context, same handoff. Feeding the previous round's findings into the re-run defeats the point
 of the fresh one.
@@ -209,7 +206,7 @@ One severity-ordered disposition list covering every pass that ran. Severity and
 axes, and a finding carries both: its pass's severity (`BLOCKER`/`HIGH`/`MEDIUM`/`LOW` from
 `review-adversarial`, Blocking or Advisory from `review-docs-drift`) orders the list, and its
 CONFIRMED/PLAUSIBLE verdict or triage says how sure the pass was. Name which pass each came from, so
-a reader can tell what kind of check stands behind it. Above the list, three lines the reviewer
+a reader can tell what kind of check stands behind it. Above the list, three lines the reader
 cannot reconstruct from the findings:
 
 - which passes ran, and which were skipped and why. A pass that found nothing reports what it
@@ -218,5 +215,5 @@ cannot reconstruct from the findings:
 - for each, what kind of context it ran in — subagent, fresh session, or the one that wrote the code;
 - what the passes could not cover: suites not run, infrastructure absent, angles refused.
 
-That list is the pull request's **Self-Review** section. "No findings" is an ordinary result, and a
-complete one only alongside what was looked for.
+Report that list to the user; do not paste it into the pull request body. "No findings" is an
+ordinary result, and a complete one only alongside what was looked for.

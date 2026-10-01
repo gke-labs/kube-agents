@@ -135,10 +135,8 @@ Then report before you start:
 - **The issue is assigned to someone else.** Report it and ask before starting anything.
 - **Nothing matches.** Say so in one line and carry on.
 
-Carry the result into the pull request's **Context** section — `Closes #<number>`, or the
-related open pull request and how yours differs.
-[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) already reserves that
-section for it.
+Note the result in the pull request body — `Closes #<number>`, or the related open pull request
+and how yours differs.
 
 This is not the `status:in-progress` claim in
 [`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md).
@@ -252,68 +250,26 @@ Agents with a user in the loop follow this file.
   exemptions are in the rule file. Open
   [`.agents/rules/github_actions.md`](.agents/rules/github_actions.md) whenever you touch a
   `uses:` line or a workflow trigger.
-- Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
-  detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
-  A bug fix must name what stops it recurring.
+- **Keep PR bodies and commit messages brief.** State _why_ the change is being made and any
+  non-obvious context (such as `Closes #<number>`), then stop — a few sentences are usually enough.
+  Do not describe _what_ the code does or list changed files; the code should be self-documenting
+  and stand on its own. Avoid multi-section boilerplate, filler headings, and self-grading
+  ("comprehensive", "significantly improves", "production-ready"); verbose PR descriptions read
+  like AI slop.
+- **Do not rely on or describe manual testing.** Manual and live testing are not desirable. The code
+  and its automated tests (unit, integration, or evals) must stand alone — if a behaviour matters,
+  cover it with a test rather than testing by hand or doing a hard sell in the PR body on how much
+  you tested it. A bug fix must include an automated regression test that fails without the fix and
+  passes with it ([`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **AI Agent Attribution & Commit Authorship:**
   - Do not add AI agents as git commit co-authors or include `Co-Authored-By:` trailers in commit messages.
   - Note AI assistance in the PR description (e.g. `Generated with the help of <Agent/Model>.`).
-- **Write PR titles, bodies, commit messages, and review replies the same way** the Documentation
-  Guidelines' "Write it straight" rule requires: what changed and why, in plain declaratives. Do
-  not grade your own work — "comprehensive", "significantly improves", and "production-ready" are
-  claims the diff either supports or does not, and the reviewer is the one who decides. Lead with
-  the outcome: the first sentence of a PR body, a review reply, or a report back to the user
-  answers "what happened", and the supporting detail follows it.
-- **Adversarial self-review before opening a PR, and record it in the PR body.** Run the
-  `review-adversarial` skill (`.agents/skills/review-adversarial/SKILL.md`) against your branch
-  diff **in a context that did not write the change** — a subagent or a fresh session handed the
-  diff range and nothing else, which `/pr-preflight` spawns for you. Invoking it is also the
-  request to delegate that an agent is otherwise told to wait for, so an agent that skips it
-  reviews the diff in the context that argued for it. Fix what the pass confirms, and fill in the
-  template's **Self-Review** section with what you looked for, what it found, and the disposition
-  of each finding. This is a required pre-PR step for AI agents working in this repository: you
-  are the change's first hostile reader, and a reviewer who has to find what you could have found
-  spends their attention on the wrong things.
-  The section carries every pre-PR pass, not this one alone — the docs-drift pass below runs on
-  every change too — merged into one list, so a reviewer reads what was looked for in one place
-  rather than inferring which passes ran from which findings appeared.
-  This bullet and [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md) are together
-  the canonical statement — the requirement here, the mechanics there (why the clean context has
-  to be a real one, what to do when your harness will not spawn one, and the disposition every
-  finding owes). The comment in
-  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarises the pair —
-  change this bullet or `pre_pr_review.md`, whichever owns what you are changing, then reconcile
-  the summary to it.
-- **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
-  (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
-  Blocking findings. This is a required pre-PR step for AI agents working in this repository;
-  `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
-  map coverage, site audience, context budget), while the skill also verifies that doc prose still matches the
-  source. Its dispositions go in **Self-Review** with the adversarial pass's, not in a section of
-  their own. `/pr-preflight` runs this pass alongside the adversarial one, each in its own context.
-- **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
-  request fills in the template's **Testing → Live validation** section with how the change was
-  exercised against a real, running kube-agents installation — see [INSTALL.md](INSTALL.md) if
-  you do not have one. Green unit tests and a clean `make docs-check` are necessary, not
-  sufficient: they cannot tell you whether the operator reconciled the change or the agent pod
-  picked it up. This bullet and
-  [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md) are together the canonical
-  statement — the requirement here, the mechanics there (what to name and observe, how to prove
-  the mechanism rather than a coincidence, the screenshot and shared-install lease rules, and what
-  to write when the change cannot reach an installation at all). The comment in
-  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarises the pair —
-  change this bullet or `pre_pr_review.md`, whichever owns what you are changing, then reconcile
-  the summary to it.
-- **Keep these sections current, not chronological.** **Self-Review** and **Live validation** tell
-  a reviewer at a glance what has been reviewed and exercised against the branch as it stands. A
-  second pass — after review findings, after a rebase — folds into what is there rather than being
-  appended beneath it: work that still holds stays and is not re-run just to have been run against
-  the new head, a check the new commits invalidated is re-run or kept with a line saying it no
-  longer reaches the head, and new findings join the rest. What a re-run drops is the superseded
-  round, not the contents these sections owe a reviewer — the angles you ran, the layers you
-  observed, what you could not cover. Round-by-round history of a _reviewer's_ findings is the
-  exception: it belongs in the threads, where a reply naming the fix and its commit stays attached
-  to the finding it answers.
+- **Pre-PR self-review (`review-adversarial` and `review-docs-drift`):** Before opening a PR, run
+  the `review-adversarial` (`.agents/skills/review-adversarial/SKILL.md`) and `review-docs-drift`
+  (`.agents/skills/review-docs-drift/SKILL.md`) skills against your branch diff in a context that
+  did not write the change (a subagent or fresh session handed the diff range and nothing else,
+  which `/pr-preflight` spawns for you) and fix confirmed findings before publishing. Do not paste
+  self-review reports into the PR body.
 - **The install has one engine: Terraform + Helm.** `terraform/examples/full-install`
   (through its `lifecycle.sh`) owns every GCP resource and the chart owns every
   Kubernetes resource; `install.sh` / `uninstall.sh` / `upgrade.sh` are front doors
@@ -392,18 +348,6 @@ with what follows, believe the comment and fix this section.
 mechanics: how long a review takes, the commands to poll for one, and how to reply to a finding —
 with [resolving the threads](docs/pull-request-workflow.md#resolving-conversations) alongside it.
 
-**What any reviewer reads first — human or agent, this bot included.** Read the pull request's
-**Self-Review** section before the diff. It tells you what the author already looked for, what they
-found, and what they consciously chose not to fix, so the review can start where theirs stopped.
-Three things to do with it:
-
-- **Absent, empty, or a bare "reviewed it"** → say so as the first thing you report. The section is
-  required (see Pull Request Hygiene) and an unanswered one is the finding.
-- **A claim it makes that the diff does not support** → that is a finding in its own right, and a
-  more serious one than most defects: it misdirects every reader after you.
-- **A finding the author rejected with a reason** → engage with the reason. Restating the finding
-  as though the reason were not there wastes both of you.
-
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review**, with one exception: a branch the bot last said does not merge gets one after
 the next push. For a fresh review of the current commit, comment `/review` on a line of its own
@@ -439,12 +383,6 @@ nothing: ask the user whether to comment `/review` for another pass — `/review
 against a strict read, `/review all` when the branch changed enough that it deserves a
 first-review-width look.
 
-Pushing fixes is also what makes the pull request body stale. Fixes that answer a finding, and any
-live test you re-ran to confirm them, belong in **Self-Review** and **Live validation** — folded
-into what is already there, per "Keep these sections current, not chronological" above. Do it once
-the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
-review brings fresh findings, and folding them in twice is the same wasted round.
-
 **Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
 merge and keeps the change counted as its author's outstanding work; what belongs here is the
 timing. Do it once the fixes are pushed and the last `/review` pass has settled: a fresh review
@@ -462,31 +400,15 @@ the commit that changed it is the only record the reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 
-The section above is about your own pull request being reviewed, and it already says where a
-reviewer starts: the **Self-Review** section, before the diff. This one is the question that comes
-before even that — whether the review you have been asked for needs to happen at all.
+Before starting a review you have been asked for, check whether `kube-agents-bot` has already
+reviewed the current head with no unresolved threads. Where a clean review already covers the
+current commit, another hostile read may be redundant spend — **ask rather than decide**. Say what
+the existing review status is and let the person who asked choose whether to spend the extra round.
 
-By the time anyone asks, a pull request here has usually been read twice already: `kube-agents-bot`
-reads every one, and "Pull Request Hygiene" separately required the author to run
-`review-adversarial` over their own diff, record the result in **Self-Review**, and exercise the
-change under **Live validation**. Where both of those hold and neither has gone stale, a third
-hostile read is usually redundant spend.
-
-So check for both first — and then **ask rather than decide**. Say what the evidence is and that
-the extra round may be unnecessary; let the person who asked choose whether to spend it. Skipping a
-review unilaterally is not yours to do, and neither is quietly running one you have reason to
-believe nobody needs.
-
-Two things make this go wrong quietly:
-
-- **Currency.** A clean review sitting at an older commit proves nothing about the current head —
-  unless the only commits since it are merges from the base branch, which are not new work to
-  review. Treat a review whose commit has vanished from the branch as stale, not clean. An
-  unresolved review thread says the same thing: work outstanding, however clean the latest review
-  reads.
-- **A Self-Review that is present but unanswered.** "No findings" counts only alongside what was
-  looked for, so a bare "reviewed it" is an absent section with characters in it — and, per the
-  section above, the first finding your review reports rather than a reason to skip it.
+Watch out for **currency**: a clean review sitting at an older commit proves nothing about the
+current head (unless the only commits since it are merges from the base branch). Treat a review
+whose commit has vanished from the branch as stale, not clean, and treat any unresolved review
+thread as work outstanding.
 
 [`.claude/commands/pr-review-batch.md`](.claude/commands/pr-review-batch.md) is the canonical home
 for the mechanics — the queries, what counts as a clean verdict, the verdicts they produce, and what
