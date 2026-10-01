@@ -387,12 +387,13 @@ func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
 	}
 }
 
-// TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt: the gateway trims
-// each entry and drops the empty ones, so a CR whose list holds only
-// whitespace would render ALLOW_ALL=false beside a list the gateway reads as
-// nobody, and the install would answer no one, silently. The render
-// normalizes first and decides allow-all on what is left, so the two sides
-// agree on what an empty allowlist is.
+// TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt: the list the gateway
+// sees is normalized with its own grammar (joined, split on commas, trimmed,
+// empties dropped), and the allow-all decision is the legacy consumer's rule
+// on the RAW CR list (allowAllUsers: absent or a single empty string). So a
+// degenerate list - whitespace or commas only - is a restriction to nobody in
+// both modes, which the gateway announces at boot, never a silent widening to
+// everyone on the mode flip.
 func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -400,16 +401,17 @@ func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 		wantList string
 		wantAll  string
 	}{
-		{"whitespace only", []string{" "}, "", "true"},
-		{"empty strings only", []string{"", "  "}, "", "true"},
+		{"whitespace only", []string{" "}, "", "false"},
+		{"empty strings only", []string{"", "  "}, "", "false"},
 		{"padded and empty entries", []string{" a@example.com ", "", "b@example.com"}, "a@example.com,b@example.com", "false"},
 		// The gateway splits the JOINED string on commas, so an entry that is
 		// only commas and whitespace is empty on its side too, and an entry
 		// that holds a comma is two entries there.
-		{"commas only", []string{","}, "", "true"},
-		{"commas and whitespace", []string{" , ", ",,"}, "", "true"},
+		{"commas only", []string{","}, "", "false"},
+		{"commas and whitespace", []string{" , ", ",,"}, "", "false"},
 		{"a comma inside one entry", []string{"a@example.com, b@example.com"}, "a@example.com,b@example.com", "false"},
 		{"nil", nil, "", "true"},
+		{"the legacy pin's single empty string", []string{""}, "", "true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := gchatTestAgent("next", true)
@@ -422,5 +424,23 @@ func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 				t.Errorf("%s = %q, want %q", a2aGchatAllowAllUsersEnvVar, got, tc.wantAll)
 			}
 		})
+	}
+}
+
+// TestTheAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer to "is
+// everyone allowed", whichever consumer the mode renders. The A2A render's
+// flag is compared with the legacy pod env's for the same list, so a CR that
+// answers nobody under today cannot answer everyone under next.
+func TestTheAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
+	for _, users := range [][]string{nil, {""}, {" "}, {","}, {" , ", ",,"}, {"", "  "}, {"a@example.com"}, {" a@example.com ", ""}} {
+		next := gchatTestAgent("next", true)
+		next.Spec.Integration.GoogleChat.AllowedUsers = users
+		today := gchatTestAgent("", true)
+		today.Spec.Integration.GoogleChat.AllowedUsers = users
+		a2a := envMapOf(buildA2AGatewayDeployment(next).Spec.Template.Spec.Containers[0].Env)[a2aGchatAllowAllUsersEnvVar].Value
+		legacy := envMapOf(brokerContainerNamed(buildPodTemplateSpec(today, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value
+		if a2a != legacy {
+			t.Errorf("allowedUsers=%q: next renders allow-all %s where today renders %s", users, a2a, legacy)
+		}
 	}
 }
