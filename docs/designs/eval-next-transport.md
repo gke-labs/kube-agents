@@ -469,34 +469,27 @@ What it adds to the proof: the relay pulls the A2A subscription, the gateway aut
 broker with its own audience, the gateway mints the session and the `authority` block, the
 allowed-users gate admits the sender, and the reply reaches the thread.
 
-The stage is blocked on product work the status line of
-[`spec-chatops-gateway.md`](spec-chatops-gateway.md), which is canonical for this list, names as
-not yet rendered by the operator: the Google Chat adapter's env, including the relay URL; the
-projected relay token and the `a2a-chat` audience on the broker
-(`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`); the gateway's
-ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`; the broker NetworkPolicy admitting the A2A
-gateway pod; the allowed-users set carried to the gateway (`A2A_GCHAT_ALLOWED_USERS`); and the
-second Pub/Sub subscription with its IAM, which the composition does not yet provision.
+The operator work this stage stood on is rendered: under `next` with Google Chat enabled the
+gateway carries the adapter's env and relay token, the broker arms the A2A relay instance on
+the install's one subscription with the third audience, the gateway's ServiceAccount is a
+broker caller and a NetworkPolicy peer, and the legacy consumer is not rendered (the gateway
+spec's "Coexistence is by mode"). What remains for this stage is the eval install's own: Chat
+enabled with a Chat app registration and a space per pool project.
 
-The eval crew owns that operator work (decided 2026-09-17), under three conditions. The change
-cites the gateway spec's sections rather than restating them, and leaves the Google Chat
-adapter's `verifiedBy: chat-event-topic-iam` and its allowed-users gate exactly as "The Google
-Chat adapter" section has them: the gate is the operator-pinned allowed-users set carried as
-environment, and the `verifiedBy` value names a project-IAM boundary, not a per-request proof. It
-lands in the same change that gives the gateway rendered under `next` the credential proxy's chat
-relay URL as its backend, and teaches the operator's own backend check the same (the render
-withholds a gateway it believes has no backend, `a2aGatewayBackend`), so an install with Google
-Chat configured has a gateway that is rendered and starts without a Discord Secret; a render that drops the relay URL leaves a gateway on the door alone,
-which the read route reports as inject-only and the stage's preflight fails as infrastructure
-before any case runs, the guard paragraph in stage 1 saying why the guard no longer catches it.
-And it settles the one-backend guard with the Slack adapter in flight, so the relay URL beside a
-Slack credential is still a refusal and never a collision, while the inject door beside the relay
-URL is not one (stage 1, above), so the install this stage wires runs both transports.
+The operator render kept the three conditions the A2A owner set on it: it cites the gateway
+spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
+allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; the relay URL
+is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
+precedence rather than by a guard change: the render omits the Discord reference when Chat is
+armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
+beside the relay URL is not one (stage 1), so the install this stage wires runs both
+transports. A render that drops the relay URL still leaves a gateway on the door alone, which
+the read route reports as inject-only and the stage's preflight fails as infrastructure before
+any case runs.
 
-Two decisions sit beside that list. The legacy Chat consumer still runs under `next`, and a topic
-fans out to every subscription, so an install that arms the A2A subscription beside it answers
-twice; the gateway spec leaves the per-install choice of which consumer takes Chat to the mode
-switch's per-component override, which does not exist. And the eval install runs with
+One decision sits beside that. The eval install runs with
 `GOOGLE_CHAT_ENABLED=false`; enabling it means a Chat app registration and a space per pool
 project, because a Chat app configuration is per GCP project.
 
