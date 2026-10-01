@@ -191,14 +191,19 @@ overwhelming majority of the stream.
 exist in a stock install: the audit log sink, topic, and subscription come from the
 `drift-pubsub` Terraform module, which the
 [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)
-composition instantiates only when you set `enable_drift_pubsub = true`. If you installed with
-`install.sh`, set it as a `TF_VAR_enable_drift_pubsub=true` line in `install.env`: the front doors
+composition instantiates only when you set `enable_drift_pubsub = true`, and the field below is
+written only when you set `enable_drift_detector = true` alongside it. Asking for the second
+without the first is refused by a precondition rather than applied. If you installed with
+`install.sh`, ask for both at once with `ENABLE_DRIFT_DETECTOR=true` in `install.env` (or
+`install.sh --enable-drift-detector`), which writes both variables together; the front doors
 regenerate `terraform.tfvars` on every run, so a value written into that file by hand does not
-survive the next one. An install that has neither set that flag nor applied the module by hand has
-nothing for the detector
-to pull. Starting it anyway gives a process that retries a failing pull for the life of the pod
-without ever reporting a change, and the pod stays Ready throughout — so unset means off, and an
-install you switched on by mistake looks exactly like a fleet nobody has touched.
+survive the next one.
+
+An install that has neither provisioned the ingress nor applied the module by hand has nothing for
+the detector to pull. Setting this field there anyway — which now takes a hand-edited CR or chart
+value, not the composition — gives a process that retries a failing pull for the life of the pod
+without ever reporting a change, and the pod stays Ready throughout, so an install you switched on
+by mistake looks exactly like a fleet nobody has touched.
 
 ```yaml
 spec:
