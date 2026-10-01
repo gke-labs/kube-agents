@@ -346,10 +346,10 @@ GITOPS_SEED_MESSAGE = "Initial commit"
 GITOPS_SEED_CONTENT = "# GitOps Infrastructure Repo"
 # The declared-intent note provisioning seeds after the first commit
 # (GITOPS_INTENT_NOTE_* in scripts/provision_ci_pool_project.sh); the
-# obtainability-declared-intent-no-finding case fails on a project whose
-# repository lacks it.
+# obtainability-declared-intent-no-finding and compliance-declared-intent-no-finding
+# cases fail on a project whose repository lacks it.
 GITOPS_INTENT_NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
-GITOPS_INTENT_NOTE_MESSAGE = "Declare notification-relay's missing PodDisruptionBudget as intended"
+GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy as intended"
 # The script's GITOPS_INTENT_NOTE_CONTENT, byte for byte, so the repair this
 # verifier prints is the note provisioning seeds; a test pins the two copies
 # to each other. The body read back is judged by the audit's parser, not
@@ -361,23 +361,24 @@ declares:
   - check: no-pdb
     namespace: seeded-intent
     object: Deployment/notification-relay
+  - check: netpol-missing
+    namespace: seeded-intent
+    object: Namespace/seeded-intent
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
 it is a stateless relay whose clients retry, and a budget would only slow node drains. The
-obtainability audit lists this posture under Declared intent rather than as a finding."""
-# The stream whose declared-intent step reads the note; its `declarable` set is
-# the policy the check defers to.
-GITOPS_INTENT_NOTE_AUDIT = "obtainability-audit"
-# The one declaration the audit's parser (audit_report.py parse_declarations)
-# must find in the note's `declares` list. A file that has the path but not
-# this declares nothing, and the case fails on that project with a
+namespace carries no NetworkPolicy by design either: nothing in it accepts traffic. The
+obtainability and compliance audits list both postures under Declared intent rather than as findings."""
+# The declarations the audits' parser (audit_report.py parse_declarations) must
+# find in the note's `declares` list, each with the stream whose `declarable`
+# set is the policy for it. A file that has the path but not these declares
+# nothing, and the declared-intent cases fail on that project with a
 # presence-only check green -- which is why presence alone is not the check.
-GITOPS_INTENT_NOTE_DECLARATION = {
-    "check": "no-pdb",
-    "namespace": "seeded-intent",
-    "object": "Deployment/notification-relay",
-}
+GITOPS_INTENT_NOTE_DECLARATIONS = (
+    ("obtainability-audit", {"check": "no-pdb", "namespace": "seeded-intent", "object": "Deployment/notification-relay"}),
+    ("compliance-audit", {"check": "netpol-missing", "namespace": "seeded-intent", "object": "Namespace/seeded-intent"}),
+)
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
 # RSA_SIGN_PKCS1_2048_SHA256 and import_only, and the KSA that impersonates the
@@ -2463,52 +2464,52 @@ def _load_audit_report():
 
 
 def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional[str]:
-    """Why the audit would not join `body`'s declaration to the fixture's finding, or None when it would.
+    """Why an audit would not join one of `body`'s declarations to its fixture finding, or None when every one joins.
 
     Not a copy of the parser: the note goes through the audit's own
-    `parse_declarations` (frontmatter delimiters, YAML and its error classes,
-    `type`, `declares`, the item shape, the `cluster` rule) and the surviving
-    items are compared on the audit's own join key, which folds
+    `parse_declarations` once per stream in GITOPS_INTENT_NOTE_DECLARATIONS
+    (frontmatter delimiters, YAML and its error classes, `type`, `declares`,
+    the item shape, the `cluster` rule, that stream's `declarable` set) and
+    the surviving items are compared on the audit's own join key, which folds
     `Deployment/notification-relay`, `deployment/notification-relay` and
     `Deployment / notification-relay` to one. The join is the audit's too:
     `apply_declarations` files clustered items under their cluster and the
     rest fleet-wide, and a finding falls through to a fleet-wide entry, so a
-    note is good when ANY matching item is fleet-wide, whatever else it lists.
-    A note the parser reads nothing from is explained by the parser itself
-    (`explain_empty_declarations`, the same ladder `parse_declarations`
-    walks), so the reason printed cannot drift from the verdict.
+    declaration is good when ANY matching item is fleet-wide, whatever else
+    the note lists. A note the parser reads nothing from is explained by the
+    parser itself (`explain_empty_declarations`, the same ladder
+    `parse_declarations` walks), so the reason printed cannot drift from the
+    verdict.
     """
     if audit is None:
         audit = _load_audit_report()
-    # The audit's own policy for which slugs a note may justify, not a local
-    # copy of it: if no-pdb ever leaves the obtainability stream's declarable
-    # set, this check rejects the note the day the audit does.
-    declarable = audit.audit_declarable_checks(GITOPS_INTENT_NOTE_AUDIT)
-    entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
-    if not entries:
-        # The reason is the parser's own (`explain_empty_declarations` walks
-        # the ladder `parse_declarations` walks); None means the note had
-        # items and the parser skipped every one, logging a WARNING each.
-        reason = audit.explain_empty_declarations(body)
-        return reason or (
-            f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
-            f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']} "
-            "(the parser skipped every item; its WARNING lines above say why)"
-        )
-    wanted = audit._declaration_key(GITOPS_INTENT_NOTE_DECLARATION, with_cluster=False)
-    matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
-    if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
-        return None
-    if matching:
-        clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
-        return (
-            f"its only matching declaration(s) name cluster {', '.join(clusters)}, so the audit joins them to "
-            "that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
-        )
-    return (
-        f"no declares item is check {GITOPS_INTENT_NOTE_DECLARATION['check']} for "
-        f"{GITOPS_INTENT_NOTE_DECLARATION['object']} in {GITOPS_INTENT_NOTE_DECLARATION['namespace']}"
-    )
+    for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
+        # The audit's own policy for which slugs a note may justify, not a local
+        # copy of it: if a slug ever leaves its stream's declarable set, this
+        # check rejects the note the day the audit does.
+        declarable = audit.audit_declarable_checks(stream)
+        entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
+        if not entries:
+            # The reason is the parser's own (`explain_empty_declarations` walks
+            # the ladder `parse_declarations` walks); None means the note had
+            # items and the parser skipped every one, logging a WARNING each.
+            reason = audit.explain_empty_declarations(body)
+            return reason or (
+                f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in "
+                f"{wanted_item['namespace']} (the {stream} parser skipped every item; its WARNING lines above say why)"
+            )
+        wanted = audit._declaration_key(wanted_item, with_cluster=False)
+        matching = [e for e in entries if audit._declaration_key(e, with_cluster=False) == wanted]
+        if any(audit.DECLARATION_CLUSTER_FIELD not in e for e in matching):
+            continue
+        if matching:
+            clusters = sorted({str(e[audit.DECLARATION_CLUSTER_FIELD]) for e in matching})
+            return (
+                f"its only matching {wanted_item['check']} declaration(s) name cluster {', '.join(clusters)}, so the "
+                "audit joins them to that cluster's finding alone; the fixture's note is fleet-wide (an item without `cluster`)"
+            )
+        return f"no declares item is check {wanted_item['check']} for {wanted_item['object']} in {wanted_item['namespace']}"
+    return None
 
 
 def _gitops_path_state(repo_slug: str, path: str, raw: bool = False) -> tuple[str, str]:

@@ -170,6 +170,13 @@ AUDITS: dict[str, AuditSpec] = {
             "lb-world-open",
             "anonymous-rbac-binding",
         ),
+        # The two compliance checks that judge a posture an owner may choose:
+        # a namespace that talks to nothing and so carries no NetworkPolicy
+        # (2.6, the zero-policy and partial-coverage shapes, which name the
+        # namespace; the allow-all shape names the policy and is a fault),
+        # and a workload that needs the API token the default ServiceAccount
+        # mounts (2.7). Every other check is a fault no declaration excuses.
+        declarable=("netpol-missing", "default-sa-automount"),
     ),
     "security-patch-orchestrator": AuditSpec(
         "Upgrade & Patch Readiness Audit",

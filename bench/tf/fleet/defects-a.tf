@@ -135,8 +135,8 @@ resource "kubernetes_deployment_v1" "checkout_gateway" {
   }
 }
 
-# Declared posture (reliability): two replicas, no PodDisruptionBudget, in a
-# namespace of its own. The same shape as checkout-gateway above, planted so
+# Declared postures (reliability and compliance): two replicas, no
+# PodDisruptionBudget, in a namespace of its own that carries no NetworkPolicy. The same shape as checkout-gateway above, planted so
 # that a repository declaration can cover it without touching the cases
 # that grade checkout-gateway's missing budget: the obtainability SOP's
 # declared-intent step (4a) lists a declared posture under the ledger's
@@ -464,8 +464,10 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     reliability = kubernetes_namespace_v1.seeded_reliability.metadata[0].name
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
-    intent      = kubernetes_namespace_v1.seeded_intent.metadata[0].name
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+    # seeded-intent gets none on purpose: its missing policy is the compliance
+    # SOP's 2.6 posture the pool repository's declared-intent note covers, the
+    # way the same note covers notification-relay's missing budget.
   }
 
   metadata {

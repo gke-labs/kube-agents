@@ -214,6 +214,7 @@ def _healthy_world() -> dict:
             "deployment/checkout-gateway": {"status": {"readyReplicas": 2, "replicas": 2}},
             "deployment/notification-relay": {"status": {"readyReplicas": 2, "replicas": 2}},
             "poddisruptionbudget?": {"items": []},
+            "networkpolicy?": {"items": []},
             "deployment/inference-server": {"status": {"readyReplicas": 1, "replicas": 3}},
             "pod?app=inference-server": _pods(
                 _pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")
