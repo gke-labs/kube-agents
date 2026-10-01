@@ -942,6 +942,20 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "echo 'from cluster_agent_profile import list_profiles' | python3",
             "printf 'import cluster_agent_profile\n' | python3",
             "echo 'import kanban_notify_propagate' | python3",
+            # Multi-line commands with newline separators, stdin forms, and alternative wrappers/interpreters
+            "cd /opt/data/scripts\npython3 -m cluster_agent_profile list",
+            "python3 - <<'EOF'\nimport cluster_agent_profile\nEOF",
+            "python3 <<EOF\nimport cluster_agent_profile\nEOF",
+            "python3 <<< 'import cluster_agent_profile'",
+            "cat <<'EOF' | python3\nimport cluster_agent_profile\nEOF",
+            "nice python3 -m cluster_agent_profile",
+            "'/opt/hermes/.venv/bin/python3' -m cluster_agent_profile",
+            '"/opt/hermes/.venv/bin/python3" -m cluster_agent_profile',
+            "$PY -m cluster_agent_profile",
+            "${PY} -m cluster_agent_profile",
+            "nice python3 -c 'import cluster_agent_profile'",
+            "'/opt/hermes/.venv/bin/python3' -c 'import cluster_agent_profile'",
+            "$PY -c 'import cluster_agent_profile'",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1004,6 +1018,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "(python3 -m cluster_agent_profile)"',
             "echo '(python3 -m cluster_agent_profile)'",
             'echo "(python3 -c \'import cluster_agent_profile\')"',
+            # Quoted mentions following subshells or conditional keywords
+            'echo "$(hostname): do not run python3 -m cluster_agent_profile"',
+            'cd $(dirname x) && echo "python3 -m cluster_agent_profile is stubbed"',
+            'echo "then python3 -m cluster_agent_profile"',
+            'echo "do not run python3 -m cluster_agent_profile"',
+            'echo "else python3 -m cluster_agent_profile"',
+            'echo "elif python3 -m cluster_agent_profile"',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
