@@ -1,6 +1,8 @@
 # shellcheck shell=bash disable=SC2034
 # Sourced by run.sh, which reads CHANNEL, START, CREATE_FLAGS and POOL_FLAGS and calls plant, before, break_it and after.
-# 13: the container runtime changes with the node image: containerd 1.7 on 1.31, 2.0 on 1.32; a v1alpha2 CRI client breaks
+# 13: the container runtime changes with the node image, and a v1alpha2 CRI client breaks. This run found the newest
+# 1.31 patch already on containerd 2.0 (the runtime moves inside the 1.31 patch line, not at 1.32); 13b stages the
+# patch-only step that moves it, and the verdict rests on 13b.
 CHANNEL=EXTENDED; START=1.31; POOL_FLAGS="--num-nodes 1 --machine-type e2-standard-2"
 CLIENT_ROLLOUT_TIMEOUT=300s; CRICTL_VERSION=v1.22.0; CRICTL_URL=https://github.com/kubernetes-sigs/cri-tools/releases/download/$CRICTL_VERSION/crictl-$CRICTL_VERSION-linux-amd64.tar.gz
 CRICTL_SHA256=45e0556c42616af60ebe93bf4691056338b3ea0001c0201a6a8ff8b1dbc0652a   # the release's published .sha256; the fetch runs as root beside the containerd socket, so it is checked before anything is unpacked
