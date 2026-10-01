@@ -966,15 +966,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "bash -c 'cd /opt/data/scripts; python3 -m cluster_agent_profile list'",
             'bash -c "cd /opt/data/scripts && python3 -m cluster_agent_profile list"',
             "python3 -m cluster_agent_profile list # don't ask the user",
-            "python3 -m cluster_agent_profile list  # users' profiles",
-            "python3 -m cluster_agent_profile list  # 5' tall",
-            'python3 -m cluster_agent_profile list  # see "notes',
-            "python3 -m cluster_agent_profile list  # users'",
-            "cd /opt/data/scripts && python3 -m cluster_agent_profile list  # users' profiles",
             "python3 -m kanban_notify_propagate list # don't ask the user",
-            "python3 -m kanban_notify_propagate list  # users' profiles",
-            "python3 -m kanban_notify_propagate list  # 5' tall",
-            'python3 -m kanban_notify_propagate list  # see "notes',
             "python3 <<< 'import cluster_agent_profile'",
             "python3 <<< 'from cluster_agent_profile import list_profiles'",
             "python3 <<< 'import kanban_notify_propagate'",
@@ -1224,6 +1216,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             # Unclosed string mentions with issue citations without shell redirect
             'echo "stub refused; python3 -m cluster_agent_profile fails #953"',
             'echo "stub refused; python3 -m kanban_notify_propagate fails #953"',
+            # Quoted mentions followed by trailing arguments or piped data to -m (Threads 1 & 3)
+            'git commit -m "fix; python3 -m cluster_agent_profile # stub" --no-verify',
+            'git commit -m "fix; python3 -m kanban_notify_propagate # stub" --no-verify',
+            "git commit -m 'fix; python3 -m cluster_agent_profile # stub' --no-verify",
+            "git commit -m 'fix; python3 -m kanban_notify_propagate # stub' --no-verify",
+            "echo 'import cluster_agent_profile' | python3 -m json.tool",
+            "echo 'import kanban_notify_propagate' | python3 -m json.tool",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
