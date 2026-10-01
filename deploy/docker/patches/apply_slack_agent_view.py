@@ -60,8 +60,9 @@ PREFIX = "slack_agent_view"
 
 FLAG_ENV = "KAGE_SLACK_UX"
 #: Neither file imports anything of ours, so the check carries its own copy of
-#: ``slack_presenter.FLAG_ON_VALUES``; a host test holds the two equal where
-#: slack_presenter.py is in the tree.
+#: ``slack_presenter.FLAG_ON_VALUES``; a host test holds the two equal once
+#: slack_presenter.py is in agents/platform/scripts or agents/chat/scripts, and
+#: fails rather than skips if it is there but will not import.
 FLAG_ON_VALUES = ("1", "true", "yes", "on")
 
 #: Mock 01's three asks, without the dev fleet's cluster name: a static prompt

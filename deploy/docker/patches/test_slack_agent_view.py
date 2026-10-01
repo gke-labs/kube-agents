@@ -39,10 +39,28 @@ from apply_slack_agent_view import (
     apply,
 )
 
-try:
-    import slack_presenter
-except ImportError:  # the presenter ships with the Slack reactions change
-    slack_presenter = None
+#: Where the image ships slack_presenter.py from: the Dockerfile copies both
+#: directories into /opt/defaults/scripts. The presenter ships with the Slack
+#: reactions change, so neither has it until that lands.
+PRESENTER_DIRS = (SCRIPTS, HERE.parents[2] / "agents" / "chat" / "scripts")
+PRESENTER = "slack_presenter.py"
+
+
+def presenter_flag_values(dirs=PRESENTER_DIRS):
+    """The presenter's ``FLAG_ON_VALUES``, or None when no directory has the file.
+
+    Loaded by path, so only absence reads as None: a presenter that is there
+    but fails its own imports raises here rather than skipping the parity test.
+    """
+    for directory in dirs:
+        path = Path(directory) / PRESENTER
+        if path.is_file():
+            spec = importlib.util.spec_from_file_location("slack_presenter_parity", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return frozenset(module.FLAG_ON_VALUES)
+    return None
+
 
 STOP_EVENT = "agent_session_stopped"
 
@@ -241,10 +259,42 @@ class FlagOnTest(unittest.TestCase):
             self.assertEqual(prompts(module, {"suggested_prompts": []}), [])
 
 
-@unittest.skipIf(slack_presenter is None, "slack_presenter.py is not in the tree")
 class FlagValuesTest(unittest.TestCase):
     def test_manifest_check_accepts_what_the_presenter_accepts(self):
-        self.assertEqual(set(FLAG_ON_VALUES), set(slack_presenter.FLAG_ON_VALUES))
+        presenter = presenter_flag_values()
+        if presenter is None:
+            self.skipTest(f"{PRESENTER} is in none of {[str(d) for d in PRESENTER_DIRS]}")
+        self.assertEqual(set(FLAG_ON_VALUES), presenter)
+
+
+class PresenterLookupTest(unittest.TestCase):
+    """The lookup the parity test stands on, run whether or not the presenter is in the tree."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dirs = (Path(tmp.name) / "platform", Path(tmp.name) / "chat")
+        for directory in self.dirs:
+            directory.mkdir()
+
+    def write(self, directory, source):
+        (directory / PRESENTER).write_text(source)
+
+    def test_absence_is_the_only_skip(self):
+        self.assertIsNone(presenter_flag_values(self.dirs))
+
+    def test_either_shipped_directory_is_read(self):
+        self.write(self.dirs[1], "FLAG_ON_VALUES = frozenset({'1', 'true', 'yes', 'on'})\n")
+        self.assertEqual(presenter_flag_values(self.dirs), set(FLAG_ON_VALUES))
+
+    def test_diverged_values_are_read_as_written(self):
+        self.write(self.dirs[0], "FLAG_ON_VALUES = frozenset({'1', 'true'})\n")
+        self.assertNotEqual(presenter_flag_values(self.dirs), set(FLAG_ON_VALUES))
+
+    def test_a_presenter_that_fails_its_imports_fails(self):
+        self.write(self.dirs[0], "import kage_no_such_module\nFLAG_ON_VALUES = ()\n")
+        with self.assertRaises(ImportError):
+            presenter_flag_values(self.dirs)
 
 
 class RefusalTest(unittest.TestCase):
