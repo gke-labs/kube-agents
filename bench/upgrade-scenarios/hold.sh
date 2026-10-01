@@ -7,7 +7,7 @@ SCHEMA1_IMAGE=gcr.io/google_containers/busybox:1.24     # a Docker schema 1 mani
 CD17_VERSION=1.31.14-gke.2704000                        # the newest 1.31 patch still on containerd 1.7
 LEGACY_JVM=eclipse-temurin:11.0.15_10-jdk; JVM_LIMIT=256Mi
 CU13_IMAGE=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
-SETTLE=180; GPU_SETTLE=900; WEBHOOK_SETTLE=10; LOG_TAIL=3; HOLD_MACHINE=e2-standard-2
+SETTLE=180; GPU_SETTLE=900; WEBHOOK_SETTLE=10; LOG_TAIL=3; HOLD_MACHINE=e2-standard-2; GPU_MACHINE=g2-standard-4; GPU_DISK_GB=200; GPU_LOG_TAIL=4
 # abort_hold: a planting step failed, so the hazard is not in place; say so in the evidence and stop.
 abort_hold(){ note hold "precondition not met: $*; the hazard is not planted"; exit 1; }
 # 7: the fail-closed webhook back in place, its Service still without endpoints
@@ -63,7 +63,7 @@ Y
   ev cgroup v1-hold-log K -n scen logs deploy/legacy-jvm-hold --tail=$LOG_TAIL; }
 # 18: a 1.33 L4 pool on the default driver running a CUDA 13 build, which crash-loops until the driver moves
 hold_18(){ local v; v=$(newest_patch EXTENDED 1.33); require_version "$v"
-  pool_exists gpu-hold || ev gpu-driver gpu-hold-pool G container node-pools create gpu-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type g2-standard-4 --disk-size 200 --accelerator type=nvidia-l4,count=1,gpu-driver-version=default --node-labels=role=gpuhold --quiet || abort_hold "pool gpu-hold was not created"
+  pool_exists gpu-hold || ev gpu-driver gpu-hold-pool G container node-pools create gpu-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type "$GPU_MACHINE" --disk-size "$GPU_DISK_GB" --accelerator type=nvidia-l4,count=1,gpu-driver-version=default --node-labels=role=gpuhold --quiet || abort_hold "pool gpu-hold was not created"
   K -n scen apply -f - <<Y || abort_hold "the CUDA 13 probe did not apply"
 apiVersion: apps/v1
 kind: Deployment
@@ -84,7 +84,7 @@ spec:
 Y
   sleep $GPU_SETTLE
   ev gpu-driver gpu-hold-pods K -n scen get pods -l app=cuda13-hold -o wide
-  ev gpu-driver gpu-hold-log K -n scen logs deploy/cuda13-hold --tail=4
+  ev gpu-driver gpu-hold-log K -n scen logs deploy/cuda13-hold --tail=$GPU_LOG_TAIL
   ev gpu-driver gpu-hold-node K get nodes -l role=gpuhold -o custom-columns='NAME:.metadata.name,VER:.status.nodeInfo.kubeletVersion,DRIVER_LABEL:.metadata.labels.cloud\.google\.com/gke-gpu-driver-version'; }
 # 19: the PD CSI driver add-on off again, with the in-tree PersistentVolume still bound
 hold_19(){ . "$H/scenarios/19.sh"; disable_driver || abort_hold "the PD CSI driver is not confirmed off after $DISABLE_TRIES tries"

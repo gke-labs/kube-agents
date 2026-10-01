@@ -9,7 +9,7 @@ CHANNEL=EXTENDED; START=1.34; POOL_FLAGS=""
 plant(){ pause_deploy steady 1; }
 before(){ ev skew before G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'; ev skew pools-before G container node-pools list --cluster "$CLUSTER" --zone "$ZONE" --format='table(name,version,status)'; }
 break_it(){ local V; V=$(newest_patch EXTENDED 1.35); require_version "$V"; note skew "attempt: master -> $V with the pools four minors behind"
-  attempt_refusal skew ev skew four-behind-attempt G container clusters upgrade "$CLUSTER" --master --cluster-version "$V" --zone "$ZONE" --quiet; wait_ops; }
+  attempt_refusal skew ev skew four-behind-attempt G container clusters upgrade "$CLUSTER" --master --cluster-version "$V" --zone "$ZONE" --quiet --timeout "$MASTER_UPGRADE_TIMEOUT"; wait_ops; }
 after(){ ev skew master-after G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(currentMasterVersion)'
   ev skew pools-after G container node-pools list --cluster "$CLUSTER" --zone "$ZONE" --format='table(name,version,status)'
   ev skew nodes K get nodes -o wide

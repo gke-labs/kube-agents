@@ -298,7 +298,9 @@ The Recommender side has two parts:
   `14b`), and stops with a note in the evidence when a pool, manifest or add-on change it needs does not take.
   A held scenario stops the same way when GKE does not add its maintenance exclusion.
 - **The read.** `check-recommender.sh` reads every `google.container.DiagnosisInsight` insight and every
-  `google.container.DiagnosisRecommender` recommendation in each zone. It saves the raw JSON under
+  `google.container.DiagnosisRecommender` recommendation in each zone a scenario cluster has sat in (`ZONES=` narrows
+  the list; `results.py` then refuses to render a table for a read that does not cover every cluster it names, since a
+  cluster never read would otherwise look like one read with nothing published). It saves the raw JSON under
   `evidence/recommender/<stamp>/`, and writes `recommender.json`, which maps each insight and recommendation to
   the cluster in its resource path (for a recommendation, its `targetResources` or its operations). It prints any
   record that names no cluster rather than dropping it, and replaces the project ID and number in every insight name

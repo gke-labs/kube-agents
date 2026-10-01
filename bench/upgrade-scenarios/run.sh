@@ -5,6 +5,8 @@
 # CREATE_FLAGS and POOL_FLAGS, and the functions plant, before, break_it, after. Evidence: evidence/NN/.
 DEFAULT_POOL_MACHINE=e2-small; PLANT_SETTLE=60   # the default pool only runs system pods; scenarios add a work-pool
 set -u; NN=${1:?scenario number, two digits}; TRACK=$NN; CLUSTER=${CLUSTER:-upg-$NN}
+# Checked before common.sh is sourced, so a mistyped number creates no evidence directory and reads nothing.
+[ -f "$(dirname "$0")/scenarios/$NN.sh" ] || { echo "no scenario $NN; scenarios: $(ls "$(dirname "$0")/scenarios" | sed 's/\.sh$//' | tr '\n' ' ')" >&2; exit 1; }
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$(dirname "$0")/common.sh"; . "$H/scenarios/$NN.sh"
 START_VERSION=$(newest_patch "$CHANNEL" "$START") || { note final "precondition not met: $CHANNEL offers no $START patch in $ZONE (the scenario's start minor has left the channel, or the version read failed); nothing created"; exit 1; }

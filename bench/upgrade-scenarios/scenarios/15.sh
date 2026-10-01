@@ -3,7 +3,7 @@
 # 15: the group OOM kill (memory.oom.group from 1.28 on cgroup v2) against the singleProcessOomKill opt-out on a second pool
 CHANNEL=REGULAR; START=1.35; POOL_FLAGS="--num-nodes 1 --machine-type e2-standard-2"
 # e2-small leaves no room for a 256Mi pod after the system pods, so both pools are e2-standard-2.
-forker(){ K -n scen apply -f - <<Y
+forker(){ K -n scen delete pod "forker-$1" --ignore-not-found --wait=true >/dev/null; K -n scen apply -f - <<Y   # a re-run must not read the previous run's restart counter
 apiVersion: v1
 kind: Pod
 metadata: {name: forker-$1, labels: {app: forker}}

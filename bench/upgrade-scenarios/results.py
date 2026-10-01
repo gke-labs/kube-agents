@@ -16,48 +16,50 @@ def esc(s): return s.replace("|", "\\|")   # a | inside a cell would split the r
 def code(s):
     fence = "`" * (max((len(m) for m in re.findall(r"`+", s)), default=0) + 1)   # outlast any backtick run in s
     return f"{fence} {s} {fence}" if len(fence) > 1 else f"`{s}`"
-# n: (failure, verdict, evidence file, verbatim quote, clusters carrying the hazard now, documented subtypes)
+# n: (failure, verdict, evidence file, verbatim quote, clusters carrying the hazard as name@zone, documented subtypes).
+# The zone is what lets the renderer tell "read and nothing published" from "never read": a cluster whose zone the
+# Recommender read did not cover is not a silent "no matching insight", it is a reason to refuse the table.
 SCENARIOS = {
  1: ("A PodDisruptionBudget forbids the eviction", "reproduced", "01/budget.txt",
      "2026-09-29T15:00:13.790784Z\tservice-<PROJECT_NUMBER>@container-engine-robot.iam.gserviceaccount.com",
-     ["upg-01", "gemma-gpu", "gemma-gpu-upgraded"], ["PDB_UNPERMISSIVE"]),
+     ["upg-01@us-central1-a", "gemma-gpu@us-central1-a", "gemma-gpu-upgraded@us-central1-a"], ["PDB_UNPERMISSIVE"]),
  2: ("No spare capacity for the displaced pods", "reproduced", "02/capacity-availability.txt",
-     "2026-09-29T14:45:24Z /Pending/", ["upg-02b"], []),
- 3: ("Every replica in one zone or on one node", "reproduced", "03/placement.txt", "samples=44 zero_serving=18", ["upg-03b"], []),
- 4: ("Data on the node is gone", "reproduced", "04/node-data.txt", "Tue Sep 29 15:17:26 UTC 2026", ["upg-04b"], []),
+     "2026-09-29T14:45:24Z /Pending/", ["upg-02b@us-central1-a"], []),
+ 3: ("Every replica in one zone or on one node", "reproduced", "03/placement.txt", "samples=44 zero_serving=18", ["upg-03b@us-central1-a"], []),
+ 4: ("Data on the node is gone", "reproduced", "04/node-data.txt", "Tue Sep 29 15:17:26 UTC 2026", ["upg-04b@us-central1-a"], []),
  5: ("Maintenance window too short, or an exclusion ends mid-roll", "partial", "05/window.txt",
      "1.35.8-gke.1380000\thold-minor={'endTime': '2026-10-02T13:49:59Z', 'maintenanceExclusionOptions': {'scope': 'NO_MINOR_UPGRADES'}",
-     ["upg-05"], []),
+     ["upg-05@us-central1-a"], []),
  6: ("A served API version is removed", "reproduced", "06/removed-api.txt",
-     "no longer serves flowcontrol.apiserver.k8s.io/v1beta3 (discovery returned 404)", ["upg-06h", "gemma-gpu"], ["DEPRECATION_K8S_1_32_API"]),
+     "no longer serves flowcontrol.apiserver.k8s.io/v1beta3 (discovery returned 404)", ["upg-06h@us-central1-a", "gemma-gpu@us-central1-a"], ["DEPRECATION_K8S_1_32_API"]),
  7: ("A fail-closed webhook whose backend is not up", "reproduced", "07/webhook.txt",
      '14:10:50Z   FailedCreate        guarded-7cf87d9df4         Error creating: Internal error occurred: failed calling webhook "gate.scen.example.com"',
-     ["upg-07"], ["K8S_ADMISSION_WEBHOOK_UNAVAILABLE"]),
+     ["upg-07@us-central1-a"], ["K8S_ADMISSION_WEBHOOK_UNAVAILABLE"]),
  8: ("A default changes in the new minor", "reproduced", "08/default-change.txt",
-     "git-repo volume plugin has been disabled", ["upg-08h"], []),
+     "git-repo volume plugin has been disabled", ["upg-08h@us-central1-a"], []),
  9: ("A feature is deprecated but still served", "no break (as expected)", "09/final.txt",
-     "2026-09-29T14:05:15Z   Completed          after                      Job completed", ["upg-09"], []),
+     "2026-09-29T14:05:15Z   Completed          after                      Job completed", ["upg-09@us-central1-a"], []),
  10: ("Add-on and client skew", "partial", "10b/skew.txt",
-      "gke-upg-10-work-pool-6fb8c002-0fdz      Ready    <none>   47m     v1.31.14-gke.2759000", ["upg-10"], ["CLUSTER_VERSION_SKEW_UNSUPPORTED"]),
- 11: ("The control plane is unreachable for minutes on a zonal cluster", "not reproduced", "11b/zonal.txt", "read_down=0", ["upg-11b"], []),
+      "gke-upg-10-work-pool-6fb8c002-0fdz      Ready    <none>   47m     v1.31.14-gke.2759000", ["upg-10@us-central1-a"], ["CLUSTER_VERSION_SKEW_UNSUPPORTED"]),
+ 11: ("The control plane is unreachable for minutes on a zonal cluster", "not reproduced", "11b/zonal.txt", "read_down=0", ["upg-11b@us-central1-a"], []),
  12: ("A node label is removed", "reproduced (GKE form)", "12/label.txt",
-      "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector.", ["upg-12b"], []),
+      "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector.", ["upg-12b@us-central1-a"], []),
  13: ("The container runtime changes", "reproduced", "13b/runtime.txt",
-     "unknown service runtime.v1alpha2.RuntimeService", ["upg-13b"], ["DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API", "DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES"]),
+     "unknown service runtime.v1alpha2.RuntimeService", ["upg-13b@us-central1-a"], ["DEPRECATION_CONTAINERD_V1ALPHA2_CRI_API", "DEPRECATION_CONTAINERD_V1_SCHEMA_IMAGES"]),
  14: ("cgroup v2 under a runtime that cannot read it", "reproduced (GKE form)", "14c/cgroup.txt",
-     "legacy-jvm-v1-6c5f68468-xq87r   gke-upg-14b-v1-pool-4922a2a8-cej9   Running   5          OOMKilled   137", ["upg-14b"], []),
+     "legacy-jvm-v1-6c5f68468-xq87r   gke-upg-14b-v1-pool-4922a2a8-cej9   Running   5          OOMKilled   137", ["upg-14b@us-central1-a"], []),
  15: ("The OOM killer starts killing the whole container", "symptom reproduced", "15/group-oom.txt",
-     "forker-default   Running   4          OOMKilled", ["upg-15b"], []),
+     "forker-default   Running   4          OOMKilled", ["upg-15b@us-central1-a"], []),
  16: ("The network dataplane changes", "reproduced (GKE form)", "16/dataplane.txt", "wget: download timed out",
-     ["upg-16h", "seeded-a", "gemma-gpu", "gemma-gpu-upgraded"], ["NETWORK_POLICIES_UNRECONCILED"]),
+     ["upg-16h@us-central1-a", "seeded-a@us-central1-a", "gemma-gpu@us-central1-a", "gemma-gpu-upgraded@us-central1-a"], ["NETWORK_POLICIES_UNRECONCILED"]),
  17: ("A node networking agent fails on the new image", "partial", "17/node-agent.txt",
-     "wget: can't connect to remote host (10.128.0.59): Connection refused", ["upg-17b"], []),
+     "wget: can't connect to remote host (10.128.0.59): Connection refused", ["upg-17b@us-central1-a"], []),
  18: ("GPU driver mismatch", "partial", "18m/compat.txt",
-     "Error 803: system has unsupported display driver / cuda driver combination", ["upg-18m", "upg-18k", "upg-18i"], []),
+     "Error 803: system has unsupported display driver / cuda driver combination", ["upg-18m@us-west1-a", "upg-18k@us-central1-b", "upg-18i@us-east1-d"], []),
  19: ("In-tree volumes lose their CSI path", "reproduced (GKE form)", "19c/csi.txt",
-     "pd-user-5f66bd9f9b-v6kmc   0/3 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity", ["upg-19c"], []),
+     "pd-user-5f66bd9f9b-v6kmc   0/3 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity", ["upg-19c@us-central1-c"], []),
  20: ("Images on a retired registry", "reproduced", "20d/registry.txt",
-     "retired-image-5b5c57c885-kzjq8   0/1     ImagePullBackOff", ["upg-20d"], []),
+     "retired-image-5b5c57c885-kzjq8   0/1     ImagePullBackOff", ["upg-20d@us-central1-c"], []),
 }
 def main():
     rec_path = f"{H}/{REC_FILE}"
@@ -65,10 +67,15 @@ def main():
         print(f"ERROR {REC_FILE} missing: run check-recommender.sh first", file=sys.stderr); return 1
     rec = json.load(open(rec_path))
     published = {c: {i["subtype"] for i in items} for c, items in rec.get("clusters", {}).items()}
+    zones_read = set(rec.get("zones", []))
+    unread = sorted({f"{c} ({z})" for v in SCENARIOS.values() for c, z in (e.split("@") for e in v[4]) if z not in zones_read})
+    if unread:
+        print(f"ERROR {REC_FILE} was read in {sorted(zones_read)} and does not cover: {', '.join(unread)}; re-run check-recommender.sh with every zone a scenario cluster sits in (ZONES=...), nothing written", file=sys.stderr); return 1
     rows = ["| # | Failure | Reproduced? | Proof (evidence file: quoted line) | GKE Recommender check for it | Published on the clusters carrying it | Caught? |",
             "| --- | --- | --- | --- | --- | --- | --- |"]
     caught = documented = 0; errors = []; csv_rows = []
-    for n, (title, verdict, efile, quote, clusters, subtypes) in SCENARIOS.items():
+    for n, (title, verdict, efile, quote, located, subtypes) in SCENARIOS.items():
+        clusters = [e.split("@")[0] for e in located]
         epath = f"{H}/{EVIDENCE_DIR}/{efile}"
         if not os.path.exists(epath): errors.append(f"{n}: evidence file missing: {efile}"); continue
         text = open(epath).read()
@@ -93,7 +100,7 @@ def main():
                f"GKE documents a check for {documented} of the {len(SCENARIOS)}.")
     every = ["", "Every insight or recommendation published on a scenario cluster, including ones unrelated to its scenario:", "",
              "| Cluster | Subtypes | Last refresh |", "| --- | --- | --- |"]
-    ours = sorted({c for v in SCENARIOS.values() for c in v[4]})
+    ours = sorted({e.split("@")[0] for v in SCENARIOS.values() for e in v[4]})
     for c in ours:
         items = rec.get("clusters", {}).get(c, [])
         every.append(f"| `{c}` | {', '.join(sorted({i['subtype'] for i in items})) or 'none'} | {max((i['lastRefreshTime'] for i in items), default='')} |")
