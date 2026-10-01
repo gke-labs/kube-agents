@@ -125,7 +125,6 @@ KEY_STALE_AFTER_H = "stale_after_h"
 KEY_DRY_RUN = "dry_run"
 KEY_DETAIL = "detail"
 KEY_HISTORY_URL = "history_url"
-KEY_DOC = "doc"
 KEY_PLACE = "place"
 KEY_ABSENCE = "absence"
 KEY_PRESENCE = "presence"
@@ -157,8 +156,6 @@ class Periodic:
     # TestGrid stale-results settings were; the weekly's is a week and a day.
     stale_after: timedelta
     artifact: str | None
-    # Where the recovery is written up, as a path a reader can find and as a link.
-    doc: str
     place: str
     absence: str
     presence: str
@@ -176,7 +173,6 @@ RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that asser
 WATCHED = (
     Periodic(
         "ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), SWEEP_ARTIFACT,
-        "docs/ci-pool-projects.md, section 5.5",
         "Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up",
         "leftover pull requests from eval runs are being cleaned up again",
         f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
@@ -185,14 +181,12 @@ WATCHED = (
     ),
     Periodic(
         "ci-kube-agents-fleet-reconcile", "seeded-fleet reconcile (hourly)", timedelta(hours=3), RECONCILE_ARTIFACT,
-        "docs/ci-pool-projects.md, section 6.2",
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs hourly and re-applies the seeded-fleet stack in the pool projects the scan reports drifted", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
     Periodic(
         "ci-kube-agents-fleet-reconcile-all", "seeded-fleet reconcile (weekly)", timedelta(hours=192), RECONCILE_ARTIFACT,
-        "docs/ci-pool-projects.md, section 6.2",
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs weekly and re-applies the seeded-fleet stack in every free pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
@@ -442,8 +436,12 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
         if exit_name not in (None, REPORT_EXIT_OK, REPORT_EXIT_FAILED):
             # Terminated or crashed: what it managed before that.
             text = f"{exit_name} after closing {closed or 0} pull request(s) across {projects} project(s)"
-        elif passed or not failed:
+        elif passed:
             text = f"closed {closed or 0} pull request(s) across {projects} project(s)"
+        elif not failed:
+            # Failed above the project level (Boskos, the mapping, a service
+            # unreachable): the run's own line in the detail says what.
+            text = f"the run failed after closing {closed or 0} pull request(s) across {projects} project(s)"
         else:
             text = f"failed in {failed} of {projects} project(s)"
         skipped = artifact.get(SWEEP_KEY_SKIPPED)
@@ -595,7 +593,6 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_DETAIL: (_thresholded_detail(periodic, persistent, artifact) if periodic.run_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact)) if verdict == VERDICT_FAILED else [],
             KEY_SUMMARY: run_summary(periodic, artifact, bool(reading.get(KEY_PASSED))) if verdict == VERDICT_FAILED else None,
             KEY_HISTORY_URL: history_url(periodic.job),
-            KEY_DOC: periodic.doc,
             KEY_PLACE: periodic.place,
             KEY_ABSENCE: periodic.absence,
             KEY_PRESENCE: periodic.presence,

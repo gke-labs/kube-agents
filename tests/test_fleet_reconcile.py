@@ -679,7 +679,7 @@ class HoldTest(unittest.TestCase):
         boskos = _Boskos_two_signals(free=[P7])
         previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
         try:
-            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch.object(boskos_pool, "pause", lambda s: None):
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos):
                 with self.assertRaises(boskos_pool.Terminated):
                     reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN)
         finally:

@@ -424,6 +424,10 @@ class WorkflowWiring(unittest.TestCase):
         self.assertIn("2 project(s) not swept after the run stopped: kube-agents-evals-3, kube-agents-evals-4", periodics.sweep_detail(stopped))
         killed = {"exit": "terminated", "projects": 2, "closed": 7, "failed": 0, "left_for_next_run": 0, "outcomes": {}}
         self.assertEqual(periodics.run_summary(SWEEP, killed, passed=False), "terminated after closing 7 pull request(s) across 2 project(s)")
+        # Failed above the project level (Boskos unreachable, the mapping): not the success wording.
+        above = {"exit": "failed", "projects": 7, "closed": 7, "failed": 0, "left_for_next_run": 0, "error": "could not reach a service (OSError: ...)", "outcomes": {}}
+        self.assertEqual(periodics.run_summary(SWEEP, above, passed=False), "the run failed after closing 7 pull request(s) across 7 project(s)")
+        self.assertEqual(periodics.sweep_detail(above), ["run: could not reach a service (OSError: ...)"])
         self.assertEqual(periodics.sweep_detail(drained), ["30 write(s) left for the next run (the run's write budget)"])
         self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
         self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=True), "nothing to do")
@@ -444,11 +448,17 @@ class WorkflowWiring(unittest.TestCase):
 
     def test_every_watched_job_has_its_words_and_a_runbook_section_that_exists(self):
         headings = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ci-pool-projects.md").read_text().splitlines()
+        # GitHub's anchor: lowercase, spaces to hyphens, punctuation dropped
+        # except hyphens and underscores; lines inside fenced code are not headings.
         slugs = set()
+        fenced = False
         for line in headings:
-            if line.startswith("#"):
+            if line.startswith("```"):
+                fenced = not fenced
+                continue
+            if not fenced and line.startswith("#"):
                 text = line.lstrip("#").strip().lower()
-                slugs.add("".join(ch for ch in text.replace(" ", "-") if ch.isalnum() or ch == "-"))
+                slugs.add("".join(ch for ch in text.replace(" ", "-") if ch.isalnum() or ch in "-_"))
         for periodic in periodics.WATCHED:
             for field in ("place", "absence", "presence", "does", "effect", "runbook"):
                 self.assertTrue(getattr(periodic, field), f"{periodic.job} has no {field}")

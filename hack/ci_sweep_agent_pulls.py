@@ -187,7 +187,14 @@ MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;
 
 
 class RateLimited(Exception):
-    """GitHub refused a write twice under its burst limit: the run ends here."""
+    """GitHub refused the App under its burst limit -- a read once, or a write
+    twice -- so the run ends here. `closed` and `deleted` are what the
+    repository's sweep had done before the refusal, for the report."""
+
+    def __init__(self, message, closed=0, deleted=0):
+        super().__init__(message)
+        self.closed = closed
+        self.deleted = deleted
 
 
 class WriteBudget:
@@ -283,8 +290,13 @@ def app_jwt(app_id, project, runner=subprocess.run):
     return (signing_input + b"." + _b64(kms_sign(project, signing_input, runner))).decode("ascii")
 
 
-def api(method, path, authorization, body=None):
-    """One GitHub call. Returns the decoded body, or None when it is empty."""
+def api(method, path, authorization, body=None, limit_as_error=False):
+    """One GitHub call. Returns the decoded body, or None when it is empty.
+
+    A refusal GitHub marks as its burst limit ends the run (RateLimited): the
+    cooldown covers every repository, so the next project's mint or listing
+    would meet it too. `write()` asks for the HTTPError instead, to wait what
+    GitHub asks and try once more."""
     data = None
     headers = {
         "Authorization": authorization,
@@ -301,6 +313,8 @@ def api(method, path, authorization, body=None):
             raw = response.read()
     except urllib.error.HTTPError as exc:
         boskos_pool.error_body(exc)
+        if not limit_as_error and is_rate_limited(exc):
+            raise RateLimited("GitHub refused %s %s under its rate limit (%s)" % (method, path, boskos_pool.describe(exc)))
         raise
     if not raw:
         return None
@@ -435,7 +449,7 @@ def write(method, path, authorization, body=None):
     project during the cooldown. Any other error is the caller's, as before."""
     try:
         try:
-            return api(method, path, authorization, body)
+            return api(method, path, authorization, body, limit_as_error=True)
         except urllib.error.HTTPError as exc:
             if not is_rate_limited(exc):
                 raise
@@ -443,7 +457,7 @@ def write(method, path, authorization, body=None):
             print("  %s %s refused (%s); waiting %ds before one retry" % (method, path, boskos_pool.describe(exc), wait), file=sys.stderr)
             pause(wait)
             try:
-                return api(method, path, authorization, body)
+                return api(method, path, authorization, body, limit_as_error=True)
             except urllib.error.HTTPError as again:
                 if not is_rate_limited(again):
                     raise
@@ -516,6 +530,9 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
                 authorization,
                 {"state": "closed"},
             )
+        except RateLimited as exc:
+            exc.closed, exc.deleted = closed, deleted
+            raise
         except CALL_FAULTS as exc:
             print("  #%s did not close (%s)" % (number, boskos_pool.describe(exc)), file=sys.stderr)
             unclosed.append(number)
@@ -533,6 +550,9 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             delete_branch(repo, ref, authorization)
             deleted += 1
             gone.add(ref)
+        except RateLimited as exc:
+            exc.closed, exc.deleted = closed, deleted
+            raise
         except CALL_FAULTS as exc:
             print("  #%s closed but %s was not deleted (%s)" % (number, ref, boskos_pool.describe(exc)), file=sys.stderr)
             undeleted.append(ref)
@@ -555,6 +575,9 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
         try:
             delete_branch(repo, ref, authorization)
             deleted += 1
+        except RateLimited as exc:
+            exc.closed, exc.deleted = closed, deleted
+            raise
         except CALL_FAULTS as exc:
             print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
             undeleted.append(ref)
@@ -642,6 +665,8 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
             closed[name] = sweep_repo(name, repo, app_id, dry_run=dry_run, runner=runner, budget=budget)
         except RateLimited as exc:
             print("  %s: %s" % (name, exc), file=sys.stderr)
+            if exc.closed:
+                closed[name] = exc.closed
             failures[name] = str(exc)
             report["ended_early"] = str(exc)
         except (
@@ -737,6 +762,8 @@ def _run(args, run):
             try:
                 run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
             except RateLimited as exc:
+                if exc.closed:
+                    run["closed"][args.project] = exc.closed
                 run["failures"][args.project] = str(exc)
                 run["ended_early"] = str(exc)
                 print("ERROR: %s" % exc, file=sys.stderr)
@@ -781,7 +808,7 @@ def write_report(path, args, run, code, error, started):
     for project, count in sorted(run["closed"].items()):
         outcomes[project] = {"closed": count}
     for project, text in sorted(run["failures"].items()):
-        outcomes[project] = {"error": text}
+        outcomes.setdefault(project, {})["error"] = text
     document = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "mode": MODE_PROJECT if args.project else MODE_POOL,

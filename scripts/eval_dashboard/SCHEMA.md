@@ -910,7 +910,7 @@ and any run-based condition take over as before.
 `periodics` is the watched Prow periodics' notes, by job name, one for each job
 whose latest finished build failed (`verdict: FAILED`) or is older than the
 job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
-finished_at, result, stale_after_h, dry_run, detail[], summary, history_url, doc,
+finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
 place, absence, presence, does, effect, runbook}`. `detail` (on `FAILED` only)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
