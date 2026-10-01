@@ -1410,10 +1410,11 @@ exit 75`))
 
 // The tails are bounded and cut on a rune boundary.
 func TestTail_BoundedOnARuneBoundary(t *testing.T) {
-	long := strings.Repeat("é", 2000) // 4000 bytes
-	got := tail(long, 2048)
-	if len(got) > 2048 || !utf8.ValidString(got) || !strings.HasSuffix(long, got) {
-		t.Fatalf("tail: len=%d valid=%v suffix=%v", len(got), utf8.ValidString(got), strings.HasSuffix(long, got))
+	long := strings.Repeat("é", 2000) // 4000 bytes, every rune two of them
+	// An odd budget lands the byte cut inside a rune, so the walk has to move.
+	got := tail(long, 2047)
+	if len(got) != 2046 || !utf8.ValidString(got) || !strings.HasSuffix(long, got) {
+		t.Fatalf("tail: len=%d (want 2046) valid=%v suffix=%v", len(got), utf8.ValidString(got), strings.HasSuffix(long, got))
 	}
 	if tail("short", 2048) != "short" {
 		t.Fatal("a short string is returned whole")
@@ -1467,6 +1468,78 @@ func TestLookup_ScheduleOutlastsTheConsumerInactiveThreshold(t *testing.T) {
 	if total <= lib.EphemeralConsumerInactiveThreshold {
 		t.Fatalf("retry schedule waits %s in total, which does not outlast the %s inactive threshold a cap refusal clears on",
 			total, lib.EphemeralConsumerInactiveThreshold)
+	}
+}
+
+// The same retry stands behind an orphan's cancel: a cancel for a task with
+// non-final events and no live executor used to be dropped on the first
+// lookup error, leaving the orphan non-terminal for the retention window.
+// The fixture is TestSweep_OrphanFinalized's prior incarnation without the
+// in-flight KV key, so the start-up sweep leaves it alone and the cancel is
+// what finalizes it.
+func TestLookup_OrphanCancelRetriesThenSynthesizes(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	taskID := "task-orphan-cancel"
+	origin := submit(t, c, taskID, "died midway, nobody holds me")
+	bridgeParty := lib.Party{Session: "platform-bridge", AgentType: "hermes-bridge", Profile: "platform"}
+	x, err := c.NewTaskExecution(origin, bridgeParty, "platform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.PublishStatus(testCtx(t), lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.PublishStatus(testCtx(t), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cons, err := js.CreateOrUpdateConsumer(testCtx(t), lib.TasksStream, jetstream.ConsumerConfig{
+		Durable:       "bridge-platform",
+		FilterSubject: "a2a.tasks.platform.*.in",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := cons.FetchNoWait(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for msg := range msgs.Messages() {
+		_ = msg.Ack()
+	}
+
+	var calls atomic.Int32
+	stop := startBridgeWith(t, url, script(t, `echo unreachable`), 1, func(b *Bridge) {
+		real := b.c.TasksGet
+		b.tasksGet = func(ctx context.Context, addressee, id string) (*lib.Task, error) {
+			if id == taskID && calls.Add(1) < 3 {
+				return nil, errors.New("nats: maximum consumers limit reached")
+			}
+			return real(ctx, addressee, id)
+		}
+	})
+	defer stop()
+
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, taskID)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("state = %s, want canceled", task.State)
+	}
+	if reason := terminalReason(t, task); !strings.Contains(reason, "canceled-while-orphaned") {
+		t.Fatalf("reason = %q, want canceled-while-orphaned", reason)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("lookup attempts on the cancel = %d, want 3 (two refusals, then the read)", got)
 	}
 }
 
