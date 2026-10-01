@@ -369,9 +369,28 @@ func (g *Gateway) Run(ctx context.Context) error {
 		go g.sweepLoop(ctx)
 	}
 
-	// The adapter's delivery goroutines only enqueue; per-conversation order
-	// is the queue's job, not the backend's.
-	return g.adapter.Run(ctx, func(msg InboundMessage) { g.inbox.enqueue(msg.Conversation, msg) })
+	// The adapter's delivery goroutines only enqueue (or refuse a console
+	// turn whose queue is full); per-conversation order is the queue's job,
+	// not the backend's.
+	return g.adapter.Run(ctx, g.enqueueInbound)
+}
+
+// enqueueInbound queues a turn for its conversation. Console turns are
+// bounded per conversation (consoleQueueCap), because the console is the
+// one ingress whose rate the sender sets.
+func (g *Gateway) enqueueInbound(msg InboundMessage) {
+	if msg.Backend != consoleBackend {
+		g.inbox.enqueue(msg.Conversation, msg)
+		return
+	}
+	accepted, first := g.inbox.enqueueBounded(msg.Conversation, msg, consoleQueueCap)
+	if accepted || !first {
+		return
+	}
+	// Once per fill: a tab publishing in a loop would otherwise get a log
+	// line and a post for every frame it loses.
+	g.log.Warn("console frame dropped", "reason", "queue full", "conversation", msg.Conversation, "messageId", msg.MessageID, "queued", consoleQueueCap)
+	g.post(msg.Conversation, fmt.Sprintf(consoleQueueFullNotice, consoleQueueCap))
 }
 
 type sessionLockEntry struct {

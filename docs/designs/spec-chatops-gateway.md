@@ -1141,7 +1141,10 @@ A dead chat backend therefore shows as that log line on a Running pod, not as a 
 
 **Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
 naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a
-frame whose `kind` is anything but `text`. A NATS render that predates the console identity,
+frame whose `kind` is anything but `text`. At most 8 turns wait behind one console
+conversation: a chat platform paces its own senders, but the console credential can publish as
+fast as it likes, so past the cap a frame is dropped. The first drop in each fill logs and posts
+one notice, and the rest are silent until the conversation has room again. A NATS render that predates the console identity,
 or a NATS pod not yet rolled onto the new one, refuses the adapter's subscription
 asynchronously; the adapter logs that with the remedy rather than boot-failing,
 because the chat backend beside it is still good.

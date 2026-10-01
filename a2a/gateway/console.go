@@ -69,6 +69,18 @@ const (
 	// could write a megabyte of log. An id is an identifier, not content;
 	// 256 bytes is far past any the page has reason to mint.
 	consoleMessageIDCap = 256
+
+	// consoleQueueCap bounds the turns waiting behind one console
+	// conversation. The chat backends are paced by their platforms and the
+	// inject door holds one turn per conversation, but a console frame
+	// arrives as fast as the credential holder publishes, and the inbox
+	// never pushes back, so without a cap one tab could grow the gateway's
+	// memory until the pod is killed. A person typing never has more than a
+	// couple of turns waiting.
+	consoleQueueCap = 8
+	// consoleQueueFullNotice is posted once per fill when consoleQueueCap
+	// refuses a turn; %d is the cap.
+	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
 )
 
 // ConsoleInFrame is what the browser publishes. Kind is empty or "text";

@@ -3,10 +3,12 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -226,4 +228,83 @@ func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// A console conversation with consoleQueueCap turns already waiting refuses
+// the next one, logs it, and posts one notice to the conversation however
+// many more arrive. A chat backend's turns are not bounded.
+func TestConsoleTurnsPastTheQueueCapAreDroppedWithOneNotice(t *testing.T) {
+	adapter := newFakeAdapter()
+	logs := &lockedBuffer{}
+	g := &Gateway{adapter: adapter, log: slog.New(slog.NewTextHandler(logs, nil))}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	taken := make(chan struct{}, 1)
+	var handled []string
+	var mu sync.Mutex
+	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
+		select {
+		case taken <- struct{}{}:
+		default:
+		}
+		<-release
+		mu.Lock()
+		for _, m := range batch {
+			handled = append(handled, m.MessageID)
+		}
+		mu.Unlock()
+	})
+	const conv = "console:tab-q"
+	turn := func(id string) InboundMessage {
+		return InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, MessageID: id, Text: "hi"}
+	}
+	g.enqueueInbound(turn("in-flight"))
+	select {
+	case <-taken:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the worker never took the first turn")
+	}
+	for i := range consoleQueueCap {
+		g.enqueueInbound(turn(fmt.Sprintf("w%d", i)))
+	}
+	if got := adapter.postTexts(); len(got) != 0 {
+		t.Fatalf("posted before the cap was reached: %q", got)
+	}
+	g.enqueueInbound(turn("over-1"))
+	g.enqueueInbound(turn("over-2"))
+
+	posts := adapter.postTexts()
+	if want := fmt.Sprintf(consoleQueueFullNotice, consoleQueueCap); len(posts) != 1 || posts[0] != want {
+		t.Fatalf("posts = %q, want exactly [%q]", posts, want)
+	}
+	if n := strings.Count(logs.String(), `reason="queue full"`); n != 1 {
+		t.Fatalf("queue-full log lines = %d, want 1:\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "messageId=over-1") {
+		t.Errorf("the drop log does not name the first refused frame:\n%s", logs.String())
+	}
+
+	// The same depth on a chat backend's conversation is all accepted.
+	for i := range consoleQueueCap + 2 {
+		g.enqueueInbound(InboundMessage{Conversation: "discord:1/2", Kind: "dm", Backend: "discord", MessageID: fmt.Sprintf("d%d", i)})
+	}
+	releaseOnce.Do(func() { close(release) })
+	want := 1 + consoleQueueCap + consoleQueueCap + 2
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := slices.Clone(handled)
+		mu.Unlock()
+		if len(got) >= want {
+			if len(got) != want || slices.Contains(got, "over-1") || slices.Contains(got, "over-2") {
+				t.Fatalf("handled = %q, want the in-flight turn, %d console and %d discord turns, no over-*", got, consoleQueueCap, consoleQueueCap+2)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("handled %d of %d turns: %q", len(got), want, got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
