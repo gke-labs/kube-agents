@@ -91,7 +91,9 @@ DEFAULT_BOARD = "default"
 OPEN_CARDS_SQL = (
     "SELECT s.task_id, t.status, "
     "(SELECT json_extract(e.payload, '$.creator_task_id') FROM task_events e "
-    "WHERE e.task_id = s.task_id AND e.kind = 'created') "
+    "WHERE e.task_id = s.task_id AND e.kind = 'created'), "
+    "(SELECT e.kind FROM task_events e WHERE e.task_id = s.task_id "
+    "AND e.kind IN ('blocked', 'gave_up') ORDER BY e.id DESC LIMIT 1) = 'gave_up' "
     "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"
@@ -125,6 +127,9 @@ class _Card(NamedTuple):
     #: The id of the card on its board whose worker created it, or None when
     #: a chat turn or the CLI did.
     creator: str | None = None
+    #: Whether its latest stop was a give-up rather than a block on the user:
+    #: Hermes parks a card that gave up at ``blocked`` too, waiting for a human.
+    gave_up: bool = False
 
 
 class _Turn:
@@ -219,7 +224,7 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
             rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
         finally:
             conn.close()
-        cards.update(((slug, row[0]), _Card(row[1], row[2])) for row in rows)
+        cards.update(((slug, row[0]), _Card(row[1], row[2], bool(row[3]))) for row in rows)
     return cards
 
 
@@ -243,22 +248,22 @@ def _own_cards(before: dict, after: dict, finished: dict) -> set:
     A card open at the start is never the turn's, even one unblocked while it
     ran: Hermes's ``unblocked`` event names no actor, so the turn cannot show
     the unblock was its own rather than the CLI's or another turn's. Nor is a
-    new card created by the worker of a card the turn did not open, such as a
-    follow-up an earlier ask's worker files. Only workers set a creator; the
-    parents a turn names do not make a card anyone else's. A card that opened
-    and closed within the turn was never read, so its creator is unknown and it
-    counts.
+    new card whose creator was open at the start, such as a follow-up an
+    earlier ask's worker files, nor one created under such a card. Only workers
+    set a creator; the parents a turn names do not make a card anyone else's. A
+    creator open at neither read opened within the turn, so it and the cards it
+    created are the turn's, even when it closed before the notifier reported it.
     """
     opened = {card for card in (*after, *finished) if card not in before}
+    foreign = set(before)
     while True:
-        kept = {
-            (board, task) for board, task in opened
-            if (board, task) not in after
-            or after[(board, task)].creator in {None, *(t for b, t in opened if b == board)}
+        more = {
+            (board, task) for board, task in opened - foreign
+            if (board, task) in after and (board, after[(board, task)].creator) in foreign
         }
-        if kept == opened:
-            return opened
-        opened = kept
+        if not more:
+            return opened - foreign
+        foreign |= more
 
 
 async def on_processing_start(adapter: Any, event: Any) -> None:
@@ -330,11 +335,15 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     is left alone. ``board`` is the notifier's slug for the card's board, which
     with the card's id is how an ask knows it.
 
-    Before a final event takes a card off, the thread is read once for open
+    Before a completion takes a card off, the thread is read once for open
     cards its worker created, and each ask waiting on the card waits on those
     too: a follow-up filed with ``parents=[own id]`` starts only once the card
-    completes, so it was not on the board when the turn ended. A failed read
-    settles as though there were none.
+    completes, so it was not on the board when the turn ended. One blocked on
+    the user is kept and puts ⏸️ on the ask; one parked by a give-up is not. A
+    give-up holds on nothing more: the card is parked, so a follow-up it gates
+    cannot start, and the ask is ❌ whatever the rest do. A failed read settles
+    as though there were none. A card filed under this one after its
+    completion is delivered is not seen: the ask has settled by then.
     """
     if not enabled() or (sub.get("platform") or "").lower() != PLATFORM:
         return
@@ -358,17 +367,18 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         for ask in asks:
             await adapter._react(key[0], ask.ts, _presenter.settle_reaction(settle), ask.team_id, remove=False)
         return
-    after = await open_cards(*key)
-    # Waiting to run only: a card left blocked by a give-up still reads as open.
-    follow_ups = {
-        (b, task) for (b, task), seen in (after or {}).items()
-        if b == card[0] and seen.creator == card[1] and seen.status in RESUMED_STATUSES
-    }
+    follow_ups = {}
+    if settle == _presenter.SETTLE_DONE:
+        follow_ups = {
+            (b, task): seen for (b, task), seen in (await open_cards(*key) or {}).items()
+            if b == card[0] and seen.creator == card[1] and not seen.gave_up
+        }
+    waits_on_user = any(seen.status not in RESUMED_STATUSES for seen in follow_ups.values())
     # The read awaited, so another event may have settled an ask meanwhile.
     asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
     settled = []
     for ask in asks:
-        ask.cards |= follow_ups
+        ask.cards |= follow_ups.keys()
         ask.cards.discard(card)
         ask.failed = ask.failed or settle == _presenter.SETTLE_FAILED
         if not ask.cards:
@@ -379,6 +389,10 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
             _deferred[key] = remaining
         else:
             _deferred.pop(key, None)
+    if waits_on_user:
+        blocked = _presenter.settle_reaction(_presenter.SETTLE_BLOCKED)
+        for ask in asks:
+            await adapter._react(key[0], ask.ts, blocked, ask.team_id, remove=False)
     for ask in settled:
         outcome = _presenter.SETTLE_FAILED if ask.failed else _presenter.SETTLE_DONE
         await adapter._react(key[0], ask.ts, _presenter.settle_reaction(outcome), ask.team_id, remove=False)

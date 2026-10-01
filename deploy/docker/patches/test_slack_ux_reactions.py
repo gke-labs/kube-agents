@@ -110,9 +110,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _cards(*ids, board="default", status="running", creator=None):
+def _cards(*ids, board="default", status="running", creator=None, gave_up=False):
     """A board read: open cards as ``{(board, id): _Card}``."""
-    return {(board, task): runtime._Card(status, creator) for task in ids}
+    return {(board, task): runtime._Card(status, creator, gave_up) for task in ids}
 
 
 class _Root:
@@ -204,6 +204,22 @@ class ApplierTest(unittest.TestCase):
         patched = path.read_text()
         drifted = patched.replace('self._reacting_message_ids = {"m"}', "self._reacting_message_ids = []")
         drifted += "\n\nclass Other:\n    def __init__(self):\n        self._reacting_message_ids = set()\n"
+        path.write_text(drifted)
+        with self.assertRaises(SystemExit):
+            verifier.check_adapter(self.root.dir)
+
+    def test_verifier_reads_the_members_off_the_adapter_class(self):
+        # A mixin above the adapter keeps the expected shape; the adapter's own
+        # _react swaps timestamp and emoji, which the runtime would call wrong.
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        patched = path.read_text()
+        mixin = "class _Mixin:\n    async def _react(self, channel, timestamp, emoji, team_id, *, remove):\n        pass\n\n\n"
+        drifted = patched.replace(
+            "async def _react(self, channel, timestamp, emoji, team_id, *, remove):",
+            "async def _react(self, channel, emoji, timestamp, team_id, *, remove):",
+        ).replace("class SlackAdapter", mixin + "class SlackAdapter", 1)
+        self.assertNotEqual(drifted, patched)
         path.write_text(drifted)
         with self.assertRaises(SystemExit):
             verifier.check_adapter(self.root.dir)
@@ -409,11 +425,36 @@ class RuntimeTest(unittest.TestCase):
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
 
-    def test_a_blocked_follow_up_does_not_hold_the_settle(self):
+    def test_a_follow_up_blocked_on_the_user_holds_the_settle_and_pauses_it(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
         self.boards[:] = [_cards("t_b", status="blocked", creator="t_a")]
         _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
-        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("double_vertical_bar", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
+        self.assertEqual(adapter.calls[-1], ("x", False))
+
+    def test_a_follow_up_parked_by_a_give_up_does_not_hold_the_settle(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="blocked", creator="t_a", gave_up=True)]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+
+    def test_a_give_up_does_not_wait_on_a_follow_up_it_gates(self):
+        # t_b waits on t_a reaching done, and a card that gave up is parked.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="todo", creator="t_a")]
+        reads = len(self.board_args)
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+        self.assertEqual(len(self.board_args), reads)
+
+    def test_a_follow_up_whose_creator_closed_within_the_turn_is_its(self):
+        # t_a opened and completed before the notifier reported it: absent from
+        # both reads and from the turn's finishes, but its follow-up is the turn's.
+        adapter = self._turn("fix it", {}, _cards("t_b", creator="t_a"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
+        self.assertEqual(adapter.calls[-1], ("x", False))
 
     def test_an_unreadable_board_at_the_finish_settles_as_before(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
@@ -635,14 +676,21 @@ class OpenCardsQueryTest(unittest.TestCase):
             "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
             "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
             "INSERT INTO task_events VALUES (1,'a','created','{\"creator_task_id\": null}'),"
-            " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}');"
-            "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready');"
+            " (2,'b','created','{\"creator_task_id\": \"c\"}'),(3,'b','blocked','{\"creator_task_id\": \"x\"}'),"
+            " (4,'f','blocked','{}'),(5,'f','gave_up','{}'),(6,'g','gave_up','{}'),(7,'g','blocked','{}');"
+            "INSERT INTO tasks VALUES ('a','running'),('b','blocked'),('c','done'),('d','archived'),('e','ready'),"
+            " ('f','blocked'),('g','blocked');"
             "INSERT INTO kanban_notify_subs VALUES"
             " ('a','slack','C1','111.000'),('b','slack','C1','111.000'),('c','slack','C1','111.000'),"
-            " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000');"
+            " ('d','slack','C1','111.000'),('e','slack','C1','222.000'),('a','telegram','C1','111.000'),"
+            " ('f','slack','C1','111.000'),('g','slack','C1','111.000');"
         )
         rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
-        self.assertEqual(sorted(rows), [("a", "running", None), ("b", "blocked", "c")])
+        # f's latest stop is a give-up; g gave up, was retried, and blocked on the user.
+        self.assertEqual(
+            sorted(rows),
+            [("a", "running", None, None), ("b", "blocked", "c", 0), ("f", "blocked", None, 1), ("g", "blocked", None, 0)],
+        )
 
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
@@ -684,11 +732,14 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(default).touch()
         Path(b2).touch()
         paths = {"default": default, "alias": default, "b2": b2}
-        rows = {default: [("t_a", "running", None)], b2: [("t_b", "running", None), ("t_c", "blocked", "t_b")]}
+        rows = {
+            default: [("t_a", "running", None, None)],
+            b2: [("t_b", "running", None, None), ("t_c", "blocked", "t_b", 1)],
+        }
         reads = []
         with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, reads)):
             found = runtime._query_open_cards("C1", "111.000")
-        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", creator="t_b")})
+        self.assertEqual(found, {**_cards("t_a"), **_cards("t_b", board="b2"), **_cards("t_c", board="b2", status="blocked", creator="t_b", gave_up=True)})
         self.assertEqual([path for path, _ in reads], [default, b2])
         self.assertEqual(reads[0][1], ("slack", "C1", "111.000"))
 
@@ -697,7 +748,7 @@ class OpenCardsQueryTest(unittest.TestCase):
         Path(good).touch()
         reads = []
         paths = {"default": good, "b3": absent}
-        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None)]}, reads)):
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, {good: [("t_a", "running", None, None)]}, reads)):
             found = runtime._query_open_cards("C1", "111.000")
         self.assertEqual(found, _cards("t_a"))
         # b3 has no database: never connected to, so never created.
