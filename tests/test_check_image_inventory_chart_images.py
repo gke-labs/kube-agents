@@ -52,7 +52,7 @@ _CHECK_THREE_CONSTANTS = (*_LIFTED_CONSTANTS, "LABEL_DEFAULT", "LABEL_MIRRORED")
 # The env vars the chart renders an image into. The pattern has to match every
 # one of them: a name it misses is an image the operator stamps onto agent pods
 # that no check sees.
-_IMAGE_ENV_NAMES = ("PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_IMAGE")
+_IMAGE_ENV_NAMES = ("OPERATOR_IMAGE", "PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_IMAGE")
 
 # What the behavioural tests below cannot reach, because it is top-level script
 # rather than a function: the call that puts the minter through check_toggle,

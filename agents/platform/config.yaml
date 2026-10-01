@@ -171,11 +171,17 @@ toolsets:
   - kanban
 
 # Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrow: the cost audit runs ten checks against every cluster and the
-# drift audit twenty, plus enumeration, the SOP read, and the publish harness.
-# Three separate runs died on `Iteration budget exhausted (90/90)` — reported as
-# a `timed_out` kanban event, though the run was actively heartbeating and no
-# clock ran out. 250 is roughly triple the observed near-miss.
+# audits outgrew when each ran its checks cluster by cluster: three separate runs
+# died on `Iteration budget exhausted (90/90)` — reported as a `timed_out` kanban
+# event, though the run was actively heartbeating and no clock ran out. Most
+# streams, cost and drift among them, now run one collector script that reads
+# the whole fleet in a single call, so a clean run costs the SOP read, the
+# collector, the recommendations and the publish harness. What still scales
+# with the fleet is the Compute Engine and networking audits, which have no
+# collector yet, and the by-hand fallback the SOPs prescribe for every cluster
+# or project a collector marks `unreachable` or `gate-failed` — a bad day on a
+# large fleet is the old per-cluster loop over part of it. 250, roughly triple
+# the observed near-miss, is kept as headroom for those paths.
 #
 # This belongs here rather than in the operator's generated root config because
 # both ways an audit can start read *this* file and not the root one: a cron run

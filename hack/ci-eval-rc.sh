@@ -2,7 +2,7 @@
 # ==============================================================================
 # Release-candidate eval (the postsubmit job's entrypoint)
 # ==============================================================================
-# Resolve the newest release candidate, check it out, deploy its published
+# Resolve the newest release candidate on main, check it out, deploy its published
 # images, and evaluate them. GATING: the verdict this writes is what decides
 # whether the candidate reaches the staging cluster. Step 5 of
 # staging-promotion-pipeline.yml polls this run's artifacts and pushes the
@@ -81,9 +81,10 @@ set -euo pipefail
 # The tier exported to ci-eval-pr.sh, and so which matrix this lane grades:
 # `presubmit` is the merge-blocking set in eval/presubmit-cases.txt plus its
 # held-out seats, `nightly` appends eval/nightly-cases.txt. Counted from those
-# files rather than stated here, because both move: on 2026-09-29 they are 13
-# (twelve on the roster and the held-out compliance canary, #2013) and 38, so
-# 51 cases, and at three repetitions 39 units against 153.
+# files rather than stated here, because both move: on 2026-09-29 they are 14
+# (twelve on the roster and two held-out seats, the compliance canary, #2013,
+# and pdb-remediation-pr, #2016) and 38, so 52 cases, and at three
+# repetitions 42 units against 156.
 #
 # It is the smaller one because of the clock, not because the other cases are
 # unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
@@ -105,9 +106,12 @@ set -euo pipefail
 # is unsettled, so it withdraws the nomination and the next night asks again.
 # The held-out canary (#2013) adds three repetitions serialized on its task
 # lock, a ~50 minute chain at its 1002 s median and ~150 minutes if all three
-# reach the 3000 s delegation ceiling, run beside the other cases. A graded
-# miss on it leaves the verdict alone, since it is not admitted; an erroring
-# check on it (rungs 1-3) turns the verdict RED like any case's.
+# reach the 3000 s delegation ceiling, run beside the other cases; the
+# held-out pdb-remediation-pr (#2016) adds three more on its own task lock, a
+# ~62 minute chain at its 1250 s hint and ~96 minutes at its measured
+# maximum. A graded miss on either leaves the verdict alone, since neither
+# is admitted; an erroring check on either (rungs 1-3) turns the verdict RED
+# like any case's.
 #
 # This read `nightly` from #1230 until now, under a comment saying #1175's
 # switch was not on main so nothing read the export. That was true when it was

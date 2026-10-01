@@ -63,6 +63,7 @@ from typing import Any
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
+    "DEFAULT_AGGREGATE_MARGIN",
     "DEFAULT_AGGREGATE_MIN_SCORED",
     "DEFAULT_JUDGED_MARGIN",
     "DEFAULT_JUDGED_METRICS",
@@ -96,16 +97,36 @@ MISSING = "MISSING"
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
 DEFAULT_CORRECTNESS_FLOOR = 1.0
 
+#: How far the suite's pass rate may fall below main's before the aggregate
+#: fires. Measured, not guessed: 0.10 was sized on 2026-09-29 against 94
+#: green presubmit runs since 2026-09-26 and the four clean nightlies at
+#: parallelism 8 (docs/designs/eval-scorer.md, "Sizing the aggregate
+#: margin"). With twelve admitted cases at three repetitions the pull
+#: request's side is 36 units, so the rate moves in steps of 1/36 = 0.028
+#: and the margin is really a count of failed repetitions: at main's window
+#: rate of 0.924 (2026-09-29) it tolerates six failures out of 36 and reds
+#: the seventh; once the outage-era lines leave the window and main sits
+#: near 0.94 it tolerates five and reds the sixth. The worst green run in
+#: the sample had five (0.861 against 0.924, a deficit of 0.063, which the
+#: old 0.05 would have redded); the next worst had four. 0.10 leaves 0.037
+#: of headroom over that worst run, more than one unit of 36, and holds
+#: five failures until main's window rate passes 0.96. The two-proportion
+#: test at one-sided 5% reds none of the same runs either (its largest z
+#: was 1.26, on that five-failure run); it sits one failed repetition
+#: stricter than 0.10 at today's window. Revisit if main's window rate
+#: exceeds 0.96 or the roster leaves twelve.
+DEFAULT_AGGREGATE_MARGIN = 0.10
+
 #: Scored repetitions the aggregate needs before it may BLOCK. Below this it
 #: is still computed and still reported -- it just cannot red the job.
 #:
 #: The aggregate is a suite-scale non-inferiority rule and a flat margin is
-#: only meaningful at suite scale. The arithmetic, at the 0.05 default margin
+#: only meaningful at suite scale. The arithmetic, at the 0.10 default margin
 #: against a baseline screened at the 19/20 admission bar (0.95, so the
-#: blocking threshold is 0.90): a run of ``n`` scored repetitions survives
-#: ``floor(n * 0.098)`` failures. One flaky repetition therefore reds the job
-#: outright at any ``n`` below 11 -- and with a single admitted case at three
-#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is nowhere near 0.902.
+#: blocking threshold is 0.85): a run of ``n`` scored repetitions survives
+#: ``floor(n * 0.15)`` failures. One flaky repetition therefore reds the job
+#: outright at any ``n`` below 7 -- and with a single admitted case at three
+#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is nowhere near 0.85.
 #:
 #: That is precisely ``agent-kanban-smoke``'s failure mode -- one bad run reds
 #: an unchanged pull request -- reintroduced through the aggregate on the day
@@ -114,12 +135,13 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: to compare rather than by widening the margin, because no single flat
 #: margin is right at both n=3 and n=600.
 #:
-#: 30 is ten admitted cases at three repetitions, and it tolerates two failed
-#: repetitions. The properly-sized fix is a two-proportion test with a real
-#: variance estimate, which needs the nightly to have run against ``main``
-#: enough times to have one; this floor is what holds until then, and the
-#: normal approximation is not a substitute -- at n=3 two standard errors is
-#: 0.247, which still reds 2/3.
+#: 30 is ten admitted cases at three repetitions, and it tolerates four failed
+#: repetitions at the 0.85 threshold. The properly-sized fix is a two-proportion
+#: test with a real variance estimate; the 2026-09-29 measurement priced it
+#: against the same runs and it drew the same line the flat margin does at
+#: today's window, so the flat margin stays for its legibility. The normal
+#: approximation is not a substitute at small ``n`` -- at n=3 two standard
+#: errors is 0.247, which still reds 2/3.
 DEFAULT_AGGREGATE_MIN_SCORED = 30
 
 #: Terminal record status devops-bench writes for a run that completed. The
@@ -1126,7 +1148,7 @@ def classify_rep(
     # when it delegates, so a low score here says the eval's wait was shorter
     # than the worker's run and nothing about the agent under test. AFTER
     # rung 1, for the never-ran signature's reason below: the catastrophic
-    # score grades the cluster, and a worker that tripped a safeguard while
+    # score grades the world outside the record, and a worker that tripped a safeguard while
     # the harness was still waiting on it acted, and must keep blocking.
     # After the scores test because a scoreless record is a crashed scoring
     # pass whatever else it carries. The reason leads with the marker so the
@@ -1155,7 +1177,7 @@ def classify_rep(
     # reached is infrastructure whatever the task's deployer builds.
     #
     # Placement is load-bearing on both sides. AFTER rung 1, because the
-    # catastrophic score grades the cluster rather than the record: a tripped
+    # catastrophic score grades the world outside the record (the cluster, or the GitOps repository): a tripped
     # safeguard here is positive evidence something acted, which contradicts
     # the never-ran inference and must keep blocking. BEFORE rungs 2-3,
     # because the check and liveness signals on a never-ran record are
@@ -1651,7 +1673,7 @@ def grade_suite(
     cases: list[dict[str, Any]],
     *,
     baseline_rate: float | None = None,
-    margin: float = 0.05,
+    margin: float = DEFAULT_AGGREGATE_MARGIN,
     min_scored: int = DEFAULT_AGGREGATE_MIN_SCORED,
     armed: bool = False,
 ) -> SuiteVerdict:
@@ -1671,9 +1693,9 @@ def grade_suite(
     CLI passes until ``EVAL_AGGREGATE_ARMED`` says otherwise -- a rate below
     the margin over a full sample is still computed and still reported, as a
     note the markdown renders, rather than as a reason that reds the job.
-    The flat margin has never been measured against how much an unchanged
-    pull request's aggregate moves on main; arming it is a decision to take
-    once the store holds enough nights to say.
+    The margin was measured on 2026-09-29 against how much an unchanged pull
+    request's aggregate moves on main (:data:`DEFAULT_AGGREGATE_MARGIN`);
+    arming it is a Prow-config decision, never a default here.
 
     Green also needs a floor under its coverage. Every fix that routes an
     environment-health shape into an infrastructure classification is right

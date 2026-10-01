@@ -315,7 +315,10 @@ class TagCommitTest(unittest.TestCase):
         self.assertIn("does not match", proc.stderr)
         self.assertEqual(git("tag", "-l", "evalcand_*").stdout.strip(), "")
 
-    def test_tag_ga_release_still_routes_through_the_shared_tagger(self):
+    def test_tag_ga_release_prints_the_same_banner_and_stamps(self):
+        """The GA rung pushes its tag with the release line, atomically, so it does
+        not route through tag_commit.sh; what it keeps is the banner shape and the
+        stamped single-parent commit."""
         repo_dir, git = self._repo()
         populate_mock_release_files(repo_dir)
         git("add", ".")

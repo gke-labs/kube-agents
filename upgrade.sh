@@ -61,6 +61,9 @@ KUBE_AGENTS_FETCH_DEPTH_OPT="--depth=1"
 # package_release_bundle.sh writes it into every bundle it produces, with
 # `version=` and `tag=` both set to the release tag.
 readonly KUBE_AGENTS_RELEASE_BUNDLE_MARKER=".release-bundle"
+# The schema the re-tag modes filter the release's recorded values against,
+# relative to the sources this run applies.
+readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -73,6 +76,10 @@ PARAM_DRY_RUN="false"
 # environment has drifted from the composition on main.
 PARAM_PLAN="false"
 PARAM_KEEP_IMAGE_TAG="false"
+# Off by default: a key the target chart no longer declares is as often a
+# renamed setting as a newer release's addition, and dropping it silently would
+# take the setting off the release. A rollback to an older release passes it.
+PARAM_DROP_UNDECLARED_VALUES="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -80,6 +87,14 @@ PARAM_REGION=""
 # before the flag existed: the namespace came from install.env alone.
 PARAM_AGENT_NAMESPACE=""
 PARAM_IMAGE_TAG="${IMAGE_TAG:-${BAKED_RELEASE_VERSION:-}}"
+# Whether that default came from the baked version alone: the one default a
+# release-line checkout past its stamp takes back (see
+# drop_baked_default_on_a_line_checkout_past_it). parse_args clears it when
+# --image-tag is passed, which is not a default.
+IMAGE_TAG_DEFAULTED_FROM_BAKED="false"
+if [ -z "${IMAGE_TAG:-}" ] && [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+  IMAGE_TAG_DEFAULTED_FROM_BAKED="true"
+fi
 TEMP_REPO_DIR=""
 # Set when this run detached the install's own checkout onto the target
 # release. Everything that can still refuse the upgrade — the configuration
@@ -298,7 +313,13 @@ Options:
   --keep-image-tag         Upgrade everything except the images, leaving them on
                            the tag the install already serves. Use instead of
                            --image-tag, not alongside it; a script carrying a
-                           baked release version already has one, and refuses it.
+                           baked release version already has one, and refuses it,
+                           unless it runs from a release-line checkout past that
+                           release, which carries no version of its own to keep.
+  --drop-undeclared-values With --upgrade-mode=operator or harness, drop the
+                           release's recorded values the target chart's schema
+                           does not declare, instead of refusing the upgrade
+                           over them. For a rollback to an older release.
   --help, -h               Show this help message
 
 Examples:
@@ -357,8 +378,8 @@ random_hex_32() {
 #
 # A fresh install generates these (the composition's random_password
 # resources), and the harness/operator fast paths never touch
-# platform-agent-secrets — `helm upgrade
-# --reset-then-reuse-values` re-tags images and nothing else, so a Secret from an old
+# platform-agent-secrets — their `helm upgrade`
+# re-tags images over the release's recorded values, so a Secret from an old
 # enough install keeps missing the keys until something adds them. The
 # operator marks both Secret references optional, so
 # a Secret without the keys yields containers without the variables rather than
@@ -550,39 +571,31 @@ release_version_of_source_tree() {
 }
 
 # Sets RECORDED_PLUGIN_IMAGE_TAG_KEYS to the Helm keys, one per line, of the
-# plugin image tags the release's user-supplied values record
-# (`plugins.<name>.image.tag`), for the harness step to re-tag with the agent
-# and sandbox tags. Read from the recorded values rather than from the enabled
-# flags because the composition records the tag for a disabled plugin too;
-# derived from the values rather than from a list of plugin names so that a
-# plugin added to the chart and the composition is covered without a change
-# here. The chart the keys are applied to is pinned to this script's commit by
-# the source check, so its `plugins` block matches.
+# plugin image tags the given values record (`plugins.<name>.image.tag`), for
+# the harness step to re-tag with the agent and sandbox tags. Read from the
+# recorded values rather than from the enabled flags because the composition
+# records the tag for a disabled plugin too; derived from the values rather
+# than from a list of plugin names so that a plugin added to the chart and the
+# composition is covered without a change here. The harness step passes what
+# retag_values kept, so a plugin the chart this run applies does not declare
+# is not put back by its `--set`.
 #
-# A read that fails is an error, not an empty list: an empty list would run
-# the pre-fix re-tag and leave the plugin images behind, with the omission
-# surfacing only from the image check after the Helm move. It assigns rather
-# than prints, as gke_dns_endpoint_flag does, so that the caller runs it as a
-# plain command: print_error writes to stdout, which a command substitution
-# would swallow, and under `set -E` the ERR trap would fire in the
+# A malformed `plugins` value is an error, not an empty list: an empty list
+# would run the pre-fix re-tag and leave the plugin images behind, with the
+# omission surfacing only from the image check after the Helm move. It assigns
+# rather than prints, as gke_dns_endpoint_flag does, so that the caller runs it
+# as a plain command: print_error writes to stdout, which a command
+# substitution would swallow, and under `set -E` the ERR trap would fire in the
 # substitution's subshell and again in the parent. `trap - ERR` inside its own
 # substitutions for the same reason, on bash 3.2 in particular. Arguments:
-# release, namespace.
+# values as JSON.
 RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
 recorded_plugin_image_tag_keys() {
-  local release="$1" namespace="$2" values keys stderr_file
+  local values="$1" keys stderr_file
   RECORDED_PLUGIN_IMAGE_TAG_KEYS=""
-  # stderr kept apart from the JSON: Helm writes warnings there on successful
-  # commands too (a group-readable kubeconfig, for one), and merged into the
-  # capture they would break the jq parse of values that are fine.
   stderr_file="$(mktemp)"
-  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" -o json 2>"$stderr_file")"; then
-    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to find the plugin image tags: $(cat "$stderr_file")"
-    rm -f "$stderr_file"
-    return 1
-  fi
   if ! keys="$(trap - ERR; jq -r '(.plugins // {}) | if type == "object" then to_entries[] | select(((.value.image.tag? // "") | tostring) != "") | "plugins.\(.key).image.tag" else error("plugins is not an object") end' <<<"$values" 2>"$stderr_file")"; then
-    print_error "Could not read the plugin image tags from the values of Helm release '${release}': $(cat "$stderr_file")"
+    print_error "Could not read the plugin image tags from the release's recorded values: $(cat "$stderr_file")"
     rm -f "$stderr_file"
     return 1
   fi
@@ -591,16 +604,15 @@ recorded_plugin_image_tag_keys() {
 }
 
 # Sets HARNESS_RETAG_KEYS, the Helm keys the harness step re-tags: the agent
-# and sandbox tags, then every plugin tag the release records. A function of
-# its own so the assembly runs under test with a stub helm, rather than being
-# pinned by the text of the case branch. A read loop rather than the bash 4
-# array builtin: operators run this from macOS, whose bash is 3.2. Arguments:
-# release, namespace.
+# and sandbox tags, then every plugin tag the given values record. A function
+# of its own so the assembly runs under test, rather than being pinned by the
+# text of the case branch. A read loop rather than the bash 4 array builtin:
+# operators run this from macOS, whose bash is 3.2. Arguments: values as JSON.
 HARNESS_RETAG_KEYS=()
 harness_retag_keys() {
-  local release="$1" namespace="$2" key
+  local values="$1" key
   HARNESS_RETAG_KEYS=("platformAgent.deployment.image.tag" "agentSandbox.image.tag")
-  recorded_plugin_image_tag_keys "$release" "$namespace"
+  recorded_plugin_image_tag_keys "$values"
   # An if, not `[ -n ] &&`: with nothing recorded the here-string is one empty
   # line, the test fails, the loop's status is that failure, and under
   # `set -e` the harness step would stop on an install with no plugins.
@@ -609,6 +621,281 @@ harness_retag_keys() {
       HARNESS_RETAG_KEYS+=("$key")
     fi
   done <<<"$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
+}
+
+# Sets RETAG_VALUES_JSON to the values the release recorded, less every key the
+# chart this run applies would refuse as undeclared. Refuses, naming each such
+# key, unless --drop-undeclared-values was passed; then prints each key it
+# drops. The values are those of the revision --reset-then-reuse-values would
+# reuse: the latest when it deployed, otherwise the last one that did, since a
+# failed upgrade leaves the revision before it serving. A rollback re-tags with N-1's chart, and a key N's install recorded
+# that N-1's values.schema.json does not declare fails Helm's schema check for
+# the whole upgrade (#2109).
+#
+# A key is dropped only where Helm would refuse it: under an object the schema
+# closes with `additionalProperties: false`. An open object keeps everything,
+# and a node using a keyword the walk does not model (`$ref`, `allOf`, ...) is
+# left for Helm to judge. A chart without a schema drops nothing. Names are
+# printed, never values: the recorded values carry the install's credentials.
+# A name is printed through `echo -e`, so its backslashes and unprintable
+# characters are written as escapes a terminal shows rather than acts on, a
+# backslash as `\\` so that it cannot be read as the start of one.
+# Assigns rather than prints, for the reasons recorded_plugin_image_tag_keys
+# gives. Arguments: release, namespace, schema path.
+RETAG_VALUES_JSON=""
+retag_values() {
+  local release="$1" namespace="$2" schema="$3" revision values stderr_file dropped_file key
+  RETAG_VALUES_JSON=""
+  # stderr kept apart from the JSON: Helm writes warnings there on successful
+  # commands too (a group-readable kubeconfig, for one).
+  stderr_file="$(mktemp)"
+  if ! revision="$(trap - ERR; helm history "$release" -n "$namespace" -o json 2>"$stderr_file" | python3 -c '
+import json
+import sys
+
+DEPLOYED = "deployed"
+
+revisions = json.loads(sys.stdin.buffer.read())
+latest = max(revisions, key=lambda r: r["revision"])
+deployed = [r for r in revisions if r.get("status") == DEPLOYED]
+if latest.get("status") != DEPLOYED and deployed:
+    latest = max(deployed, key=lambda r: r["revision"])
+print(latest["revision"])
+' 2>>"$stderr_file")"; then
+    print_error "Could not read the history of Helm release '${release}' in '${namespace}' to re-tag it: $(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    return 1
+  fi
+  if ! values="$(trap - ERR; helm get values "$release" -n "$namespace" --revision "$revision" -o json 2>"$stderr_file")"; then
+    print_error "Could not read the values of Helm release '${release}' in '${namespace}' to re-tag it: $(cat "$stderr_file")"
+    rm -f "$stderr_file"
+    return 1
+  fi
+  # The kept values on stdout, and each dropped key on a line of its own file,
+  # since splitting one string in bash takes time quadratic in its length.
+  # UTF-8 in and out whatever the locale. Every character from U+007F to U+FFFF
+  # is written as a \u escape: Helm's YAML parser refuses some of them raw and
+  # reads NEL, U+2028 and U+2029 as line breaks, and escaping the whole range
+  # keeps a character nobody listed from corrupting a value. Those above U+FFFF
+  # stay raw, since the parser refuses the surrogate-pair escape they would need.
+  dropped_file="$(mktemp)"
+  if ! RETAG_VALUES_JSON="$(trap - ERR; printf '%s' "$values" | python3 -c '
+import json
+import re
+import sys
+
+UNMODELLED_KEYWORDS = ("$ref", "allOf", "anyOf", "oneOf", "not", "if", "patternProperties", "dependencies")
+BELOW_ASTRAL = re.compile("[\u007f-\uffff]")
+
+values = json.loads(sys.stdin.buffer.read()) or {}
+try:
+    with open(sys.argv[1], encoding="utf-8") as schema_file:
+        schema = json.load(schema_file)
+except FileNotFoundError:
+    schema = {}
+dropped = []
+
+
+def visible(key):
+    out = []
+    for char in key:
+        if char == "\\":
+            out.append("\\\\\\\\")
+        elif char.isprintable():
+            out.append(char)
+        elif ord(char) <= 0xFFFF:
+            out.append(f"\\\\u{ord(char):04x}")
+        else:
+            out.append(f"\\\\U{ord(char):08x}")
+    return "".join(out)
+
+
+def prune(node, node_schema, path):
+    if not isinstance(node_schema, dict) or any(k in node_schema for k in UNMODELLED_KEYWORDS):
+        return
+    if isinstance(node, dict):
+        properties = node_schema.get("properties", {})
+        additional = node_schema.get("additionalProperties", True)
+        for key in list(node):
+            key_path = f"{path}.{key}" if path else key
+            if key in properties:
+                prune(node[key], properties[key], key_path)
+            elif additional is False:
+                dropped.append(key_path)
+                del node[key]
+            else:
+                prune(node[key], additional, key_path)
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            prune(item, node_schema.get("items"), f"{path}[{index}]")
+
+
+prune(values, schema, "")
+with open(sys.argv[2], "w", encoding="utf-8") as dropped_file:
+    dropped_file.write("".join(f"{visible(key)}\n" for key in dropped))
+text = BELOW_ASTRAL.sub(lambda match: f"\\u{ord(match.group()):04x}", json.dumps(values, ensure_ascii=False))
+sys.stdout.buffer.write(text.encode("utf-8"))
+' "$schema" "$dropped_file" 2>"$stderr_file")"; then
+    RETAG_VALUES_JSON=""
+    print_error "Could not filter the values of Helm release '${release}' against ${schema}: $(cat "$stderr_file")"
+    rm -f "$stderr_file" "$dropped_file"
+    return 1
+  fi
+  rm -f "$stderr_file"
+  if [ ! -s "$dropped_file" ]; then
+    rm -f "$dropped_file"
+    return 0
+  fi
+  if [ "$PARAM_DROP_UNDECLARED_VALUES" != "true" ]; then
+    RETAG_VALUES_JSON=""
+    while IFS= read -r key; do
+      print_error "The release's recorded values set '${key}', which the chart this run applies does not declare."
+    done <"$dropped_file"
+    rm -f "$dropped_file"
+    print_error "Helm would refuse this upgrade over the keys above. If the target is an older release that predates them, re-run with --drop-undeclared-values to drop them; the settings they carry then leave the release until an --upgrade-mode=full run sets them again. If the target renamed or removed them, run --upgrade-mode=full instead."
+    return 1
+  fi
+  while IFS= read -r key; do
+    print_warning "Dropping '${key}' from the release's recorded values: the chart this run applies does not declare it, and Helm would refuse the upgrade over it. A later release that declares it renders it from that chart's default until an --upgrade-mode=full run there sets it again."
+  done <"$dropped_file"
+  rm -f "$dropped_file"
+}
+
+# A release-line checkout between stamps. A patch is stamped as a child of the
+# line's head, so every backport that lands on release/<X.Y> after a release
+# descends from a stamped commit and carries its BAKED_RELEASE_VERSION, which is
+# the previous release's. True when the directory is a Git checkout whose HEAD
+# descends from the baked release's commit without being it: unreleased
+# development on the line, whose images are built per commit, so the release is
+# not the tag to default to. Exactly the tag's commit is the release checkout,
+# and a HEAD that is neither is left to verify_local_source_ref, which refuses
+# the mismatch as before. A tag the checkout does not hold reads as "not past":
+# the release's own commit is on the line's history, so a clone of the line
+# brings the tag with it. And only a checkout whose own scripts carry the
+# baked version (release_version_of_source_tree): the version belongs to the
+# script that is running, and a tree whose upgrade.sh was replaced by another
+# release's is not a line checkout of that release. Same rule as install.sh's;
+# the front doors carry their own copies of what they need before any sources
+# are acquired.
+checkout_is_past_baked_release() {
+  local repo_dir="${1:-.}" tag_commit head_commit
+  [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
+  [ "$(release_version_of_source_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
+  head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  [ "$tag_commit" != "$head_commit" ] || return 1
+  git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
+}
+
+# What stands between a line checkout and being recognised, for the refusals in
+# verify_local_source_ref, mirroring checkout_is_past_baked_release's conditions
+# and where main reads it from: the release's tag not fetched, or a shallow
+# history the ancestry walk cannot cross (a `--depth 1` clone of the line, which
+# `git fetch --tags` alone does not mend); else a running upgrade.sh that is not
+# the tree's own (piped, or run from elsewhere); else a HEAD that does not
+# descend from the release, which no fetch mends. Printed only for a tree whose
+# own scripts carry the version; the caller checks that. Same text as
+# install.sh's.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" descends="false" line="${BAKED_RELEASE_VERSION%.*}"
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    descends="true"
+  fi
+  # The fetches the predicate's walk would need, and only those: no tag, or a
+  # shallow history the walk could not cross. A shallow clone deep enough to
+  # hold the release needs nothing fetched.
+  if [ -z "$tag_commit" ]; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$descends" != "true" ] && [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  script_dir="$(script_checkout_dir)"
+  [ -z "$script_dir" ] || script_dir="$(cd "$script_dir" && pwd -P)"
+  local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
+  if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release upgrade.sh, or one run from another directory: only the
+    # checkout's own upgrade.sh recognises a release-line checkout, so that comes
+    # first, with whatever fetch it would also need.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the upgrade.sh running is not this checkout's. If it is a checkout of a release line, run its own ./upgrade.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ "$descends" = "true" ]; then
+    # Recognisable, and asked for the release by name anyway (--image-tag, or
+    # IMAGE_TAG in the shell or install.env, naming the baked version): the
+    # checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; or ${own_images}."
+  elif [ -n "$remedies" ]; then
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
+  else
+    # Tag present, history complete, the checkout's own script running: HEAD
+    # simply does not descend from the release (a cherry-picked or rebased
+    # stamp). No fetch changes that.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but ${head_commit:0:7} is neither that release's commit nor a descendant of it, so it is not a release-line checkout past it. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
+  fi
+}
+
+# The directory this script runs from, when that is a kube-agents checkout;
+# empty under `curl … | bash`, where no file names one. acquire_upgrade_sources
+# and the release-line check in main both read it.
+#
+# Under `curl … | bash` there is no script file on disk. At the top level
+# `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
+# this runs — what bash reports depends on its version: `main` or nothing on
+# the releases on_error's comment above describes, and `$0` on bash 5.3
+# (measured): `bash` for the documented one-liner, or the interpreter's own
+# path (`/bin/bash`) when it is invoked by path. None of them names this
+# script. An unguarded `dirname` turns the empty value, `main` and a bare
+# `bash` into `.`, and `pwd` into the directory the operator is standing in,
+# which would skip the checkout arms in acquire_upgrade_sources. Two checks
+# share the job:
+# requiring a non-empty path that names an existing file rejects the empty
+# value, `main` and a bare `bash` (short of a file by that name in the
+# working directory), and the installer-helper marker check that follows
+# rejects the interpreter's directory, which carries no checkout.
+script_checkout_dir() {
+  local script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd || echo "")"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+    printf '%s' "$script_dir"
+  fi
+}
+
+# The baked version is the run's target from the moment it starts, which is
+# right for a release's own upgrade.sh and wrong for the upgrade.sh of a line
+# checkout that has moved past that release: it would upgrade to the previous
+# release's images under the backport's engine, a mismatch nobody asked for,
+# and verify_local_source_ref would refuse it as a source mismatch rather than
+# ask for a version. So a defaulted target is taken back on such a checkout,
+# and the run asks the way a copy with no baked version does. An explicit
+# --image-tag or IMAGE_TAG is not a default and is left alone.
+# Arguments: $1 = the checkout to judge (the script's own, in main)
+drop_baked_default_on_a_line_checkout_past_it() {
+  local repo_dir="${1:-}"
+  [ "$IMAGE_TAG_DEFAULTED_FROM_BAKED" = "true" ] || return 0
+  [ -n "$repo_dir" ] && checkout_is_past_baked_release "$repo_dir" || return 0
+  local head_commit count
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD)"
+  count="$(git -C "$repo_dir" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")"
+  # The remedy depends on what the run is about: a plan or a --keep-image-tag
+  # run reads the installed tag next and needs no --image-tag, so it is not
+  # told to pass one.
+  local remedy="pass --image-tag ${head_commit} for this commit's images, or run tag ${BAKED_RELEASE_VERSION}'s own upgrade.sh for the release."
+  if [ "$PARAM_KEEP_IMAGE_TAG" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    remedy="this run reads the tag the install already serves instead."
+  fi
+  print_info "This checkout is release line ${BAKED_RELEASE_VERSION%.*} at ${head_commit:0:7}, ${count} commit(s) past release ${BAKED_RELEASE_VERSION}, whose version its scripts still carry. Its images are built per commit and not released, so ${BAKED_RELEASE_VERSION} is not this run's default: ${remedy}"
+  PARAM_IMAGE_TAG=""
+}
+
+# Whether main's tag block is looking at the default the function above took
+# back: the baked version was the default and the tag is now empty, which
+# nothing else produces. The "--image-tag is required" exit reads it to say why
+# rather than that the script carries no baked version.
+baked_default_was_dropped() {
+  [ "$IMAGE_TAG_DEFAULTED_FROM_BAKED" = "true" ] && [ -z "$PARAM_IMAGE_TAG" ]
 }
 
 # The two refusals that do not need a ref to make sense: an unversioned source
@@ -717,11 +1004,26 @@ verify_local_source_ref() {
   local expected_commit current_commit
   if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    # Only when the tree's own scripts carry the version (the line
+    # checkout_is_past_baked_release draws): a piped release upgrade.sh
+    # standing in some other checkout that lacks the tag is not a line checkout
+    # to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     return 1
   fi
   current_commit="$(git -C "$repo_dir" rev-parse HEAD)"
   if [ "$current_commit" != "$expected_commit" ]; then
     print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+    # The tag is here and HEAD is not it: a line checkout asked for the release
+    # by name (--image-tag with the baked version), one the predicate could not
+    # walk (a shallow clone), or an unrelated commit. Same gate as above.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     return 1
   fi
   # Whose '0.6.0' is this? For sources this run fetched, the answer is settled:
@@ -952,6 +1254,7 @@ parse_args() {
       --non-interactive|-y) PARAM_NON_INTERACTIVE="true"; shift ;;
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
+      --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -961,8 +1264,8 @@ parse_args() {
       --gcp-region) PARAM_REGION="$2"; shift 2 ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --agent-namespace) PARAM_AGENT_NAMESPACE="$2"; shift 2 ;;
-      --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
-      --image-tag) PARAM_IMAGE_TAG="$2"; shift 2 ;;
+      --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift ;;
+      --image-tag) PARAM_IMAGE_TAG="$2"; IMAGE_TAG_DEFAULTED_FROM_BAKED="false"; shift 2 ;;
       --help|-h) show_help; exit 0 ;;
       *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
     esac
@@ -1052,24 +1355,9 @@ acquire_upgrade_sources() {
   # locals dynamically, so a local sharing a name with the variable named in
   # $1 or $2 would be the one printf -v writes to, and the caller would read
   # back an empty string.
-  local resolved_dir="" found_checkout="" script_dir="" script_path="${BASH_SOURCE[0]:-}"
-  # Under `curl … | bash` there is no script file on disk. At the top level
-  # `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
-  # this runs — what bash reports depends on its version: `main` or nothing on
-  # the releases on_error's comment above describes, and `$0` on bash 5.3
-  # (measured): `bash` for the documented one-liner, or the interpreter's own
-  # path (`/bin/bash`) when it is invoked by path. None of them names this
-  # script. An unguarded `dirname` turns the empty value, `main` and a bare
-  # `bash` into `.`, and `pwd` into the directory the operator is standing in,
-  # which would skip the checkout arms below. Two checks share the job:
-  # requiring a non-empty path that names an existing file rejects the empty
-  # value, `main` and a bare `bash` (short of a file by that name in the
-  # working directory), and the installer-helper marker check that follows
-  # rejects the interpreter's directory, which carries no checkout.
-  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
-    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd || echo "")"
-  fi
-  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+  local resolved_dir="" found_checkout="" script_dir=""
+  script_dir="$(script_checkout_dir)"
+  if [ -n "$script_dir" ]; then
     resolved_dir="$script_dir"
   elif [ -f "$(pwd)/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ] && {
     [ -z "$expected_ref" ] || ! is_kube_agents_clone "$(pwd)"
@@ -1185,11 +1473,16 @@ main() {
   # A flag rather than "empty means keep", because empty already means
   # something: it is the shape of a CI job whose IMAGE_TAG variable did not
   # resolve, and that has to stay the hard error it has always been.
+  drop_baked_default_on_a_line_checkout_past_it "$(script_checkout_dir)"
   if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_KEEP_IMAGE_TAG" = "true" ]; then
     print_info "--keep-image-tag: this run keeps the tag the install is already serving."
   elif [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_info "No --image-tag given; the plan will use the tag this install is already running."
   elif [ -z "$PARAM_IMAGE_TAG" ]; then
+    if baked_default_was_dropped && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! { [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; }; }; then
+      print_error "--image-tag is required from a release-line checkout past its release; pass this commit's full SHA (above) or a validated release tag."
+      exit 1
+    fi
     if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       print_error "--image-tag is required; this copy of the script carries no baked release version. Re-run the release-pinned script for the version you want, or pass a validated release tag or full commit SHA."
       exit 1
@@ -1223,6 +1516,10 @@ main() {
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
+  if [ "$PARAM_DROP_UNDECLARED_VALUES" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "full" ]; then
+    print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
+    exit 1
+  fi
 
   if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
@@ -1247,7 +1544,7 @@ main() {
   fi
 
   # python3: installer_common's state readers and the pre-apply scope check
-  # compare JSON with it.
+  # compare JSON with it, and the re-tag modes filter the release's values.
   local required_tools=(gcloud kubectl helm python3)
   # jq: the harness step's plugin re-tag reads the release's values with it,
   # and the post-upgrade image check that harness and full modes run has
@@ -1482,22 +1779,26 @@ main() {
   # against an old sandbox, and the second one's reused values would have to
   # re-read what the first wrote.
   #
-  # --reset-then-reuse-values, not --reuse-values. --reuse-values renders this
-  # checkout's chart against only the previous release's values, so any key the
-  # chart gained since that release is simply absent: upgrading a pre-split
-  # install this way hits a nil pointer in operator-deployment.yaml, or renders
-  # the sandbox image as ":<tag>" and leaves the StatefulSet unable to start.
-  # Resetting first takes the checkout's defaults for the new keys and re-applies
-  # the release's own overrides on top, which is what the redeploy workflows
-  # already do for the same reason.
+  # --reset-values with the release's own values, not --reuse-values.
+  # --reuse-values renders this checkout's chart against only the previous
+  # release's values, so any key the chart gained since that release is simply
+  # absent: upgrading a pre-split install this way hits a nil pointer in
+  # operator-deployment.yaml, or renders the sandbox image as ":<tag>" and
+  # leaves the StatefulSet unable to start. Resetting first takes the checkout's
+  # defaults for the new keys and re-applies the release's own overrides on top,
+  # which is what --reset-then-reuse-values does. The overrides come from retag_values rather than that flag so that a key this
+  # chart does not declare can be dropped: the flag has no way to leave one out.
+  # Piped, so the recorded values never land in a file. The newline is not
+  # optional: Helm 4 drops an unterminated last line of a length that is a
+  # multiple of 4096 bytes, which here is every value at once.
   helm_retag() {
     local set_args=()
     local set_key
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
-    helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
-      --namespace "$target_namespace" --reset-then-reuse-values \
+    printf '%s\n' "$RETAG_VALUES_JSON" | helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
+      --namespace "$target_namespace" --reset-values --values - \
       "${set_args[@]}" --wait --timeout 10m
   }
 
@@ -1576,10 +1877,11 @@ main() {
   # UPGRADE_APPLY_STARTED is set inside each arm below rather than here, and
   # the difference is load-bearing. Both previews have exited above, so it is
   # tempting to read "past the previews" as "past the point of no return" — but
-  # two arms still refuse after the dispatch and before they write anything:
+  # every arm can still refuse after the dispatch and before it writes anything:
   # full runs the scope check, the container preflight, the minter/KMS guard
-  # and the service-account 409 check, and
-  # harness reads the release's values to learn which plugin tags to move. A run
+  # and the service-account 409 check, and operator and harness read the
+  # release's values to re-tag it (harness also takes from them which plugin
+  # tags to move). A run
   # that stops on one of those has applied none of the new release, so the
   # checkout this run detached has to go back. Each arm therefore flips the gate
   # on its own last line before its first mutating command, and
@@ -1588,6 +1890,7 @@ main() {
   case "$PARAM_UPGRADE_MODE" in
     operator)
       print_step "4. Upgrading Kubernetes Operator (CRDs & Controller Manager)"
+      retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
       helm_retag "operator.image.tag"
@@ -1603,11 +1906,14 @@ main() {
       # The plugin images move with them for the same reason, when the
       # release records them: the operator renders them into the gateway as
       # stage-<plugin> init containers or plugin-<name> image volumes, and
-      # the image check below reads both. A plain call, not a substitution: a
-      # failed read stops the run here, once, with its own message shown.
-      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"
-      # After the read, not before it: `helm get values` is the last thing this
-      # arm does that can fail without having changed anything.
+      # the image check below reads both. From the filtered values, so a
+      # plugin block retag_values dropped is not put back by a `--set`. Plain
+      # calls, not substitutions: a failed read stops the run here, once, with
+      # its own message shown.
+      retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
+      harness_retag_keys "$RETAG_VALUES_JSON"
+      # After the reads, not before them: they are the last things this arm
+      # does that can fail without having changed anything.
       UPGRADE_APPLY_STARTED="true"
       helm_retag "${HARNESS_RETAG_KEYS[@]}"
       print_success "Platform Agent deployment upgraded successfully!"

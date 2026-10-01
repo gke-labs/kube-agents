@@ -78,7 +78,7 @@ direct-bus transport the first draft of this document proposed proves the bus, t
 streams and the executor, but it leaves out the gateway's routing, its session registry and the
 relay back, and it hands a second process the one credential that may publish on `.in`. Stage 1
 is therefore the next-stack analogue of the door the harness uses today: an **inject adapter in
-the gateway**, a third backend beside Discord and Google Chat, HTTP on localhost or a ClusterIP
+the gateway**, a backend beside Discord, Google Chat and Slack, HTTP on localhost or a ClusterIP
 Service, off by default, rendered by the operator only under the eval flag. Its design text is
 the gateway spec's "The inject backend" section; this document records what the harness does
 with it. The direct-bus transport survives as a diagnostic, below.
@@ -195,7 +195,8 @@ the adapter's side of the door and is not a sixth backend operation: a pure read
 conversation's state that mutates nothing. It returns what the session record holds for the key,
 the active task with its `SubmittedAt`, from which the age in the nobody-took-it outcome is
 computed, and `Detached`, which the harness reads after its own cancel so it never sends a
-second one and grades the timeout from a detached record, the fold of the task's stream, its
+second one and grades the timeout from a detached record (a `task=` read of a task the record
+no longer holds as active carries neither), the fold of the task's stream, its
 state none, `submitted`, `working` or a terminal with the result text, and the last posted
 message, plus the gateway's configured grace and the backend the gateway armed; the
 infrastructure paragraph below says what the harness does with it.
@@ -268,15 +269,16 @@ the cancel's answer: a cancel sent to a task nobody consumed gets "cancel sent" 
 terminal follows, so the answer is not evidence, and the cancel is sent anyway because the
 submission is durable on the task's `in` subject under the bridge's durable consumer, so a bridge
 that first binds inside the stream's retention window would otherwise be handed the stale case
-prompt and run it with the install's credentials. What the cancel buys on the bridge as it stands
-is a bound, not a clean refusal: the durable consumer delivers serially and acks after the
-handler, so the cancel is read only after the submission's accept returns, and by then an idle
-worker, which a freshly bound bridge ordinarily has, has taken the run, published `working` and
-spawned the stale prompt, so spawn-before-cancel is the common case and `canceled-before-start`
-the exception; the cancel then kills it within the bridge's kill grace and the terminal is
-`canceled-by-request`, which is the record. `canceled-before-start` is what a task
-still queued gets, the `submitted` outcome above. The stage-1 bridge work below therefore
-includes a look-ahead that makes the refusal clean. The release still happens on the next real
+prompt and run it with the install's credentials. What the cancel buys on the bridge is a clean
+refusal: the durable consumer delivers serially and acks after the handler, so the cancel is
+read only after the submission's accept returns, and by then an idle worker, which a freshly
+bound bridge ordinarily has, has taken the run; before it spawns, the worker replays the task's
+`in` subject for a cancel newer than the submission and, finding one, finalizes
+`canceled-before-start` without publishing `working` or spawning. `canceled-before-start` is
+also what a task still queued gets, the `submitted` outcome above. A cancel that lands after
+that read still kills the run within the bridge's kill grace and the terminal is
+`canceled-by-request`, which is the record; a look-ahead read that fails spawns rather than
+drops, and the same cancel bounds it. The release still happens on the next real
 inbound message, as today, which matters
 only if the key is reused, and the harness uses a fresh key per run, case and repetition. That is
 how the harness and the gateway agree on what "nobody took it" means, one grace read from the
@@ -288,7 +290,8 @@ faults as well as the persona's. The reason rides as the terminal's status messa
 takes the token up to the next space, so `bus-publish-failed at working` reads as
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
-`spawn-failed` and `bridge-died-without-terminal-event` and the worker adapter's `worker-evicted`
+`spawn-failed`, `bridge-died-without-terminal-event` and `hermes-rate-limited` (a turn that gave
+up on the provider's rate limit or billing, Hermes's exit 75) and the worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api
 transport gives an exhausted transport retry, because they say the executor lost the task rather
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
@@ -321,7 +324,12 @@ a trajectory item in the api path's shape, and writes one `a2a.activity` marker 
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the
-harness asks neither and grades on what the probe carried. `worker_commands` reads
+harness asks neither and grades on what the probe carried. Both executors publish it: the
+worker adapter from the `tool_use` content blocks in the stream of the coding agent it runs,
+the Hermes bridge from hermes's outbound
+webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
+its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
+`progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id; on
 this path it has data only once the case runner's delegation wait is rebuilt for it (Completion
 signals), and until then a case that gates on it has no data on stage 1 either. Neither is graded
@@ -356,7 +364,7 @@ session pod waits on the profile and dispatcher work, which has no date, and the
 none for the bridge's retirement: it goes when profiles land and the retirement ordering is
 written. Stage 1 builds against the bridge
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md)), a sidecar declared on the CR
-through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds, CI-only. A
+through `spec.deployment.sidecars` whose image `a2a/Dockerfile.hermes-bridge` builds. A
 case addresses `platform` and does not care who answers; when the persona moves to a worker the
 addressee stays `platform`, which is what the addressee token is for. An install under `next`
 with no sidecar declared has a bus with nobody consuming `platform` tasks, and every case on the
@@ -364,7 +372,7 @@ inject transport ends as infrastructure. That is the correct reading of that ins
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
 publishes `working` only when a worker spawns the subprocess; the presubmit fans units out at
-`EVAL_TASK_PARALLELISM`, default 4, the nightly at 6. At those defaults two of every four
+`EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
 concurrent units wait in the bridge's queue carrying an executor event and no subprocess, for as
 long as the two ahead of them run. The eval install's sidecar therefore sets
 `BRIDGE_CONCURRENCY` to at least `EVAL_TASK_PARALLELISM`, declared with the sidecar on the CR,
@@ -377,9 +385,10 @@ Dockerfiles: the platform-agent image plus the bridge binary, built in the same 
 the A2A images (a step of its own, after the platform image) and tagged per pull request into the
 pool project's registry,
 `FROM` the platform-agent image that build produced by the tag it just pushed and never a
-registry default, so the sidecar and the agent container it shares a pod with are one build;
-CI-only, outside `images.json`, with the exclusion stated in `hack/check-image-inventory.sh`
-and the bridge doc's provenance paragraph saying the same. `hack/ci-deploy.sh` under the flag
+registry default, so the sidecar and the agent container it shares a pod with are one build.
+The bridge was CI-only until the executor question was settled; the release workflow
+publishes it as `hermes-bridge`, on the same `FROM`-the-same-commit rule, and `images.json`
+carries it (the bridge doc's provenance paragraph says the same). `hack/ci-deploy.sh` under the flag
 declares the sidecar on the CR through `spec.deployment.sidecars` once the bus is up (a bridge
 that starts before NATS resolves crash-loops the agent's pod), with that image, the bus URL and
 the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
@@ -391,10 +400,35 @@ resources, derived from the rendered Deployment at deploy time rather than copie
 script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
 the agent container, and that is the environment such a worker inherits. The one mount not
 carried is the projected bus token, which the webhook reserves for the agent container. The
-third piece, a look-ahead in the bridge's worker that before it spawns replays the task's `in`
-subject for a trailing `cancel` and finalizes `canceled-before-start` when it finds one, so a
-cancel already in the stream is honoured without a spawn, was decided the same day and is
-tracked as its own issue.
+third piece was decided the same day and is built: a look-ahead in the bridge's worker that
+before it spawns replays the task's `in` subject for a trailing `cancel` and finalizes
+`canceled-before-start` when it finds one, so a cancel already in the stream is honoured without
+a spawn ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Lifecycle, steering,
+cancel"; its "Sizing against the eval harness" is the canonical statement of
+`BRIDGE_CONCURRENCY` against the fan-out and the bridge's queue capacity, which this paragraph
+summarises).
+
+**What the lane grades (decided 2026-09-28 on gke-labs/kube-agents#2037).** Through the inject
+door the eval addresses the platform persona directly, with the `platform_toolsets.cli` bundle:
+`terminal`, `read_file`, `patch`, `process_manage`, `execute_code`, `delegate_task` and every
+MCP tool the install carries. That is a different agent from the one today's evals reach. The api transport posts to
+the API server, which runs the default profile, the Planning Agent: its model-facing tools are the
+kanban set, it delegates fleet work to the platform persona over a card, and it relays the
+worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
+of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
+where the persona follows its own rule and opens a pull request. The lane's record is therefore
+the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
+(phase 2) is that persona's record being acceptable per case and stable across the on-demand
+runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
+like-for-like comparison. Two things follow for the lane. A case that grades the delegation
+composition rather than the executor's answer gets a persona-aware check or leaves the lane
+through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
+by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
+none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
+repository), because the persona can open a pull request where the cluster safeguards see
+nothing, and the first run left several on the pool repository that no case had asked for. The
+lane moves to the session agent's front door when the delegation primitive lands, and the
+classification says which cases regain their delegation checks then.
 
 ### The direct-bus transport, kept as a diagnostic
 
@@ -554,10 +588,18 @@ three are set on the operator, because its defaults point at a registry the pool
 pull from. Under the same flag
 `hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
-changes nothing else about the run except the matrix itself, from which the inject lane's
-exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather than
-on this flag) then leaves out the cases whose premise needs the chat front door. With the flag
-unset both scripts are byte for byte what they were, and the presubmit's own tests hold that.
+changes nothing else about the run except what hangs off that transport switch: the inject
+lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
+than on this flag) leaves out the cases whose premise needs the chat front door; the lane's
+safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
+remaining task file, which the unit hands devops-bench, over the leased project's GitOps
+repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
+cases that request a pull request run in a second phase after every other unit, one at a time
+and each after a settle, so no repetition that requests nothing shares the repository with one
+that writes by design and no window reaches back into the unit before; and after the
+fan-out the script lists in the job log what the run left on that repository, closing nothing.
+With the flag unset both scripts are byte for byte what
+they were, and the presubmit's own tests hold that.
 
 The flag stays off by default for three reasons. Flipping the shared presubmit install changes
 what every pull request measures, and that is the eval crew's decision, not a script default.
@@ -583,9 +625,10 @@ owner, which executor answers `platform` and whether delegation becomes a child 
 were answered on 2026-09-17 and are recorded above as decisions, as was how the eval flag
 reaches the operator (The CI flag). Whether the bridge image build lands in this repository, and
 the bridge look-ahead with it, was the A2A owner's and was answered on 2026-09-18 on
-gke-labs/kube-agents#1661: both yes, the build CI-only and `FROM` the same run's platform-agent
-image, outside `images.json` with the exclusion written into the inventory check, and the
-look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. What
+gke-labs/kube-agents#1661: both yes, the build `FROM` the same run's platform-agent image and
+the look-ahead a read rather than a consume; the executor paragraph in stage 1 records it. The
+build was CI-only and outside `images.json` at first; with the executor settled (the bridge
+graduates) the release workflow publishes it and the inventory carries it. What
 remains is the eval crew's:
 
 - **Which reply stage 2 grades,** the bus events of the task the gateway opened or the Chat

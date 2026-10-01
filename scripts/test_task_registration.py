@@ -540,6 +540,55 @@ class TestTheRulesReject(unittest.TestCase):
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
 
+    # -- the first-install-hello stack's phrase --
+
+    def _greet_eval(self, phrase, prompt="hi! priya here, just installed you"):
+        infrastructure = {
+            "deployer": "tofu",
+            "stack": validator.GREET_EVAL_STACK,
+            "variables": {"phrase": phrase},
+        }
+        return {"infrastructure": infrastructure, "prompt": prompt}
+
+    def test_a_greet_eval_phrase_in_the_prompt_passes(self):
+        self.assertEqual(self._validate(**self._greet_eval("just installed you")), [])
+
+    def test_a_short_greet_eval_phrase_is_rejected(self):
+        for phrase in (" ", "hi", "   priya   "):
+            with self.subTest(phrase=phrase):
+                self._only("shorter than", **self._greet_eval(phrase))
+
+    def test_a_missing_greet_eval_phrase_is_rejected(self):
+        spec = self._greet_eval("unused")
+        del spec["infrastructure"]["variables"]
+        self._only("shorter than", **spec)
+
+    def test_a_greet_eval_phrase_outside_the_prompt_is_rejected(self):
+        self._only("not a substring", **self._greet_eval("set you up earlier today"))
+
+    def test_a_greet_eval_phrase_with_an_apostrophe_passes(self):
+        # The stack passes the request through local-exec's environment, not
+        # a shell literal, so a quote in the phrase is safe.
+        spec = self._greet_eval("I've just installed you", prompt="hi! I've just installed you")
+        self.assertEqual(self._validate(**spec), [])
+
+    def test_a_greet_eval_phrase_inside_another_cases_prompt_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {}
+            for name, spec in (
+                ("greeted", self._greet_eval("just installed you")),
+                ("other", {"prompt": "priya here, just installed you, now check my pods"}),
+                ("unrelated", {"prompt": "why is my pod pending?"}),
+            ):
+                path = pathlib.Path(tmp) / name / "task.yaml"
+                path.parent.mkdir()
+                path.write_text(yaml.safe_dump(spec))
+                cases[name] = path
+            found = validator.greet_phrase_collisions(cases)
+        self.assertEqual(list(found), ["greeted"])
+        self.assertEqual(len(found["greeted"]), 1)
+        self.assertIn("inside other's 'prompt:'", found["greeted"][0])
+
     # -- the case-level keys --
 
     def test_the_task_id_alias_is_rejected(self):
@@ -841,6 +890,8 @@ class TestTheSanitizer(unittest.TestCase):
             "a Slack token": "xoxb-" + "0" * 10,
             "a JWT": "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10,
             "an sk- API key": "sk-" + "a" * 20,
+            "an Anthropic or hyphenated OpenAI key": "sk-ant-api03-" + "A1b2C3d4" * 5,
+            "an AWS access key id": "AKIAIOSFODNN7EXAMPLE",
         }
         for label, value in shapes.items():
             with self.subTest(shape=label):

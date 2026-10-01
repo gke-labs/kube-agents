@@ -4,6 +4,8 @@ Tests pure numeric SemVer (X.Y.Z) references, 40-character commit SHAs,
 piped stdin execution, and source ref alignment in upgrade.sh.
 """
 
+import base64
+import json
 import os
 import pathlib
 import re
@@ -60,6 +62,14 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         self.assertNotIn("NOT_REACHED", proc.stdout)
         self.assertEqual(proc.stderr.count("Upgrade error encountered"), 1, proc.stderr)
         self.assertIn(' in main (exit code 1): x="$(probe)"', proc.stderr)
+
+    def test_drop_undeclared_values_is_refused_with_a_full_upgrade(self):
+        """A full upgrade renders the release from install.env, so there are no recorded values to drop."""
+        proc = self._run_upgrade_func(
+            "main --drop-undeclared-values --upgrade-mode=full --image-tag=0.3.0 --non-interactive"
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("--drop-undeclared-values applies to --upgrade-mode=operator and harness", proc.stdout)
 
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
@@ -271,6 +281,201 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("dirty checkout", proc.stdout)
 
+    def _release_line_checkout(self, temp_dir):
+        """A kube-agents checkout shaped like a release line: release 0.2.0 stamped on A,
+        a backport B on it, and an unrelated commit U descending from neither."""
+        repo_path = pathlib.Path(temp_dir)
+        git = lambda *args: subprocess.run(["git", *args], cwd=str(repo_path), check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        git("config", "commit.gpgsign", "false")
+        (repo_path / "scripts" / "installer").mkdir(parents=True)
+        (repo_path / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+        (repo_path / "upgrade.sh").write_text('BAKED_RELEASE_VERSION="0.2.0"\n')
+        git("add", ".")
+        git("commit", "-q", "-m", "chore(release): stamp release version 0.2.0")
+        stamp = git("rev-parse", "HEAD")
+        git("tag", "0.2.0", stamp)
+        git("switch", "-q", "-c", "release/0.2")
+        (repo_path / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-q", "-m", "fix: backport")
+        backport = git("rev-parse", "HEAD")
+        git("switch", "-q", "--orphan", "elsewhere")
+        (repo_path / "other.txt").write_text("x\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "chore: unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("switch", "-q", "release/0.2")
+        return repo_path, git, stamp, backport, unrelated
+
+    def test_a_release_line_checkout_past_its_stamp_takes_the_baked_default_back(self):
+        """The backport's upgrade.sh carries the previous release's baked version. A run
+        from it asks for --image-tag, naming the line and the commit's own SHA, rather
+        than upgrading to the previous release's images under the backport's engine; an
+        explicit tag is not a default and stays. The stamp's own commit and an unrelated
+        commit keep the baked default, and the unrelated one is refused downstream."""
+        with tempfile.TemporaryDirectory(prefix="release-line-upgrade-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            probe = (
+                'BAKED_RELEASE_VERSION="0.2.0"; PARAM_IMAGE_TAG="0.2.0"; IMAGE_TAG_DEFAULTED_FROM_BAKED="{defaulted}"; '
+                'drop_baked_default_on_a_line_checkout_past_it "{repo}"; echo "tag=[$PARAM_IMAGE_TAG] dropped=$(baked_default_was_dropped && echo true || echo false)"'
+            )
+
+            past = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
+            self.assertEqual(past.returncode, 0, past.stderr)
+            self.assertIn("tag=[] dropped=true", past.stdout)
+            self.assertIn("release line 0.2 at " + backport[:7], past.stdout)
+            self.assertIn("1 commit(s) past release 0.2.0", past.stdout)
+            self.assertIn(f"--image-tag {backport}", past.stdout)
+
+            explicit = self._run_upgrade_func(probe.format(defaulted="false", repo=repo_path), cwd=repo_path)
+            self.assertIn("tag=[0.2.0] dropped=false", explicit.stdout, "an explicit --image-tag is not a default")
+            # Through parse_args, which is what clears the flag: the flag is computed at
+            # load, before the flags are read, and --image-tag has to undo it.
+            for form in ("--image-tag {sha}", "--image-tag={sha}"):
+                with self.subTest(form=form):
+                    parsed = self._run_upgrade_func(
+                        'BAKED_RELEASE_VERSION="0.2.0"; PARAM_IMAGE_TAG="0.2.0"; IMAGE_TAG_DEFAULTED_FROM_BAKED="true"; '
+                        f'parse_args {form.format(sha=backport)}; drop_baked_default_on_a_line_checkout_past_it "{repo_path}"; '
+                        'echo "tag=[$PARAM_IMAGE_TAG] dropped=$(baked_default_was_dropped && echo true || echo false)"',
+                        cwd=repo_path,
+                    )
+                    self.assertEqual(parsed.returncode, 0, parsed.stderr)
+                    self.assertIn(f"tag=[{backport}] dropped=false", parsed.stdout)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
+            self.assertIn("tag=[0.2.0]", at_stamp.stdout)
+            self.assertNotIn("release line", at_stamp.stdout)
+
+            git("switch", "-q", "--detach", unrelated)
+            off = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
+            self.assertIn("tag=[0.2.0]", off.stdout)
+            refused = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(refused.returncode, 0)
+            # The orphan tree carries no stamped script, so no recognition hint at all.
+            self.assertNotIn("release line", refused.stdout + refused.stderr)
+            self.assertNotIn("git fetch", refused.stdout + refused.stderr)
+
+            # On the line, with the tag present, the repository's upgrade.sh is the one
+            # running rather than the fixture's own: the hint names that, not a fetch.
+            git("switch", "-q", "release/0.2")
+            piped = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(piped.returncode, 0)
+            self.assertIn("run its own ./upgrade.sh", piped.stdout + piped.stderr)
+            self.assertNotIn("git fetch", piped.stdout + piped.stderr)
+
+    def _run_fixture_upgrade_func(self, repo_path, func_call):
+        """Source the fixture's own stamped copy of this branch's upgrade.sh and call a
+        function, so script_checkout_dir names the fixture."""
+        text = _UPGRADE_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+        (repo_path / "upgrade.sh").write_text(text)
+        return subprocess.run(
+            ["bash", "-c", f"KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; {func_call}"],
+            cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+        )
+
+    def _run_fixture_upgrade_main(self, repo_path, args):
+        """main from the fixture's own stamped copy: the load-time flag, the drop's wiring
+        and the exit arms, as an operator's run."""
+        return self._run_fixture_upgrade_func(repo_path, f"main {args}")
+
+    def test_main_from_a_release_line_checkout_past_its_stamp_asks_for_the_tag(self):
+        """The composed path: the stamped copy computes the baked default at load, main
+        takes it back on this checkout and exits naming the line checkout, an explicit
+        --image-tag is kept, and a --plan is told what it reads instead of what to pass."""
+        with tempfile.TemporaryDirectory(prefix="release-line-upgrade-main-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+
+            asks = self._run_fixture_upgrade_main(repo_path, "--non-interactive --dry-run")
+            self.assertNotEqual(asks.returncode, 0)
+            self.assertIn("release line 0.2 at " + backport[:7], asks.stdout)
+            self.assertIn("--image-tag is required from a release-line checkout past its release", asks.stdout + asks.stderr)
+            self.assertNotIn("carries no baked release version", asks.stdout + asks.stderr)
+            self.assertNotIn("mismatch", asks.stdout + asks.stderr)
+
+            # --dry-run with --plan is refused just past the tag block and before the
+            # tool checks, so that refusal is the environment-independent proof that
+            # the run left the tag block with the tag it was given.
+            past_the_block = "--dry-run and --plan are different previews"
+            explicit = self._run_fixture_upgrade_main(repo_path, f"--non-interactive --dry-run --plan --image-tag={backport}")
+            self.assertNotIn("release line 0.2 at", explicit.stdout)
+            self.assertNotIn("--image-tag is required", explicit.stdout + explicit.stderr)
+            self.assertIn(past_the_block, explicit.stdout + explicit.stderr)
+
+            # Asked for the release by name from the backport, with the checkout's own script
+            # running: refused, and told what the checkout is rather than that it is unrelated.
+            named = self._run_fixture_upgrade_func(repo_path, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(named.returncode, 0)
+            self.assertIn("Source/image version mismatch", named.stdout + named.stderr)
+            self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
+            self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
+            self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
+
+            plan = self._run_fixture_upgrade_main(repo_path, "--non-interactive --plan")
+            self.assertIn("release line 0.2 at", plan.stdout)
+            self.assertIn("reads the tag the install already serves", plan.stdout)
+            self.assertNotIn("pass --image-tag", plan.stdout)
+            self.assertIn("the plan will use the tag this install is already running", plan.stdout)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_fixture_upgrade_main(repo_path, "--non-interactive --dry-run --plan")
+            self.assertNotIn("release line", at_stamp.stdout)
+            self.assertNotIn("the plan will use the tag this install is already running", at_stamp.stdout, "the baked target stands")
+            self.assertIn(past_the_block, at_stamp.stdout + at_stamp.stderr)
+
+    def test_a_missing_release_tag_is_named_by_the_source_check(self):
+        """A line checkout that never fetched the release's tag cannot be recognised; the
+        refusal says the scripts carry a release whose tag the checkout lacks, and what to do."""
+        with tempfile.TemporaryDirectory(prefix="release-line-upgrade-tagless-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            git("tag", "-d", "0.2.0")
+            proc = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            self.assertNotIn("--unshallow", proc.stdout + proc.stderr)
+            self.assertIn(f"--image-tag {backport}", proc.stdout + proc.stderr)
+            # A shallow clone of the line with the tag fetched: the mismatch names the
+            # shallow history, which `git fetch --tags` alone did not mend.
+            shallow = pathlib.Path(temp_dir) / "shallow"
+            git("tag", "0.2.0", stamp)
+            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "release/0.2", f"file://{repo_path}", str(shallow)], check=True)
+            subprocess.run(["git", "fetch", "-q", "--tags", "origin"], cwd=str(shallow), check=True)
+            mismatch = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{shallow}" "0.2.0"', cwd=shallow)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("Source/image version mismatch", mismatch.stdout + mismatch.stderr)
+            self.assertIn("git fetch --unshallow", mismatch.stdout + mismatch.stderr)
+            # A tree whose own scripts do not carry the version is not told to fetch:
+            # the running script's release is not this checkout's.
+            git("tag", "-d", "0.2.0")
+            (repo_path / "upgrade.sh").write_text('BAKED_RELEASE_VERSION=""\n')
+            other = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(other.returncode, 0)
+            self.assertIn("is not present in the current checkout", other.stdout + other.stderr)
+            self.assertNotIn("release line", other.stdout + other.stderr)
+            self.assertNotIn("git fetch --tags", other.stdout + other.stderr)
+
+    def test_script_checkout_dir_names_the_checkout_the_script_runs_from(self):
+        """Empty for a body sourced from no file in a checkout; the checkout when upgrade.sh
+        is run from one. The marker, not the directory name, is what makes it a checkout."""
+        with tempfile.TemporaryDirectory(prefix="script-checkout-dir-") as temp_dir:
+            repo_path, _, _, _, _ = self._release_line_checkout(temp_dir)
+            shutil.copy(_UPGRADE_SH, repo_path / "upgrade.sh")
+            proc = subprocess.run(
+                ["bash", "-c", 'KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; script_checkout_dir'],
+                cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(pathlib.Path(proc.stdout.strip()).resolve(), repo_path.resolve())
+            (repo_path / "scripts" / "installer" / "installer_common.sh").unlink()
+            proc = subprocess.run(
+                ["bash", "-c", 'KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; script_checkout_dir'],
+                cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.stdout.strip(), "")
+
     def test_a_plan_previews_a_dirty_checkout_instead_of_refusing_it(self):
         """--plan says it changes nothing, so a stray edit is something to report, not refuse.
 
@@ -335,6 +540,27 @@ class UpgradeRunContractTest(unittest.TestCase):
         for var in ("PROJECT_ID", "CLUSTER_NAME", "REGION"):
             with self.subTest(var=var):
                 self.assertIn(f'export {var}="$target_', source)
+
+    def test_the_upgrade_clearing_list_is_the_three_coordinates(self):
+        """What upgrade.sh does not clear is a sentence install.sh prints.
+
+        install.sh's unrecorded-value guard tells the operator that a key their
+        install.env does not record still reaches the next upgrade from the
+        shell that exports it. That is only true because upgrade.sh clears the
+        three coordinates and nothing else before sourcing the file: add
+        ENABLE_DRIFT_DETECTOR to this line and the guard is announcing a route
+        that no longer exists, with no other test in either suite noticing.
+        """
+        clears = [
+            line.strip()
+            for line in _UPGRADE_SH.read_text().splitlines()
+            if line.strip().startswith("unset ")
+        ]
+        self.assertIn("unset PROJECT_ID CLUSTER_NAME REGION", clears)
+        for line in clears:
+            with self.subTest(line=line):
+                self.assertNotIn("ENABLE_DRIFT_DETECTOR", line)
+                self.assertNotIn("TF_VAR_enable_drift", line)
 
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.
@@ -405,9 +631,8 @@ class UpgradeRunContractTest(unittest.TestCase):
         checkout back, so a run that raises it and then refuses strands someone
         else's clone on this run's ref. Both previews exit before the mode
         dispatch, but refusals do not stop there: full still runs the scope check,
-        the minter/KMS guard and the service-account 409 check, and harness still
-        reads the
-        release's values to learn which plugin tags to move. So the gate cannot
+        the minter/KMS guard and the service-account 409 check, and operator and
+        harness still read the release's values to re-tag it. So the gate cannot
         be raised once above the `case`; each arm has to raise it on its own,
         after its last refusal and before its first write.
 
@@ -439,10 +664,10 @@ class UpgradeRunContractTest(unittest.TestCase):
             return "\n      " + literal
 
         for mode, last_refusal, first_write in (
-            ("operator", None, "apply_crd_upgrades"),
+            ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE"', "apply_crd_upgrades"),
             (
                 "harness",
-                'harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE"',
+                'harness_retag_keys "$RETAG_VALUES_JSON"',
                 'helm_retag "${HARNESS_RETAG_KEYS[@]}"',
             ),
             ("full", "check_service_account_ownership || exit 1", "apply_crd_upgrades"),
@@ -691,18 +916,26 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         branch owes is to call it and to hand the whole list to helm_retag,
         which turns each key into `--set key=<tag>` (#1808).
 
-        Order, not adjacency: the arm raises UPGRADE_APPLY_STARTED between the
-        two, because the read is the last thing here that can fail without
-        having changed anything. That placement is
+        The keys come from the values retag_values kept, so the read goes
+        first. Order, not adjacency: UPGRADE_APPLY_STARTED sits between the
+        assembly and the re-tag, because the reads are the last things here
+        that can fail without having changed anything. That placement is
         UpgradeRunContractTest.test_the_apply_gate_sits_after_every_refusal_in_its_arm's
         to keep.
         """
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         harness = text[text.index("    harness)") : text.index("    full)")]
-        assemble = '\n      harness_retag_keys "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"\n'
+        read = '\n      retag_values "$KUBE_AGENTS_HELM_RELEASE"'
+        assemble = '\n      harness_retag_keys "$RETAG_VALUES_JSON"\n'
         retag_call = '\n      helm_retag "${HARNESS_RETAG_KEYS[@]}"\n'
+        self.assertIn(read, harness, f"the values read left the arm ({len(harness)} chars read)")
         self.assertIn(assemble, harness, f"the key assembly left the arm ({len(harness)} chars read)")
         self.assertIn(retag_call, harness, f"the re-tag left the arm ({len(harness)} chars read)")
+        self.assertLess(
+            harness.index(read),
+            harness.index(assemble),
+            "the plugin keys come from values the filter has not seen, so a --set can put back a dropped block",
+        )
         self.assertLess(
             harness.index(assemble),
             harness.index(retag_call),
@@ -711,6 +944,20 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertNotIn("mapfile", harness, "macOS ships bash 3.2, which has no mapfile")
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
         self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
+
+    def test_the_retag_applies_the_filtered_values_over_the_chart_defaults(self):
+        """helm_retag re-applies what retag_values kept, not what the release recorded.
+
+        --reset-then-reuse-values re-applies every recorded key, one the chart
+        does not declare included, and Helm then refuses the whole upgrade on
+        the schema check (#2109). RetagValuesTest runs the filter itself.
+        """
+        text = _UPGRADE_SH.read_text()
+        start = text.index("  helm_retag() {")
+        retag = text[start : text.index("\n  }\n", start)]
+        self.assertIn("printf '%s\\n' \"$RETAG_VALUES_JSON\" | helm upgrade", retag)
+        self.assertIn("--reset-values --values -", retag)
+        self.assertNotIn("reuse-values", retag)
 
     def test_jq_is_required_for_the_modes_that_read_with_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
@@ -835,21 +1082,32 @@ class AgentNamespaceFlagTest(unittest.TestCase):
 class _StubHelm:
     """Sources upgrade.sh with a stub `helm` on PATH and runs a snippet after it.
 
-    The stub prints `stdout_json` on stdout, `stderr_text` on stderr, and
-    exits `helm_exit`. The script's own ERR trap is stood in for by one that
-    writes a banner, so a failure inside the functions shows where the real
-    run would abort.
+    `helm history` prints `history_json` and exits `history_exit`; any other
+    command prints `stdout_json` on stdout, `stderr_text` on stderr, and exits
+    `helm_exit`. Every call's arguments are appended to `self.helm_log`. The
+    script's own ERR trap is stood in for by one that writes a banner, so a
+    failure inside the functions shows where the real run would abort.
     """
 
-    def _run_with_helm(self, snippet, stdout_json, helm_exit=0, stderr_text=""):
+    _DEPLOYED_HISTORY = '[{"revision": 1, "status": "deployed"}]'
+
+    def _run_with_helm(
+        self, snippet, stdout_json, helm_exit=0, stderr_text="", history_json=_DEPLOYED_HISTORY, history_exit=0
+    ):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         bin_dir = pathlib.Path(tmp.name) / "bin"
         bin_dir.mkdir()
+        self.helm_log = pathlib.Path(tmp.name) / "helm.log"
         helm = bin_dir / "helm"
         helm.write_text(
             "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> {shlex.quote(str(self.helm_log))}\n"
             f"printf '%s\\n' {shlex.quote(stderr_text)} >&2\n"
+            'if [ "$1" = "history" ]; then\n'
+            f"  cat <<'JSON'\n{history_json}\nJSON\n"
+            f"  exit {history_exit}\n"
+            "fi\n"
             f"cat <<'JSON'\n{stdout_json}\nJSON\n"
             f"exit {helm_exit}\n"
         )
@@ -867,15 +1125,20 @@ trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
         )
 
 
-class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
-    """recorded_plugin_image_tag_keys against a stub helm, under the system bash."""
+class RecordedPluginImageTagKeysTest(unittest.TestCase):
+    """recorded_plugin_image_tag_keys on the values it is given, under the system bash."""
 
-    _SNIPPET = 'recorded_plugin_image_tag_keys kube-agents kubeagents-system\nprintf "%s\\n" "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"\necho "rc=$?"'
+    def _run(self, values_json):
+        script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER line $LINENO" >&2' ERR
+recorded_plugin_image_tag_keys {shlex.quote(values_json)}
+printf "%s\\n" "$RECORDED_PLUGIN_IMAGE_TAG_KEYS"
+echo "rc=$?"
+"""
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env())
 
-    def _run(self, values_json, helm_exit=0, stderr_text=""):
-        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit, stderr_text=stderr_text)
-
-    def test_every_plugin_tag_the_release_records_is_printed(self):
+    def test_every_plugin_tag_the_values_record_is_printed(self):
         proc = self._run(
             '{"plugins":{"pubsubPlatform":{"enabled":false,"image":{"tag":"abc"}},'
             '"stockoutInvestigator":{"image":{"tag":"abc"}},'
@@ -902,16 +1165,6 @@ class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
         self.assertEqual(proc.stdout.split(), ["rc=0"])
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
-    def test_a_helm_warning_on_stderr_does_not_break_the_read(self):
-        """Helm warns on stderr on successful commands (a group-readable kubeconfig)."""
-        proc = self._run(
-            '{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}}}}',
-            stderr_text="WARNING: Kubernetes configuration file is group-readable. This is insecure.",
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.split()[:-1], ["plugins.pubsubPlatform.image.tag"])
-        self.assertNotIn("ABORT BANNER", proc.stderr)
-
     def test_a_malformed_plugins_value_is_an_error_not_an_empty_list(self):
         """upgrade.sh runs under set -e, so the failed call ends the sourced run."""
         proc = self._run('{"plugins":"oops"}')
@@ -923,23 +1176,13 @@ class RecordedPluginImageTagKeysTest(_StubHelm, unittest.TestCase):
         # inside the jq substitution as well, which `trap - ERR` there prevents.
         self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
 
-    def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
-        """An empty list would run the pre-fix re-tag and leave the plugins behind."""
-        proc = self._run("", helm_exit=1, stderr_text="Error: release: not found")
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertNotIn("rc=", proc.stdout)
-        self.assertIn("Could not read the values of Helm release", proc.stdout)
-        self.assertIn("Error: release: not found", proc.stdout)
-        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
-
 
 class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
-    """harness_retag_keys against a stub helm: the list helm_retag receives."""
+    """harness_retag_keys: the list helm_retag receives."""
 
-    _SNIPPET = 'harness_retag_keys kube-agents kubeagents-system\nprintf "%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
-
-    def _run(self, values_json, helm_exit=0):
-        return self._run_with_helm(self._SNIPPET, values_json, helm_exit=helm_exit)
+    def _run(self, values_json):
+        snippet = f'harness_retag_keys {shlex.quote(values_json)}\nprintf "%s\\n" "${{HARNESS_RETAG_KEYS[@]}}"'
+        return self._run_with_helm(snippet, "{}")
 
     def test_the_plugin_keys_follow_the_agent_and_sandbox_keys(self):
         proc = self._run('{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}')
@@ -960,11 +1203,398 @@ class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
         self.assertEqual(proc.stdout.split(), ["platformAgent.deployment.image.tag", "agentSandbox.image.tag"])
         self.assertNotIn("ABORT BANNER", proc.stderr)
 
-    def test_a_failed_read_stops_before_any_list_is_handed_on(self):
-        proc = self._run("{}", helm_exit=1)
+    def test_a_plugin_the_filter_dropped_gets_no_set(self):
+        """A `--set` for a plugin the chart does not declare puts the block back, and Helm refuses it."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        schema_path = pathlib.Path(tmp.name) / "values.schema.json"
+        schema_path.write_text(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {
+                        "plugins": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {"pubsubPlatform": {"type": "object"}},
+                        }
+                    },
+                }
+            )
+        )
+        snippet = (
+            "PARAM_DROP_UNDECLARED_VALUES=true\n"
+            f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
+            'harness_retag_keys "$RETAG_VALUES_JSON"\n'
+            'printf "key=%s\\n" "${HARNESS_RETAG_KEYS[@]}"'
+        )
+        proc = self._run_with_helm(
+            snippet,
+            '{"plugins":{"pubsubPlatform":{"image":{"tag":"abc"}},"stockoutInvestigator":{"image":{"tag":"abc"}}}}',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Dropping 'plugins.stockoutInvestigator'", proc.stdout)
+        keys = [line[len("key=") :] for line in proc.stdout.splitlines() if line.startswith("key=")]
+        self.assertEqual(
+            keys,
+            ["platformAgent.deployment.image.tag", "agentSandbox.image.tag", "plugins.pubsubPlatform.image.tag"],
+        )
+
+
+class RetagValuesTest(_StubHelm, unittest.TestCase):
+    """retag_values against a stub helm: the values helm_retag re-applies (#2109)."""
+
+    _SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "platformAgent": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "env": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {"name": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+            "open": {"type": "object"},
+            "plugins": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"enabled": {"type": "boolean"}},
+                },
+            },
+            "combined": {"allOf": [{"type": "object"}], "additionalProperties": False, "properties": {}},
+        },
+    }
+    _VALUES_PREFIX = "values="
+
+    def _run(self, values_json, schema_text=None, helm_exit=0, drop=True, **stub):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        schema_path = pathlib.Path(tmp.name) / "values.schema.json"
+        if schema_text != "":
+            schema_path.write_text(schema_text or json.dumps(self._SCHEMA))
+        snippet = (
+            f"PARAM_DROP_UNDECLARED_VALUES={'true' if drop else 'false'}\n"
+            f"retag_values kube-agents kubeagents-system {shlex.quote(str(schema_path))}\n"
+            f'echo "{self._VALUES_PREFIX}$RETAG_VALUES_JSON"'
+        )
+        return self._run_with_helm(snippet, values_json, helm_exit=helm_exit, **stub)
+
+    def _read_revision(self):
+        reads = [line.split() for line in self.helm_log.read_text().splitlines() if line.startswith("get values")]
+        self.assertEqual(len(reads), 1, reads)
+        return reads[0][reads[0].index("--revision") + 1]
+
+    def _values(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = [line for line in proc.stdout.splitlines() if line.startswith(self._VALUES_PREFIX)]
+        self.assertEqual(len(lines), 1, proc.stdout)
+        return json.loads(lines[0][len(self._VALUES_PREFIX) :])
+
+    def test_a_key_the_schema_does_not_declare_is_dropped_and_named(self):
+        proc = self._run('{"platformAgent":{"name":"p","scope":{"projects":[]}},"stray":1}')
+        self.assertEqual(self._values(proc), {"platformAgent": {"name": "p"}})
+        self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
+        self.assertIn("Dropping 'stray'", proc.stdout)
+
+    def test_without_the_flag_an_undeclared_key_is_refused_and_named(self):
+        """A key the target chart does not declare may be a renamed setting; dropping it is opt-in."""
+        proc = self._run('{"platformAgent":{"name":"p","scope":{"projects":[]}},"stray":1}', drop=False)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertNotIn("platformAgent.deployment.image.tag", proc.stdout)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("'platformAgent.scope'", proc.stdout)
+        self.assertIn("'stray'", proc.stdout)
+        self.assertIn("--drop-undeclared-values", proc.stdout)
+        self.assertNotIn("Dropping", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_without_the_flag_values_the_schema_declares_pass(self):
+        values = {"platformAgent": {"name": "p"}, "open": {"anything": 1}}
+        self.assertEqual(self._values(self._run(json.dumps(values), drop=False)), values)
+
+    def test_a_named_key_shows_its_escapes_rather_than_sending_them_to_the_terminal(self):
+        """The names go out through `echo -e`, which turns `\\033` into ESC."""
+        for drop in (True, False):
+            with self.subTest(drop=drop):
+                proc = self._run(json.dumps({"a\x1bb\\033c\u2028d": 1}), drop=drop)
+                self.assertIn("'a\\u001bb\\\\033c\\u2028d'", proc.stdout)
+                # The colours are ESC sequences of their own, so look for the key's.
+                for raw in ("a\x1bb", "b\x1bc", "\u2028"):
+                    self.assertNotIn(raw, proc.stdout + proc.stderr)
+
+    def test_an_object_the_schema_leaves_open_keeps_every_key(self):
+        values = {"open": {"anything": {"nested": 1}}}
+        proc = self._run(json.dumps(values))
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("Dropping", proc.stdout)
+
+    def test_map_entries_and_list_items_are_checked_against_their_schema(self):
+        proc = self._run(
+            '{"plugins":{"a":{"enabled":true,"extra":1}},'
+            '"platformAgent":{"env":[{"name":"A"},{"name":"B","value":"v"}]}}'
+        )
+        self.assertEqual(
+            self._values(proc),
+            {"plugins": {"a": {"enabled": True}}, "platformAgent": {"env": [{"name": "A"}, {"name": "B"}]}},
+        )
+        self.assertIn("Dropping 'plugins.a.extra'", proc.stdout)
+        self.assertIn("Dropping 'platformAgent.env[1].value'", proc.stdout)
+
+    def test_a_node_using_a_keyword_the_walk_does_not_model_is_left_for_helm(self):
+        values = {"combined": {"x": 1}}
+        proc = self._run(json.dumps(values))
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("Dropping", proc.stdout)
+
+    def test_a_chart_without_a_schema_drops_nothing(self):
+        values = {"platformAgent": {"scope": {"projects": []}}}
+        proc = self._run(json.dumps(values), schema_text="")
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("Dropping", proc.stdout)
+
+    def test_a_release_that_recorded_no_values_is_an_empty_object(self):
+        """`helm get values -o json` prints null for a release installed with none."""
+        self.assertEqual(self._values(self._run("null")), {})
+
+    def test_a_dropped_value_is_never_printed(self):
+        """The recorded values carry the install's credentials."""
+        proc = self._run('{"platformAgent":{"apiKey":"s3cr3t-token"}}')
+        self.assertEqual(self._values(proc), {"platformAgent": {}})
+        self.assertNotIn("s3cr3t-token", proc.stdout + proc.stderr)
+
+    def test_a_failing_helm_read_is_an_error_that_names_the_cause(self):
+        proc = self._run("", helm_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
         self.assertIn("Could not read the values of Helm release", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_the_values_are_read_from_the_revision_the_reuse_flag_would_reuse(self):
+        """A failed latest revision holds values that never served; Helm reuses the last deployed one."""
+        for history, revision in (
+            ('[{"revision": 1, "status": "superseded"}, {"revision": 2, "status": "deployed"}]', "2"),
+            ('[{"revision": 2, "status": "deployed"}, {"revision": 3, "status": "failed"}]', "2"),
+            ('[{"revision": 1, "status": "failed"}]', "1"),
+        ):
+            with self.subTest(history=history):
+                self._values(self._run("{}", history_json=history))
+                self.assertEqual(self._read_revision(), revision)
+
+    def test_a_failing_history_read_is_an_error_that_names_the_cause(self):
+        proc = self._run("{}", history_json="", history_exit=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("Could not read the history of Helm release", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+    def test_a_helm_warning_on_stderr_does_not_break_the_read(self):
+        """Helm warns on stderr on successful commands (a group-readable kubeconfig)."""
+        values = {"platformAgent": {"name": "p"}}
+        proc = self._run(
+            json.dumps(values),
+            stderr_text="WARNING: Kubernetes configuration file is group-readable. This is insecure.",
+        )
+        self.assertEqual(self._values(proc), values)
+        self.assertNotIn("ABORT BANNER", proc.stderr)
+
+    def test_characters_above_u_ffff_pass_through_raw(self):
+        """Helm's YAML parser refuses the surrogate-pair escapes they would otherwise become."""
+        values = {"open": {"note": "deploy \U0001F680"}}
+        proc = self._run(json.dumps(values, ensure_ascii=False))
+        self.assertEqual(self._values(proc), values)
+        self.assertIn("\U0001F680", proc.stdout)
+        self.assertNotIn("\\ud83d", proc.stdout)
+
+    def test_characters_below_u_ffff_outside_ascii_are_escaped(self):
+        """Helm's YAML parser refuses some of them raw and reads NEL, U+2028 and U+2029 as line breaks."""
+        values = {"open": {"note": "a\u007f\u0085\u00e9\u2028\uffffb"}}
+        proc = self._run(json.dumps(values, ensure_ascii=False))
+        self.assertEqual(self._values(proc), values)
+        for code_point in ("007f", "0085", "00e9", "2028", "ffff"):
+            self.assertIn(f"\\u{code_point}", proc.stdout)
+
+    def test_a_malformed_schema_is_an_error_not_an_unfiltered_upgrade(self):
+        proc = self._run('{"stray":1}', schema_text="{not json")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(self._VALUES_PREFIX, proc.stdout)
+        self.assertIn("Could not filter the values of Helm release", proc.stdout)
+        self.assertEqual(proc.stderr.count("ABORT BANNER"), 1, proc.stderr)
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class RetagValuesAgainstHelmTest(unittest.TestCase):
+    """retag_values and helm_retag end to end, with Helm's own parser and schema check (#2109).
+
+    `helm history` and `helm get values` are stubbed, and `helm upgrade` is
+    turned into `helm template` with the same chart, values and `--set`: the
+    same parse and schema check, with no cluster. helm_retag is lifted from
+    upgrade.sh as written, so the pipe the values take is the real one.
+    """
+
+    _RECORDED = {
+        "platformAgent": {
+            "harness": {"clusterName": "ci-cluster", "location": "us-central1", "projectId": "ci-project"},
+            "scope": {"projects": [], "folders": [], "organizations": []},
+        }
+    }
+    _HELM_TIMEOUT_SECONDS = 120
+    # Helm 3.18+ and 4, then older Helm 3.
+    _SCHEMA_ERROR = r"additional properties 'scope' not allowed|Additional property scope is not allowed"
+    _SCOPE_DEFAULT = "\n  scope: null\n"
+    _TEXT_TEMPLATE = (
+        'note: {{ .Values.note | default "" | b64enc }}\n'
+        "notes: {{ .Values.notes | default list | toJson | b64enc }}\n"
+        "keys: {{ .Values.keys | default dict | toJson | b64enc }}\n"
+    )
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = pathlib.Path(tmp.name)
+
+    def _rollback_chart(self):
+        """This repository's chart less `platformAgent.scope`: a rollback to 0.7.0 over values that record it."""
+        repo = self.base / "rollback-repo"
+        chart = repo / "charts" / "kube-agents"
+        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
+        schema_path = chart / "values.schema.json"
+        schema = json.loads(schema_path.read_text())
+        del schema["properties"]["platformAgent"]["properties"]["scope"]
+        schema_path.write_text(json.dumps(schema))
+        # 0.7.0 has no `scope` default either, and Helm 3 keeps a null default
+        # through to the schema check where Helm 4 discards it.
+        values_path = chart / "values.yaml"
+        values = values_path.read_text()
+        self.assertEqual(values.count(self._SCOPE_DEFAULT), 1)
+        values_path.write_text(values.replace(self._SCOPE_DEFAULT, "\n"))
+        return repo
+
+    def _text_chart(self):
+        """A chart with no schema that renders its values back, base64-encoded."""
+        repo = self.base / "text-repo"
+        chart = repo / "charts" / "kube-agents"
+        (chart / "templates").mkdir(parents=True)
+        (chart / "Chart.yaml").write_text("apiVersion: v2\nname: kube-agents\nversion: 0.1.0\n")
+        (chart / "templates" / "values.yaml").write_text(self._TEXT_TEMPLATE)
+        return repo
+
+    def _retag(self, recorded, repo, drop=True):
+        bin_dir = self.base / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        recorded_path = self.base / "recorded.json"
+        recorded_path.write_text(json.dumps(recorded, ensure_ascii=False), encoding="utf-8")
+        helm = bin_dir / "helm"
+        helm.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = "history" ]; then\n'
+            """  echo '[{"revision": 1, "status": "deployed"}]'\n"""
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "get" ]; then\n'
+            f"  exec cat {shlex.quote(str(recorded_path))}\n"
+            "fi\n"
+            'if [ "$1" = "upgrade" ]; then\n'
+            "  shift\n"
+            "  args=()\n"
+            "  while [ $# -gt 0 ]; do\n"
+            '    case "$1" in\n'
+            "      --reset-values|--wait) ;;\n"
+            "      --timeout) shift ;;\n"
+            '      *) args+=("$1") ;;\n'
+            "    esac\n"
+            "    shift\n"
+            "  done\n"
+            f'  exec {shlex.quote(shutil.which("helm"))} template "${{args[@]}}"\n'
+            "fi\n"
+            "exit 1\n"
+        )
+        helm.chmod(0o755)
+        text = _UPGRADE_SH.read_text()
+        start = text.index("  helm_retag() {")
+        helm_retag = text[start : text.index("\n  }\n", start) + len("\n  }\n")]
+        schema = repo / "charts" / "kube-agents" / "values.schema.json"
+        script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+trap 'echo "ABORT BANNER" >&2' ERR
+PARAM_DROP_UNDECLARED_VALUES={'true' if drop else 'false'}
+retag_values kube-agents kubeagents-system {shlex.quote(str(schema))}
+{helm_retag}
+KUBE_AGENTS_HELM_RELEASE=kube-agents
+repo_dir={shlex.quote(str(repo))}
+target_namespace=kubeagents-system
+PARAM_IMAGE_TAG=0.0.0-test
+helm_retag operator.image.tag
+"""
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
+            env=get_isolated_test_env(bin_dir=str(bin_dir)),
+        )
+
+    def _rendered(self, proc, field):
+        encoded = re.search(rf"^{field}: (\S*)$", proc.stdout, re.MULTILINE).group(1)
+        return base64.b64decode(encoded).decode("utf-8")
+
+    def test_the_recorded_values_fail_the_schema_check(self):
+        """The control: without the filter, Helm refuses on `scope`."""
+        repo = self._rollback_chart()
+        recorded = self.base / "recorded.json"
+        recorded.write_text(json.dumps(self._RECORDED))
+        proc = subprocess.run(
+            ["helm", "template", "kube-agents", str(repo / "charts" / "kube-agents"), "--values", str(recorded)],
+            capture_output=True,
+            text=True,
+            timeout=self._HELM_TIMEOUT_SECONDS,
+        )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
+        self.assertRegex(proc.stderr, self._SCHEMA_ERROR)
+
+    def test_the_filtered_values_render(self):
+        proc = self._retag(self._RECORDED, self._rollback_chart())
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertIn("Dropping 'platformAgent.scope'", proc.stdout)
+        self.assertIn("ci-cluster", proc.stdout)
+
+    def test_without_the_flag_the_run_stops_before_helm_upgrade(self):
+        proc = self._retag(self._RECORDED, self._rollback_chart(), drop=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("'platformAgent.scope'", proc.stdout)
+        self.assertIn("--drop-undeclared-values", proc.stdout)
+        self.assertNotIn("ci-cluster", proc.stdout)
+
+    def test_every_character_reaches_the_chart_as_recorded(self):
+        """Every code point, in a value between spaces and inside a key: the spellings Helm's parser alters."""
+        code_points = [cp for cp in range(1, 0x10000) if not 0xD800 <= cp <= 0xDFFF]
+        code_points += [0x10000, 0x1F680, 0xE0001, 0x10FFFF]
+        notes = [f" {chr(cp)} " for cp in code_points]
+        keys = {f"a{chr(cp)}b": cp for cp in code_points}
+        proc = self._retag({"notes": notes, "keys": keys}, self._text_chart())
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+        self.assertEqual(json.loads(self._rendered(proc, "notes")), notes)
+        self.assertEqual(json.loads(self._rendered(proc, "keys")), keys)
+
+    def test_values_of_a_length_helm_reads_in_whole_buffers_arrive(self):
+        """Helm 4 drops an unterminated last line of stdin whose length is a multiple of 4096 bytes."""
+        empty_length = len(json.dumps({"note": ""}))
+        repo = self._text_chart()
+        for length in (4095, 4096, 8192):
+            with self.subTest(length=length):
+                note = "x" * (length - empty_length)
+                proc = self._retag({"note": note}, repo)
+                self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
+                self.assertEqual(self._rendered(proc, "note"), note)
 
 
 class UpgradeReusesTheInstallCheckoutTest(unittest.TestCase):

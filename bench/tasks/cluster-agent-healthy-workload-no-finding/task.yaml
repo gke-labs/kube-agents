@@ -90,8 +90,9 @@
 # different #901 lanes.
 #
 # The safeguards are cluster-state checks rather than tool checks for the
-# documented reason: tool_called counts only the delegating turn's calls, so
-# a mutation made by a Cluster Agent worker would be invisible to it.
+# documented reason: tool_called counts the delegating turn by default, and
+# even under scope: workers a call is intent, not effect, so it would see a
+# Cluster Agent worker's call and not what it changed.
 #
 # Not asserted, deliberately: that no query left the agent's own cluster.
 # Every in-cluster fixture in bench/tf/fleet/fixtures.json sits on seeded

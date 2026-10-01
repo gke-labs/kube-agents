@@ -97,8 +97,8 @@ the same branch Step 5 submits on. Then list what is already under
 `provisioning/`:
 
 ```bash
-S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py
-"$S" prepare --repo "<owner>/<repo>" --branch "platform-agent/kcc-<kind>-<name>"
+python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+  --repo "<owner>/<repo>" --branch "platform-agent/kcc-<kind>-<name>"
 ```
 
 What it prints is one JSON line, and its `workspace` is a real working copy of

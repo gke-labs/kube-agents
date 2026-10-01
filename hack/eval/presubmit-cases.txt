@@ -1,6 +1,6 @@
 # The presubmit eval matrix: what every pull request runs -- since 2026-09-22
 # the blocking roster, plus the held-out seats the last section names (one
-# per coverage tracker, #2013).
+# per coverage tracker: #2013, #2016).
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. hack/ci-eval-pr.sh reads this file at
@@ -48,17 +48,19 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Thirteen cases, thirty-nine units at the script's EVAL_REPETITIONS
+# BUDGET. Fourteen cases, forty-two units at the script's EVAL_REPETITIONS
 # of 3: six domain probes, one reliability prompt variation, three
 # cluster-debugging cases, the incident-triage probe, the kanban smoke, and
-# one held-out seat (the compliance canary, ~1000-2000s a repetition, three
-# repetitions serialized on its task lock).
-# Neither of the remediation domain's two writers holds a seat --
+# two held-out seats (the compliance canary, ~1000-2000s a repetition, and
+# pdb-remediation-pr, 420-1929s measured, hinted at 1250; each seat's three
+# repetitions serialize on its own task lock).
+# Neither of the remediation domain's two writers holds a ROSTER seat --
 # rca-remediation-pr was demoted 2026-09-02 (#1189), and the 2026-09-22
 # promotion of pdb-remediation-pr was withdrawn before merge because its
-# record was graded by the check #1780 replaced (nightly-cases.txt has the
-# note) -- so remediation sits on the docs/designs/domains.yaml allowlist
-# beside fleet-audits. The 2026-08-26
+# record was graded by the check #1780 replaced; its held-out seat
+# below opened 2026-09-28 (#2016) -- so remediation sits on the
+# docs/designs/domains.yaml allowlist beside fleet-audits until a roster
+# line lands. The 2026-08-26
 # smoke run (build 2092638061140643840, kube-agents-evals-3) measured what
 # six full audits cost: obtainability-planted-pdb PASSED in 962s and
 # compliance-rbac-overgrant in 606s, the three that failed did so on
@@ -152,7 +154,7 @@
 
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
-# coverage tracker (one today: #2013, fleet-audits). A case
+# coverage tracker (two today: #2013, fleet-audits; #2016, remediation). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
 # in blocking-roster.txt, so rung 4 (collapse) and rung 6 (judged
@@ -172,13 +174,44 @@
 
 # The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
 # Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
-# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. The one presubmit
-# case that writes to GitHub: the minted token, the cloned *-infra
-# workspace, the ledger write. 1002s median / 2074s p90 over 903 presubmit
+# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. The first of the
+# two presubmit cases that write to GitHub (pdb-remediation-pr, below, is the
+# second): the minted token, the cloned *-infra workspace, the ledger write.
+# 1002s median / 2074s p90 over 903 presubmit
 # repetitions 2026-09-04 to 09-15, the 3000s delegation ceiling, priced in
 # unit_cost_hint. Roster line when #2013 step 3's three clean days hold;
 # fleet-audits stays on the docs/designs/domains.yaml allowlist until then.
 ./tasks/compliance-rbac-overgrant/task.yaml
+
+# The remediation domain's second writer, #2016 step 2, seat opened
+# 2026-09-28. Never a roster seat: nightly from 2026-09-15 (#1079); its
+# 2026-09-22 promotion was withdrawn before merge because the record it
+# cited (12/12 on the four graded nights 09-16 to 09-20) was graded by
+# report_contains, which #1780 replaced with pull_request_opened, and under
+# that check it has passed nothing on any graded night since, none of the
+# misses the case's own: 2026-09-24 (build 2103273400171499520) 0/2 graded
+# plus one infra repetition, on #1968, #2011 and the delegation-ceiling
+# residual in that order; the nights after (09-25 to 09-27) 0/3 each on
+# "no pull request URL", the #2011 credential-proxy workspace leak, whose
+# fix #2069 merged 2026-09-28, except one 09-25 repetition that linked a
+# 09-17 leftover, evals-6-infra#38. One nightly data point a night would
+# take weeks to show the fix landing; this seat shows it at ~40 runs a day.
+# The second presubmit case that writes to GitHub: submit-suggestion's pull
+# request on the leased *-infra repository, graded by pull_request_opened.
+# 420-1929s a repetition measured; hinted at 1250 in unit_cost_hint,
+# unchanged. Roster line when #2016 step 3 holds -- three clean days at
+# >= 90% of graded repetitions, no all-reps collapse, infra classes the
+# harness excludes not counted. One graded miss shape is the case's own and
+# counts: a job's three repetitions share the leased repository and the
+# pool sweep (hack/ci_sweep_agent_pulls.py, #1832) runs between leases, not
+# between them, so repetitions 2 and 3 meet repetition 1's open pull
+# request; one that pushes its own commit onto it passes (#1832 grades the
+# head commit), one that only links its sibling's pull request fails. Read
+# a 50-67% day as that before reading it as regression; step 3 decides
+# whether to count it, grade repetition 1 only, or sweep between
+# repetitions. remediation stays on the docs/designs/domains.yaml
+# allowlist until then.
+./tasks/pdb-remediation-pr/task.yaml
 
 # Moved out to nightly-cases.txt, for the record:
 #   the seven held-out cases this file ran without blocking, on 2026-09-22

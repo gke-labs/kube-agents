@@ -669,8 +669,8 @@ when none did — evidence about `main`, shown beside the case, never a tag.
 demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
 (active, off the roster, no demotion date: the held-out seat a coverage tracker takes in the
-presubmit file; a dated one reads `demoted`, which is what the compliance canary shows while
-seated),
+presubmit file, which is what pdb-remediation-pr shows while seated; a dated one reads
+`demoted`, which is what the compliance canary shows while seated),
 `demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
 2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
@@ -821,7 +821,7 @@ read is final.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -845,7 +845,13 @@ role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
 carries `roles`, `projects` and `drift` in its `incident` and a
 `fixture_state` block beside `metrics`; the pages show it as the generic
 degraded headline, and `fixture-state.json` beside `health.json` is the
-scan's own document, which no page reads. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+scan's own document, which no page reads. `pool_drift` (the hourly pool-state
+scan found a pool project no longer shaped as the verifier requires;
+docs/ci-health.md, "The pool-state scan") is the same shape: `roles` are the
+verifier's finding ids, `incident` also carries `repairs` (`{project: {finding:
+command}}`), and the `pool_state` block beside `fixture_state` summarises the
+scan; `pool-state.json` is its document, which no page reads: `scope` (`pool` for the hourly job's whole mapping, `selected` for a hand run's `--projects`, on both scan documents; the health rule reads a project absent from a `pool` document as retired from the mapping and one absent from a `selected` document as not read), then per project, per check, `state`, `detail`, and for a healthy or drifted check `unread`, the reads the verifier could not make, which is what keeps a check out of the incident's `reads` exit. Both blocks also carry `unread_units`, how many roles or checks were not read in full on projects that were checked (not checked, or read in part with the rest refused), which the pool digest line reports instead of calling the pool clean. Both scan
+incidents carry `reads` (`{project: [what a later scan must read again]}`). `slow` is `null` or, on a `GREEN` tick, the slow-gate note
 (`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
 baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
@@ -893,6 +899,55 @@ day with no runs. The poster needs the difference — going blind must not read 
 the episode ending. `metrics.pool_since` is the open episode's start, held
 across the ticks that read no artifact and so write no `pool`, and `null` once
 a tick reads one and writes none, which is the episode ending.
+
+A held scan condition (`fixture_drift` or `pool_drift` whose scan is stale,
+blind, or still shows the drift) keeps its `condition` and `incident` while a
+scan condition ranking at or below it (`pool_drift` below `fixture_drift`, or
+its own on other units that do not cover the held ones) is assessed at the same
+severity; `fixture_drift` over a held `pool_drift`, a spread of the same drift,
+and any run-based condition take over as before.
+
+`periodics` is the watched Prow periodics' notes, by job name, one for each job
+whose latest finished build failed (`verdict: FAILED`) or is older than the
+job's stale window, or carries no readable finish time (`STALE`): `{job, label, verdict, since, build,
+finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
+place, absence, does, effect, runbook}`. `detail` (on `FAILED` only)
+is the report's lines, the projects capped at five (then `and N more`) and the
+run's lines after the cap: for the reconcile the
+projects it refused, failed or was interrupted in, then the run's own `error`
+line; for the sweep the projects whose sweep failed with GitHub's answer, then
+the writes left for the next run under its budget, then the projects held and
+released unswept after the run stopped, then why the run ended early or its
+`error` line; either says when the report was not a JSON object.
+`summary` (on `FAILED` only) is one clause on what the run did ("failed in 11
+of 11 project(s)", "3 applied, 9 unchanged"); `since` is carried from the
+previous `health.json`;
+`place`, `absence`, `does`, `effect` and `runbook` are the words and
+the link the message is built from, from `WATCHED`. The reconcile's report,
+`fleet-reconcile.json` from `hack/fleet_reconcile.py --report`, is
+`{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
+error, outcomes{project: {outcome, detail}}, summary}`; the sweep's,
+`pull-sweep.json` from `hack/ci_sweep_agent_pulls.py --report`, is
+`{schema_version, mode, dry_run, started_at, finished_at, exit, exit_code,
+error, ended_early, projects, closed, failed, unmapped[], skipped[],
+left_for_next_run, outcomes{project: {closed, error}}}` (a project carries
+its closes, its error, or both), `skipped` being the
+projects held and released unswept after the run stopped on the burst limit,
+and `left_for_next_run` the writes the budget deferred (a pull request left
+unclosed counts its close and its delete). `periodics_read` names the jobs a
+reading arrived for this tick, whether or not they are noted; the poster clears
+a told job only on a reading that shows it clean. `periodics_runs` is, per read
+job, `{build, finished_at, passed, summary}` of its latest finished build, what
+the recovery message says. `periodics_streaks` is, per watched job, `{build,
+projects{project: n}, runs}`: the last build counted, each project's
+consecutive failed checks (dropped at zero; every count cleared by a clean
+build) and the run's; a failed build is a note only once the run's count
+reaches the job's threshold (two consecutive checks for the sweep, the first
+failure for the reconciles), and the poster treats a told job as recovered only
+on a build that passed (`periodics_runs`), not on a sub-threshold failure. `periodics_since` is each open note's start, kept
+for a job across the ticks with no reading for it (which write no note for it)
+and dropped once a tick with a reading for it writes no note
+(`scripts/eval_dashboard/periodics.py` owns the notes).
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

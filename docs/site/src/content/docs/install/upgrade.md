@@ -50,7 +50,7 @@ The release-pinned script upgrades to its own version, so you pass no tag. It re
 checkout in `$HOME/kube-agents`, moving it to the release you asked for, and reads the `install.env`
 in it. A checkout with uncommitted changes is left alone and the run stops rather than upgrading
 from sources that do not match the release. Only a release copy is flagless: a copy built from
-`main` carries no version and asks for one, so name a release tag in the URL rather than a branch.
+`main` carries no version and asks for one, so name a release tag in the URL rather than `main`.
 
 The release bundle is the other supported source, and the one to use on a machine with no install
 checkout:
@@ -66,7 +66,14 @@ cp /path/to/your/install/install.env .
 
 - `--upgrade-mode=harness` re-tags the Platform Agent image, the sandbox image it reaches over
   ssh, and every plugin image the release records — all are built from the same revision —
-  through `helm upgrade --reset-then-reuse-values`.
+  through one `helm upgrade` that re-applies the values the release recorded over the chart's
+  defaults. Before any of the new release is applied it names and stops on any recorded key the
+  chart's values schema refuses as undeclared, since Helm would refuse the whole upgrade over it. On an upgrade
+  the usual cause is a setting the new chart renamed or removed: take that upgrade through
+  `--upgrade-mode=full`. On a rollback to a release that predates the key, pass
+  `--drop-undeclared-values` to drop and name each one instead; a later release that declares the
+  key renders it from that chart's default until a full-mode run there renders `install.env` onto
+  the chart again.
 - `--upgrade-mode=operator` applies the chart's CRDs with `kubectl` first — Helm never touches
   `crds/` on an upgrade — then re-tags the operator image the same way.
 - `--upgrade-mode=full`, the default, applies the CRDs and then runs a full `terraform apply`
@@ -81,7 +88,13 @@ without one predates the Terraform and Helm engine, and has to be re-installed t
 
 A release copy of the script carries the version it upgrades to, which is what makes the one-liner
 above flagless. That baked version is the run's target from the moment it starts, before any flag
-is read, so two of the flags below behave differently depending on which copy you are holding.
+is read, so two of the flags below behave differently depending on which copy you are holding. One
+copy is the exception: `upgrade.sh` in a checkout of a release line (`release/<X.Y>`) that has moved
+past its latest release still carries that release's version but is not that release, so run from
+there, with the release's tag and full history fetched, it drops the baked default, says which line
+and commit it is on, and asks for `--image-tag` the way a copy with no baked version does; a clone that
+lacks the tag, or whose shallow history stops short of the release, is refused and told which fetch
+to run.
 
 - `--image-tag` names a revision to move to instead: a release tag or a full commit SHA. It
   overrides the baked version, and it exists for development and CI/CD testing — a candidate
@@ -167,7 +180,7 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first three are
-settled before the run touches the cluster at all. The last two need the cluster: they are settled
+settled before the run touches the cluster at all. The last three need the cluster: they are settled
 after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
 skips those — but still before any CRD, chart or Terraform change of the new release.
 
@@ -193,6 +206,12 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   pointed elsewhere, the credentials have expired, the API server times out — the run stops instead
   of guessing. Record `MEMORY=hindsight|file|off` in `install.env`, or restore access to the cluster
   and re-run.
+- **The chart does not declare a value the release recorded.** The operator and harness modes
+  re-apply the values the release recorded, and name each one the new chart's values schema refuses
+  as undeclared. On an upgrade that is usually a setting the new chart renamed or removed: run
+  `--upgrade-mode=full`, which renders `install.env` onto the chart instead. On a rollback to a
+  release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
+  that flag, since it has no recorded values to drop.
 
 ## Where to go next
 

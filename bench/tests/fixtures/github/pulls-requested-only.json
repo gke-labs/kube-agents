@@ -1,0 +1,27 @@
+[
+  {
+    "url": "https://api.github.com/repos/gke-agentic/kube-agents-evals-21-infra/pulls/39",
+    "html_url": "https://github.com/gke-agentic/kube-agents-evals-21-infra/pull/39",
+    "number": 39,
+    "state": "open",
+    "title": "feat: Add PodDisruptionBudget for checkout-gateway",
+    "user": {
+      "login": "kube-agents-evals-token-minter[bot]",
+      "type": "Bot"
+    },
+    "created_at": "2026-09-25T17:32:18Z",
+    "updated_at": "2026-09-25T17:32:18Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+      "ref": "platform-agent/checkout-gateway-pdb-new",
+      "sha": "f6314dad3b1c6e60a5b495350e163fa1badce473",
+      "repo": {
+        "full_name": "gke-agentic/kube-agents-evals-21-infra"
+      }
+    },
+    "base": {
+      "ref": "main"
+    }
+  }
+]

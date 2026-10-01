@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       rc_tag:
-        description: "Release Candidate Tag Name (Optional, auto-generated if omitted)"
+        description: "Release Candidate Tag Name (Optional, auto-generated if omitted; leave empty for a release line's head, whose GA gate reads the generated shape only)"
         required: false
         type: string
 

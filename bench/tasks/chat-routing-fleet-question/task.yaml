@@ -35,9 +35,11 @@ prompt: >-
   they running?
 expected_output: >-
   The front door files a kanban task assigned to the platform specialist
-  rather than answering from its own knowledge. The final answer to the user
-  names the specialist that did the work and states the cluster count and
-  versions as read from the live fleet.
+  rather than answering from its own knowledge, and acknowledges with one line
+  naming what is being checked, with no attribution line and no task id. The
+  answer the user receives states the cluster count and versions as read from
+  the live fleet; where the front door restates the specialist's work in its
+  own words, it names the specialist in that sentence.
 infrastructure:
   deployer: noop
 validated: false

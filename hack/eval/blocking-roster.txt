@@ -11,7 +11,8 @@
 # Since 2026-09-22 (#1023, the eval crew's call) the presubmit runs this
 # roster and, as the one documented exception, the held-out seats a coverage
 # tracker puts in presubmit-cases.txt without a name here (its last section;
-# #2013 seated the compliance canary 2026-09-29): such a case runs on every
+# #2013 seated the compliance canary 2026-09-29 and #2016 pdb-remediation-pr,
+# seat opened 2026-09-28): such a case runs on every
 # pull request and, under the default EVAL_ADMISSION_MODE=roster, cannot red
 # one on a graded failure. Every other held-out case is a nightly case
 # (nightly-cases.txt carries each with its hold-out reason). The script

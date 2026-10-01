@@ -68,6 +68,9 @@ RESERVED_PROFILES = frozenset({"default", "platform"})
 KUBECONFIG_PROBE = "/usr/bin/test"
 KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 
+# What the reconcile engine and the roster read as "this profile is finished".
+USER_MD_NAME = "USER.md"
+
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-PROFILE] {msg}", file=sys.stderr)
@@ -131,9 +134,11 @@ def read_cluster_identity(home: Path) -> dict[str, str] | None:
     """Read the ``cluster_identity`` block written into a profile's ``config.yaml``.
 
     Returns the ``{project, cluster, location}`` dict, or ``None`` if the config is
-    missing/unparseable or the block is absent/incomplete. This is the robust,
-    machine-readable inverse of :func:`_inject_cluster_identity` — reconciliation
-    reads it rather than trying to reverse the sanitized/hashed profile name.
+    missing/unparseable or the block is absent/incomplete. Raises if the config
+    cannot be read (permissions, encoding) or parses to something other than a
+    mapping. This is the robust, machine-readable inverse of
+    :func:`_inject_cluster_identity` — reconciliation reads it rather than trying
+    to reverse the sanitized/hashed profile name.
     """
     import yaml  # lazy: keeps the module importable without pyyaml on pure-lookup paths
 
@@ -167,6 +172,30 @@ def _pin_kubeconfig_env(home: Path, kubeconfig: Path) -> None:
     existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
     kept = [ln for ln in existing.splitlines(keepends=True) if not ln.startswith("KUBECONFIG=")]
     env_path.write_text("".join(kept) + f"KUBECONFIG={kubeconfig}\n", encoding="utf-8")
+
+
+def _pin_terminal_env(home: Path, name: str) -> None:
+    """Copy the managed terminal settings into the profile's ``.env`` and check them.
+
+    The terminal scope a scheduled run executes under ignores the managed config, so
+    without this the profile's cron jobs fall back to Hermes' default local backend
+    instead of the sandbox; terminal_env_pin.py has the detail. The entrypoint sweeps every profile
+    at start-up, but a cluster profile is created long after that.
+
+    Fatal, and it takes USER.md with it: a re-scaffold may have left one from an earlier
+    run, and cluster_agent_reconcile's _scaffold_gaps and the roster both count a profile
+    with USER.md as finished. Without it the next reconcile retries the scaffold.
+    """
+    try:
+        from terminal_env_pin import pin  # lazy: imports Hermes
+
+        pin(home)
+    except Exception as exc:
+        (home / USER_MD_NAME).unlink(missing_ok=True)
+        raise SystemExit(
+            f"ERROR: scheduled runs in profile '{name}' would not use the managed ssh "
+            f"terminal: {exc}. The profile is left unfinished; the next reconcile retries it."
+        ) from exc
 
 
 def _pin_otel_endpoint(home: Path, name: str) -> None:
@@ -410,6 +439,10 @@ def create_profile(project: str, cluster: str, location: str) -> str:
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)
+
+    # 3c. Pin the managed terminal for the profile's scheduled runs, before USER.md
+    # marks the profile finished.
+    _pin_terminal_env(home, name)
 
     # 4. Write the fixed cluster identity into USER.md.
     #

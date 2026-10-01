@@ -15,9 +15,12 @@ revert, and it needs a plan read first.
 
 Because the script that runs is `N-1`'s, its timeouts and Helm flags are `N-1`'s too, and this
 page says where the published releases differ. A copy of the script that carries no baked version
-— one taken from `main` rather than from release `N-1` — is the exception: it fetches only `N-1`'s
-chart, CRDs and installer library, so a rollback done that way has the current script's behaviour
-against `N-1`'s chart. This page describes the checkout.
+— one taken from `main` rather than from release `N-1` — fetches `N-1`'s tree and runs its own
+steps over it, and it cannot complete a rollback to any release through `0.7.0`: it calls
+installer functions the libraries of `0.4.0` through `0.7.0` do not define, and `0.3.0` and
+earlier have no installer library to load, so its operator step, `--plan` and full mode each stop
+before they apply anything of `N-1`. Roll back from the `N-1` checkout, which is what this page
+describes.
 
 The forward move, the three upgrade modes, and how a run resolves the version it targets are in
 [Upgrade](/kube-agents/install/upgrade/); this page covers going backwards only.
@@ -74,6 +77,11 @@ From the `N-1` checkout, a dry run, then operator and harness back to back:
 ./upgrade.sh --upgrade-mode=operator --image-tag <N-1>
 ./upgrade.sh --upgrade-mode=harness --image-tag <N-1>
 ```
+
+Where `N-1` is a release after `0.7.0`, add `--drop-undeclared-values` to the operator and harness
+commands. Without it, their script stops before any of `N-1` is applied when the release records a
+value `N-1`'s chart does not declare, and names each one; with it, the script drops and names them.
+The scripts of `0.7.0` and earlier do not take the flag.
 
 `--dry-run` prints the target and the image references the step would apply, from the
 configuration alone, and contacts nothing. It refuses a checkout at the wrong commit, as the real
@@ -134,11 +142,14 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 - Every object the chart renders, including the `PlatformAgent` resource, re-rendered from
   `N-1`'s templates. Objects `N`'s chart rendered and `N-1`'s does not are deleted by the upgrade;
   that is Helm's ordinary behaviour.
-- Which values those templates are rendered with depends on the script. From `0.5.0` on the
-  re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the values the
-  install set on top. `0.4.0` and earlier use `--reuse-values`, which keeps every value `N`'s
-  release computed, defaults included, so a chart default `N` changed stays at `N`'s value after a
-  rollback to `0.4.0` even though the chart version reads `0.4.0`.
+- Which values those templates are rendered with depends on the script. From `0.5.0` through
+  `0.7.0` the re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the
+  values the install set on top. From the first release after `0.7.0` it is the same, less any
+  value the install set that `N-1`'s values schema refuses as undeclared, which the script drops
+  and names before any of `N-1` is applied when it is given `--drop-undeclared-values`, and names
+  and stops on when it is not. `0.4.0` and earlier use `--reuse-values`, which
+  keeps every value `N`'s release computed, defaults included, so a chart default `N` changed
+  stays at `N`'s value after a rollback to `0.4.0` even though the chart version reads `0.4.0`.
 
 ## What they leave as it is
 
@@ -165,9 +176,13 @@ it, so the replacement pod stays in `ContainerCreating`. That is harmless to the
 which has no sandbox, and the next forward upgrade renders the Secret again.
 
 Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the API server prunes
-them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
-them stay in the release's recorded values: a later forward re-tag renders them again, the schema
-refusal below turns on them, and the full mode discards them.
+them from the stored object, and `N-1`'s chart does not render them. The full mode discards the
+Helm values that produced them. A re-tag by the script of `0.7.0` or earlier keeps those values in
+the release's recorded values: a later forward re-tag renders them again, and the schema refusal
+below turns on them. A re-tag by a script from after `0.7.0`, run with `--drop-undeclared-values`,
+drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the release no
+longer records it, and the next forward re-tag renders it from `N`'s chart default until a
+full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
@@ -211,7 +226,7 @@ The composition refuses some of those destructions itself: its `lifecycle.sh` ex
 `terraform apply` when the regenerated configuration disagrees with state on the cluster, the
 agent's service account, the CMEK key, the release namespace, the Pub/Sub subscription or the
 minter key. That refusal comes after the full mode's CRD apply, so it leaves `N-1`'s CRDs in
-place, like the schema refusal below. How to read a `destroy` line in the plan, as missing
+place, as the schema refusal below does when `N-1` is `0.7.0` or earlier. How to read a `destroy` line in the plan, as missing
 configuration first and real drift second, is in the
 [installer README](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md).
 
@@ -242,8 +257,10 @@ that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the cha
 ## When a rollback is refused
 
 The first two refusals happen before anything on the cluster moves, and the third before any of
-`N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied; Helm
-checks before it renders or applies anything, so the release itself keeps its last revision.
+`N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied, except
+that from the first release after `0.7.0` the script makes the schema check itself, before the CRD
+apply. Helm checks before it renders or applies anything, so the release itself keeps its last
+revision.
 
 - **The sources do not match the tag.** The checkout's `HEAD` is not the tag's commit, the tree
   has uncommitted changes, or the bundle's baked version is not the `--image-tag` given. Start
@@ -262,17 +279,32 @@ checks before it renders or applies anything, so the release itself keeps its la
   `install.env`, or restore access to the cluster and re-run. See
   [Upgrade](/kube-agents/install/upgrade/#when-an-upgrade-is-refused).
 - **`N-1`'s chart carries a values schema and `N` added a chart value.** Every release after
-  `0.5.0` ships a `values.schema.json` that closes each level of the chart's values, and the
-  re-tag reuses the values the release recorded, so a key `N`'s install set that `N-1`'s chart
-  does not declare fails Helm's schema check. Helm checks before it renders, so the release keeps
-  its last revision, but in the operator step the CRD apply has already run: put `N`'s CRDs back
-  from the `N` checkout with the same command the script uses,
-  `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. The re-tag has no
-  flag that drops a reused key, so for such a pair the Helm-only rollback does not complete. The
-  full mode does, because its Helm release renders from the composition's values rather than the
-  recorded ones (the section above), at the price of a GCP-level apply and the plan read that
-  goes before it. Neither pair published today is affected: neither `0.4.0`'s nor `0.5.0`'s
-  chart has a schema.
+  `0.5.0` ships a `values.schema.json` that closes each level of the chart's values. Through
+  `0.7.0` the re-tag reuses the values the release recorded with no way to drop one, so a key
+  `N`'s install set that `N-1`'s chart does not declare fails Helm's schema check. Helm checks
+  before it renders, so the release keeps its last revision, but in the operator step the CRD
+  apply has already run: put `N`'s CRDs back from the `N` checkout with the same command the
+  script uses, `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. For a
+  pair whose `N-1` is `0.7.0` or earlier the Helm-only rollback therefore does not complete. From
+  the first release after `0.7.0` the re-tag checks the recorded values against the schema before
+  any of `N-1` is applied, and names and stops on each key the schema refuses as undeclared. Given
+  `--drop-undeclared-values` it drops those keys instead, so with the flag the refusal no longer
+  happens where `N-1` is that release or later. The full mode completes either way, because its
+  Helm release renders from the composition's values rather than the recorded ones (the section
+  above), at the price of a GCP-level apply and the plan read that goes before it.
+
+  Two pairs are refused this way, each on an install the newer release's composition applied (a
+  fresh install of it, or a full-mode upgrade to it). `0.7.0` rolling back to `0.6.0`: `0.7.0`'s
+  composition records `litellm.maxTokens` on every apply, and `0.6.0`'s chart does not declare it.
+  The first release after `0.7.0` rolling back to `0.7.0`: its composition records
+  `platformAgent.scope` on every apply, empty lists included, and
+  `platformAgent.harness.driftDetector` on an install with `enable_drift_pubsub`, and `0.7.0`'s
+  chart declares neither. Either stops at the operator step with a schema error naming the key:
+  `at '/litellm': additional properties 'maxTokens' not allowed` from a current Helm,
+  `litellm: Additional property maxTokens is not allowed` from an older Helm 3 release. Take
+  either through the full mode from the `N-1` checkout: `./upgrade.sh --plan --image-tag <N-1>`,
+  read the plan, then `./upgrade.sh --upgrade-mode=full --image-tag <N-1>`.
+
 - **`N`'s operator owns an object that `N-1`'s chart renders.** Helm refuses to adopt an object
   that carries another manager's ownership labels (`exists and cannot be imported into the
 current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case

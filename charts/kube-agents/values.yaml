@@ -378,7 +378,8 @@ litellm:
   # default: on, the ConfigMap also carries the shared redactor module and a
   # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
   # the built-in credential patterns plus the rules below over messages,
-  # embeddings input and completion prompts before the provider sees them.
+  # tool-call arguments, embeddings input and completion prompts before the
+  # provider sees them.
   # Request bodies only: responses, tool results on disk and chat egress are
   # not covered. The concepts/inference-gateway page on the site owns the
   # model, including why a pseudonymised identifier is one the agent can no
@@ -590,6 +591,23 @@ platformAgent:
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
   # render too.
   annotations: {}
+  # GKE managed-Prometheus PodMonitorings for the agent's pods: the gateway,
+  # where the k8s-event-watcher serves its metrics on the agent-api-auth
+  # sidecar's event-metrics port (9095), and the credential proxy, where the
+  # broker serves its own on the metrics-only cred-metrics port (8766). The
+  # operator's policies on both pods admit the collector's namespace,
+  # gke-gmp-system, on those ports whatever this is set to; this decides only
+  # whether a scrape is configured.
+  # A tri-state: null (the default) renders them when the cluster serves
+  # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
+  # Prometheus is installed, and renders nothing elsewhere, so an install on a
+  # cluster without the CRD upgrades without setting anything. true renders
+  # them regardless and fails at apply time where the CRD is absent, the caveat
+  # litellm.podMonitoring carries; false never renders them. helm template
+  # alone has no cluster to ask: pass
+  # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
+  # default render.
+  podMonitoring: null
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
@@ -832,19 +850,24 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
-  # The GCP projects, folders and organisations, beyond the project the agent
-  # runs in, whose GKE clusters the hourly Cluster Agent reconcile enumerates,
-  # and what it leaves unmanaged: rendered as spec.scope on the PlatformAgent
-  # (the CRD reference on the site documents the field). The agent's service
-  # account needs the read roles in each project named, and the read roles
-  # plus roles/cloudasset.viewer on each folder and organisation; the
-  # Terraform composition binds them from the same value it passes here, and
-  # a chart installed on its own needs them granted by hand.
+  # The GCP projects, folders, organisations, Shared VPC hosts and Metrics
+  # Scopes, beyond the project the agent runs in, whose GKE clusters the hourly
+  # Cluster Agent reconcile enumerates, and what it leaves unmanaged: rendered
+  # as spec.scope on the PlatformAgent (the CRD reference on the site documents
+  # the field). The agent's service account needs the read roles in each
+  # project named, the read roles plus roles/cloudasset.viewer on each folder
+  # and organisation, and the read roles in every project a Shared VPC host or
+  # Metrics Scope resolves to, in each scoping project, and roles/compute.viewer
+  # alone in a host not otherwise in scope;
+  # the Terraform composition binds them from the same value it passes here,
+  # resolving the two selectors at plan time, and a chart installed on its own
+  # needs them granted by hand.
   #
-  # A map renders the block as it is, empty lists included (folders and
-  # organizations only when the map carries the key, so a release record from
-  # before the chart knew them re-renders without them and a retag's patch
-  # leaves the CR's lists alone; the composition always passes both): an
+  # A map renders the block as it is, empty lists included (folders,
+  # organizations, sharedVpcHosts and metricsScopes only when the map carries
+  # the key, so a release record from before the chart knew them re-renders
+  # without them and a retag's patch leaves the CR's lists alone; the
+  # composition always passes all four): an
   # empty scope is a present block with empty lists, which the reconcile reads as the
   # declaration that drops projects (their Cluster Agent profiles retire over
   # its next two clean runs), so the composition always passes a map and a
@@ -867,6 +890,8 @@ platformAgent:
   #     projects: [payments-prod, payments-staging]
   #     folders: ["123456789012"]   # numeric IDs; every project beneath, at any depth
   #     organizations: []           # numeric IDs; wide, prefer folders
+  #     sharedVpcHosts: [shared-vpc-host]  # host project IDs; every attached service project
+  #     metricsScopes: []           # scoping project IDs; every project the scope monitors
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple
@@ -935,6 +960,33 @@ platformAgent:
   # Reference: docs/site/src/content/docs/operator/platformagent-crd.md
   networkPolicy: {}
   integration:
+    # The forges the agent talks to, and the repositories on them. Set these
+    # or `github` below, not both — `github` is a deprecated alias for one
+    # forge with provider: github and one gitops repository. If neither is
+    # set, the agent starts with no registered repos, and repositories can be
+    # registered in the gitops-state ConfigMap by a cluster administrator.
+    #
+    # forges:
+    #   - name: github            # what repositories[].forge refers to
+    #     provider: github        # the only registered provider; default github
+    #     host: ""                # empty is the provider's default (github.com)
+    #     namespace: my-org       # default owner for this forge's repositories
+    #     credentialsRef:         # Secret for providers that need one; ignored
+    #       name: ""              # for github, which uses the GitHub App
+    forges: []
+    # repositories:
+    #   - forge: github
+    #     repository: infra       # URL, scp remote, namespace/path, or bare name
+    #     role: gitops            # gitops (at most one), managed, or context
+    #   - forge: github
+    #     repository: my-org/app
+    #     role: managed           # read-write, like the gitops repository
+    #   - forge: github
+    #     repository: runbooks
+    #     namespace: other-org    # qualifies a bare name, overriding the forge's namespace
+    #     role: context           # read-only reference material
+    repositories: []
+    # Deprecated: use `forges` and `repositories` above. Kept so existing values files keep working.
     github:
       # Target GitHub Organization where the GitHub App is installed (optional).
       # If omitted and gitRepo is specified, the organization is inferred from the repository owner.

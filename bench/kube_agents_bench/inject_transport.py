@@ -229,10 +229,14 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # The bridge caps one call's ``input`` and replaces an input over the cap
 # wholesale with ``{"truncated": true, "bytes": N, "head": "..."}``. Such
 # an entry is still a call to its tool, and is written as one; but a
-# ``tool_call`` wrapper over the cap has lost its ``input.calls[]``, so the
-# verifier cannot unwrap the tools it invoked, and a ``tool_called`` naming
-# one of them would fail on this transport where the api path passes. The
-# marker counts these, and the scorer reads the count as a loss (below).
+# ``tool_call`` wrapper capped that way has lost its ``input.calls[]``, so
+# the verifier cannot unwrap the tools it invoked, and a ``tool_called``
+# naming one of them would fail on this transport where the api path
+# passes. The bridge caps a wrapper per nested call first (the large
+# ``arguments`` objects become stand-ins, then every one does, the names
+# staying), and a wrapper that still does not fit, or whose ``calls`` holds
+# an element that is not an object, is replaced whole. The marker counts
+# these, and the scorer reads the count as a loss (below).
 # The stand-in is recognised by its whole shape -- exactly these three
 # keys with the flag true -- not by the flag alone, because the input is
 # the persona's own arguments and a tool whose schema carries a boolean
@@ -324,6 +328,11 @@ REASON_SPAWN_FAILED = "spawn-failed"
 REASON_BRIDGE_DIED = "bridge-died-without-terminal-event"
 REASON_WORKER_EVICTED = "worker-evicted"
 REASON_BUS_SUBSCRIBE_FAILED = "bus-subscribe-failed"
+# The hermes turn gave up on the model provider's rate limit or billing (its
+# retries exhausted the 429 window; exit 75, EX_TEMPFAIL, the code Hermes
+# reserves for both). A quota storm is the install's, not the persona's: the
+# turn never got an answer to grade.
+REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -333,6 +342,7 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_BRIDGE_DIED,
         REASON_WORKER_EVICTED,
         REASON_BUS_SUBSCRIBE_FAILED,
+        REASON_HERMES_RATE_LIMITED,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
@@ -1752,13 +1762,13 @@ class InjectTask:
         this very turn, while the submission is still on the bus, and the
         bridge's durable consumer delivers from the start of the stream, so
         a bridge that binds later within retention would otherwise run the
-        stale prompt. Honestly: on today's bridge the cancel does not prevent
-        that spawn -- the consumer delivers serially, so an idle worker
-        spawns the stale prompt before the cancel is dispatched, and the
-        cancel then kills it inside the bridge's kill grace with a
-        ``canceled-by-request`` terminal; ``canceled-before-start`` is what a
-        task still queued behind the cap gets. The cancel bounds the stray
-        run and leaves the record. The terminal that follows, if an executor
+        stale prompt. The bridge's worker replays the task's ``in`` subject
+        before it spawns and answers a cancel it finds there with
+        ``canceled-before-start`` and no spawn, the terminal a task still
+        queued behind the cap gets too; a cancel that lands after that read
+        kills the run inside the bridge's kill grace with a
+        ``canceled-by-request`` terminal. Either way the cancel bounds the
+        stray run and leaves the record. The terminal that follows, if an executor
         confirms inside ``settle``, is ``canceled`` with the executor's
         reason.
 
