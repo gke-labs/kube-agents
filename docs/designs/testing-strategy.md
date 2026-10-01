@@ -159,13 +159,13 @@ The ladder above is per case. Run it unchanged over hundreds of cases and the su
 
 Our cases will not be 99.9% reliable, and a gate that reds seven pull requests in eight is ignored within two days. So the suite verdict is not "every case passed." It is these five rules:
 
-| Rule            | What it means                                                                                                      |
-| --------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Rule            | What it means                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------- |
 | **Admission**   | A case cannot block anyone until it has proved it is reliable: 20 runs against `main`, at least 90% of them passing |
-| **Repetitions** | Every case runs **3 times** on every pull request. One number, no re-run tier                                      |
-| **Aggregate**   | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                           |
-| **Collapse**    | An admitted case that fails **all three** of its runs reds the job on its own                                      |
-| **Coverage**    | An admitted case that lost **all three** of its runs to infrastructure makes the run not evaluated, never green    |
+| **Repetitions** | Every case runs **3 times** on every pull request. One number, no re-run tier                                       |
+| **Aggregate**   | Across all admitted cases, the pull request's pass rate must be non-inferior to `main`'s                            |
+| **Collapse**    | An admitted case that fails **all three** of its runs reds the job on its own                                       |
+| **Coverage**    | An admitted case that lost **all three** of its runs to infrastructure makes the run not evaluated, never green     |
 
 A worked example. Your pull request touches a prompt. A case that passed 18 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the aggregate. Fails all three: it has collapsed, and that one case reds the job. A case that passes 18 times in 20 does not fail three in a row by chance.
 
