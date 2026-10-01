@@ -8,7 +8,7 @@
 . "$H/scenarios/18.sh"
 START=1.33
 POOL_FLAGS="--num-nodes 1 --machine-type n1-standard-4 --disk-size 200 --max-surge-upgrade 1 --max-unavailable-upgrade 0 --accelerator type=nvidia-tesla-t4,count=1,gpu-driver-version=default,gpu-sharing-strategy=time-sharing,max-shared-clients-per-gpu=2"
-compat_round(){ TRACK=$TRACK CLUSTER=$CLUSTER ZONE=$ZONE bash "$H/compat-probe.sh" "$1"; }
+compat_round(){ TRACK=$TRACK CLUSTER=$CLUSTER ZONE=$ZONE bash "$H/compat-probe.sh" "$1" || { note final "precondition not met: the compatibility probe $1 did not run; stopping"; exit 1; }; }
 before(){ probe_round v133; compat_round v133; }
 break_it(){ local v; v=$(newest_patch EXTENDED 1.34); upgrade_master "$v"; upgrade_pool work-pool "$v"; }
 after(){ probe_round v134; compat_round v134; ev gpu-driver pool-ops G container operations list --zone "$ZONE" --filter="targetLink~clusters/$CLUSTER/nodePools/work-pool AND operationType=UPGRADE_NODES" --format='table(name,status,startTime,endTime,statusMessage)'; }

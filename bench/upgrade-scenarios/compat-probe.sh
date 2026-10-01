@@ -9,9 +9,9 @@ H=$(cd "$(dirname "$0")" && pwd); unset EXTENDS; . "$H/common.sh"; require_scena
 TAG=$1; WAIT=900; POLL=10
 CU12_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04; CU12_TORCH=pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 CU13_BASE=nvidia/cuda:13.0.0-base-ubuntu24.04; CU13_TORCH=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
-compat_pod(){ # compat_pod <name> <base image> <torch image>
+compat_pod(){ # compat_pod <name> <base image> <torch image>; an apply that fails stops the probe, since there would be no pod to wait for
   K -n scen delete pod "$1" --ignore-not-found >/dev/null
-  K -n scen apply -f - <<Y
+  K -n scen apply -f - <<Y || { note compat "precondition not met: probe pod $1 did not apply; the probe did not run"; exit 1; }
 apiVersion: v1
 kind: Pod
 metadata: {name: $1, labels: {app: compat-probe}}

@@ -13,9 +13,9 @@ CU13_IMAGE=pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 GPU_WAIT=1200; PROBE_WAIT=1500; POLL=15
 gpu_ready(){ [ -n "$(K get nodes -l role=work -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}' 2>/dev/null | tr -d ' 0')" ]; }
 wait_gpu(){ local t=0; while ! gpu_ready && [ $t -lt $GPU_WAIT ]; do sleep $POLL; t=$((t+POLL)); done; note gpu-driver "GPU allocatable after ${t}s wait: $(K get nodes -l role=work -o jsonpath='{.items[*].status.allocatable.nvidia\.com/gpu}')"; gpu_ready; }
-torch_probe(){ # torch_probe <pod> <image>: print the node's driver, then exit 0 only if torch can open the GPU
+torch_probe(){ # torch_probe <pod> <image>: print the node's driver, then exit 0 only if torch can open the GPU; an apply that fails stops the run
   K -n scen delete pod "$1" --ignore-not-found >/dev/null
-  K -n scen apply -f - <<Y
+  K -n scen apply -f - <<Y || { note final "precondition not met: probe pod $1 did not apply; stopping"; exit 1; }
 apiVersion: v1
 kind: Pod
 metadata: {name: $1, labels: {app: torch-probe}}
