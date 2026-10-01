@@ -1419,6 +1419,246 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             f"Expected valid 40-character SHA or SemVer tag, got: {proc.stdout.strip()}",
         )
 
+    def _release_line_checkout(self, temp_dir):
+        """A kube-agents checkout shaped like a release line: this branch's install.sh
+        stamped 0.2.0 and tagged on A, a backport B on top of it, and an unrelated
+        commit U, carrying the same stamped script, that descends from neither."""
+        repo_path = pathlib.Path(temp_dir)
+        git = lambda *args: subprocess.run(["git", *args], cwd=str(repo_path), check=True, capture_output=True, text=True).stdout.strip()
+
+        def stamped_tree():
+            (repo_path / "scripts" / "installer").mkdir(parents=True, exist_ok=True)
+            (repo_path / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            text = _INSTALL_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+            (repo_path / "install.sh").write_text(text)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        git("config", "commit.gpgsign", "false")
+        stamped_tree()
+        git("add", ".")
+        git("commit", "-q", "-m", "chore(release): stamp release version 0.2.0")
+        stamp = git("rev-parse", "HEAD")
+        git("tag", "0.2.0", stamp)
+        git("switch", "-q", "-c", "release/0.2")
+        (repo_path / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-q", "-m", "fix: backport")
+        backport = git("rev-parse", "HEAD")
+        git("switch", "-q", "--orphan", "elsewhere")
+        stamped_tree()
+        (repo_path / "other.txt").write_text("x\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "chore: unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("switch", "-q", "release/0.2")
+        return repo_path, git, stamp, backport, unrelated
+
+    def _run_fixture_install_func(self, repo_path, func_call):
+        """Source the fixture's own stamped install.sh, so BASH_SOURCE names it: the
+        checkout's script is the one running, as when an operator runs ./install.sh."""
+        setup = f"KUBE_AGENTS_SOURCE_ONLY=true source ./install.sh\n{func_call}\n"
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides), cwd=repo_path)
+
+    def test_a_release_line_checkout_past_its_stamp_defaults_to_its_own_head(self):
+        """The backport carries the previous release's baked version, but it is not that
+        release: run from it, install.sh defaults the way a main checkout does, to its
+        own HEAD, whose images the merge onto the line built, and verification passes on
+        that tag. The stamp's own commit still defaults to the release, and an unrelated
+        commit with the baked version still defaults to it and is refused as a source
+        mismatch."""
+        with tempfile.TemporaryDirectory(prefix="release-line-checkout-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+
+            past = self._run_fixture_install_func(repo_path, 'default_image_tag "."; echo "label=$(default_image_tag_label ".")"')
+            self.assertEqual(past.returncode, 0, past.stderr)
+            lines = past.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("1 commit(s) past release 0.2.0", lines[1])
+
+            resolved = self._run_fixture_install_func(
+                repo_path,
+                'tag=""; resolve_effective_image_tag tag "." "" && echo "tag=$tag" && verify_local_source_ref "." "$tag" && echo "verified"',
+            )
+            self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
+            self.assertIn(f"tag={backport}", resolved.stdout)
+            self.assertIn("verified", resolved.stdout)
+            self.assertNotIn("mismatch", resolved.stdout + resolved.stderr)
+
+            # Asked for the release by name from the backport: refused, and told what the
+            # checkout is rather than that it is unrelated.
+            named = self._run_fixture_install_func(repo_path, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(named.returncode, 0)
+            self.assertIn("mismatch", named.stdout + named.stderr)
+            self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
+            self.assertIn("with no --image-tag and IMAGE_TAG unset", named.stdout + named.stderr)
+            self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
+            self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(at_stamp.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+
+            git("switch", "-q", "--detach", unrelated)
+            off = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(off.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(off.returncode, 0)
+            self.assertIn("mismatch", off.stdout + off.stderr)
+            # Tag present, history complete, own script running: no fetch would change
+            # the answer, and the hint does not name one.
+            self.assertIn("neither that release's commit nor a descendant of it", off.stdout + off.stderr)
+            self.assertNotIn("git fetch", off.stdout + off.stderr)
+
+    def test_a_line_checkout_in_a_release_named_directory_still_defaults_to_its_head(self):
+        """The archive-directory rule (step 3) must not hand the release back once the
+        checkout is recognised as a line past it: a clone named kube-agents-0.2.0, the
+        name the rollback page uses, later moved onto the line, defaults to HEAD."""
+        with tempfile.TemporaryDirectory(prefix="release-line-named-") as temp_dir:
+            named = pathlib.Path(temp_dir) / "kube-agents-0.2.0"
+            named.mkdir()
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(named)
+            proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+
+    def test_a_line_checkouts_install_sh_run_from_inside_another_checkout_still_defaults_to_its_head(self):
+        """The release-line read judges the script's own checkout, which is the tree
+        acquire_source_repo installs from, not the working directory: one checkout's
+        install.sh invoked by path from inside another kube-agents checkout resolves
+        as it would from its own directory, and the source check passes on that tag."""
+        with tempfile.TemporaryDirectory(prefix="release-line-elsewhere-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            other = pathlib.Path(temp_dir) / "other-checkout"
+            (other / "scripts" / "installer").mkdir(parents=True)
+            (other / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            (other / "install.sh").write_text(_INSTALL_SH.read_text())
+            setup = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{repo_path}/install.sh"\n'
+                'default_image_tag "."; echo "label=$(default_image_tag_label ".")"; '
+                f'tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "{repo_path}" "$tag" && echo verified\n'
+            )
+            proc = _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}), cwd=other)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("verified", proc.stdout)
+            self.assertNotIn("--image-tag and IMAGE_TAG unset", proc.stdout + proc.stderr)
+
+    def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
+        """The baked version belongs to the running script. A release's install.sh that is
+        not the checkout's own file (piped, or run from another directory) keeps its release
+        as the default even when the checkout it resolves its sources to is a line past that
+        release, and the source check then fetches or refuses as before."""
+        with tempfile.TemporaryDirectory(prefix="release-line-piped-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            proc = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; default_image_tag "."; default_image_tag_label "."', cwd=repo_path)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+            # The refusal that follows says the running script is not this checkout's,
+            # not to fetch anything: the tags are here.
+            piped = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(piped.returncode, 0)
+            self.assertIn("is not this checkout's", piped.stdout + piped.stderr)
+            self.assertIn("run its own ./install.sh", piped.stdout + piped.stderr)
+            self.assertNotIn("git fetch", piped.stdout + piped.stderr)
+            # Tagless but stamped: the piped installer still leads with "run the checkout's
+            # own install.sh", naming the fetch that would also be needed, rather than a
+            # fetch alone that leaves the piped copy unable to recognise the checkout.
+            git("tag", "-d", "0.2.0")
+            tagless = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("run its own ./install.sh", tagless.stdout + tagless.stderr)
+            self.assertIn("once you fetch the tags (git fetch --tags)", tagless.stdout + tagless.stderr)
+            # Standing in a checkout that lacks the tag and the stamp, the piped installer's
+            # refusal does not tell the operator their checkout's scripts carry the release.
+            (repo_path / "install.sh").write_text(_INSTALL_SH.read_text())
+            refused = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("is not present in the current checkout", refused.stdout + refused.stderr)
+            self.assertNotIn("release line", refused.stdout + refused.stderr)
+            self.assertNotIn("git fetch --tags", refused.stdout + refused.stderr)
+
+    def test_a_line_checkout_without_the_release_tag_is_refused_and_told_to_fetch_it(self):
+        """Without the tag the shape cannot be recognised, so the baked default and the
+        refusal stand; the refusal says why and what to do."""
+        with tempfile.TemporaryDirectory(prefix="release-line-tagless-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            git("tag", "-d", "0.2.0")
+            proc = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(proc.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            self.assertNotIn("--unshallow", proc.stdout + proc.stderr)
+            self.assertIn(f"--image-tag {backport}", proc.stdout + proc.stderr)
+
+    def test_a_shallow_line_clone_is_told_to_unshallow_and_is_recognised_once_it_does(self):
+        """`git fetch --tags` alone does not mend a --depth 1 clone of the line: the tag
+        arrives but HEAD's parents stay behind the graft, so the ancestry walk fails and
+        the run lands in the mismatch refusal. That refusal names the shallow history;
+        after `git fetch --unshallow` the checkout is recognised."""
+        with tempfile.TemporaryDirectory(prefix="release-line-shallow-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            shallow = pathlib.Path(temp_dir) / "shallow"
+            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "release/0.2", f"file://{repo_path}", str(shallow)], check=True)
+            sgit = lambda *args: subprocess.run(["git", *args], cwd=str(shallow), check=True, capture_output=True, text=True).stdout.strip()
+            probe = 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+
+            tagless = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("git fetch --tags", tagless.stdout + tagless.stderr)
+            self.assertIn("git fetch --unshallow", tagless.stdout + tagless.stderr)
+
+            sgit("fetch", "-q", "--tags", "origin")
+            self.assertEqual(sgit("rev-parse", "--is-shallow-repository"), "true")
+            tagged = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagged.returncode, 0)
+            self.assertIn("Source/image version mismatch", tagged.stdout + tagged.stderr)
+            self.assertIn("git fetch --unshallow", tagged.stdout + tagged.stderr)
+            self.assertNotIn("git fetch --tags", tagged.stdout + tagged.stderr)
+
+            sgit("fetch", "-q", "--unshallow", "origin")
+            deep = self._run_fixture_install_func(shallow, 'default_image_tag "."; verify_local_source_ref "." "$(default_image_tag ".")" && echo verified')
+            self.assertEqual(deep.returncode, 0, deep.stdout + deep.stderr)
+            self.assertEqual(deep.stdout.strip().splitlines()[0], backport)
+            self.assertIn("verified", deep.stdout)
+
+            # A shallow clone deep enough to hold the release is recognised, and asked
+            # for the release by name it is told what it is, not to unshallow.
+            enough = pathlib.Path(temp_dir) / "deep-enough"
+            subprocess.run(["git", "clone", "-q", "--depth", "2", "--branch", "release/0.2", f"file://{repo_path}", str(enough)], check=True)
+            subprocess.run(["git", "fetch", "-q", "--tags", "origin"], cwd=str(enough), check=True)
+            self.assertEqual(subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=str(enough), capture_output=True, text=True).stdout.strip(), "true")
+            recognised = self._run_fixture_install_func(enough, 'default_image_tag "."')
+            self.assertEqual(recognised.stdout.strip(), backport)
+            by_name = self._run_fixture_install_func(enough, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(by_name.returncode, 0)
+            self.assertIn("release line 0.2 at", by_name.stdout + by_name.stderr)
+            self.assertNotIn("--unshallow", by_name.stdout + by_name.stderr)
+
+    def test_the_stamp_line_is_read_with_the_same_grammar_as_upgrade_sh(self):
+        """release_version_of_source_tree strips quotes and whitespace; install.sh reads the
+        tree's stamp the same way, so one tree is a line checkout to both front doors."""
+        for spelling in ("BAKED_RELEASE_VERSION='0.2.0'", 'BAKED_RELEASE_VERSION="0.2.0" ', "BAKED_RELEASE_VERSION=0.2.0"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory(prefix="release-line-grammar-") as temp_dir:
+                repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+                text = (repo_path / "install.sh").read_text().replace('BAKED_RELEASE_VERSION="0.2.0"', spelling, 1)
+                (repo_path / "install.sh").write_text(text)
+                git("commit", "-q", "-am", "chore: respell the stamp")
+                head = git("rev-parse", "HEAD")
+                proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), head)
+
     def test_default_image_tag_resolves_semver_when_multiple_tags_present(self):
         """Verifies default_image_tag prefers numeric SemVer tag over rc_*_validated tags on the same commit."""
         temp_dir, repo_dir, git = create_mock_git_repo()
@@ -6284,6 +6524,8 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
         "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),
+        "--scope-shared-vpc-hosts": ("PARAM_SCOPE_SHARED_VPC_HOSTS", "shared-net-host"),
+        "--scope-metrics-scopes": ("PARAM_SCOPE_METRICS_SCOPES", "observability-hub"),
         "--scope-exclude-projects": ("PARAM_SCOPE_EXCLUDE_PROJECTS", "*-sandbox"),
         "--scope-exclude-clusters": ("PARAM_SCOPE_EXCLUDE_CLUSTERS", "payments-staging/us-central1/scratch"),
     }
@@ -7394,7 +7636,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             cwd=str(_REPO_ROOT),
         )
 
-    def test_a_first_install_records_the_five_keys_even_when_empty(self):
+    def test_a_first_install_records_the_seven_keys_even_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = pathlib.Path(tmp) / "new.install.env"
             loaded = pathlib.Path(tmp) / "loaded.install.env"
@@ -7403,7 +7645,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             # Exported after the load, as main() exports the flags' values: the
             # loader drops an inherited key once an install.env exists.
             proc = self._run(
-                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_FOLDERS="123456789012" SCOPE_ORGANIZATIONS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
+                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_FOLDERS="123456789012" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="shared-net-host" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
                 f'bootstrap_install_env_file "{dest}" some-tag >/dev/null\ncat "{dest}"',
                 env={"KUBE_AGENTS_INSTALL_ENV": str(loaded)},
             )
@@ -7411,6 +7653,8 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_PROJECTS=payments-prod\\ payments-staging$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_FOLDERS=123456789012$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_ORGANIZATIONS=''$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_SHARED_VPC_HOSTS=shared-net-host$", re.MULTILINE))
+            self.assertRegex(proc.stdout, re.compile(r"^SCOPE_METRICS_SCOPES=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
 
@@ -7420,8 +7664,10 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         # record it is dropped again by the next run. A file that carries the
         # key sets it; a first install (no file) keeps the environment.
         probe = ('echo "P=${PARAM_SCOPE_PROJECTS:-unset} F=${PARAM_SCOPE_FOLDERS:-unset} O=${PARAM_SCOPE_ORGANIZATIONS:-unset} '
+                 'H=${PARAM_SCOPE_SHARED_VPC_HOSTS:-unset} M=${PARAM_SCOPE_METRICS_SCOPES:-unset} '
                  'X=${PARAM_SCOPE_EXCLUDE_PROJECTS:-unset} C=${PARAM_SCOPE_EXCLUDE_CLUSTERS:-unset}"')
         stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_FOLDERS": "111", "SCOPE_ORGANIZATIONS": "222",
+                 "SCOPE_SHARED_VPC_HOSTS": "stray-host", "SCOPE_METRICS_SCOPES": "stray-scope",
                  "SCOPE_EXCLUDE_PROJECTS": "*-stray", "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
         with tempfile.TemporaryDirectory() as tmp:
             env_file = pathlib.Path(tmp) / "install.env"
@@ -7432,14 +7678,14 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                 capture_output=True, text=True, cwd=str(_REPO_ROOT),
                 env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
             )
-            self.assertIn("P=unset F=unset O=unset X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=unset F=unset O=unset H=unset M=unset X=unset C=unset", proc.stdout, proc.stderr)
             env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
             proc = subprocess.run(
                 ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
                 capture_output=True, text=True, cwd=str(_REPO_ROOT),
                 env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
             )
-            self.assertIn("P=from-the-file F=unset O=unset X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=from-the-file F=unset O=unset H=unset M=unset X=unset C=unset", proc.stdout, proc.stderr)
         # No file: a first install seeds from the environment and records it.
         with tempfile.TemporaryDirectory() as tmp:
             script_copy = pathlib.Path(tmp) / "install.sh"
@@ -7449,7 +7695,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                 capture_output=True, text=True, cwd=tmp,
                 env=get_isolated_test_env(overrides={"HOME": tmp, **stray}),
             )
-            self.assertIn("P=stray-project F=111 O=222 X=*-stray C=s/l/c", proc.stdout, proc.stderr)
+            self.assertIn("P=stray-project F=111 O=222 H=stray-host M=stray-scope X=*-stray C=s/l/c", proc.stdout, proc.stderr)
 
     def test_a_flag_that_disagrees_with_the_recorded_file_warns_and_names_the_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -7529,6 +7775,8 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         for flag, key in (("--scope-projects", "SCOPE_PROJECTS"),
                           ("--scope-folders", "SCOPE_FOLDERS"),
                           ("--scope-organizations", "SCOPE_ORGANIZATIONS"),
+                          ("--scope-shared-vpc-hosts", "SCOPE_SHARED_VPC_HOSTS"),
+                          ("--scope-metrics-scopes", "SCOPE_METRICS_SCOPES"),
                           ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
                           ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
             for value in ("", ",", " ", " , "):
@@ -7551,6 +7799,7 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         )
         help_text = proc.stdout + proc.stderr
         for flag in ("--scope-projects=IDS", "--scope-folders=IDS", "--scope-organizations=IDS",
+                     "--scope-shared-vpc-hosts=IDS", "--scope-metrics-scopes=IDS",
                      "--scope-exclude-projects=IDS", "--scope-exclude-clusters=TRIPLES"):
             with self.subTest(flag=flag):
                 self.assertIn(flag, help_text)
@@ -7639,6 +7888,62 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(preflight, crds)
         self.assertLess(crds, apply)
 
+    def test_the_selector_apis_are_enabled_where_the_apply_is_about_to_run(self):
+        # The plan-time resolution of a Shared VPC host or Metrics Scope reads
+        # three APIs the apply is what enables, so a first install enables
+        # them first: after the generate-only route has left, before the
+        # apply; and in the menu's re-apply, after the checks, before the CRDs.
+        handoff = self.text.index('print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"')
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        enable = self.text.index('enable_scope_selector_apis "$project_id"')
+        apply = self.text.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"')
+        self.assertLess(handoff, step12)
+        self.assertLess(step12, enable)
+        self.assertLess(enable, apply)
+        menu_check = self.text.index('        check_scope_container_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
+        self.assertLess(menu_check, handoff)
+
+    def test_the_dry_run_skips_its_plan_while_a_selector_api_is_off(self):
+        # A dry run enables nothing, so with a selector declared and one of
+        # the three APIs off its plan would be refused for a reason the real
+        # run, which enables them prior to apply, does not have: it skips the
+        # plan with the command instead, beside the other known-postcondition
+        # skips, and a listing that failed lets the plan speak.
+        branch = self.text.index('elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
+        node_pools = self.text.index('elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then')
+        plan = self.text.index('print_info "Previewing the resources a real run would create (terraform plan)..."')
+        self.assertLess(node_pools, branch)
+        self.assertLess(branch, plan)
+        self.assertIn('print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project', self.text[branch:plan])
+        self.assertIn('gcloud services enable ${missing_apis} --project=${project_id}', self.text[branch:plan])
+
+    def test_the_generate_only_handoff_names_the_selector_apis_only_when_a_selector_is_declared(self):
+        cmd_template = """
+{source}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+export SCOPE_METRICS_SCOPES="{scope}"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        # A Metrics Scope alone: the two APIs its reads use, not the Compute API a host's would.
+        line = "gcloud services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com --project=test-proj"
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = pathlib.Path(tmp) / "install.env"
+            empty.write_text("")
+            def run(scope):
+                setup = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n' + cmd_template.format(source=_SOURCE_INSTALLER_COMMON, scope=scope)
+                return _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}), cwd=_REPO_ROOT)
+            proc = run("observability-hub")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(line, proc.stdout)
+            self.assertIn("enable them first, or the plan is refused", proc.stdout)
+            # Above the apply it has to precede, for an operator pasting top to bottom.
+            self.assertLess(proc.stdout.index(line), proc.stdout.index("./lifecycle.sh apply"))
+            proc = run("")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(line, proc.stdout)
+
     def test_the_menu_refuses_a_scope_flag(self):
         proc = subprocess.run(
             ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],
@@ -7658,7 +7963,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertIn("The live-scope check does not run here", self.text)
         handoff = self.text[self.text.index("The live-scope check does not run here"):]
         handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
-        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS and the two exclusions",
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions",
                        "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, handoff)

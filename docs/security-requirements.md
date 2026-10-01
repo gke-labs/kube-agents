@@ -94,8 +94,15 @@ unset in every configuration.
 The broker authenticates every caller. A caller presents an audience-bound projected ServiceAccount
 token (one hour; the audience is per pod, `kubeagents-credential-proxy` for the sandbox and
 `kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the broker verifies
-it with a `TokenReview` before serving any path but `/healthz`; `CREDENTIAL_PROXY_ALLOWED_CALLERS`
-names the ServiceAccounts allowed to call. Three properties do not follow from that. The
+it with a `TokenReview` before serving any path on that listener but `/healthz`;
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP
+listener in the pod is the runtime's metrics-only one on 8766, unauthenticated like
+`/healthz`: it serves Prometheus counters whose label values are static enums and closed
+vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
+time with a ten-second deadline on each, and is the one port the broker's
+NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
+collector runs, and to no other peer
+([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount and the sandbox's and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a
 multi-tenancy control rather than an agent-containment one.

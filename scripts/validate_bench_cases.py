@@ -203,6 +203,19 @@ FIXTURE_NOT_READY = {
         "on seeded cluster A waiting on a ConfigMap that does not exist; no "
         "fixture role plants a stall today"
     ),
+    "gitops-drift-noise-filtered-triage": (
+        "#911: needs an audit ingress on the eval install -- a drift-audit "
+        "topic, a subscription and a detector enabled to pull from it, none of "
+        "which hack/ci-deploy.sh builds, so no record of any tier reaches the "
+        "classifier and the case files no card at all, which is broken rather "
+        "than red. The umbrella owns it because the gap is the eval install "
+        "not asking for what the composition already builds behind "
+        "enable_drift_pubsub, not a defect anyone has filed separately. The "
+        "case's own header carries the rest: why the sink is the one part of "
+        "the trio it can do without, why #2137 is not a second blocker, and "
+        "the ALERT_DAILY_LIMIT_DRIFT raise the unparking pull request owes "
+        "alongside the ingress"
+    ),
 }
 
 # Cases that claim no domain because no row in domains.yaml describes them.
@@ -210,6 +223,11 @@ FIXTURE_NOT_READY = {
 # because a domain with no case reports as uncovered and a case with no slug
 # can stay green for months while the report shows the gap.
 KNOWN_NO_DOMAIN = {
+    "platform-worker-refuses-shipped-skill-edit": (
+        "a skill-governance refusal graded on the worker's card result and on "
+        "its skill_manage calls (none may succeed); reads no fleet, and no "
+        "domains.yaml row describes skill or self-modification governance"
+    ),
     "vcs-history-only-fact": (
         "a repository-history question graded on the answer and on the route "
         "the worker took to it (the version-control verbs, never a credentialed "
@@ -229,6 +247,12 @@ KNOWN_NO_DOMAIN = {
         "took to the read-back; rca-remediation-pr owns the remediation "
         "journey -- a proposed fix landing as a pull request -- and this case "
         "proposes no fix"
+    ),
+    "vcs-spent-branch-reuse": (
+        "a second proposal opened under a branch name whose first proposal "
+        "was closed, graded on the branch the pull request came from; like "
+        "vcs-review-feedback-read-back it proposes no fix, and "
+        "rca-remediation-pr owns the remediation journey"
     ),
     "gpu-stress-test-diagnosis": (
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "

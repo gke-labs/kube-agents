@@ -25,10 +25,12 @@ import (
 // here drives the executor side through the lib, as the bridge does.
 
 // Compile-time contract. The inject backend is the one adapter that has to
-// answer ABOUT a task, and the chat backends deliberately do not -- a human
-// reads the chat, so the rendered text is their whole interface. The negative
-// assertions are in TestOnlyTheInjectBackendObservesTasks below, which a
-// compile-time var cannot express.
+// answer ABOUT a task. Discord and gchat deliberately do not -- a human reads
+// the chat, so the rendered text is their whole interface -- and Slack
+// implements TaskObserver for TaskStarted and TaskTerminal, to learn which threads a task
+// started in; it answers about nothing. The negative assertions are in
+// TestWhichAdaptersObserveTasks below, which a compile-time var cannot
+// express.
 var (
 	_ Adapter         = (*InjectAdapter)(nil)
 	_ TaskObserver    = (*InjectAdapter)(nil)
@@ -878,11 +880,12 @@ func TestInjectPostsTheWholeOfALongAnswer(t *testing.T) {
 	}
 }
 
-// TestOnlyTheInjectBackendObservesTasks: TaskObserver is an optional
-// extension, and the chat backends must stay outside it. If a chat adapter
-// ever implements it by accident, the gateway starts calling into it on every
-// task with no test covering what it does there.
-func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
+// TestWhichAdaptersObserveTasks: TaskObserver is an optional
+// extension. Discord and gchat stay outside it, and Slack is inside it for
+// one documented reason (TaskStarted marks session threads). If any other
+// chat adapter picks it up by accident, the gateway starts calling into it on
+// every task with no test covering what it does there.
+func TestWhichAdaptersObserveTasks(t *testing.T) {
 	discord := &DiscordAdapter{}
 	if _, ok := any(discord).(TaskObserver); ok {
 		t.Error("the Discord adapter implements TaskObserver; the gateway now calls into it untested")
@@ -896,6 +899,17 @@ func TestOnlyTheInjectBackendObservesTasks(t *testing.T) {
 	}
 	if _, ok := any(gchat).(InboundObserver); ok {
 		t.Error("the Google Chat adapter implements InboundObserver; the gateway now calls into it untested")
+	}
+	// The Slack adapter is the one chat backend that implements TaskObserver,
+	// for TaskStarted and TaskTerminal: a task starting in a thread is what makes the
+	// thread a session thread (SessionLookup). Pinned so the rule above is
+	// read as "Discord and gchat", not "every chat backend".
+	slackA := &SlackAdapter{}
+	if _, ok := any(slackA).(TaskObserver); !ok {
+		t.Error("the Slack adapter does not implement TaskObserver, so it can no longer learn which threads are session threads")
+	}
+	if _, ok := any(slackA).(InboundObserver); ok {
+		t.Error("the Slack adapter implements InboundObserver; the gateway now calls into it untested")
 	}
 	inject := &InjectAdapter{}
 	if _, ok := any(inject).(TaskObserver); !ok {

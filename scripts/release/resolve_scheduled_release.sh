@@ -12,8 +12,9 @@
 #
 #   1. A candidate has passed the gate — the newest staging_<ts>_<sha> tag,
 #      matched on its shape rather than its prefix. Skip.
-#   2. There is something to release: commits exist between the newest GA tag
-#      and that candidate's commit. Skip.
+#   2. There is something to release: commits exist between the GA release the
+#      candidate descends from (by ancestry, qualified against main's head) and
+#      that candidate's commit. Skip.
 #   3. On stable GA (>= 1.0.0), nothing in the range is a breaking change. HALT.
 #
 # Conditions 1 and 2 are green skips: nothing is published, the run stays green,
@@ -31,8 +32,8 @@
 # There is deliberately no weekday or elapsed-time check in here. The cron is
 # the cadence, so no wall-clock arithmetic exists anywhere in the decision, and
 # "has this candidate already been released?" needs no condition of its own:
-# if the newest GA tag points at the gated commit, condition 2's range is empty
-# and the skip already covers it. The state lives in the tags.
+# if the candidate's base GA tag was cut from the gated commit, condition 2's
+# range is empty and the skip already covers it. The state lives in the tags.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -150,7 +151,14 @@ LATEST_GA_TAG="$(get_latest_ga_tag)"
 # The picker reads main from the release repository in CI and fails when it
 # cannot; that failure has to leave through emit_and_exit like every other, or
 # the outputs the gate job declares are empty for the reader asking why.
-if ! GATE_TAG="$(get_latest_staging_tag)"; then
+# main is resolved once, here, and handed to both reads that need it: the
+# candidate pick and the base read below would otherwise each fetch it.
+if ! MAIN_TIP="$(release_main_tip)"; then
+  ERRORED="true"
+  SKIP_REASON="Could not read the tag graph against main — see the log."
+  emit_and_exit
+fi
+if ! GATE_TAG="$(get_latest_staging_tag "${MAIN_TIP}")"; then
   ERRORED="true"
   SKIP_REASON="Could not read the tag graph against main — see the log."
   emit_and_exit
@@ -163,6 +171,16 @@ fi
 if ! RELEASE_COMMIT="$(git rev-parse --verify "${GATE_TAG}^{commit}" 2>/dev/null)"; then
   ERRORED="true"
   SKIP_REASON="Gate tag '${GATE_TAG}' does not resolve to a commit."
+  emit_and_exit
+fi
+
+# The base is the candidate's own last release, by ancestry: with 0.7.1 cut on
+# release/0.7, the numerically highest tag is not main's base and condition 2
+# would name the wrong tag. Read once the candidate is known, in place of the
+# numeric read above that the no-candidate messages used.
+if ! LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RELEASE_COMMIT}" "" "${MAIN_TIP}")"; then
+  ERRORED="true"
+  SKIP_REASON="Could not read the GA base of the gate-passing commit ${RELEASE_COMMIT:0:7} — see the log."
   emit_and_exit
 fi
 

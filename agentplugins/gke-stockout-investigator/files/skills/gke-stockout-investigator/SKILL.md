@@ -101,18 +101,25 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    **Keep that whole line — every step from here works inside `workspace`.**
 
-   **If `prepare` refuses the branch name**, it is because an earlier
-   remediation pull request for this same workload was closed, or merged in a
-   way that did not carry its last revision into the base — a squash merge, the
-   ordinary setting on a GitOps repository. The name is one per workload, so a
-   repeat alert reaches this every time. Step 2's duplicate check has already
-   established that no pull request for this workload is open, so nothing is
-   being overwritten;
-   what is unknown is whether the forge still holds the branch, and no read verb
-   can say. Re-run the command with `--allow-reused-branch`, which says the
-   name is free; if the remote does still hold the branch, Step 7 refuses the
-   publish as `BRANCH_DIVERGED`, and the branch has to be deleted on the forge
-   before this workload can be remediated again. Report that and stop.
+   **A repeat alert reuses the name.** It is one per workload, so an earlier
+   remediation pull request for this workload that was closed or squash-merged
+   left its branch behind. `prepare` deletes that spent branch itself and says
+   so in its log; nothing is needed from you.
+
+   **If `prepare` refuses the branch name**, it names the code. `NOT_SPENT`:
+   the old branch holds revisions no closed pull request carried.
+   `BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
+   it has carried a full page of pull requests, too many to read, or an open
+   pull request targets it. Treat those
+   revisions as somebody's. Report the refusal, its code and the branch,
+   and stop. `BRANCH_MOVED` (something pushed to it just now), `OPEN_PROPOSAL` (a pull
+   request was opened on it just now; the next run adds to it), and
+   `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
+   not complete) all mean run `prepare` once more before reporting.
+   `FORGE_RATE_LIMITED` or `FORGE_UNAVAILABLE` (the forge turned the delete
+   away for now) means wait a few minutes, then run `prepare` once more.
+   Any other refusal: report it and stop. The helper's own message may suggest
+   another name; for this skill the name is fixed.
 
    **Do not put a suffix on the name to get past the refusal.** The duplicate
    check in Step 2 §A asks the forge about

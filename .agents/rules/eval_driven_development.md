@@ -25,7 +25,8 @@ secrets. For cases that read the seeded fleet, whether through `fixtures:` or by
 agent, is expected to have one. A stock install sandboxes the agent, which the harness's
 `kubectl port-forward` cannot reach; [`bench/README.md`](../../bench/README.md#sandboxed-installs)
 has the ways round that. There is no path around the loop: a pull request that changes agent
-behaviour without eval evidence is not ready for review.
+behaviour without eval evidence is not ready for review; being one change in a stack is not an
+exception, and "What does not count" says why.
 
 ## The loop
 
@@ -131,6 +132,17 @@ is this loop and nothing less:
 - A case run once, or a green you did not see. Three passing runs, observed.
 - A red you did not see. If you cannot run the case before the change, you do not know it tests
   the change.
+- A case deferred to another pull request in a stack, in either direction. The change merges with
+  this pull request, so the case merges with it. "The next one carries it" is a hand-off nobody has
+  accepted, and two bodies that each point at the other leave `main` holding a change no case
+  covers. No form of the hand-off survives: the sibling would have to merge first for the case to
+  reach `main` at all, and once it has, the case is registered there and step 1 is available to you
+  unchanged — run it red against that `main`, implement, green three times. So where the behaviour
+  genuinely cannot be observed until a sibling lands, the answer is merge order rather than a
+  hand-off. Wait for the sibling, then run the loop. Where the dependency runs both ways — neither
+  change observable without the other, so neither can merge first — they are one change and go in
+  one pull request that carries the case. The reviewer's thread stays open until this pull request
+  carries its own red.
 
 ## Finding a case
 

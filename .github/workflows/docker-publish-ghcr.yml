@@ -5,7 +5,7 @@ on:
     # Release lines too: a backport merged onto `release/<X.Y>` needs the
     # SHA-tagged images every rung of the release ladder checks for, and this is
     # the only workflow that publishes them. The pattern admits the line shape
-    # alone: not the per-release `release/<X.Y.Z>` branches the GA tagger pushes,
+    # alone: not the legacy per-release `release/<X.Y.Z>` branches of 0.1.0–0.7.0,
     # and not a misnamed `release/x`. Which release-branch pushes actually build
     # is the `decide` job's question. `:latest` still follows `main` alone; see
     # the `tags:` blocks below.

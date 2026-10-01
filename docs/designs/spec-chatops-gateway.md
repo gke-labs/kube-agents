@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either
 
 ## Purpose
 
@@ -507,8 +507,12 @@ than a compromise: it keeps a toy backend structurally incapable of asserting a 
 principal.
 
 Google Chat stays the supported production ingress, for the trust-domain reason above -
-it is the first real adapter, specified in its own section below. Slack follows when a
-customer asks, with the mapping table as a hard prerequisite.
+it is the first real adapter, specified in its own section below. ~~Slack follows when a
+customer asks, with the mapping table as a hard prerequisite.~~ **Update 9/4:** Slack did
+not wait for a customer to ask - it was resequenced against the order stated here and
+written ahead of gchat (which followed on 9/5), with the mapping table built as part of
+the card rather than left as a later chore. Both adapters now have a section below, and
+those sections are the design of record for each.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
@@ -517,7 +521,7 @@ that's a bug in the interface, and better to learn it on the throwaway backend.
 
 ### The inject backend (added 9/17)
 
-A third backend beside Discord and Google Chat, and the one with no human on the other end:
+A backend beside Discord, Google Chat and Slack, and the one with no human on the other end:
 an HTTP door into `handleInbound` for a program. It is the next-stack analogue of the door
 the eval harness uses today, which posts to the agent's own `/v1/responses` and bypasses chat
 entirely - a path identical under both modes, so a run through it says nothing about the stack
@@ -659,9 +663,11 @@ arrives while the first turn is still in flight. The id is unique per invocation
 never mistaken for a retry, and each status turn of the harness's delegation wait carries its own,
 `<run>/<case>/<rep>/status-<n>`, so the dedupe does not fold it into the opening task.
 
-The gateway tells the adapter a task's ends through an optional `TaskObserver` interface the
-chat backends do not implement: a human reads the chat, so rendered text is their whole
-interface, while a program must not have to parse `✅ **completed**` to know a task is over. The
+The gateway tells the adapter a task's ends through an optional `TaskObserver` interface that
+Discord and Google Chat do not implement: a human reads the chat, so rendered text is their
+whole interface, while a program must not have to parse `✅ **completed**` to know a task is
+over. (The Slack adapter implements it for one reason of its own, given in its section: a task
+starting or ending in a thread is what its session-thread cache keys on.) The
 start and the accept are separate calls because the id and the submission are different facts,
 as the refusal above turns on. The terminal says who declared it, which is the difference between
 an executor that failed, a task that never reached the bus, the supervisor's word about an
@@ -809,7 +815,9 @@ pulled event before handing it to the session manager. Acking after a durable pu
 would be at-least-once, but the redelivery dedupe is in-memory, so a redelivery
 racing a slow publish across a restart becomes a DUPLICATE task — a worse failure
 than a lost ask, which a user retries by typing again. It also matches the other
-backends' ingress semantics: the Discord and Slack websockets redeliver nothing.
+backends' ingress semantics closely enough: the Discord websocket redelivers nothing,
+and Slack's Socket Mode, which does redeliver unacked envelopes, carries its own
+in-adapter dedupe ring for exactly that (the Slack section below).
 
 **Coexistence is by activation, not routing.** `mode: next` is additive, so a next
 install still runs the legacy chat consumer. A topic fans out to every subscription:
@@ -888,17 +896,111 @@ email to the immutable `users/{id}` it learned from that person's own event, whi
 `findDirectMessage` does accept; a person who has never spoken cannot be opened. Ships
 as the primitive, unused, like the other backends.
 
+## The Slack adapter (added 9/4)
+
+The mapped-identity adapter behind the five-operation interface, built ahead of gchat
+and the first backend with a real identity join - gchat needs none, since the email it
+asserts is already the principal. Transport is Socket Mode - an outbound websocket, so no inbound endpoint
+on the cluster and no ingress to secure, the same property that made Discord cheap. The
+existing `SlackSpec` already carries the two Secret refs Socket Mode needs (bot token
+for the Web API, app token for the socket).
+
+**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
+threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
+channel mention binds the session to the mention message's own ts as thread root, with
+no thread-creation failure mode to handle. Session semantics are unchanged: the whole
+DM is one conversation, a channel is not a session, a thread in it is.
+
+**Which messages become turns.** DMs carry every message. A channel message must
+mention the bot, and the ask's own ts is the thread the session will live in. A thread
+reply is a turn when it mentions the bot or the thread is a session thread - one the
+gateway has started a task in. That is what lets a session thread carry every message
+(the Discord parity) without making every thread in a joined channel a session. A
+thread becomes a session thread only when the gateway starts a task in it - a verified
+sender's mentioned ask, in the channel or in someone else's thread - and the adapter
+learns that from the gateway's `TaskStarted` and, on a cache miss, from the session
+registry, which it asks whether a task has started in that thread (a record alone is
+not enough, since one is minted for any verified turn, a "stop" with nothing running
+included). Nothing is derived from the root message. A mention on its own starts
+nothing and makes nothing a session thread, whoever typed it, so a channel mention from
+a sender the principal map refuses roots nothing. A session thread stays one while a
+task runs there or the session has had activity within the idle TTL; past that, the
+thread needs a fresh mention. The activity that counts is the last task's own: its start,
+and an executor's terminal for it, so the window opens at the answer, not at the ask that
+started a long task. A verified turn that starts nothing (a "stop" with nothing running) moves
+the reap's clock but not this one, and the reap's own supervisor terminal moves neither. The
+bound is activity, not the record: the session record
+outlives the reap (which deletes the idle pod and keeps the record), so the registry
+answers from the active task and the last activity, hands back the bound its answer
+holds to, and the adapter expires its cached answer on that bound - the registry's own,
+not a TTL of its own counting - and asks again. Two subtypes count as turns besides
+plain messages: `thread_broadcast` (a
+thread reply with "also send to channel" checked - dropping it would eat a steer
+silently) and `file_share` (an ask with an attachment). Everything else drops in the
+adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs
+(mpim) are group spaces here, not DMs - they have threads, so the mention affordance
+applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The bot
+only sees channels it has been invited to, so the invitation is the trust boundary for
+group ingress.
+
+**The mapping table - where it lives and who writes it.** The join is Slack's immutable
+`user_id` against a table sourced from our own IdP; never `profile.email` (the identity
+section above says why). The table is a Kubernetes Secret, mounted read-only at the
+gateway's principal-map path, same file format the Discord ConfigMap uses.
+`a2a-slack-principal-map` is the name for the hand-made Secret today and the one the
+future `principalMapSecretRef` render binds - nothing in-tree creates it yet, like the
+rest of the gateway's env. A Secret rather than a ConfigMap because a
+write to this table grants a principal - it is an impersonation primitive, and it holds
+emails besides. Write access is the install admin's, through the install path. No
+product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
+it, so nothing an agent can be talked into doing edits its own identity table. When the
+W6 rendering series reaches the gateway, the operator renders the mount from a
+`principalMapSecretRef` on `spec.integration.slack`, which makes write authority "may
+write the PlatformAgent CR" and puts changes in the API server audit log. Generating
+the Secret's content from the IdP is a job we do not build yet; until it exists the
+table is maintained by hand, which is honest at the current install count.
+
+**Unmapped senders.** Dropped at ingress, as everywhere - but visibly now: the gateway
+posts a one-line notice to the conversation, once per sender, and keeps the structured
+log line. A silent drop of a real user is a support burden. Per sender, not per
+conversation - a channel mention mints a fresh conversation every time, so a
+conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
+wholesale at the cap, so the worst an unverified sender can do is make one notice
+repeat. This is gateway behavior, not Slack behavior, so Discord and Google Chat get
+it too - the notice names the remedy for whichever backend it fires on (the principal
+map here, the allowed-users list on gchat).
+
+**Roster.** Channel membership via the members API, one page; past a page the roster
+reports incomplete rather than paging (the roster cap truncates far below it anyway).
+Slack has no per-thread membership, and anyone in the channel can read the thread, so
+channel membership is the honest answer to "who could have read this."
+
+**One backend per gateway process.** The relay binds one durable, and two gateways on
+one durable split event deliveries - so config counts the armed backends and refuses
+any combination but exactly one: a Slack pair, a Discord token, and a gchat relay URL
+are mutually exclusive, and none of the three is also a refusal. A second backend is a
+second Deployment with its own durable, when we want one. The inject side door is not
+in that count - it may sit beside any one of the three, for the reason the inject
+section gives.
+
+`verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
+the socket and asserted the `user_id`, our table joined it to a principal. Rendering
+into mrkdwn is a narrow deterministic translation of the two forms the relay emits
+(bold, links); the legacy Hermes converter stays where it is. Everything posted is
+escaped first (`&`, `<`, `>`) - relayed text is executor-authored, ie model output,
+and an unescaped `<!channel>` in a result would ping the room.
+
 ## What stage 2 builds from this doc
 
-- The gateway: Discord and Google Chat adapters, session manager (spawn / stream / reap / rehydrate /
-  sweep), bus client, KV session registry.
+- The gateway: Discord, Google Chat and Slack adapters, session manager (spawn / stream
+  / reap / rehydrate / sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
 - The `authority` block, populated at ingress, advisory.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, the slack adapter, `grants`,
-and anything that makes `authority` decision-grade. (The gchat adapter was on this
-list until 9/5; it now has its own section above.)
+Not in stage 2: the classifier, the LCD permissions tool, `grants`, and anything that
+makes `authority` decision-grade. (The gchat and slack adapters were on this list until
+9/5 and 9/4 respectively; each now has its own section above.)
 
 ## Inherited from the kanban retirement (added 8/24)
 
