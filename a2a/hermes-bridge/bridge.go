@@ -726,7 +726,6 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	// The activity door's side of this task: a signing key in the child's
 	// environment when the door is open, and the heartbeat either way.
 	act := newActivityState(b.activityLn != nil, b.cfg.ActivityInputValues)
-	var err error
 	if b.activityLn != nil {
 		scope, err := b.childManagedScope(taskID)
 		if err != nil {
@@ -774,7 +773,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		}
 		run.mu.Unlock()
 	})
-	err = cmd.Wait()
+	err := cmd.Wait()
 	deadline.Stop()
 	// The group is gone; stop any armed grace-period SIGKILLs before the
 	// pgid can be recycled onto an innocent process.

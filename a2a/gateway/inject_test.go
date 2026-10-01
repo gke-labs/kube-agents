@@ -3651,6 +3651,21 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"tool":"terminal"`) || !strings.Contains(string(out), `"input":{"command":"ls"}`) || strings.Contains(string(out), `"truncated"`) {
 		t.Fatalf("bulk outside the input: the input must stay and claim no cut: %d bytes %s", len(out), out[:min(len(out), 200)])
 	}
+	// Inside the wrapper, a key beside calls and an element that is not a
+	// named call are kept when small and said as a stand-in when not, so
+	// nothing leaves the input unaccounted for.
+	beside := json.RawMessage(`{"tool":"tool_call","input":{"mode":"parallel","note":"` + big + `","calls":[{"name":"a","arguments":{"body":"` + big + `"}},"` + big + `",{"id":3}]},"status":"completed"}`)
+	out = capActivityEntry(beside)
+	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"mode":"parallel"`) || !strings.Contains(string(out), `"note":{"bytes":`+strconv.Itoa(len(big)+2)+`,"head":"","truncated":true}`) || !strings.Contains(string(out), `{"id":3}`) || !strings.Contains(string(out), `"name":"a"`) || strings.Count(string(out), `"truncated":true`) != 3 {
+		t.Fatalf("wrapper input beside the calls not accounted for: %d bytes %s", len(out), out[:min(len(out), 400)])
+	}
+	// A calls array under any other tool is not the wrapper: the whole
+	// input is the stand-in, with the input's size.
+	notWrapper := json.RawMessage(`{"tool":"batch","input":{"calls":[{"name":"a","arguments":{"body":"` + big + `"}}]},"status":"completed"}`)
+	out = capActivityEntry(notWrapper)
+	if len(out) > injectMaxEntryBytes || strings.Contains(string(out), `"name":"a"`) || !strings.Contains(string(out), `"input":{"bytes":`) {
+		t.Fatalf("non-wrapper calls array kept: %s", out[:min(len(out), 200)])
+	}
 	// A nested call's bulk under a key other than arguments is cut and said.
 	otherKey := json.RawMessage(`{"tool":"tool_call","input":{"calls":[{"name":"x","input":{"body":"` + big + `"}}]},"status":"completed"}`)
 	out = capActivityEntry(otherKey)

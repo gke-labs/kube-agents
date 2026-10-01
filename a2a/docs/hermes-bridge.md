@@ -332,8 +332,10 @@ same key, so none is attempted and no string value rides the trace under any key
 the values after the scrub described next, for a debug install that wants them, and is where
 the scrub's best-effort reach matters. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
 large file write is a few MiB); a larger one is refused and logged, and since the cut body cannot
-be verified the call it was for is absent from the trace with nothing counting it, the one loss
-the `activity-budget` marker does not see. In either mode `input` is capped (2 KiB): over the cap it becomes
+be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
+over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
+small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
+terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. In either mode `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Values under keys with `token`, `secret`, `password`, `passwd`, `authorization`,

@@ -1091,9 +1091,11 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, activityBodyCap+1))
 	if err != nil || len(body) > activityBodyCap {
 		// Cut at the cap, so the signature cannot verify and the task is
-		// not known here; the call this was for is absent from the trace
-		// (its pre, if it arrived, ends interrupted). Said in the log, since
-		// nothing else can say it.
+		// not known here. The usual over-size delivery is a post_tool_call
+		// (it carries the result), whose small pre arrived and opened the
+		// call, so the call ends interrupted at the terminal though the
+		// tool finished; an over-size pre leaves the call absent. Said in
+		// the log, since nothing else can say it.
 		b.cfg.Logger.Warn("activity delivery refused: over the body cap or unreadable", "bytes", len(body), "cap", activityBodyCap, "err", err)
 		w.WriteHeader(http.StatusNoContent)
 		return

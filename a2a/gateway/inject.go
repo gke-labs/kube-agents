@@ -184,8 +184,12 @@ const (
 	injectMaxEntryToolBytes  = 256
 	injectMaxEntryFieldBytes = 128
 	// injectMaxNestedCallBytes is how much of a nested call beside its name
-	// an over-size wrapper keeps verbatim before it becomes a stand-in.
+	// (and of anything else inside the wrapper's input) an over-size
+	// wrapper keeps verbatim before it becomes a stand-in.
 	injectMaxNestedCallBytes = 128
+	// injectWrapperTool is hermes's tool_call wrapper, the one entry whose
+	// input the probe's cap reads into rather than replaces whole.
+	injectWrapperTool = "tool_call"
 	// injectMaxActivityEntries bounds the trace a probe carries: the read
 	// route runs before and after every wait on the harness's hot loop, and
 	// a long run's trace would otherwise ride every poll whole. The newest
@@ -1938,63 +1942,84 @@ func capActivityEntry(raw json.RawMessage) json.RawMessage {
 			return out
 		}
 	}
-	// The input is the bulk. A wrapper keeps its nested names, each call's
-	// arguments replaced by the bridge's own stand-in shape with that call's
-	// size; any other input becomes the stand-in with the input's own size.
-	inputSize := 0
-	if b, err := json.Marshal(entry["input"]); err == nil {
-		inputSize = len(b)
-	}
-	names := []any{}
-	if in, ok := entry["input"].(map[string]any); ok {
+	// The input is the bulk. The tool_call wrapper keeps its nested names,
+	// each call's arguments replaced by the bridge's own stand-in shape with
+	// that call's size, and everything else inside it (a key beside calls,
+	// an element that is not a named call) kept when small and a stand-in
+	// of its own size otherwise, so every cut is said; any other input
+	// becomes the stand-in with the input's own size.
+	rawInput := entry["input"]
+	stand := map[string]any{"truncated": true, "bytes": marshalLen(rawInput), "head": ""}
+	entry["input"] = stand
+	tool, _ := entry["tool"].(string)
+	if in, ok := rawInput.(map[string]any); ok && tool == injectWrapperTool {
 		if calls, ok := in["calls"].([]any); ok {
-			for _, c := range calls {
-				if m, ok := c.(map[string]any); ok {
-					if n, ok := m["name"].(string); ok {
-						// Everything of the call but its name is cut, under
-						// whatever key it sat, and the stand-in says how much;
-						// a call whose other keys are small (an empty
-						// arguments object, an id) keeps them, since there is
-						// nothing to cut.
-						call := map[string]any{"name": n}
-						size := 0
-						for k, v := range m {
-							if k == "name" {
-								continue
-							}
-							if b, err := json.Marshal(v); err == nil {
-								size += len(b)
-							}
-						}
-						if size > injectMaxNestedCallBytes {
-							call["arguments"] = map[string]any{"truncated": true, "bytes": size, "head": ""}
-						} else {
-							for k, v := range m {
-								call[k] = v
-							}
-						}
-						names = append(names, call)
-					}
+			kept := make(map[string]any, len(in))
+			for k, v := range in {
+				if k != "calls" {
+					kept[k] = smallOrStandIn(v)
 				}
 			}
+			names := make([]any, 0, len(calls))
+			for _, c := range calls {
+				m, isObject := c.(map[string]any)
+				n, named := m["name"].(string)
+				if !isObject || !named {
+					names = append(names, smallOrStandIn(c))
+					continue
+				}
+				// Everything of the call but its name is cut, under
+				// whatever key it sat, and the stand-in says how much;
+				// a call whose other keys are small (an empty
+				// arguments object, an id) keeps them, since there is
+				// nothing to cut.
+				call := map[string]any{"name": n}
+				size := 0
+				for k, v := range m {
+					if k != "name" {
+						size += marshalLen(v)
+					}
+				}
+				if size > injectMaxNestedCallBytes {
+					call["arguments"] = map[string]any{"truncated": true, "bytes": size, "head": ""}
+				} else {
+					for k, v := range m {
+						call[k] = v
+					}
+				}
+				names = append(names, call)
+			}
+			kept["calls"] = names
+			entry["input"] = kept
 		}
-	}
-	stand := map[string]any{"truncated": true, "bytes": inputSize, "head": ""}
-	if len(names) > 0 {
-		entry["input"] = map[string]any{"calls": names}
-	} else {
-		entry["input"] = stand
 	}
 	if out, err := json.Marshal(entry); err == nil && len(out) <= injectMaxEntryBytes {
 		return out
 	}
 	// Still over (very many nested names): the tool and the stand-in alone.
-	tool, _ := entry["tool"].(string)
 	out, err := json.Marshal(map[string]any{"tool": tool, "input": stand})
 	if err != nil {
 		return raw[:0]
 	}
 	return out
+}
+
+// marshalLen is the JSON size of v, 0 when it does not marshal.
+func marshalLen(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
+
+// smallOrStandIn keeps v when its JSON is at most injectMaxNestedCallBytes
+// and replaces it with a stand-in of its size otherwise.
+func smallOrStandIn(v any) any {
+	if n := marshalLen(v); n > injectMaxNestedCallBytes {
+		return map[string]any{"truncated": true, "bytes": n, "head": ""}
+	}
+	return v
 }
 
 // injectConversationKey validates a caller's conversation id and prefixes it.
