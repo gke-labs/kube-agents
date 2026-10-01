@@ -68,9 +68,12 @@
 # Within a job the accumulation is graded as such since #2016 step 3: the
 # skill reuses the branch, so a later rep with the same fix pushes nothing
 # and links the earlier rep's pull request; pull_request_opened passes that
-# as an in-job sibling (opened by a [bot] login in the leased *-infra
-# repository at or after this job's lease window began, open or merged) and
-# says so in the reason,
+# as an in-job sibling (opened by a [bot] login on a platform-agent/ branch
+# in the leased *-infra repository itself at or after this job's lease
+# window began, open or merged; another App's or a fork's is not) and says
+# so in the reason, without being able to tell a rep that did the same work
+# from one that did none and linked the sibling (the cost #2016 step 3
+# accepts for the pdb seat),
 # where a rep that pushed passes as own-head-commit. A pull request from an
 # earlier lease -- before the window -- still fails, as #1832 intends.
 #
@@ -125,8 +128,12 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on
-      # the PR an earlier rep opened. This resolves the URL and reads the head
-      # commit, so a rep that only quoted an earlier rep's PR fails.
+      # the PR an earlier lease left behind. This resolves the URL and reads
+      # the head commit; a rep passes on its own push (own-head-commit) or,
+      # since #2016 step 3, on the PR an earlier rep of the same job opened
+      # in the leased repository (in-job-sibling; the accumulation paragraph
+      # above says what that rule reads and what it cannot). A leftover from
+      # before this job's lease window still fails.
       type: pull_request_opened
       # Closes the TODO this check carried: the repositories are decided.
       owner: gke-agentic

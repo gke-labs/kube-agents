@@ -2141,6 +2141,8 @@ def _pr_payload(
         "user": {"login": _AGENT_LOGIN},
     }
     body["pull_request" if as_issue else "head"] = {"ref": "platform-agent/fix"}
+    if not as_issue:
+        body["head"]["repo"] = {"full_name": f"gke-agentic/{_PR_REPO}"}
     return body
 
 
@@ -2156,9 +2158,13 @@ def _pr_head_routes(
     *,
     changed_files: int = 3,
     repo: str = _PR_REPO,
+    head_ref: str = "platform-agent/fix",
+    head_repo: str | None = None,
 ) -> None:
     """Route the reads `_head_push` makes: the pulls payload for the file count
-    and the page of the commit listing the head sits on."""
+    and the page of the commit listing the head sits on. The head is the
+    agent's unless a test says otherwise: a `platform-agent/` branch in the
+    repository itself, which is what the sibling rule's second half reads."""
     pulls = _pr_api("pulls", repo=repo)
     github.routes[pulls] = (
         200,
@@ -2166,7 +2172,11 @@ def _pr_head_routes(
             "number": 7,
             "changed_files": changed_files,
             "commits": 1,
-            "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA},
+            "head": {
+                "ref": head_ref,
+                "sha": _PR_HEAD_SHA,
+                "repo": {"full_name": f"gke-agentic/{head_repo or repo}"},
+            },
         },
     )
     github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
@@ -2823,6 +2833,60 @@ def test_a_pull_request_a_person_opened_in_the_window_is_not_a_sibling(token, gi
     assert res.status == "fail", res.reason
     assert "opened by jayantid, not a [bot] login" in res.reason
     assert "not an in-job sibling" in res.reason
+
+
+def test_another_app_s_pull_request_in_the_window_is_not_a_sibling(token, github, lease):
+    """A [bot] login is any App's. Dependabot, a workflow or another App
+    installed on the repository can open a pull request in the leased
+    repository inside the window; the agent's are the ones on a
+    platform-agent/ branch in the repository itself, as the pool sweep and
+    github_writes decide it, and a rep that links another App's fails naming
+    the branch."""
+    _stash_pr_report()
+    _sibling_routes(
+        github,
+        state={"user": {"login": "dependabot[bot]"}},
+        head_ref="dependabot/terraform/google-7.1.0",
+    )
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "its head branch dependabot/terraform/google-7.1.0 is not under platform-agent/" in res.reason
+    assert "another App's pull request and not an in-job sibling" in res.reason
+
+
+def test_an_agent_branch_in_a_fork_is_not_a_sibling(token, github, lease):
+    """The prefix alone is a name anyone can use on a fork; the agent pushes
+    to the repository itself."""
+    _stash_pr_report()
+    _sibling_routes(github, head_repo="someone-else-fork")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert f"its head gke-agentic/someone-else-fork:platform-agent/fix is not in gke-agentic/{_PR_REPO} itself" in res.reason
+
+
+def test_a_pulls_payload_with_no_head_is_not_a_sibling(token, github, lease):
+    """An observation the API would not give is not evidence that the pull
+    request is the agent's."""
+    _stash_pr_report()
+    _sibling_routes(github)
+    pulls = _pr_api("pulls")
+    status, body = github.routes[pulls]
+    github.routes[pulls] = (status, {k: v for k, v in body.items() if k != "head"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "its head branch ? is not under platform-agent/" in res.reason
+
+
+def test_another_app_s_pull_request_still_passes_on_its_own_head_commit(token, github, lease):
+    """The head test narrows the second rule only: a pull request written and
+    pushed during this run passes under the first, whoever opened it, as a
+    person's does."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(_SIBLING_OPENED, "2026-08-21T09:04:00Z") | {"user": {"login": "dependabot[bot]"}})
+    _pr_head_routes(github, "2026-08-21T09:03:50Z", head_ref="dependabot/terraform/google-7.1.0")
+    res = _pr_check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("own-head-commit: ")
 
 
 def test_a_pull_request_with_no_author_is_not_a_sibling(token, github, lease):

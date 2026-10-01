@@ -30,12 +30,18 @@
 # 1's open pull request with the fix already on it and push nothing (the
 # seat's second live run read 1/3 on exactly that). pull_request_opened
 # passes a repetition either on its own head commit (#1832's rule) or on a
-# pull request in the leased *-infra repository opened by a [bot] login at
-# or after this job's lease window began and open or merged -- this job's
-# own, since the project is leased to no one else -- and names which in the
-# reason (own-head-commit / in-job-sibling). A pull request an earlier lease
-# left behind, one in another repository, one a person opened, or one closed
-# unmerged still fails.
+# pull request in the leased *-infra repository opened by a [bot] login on a
+# platform-agent/ branch in the repository itself (the agent's, as the pool
+# sweep decides it) at or after this job's lease window began and open or
+# merged -- this job's own, since the project is leased to no one else -- and
+# names which in the reason (own-head-commit / in-job-sibling). A pull
+# request an earlier lease left behind, one in another repository, one a
+# person or another App opened, one on a fork, or one closed unmerged still
+# fails. What the sibling rule cannot see is whether this repetition did the
+# work: a rep that produced no fix and links its sibling's pull request
+# passes as a sibling too; that cost is accepted for the seat (#2016 step 3)
+# because the first rule would fail the correct no-push rep, and the record
+# names the rule so the two can be counted apart.
 # Then step 4 adds the roster line and takes remediation off
 # the allowlist (docs/eval-gate-roster.md has the entry). Measured before
 # the 2026-09-15 move: 7/9 across three presubmit
@@ -135,8 +141,12 @@ verification_spec:
     mode: assert
     check:
       # Not report_contains: a substring passes on an invented URL, and on
-      # the PR an earlier rep opened. This resolves the URL and reads the head
-      # commit, so a rep that only quoted an earlier rep's PR fails.
+      # the PR an earlier lease left behind. This resolves the URL and reads
+      # the head commit; a rep passes on its own push (own-head-commit) or,
+      # since #2016 step 3, on the PR an earlier rep of the same job opened
+      # in the leased repository (in-job-sibling; the header says what that
+      # rule reads and what it cannot). A leftover from before this job's
+      # lease window still fails.
       type: pull_request_opened
       # gke-agentic/<project>-infra on every pool project, so the org half is a
       # fair exact match and breaks loudly if the org moves.

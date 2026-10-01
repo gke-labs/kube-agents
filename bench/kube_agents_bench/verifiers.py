@@ -1425,14 +1425,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
       (``EVAL_LEDGER_REPO``), was created at or after this job's lease window
       began (``EVAL_LEASE_STARTED_AT``, the same skew allowed), was opened by
       a ``[bot]`` login (``PR_BOT_LOGIN_SUFFIX``: an App's, as the agent
-      writes; not a person's), and is open or merged. The skill derives the
+      writes; not a person's) on a head branch under ``AGENT_BRANCH_PREFIX``
+      in the repository itself (the agent's, as the pool sweep and
+      ``github_writes`` recognise it; not another App's, not a fork's), and
+      is open or merged. The skill derives the
       branch from the change, so once repetition 1's fix is on it,
       repetitions 2 and 3 of the same job push nothing, ``gh pr create``
       answers "already exists", and the skill hands back repetition 1's
       URL: correct work with no commit of its own, the 1/3 the held-out
       seat's second live run read (#2016 step 3). The
       project is leased to no one else during the window, so a pull request
-      an App opened inside it in that repository is this job's; one opened
+      the agent opened inside it in that repository is this job's; one opened
       before it is an earlier lease's leftover and fails exactly as #1832
       intends. The window is the job's, not the case's: every PR-writing
       case in a nightly shares it and writes as the same App, so which case
@@ -1800,6 +1803,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
     ) -> str | None:
         """Why a pull request is NOT an in-job sibling, or None when it is one.
 
+        The first half of the test, from the issues payload; the head's half
+        is :meth:`_not_agent_head`, asked once the pulls payload is read.
         Four answers, each a clause the rejection can carry: no lease window
         in the environment; a repository other than the leased one (nobody's
         sibling, whatever its dates); an author that is not a ``[bot]`` login
@@ -1829,6 +1834,35 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"opened at {created.isoformat()}, {early:.0f}s before this job's "
                 f"lease window began ({lease_start.isoformat()}), so an earlier "
                 "lease's leftover and not an in-job sibling"
+            )
+        return None
+
+    @staticmethod
+    def _not_agent_head(pull: dict, owner: str, repo: str) -> str | None:
+        """Why the pull request's head is NOT the agent's, or None when it is.
+
+        The second half of the sibling test, asked once the pulls payload is
+        in hand (the issues payload carries no head). A ``[bot]`` login alone
+        is any App's: Dependabot, a workflow, another App installed on the
+        repository. The agent's pull requests are the ones the pool sweep and
+        ``github_writes`` recognise as its: a head branch under
+        ``AGENT_BRANCH_PREFIX`` (the prefix ``forge.py`` gives every agent
+        branch) in the repository itself, not a fork. A payload with no head
+        is nobody's: an observation the API would not give is not evidence.
+        """
+        head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+        ref = str(head.get("ref") or "")
+        head_repo = str((head.get("repo") or {}).get("full_name") or "")
+        if not ref.startswith(github_writes.AGENT_BRANCH_PREFIX):
+            return (
+                f"its head branch {ref or '?'} is not under {github_writes.AGENT_BRANCH_PREFIX}, "
+                "the prefix every agent branch carries, so another App's pull request "
+                "and not an in-job sibling"
+            )
+        if head_repo.lower() != f"{owner}/{repo}".lower():
+            return (
+                f"its head {head_repo or '?'}:{ref} is not in {owner}/{repo} itself, so "
+                "not a pull request the agent pushed and not an in-job sibling"
             )
         return None
 
@@ -1972,6 +2006,20 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if unevaluable:
                 unresolved.append(unevaluable)
                 continue
+            # The sibling test's second half needs the pulls payload, which
+            # is in hand only now: the login said an App, the head says
+            # whether it is the agent's. A candidate the first half already
+            # rejected keeps that reason.
+            if not_sibling is None:
+                not_sibling = self._not_agent_head(pull or payload, owner, repo)
+                if not_sibling and stale_write:
+                    rejected.append(
+                        f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
+                        f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                        "an earlier run opened, which this run either quoted or "
+                        f"resubmitted unchanged; {not_sibling}"
+                    )
+                    continue
             if changed == 0:
                 rejected.append(
                     f"{slug}: changes no files, so it carries no proposed fix"
