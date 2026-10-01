@@ -119,8 +119,9 @@ const (
 	// nulls and the structure stay.
 	InputValuesShape = "shape"
 	InputValuesFull  = "full"
-	// activityInputCap bounds one call's redacted input on the bus; it is the
-	// tool_call_audit plugin's own _PAYLOAD_LOG_LIMIT.
+	// activityInputCap bounds one call's input on the bus: two KiB, enough
+	// for any argument object a grader would read and small beside the
+	// stream's per-message ceiling.
 	activityInputCap = 2048
 	// activityInputHead is how much of an over-cap input survives, as text.
 	activityInputHead = 1024
@@ -305,7 +306,7 @@ var (
 	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`)
 	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
 	// the userinfo alone goes, the scheme and host around it stay.
-	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]+:[^\s/@]+(@)`)
+	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]*:[^\s/@]+(@)`)
 	// A Cookie or Set-Cookie header by its key: the rest of the line, the
 	// character before the key kept.
 	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
@@ -321,11 +322,12 @@ var shapeKeptKeys = map[string]bool{
 }
 
 // shapeKeptValuePattern is the shape a kept value must have to survive:
-// one identifier, no whitespace, no quotes, at most shapeKeptValueMax
-// characters. A manifest body under "name", a token-length blob, anything
-// with a space in it is shaped like every other string, so the kept keys
-// are a list of places identifiers live and not a hole.
-var shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z0-9._/:@-]+$`)
+// one identifier, no whitespace, no quotes, no ':' or '@' (a user:pass@host
+// is neither), at most shapeKeptValueMax characters. A manifest body under
+// "name", a token-length blob, anything with a space in it is shaped like
+// every other string, so the kept keys are a list of places identifiers
+// live and not a hole.
+var shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
 const shapeKeptValueMax = 128
 
@@ -1041,7 +1043,9 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if entry, ok := act.observe(d); ok {
 		if run.state == stateRunning {
 			if act.underBudget() {
-				b.publishActivityEntry(run, entry)
+				if !b.publishActivityEntry(run, entry) {
+					act.countDropped(1)
+				}
 			}
 		} else {
 			b.cfg.Logger.Warn("activity delivery after the terminal; dropped", "task", run.origin.TaskID, "tool", entry.Tool)
@@ -1118,8 +1122,8 @@ func (b *Bridge) drainActivity(run *taskRun) {
 			b.cfg.Logger.Warn("activity drain budget spent; interrupted calls not all reported", "task", run.origin.TaskID, "unreported", len(open)-i)
 			break
 		}
-		if a.underBudget() {
-			b.publishActivityEntry(run, e)
+		if a.underBudget() && !b.publishActivityEntry(run, e) {
+			a.countDropped(1)
 		}
 	}
 	// The marker is what tells a reader the trace is short; it goes out

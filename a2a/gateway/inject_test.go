@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3635,6 +3636,11 @@ func TestCapActivityEntryKeepsToolAndNestedNames(t *testing.T) {
 	out := capActivityEntry(wrapper)
 	if len(out) > injectMaxEntryBytes || !strings.Contains(string(out), `"name":"kanban_create"`) || !strings.Contains(string(out), `"name":"kanban_list"`) || strings.Contains(string(out), big[:64]) {
 		t.Fatalf("wrapper cap: %d bytes %s", len(out), out[:min(len(out), 200)])
+	}
+	// The cut is said per call: the large call's arguments is the bridge's
+	// stand-in shape with its size, the argument-less call stays so.
+	if !strings.Contains(string(out), `"arguments":{"bytes":`+strconv.Itoa(len(`{"body":"`+big+`"}`))+`,"head":"","truncated":true}`) || strings.Contains(string(out), `"name":"kanban_list","arguments"`) {
+		t.Fatalf("wrapper cap carries no per-call marker: %s", out[:min(len(out), 300)])
 	}
 	bulky := json.RawMessage(`{"tool":"terminal","input":{"command":"ls"},"callId":"` + big + `","status":"completed"}`)
 	out = capActivityEntry(bulky)

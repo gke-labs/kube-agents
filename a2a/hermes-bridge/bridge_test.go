@@ -126,6 +126,12 @@ func startBridgeWith(t *testing.T, url string, command []string, concurrency int
 // and Run.
 func startBridgeConfig(t *testing.T, cfg Config, mutate func(*Bridge)) (*Bridge, context.CancelFunc) {
 	t.Helper()
+	// A scratch dir of the test's own: the default is the host's shared
+	// $TMPDIR/hermes-bridge, which the start-time sweep would clear under
+	// any other bridge on the machine.
+	if cfg.ScratchDir == "" {
+		cfg.ScratchDir = t.TempDir()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	b, err := New(ctx, cfg)
 	if err != nil {

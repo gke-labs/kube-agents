@@ -1889,19 +1889,31 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 
 // capActivityEntry replaces an over-size activity entry with a stand-in that
 // keeps what a grader reads (the tool, and a tool_call wrapper's nested
-// names) and says the input was cut, in the bridge's own stand-in shape.
+// names) and says what was cut, in the bridge's own stand-in shape: the
+// whole input for an ordinary entry, each call's arguments for a wrapper.
 func capActivityEntry(raw json.RawMessage) json.RawMessage {
 	var entry map[string]any
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		return json.RawMessage(`{"tool":"","input":{"truncated":true,"bytes":` + strconv.Itoa(len(raw)) + `,"head":""}}`)
 	}
+	// A wrapper keeps its nested names, each call's arguments replaced by
+	// the bridge's own stand-in shape with that call's size, so a reader
+	// sees the cut per call rather than a wrapper of argument-less calls.
 	names := []any{}
 	if in, ok := entry["input"].(map[string]any); ok {
 		if calls, ok := in["calls"].([]any); ok {
 			for _, c := range calls {
 				if m, ok := c.(map[string]any); ok {
 					if n, ok := m["name"].(string); ok {
-						names = append(names, map[string]any{"name": n})
+						call := map[string]any{"name": n}
+						if args, has := m["arguments"]; has {
+							size := 0
+							if b, err := json.Marshal(args); err == nil {
+								size = len(b)
+							}
+							call["arguments"] = map[string]any{"truncated": true, "bytes": size, "head": ""}
+						}
+						names = append(names, call)
 					}
 				}
 			}
