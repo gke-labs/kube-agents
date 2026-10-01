@@ -1823,7 +1823,7 @@ class WatchedPeriodics(RunHarness):
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
         clean["periodics_runs"] = {self.WEEKLY: {"build": "104", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "3 applied, 9 unchanged"}}
         self.tick(clean, T14 + timedelta(hours=3))
-        self.assertEqual(self.opener.texts[-1], "✅ *Eval seeded fleet: planted defects are being re-applied again.* Its 12:40 PM ET run (build 104): 3 applied, 9 unchanged.")
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval seeded fleet: planted defects are being re-applied again.* `ci-kube-agents-fleet-reconcile-all`'s 12:40 PM ET run (build 104): 3 applied, 9 unchanged.")
         self.assertEqual(self.recorded()["periodics_told"], {})
         self.assertEqual(self.gh.writes(), [], "nothing is filed for a periodic")
 
@@ -1932,7 +1932,7 @@ class WatchedPeriodics(RunHarness):
         clean["periodics"], clean["periodics_read"] = {}, [sweep]
         clean["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"}}
         self.tick(clean, T14 + timedelta(minutes=15))
-        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* Its 9:50 AM ET run (build 101): closed 241 pull request(s) across 12 project(s).")
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* `ci-kube-agents-pull-sweep`'s 9:50 AM ET run (build 101): closed 241 pull request(s) across 12 project(s).")
 
     def test_a_read_failed_build_under_the_threshold_is_not_a_recovery(self):
         # The sweep's first failed check writes no note; read and not noted is
@@ -1952,7 +1952,7 @@ class WatchedPeriodics(RunHarness):
         passed["periodics"], passed["periodics_read"] = {}, [sweep]
         passed["periodics_runs"] = {sweep: {"build": "102", "finished_at": "2026-09-14T14:00:00+00:00", "passed": True, "summary": None}}
         self.tick(passed, T14 + timedelta(minutes=30))
-        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* Its 10:00 AM ET run (build 102) finished clean.")
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* `ci-kube-agents-pull-sweep`'s 10:00 AM ET run (build 102) finished clean.")
 
     def test_the_digest_carries_a_line_per_noted_job(self):
         doc = health("GREEN")

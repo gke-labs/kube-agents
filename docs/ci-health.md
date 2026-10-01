@@ -389,7 +389,9 @@ threshold could never fire before the run's; the per-project counts name, in
 the message, the projects that failed in this check and the ones before it.
 The counts are `periodics_streaks` in `health.json`, advanced once per newly
 read build and carried across ticks; a failed build that did not reach a
-project (busy) keeps its count, and a clean build clears every count. A
+project (busy) keeps its count, and a clean build clears every count. A tick
+that could not fetch the previous `health.json` has no counts to carry, so it
+notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (an hour for the sweep, three for the

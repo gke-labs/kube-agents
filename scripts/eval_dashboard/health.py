@@ -2231,9 +2231,14 @@ def adjudicate(
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
     # Per job, consecutive failed checks (and per project, for the message),
-    # so a ten-minute job's single flap is not news and two in a row are.
+    # so a ten-minute job's single flap is not news and two in a row are. The
+    # counts live in the previous health.json; a tick that could not fetch it
+    # starts them over, which would hide a told, still-failing job for a tick
+    # or two, so on that tick the thresholds are off: a failed build is a note,
+    # and the poster, which keys on the verdict, does not re-announce one it
+    # has told.
     streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
-    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks)
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.

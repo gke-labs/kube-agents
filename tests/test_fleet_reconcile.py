@@ -408,6 +408,27 @@ class LeaseTest(unittest.TestCase):
         self.assertIn("force-unlock", outcomes[P8][1])
         self.assertIn("release failed", outcomes[P8][1])
 
+    def test_a_named_projects_release_failure_before_a_termination_is_on_the_record(self):
+        # The hourly's path (reconcile_named): a release refused, then a
+        # termination raised by the unblock, must still record the failure.
+        class _Boskos_signalling_release(_Boskos):
+            def __call__(self, request, timeout=None):
+                if "/release?" in request.full_url:
+                    os.kill(os.getpid(), signal.SIGINT)
+                return super().__call__(request, timeout)
+
+        boskos = _Boskos_signalling_release(free=[P7], release_errors={P7: _http_error(502, BOSKOS)})
+        outcomes = {}
+        previous = signal.signal(signal.SIGINT, boskos_pool.terminate)
+        try:
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(boskos_pool.Terminated):
+                    reconcile.reconcile_named([P7], BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}), known=KNOWN, outcomes=outcomes)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_FAILED)
+        self.assertIn("release failed", outcomes[P7][1])
+
     def test_no_lease_asks_boskos_nothing_and_takes_a_project_outside_the_pool(self):
         # The dev-project path: no Boskos, and no mapping check, since the
         # check exists only to stop a typo reading as busy at Boskos.
