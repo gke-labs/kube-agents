@@ -13,14 +13,14 @@ and for the gap it leaves.
 ## How it runs
 
 `eod-event-watcher-daily-report` is a `no_agent` script entry on the Platform Agent's roster
-(`cron/jobs.json`): a tick runs `eod_report_generator.py` as a plain subprocess and prompts no
+(`agents/platform/cron/jobs.json`): a tick runs `eod_report_generator.py` as a plain subprocess and prompts no
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
 The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
 bar the two on `"all"`. That routes the report through the
 Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
-[relay design](../../../docs/designs/cron-report-relay.md) is canonical. `"all"` is the wrong value
+[relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
 one, so a job left on `"all"` reports twice — once flat and once through the Chat Agent. `"local"`
 resolves to no target and drops the report. The script still emits a bullet list rather than a
@@ -69,7 +69,7 @@ kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-
 **The schedule is `0 21 * * 1-5`, and that hour is UTC** — 17:00 US/Eastern in summer, 16:00 in
 winter. Nothing in this repository sets `HERMES_TIMEZONE` or a `config.yaml` `timezone` key, so
 every entry on every roster here runs on UTC whatever the local reading of its hour suggests;
-[`cron-jobs.md`](../../../docs/site/src/content/docs/reference/cron-jobs.md) is canonical. A run
+[`cron-jobs.md`](../site/src/content/docs/reference/cron-jobs.md) is canonical. A run
 looks back 24 hours, except on Monday, when it looks back 72 — a fixed day-long window would leave
 Friday 21:00 through Sunday 21:00 in no run's scope at all. `default_window_hours` reads the weekday
 in UTC so it agrees with the clock the scheduler ticked on.
@@ -83,7 +83,7 @@ event was announced in chat. It has a second writer — the drift detector's `gi
 land in the same table under `reason = 'OutOfBandChange'` — and the generator excludes those rows
 before it counts anything, so every number below is still the watcher's alone. That exclusion is
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
-drift record is not an event the watcher forwarded. [`../docs/session_management.md`](../docs/session_management.md) is
+drift record is not an event the watcher forwarded. [`../docs/session_management.md`](../../agents/platform/docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
 
 Three things are deliberately not sources. The `incidents` table alongside it holds the triage
@@ -126,9 +126,9 @@ A missing database, a volume old enough to have the database but not the table, 
 enough to be missing its `cluster` column, all yield zero rows — indistinguishable from a quiet
 fleet. The third is the nastiest, and is not a stale-reader problem: `record_intercepted_event`
 names `cluster` in its INSERT, so on that shape every write fails and the ledger stays permanently
-empty. See ["A pre-release table, and no migration"](../docs/session_management.md) for the
+empty. See ["A pre-release table, and no migration"](../../agents/platform/docs/session_management.md) for the
 `DROP TABLE` that fixes it. Per
-["I found nothing" and "I could not look" must not arrive as the same silence](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md),
+["I found nothing" and "I could not look" must not arrive as the same silence](../site/src/content/docs/concepts/autonomous-watchdogs.md),
 the header turns 🔴, the body names each path and why it failed, and the telemetry counts, the
 suppressed-events line and the ✅ all-clear are all withheld: those zeroes are the absence of a
 measurement, not a measurement of zero. A warning on stderr is not enough — this job runs
@@ -178,7 +178,7 @@ any non-`Warning` event `Info`, however serious its reason reads. A held-back li
 a judgement that the event was minor. Reasons that appear in no recap at all are a separate case —
 the watcher's `--reason` list in deploy/shared/start-services.sh never forwarded them, so nothing
 was recorded to hold back. Do not read absence from a recap as absence from the fleet. See the
-Severity Gate section of [`../docs/session_management.md`](../docs/session_management.md).
+Severity Gate section of [`../docs/session_management.md`](../../agents/platform/docs/session_management.md).
 
 The listing is fixed to `Info` in `LISTED_SEVERITIES` in `eod_report_generator.py`, and nothing
 widens it. Widening it would buy a digest of the day's already-delivered alerts, and it still would

@@ -442,10 +442,11 @@ is a hand-authored dotenv and a hand may well write `export`.
   `tf_state_read`) run `trap - ERR` inside their substitution as well. Process
   substitution (`< <(...)`) leaves `BASH_SUBSHELL` at 0 on bash 3.2, so a tolerated read
   through one clears the trap inline wherever it sits.
-- **[common.sh](common.sh)**: utilities the dev tooling and the Prow CI scripts
-  (`hack/ci-deploy.sh`) use — colour output, `init_var`/`load_state`,
-  registry and third-party-image resolution, cluster connection helpers. Sources
-  `installer_common.sh`, so nothing is defined twice.
+- **[common.sh](common.sh)**: utilities the dev tooling (`scripts/dev/`) and the
+  `print_instructions_*` helpers use — colour output, `init_var`/`load_state`,
+  the registry prefixes, cluster connection, the step runner. Sources
+  `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
+  `scripts/release/common.sh`, not this file.
 - **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.

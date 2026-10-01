@@ -1265,8 +1265,8 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 }
 
 // memoryProviderIsHindsightBacked reports whether a provider talks to the in-cluster
-// Hindsight service. Keep in sync with memory_provider_uses_hindsight in
-// scripts/installer/common.sh, which decides whether to deploy it.
+// Hindsight service. Keep in sync with kube-agents.hindsightEnabled in
+// charts/kube-agents/templates/_helpers.tpl, which decides whether to deploy it.
 func memoryProviderIsHindsightBacked(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case kubeAgentsMemoryProvider, "hindsight":
