@@ -444,6 +444,8 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
             text = f"the run failed after closing {closed or 0} pull request(s) across {projects} project(s)"
         else:
             text = f"failed in {failed} of {projects} project(s)"
+            if closed:
+                text += f" after closing {closed} pull request(s)"
         skipped = artifact.get(SWEEP_KEY_SKIPPED)
         if isinstance(skipped, list) and skipped:
             text += f", {len(skipped)} not swept"

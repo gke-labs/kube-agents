@@ -636,8 +636,8 @@ class PacingTest(unittest.TestCase):
 
     def test_a_limit_on_a_read_ends_the_run_too(self):
         # The cooldown covers every repository: a 429 on a project's listing
-        # (or its mint) must not be that project's failure with the walk
-        # minting and listing the next one during the cooldown.
+        # must not be that project's failure with the walk minting and listing
+        # the next one during the cooldown.
         eight = "gke-agentic/kube-agents-evals-8-infra"
         github = _GitHub(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]}, odd_bodies={})
         refused = _http_error(429, headers={"Retry-After": "30"})
@@ -666,6 +666,34 @@ class PacingTest(unittest.TestCase):
             (closed, failures, _), _, _ = run_pool(["kube-agents-evals-7"], github, report=report)
         self.assertEqual(closed, {"kube-agents-evals-7": 2}, "the two closes before the refusal are on the record")
         self.assertIn("kube-agents-evals-7", failures)
+
+    def test_a_limit_on_the_branch_listing_after_closes_keeps_them(self):
+        # The first call after a burst of writes is where a refusal lands.
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2, 3)]
+        github = _GitHub(pulls=pulls)
+        original = github.__call__
+
+        def limited(request, timeout=None):
+            if "/git/matching-refs/" in request.full_url:
+                raise _http_error(429, headers={"Retry-After": "30"})
+            return original(request, timeout=timeout)
+
+        report = {}
+        boskos = _Boskos(["kube-agents-evals-7"])
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(limited, boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud(), report=report)
+        self.assertEqual(closed, {"kube-agents-evals-7": 3})
+        self.assertIn("kube-agents-evals-7", failures)
+
+    def test_a_limit_on_the_mint_ends_the_run_too(self):
+        eight = "gke-agentic/kube-agents-evals-8-infra"
+        github = _GitHub(pulls={REPO: [agent_pull()], eight: [agent_pull(head_repo=eight)]}, mint_error=_http_error(403, body=b'{"message":"You have exceeded a secondary rate limit"}'))
+        report = {}
+        with mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            (closed, failures, _), boskos, github = run_pool(["kube-agents-evals-7", "kube-agents-evals-8"], github, report=report)
+        self.assertIn("rate limit", report["ended_early"])
+        self.assertEqual(report["skipped"], ["kube-agents-evals-8"])
+        self.assertEqual(len([k for k, _ in github.calls if k.startswith("POST /app/installations/")]), 1, "no second mint during the cooldown")
 
     def test_a_refused_write_is_followed_by_the_pause_too(self):
         github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], delete_errors={"platform-agent/fix-the-thing": _http_error(422)})

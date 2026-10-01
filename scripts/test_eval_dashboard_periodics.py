@@ -417,6 +417,8 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(lines[periodics.DETAIL_LIMIT], "and 6 more")
         self.assertEqual(lines[-1], "run ended early: GitHub refused PATCH twice (HTTP 403 Forbidden: secondary rate limit)")
         self.assertEqual(periodics.run_summary(SWEEP, report, passed=False), "failed in 11 of 11 project(s)")
+        partial = {"projects": 1, "closed": 2, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-7": {"closed": 2, "error": "GitHub refused PATCH twice"}}}
+        self.assertEqual(periodics.run_summary(SWEEP, partial, passed=False), "failed in 1 of 1 project(s) after closing 2 pull request(s)")
         drained = {"projects": 12, "closed": 241, "failed": 0, "left_for_next_run": 30, "ended_early": None, "outcomes": {}}
         self.assertEqual(periodics.run_summary(SWEEP, drained, passed=True), "closed 241 pull request(s) across 12 project(s), 30 write(s) left for the next run")
         stopped = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "ended_early": "GitHub refused PATCH twice", "skipped": ["kube-agents-evals-3", "kube-agents-evals-4"], "outcomes": {"kube-agents-evals-2": {"error": "GitHub refused PATCH twice"}}}
@@ -438,7 +440,7 @@ class WorkflowWiring(unittest.TestCase):
         failed = {"job": SWEEP.job, "build": "100", "finished_at": (NOW - timedelta(minutes=5)).isoformat(timespec="seconds"), "passed": False, "result": "FAILURE", "artifact": report}
         notes = periodics.assess({SWEEP.job: failed}, NOW, None)
         note = notes[SWEEP.job]
-        self.assertEqual(note["summary"], "failed in 2 of 3 project(s)")
+        self.assertEqual(note["summary"], "failed in 2 of 3 project(s) after closing 1 pull request(s)")
         self.assertEqual(note["detail"], ["kube-agents-evals-2: HTTP 403 Forbidden: x", "kube-agents-evals-4: HTTP 502 Bad Gateway"])
         self.assertEqual((note["place"], note["absence"]), ("Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up"))
         self.assertTrue(note["runbook"].endswith("#55-the-pull-request-sweep"))

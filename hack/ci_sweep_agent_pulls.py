@@ -28,9 +28,11 @@ No listing endpoint is needed and no run's state is read.
 
 The writes are paced to GitHub's published burst limits for an App -- a second
 between writes, 500 writes an hour -- with a budget of writes per run past which
-the rest waits for the next run, logged and reported; a write GitHub refuses is
-retried once after the Retry-After it asks for, and refused again the run ends
-rather than visiting every project during the cooldown. Every run writes a
+the rest waits for the next run, logged and reported; a write GitHub refuses
+under its limit is retried once after the Retry-After it asks for, and refused
+again the run ends rather than visiting every project during the cooldown; a
+read it refuses under its limit ends the run at once, since the cooldown covers
+the next project's mint and listing too. Every run writes a
 report beside the job's artifacts (write_report), which the CI health bot reads.
 
 Three conditions, all required, matching is_agent_pull_request in
@@ -188,13 +190,12 @@ MAPPING_LINE_RE = re.compile(r'^\s+([A-Za-z0-9-]+)\)\s+echo "([^"/]+/[^"]+)"\s+;
 
 class RateLimited(Exception):
     """GitHub refused the App under its burst limit -- a read once, or a write
-    twice -- so the run ends here. `closed` and `deleted` are what the
-    repository's sweep had done before the refusal, for the report."""
+    twice -- so the run ends here. `closed` is what the repository's sweep had
+    closed before the refusal, for the report."""
 
-    def __init__(self, message, closed=0, deleted=0):
+    def __init__(self, message, closed=0):
         super().__init__(message)
         self.closed = closed
-        self.deleted = deleted
 
 
 class WriteBudget:
@@ -531,7 +532,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
                 {"state": "closed"},
             )
         except RateLimited as exc:
-            exc.closed, exc.deleted = closed, deleted
+            exc.closed = closed
             raise
         except CALL_FAULTS as exc:
             print("  #%s did not close (%s)" % (number, boskos_pool.describe(exc)), file=sys.stderr)
@@ -551,7 +552,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             deleted += 1
             gone.add(ref)
         except RateLimited as exc:
-            exc.closed, exc.deleted = closed, deleted
+            exc.closed = closed
             raise
         except CALL_FAULTS as exc:
             print("  #%s closed but %s was not deleted (%s)" % (number, ref, boskos_pool.describe(exc)), file=sys.stderr)
@@ -563,7 +564,13 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
     # an open pull request (anyone's) still has it as head. In the repository
     # itself only the agent pushes under its prefix; the prefix-alone caveat
     # is about forks, which this listing never reaches.
-    for ref in agent_branches(repo, authorization):
+    try:
+        leftover_refs = agent_branches(repo, authorization)
+    except RateLimited as exc:
+        # The first call after a burst of writes is where a refusal lands.
+        exc.closed = closed
+        raise
+    for ref in leftover_refs:
         if ref in gone or ref in still_open or ref in undeleted or ref in deferred:
             continue
         print("  branch %s (no open pull request)" % ref)
@@ -576,7 +583,7 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
             delete_branch(repo, ref, authorization)
             deleted += 1
         except RateLimited as exc:
-            exc.closed, exc.deleted = closed, deleted
+            exc.closed = closed
             raise
         except CALL_FAULTS as exc:
             print("  %s was not deleted (%s)" % (ref, boskos_pool.describe(exc)), file=sys.stderr)
@@ -687,7 +694,7 @@ def sweep_pool(server, owner, app_id, mapping, dry_run=False, runner=subprocess.
     boskos_pool.walk(server, owner, BOSKOS_SWEEP_STATE, len(mapping), visit, heartbeat=True, release_failures=failures)
     print(
         "swept %d project(s): closed %d pull request(s), %d failed, %d unmapped, %d skipped, %d write(s) left for the next run"
-        % (len(closed) + len(failures), sum(closed.values()), len(failures), len(unmapped), len(skipped), budget.left)
+        % (len(set(closed) | set(failures)), sum(closed.values()), len(failures), len(unmapped), len(skipped), budget.left)
     )
     return closed, failures, unmapped
 
