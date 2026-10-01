@@ -1085,6 +1085,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'pypy3 -c "import kanban_notify_propagate"',
             "pypy3 -c \"m=\x27cluster_agent_profile\x27; __import__(m).main()\"",
             "pypy3 -c \"m=\x27kanban_notify_propagate\x27; __import__(m).main()\"",
+            # Dynamic imports via importlib.import_module across -c and stdin (Thread 3)
+            "python3 -c \"import importlib; importlib.import_module(\x27cluster_agent_profile\x27).main()\"",
+            "python3 -c \x27import importlib; importlib.import_module(\"cluster_agent_profile\").main()\x27",
+            "python3 -c \"import importlib; importlib.import_module(\x27kanban_notify_propagate\x27).main()\"",
+            "python3 -c \x27import importlib; importlib.import_module(\"kanban_notify_propagate\").main()\x27",
+            "echo \"import importlib; importlib.import_module(\x27cluster_agent_profile\x27)\" | python3",
+            "python3 <<< \"import importlib; importlib.import_module(\x27cluster_agent_profile\x27)\"",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1275,6 +1282,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         flagged_cmds = [
             "python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "timeout --foreground 60 python3 " + " ".join("-a" for _ in range(50)) + " script.py",
+            "timeout " + " ".join("-abcdef" for _ in range(30)) + " python3 script.py",
             "env FOO=bar python3 " + " ".join(f"--flag{i}" for i in range(50)) + " script.py",
             # Verify double-quoted -c commands with backslash-escaped quotes and no whitespace do not backtrack
             'python3 -c "print({' + ",".join(f'\"k{i}\":\"v{i}\"' for i in range(10)) + '})"',
