@@ -839,6 +839,17 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(sweeper.boskos_pool.describe(exc), "HTTP 429 reason")
         self.assertTrue(sweeper.is_rate_limited(exc), "the status still decides")
 
+    def test_a_release_failure_joins_the_projects_own_fault(self):
+        # A project whose sweep left a pull request open and whose release then
+        # failed: the report says both, not the release alone.
+        github = _GitHub(pulls=[agent_pull(number=1), agent_pull(number=2, branch="platform-agent/other")], close_errors={2: _http_error(409)})
+        boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
+        with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(github, boskos)), mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+            closed, failures, _ = sweeper.sweep_pool(BOSKOS, OWNER, APP_ID, MAPPING, runner=_Gcloud())
+        self.assertIn("#2", failures["kube-agents-evals-7"])
+        self.assertIn("release failed", failures["kube-agents-evals-7"])
+        self.assertEqual(closed, {"kube-agents-evals-7": 1})
+
     def test_a_release_refused_for_another_reason_is_not_retried(self):
         boskos = _Boskos(["kube-agents-evals-7"], release_errors={"kube-agents-evals-7": _http_error(502, BOSKOS)})
         with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub(), boskos)), mock.patch("sys.stderr", io.StringIO()):
@@ -957,6 +968,37 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(doc["outcomes"]["kube-agents-evals-7"]["closed"], 1)
         self.assertIn("terminated mid-sweep", doc["outcomes"]["kube-agents-evals-7"]["error"])
         self.assertEqual(boskos.released, ["kube-agents-evals-7"])
+
+    def test_a_hand_run_terminated_after_a_close_reports_the_close_and_the_interruption(self):
+        import tempfile
+        pulls = [agent_pull(number=n, branch="platform-agent/b%d" % n) for n in (1, 2)]
+
+        class _TerminatingOnSecond(_GitHub):
+            def __call__(self, request, timeout=None):
+                if request.method == "PATCH" and request.full_url.endswith("/pulls/2"):
+                    raise sweeper.Terminated("signal 15")
+                return super().__call__(request, timeout=timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_TerminatingOnSecond(pulls=pulls))), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(_CI_DEPLOY), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"], doc["closed"]), (sweeper.TERMINATED_EXIT_CODE, "terminated", 1))
+        self.assertEqual(doc["outcomes"][PROJECT]["closed"], 1)
+        self.assertIn("terminated mid-sweep", doc["outcomes"][PROJECT]["error"])
+
+    def test_a_hand_run_with_no_mapping_does_not_blame_its_project(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            script = pathlib.Path(tmp) / "ci-deploy.sh"
+            script.write_text("#!/bin/bash\necho no mapping here\n")
+            path = pathlib.Path(tmp) / "pull-sweep.json"
+            with mock.patch.object(sweeper.urllib.request, "urlopen", _Cluster(_GitHub())), mock.patch.object(sweeper.subprocess, "run", _Gcloud()), mock.patch.object(sweeper.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = sweeper.main(["--project", PROJECT, "--ci-deploy-script", str(script), "--report", str(path)])
+            doc = json.loads(path.read_text())
+        self.assertEqual((rc, doc["exit"], doc["projects"], doc["failed"]), (1, "failed", 0, 0))
+        self.assertIn("mapping", doc["error"])
 
     def test_a_hand_run_refused_twice_exits_one_and_reports_it(self):
         import tempfile

@@ -304,7 +304,10 @@ def acquire_and_hold(server, owner, hold_state, acquire_fn, visit, release_failu
                     release_settled(server, owner, name, held_since)
                 except (BoskosError,) + REACH_ERRORS as exc:
                     print("  %s: release failed (%s); the next run's reset returns it" % (name, describe(exc)), file=sys.stderr)
-                    release_failures[name] = "release failed: %s" % describe(exc)
+                    # Joined to what the visit recorded for the project, if it did:
+                    # the sweep's own fault must not be replaced by the release's.
+                    before = release_failures.get(name)
+                    release_failures[name] = ("%s; " % before if before else "") + "release failed: %s" % describe(exc)
     finally:
         _hold_signals(False)
 

@@ -436,6 +436,11 @@ class WorkflowWiring(unittest.TestCase):
         self.assertEqual(periodics.sweep_detail(drained), ["30 write(s) left for the next run (the run's write budget)"])
         self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"applied": 3, "unchanged": 9, "refused": 0}}, passed=True), "3 applied, 9 unchanged")
         self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=True), "nothing to do")
+        # A failed reconcile build never reads as success: the named failures
+        # lead, or the run failed above the projects.
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"unchanged": 9, "refused": 3, "failed": 1}}, passed=False), "3 refused, 1 failed, 9 unchanged")
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {"unchanged": 9}}, passed=False), "the run failed after 9 unchanged")
+        self.assertEqual(periodics.run_summary(WEEKLY, {"summary": {}}, passed=False), "the run failed before reaching a project")
         self.assertIsNone(periodics.run_summary(WEEKLY, None, passed=True))
 
     def test_a_failed_sweep_note_carries_its_report_and_a_passed_one_its_summary(self):

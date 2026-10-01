@@ -456,7 +456,15 @@ def run_summary(periodic: Periodic, artifact: dict | None, passed: bool) -> str 
     if not isinstance(summary, dict):
         return None
     parts = [f"{count} {outcome}" for outcome, count in summary.items() if isinstance(count, int) and count > 0]
-    return ", ".join(parts) if parts else "nothing to do"
+    if passed:
+        return ", ".join(parts) if parts else "nothing to do"
+    # A failed build: the named failures first; none means the run failed
+    # above the projects (Boskos, the mapping, a crash), which the detail's
+    # run line names.
+    named = [p for p in parts if p.split(" ", 1)[1] in RECONCILE_NAMED_OUTCOMES]
+    if named:
+        return ", ".join(named + [p for p in parts if p not in named])
+    return f"the run failed after {', '.join(parts)}" if parts else "the run failed before reaching a project"
 
 
 def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:

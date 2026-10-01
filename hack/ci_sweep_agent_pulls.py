@@ -788,6 +788,15 @@ def _run(args, run):
             # A hand run: paced, but every write is made; there is no next run.
             try:
                 run["closed"][args.project] = sweep_repo(args.project, repo, args.app_id, dry_run=args.dry_run, runner=subprocess.run)
+            except SweepError as exc:
+                # The project's own fault (a refused close, a mint the App
+                # cannot make); a mapping fault is raised before this branch
+                # and is the run's, not the project's.
+                if getattr(exc, "closed", 0):
+                    run["closed"][args.project] = exc.closed
+                run["failures"][args.project] = str(exc)
+                print("ERROR: %s" % exc, file=sys.stderr)
+                return 1, str(exc)
             except RateLimited as exc:
                 if exc.closed:
                     run["closed"][args.project] = exc.closed
@@ -816,12 +825,6 @@ def _run(args, run):
             return 1, error
         return 0, None
     except (SweepError, boskos_pool.BoskosError) as exc:
-        if args.project:
-            # The hand run's one project: its closes and its fault, as the
-            # pool walk records them for each of its projects.
-            if getattr(exc, "closed", 0):
-                run["closed"][args.project] = exc.closed
-            run["failures"][args.project] = str(exc)
         print("ERROR: %s" % exc, file=sys.stderr)
         return 1, str(exc)
     except urllib.error.HTTPError as exc:
