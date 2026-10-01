@@ -14,7 +14,7 @@ probe_loop(){ local stop=$1 f="$EVID/zonal-probe.txt" i=0 run; run=$(date -u +%H
     echo "$(ts) read=$r write=$w" >>"$f"; sleep 1; done; echo "# $(ts) probe end" >>"$f"; }
 plant(){ pause_deploy bystander 1 "      nodeSelector: {}"; }
 before(){ ev zonal before K get --raw /version; ev zonal endpoint G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(endpoint,location,locations)'; }
-break_it(){ V=$(newest_patch REGULAR 1.35); local stop="$KCFG_DIR/$CLUSTER.$TRACK.zonal-done"; rm -f "$stop"; probe_loop "$stop" & local P=$!; sleep 10
+break_it(){ V=$(newest_patch REGULAR 1.35); require_version "$V"; local stop="$KCFG_DIR/$CLUSTER.$TRACK.zonal-done"; rm -f "$stop"; probe_loop "$stop" & local P=$!; sleep 10
   retry_busy zonal ev zonal upgrade G container clusters upgrade "$CLUSTER" --master --cluster-version "$V" --zone "$ZONE" --quiet --timeout "$MASTER_UPGRADE_TIMEOUT" ||
     { touch "$stop"; wait $P; rm -f "$stop"; exit 1; }   # a probe of an untouched control plane would read as "not reproduced"
   wait_ops; sleep 30; touch "$stop"; wait $P; rm -f "$stop"; }

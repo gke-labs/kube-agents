@@ -12,13 +12,16 @@ SCENARIO_LABEL=upgrade-scenarios
 require_scenario_cluster(){ local p; p=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.purpose)' 2>/dev/null) ||
     { echo "refusing: cannot describe $CLUSTER in $ZONE (missing, or its creation failed)" >&2; exit 1; }
   [ "$p" = "$SCENARIO_LABEL" ] || { echo "refusing: $CLUSTER in $ZONE is not labelled purpose=$SCENARIO_LABEL (label: '$p')" >&2; exit 1; }; }
-# require_own_cluster <NN>: the cluster's scenario label (set by run.sh at creation) must be NN, or share NN's number as the
-# base a lettered re-run extends (CLUSTER=upg-10 bash run.sh 10b; CLUSTER=upg-14b bash run.sh 14c). A hold cluster (label
-# ending in h) is accepted only by its own scenario, since a change there ends the multi-day hold the Recommender waits on.
-require_own_cluster(){ local nn=$1 label base=${1%%[a-z]*}; label=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)') ||
+# require_own_cluster <NN>: the cluster's scenario label (set by run.sh at creation) must be NN itself, or a run that NN
+# extends: the plain base (CLUSTER=upg-10 bash run.sh 10b) or an earlier lettered leg of the same number (CLUSTER=upg-14b
+# bash run.sh 14c). A later or unrelated sibling (upg-13b for run.sh 13, upg-18m for run.sh 18k) is refused, and so is a
+# hold cluster (label ending in h) by anything but its own scenario, since a change there ends the multi-day hold the
+# Recommender waits on.
+require_own_cluster(){ local nn=$1 label; label=$(G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(resourceLabels.scenario)') ||
     { echo "refusing: cannot read $CLUSTER's scenario label" >&2; exit 1; }
-  [ "$label" = "$nn" ] || { [ "${label%%[a-z]*}" = "$base" ] && [[ $label != *h ]]; } ||
-    { echo "refusing: $CLUSTER was built for scenario '$label', which is not $nn, a base it extends, or the same number without a hold suffix" >&2; exit 1; }; }
+  local base=${nn%%[a-z]*} nsuf=${nn#"${nn%%[a-z]*}"} lbase=${label%%[a-z]*} lsuf=${label#"${label%%[a-z]*}"}
+  [ "$label" = "$nn" ] || { [ -n "$nsuf" ] && [ "$lbase" = "$base" ] && [[ $lsuf != *h ]] && [[ "$lsuf" < "$nsuf" ]]; } ||
+    { echo "refusing: $CLUSTER was built for scenario '$label', which is not $nn or an earlier leg of it that $nn extends" >&2; exit 1; }; }
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 in_days(){ date -u -v+"$1"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "+$1 days" +%Y-%m-%dT%H:%M:%SZ; }   # BSD date, then GNU
 # ev returns the command's own exit status, not tee's, so a caller can stop on a failed step.
@@ -81,6 +84,8 @@ upgrade_pool(){ local pool=$1 v=$2 stop="$KCFG_DIR/$CLUSTER.$TRACK.pool-done"; s
 # hold_exclusion: the held scenarios (06h, 08h, 16h) keep GKE from upgrading the cluster while the hazard waits for the
 # Recommender. Without the exclusion GKE may upgrade the cluster first, so a failure to add it stops the run.
 HOLD_DAYS=2
+# hold_break: the whole break step of a held scenario (06h, 08h, 16h): the exclusion, then a note that nothing is upgraded.
+hold_break(){ hold_exclusion; note hold "hazard left planted for the Recommender's next daily refresh; no upgrade"; }
 hold_exclusion(){ has_exclusion hold-recommender && return; retry_busy hold ev hold exclusion G container clusters update "$CLUSTER" --zone "$ZONE" --add-maintenance-exclusion-name hold-recommender --add-maintenance-exclusion-start "$(ts)" --add-maintenance-exclusion-end "$(in_days "$HOLD_DAYS")" --add-maintenance-exclusion-scope no_upgrades --quiet ||
   { note final "precondition not met: the maintenance exclusion was not added, so GKE may upgrade the cluster before the Recommender reads it"; exit 1; }; }
 # pool_exists <pool> / has_exclusion <name>: both key off the describe's exit status. A describe that fails for any reason

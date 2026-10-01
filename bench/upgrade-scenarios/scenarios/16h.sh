@@ -5,5 +5,5 @@
 . "$H/scenarios/16.sh"; CREATE_FLAGS="--cluster-ipv4-cidr=/19"
 before(){ ev dataplane enforcement G container clusters describe "$CLUSTER" --zone "$ZONE" --format='value(networkPolicy,addonsConfig.networkPolicyConfig,networkConfig.datapathProvider)'
   ev dataplane policies K -n scen get networkpolicy; ev dataplane connect-unenforced connect; }
-break_it(){ hold_exclusion; note hold "hazard left planted for the Recommender's next daily refresh; no upgrade"; }
+break_it(){ hold_break; }
 after(){ :; }

@@ -36,7 +36,7 @@ Y
   ev runtime schema1-pods K -n scen get pods -l app=schema1 -o wide
   ev runtime schema1-events K -n scen get events --field-selector reason=Failed -o custom-columns='T:.lastTimestamp,O:.involvedObject.name,M:.message'; }
 # 14: a cgroup v1 pool on 1.34 (the last minor that upgrades one) with the legacy JVM on it
-hold_14(){ local v; v=$(newest_patch REGULAR 1.34); printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V1\n' >"$EVID/cgroup-v1.yaml"
+hold_14(){ local v; v=$(newest_patch REGULAR 1.34); require_version "$v"; printf 'linuxConfig:\n  cgroupMode: CGROUP_MODE_V1\n' >"$EVID/cgroup-v1.yaml"
   pool_exists v1-hold || ev cgroup v1-hold-pool G container node-pools create v1-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=role=v1hold --system-config-from-file "$EVID/cgroup-v1.yaml" --quiet || abort_hold "pool v1-hold was not created"
   K -n scen apply -f - <<Y || abort_hold "the legacy JVM did not apply"
 apiVersion: apps/v1
@@ -62,7 +62,7 @@ Y
   ev cgroup v1-hold-pods K -n scen get pods -l app=legacy-jvm-hold -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount'
   ev cgroup v1-hold-log K -n scen logs deploy/legacy-jvm-hold --tail=3; }
 # 18: a 1.33 L4 pool on the default driver running a CUDA 13 build, which crash-loops until the driver moves
-hold_18(){ local v; v=$(newest_patch EXTENDED 1.33)
+hold_18(){ local v; v=$(newest_patch EXTENDED 1.33); require_version "$v"
   pool_exists gpu-hold || ev gpu-driver gpu-hold-pool G container node-pools create gpu-hold --cluster "$CLUSTER" --zone "$ZONE" --node-version "$v" --num-nodes 1 --machine-type g2-standard-4 --disk-size 200 --accelerator type=nvidia-l4,count=1,gpu-driver-version=default --node-labels=role=gpuhold --quiet || abort_hold "pool gpu-hold was not created"
   K -n scen apply -f - <<Y || abort_hold "the CUDA 13 probe did not apply"
 apiVersion: apps/v1

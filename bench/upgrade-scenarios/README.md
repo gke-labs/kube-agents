@@ -251,8 +251,8 @@ up, and name it in their header comment (`CLUSTER=upg-10 bash run.sh 10b`).
 
 1. Creates the cluster at the minor the scenario needs (a minor the channel no longer offers stops the run before
    anything is created, and an upgrade step whose target version cannot be read stops the same way), stops unless the cluster carries the campaign's label and
-   was built for this scenario (its `scenario` label is `NN`, or a base a lettered re-run extends, and never a hold
-   cluster of another run), and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
+   was built for this scenario (its `scenario` label is `NN`, or the base or an earlier lettered leg that `NN` extends;
+   a later or unrelated sibling and another run's hold cluster are refused), and, when the scenario sets `POOL_FLAGS`, adds a `work-pool`.
 2. Plants the defect and records the before-state. Scenario 6's caller is `manifests/deprecated-api-caller.yaml`;
    every other scenario writes its manifests inline. If any step of the plant fails, the run stops here, before
    the upgrade, with a "precondition not met" note in the evidence.
