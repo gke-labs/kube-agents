@@ -103,11 +103,10 @@ type Config struct {
 	ProgressInterval time.Duration
 	// ActivityInputValues says what of a tool call's input reaches the bus:
 	// InputValuesShape (the default, and the zero value) publishes the
-	// input's structure with every free-text value replaced by its shape
-	// and only name-like fields kept, so no credential can ride it whatever
-	// its spelling (a kept value is one short identifier, never free
-	// text); InputValuesFull publishes the values after the best-effort
-	// scrub, for a debug install that wants them.
+	// input's structure with every string replaced by its shape, the nested
+	// tool names of hermes's tool_call wrapper excepted, so no string value
+	// rides it whatever its key; InputValuesFull publishes the values after
+	// the best-effort scrub, for a debug install that wants them.
 	ActivityInputValues string
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option

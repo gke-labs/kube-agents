@@ -22,9 +22,11 @@ package hermesbridge
 // are shared by every process under the profile, and the URL does not expand
 // environment variables. So each child gets a random key in its environment
 // under ActivitySecretEnv, and a delivery belongs to whichever in-flight task's
-// key verifies its signature - at most Concurrency keys to try. Unsigned or
-// unmatched deliveries (kanban workers and cron ticks under the same profile)
-// are answered 204 and dropped, so they cost their sender nothing per call.
+// key verifies its signature - at most Concurrency keys to try. Only the
+// bridge's children carry the hook (it rides each child's own managed
+// scope), so a kanban worker or cron tick under the same profile never
+// delivers; an unsigned or unmatched delivery that does arrive is answered
+// 204 and dropped.
 //
 // Trust boundary, stated: everything in the pod is reachable from the
 // persona's own terminal tool, its environment included. The trace is "as
@@ -112,12 +114,13 @@ const (
 	// InputValuesShape and InputValuesFull are Config.ActivityInputValues'
 	// two settings. Shape is the default: the graders on the inject lane
 	// read tool names (an entry's tool, a tool_call wrapper's calls[].name)
-	// and nothing of the arguments, and a free-text value is where every
+	// and nothing of the arguments, and a string value is where every
 	// credential the scrub ever missed arrived, so by default none leaves
-	// the pod. Under shape a string value becomes "<string, N chars>" unless
-	// its key is one the graders or a reader of the trace needs by name
-	// (shapeKeptKeys), where it is kept after the scrub; numbers, booleans,
-	// nulls and the structure stay.
+	// the pod. Under shape every string value becomes "<string, N chars>",
+	// the one exception being the nested tool names of hermes's tool_call
+	// wrapper, which a grader reads; numbers, booleans, nulls, the
+	// redaction markers and the structure stay. No grammar tells a name
+	// from a token, so none is attempted.
 	InputValuesShape = "shape"
 	InputValuesFull  = "full"
 	// activityInputCap bounds one call's input on the bus: two KiB, enough
@@ -299,68 +302,32 @@ var (
 		// on the same word goes with it, the lesser cost). The separator's
 		// whitespace is same-line only, so a YAML key with its value on the
 		// next line does not take that line's first token.
-		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?[ \t]*[=:][ \t]*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
+		regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])[A-Za-z0-9_-]*(?:token|secret|password|passwd|passphrase|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:[_-][A-Za-z0-9_-]*)?["']?[ \t]*[=:][ \t]*(?:"[^"\n]*"|'[^'\n]*'|["']?\S+)`),
 		// A PEM private-key block, banner to banner: the one credential with
 		// a fixed marker, however it arrived (a heredoc, a file tool's
 		// content, a kubeconfig body under an innocent key).
 		regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
 		// --flag value, the word a component of the flag (--token, --secret-access-key);
 		// a quoted value runs to its closing quote as above.
-		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
+		regexp.MustCompile(`(?i)(?:^|\s)--?[a-z0-9-]*(?:token|secret|password|passwd|passphrase|cookie|api[_-]?key|private[_-]?key|ssh[_-]?key|signing[_-]?key|key[_-]?data|credential)s?(?:-[a-z0-9-]+)?\s+(?:"[^"\n]*"|'[^'\n]*'|\S+)`),
 	}
 )
 
-// curl's -u user:password: the command is found whole (so "date -u 12:30"
-// and "sort -u a:b" are not read), and only the credential inside it is
-// replaced, the URL and headers around it kept. A quoted value runs to its
+// curl's -u user:password and -b/--cookie: the command is found whole (so
+// "date -u 12:30" and "sort -u a:b" are not read), and only the credential
+// inside it is replaced, the URL and headers around it kept. A quoted value runs to its
 // closing quote and the attached form (-uuser:pass) is read too. The
 // command runs to a separator (;, |, &&, newline), not to a lone & inside a
 // quoted password.
 var (
 	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n]|&[^&\n])*`)
-	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`)
+	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user|-b|--cookie)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+)`)
 	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
 	// the userinfo alone goes, the scheme and host around it stay.
 	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]*:[^\s/@]+(@)`)
 	// A Cookie or Set-Cookie header by its key: the rest of the line, the
 	// character before the key kept.
 	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
-)
-
-// shapeKeptKeys are the keys whose string values survive shape mode: the
-// names and identifiers a grader or a reader of the trace keys on, none of
-// them a place a credential is passed. Matched on the key's lowercase form.
-var shapeKeptKeys = map[string]bool{
-	"name": true, "tool": true, "kind": true, "namespace": true, "project": true,
-	"location": true, "region": true, "zone": true, "cluster": true, "cluster_name": true,
-	"resource_type": true, "skill": true, "skill_name": true, "profile": true, "agent": true,
-}
-
-// shapeKeptValuePattern is the shape a kept value must have to survive: an
-// identifier, starting with a letter, made of letters, digits and ._/-
-// (seeded-a, kube-system, mcp__gke__list_clusters, mcp__gke__listClusters,
-// projects/p/locations/l, PodDisruptionBudget, createPullRequest), at most
-// shapeKeptValueMax characters. No ':' or '@' (a user:pass@host is
-// neither), no whitespace or quotes. What an identifier is not, a token
-// is: shapeTokenRunPattern shapes a value with a long lowercase run, a
-// long digit run, an all-hex body or an all-caps-and-digits body (an
-// AKIA... key, a ghp_ token's body), and tokenShapedWords a word whose
-// case or digits churn (a JWT, a Stripe key); a long CamelCase kind
-// (ValidatingAdmissionPolicyBinding) is a few short words and stays. A manifest body under "name",
-// anything with a space in it, is shaped like every other string, so the
-// kept keys are a list of places identifiers live and not a hole.
-var (
-	shapeKeptValuePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._/-]*$`)
-	shapeTokenRunPattern  = regexp.MustCompile(`[a-z0-9]{24,}|[0-9]{8,}|^[a-f0-9]{20,}$|[A-Z]{2}[A-Z0-9]{14,}`)
-)
-
-const (
-	shapeKeptValueMax = 128
-	// shapeMaxCaseChanges and shapeMaxDigitChanges bound how often one word
-	// of a kept value may change case, or change between letters and
-	// digits, before it is a token's shape (tokenShapedWords).
-	shapeMaxCaseChanges  = 5
-	shapeMaxDigitChanges = 3
 )
 
 // capRunes cuts s to at most n bytes at a rune boundary.
@@ -374,48 +341,6 @@ func capRunes(s string, n int) string {
 // shapeOf is what a free-text value becomes under shape mode.
 func shapeOf(s string) string {
 	return fmt.Sprintf("<string, %d chars>", utf8.RuneCountInString(s))
-}
-
-// keptUnderShape says whether a string under key is published as it is.
-func keptUnderShape(key, s string) bool {
-	return shapeKeptKeys[strings.ToLower(key)] && len(s) <= shapeKeptValueMax &&
-		shapeKeptValuePattern.MatchString(s) && !shapeTokenRunPattern.MatchString(s) && !tokenShapedWords(s)
-}
-
-// tokenShapedWords says whether any ._/- separated word of s starts a new
-// CamelCase word, or changes between letters and digits, more often than a
-// name's word does: a CamelCase kind (MutatingWebhookConfiguration) or tool
-// (createPullRequestReview) changes case a few times and a version word
-// (v1beta1) changes between letters and digits a few times, where a
-// mixed-case token (sk_live_4eC39HqLyjWDarjtT1zdp7dc, GOCSPX-aBcDeFg...)
-// changes constantly.
-func tokenShapedWords(s string) bool {
-	for _, w := range strings.FieldsFunc(s, func(r rune) bool { return r == '.' || r == '_' || r == '/' || r == '-' }) {
-		caseChanges, digitChanges := 0, 0
-		var prevUpper, prevDigit, started bool
-		for _, r := range w {
-			upper := r >= 'A' && r <= 'Z'
-			digit := r >= '0' && r <= '9'
-			if started {
-				// A word start: lowercase to uppercase. Uppercase to
-				// lowercase is the rest of the same word and is not counted.
-				if !digit && !prevDigit && upper && !prevUpper {
-					caseChanges++
-				}
-				if digit != prevDigit {
-					digitChanges++
-				}
-			}
-			if !digit {
-				prevUpper = upper
-			}
-			prevDigit, started = digit, true
-		}
-		if caseChanges > shapeMaxCaseChanges || digitChanges > shapeMaxDigitChanges {
-			return true
-		}
-	}
-	return false
 }
 
 // ActivityEntry is one data part of the activity artifact: one tool
@@ -833,9 +758,9 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 }
 
 // shapeValue is shape mode's pass over an already-scrubbed value: every
-// string becomes its shape unless its key is kept, with the structure,
-// numbers, booleans and nulls left as they are. A "[redacted]" marker stays
-// a marker, so the trace still says a secret-looking key was there.
+// string becomes its shape, with the structure, numbers, booleans and nulls
+// left as they are. A "[redacted]" marker stays a marker, so the trace still
+// says a secret-looking key was there.
 func shapeValue(v any, tool string) any {
 	return shapeValueIn(v, "", "", tool == hermesToolCallWrapper, 0)
 }
@@ -844,9 +769,8 @@ func shapeValue(v any, tool string) any {
 // and whether this input is hermes's tool_call wrapper, so a tool name is
 // known as one: in the wrapper, the "name" of an element of the top-level
 // "calls" array is what a tool_called check reads and is kept whatever its
-// spelling, bounded like the entry's own tool. Any other string under a
-// "name", at any depth and under any tool, is the model's text and is
-// shaped unless the identifier grammar keeps it.
+// spelling, bounded like the entry's own tool. Every other string, under
+// any key, at any depth and under any tool, is shaped.
 func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -860,7 +784,7 @@ func shapeValueIn(v any, key, parent string, wrapper bool, depth int) any {
 		}
 		return t
 	case string:
-		if t == redactedValue || keptUnderShape(key, t) {
+		if t == redactedValue {
 			return t
 		}
 		if wrapper && key == "name" && parent == wrapperCallsKey && depth == wrapperNameDepth {

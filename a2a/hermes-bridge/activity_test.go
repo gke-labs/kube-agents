@@ -633,30 +633,6 @@ func TestRedactInput_LeavesOrdinaryTextAlone(t *testing.T) {
 	}
 }
 
-// Under a kept key, a name stays and a token is a length: the grammar that
-// tells them apart is the one claim shape mode makes about kept values.
-func TestRedactInput_ShapeKeepsNamesAndShapesTokensUnderKeptKeys(t *testing.T) {
-	names := []string{"seeded-a", "kube-system", "v1beta1", "gke-standard-1", "northamerica-northeast1", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicyBinding", "createPullRequestReview", "listDashboardsForProjectsAndFolders", "mcp__gke__listClusters", "projects/p/locations/l", "n2d-standard-4"}
-	tokens := []string{"sk_live_4eC39HqLyjWDarjtT1zdp7dc", "GOCSPX-aBcDeFgHiJkLmNoPqRsTuVwXyZ12", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "xoxq-1234567890-abcdefghijklmnop", "9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f", "QKIAIOSFODNN7EXAMPLE", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", "admin:hunter2@db", "name with space"}
-	for _, n := range names {
-		out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"name":`+strconvQuote(n)+`}`)))
-		if !strings.Contains(out, `"name":`+strconvQuote(n)) {
-			t.Fatalf("name %q shaped under a kept key: %s", n, out)
-		}
-	}
-	for _, tok := range tokens {
-		out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"name":`+strconvQuote(tok)+`}`)))
-		if strings.Contains(out, tok) || strings.Contains(out, tok[:8]) {
-			t.Fatalf("token %q kept under a kept key: %s", tok, out)
-		}
-	}
-}
-
-func strconvQuote(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
-}
-
 // The shape default, end to end: a bridge whose Config says nothing about
 // input values puts shapes on the bus, with the redaction marker and the
 // numbers kept, and the raw argument text absent from every part.
@@ -680,7 +656,7 @@ print("the answer")
 	if err := json.Unmarshal(entries[0].Input, &input); err != nil {
 		t.Fatal(err)
 	}
-	if input["cmd"] != shapeOf("get pods") || input["token"] != redactedValue || input["project"] != "p" {
+	if input["cmd"] != shapeOf("get pods") || input["token"] != redactedValue || input["project"] != shapeOf("p") {
 		t.Fatalf("default input not shaped as designed: %v", input)
 	}
 	if nested := input["nested"].(map[string]any); nested["api_key"] != redactedValue || nested["keep"] != float64(1) {
@@ -695,20 +671,21 @@ print("the answer")
 	}
 }
 
-// Shape mode, the default: no free-text value leaves the pod, whatever its
-// key; the structure, numbers, booleans, the redaction markers and the
-// name-like fields a grader reads stay, so a tool_call wrapper still names
-// its calls and a terminal command's text is a length.
-func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
-	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}},{"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"}],"resource":"apiVersion: v1\nkind: Secret\ndata:\n  k: QUtJQQ==","id":"QKIAIOSFODNN7EXAMPLE","cluster":"name with space","profile":"` + strings.Repeat("p", 129) + `","tool":"mcp__gke__list_clusters","kind":"PodDisruptionBudget","location":"projects/p/locations/northamerica-northeast1","skill":"QKIAIOSFODNN7EXAMPLE","calls2":[{"name":"mcp__gke__listClusters"},{"name":"createPullRequest"},{"name":"mcp__kubernetesdiagnostics__inspect"}],"region":"ValidatingAdmissionPolicy","namespace2":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345","project":"9f3c2a1b7d9f3c2a1b7d9f3c2a1b7d9f","agent":"xoxq-1234567890-abcdefghijklmnop"}`
+// Shape mode, the default: no string value leaves the pod, whatever its
+// key; the structure, numbers, booleans and the redaction markers stay, and
+// the one exception is a tool_call wrapper's own nested tool names, which a
+// grader reads. No grammar keeps a "name": a resource name and a credential
+// under the same key are the same length to the trace.
+func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyWrapperNames(t *testing.T) {
+	in := `{"command":"psql postgresql://admin:hunter2@db/app","PGPASSWORD":"hunter3","name":"seeded-a","namespace":"kube-system","count":3,"dry_run":true,"nested":{"token":"t","id":"abc","note":"free text"},"calls":[{"name":"kanban_create","arguments":{"title":"x","body":"long body"}},{"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"}],"resource":"apiVersion: v1\nkind: Secret","project":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","cluster":"name with space","kind":"PodDisruptionBudget"}`
 	for _, mode := range []string{"", InputValuesShape, "anything-else"} {
 		out := string(redactInput(mode, hermesToolCallWrapper, json.RawMessage(in)))
-		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "QKIAIOSFODNN7EXAMPLE", "name with space", strings.Repeat("p", 129), "9f3c2a1b7d9f3c2a1b7d", "xoxq-", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"} {
+		for _, leaked := range []string{"hunter2", "hunter3", "psql", "free text", "long body", `"title":"x"`, "kind: Secret", "wJalrXUtnFEMI", "name with space", "seeded-a", "kube-system", "PodDisruptionBudget", `"id":"abc"`} {
 			if strings.Contains(out, leaked) {
-				t.Fatalf("mode %q published a free-text value %q: %s", mode, leaked, out)
+				t.Fatalf("mode %q published a string value %q: %s", mode, leaked, out)
 			}
 		}
-		for _, kept := range []string{`"name":"seeded-a"`, `"namespace":"kube-system"`, `"count":3`, `"dry_run":true`, `"id":"\u003cstring, 3 chars\u003e"`, `"name":"kanban_create"`, `"tool":"mcp__gke__list_clusters"`, `"kind":"PodDisruptionBudget"`, `"location":"projects/p/locations/northamerica-northeast1"`, `"name":"mcp__gke__listClusters"`, `"name":"createPullRequest"`, `"name":"mcp__kubernetesdiagnostics__inspect"`, `"region":"ValidatingAdmissionPolicy"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`} {
+		for _, kept := range []string{`"count":3`, `"dry_run":true`, `"name":"kanban_create"`, `"name":"mcp__cloudmonitoringdashboards__listDashboardsForProjectsAndFolders"`, `"PGPASSWORD":"[redacted]"`, `"token":"[redacted]"`, `"command":"\u003cstring, `, `"note":"\u003cstring, 9 chars\u003e"`, `"name":"\u003cstring, 8 chars\u003e"`} {
 			if !strings.Contains(out, kept) {
 				t.Fatalf("mode %q lost %q: %s", mode, kept, out)
 			}
@@ -721,8 +698,8 @@ func TestRedactInput_ShapeIsTheDefaultAndKeepsOnlyNames(t *testing.T) {
 	}
 	// Under any other tool a calls[].name is the model's text, not a tool name.
 	other := string(redactInput(InputValuesShape, "http_request", json.RawMessage(`{"calls":[{"name":"admin:hunter2@db"},{"name":"kanban_create"}]}`)))
-	if strings.Contains(other, "hunter2") || !strings.Contains(other, `"name":"kanban_create"`) {
-		t.Fatalf("calls[].name under a tool that is not the wrapper: free text must be shaped, an identifier may stay: %s", other)
+	if strings.Contains(other, "hunter2") || strings.Contains(other, `"name":"kanban_create"`) {
+		t.Fatalf("calls[].name kept under a tool that is not the wrapper: %s", other)
 	}
 	full := string(redactInput(InputValuesFull, hermesToolCallWrapper, json.RawMessage(in)))
 	if !strings.Contains(full, `"note":"free text"`) || strings.Contains(full, "hunter2") {
@@ -786,14 +763,14 @@ func TestRedactInput_CamelCaseKeys(t *testing.T) {
 // A quoted secret with spaces in it is scrubbed whole: the tail of a
 // passphrase must not ship behind a marker that says it was redacted.
 func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
-	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z; export DB_PASSWORD=p@ss,w0rd; echo token=ab}cd; curl -u 'admin:p&ss' https://w && echo done", "plain": "kubectl get pods -h db"}`
+	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z; curl --cookie 'session=9f3c2a1b7d' https://k; curl -b sid=c0ffee https://m; export DB_PASSWORD=p@ss,w0rd; echo token=ab}cd; curl -u 'admin:p&ss' https://w && echo done", "plain": "kubectl get pods -h db"}`
 	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8", "w0rd", "}cd", "p&ss"} {
+	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8", "w0rd", "}cd", "p&ss", "session=9f3c2a1b7d", "sid=c0ffee"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
 	}
-	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`, "https://y", "https://z", "https://w ", "echo done"} {
+	for _, kept := range []string{"-h db", "https://x", "-c 'select 1'", `"plain":"kubectl get pods -h db"`, "https://y", "https://z", "https://k", "https://m", "https://w ", "echo done"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("text after the secret was lost: %q missing in %s", kept, out)
 		}
@@ -818,7 +795,7 @@ func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {
 	// A short word after "basic" is not a credential, and a camelCase key
 	// that starts with the word is a name, as for secretName.
 	// The curl command's URL and method survive its credential.
-	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d", `"client-certificate-data":"cert-ok"`, "https://api.linear.app", "https://r", `"PGHOST":"db"`, `"Accept":"json"`, "mode: Webhook", "secretKeyRef: x", "postgresql://[redacted]@db.internal:5432/app", "https://[redacted]@gitlab.example/r.git", "curl -H '[redacted]' https://c"} {
+	for _, kept := range []string{`"basic":"basic refactoring"`, `"privateKeyPath":"/x"`, "curl -sS https://api.example.com/v1/clusters -H '[redacted]'[redacted]", "https://api", "https://b", "https://d", `"client-certificate-data":"cert-ok"`, "https://api.linear.app", "https://r", `"PGHOST":"db"`, `"Accept":"json"`, "mode: Webhook", "secretKeyRef: x", "postgresql://[redacted]@db.internal:5432/app", "https://[redacted]@gitlab.example/r.git", "https://c"} {
 		if !strings.Contains(out, kept) {
 			t.Fatalf("expected %q in %s", kept, out)
 		}
