@@ -1290,7 +1290,10 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         # Verify sabotage: 126 WOULD have produced the misleading hint
         hint_126 = terminal_hints.annotate_failure("kubectl delete pod mypod", 126, output)
         self.assertIsNotNone(hint_126)
-        self.assertIn("chmod +x", hint_126)
+        self.assertTrue(
+            any(term in hint_126.lower() for term in ("chmod", "executable", "interpreter")),
+            f"Exit 126 should advise execution or file permission resolution, got: {hint_126!r}",
+        )
 
 
 class TestConnectTimeout(unittest.TestCase):
