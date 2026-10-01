@@ -2,6 +2,8 @@ package hermesbridge
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -337,6 +339,40 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	})
 }
 
+// The scope's config.yaml is written before its .env, so a scope cut short
+// between the two is one the sweep removes rather than a credential copy it
+// never sees: a source with an unwritable destination for the env fails
+// after the config exists, and the failed scope is gone.
+func TestChildManagedScope_WritesTheConfigBeforeTheEnv(t *testing.T) {
+	src := t.TempDir()
+	for name, body := range map[string]string{managedConfigFile: "model: {default: m}\n", managedEnvFile: "K=v\n"} {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scratch := t.TempDir()
+	b := &Bridge{cfg: Config{ScratchDir: scratch, ManagedScopeDir: src, ActivityListen: "127.0.0.1:0"}}
+	if err := b.listenActivity(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.activityLn.Close() })
+	dir, err := b.childManagedScope("task-order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgInfo, err := os.Stat(filepath.Join(dir, managedConfigFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envInfo, err := os.Stat(filepath.Join(dir, managedEnvFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envInfo.ModTime().Before(cfgInfo.ModTime()) {
+		t.Fatalf("env written (%v) before config (%v)", envInfo.ModTime(), cfgInfo.ModTime())
+	}
+}
+
 // Without a source scope the child still gets one, holding only the hook.
 func TestActivity_ChildScopeWithoutASourceHoldsOnlyTheHook(t *testing.T) {
 	_, url := startServer(t)
@@ -560,9 +596,9 @@ func TestRedactInput_CamelCaseKeys(t *testing.T) {
 // A quoted secret with spaces in it is scrubbed whole: the tail of a
 // passphrase must not ship behind a marker that says it was redacted.
 func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
-	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail", "plain": "kubectl get pods -h db"}`
+	in := `{"command": "mysql --password \"my pass word\" -h db; curl -d '{\"password\": \"my pass word\"}' https://x; export TOKEN='one two three'; gcloud --api-key=\"k e y\" ls; psql --password 'p q' -c 'select 1'; echo --token unterminated\" tail; curl -u \"admin:my pass\" https://y; curl -uadmin:hunter8 https://z", "plain": "kubectl get pods -h db"}`
 	out := string(redactInput("terminal", json.RawMessage(in)))
-	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated"} {
+	for _, leaked := range []string{"pass word", "one two three", "k e y", `'p q'`, "unterminated", "my pass", "hunter8"} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("leaked %q in %s", leaked, out)
 		}
@@ -574,7 +610,7 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 	}
 	// An unterminated quote falls back to the whitespace rule: the first
 	// word is scrubbed and the rest of the line survives.
-	if !strings.Contains(out, ` tail"`) {
+	if !strings.Contains(out, ` tail;`) {
 		t.Fatalf("unterminated-quote fallback lost the line: %s", out)
 	}
 }
@@ -817,7 +853,23 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 		}
 	}
 
-	b := &Bridge{cfg: Config{ScratchDir: scratch, ActivityListen: "127.0.0.1:0"}}
+	// A scope nobody can remove (a same-uid writer in the pod can make
+	// one) is logged and left; the bridge still starts.
+	stuck := filepath.Join(scratch, "task-stuck")
+	if err := os.MkdirAll(filepath.Join(stuck, "inner"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuck, managedConfigFile), []byte("model: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(stuck, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(stuck, 0o700) })
+	}
+
+	b := &Bridge{cfg: Config{ScratchDir: scratch, ActivityListen: "127.0.0.1:0", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 	if err := b.listenActivity(); err != nil {
 		t.Fatalf("listenActivity: %v", err)
 	}
@@ -837,7 +889,7 @@ func TestListenActivity_SweepsOnlyTaskScopesAtStart(t *testing.T) {
 	if err := os.WriteFile(fileNamedLikeATask, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := sweepTaskScopes(scratch); err != nil {
+	if err := sweepTaskScopes(scratch, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(fileNamedLikeATask); err != nil {

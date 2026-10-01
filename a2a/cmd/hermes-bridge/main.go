@@ -97,9 +97,6 @@ func run() int {
 	return 0
 }
 
-// realMain is the bridge from environment to shutdown. Every failure is
-// logged where it is found and then returned; a missing NATS_URL returns
-// errUsage before anything is dialed.
 // managedScopeDir is hermes's managed scope as this process sees it, the
 // source each child's scope is copied from: HERMES_MANAGED_DIR when set, else
 // /etc/hermes when it is a directory, else none (the child gets a hook-only
@@ -116,6 +113,9 @@ func managedScopeDir() string {
 	return ""
 }
 
+// realMain is the bridge from environment to shutdown. Every failure is
+// logged where it is found and then returned; a missing NATS_URL returns
+// errUsage before anything is dialed.
 func realMain(ctx context.Context, log *slog.Logger) error {
 	url := os.Getenv("NATS_URL")
 	if url == "" {

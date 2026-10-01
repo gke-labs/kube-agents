@@ -41,11 +41,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -233,8 +235,9 @@ var (
 		// commit message is not one: the word after it is too short.
 		regexp.MustCompile(`(?i)basic\s+[A-Za-z0-9+/]{16,}={0,2}`),
 		// curl's -u user:password, on a curl command: "date -u 12:30" and
-		// "sort -u a:b" are not.
-		regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*\s(?:-u|--user)[\s=]+\S+:\S+`),
+		// "sort -u a:b" are not. A quoted value runs to its closing quote and
+		// the attached form (-uuser:pass) is read too.
+		regexp.MustCompile(`(?i)\bcurl\b[^;|&\n]*\s(?:-u|--user)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+:\S+)`),
 		// key=value / key: value / "key": "value", where a secret word is a
 		// whole component of the key (SECRET_KEY, AWS_SECRET_ACCESS_KEY). A
 		// quoted value runs to its closing quote, spaces included, so a
@@ -396,7 +399,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	case hookPostToolCall:
 		if _, seen := a.open[id]; seen {
 			delete(a.open, id)
-			a.openOrder = removeString(a.openOrder, id)
+			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
 		}
 		a.calls++
 		status := activityStatus(d)
@@ -509,16 +512,6 @@ func activityStatus(d hookDelivery) string {
 		return ActivityStatusError
 	}
 	return ActivityStatusCompleted
-}
-
-func removeString(list []string, s string) []string {
-	out := list[:0]
-	for _, v := range list {
-		if v != s {
-			out = append(out, v)
-		}
-	}
-	return out
 }
 
 // redactInput returns the tool input fit for the bus: secret-looking keys
@@ -676,6 +669,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	// absence: a child started on a hook-only scope would run without the
 	// operator's pins, silently. Only a missing file means nothing to copy.
 	cfg := map[string]any{}
+	var env []byte
 	src := b.cfg.ManagedScopeDir
 	if src != "" {
 		raw, rerr := os.ReadFile(filepath.Join(src, managedConfigFile))
@@ -693,9 +687,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 		raw, rerr = os.ReadFile(filepath.Join(src, managedEnvFile))
 		switch {
 		case rerr == nil:
-			if err := os.WriteFile(filepath.Join(dir, managedEnvFile), raw, childScopeFileMode); err != nil {
-				return "", fmt.Errorf("child scope env: %w", err)
-			}
+			env = raw
 		case !errors.Is(rerr, os.ErrNotExist):
 			return "", fmt.Errorf("managed env %s: %w", src, rerr)
 		}
@@ -718,8 +710,16 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("child scope config: %w", err)
 	}
+	// config.yaml first, .env second: the start-time sweep takes a scope by
+	// its config.yaml, so a kill between the two writes leaves a scope the
+	// next start removes rather than a credential copy it never sees.
 	if err := os.WriteFile(filepath.Join(dir, managedConfigFile), out, childScopeFileMode); err != nil {
 		return "", fmt.Errorf("child scope config: %w", err)
+	}
+	if env != nil {
+		if err := os.WriteFile(filepath.Join(dir, managedEnvFile), env, childScopeFileMode); err != nil {
+			return "", fmt.Errorf("child scope env: %w", err)
+		}
 	}
 	return dir, nil
 }
@@ -742,7 +742,7 @@ func (b *Bridge) listenActivity() error {
 	if err := os.MkdirAll(b.cfg.ScratchDir, childScopeDirMode); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
-	if err := sweepTaskScopes(b.cfg.ScratchDir); err != nil {
+	if err := sweepTaskScopes(b.cfg.ScratchDir, b.cfg.Logger); err != nil {
 		return fmt.Errorf("scratch dir %s: %w", b.cfg.ScratchDir, err)
 	}
 	ln, err := net.Listen("tcp", b.cfg.ActivityListen)
@@ -767,8 +767,12 @@ func (b *Bridge) listenActivity() error {
 // marks, because BRIDGE_SCRATCH_DIR may name a directory the bridge shares,
 // and a name alone - cache, data, work - is the shape of most directories. A
 // file, a directory with another name, or a task-named directory with no
-// config in it is not the bridge's and stays.
-func sweepTaskScopes(dir string) error {
+// config in it is not the bridge's and stays. A scope that cannot be removed
+// is logged and left: the scratch dir is a shared emptyDir, any same-uid
+// process in the pod can plant an unremovable directory in it, and the
+// executor must not stay down for that. Only an unreadable scratch dir is
+// an error.
+func sweepTaskScopes(dir string, log *slog.Logger) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -781,8 +785,8 @@ func sweepTaskScopes(dir string) error {
 		if _, err := os.Stat(filepath.Join(scope, managedConfigFile)); err != nil {
 			continue
 		}
-		if err := os.RemoveAll(scope); err != nil {
-			return err
+		if err := os.RemoveAll(scope); err != nil && log != nil {
+			log.Warn("leftover task scope not removed", "scope", scope, "err", err)
 		}
 	}
 	return nil
