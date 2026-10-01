@@ -515,10 +515,12 @@ const (
 	// handleMessage logs "events lookup failed after retries; dropping
 	// submission", which loses the task, and cancelOrphan logs "cancel
 	// events lookup failed after retries", which drops the cancel and leaves
-	// the orphan non-terminal for the retention window. The retries (three,
-	// short backoff) make a brief refusal a late task rather than a lost one;
-	// a submission burst wide enough to hold the cap past them is that
-	// handler's hazard, and pacing it is a bridge change, not a number here.
+	// the orphan non-terminal for the retention window. The cancel's retries
+	// (six seconds, past the inactive threshold) make a brief refusal a late
+	// cancel rather than a lost one; a new submission's lookup opens no
+	// consumer and gets one quick retry; a burst wide enough to hold the cap
+	// past them is that handler's hazard, and pacing it is a bridge change,
+	// not a number here.
 	//
 	// What this term holds is the trigger-paced callers, each counted at
 	// what can be in flight at once from the structure above, times

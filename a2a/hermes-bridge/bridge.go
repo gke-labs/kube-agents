@@ -44,18 +44,24 @@ const (
 	// turn gave up on the provider's rate limit; the terminal names it so a
 	// quota storm is not graded as the persona's failure.
 	rateLimitedExitCode = 75
-	// taskLookupAttempts bounds the TasksGet retries behind handleMessage
-	// and cancelOrphan. The lib acks after the handler returns and exposes
-	// no nak, so a transient read failure (a consumer-cap refusal, a bus
-	// hiccup) used to drop the submission for good; a bounded retry turns a
-	// lost task into a late one (#2043). The schedule is sized to the fault
-	// it is named for: a TASKS consumer-cap refusal clears when the
-	// ephemeral consumers holding the cap are reaped, which takes the lib's
+	// The task lookups behind handleMessage and cancelOrphan retry, because
+	// the lib acks after the handler returns and exposes no nak, so a
+	// transient read failure used to drop the delivery for good (#2043).
+	// Two schedules, because the two reads meet different faults. A new
+	// submission has no events, so its lookup is answered by the direct
+	// horizon gets without opening a consumer and cannot meet the TASKS
+	// consumer cap; what it can meet is a bus hiccup on those gets, worth one
+	// quick retry and no more, since the durable's handler is serial and a
+	// long wait here holds every other delivery behind a message that ends
+	// as "ignoring" anyway. An orphan's cancel reads a task that has events,
+	// which opens the consumer and can be refused at the cap; that refusal
+	// clears when the consumers holding the cap are reaped, after the lib's
 	// inactive threshold (lib.EphemeralConsumerInactiveThreshold, 5s), so
-	// the waits (1s, 2s, 3s) outlast it. The cost is paid by the durable's
-	// serial handler, once, only while a lookup is failing.
-	taskLookupAttempts = 4
-	taskLookupBackoff  = time.Second
+	// its waits (1s, 2s, 3s) outlast it.
+	submissionLookupAttempts = 2
+	submissionLookupBackoff  = 200 * time.Millisecond
+	cancelLookupAttempts     = 4
+	cancelLookupBackoff      = time.Second
 	// finalizePublishTimeout bounds the result+terminal publishes of one
 	// finalize; it must outlast a NATS reconnect, not a task.
 	finalizePublishTimeout = 20 * time.Second
@@ -343,7 +349,7 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 	// Unknown task: the dispatcher rule. Empty events subject means new;
 	// terminal means acked with a warning; non-final events with no local run
 	// is an orphan a follow-up cannot revive.
-	task, attempts, err := b.lookupTask(ctx, env.TaskID)
+	task, attempts, err := b.lookupTask(ctx, env.TaskID, submissionLookupAttempts, submissionLookupBackoff)
 	switch {
 	case isTaskNotFound(err):
 		b.accept(ctx, env)
@@ -441,7 +447,7 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 		b.cfg.Logger.Warn("cancel for a task with a terminal event; ignoring", "task", env.TaskID)
 		return
 	}
-	task, attempts, err := b.lookupTask(ctx, env.TaskID)
+	task, attempts, err := b.lookupTask(ctx, env.TaskID, cancelLookupAttempts, cancelLookupBackoff)
 	switch {
 	case isTaskNotFound(err):
 		b.cfg.Logger.Warn("cancel for a task with no events; ignoring", "task", env.TaskID)
@@ -801,8 +807,8 @@ func tail(s string, n int) string {
 	return s[cut:]
 }
 
-// lookupTask is TasksGet with the bounded retry taskLookupAttempts
-// describes. A not-found answer is an answer and returns at once. An error
+// lookupTask is TasksGet with a bounded retry (the schedules are the
+// constants above). A not-found answer is an answer and returns at once. An error
 // from before the read opened its consumer (a creation refusal, which is
 // what a consumer-cap refusal is) is retried with a growing backoff; an error
 // from after it is not, because that consumer is now live for the inactive
@@ -811,12 +817,12 @@ func tail(s string, n int) string {
 // count is how many lookups were made, which is what the drop log reports: a
 // context that ends the loop after one attempt (a shutdown mid-handler) is
 // one, not the bound.
-func (b *Bridge) lookupTask(ctx context.Context, taskID string) (task *lib.Task, attempts int, err error) {
+func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int, backoff time.Duration) (task *lib.Task, attempts int, err error) {
 	get := b.tasksGet
 	if get == nil {
 		get = b.c.TasksGetOpened
 	}
-	for attempts = 1; attempts <= taskLookupAttempts; attempts++ {
+	for attempts = 1; attempts <= maxAttempts; attempts++ {
 		var opened bool
 		task, opened, err = get(ctx, b.cfg.Profile, taskID)
 		if err == nil || isTaskNotFound(err) || ctx.Err() != nil {
@@ -827,17 +833,17 @@ func (b *Bridge) lookupTask(ctx context.Context, taskID string) (task *lib.Task,
 				"task", taskID, "attempt", attempts, "err", err)
 			return task, attempts, err
 		}
-		if attempts < taskLookupAttempts {
+		if attempts < maxAttempts {
 			b.cfg.Logger.Warn("task lookup failed; retrying",
-				"task", taskID, "attempt", attempts, "of", taskLookupAttempts, "err", err)
+				"task", taskID, "attempt", attempts, "of", maxAttempts, "err", err)
 			select {
-			case <-time.After(taskLookupBackoff * time.Duration(attempts)):
+			case <-time.After(backoff * time.Duration(attempts)):
 			case <-ctx.Done():
 				return nil, attempts, ctx.Err()
 			}
 		}
 	}
-	return task, taskLookupAttempts, err
+	return task, maxAttempts, err
 }
 
 // finalize is the single writer of a task's terminal event, idempotent: the

@@ -1437,8 +1437,8 @@ func TestLookup_TransientErrorIsRetriedThenAccepted(t *testing.T) {
 	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
 		real := b.c.TasksGetOpened
 		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
-			if calls.Add(1) < 3 {
-				return nil, false, errors.New("nats: maximum consumers limit reached")
+			if calls.Add(1) < 2 {
+				return nil, false, errors.New("nats: timeout on the horizon get")
 			}
 			return real(ctx, addressee, taskID)
 		}
@@ -1451,19 +1451,20 @@ func TestLookup_TransientErrorIsRetriedThenAccepted(t *testing.T) {
 	if task.State != lib.StateCompleted {
 		t.Fatalf("state = %s, want completed after the lookup retries", task.State)
 	}
-	if got := calls.Load(); got != 3 {
-		t.Fatalf("lookup attempts = %d, want 3 (two transient failures, then the real read)", got)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("lookup attempts = %d, want 2 (one transient failure, then the real read)", got)
 	}
 }
 
-// The retry schedule outlasts the fault it is named for: a consumer-cap
-// refusal clears when the ephemeral consumers holding the cap are reaped,
-// after the lib's inactive threshold. Pinned as arithmetic, because the
+// The cancel's retry schedule outlasts the fault it is named for: a
+// consumer-cap refusal clears when the ephemeral consumers holding the cap
+// are reaped, after the lib's inactive threshold. (The submission's lookup
+// never opens a consumer for a new task, so its schedule is one quick retry.) Pinned as arithmetic, because the
 // constant it has to beat lives in another package and could move.
 func TestLookup_ScheduleOutlastsTheConsumerInactiveThreshold(t *testing.T) {
 	var total time.Duration
-	for attempt := 1; attempt < taskLookupAttempts; attempt++ {
-		total += taskLookupBackoff * time.Duration(attempt)
+	for attempt := 1; attempt < cancelLookupAttempts; attempt++ {
+		total += cancelLookupBackoff * time.Duration(attempt)
 	}
 	if total <= lib.EphemeralConsumerInactiveThreshold {
 		t.Fatalf("retry schedule waits %s in total, which does not outlast the %s inactive threshold a cap refusal clears on",
@@ -1557,9 +1558,9 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 	defer stop()
 	c := gatewayClient(t, url)
 	submit(t, c, "task-drop", "hello")
-	time.Sleep(8 * time.Second) // the full schedule (1s+2s+3s) plus slack
-	if got := calls.Load(); got != taskLookupAttempts {
-		t.Fatalf("lookup attempts = %d, want %d", got, taskLookupAttempts)
+	time.Sleep(3 * time.Second) // the submission schedule (one 200ms retry) plus slack
+	if got := calls.Load(); got != submissionLookupAttempts {
+		t.Fatalf("lookup attempts = %d, want %d", got, submissionLookupAttempts)
 	}
 	if ev := replayEvents(t, url, "task-drop"); len(ev) != 0 {
 		t.Fatalf("a dropped submission published %d events, want none", len(ev))
@@ -1571,7 +1572,7 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 		nf.Add(1)
 		return nil, false, &lib.A2AError{Code: lib.CodeTaskNotFound}
 	}
-	if _, attempts, err := b.lookupTask(context.Background(), "x"); !isTaskNotFound(err) || nf.Load() != 1 || attempts != 1 {
+	if _, attempts, err := b.lookupTask(context.Background(), "x", cancelLookupAttempts, cancelLookupBackoff); !isTaskNotFound(err) || nf.Load() != 1 || attempts != 1 {
 		t.Fatalf("not-found was retried or lost: err=%v calls=%d attempts=%d", err, nf.Load(), attempts)
 	}
 
@@ -1582,7 +1583,7 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 		cancel()
 		return nil, false, errors.New("nats: timeout")
 	}
-	if _, attempts, err := b.lookupTask(ctx, "y"); err == nil || attempts != 1 {
+	if _, attempts, err := b.lookupTask(ctx, "y", cancelLookupAttempts, cancelLookupBackoff); err == nil || attempts != 1 {
 		t.Fatalf("interrupted lookup: err=%v attempts=%d, want an error and 1", err, attempts)
 	}
 
@@ -1594,7 +1595,7 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 		opened.Add(1)
 		return nil, true, errors.New("protocol error folding events")
 	}
-	if _, attempts, err := b.lookupTask(context.Background(), "z"); err == nil || attempts != 1 || opened.Load() != 1 {
+	if _, attempts, err := b.lookupTask(context.Background(), "z", cancelLookupAttempts, cancelLookupBackoff); err == nil || attempts != 1 || opened.Load() != 1 {
 		t.Fatalf("post-create failure: err=%v attempts=%d calls=%d, want an error after exactly one lookup", err, attempts, opened.Load())
 	}
 }
