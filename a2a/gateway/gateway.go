@@ -17,6 +17,10 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
+// sessionProfile is the AgentProfile a /session conversation runs as - the
+// conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
+const sessionProfile = "chat"
+
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
 // slot instead of holding it forever. Where the clock starts relative to
@@ -622,7 +626,16 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path.
 	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
+	// A slash command resolves before everything else (architecture 02,
+	// "Chat entrypoints"): it is not a status ask, not a stop, and never a
+	// steer. Text only - a programmatic cancel keeps its intent whatever
+	// its text says.
+	sessionRest, sessionCmd := isSessionCommand(msg.Text)
 	switch {
+	case msg.Intent == "" && sessionCmd:
+		if !g.sessionCommand(ctx, rec, msg, sessionRest, principal, authority) {
+			return
+		}
 	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
 		g.answerStatusByReplay(ctx, rec)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
@@ -1012,6 +1025,82 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	}
 	rec.BusSession = mintSessionName(rec.Profile)
 	rec.Addressee = rec.BusSession
+	return true
+}
+
+// sessionCommand resolves the one slash command the gateway owns:
+// "/session" marks the conversation session-routed, "/session <text>" marks
+// it and runs <text> as the first turn, "/session off" releases the
+// incarnation and re-homes to the default addressee. Deterministic, like
+// every other affordance here; it names a route, not a handle, and it is
+// resolved before status, stop and steer (spec-chatops-gateway, "Sessions by
+// default"). It reports whether the record changed and must be written back;
+// false means a post already answered and the record is as it was.
+func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, rest, principal string, authority []byte) bool {
+	if g.spawner == nil {
+		g.post(rec.Key, "🤷 sessions are not enabled on this install")
+		return false
+	}
+	off := isSessionOff(rest)
+	if g.cfg.DefaultAddressee == RouteSession {
+		// Post-flip: every conversation is a session already.
+		if off {
+			g.post(rec.Key, "ℹ️ sessions are the default on this install; there is nothing to turn off")
+		} else {
+			g.post(rec.Key, "ℹ️ this conversation is already a session")
+		}
+		return false
+	}
+	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
+	if off {
+		if !rec.SessionRouted {
+			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
+			return false
+		}
+		if running {
+			g.post(rec.Key, "⚠️ a session task is still running — `stop` it first, then `/session off`")
+			return false
+		}
+		if rec.PodName != "" {
+			if !g.closeDetachedBeforeDelete(ctx, rec) {
+				g.post(rec.Key, "⚠️ could not close the previous task on the bus; try again in a moment")
+				return false
+			}
+			if err := g.spawner.Delete(ctx, rec.PodName); err != nil {
+				g.log.Warn("session off: incarnation delete failed; pod may linger", "pod", rec.PodName, "err", err)
+			}
+			rec.PodName = ""
+		}
+		rec.SessionRouted = false
+		rec.Profile = ""
+		rec.BusSession = ""
+		rec.Addressee = g.cfg.DefaultAddressee
+		g.log.Info("session route off", "conversation", rec.Key, "addressee", rec.Addressee)
+		g.post(rec.Key, "↩️ session route off — back to `"+g.cfg.DefaultAddressee+"`")
+		return true
+	}
+	if rec.SessionRouted && rest == "" {
+		g.post(rec.Key, "ℹ️ already on the session route")
+		return false
+	}
+	rec.SessionRouted = true
+	if rec.Profile == "" {
+		rec.Profile = sessionProfile
+	}
+	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "")
+	if rest == "" {
+		g.post(rec.Key, "🧵 session route on — your next message opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
+		return true
+	}
+	if running {
+		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
+		return true
+	}
+	msg.Text = rest
+	if !g.freshIncarnation(ctx, rec) {
+		return false
+	}
+	g.startTask(ctx, rec, msg, principal, authority)
 	return true
 }
 
