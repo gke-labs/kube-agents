@@ -861,8 +861,9 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // googleChatEnabled is the enabled test the Chat render sites make, in one
-// place for the sites this change touches; the agent-pod sites it did not
-// touch still spell it inline.
+// place; the status interfaces list (resolveActiveInterfaces in
+// manifest_helpers.go) still spells it inline, since it is about the install
+// having Chat at all rather than about which consumer renders.
 func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Integration == nil {
 		return false
@@ -872,13 +873,15 @@ func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // a2aGchatAllowlist reads the CR's allowed-users list the way the gateway's
-// FromEnv reads the env it becomes: each entry trimmed, the empty ones
-// dropped. The operator decides allow-all on the result, so a list that holds
-// only whitespace is an empty list on both sides rather than a restriction to
-// nobody on one of them.
+// FromEnv reads the env it becomes, with the gateway's own grammar: the
+// entries joined on commas and split again, each piece trimmed, the empty
+// ones dropped. The operator decides allow-all on the result, so a list that
+// holds only whitespace or commas is an empty list on both sides rather than
+// a restriction to nobody on one of them, and an entry carrying a comma is
+// the two entries the gateway would read.
 func a2aGchatAllowlist(users []string) []string {
 	var out []string
-	for _, u := range users {
+	for _, u := range strings.Split(strings.Join(users, ","), ",") {
 		if u = strings.TrimSpace(u); u != "" {
 			out = append(out, u)
 		}

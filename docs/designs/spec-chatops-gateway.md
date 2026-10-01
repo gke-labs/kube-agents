@@ -848,7 +848,12 @@ the guard accepts, by the decision recorded above, and the render counts the doo
 for the same reason. An install that enables Google Chat under `next` has a backend by that
 fact alone: the render asks the CR before it reads any Secret, and, because the gateway
 refuses two real backends, omits the Discord reference when Chat is armed, so a
-`discord-bot` Secret left in the namespace does not stop a Chat gateway starting.
+`discord-bot` Secret left in the namespace does not stop a Chat gateway starting. The
+rule is creation-only in this direction too: disabling Google Chat on an install whose gateway
+has no other backend re-renders the existing gateway without one, and it exits on
+`no chat backend` until the admin flips the CR to `today` (which tears the stack down), creates
+a `discord-bot` Secret, or deletes the gateway Deployment and its session pods with it - the
+same shape as removing the Secret from under a Discord gateway, reached through the CR.
 
 ## The Google Chat adapter (added 9/5)
 

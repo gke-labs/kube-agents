@@ -172,20 +172,6 @@ func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 	}
 }
 
-// TestAnEmptyAllowlistArmsAllowAllUnderNext: the legacy pin's rule, kept.
-// The gateway refuses to start the gchat adapter with neither an allowlist
-// nor the explicit allow-all, and the CR's empty list has always meant all.
-func TestAnEmptyAllowlistArmsAllowAllUnderNext(t *testing.T) {
-	agent := gchatTestAgent("next", true)
-	agent.Spec.Integration.GoogleChat.AllowedUsers = nil
-	env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
-	if env[a2aGchatAllowAllUsersEnvVar].Value != "true" || env[a2aGchatAllowedUsersEnvVar].Value != "" {
-		t.Errorf("empty allowlist renders %s=%q %s=%q, want allow-all true and an empty list",
-			a2aGchatAllowAllUsersEnvVar, env[a2aGchatAllowAllUsersEnvVar].Value,
-			a2aGchatAllowedUsersEnvVar, env[a2aGchatAllowedUsersEnvVar].Value)
-	}
-}
-
 // TestDisplayModeFollowsTheCRField: debug on the CR reaches the gateway.
 func TestDisplayModeFollowsTheCRField(t *testing.T) {
 	agent := gchatTestAgent("next", true)
@@ -417,6 +403,12 @@ func TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt(t *testing.T) {
 		{"whitespace only", []string{" "}, "", "true"},
 		{"empty strings only", []string{"", "  "}, "", "true"},
 		{"padded and empty entries", []string{" a@example.com ", "", "b@example.com"}, "a@example.com,b@example.com", "false"},
+		// The gateway splits the JOINED string on commas, so an entry that is
+		// only commas and whitespace is empty on its side too, and an entry
+		// that holds a comma is two entries there.
+		{"commas only", []string{","}, "", "true"},
+		{"commas and whitespace", []string{" , ", ",,"}, "", "true"},
+		{"a comma inside one entry", []string{"a@example.com, b@example.com"}, "a@example.com,b@example.com", "false"},
 		{"nil", nil, "", "true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
