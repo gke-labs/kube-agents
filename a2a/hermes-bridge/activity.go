@@ -1144,6 +1144,7 @@ func (b *Bridge) listenActivity() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(ActivityPath, b.handleActivity)
 	b.activityLn = ln
+	b.activityDone = make(chan struct{})
 	b.activitySrv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: activityReadHeaderTimeout,
@@ -1199,10 +1200,11 @@ func (b *Bridge) serveActivity(ctx context.Context) {
 		return
 	}
 	go func() {
-		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), activityShutdownTimeout)
-		defer cancel()
-		_ = b.activitySrv.Shutdown(sctx)
+		select {
+		case <-ctx.Done():
+		case <-b.activityDone:
+		}
+		b.closeActivity()
 	}()
 	go func() {
 		if err := b.activitySrv.Serve(b.activityLn); err != nil && err != http.ErrServerClosed {
@@ -1210,6 +1212,26 @@ func (b *Bridge) serveActivity(ctx context.Context) {
 		}
 	}()
 	b.cfg.Logger.Info("activity door listening", "url", b.ActivityURL())
+}
+
+// closeActivity shuts the door once, from whichever side ends first: the
+// context (a shutdown) or the bridge's own close (a Run that returned
+// early, say on a refused subscribe). The server is asked to shut down
+// before the listener is closed, so Serve ends with ErrServerClosed and
+// nothing logs a stopped door beside the error that really ended the run.
+func (b *Bridge) closeActivity() {
+	if b.activityLn == nil {
+		return
+	}
+	b.activityOnce.Do(func() {
+		close(b.activityDone)
+		if b.activitySrv != nil {
+			sctx, cancel := context.WithTimeout(context.Background(), activityShutdownTimeout)
+			defer cancel()
+			_ = b.activitySrv.Shutdown(sctx)
+		}
+		_ = b.activityLn.Close()
+	})
 }
 
 // handleActivity is the door. Every answer past the method check is 204:

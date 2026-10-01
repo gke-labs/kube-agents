@@ -262,8 +262,10 @@ type Bridge struct {
 	holdReplaySlot func(release func())
 
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
-	activityLn  net.Listener
-	activitySrv *http.Server
+	activityLn   net.Listener
+	activitySrv  *http.Server
+	activityDone chan struct{} // closed by closeActivity, so serveActivity's shutdown waiter stops too
+	activityOnce sync.Once
 	// tasksGet is the task lookup lookupTask retries, in the shape of
 	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
 	// drive the retry without a bus fault.
@@ -322,9 +324,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 func (b *Bridge) close() {
 	b.c.Close()
 	b.nc.Close()
-	if b.activityLn != nil {
-		_ = b.activityLn.Close()
-	}
+	b.closeActivity()
 }
 
 // Run sweeps orphans from a prior incarnation, then consumes the profile's

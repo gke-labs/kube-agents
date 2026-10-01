@@ -2,6 +2,7 @@ package hermesbridge
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1338,5 +1340,39 @@ func TestChildManagedScope_KeepsLargeIntegersAndRefusesMisshapenHooks(t *testing
 	}
 	if _, err := (&Bridge{cfg: Config{ScratchDir: t.TempDir(), ManagedScopeDir: src}}).childManagedScope("task-null"); err != nil {
 		t.Fatalf("null hooks refused: %v", err)
+	}
+}
+
+// A bridge that closes while the door is served (Run returning early on a
+// refused subscribe) ends Serve with ErrServerClosed: no "activity door
+// stopped" error beside the one that ended the run, the port released, and
+// a second close a no-op.
+func TestServeActivity_CloseIsNotAStoppedDoor(t *testing.T) {
+	var logs bytes.Buffer
+	b := &Bridge{cfg: Config{ScratchDir: t.TempDir(), ActivityListen: "127.0.0.1:0", Logger: slog.New(slog.NewTextHandler(&logs, nil))}}
+	if err := b.listenActivity(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.serveActivity(ctx)
+	addr := b.activityLn.Addr().String()
+	b.closeActivity()
+	b.closeActivity()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if c, err := net.Dial("tcp", addr); err != nil {
+			break
+		} else {
+			_ = c.Close()
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the door still accepts after close")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if strings.Contains(logs.String(), "activity door stopped") {
+		t.Fatalf("close logged a stopped door: %s", logs.String())
 	}
 }
