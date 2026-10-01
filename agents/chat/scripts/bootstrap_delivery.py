@@ -25,10 +25,8 @@ When all three hold, the script claims delivery, prints ``INVENTORY.md``
 (delivered verbatim) and sets the report aside where it was read. Otherwise it
 prints nothing, which the ``no_agent`` cron path treats as a silent run (no
 message). A report it cannot read, or one over ``REPORT_MAX_BYTES``, fails the
-run instead (exit 1), which the scheduler posts as an alert. An unreachable
-sandbox stays silent and is retried on the next tick until it has not answered
-for ``SANDBOX_UNANSWERED_ALERT_SECONDS``, then fails the run once and again every
-``UNANSWERED_REALERT_SECONDS`` while it stays unanswered. The first run
+run instead (exit 1), which the scheduler posts as an alert; an unreachable
+sandbox stays silent and is retried on the next tick. The first run
 ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
 cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
@@ -46,7 +44,6 @@ exactly what the user sees. The sweep's complete findings are a different file
 (``INVENTORY.raw.md``) and are never delivered from here.
 """
 
-import json
 import os
 import subprocess
 import sys
@@ -81,21 +78,6 @@ SANDBOX_TIMEOUT_SECONDS = 30
 # report. Far above that run's post-claim work: a stdout write and one archive
 # over ssh bounded by SANDBOX_TIMEOUT_SECONDS.
 RETIRE_AFTER_SECONDS = 300
-
-# Records the current streak of reads the sandbox does not answer, and is removed
-# by the next read it does. Past SANDBOX_UNANSWERED_ALERT_SECONDS the sandbox is
-# not rolling: SandboxUnavailable also covers a rejected key, a changed host key
-# and a config with no ssh_host, none of which clear on their own. Far above a
-# sandbox pod restart.
-UNANSWERED_MARKER = ".bootstrap_sandbox_unanswered"
-SANDBOX_UNANSWERED_ALERT_SECONDS = 900
-# A gap this long since the last unanswered read means reads stopped (no delivery
-# was due, or the agent pod was down) and the sandbox may have answered unseen,
-# so the streak starts again. Five of the job's one-minute ticks.
-UNANSWERED_STREAK_GAP_SECONDS = 300
-# Each failed run is an alert in the user's chat, so past the limit the run fails
-# once and then only this often.
-UNANSWERED_REALERT_SECONDS = 3600
 
 # By absolute path, so no PATH entry picks the binary. A function defined under
 # this name in the ~/.bashrc the model owns still shadows it, since bash allows a
@@ -234,49 +216,6 @@ def _retire_jobs() -> None:
             sys.stderr.write(f"bootstrap_delivery: could not remove {job_id}: {e}\n")
 
 
-def _sandbox_unanswered(data_dir: Path, error: Exception) -> int:
-    """Stay silent while the sandbox may be rolling, and fail once it has been gone too long.
-
-    Silent at first because a non-zero exit is posted to the user's chat as a
-    failure alert, and a sandbox restart is not the user's problem. See
-    ``UNANSWERED_MARKER`` for why the silence ends.
-    """
-    marker = data_dir / UNANSWERED_MARKER
-    now = time.time()
-    since, alerted = now, None
-    try:
-        streak = json.loads(marker.read_text())
-        if now - float(streak["last"]) < UNANSWERED_STREAK_GAP_SECONDS:
-            last_alert = streak.get("alerted")
-            since, alerted = float(streak["since"]), None if last_alert is None else float(last_alert)
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    unanswered_for = now - since
-    alert = unanswered_for >= SANDBOX_UNANSWERED_ALERT_SECONDS and (
-        alerted is None or now - alerted >= UNANSWERED_REALERT_SECONDS
-    )
-    try:
-        marker.write_text(json.dumps({"since": since, "last": now, "alerted": now if alert else alerted}))
-    except OSError as e:
-        # Without a record of the alert, every later tick would repeat it.
-        sys.stderr.write(f"bootstrap_delivery: could not record the unanswered read: {e}\n")
-        alert = False
-    if not alert:
-        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {error}\n")
-        return 0
-    sys.stderr.write(
-        f"bootstrap_delivery: the shell sandbox has not answered for {int(unanswered_for)} s: {error}\n"
-    )
-    return 1
-
-
-def _clear_unanswered(data_dir: Path) -> None:
-    try:
-        (data_dir / UNANSWERED_MARKER).unlink(missing_ok=True)
-    except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not clear {UNANSWERED_MARKER}: {e}\n")
-
-
 def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
@@ -301,12 +240,15 @@ def main(data_dir: Path | None = None) -> int:
     try:
         raw = _read_report(data_dir, in_sandbox)
     except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
-        return _sandbox_unanswered(data_dir, e)
+        # Silent, and retried next tick: a non-zero exit is posted to the
+        # user's chat as a failure alert on every tick. A lasting fault (a
+        # rejected key, a changed host key) lands here too; the agent's terminal
+        # shares that key and host, so it fails there too.
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
     except (OSError, sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed) as e:
-        _clear_unanswered(data_dir)
         sys.stderr.write(f"bootstrap_delivery: could not read INVENTORY.md: {e}\n")
         return 1
-    _clear_unanswered(data_dir)
     if raw is None:
         return 0  # silent run — the report is not written yet
     if len(raw) > REPORT_MAX_BYTES:

@@ -42,11 +42,10 @@
 # Isolation class: read-only on the cluster; it plants the raw report on the
 # install under test, files one card and touches `.user_aligned`, and the
 # destroy archives the onboarding cards, removes the INVENTORY files from both
-# pods, removes `.user_aligned`, `.bootstrap_completed` and
-# `.bootstrap_sandbox_unanswered`, and puts back whichever onboarding cron job
-# the delivery removed. Eligible tier: nightly -- one card's worker runs the
-# whole prioritization SOP, which takes a dispatcher slot for most of the
-# stack's wait.
+# pods, removes `.user_aligned` and `.bootstrap_completed`, and puts back
+# whichever onboarding cron job the delivery removed. Eligible
+# tier: nightly -- one card's worker runs the whole prioritization SOP, which
+# takes a dispatcher slot for most of the stack's wait.
 ---
 id: bootstrap-inventory-ranking-delivery
 name: Onboarding extracts the sweep's findings in the shell sandbox and delivers the report from there
