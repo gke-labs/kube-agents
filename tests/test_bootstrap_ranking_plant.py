@@ -803,6 +803,20 @@ class ArmDisarmTest(unittest.TestCase):
         self.assertTrue((self._home / ".user_aligned").exists())
         self.assertNotEqual(self._py(self._arm).returncode, 0)
 
+    def test_arm_refuses_a_marker_it_did_not_create_and_leaves_its_record_for_the_trap(self):
+        # A person's first chat between step 1 and the arm. The state file is
+        # already in place, so the exit trap's disarm handles this as an arm;
+        # main.tf's header says what that person then gets.
+        marker = self._home / ".user_aligned"
+        marker.write_text("person")
+        out = self._py(self._arm)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("FileExistsError", out.stderr)
+        self.assertEqual(marker.read_text(), "person")
+        self.assertEqual(
+            sorted(p.name for p in self._home.iterdir()), [".bench-onboarding-jobs.json", ".user_aligned", "cron"]
+        )
+
     def test_a_failed_write_leaves_no_state_file_to_wedge_the_next_run(self):
         # Every reader takes the state file as proof of an arm and hands it to
         # the disarm, which cannot parse a half-written one.
