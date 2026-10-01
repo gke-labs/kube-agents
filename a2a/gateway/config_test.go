@@ -8,7 +8,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -781,8 +780,7 @@ func TestFromEnvStrictEventsWriter(t *testing.T) {
 // platform agent as the default; /session is the per-conversation opt-in.
 func TestDefaultAddresseeIsPlatform(t *testing.T) {
 	setBaseEnv(t) // the file's shared FromEnv environment (NATS_URL, salt, principal map)
-	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
-	_ = os.Unsetenv("A2A_DEFAULT_ADDRESSEE")
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "") // envOr treats empty as unset
 	cfg, err := FromEnv()
 	if err != nil {
 		t.Fatal(err)

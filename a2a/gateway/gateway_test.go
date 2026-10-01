@@ -1894,3 +1894,46 @@ func TestSessionStopIsAHintNotATask(t *testing.T) {
 		t.Fatalf("/session stop marked the route: %+v", rec)
 	}
 }
+
+// TestSessionInfoRepliesStillCountAsActivity: an informational /session
+// reply is a turn like "nothing is running" - the idle clock moves.
+func TestSessionInfoRepliesStillCountAsActivity(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s14"
+	sessionRigTurn(r, conv, "s-230", "/session off")
+	waitFor(t, "answer", postedContaining(r, "not on the session route"))
+	sessionRigTurn(r, conv, "s-231", "/session")
+	waitFor(t, "ack", postedContaining(r, "session route on"))
+	// The ack is persisted; take its clock, then let only an informational
+	// reply move it.
+	rec, _ := r.g.reg.Get(context.Background(), conv)
+	if rec == nil || !rec.SessionRouted {
+		t.Fatalf("record after the ack: %+v", rec)
+	}
+	first := rec.LastActivity
+	time.Sleep(30 * time.Millisecond)
+	sessionRigTurn(r, conv, "s-232", "/session")
+	waitFor(t, "already", postedContaining(r, "already on the session route"))
+	time.Sleep(50 * time.Millisecond)
+	rec, _ = r.g.reg.Get(context.Background(), conv)
+	if !rec.LastActivity.After(first) {
+		t.Fatalf("informational reply did not move LastActivity: %s then %s", first, rec.LastActivity)
+	}
+}
+
+// TestSessionStatusIsAFirstTurn: the spec's sentence - "/session status" is
+// /session with the text "status", a first turn, not a status ask.
+func TestSessionStatusIsAFirstTurn(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "discord:g1/thread-s15"
+	sessionRigTurn(r, conv, "s-240", "/session status")
+	waitFor(t, "spawn", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "status" {
+		t.Fatalf("task text = %q", got)
+	}
+}

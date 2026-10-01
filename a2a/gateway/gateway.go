@@ -1011,8 +1011,9 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 // over.
 //
 // False means the turn was refused - at the cap, or because the previous
-// task could not be closed on the bus - and a post has already said so. The
-// record is left as it was: every mutation below follows the last refusal.
+// task could not be closed on the bus - and a post has already said so.
+// Nothing below the last refusal has run, so the caller returns without a
+// Put and whatever it set in memory beforehand never persists.
 func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool {
 	if g.refuseAtSessionCap(ctx, rec, rec.PodName != "") {
 		return false
@@ -1031,12 +1032,15 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // incarnation and re-homes to the default addressee. Deterministic, like
 // every other affordance here; it names a route, not a handle, and it is
 // resolved before status, stop and steer (spec-chatops-gateway, "Sessions by
-// default"). It reports whether the record changed and must be written back;
-// false means a post already answered and the record is as it was.
+// default"). It reports whether the record is to be written back: true for
+// every answered turn, including the informational replies (a turn is a turn,
+// and the idle clock moves as it does for "nothing is running"); false only
+// when the turn was refused part-way (the cap, or a previous task that could
+// not be closed) and the in-memory route change must not persist.
 func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, rest, principal string, authority []byte) bool {
 	if g.spawner == nil {
 		g.post(rec.Key, "🤷 sessions are not enabled on this install")
-		return false
+		return true
 	}
 	off := isSessionOff(rest)
 	if g.cfg.DefaultAddressee == RouteSession {
@@ -1046,17 +1050,19 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		} else {
 			g.post(rec.Key, "ℹ️ this conversation is already a session")
 		}
-		return false
+		return true
 	}
 	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
 	if off {
 		if !rec.SessionRouted {
 			g.post(rec.Key, "ℹ️ not on the session route; nothing to turn off")
-			return false
+			return true
 		}
 		if running {
-			g.post(rec.Key, "⚠️ a session task is still running — `stop` it first, then `/session off`")
-			return false
+			// The running task may be the platform's (the route was turned on
+			// mid-task), so name it neutrally.
+			g.post(rec.Key, "⚠️ a task is still running — `stop` it first, then `/session off`")
+			return true
 		}
 		if !g.retireIncarnation(ctx, rec, "session off") {
 			return false
@@ -1071,14 +1077,14 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	if rec.SessionRouted && rest == "" {
 		g.post(rec.Key, "ℹ️ already on the session route")
-		return false
+		return true
 	}
 	if isStop(rest) {
 		// "/session stop" is almost certainly the way back misspelled. It
 		// must never become a task whose text reads "stop" - the same rule
 		// the stopping case below enforces for a bare "stop".
 		g.post(rec.Key, "ℹ️ to leave the session route say `/session off`; to stop a running task say `stop`")
-		return false
+		return true
 	}
 	rec.SessionRouted = true
 	if rec.Profile == "" {
