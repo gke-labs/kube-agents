@@ -298,7 +298,7 @@ class RuntimeTest(unittest.TestCase):
 
         async def open_cards(chat_id, thread_id):
             self.board_args.append((chat_id, thread_id))
-            return self.boards.pop(0)
+            return self.boards.pop(0) if self.boards else {}
 
         cards = mock.patch.object(runtime, "open_cards", open_cards)
         cards.start()
@@ -395,6 +395,31 @@ class RuntimeTest(unittest.TestCase):
         # The stale card finishing later touches nothing.
         _run(runtime.settle_delegated(adapter, self._sub("t_old"), "gave_up"))
         self.assertEqual(len(adapter.calls), 2)
+
+    def test_a_follow_up_the_cards_worker_files_after_the_turn_holds_the_settle(self):
+        # t_a's worker files t_b with parents=[t_a]: absent at the turn's end,
+        # open on the board when t_a completes.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [{**_cards("t_b", status="todo", creator="t_a"), **_cards("t_other", creator="t_x")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        # Another worker's card is not this ask's.
+        _run(runtime.settle_delegated(adapter, self._sub("t_other"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+
+    def test_a_blocked_follow_up_does_not_hold_the_settle(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [_cards("t_b", status="blocked", creator="t_a")]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
+
+    def test_an_unreadable_board_at_the_finish_settles_as_before(self):
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.boards[:] = [None]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls[-1], ("white_check_mark", False))
 
     def test_two_asks_in_one_thread_settle_on_their_own_cards(self):
         log = []

@@ -328,7 +328,13 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     takes the card off each ask's set; an ask whose set empties gets ✅, or ❌
     if any of its cards gave up, and is forgotten. A card no ask is waiting on
     is left alone. ``board`` is the notifier's slug for the card's board, which
-    with the card's id is how an ask knows it; no board is read here.
+    with the card's id is how an ask knows it.
+
+    Before a final event takes a card off, the thread is read once for open
+    cards its worker created, and each ask waiting on the card waits on those
+    too: a follow-up filed with ``parents=[own id]`` starts only once the card
+    completes, so it was not on the board when the turn ended. A failed read
+    settles as though there were none.
     """
     if not enabled() or (sub.get("platform") or "").lower() != PLATFORM:
         return
@@ -352,8 +358,17 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         for ask in asks:
             await adapter._react(key[0], ask.ts, _presenter.settle_reaction(settle), ask.team_id, remove=False)
         return
+    after = await open_cards(*key)
+    # Waiting to run only: a card left blocked by a give-up still reads as open.
+    follow_ups = {
+        (b, task) for (b, task), seen in (after or {}).items()
+        if b == card[0] and seen.creator == card[1] and seen.status in RESUMED_STATUSES
+    }
+    # The read awaited, so another event may have settled an ask meanwhile.
+    asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]
     settled = []
     for ask in asks:
+        ask.cards |= follow_ups
         ask.cards.discard(card)
         ask.failed = ask.failed or settle == _presenter.SETTLE_FAILED
         if not ask.cards:

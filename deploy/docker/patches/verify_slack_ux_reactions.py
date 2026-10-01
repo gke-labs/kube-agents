@@ -328,7 +328,8 @@ async def _drive(module) -> None:
 
     # A delegated answer: nothing at completion; the notifier's terminal event settles it.
     adapter = _StubAdapter()
-    boards[:] = [{}, {(module.DEFAULT_BOARD, CARD): module._Card("running")}]
+    # The third read is the settle's look for follow-up cards: none.
+    boards[:] = [{}, {(module.DEFAULT_BOARD, CARD): module._Card("running")}, {}]
     await module.on_processing_start(adapter, _event("is seeded-a healthy?"))
     await module.on_processing_complete(adapter, _event("is seeded-a healthy?"), success)
     if adapter.calls != [(CHANNEL, ASK_TS, "eyes", TEAM, False)]:
