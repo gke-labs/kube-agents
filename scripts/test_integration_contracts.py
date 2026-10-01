@@ -120,6 +120,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         ("developer_knowledge", "answer_query"),
         # #953: read-only workload existence inspection across clusters
         ("gke", "get_k8s_resource"),
+        ("gke", "describe_k8s_resource"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",

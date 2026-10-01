@@ -91,21 +91,26 @@ verification_spec:
       tool_names:
         - mcp__gke__get_k8s_resource
         - mcp_gke_get_k8s_resource
+        - mcp__gke__describe_k8s_resource
+        - mcp_gke_describe_k8s_resource
       minimum_calls: 1
+      require_success: true
   - name: no-stubbed-profile-scripts
     role: objective
     check:
       # A match anywhere in a command: catches script executions by file path
       # or script filename (cluster_agent_profile.py, kanban_notify_propagate.py)
       # and Python module invocations (python3 -m cluster_agent_profile), including
-      # options with arguments (-W ignore, -X dev) and -mmodule syntax, while
-      # allowing harmless mentions in text inspection tools (grep, echo, cat).
+      # options with arguments (-W ignore, -X dev), combined flags (-um), quoted
+      # module names ('cluster_agent_profile', "cluster_agent_profile"), and
+      # -mmodule syntax, while allowing harmless mentions in text inspection
+      # tools (grep, echo, cat).
       type: worker_commands
       forbidden_patterns:
         - 'cluster_agent_profile\.py'
         - 'kanban_notify_propagate\.py'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+-m\s*cluster_agent_profile\b'
-        - 'python[0-9.]*(?:\s+\S+)*?\s+-m\s*kanban_notify_propagate\b'
+        - 'python[0-9.]*(?:\s+\S+)*?\s+-[a-zA-Z0-9]*m\s*["'']?cluster_agent_profile["'']?\b'
+        - 'python[0-9.]*(?:\s+\S+)*?\s+-[a-zA-Z0-9]*m\s*["'']?kanban_notify_propagate["'']?\b'
   - name: rca-names-the-oom
     role: objective
     mode: assert

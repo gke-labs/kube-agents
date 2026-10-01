@@ -875,10 +875,18 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "cd /opt/data/scripts && python3 -m cluster_agent_profile list",
             "python3 -m cluster_agent_profile",
             "python3 -u -m cluster_agent_profile list",
+            "python3 -um cluster_agent_profile list",
+            "python3 -m 'cluster_agent_profile' list",
+            'python3 -m "cluster_agent_profile" list',
+            "python3 -um 'cluster_agent_profile' list",
+            'python3 -um "cluster_agent_profile" list',
             "python3 -W ignore -m cluster_agent_profile list",
             "python3 -X dev -m cluster_agent_profile",
             "python3 -mcluster_agent_profile list",
             "python3 -m kanban_notify_propagate",
+            "python3 -um kanban_notify_propagate",
+            "python3 -m 'kanban_notify_propagate'",
+            'python3 -m "kanban_notify_propagate"',
             "python3 -W error -mkanban_notify_propagate",
             "python3 -X dev -m kanban_notify_propagate",
             "python -m cluster_agent_profile",
@@ -924,8 +932,11 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
         tool_names = check.get("check", {}).get("tool_names", [])
         self.assertIn("mcp__gke__get_k8s_resource", tool_names)
         self.assertIn("mcp_gke_get_k8s_resource", tool_names)
+        self.assertIn("mcp__gke__describe_k8s_resource", tool_names)
+        self.assertIn("mcp_gke_describe_k8s_resource", tool_names)
         self.assertEqual(check.get("check", {}).get("scope"), "workers")
         self.assertEqual(check.get("check", {}).get("agent"), "platform")
+        self.assertTrue(check.get("check", {}).get("require_success"), "require_success must be true")
 
     def test_expected_output_requires_delegation(self):
         expected_output = self.data.get("expected_output", "")
