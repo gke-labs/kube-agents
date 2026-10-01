@@ -346,8 +346,9 @@ or `credential` as a whole component (`access_token`, `SECRET_KEY`, `accessToken
 location, `secretName`, `tokenPath`) are replaced before
 publishing, and so are the credential shapes a value can carry under an innocent key (a
 bearer value, an `Authorization` or `Cookie` header, a URL's `user:password@`, a PEM private-key block, a Google OAuth or API key, a GitHub token, a `key=value`
-pair or `--flag value` whose key looks like a secret, curl's `-u user:password` with the rest
-of the command kept, a quoted value taken whole to its closing quote) — a terminal
+pair or `--flag value` whose key looks like a secret, curl's `-u user:password` and `-b` with the
+rest of the command kept, the command read across its backslash-newline continuations, a quoted
+value taken whole to its closing quote) — a terminal
 command is one string, so this is best-effort, and anything else the model pastes into a
 command line ships. Tool results are not published: no check
 reads them and they are the riskiest payload in the pod. One task publishes at most 3000

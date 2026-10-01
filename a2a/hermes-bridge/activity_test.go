@@ -787,6 +787,24 @@ func TestRedactInput_QuotedValuesWithSpaces(t *testing.T) {
 	}
 }
 
+// A curl command continued over backslash-newlines is one command: its -u
+// and -b on a continuation line are scrubbed, the lines around them kept,
+// and the next command after the separator is untouched.
+func TestRedactInput_CurlContinuationLines(t *testing.T) {
+	in := `{"command": "curl -sS https://api.example.com/v1 \\\n  -u admin:hunter2 \\\n  -H 'Accept: json'; curl https://q \\\r\n -b sid=deadbeef99 \\\n -o out.json\necho -u notcurl"}`
+	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
+	for _, leaked := range []string{"hunter2", "deadbeef99"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("leaked %q in %s", leaked, out)
+		}
+	}
+	for _, kept := range []string{"https://api.example.com/v1", "-H 'Accept: json'", "https://q", "-o out.json", "echo -u notcurl"} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("expected %q in %s", kept, out)
+		}
+	}
+}
+
 // The scheme token is case-insensitive, and a credential can arrive under a
 // key outside the first list of words: a private key, a passphrase.
 func TestRedactInput_LowercaseBasicAndKeyMaterial(t *testing.T) {

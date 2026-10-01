@@ -592,9 +592,9 @@ not be silent about it.
   task's stream whether or not the record still holds it as active - the relay clears the active
   task when it posts the terminal, and that is how a harness reads a finished run's trace after
   the release), which mutates nothing - no
-  heal, no lock, no post, no publish, no write. It returns the id of the task it read, with its
-  `submittedAt`, age and `detached` flag when that task is the record's active one (a `task=`
-  read of a finished task carries none of the three), the latest executor state the stream shows (none,
+  heal, no lock, no post, no publish, no write. It returns the id of the task it was asked about
+  (the active one when none was named), with its `submittedAt`, age and `detached` flag when that
+  task is the record's active one (a `task=` read of a finished task carries none of the three), the latest executor state the stream shows (none,
   `submitted`, `working`, or a terminal, with `final`), whether `working` was ever on the stream
   (`reachedWorking`, read off the fold's history, because two events can land between a
   caller's reads and the latest state alone would hide the one that says a model ran) and, when

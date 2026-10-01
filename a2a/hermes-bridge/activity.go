@@ -324,9 +324,10 @@ var (
 // inside it is replaced, the URL and headers around it kept. A quoted value runs to its
 // closing quote and the attached form (-uuser:pass) is read too. The
 // command runs to a separator (;, |, &&, newline), not to a lone & inside a
-// quoted password.
+// quoted password, and across a backslash-newline continuation, the way a
+// model writes a long command.
 var (
-	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n]|&[^&\n])*`)
+	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n\\]|&[^&\n]|\\\r?\n|\\[^\n])*`)
 	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user|-b|--cookie)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+)`)
 	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
 	// the userinfo alone goes, the scheme and host around it stay.
