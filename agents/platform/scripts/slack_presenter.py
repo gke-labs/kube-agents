@@ -2,10 +2,10 @@
 
 Pure functions only. Nothing here imports the Hermes gateway, the Slack SDK or
 the network, so any process that posts to Slack can use it, and it can move
-with Slack ingress when it leaves the gateway. Today its callers are three
-gateway patches: reactions (``slack_ux_reactions``, which the kanban notifier
-also reaches), incident triage (``slack_ux_incident``) and button clicks
-(``slack_ux_clicks``).
+with Slack ingress when it leaves the gateway. Its callers include the
+gateway patches for reactions (``slack_ux_reactions``, which the kanban
+notifier also reaches), incident triage (``slack_ux_incident``) and button
+clicks (``slack_ux_clicks``).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
@@ -16,7 +16,8 @@ take their upstream path unchanged; this module only answers questions.
 Layout: :func:`split_answer` takes the headline off an agent's markdown
 answer; url link buttons and choice buttons, whose value is the label, are
 built by ``_button`` and wrapped into rows by ``_actions``; :func:`fallback_text`
-is the headline and choices as plain mrkdwn, for the message's ``text`` field.
+is the headline, links and choices as plain mrkdwn, for the message's ``text``
+field.
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model

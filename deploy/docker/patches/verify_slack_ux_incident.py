@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build-time behaviour gate for the KAGE_SLACK_UX incident-triage patch.
 
-Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes``, immediately after
-``apply_slack_ux_incident.py``, with ``slack_presenter.py`` staged beside this
+Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes``, after the patches in
+the same ``RUN`` have applied, with ``slack_presenter.py`` staged beside this
 script (``/opt/defaults/scripts`` is not populated yet at that point).
 
 Two things are checked:

@@ -765,6 +765,7 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_incident.py \
      deploy/docker/patches/verify_slack_ux_incident.py \
      deploy/docker/patches/slack_ux_incident.py \
+     deploy/docker/patches/verify_kanban_progress_lines.py \
      agents/platform/scripts/slack_presenter.py \
      deploy/docker/patches/patchlib.py \
      /tmp/message-surface/
@@ -793,6 +794,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_clicks.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_incident.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates

@@ -4255,12 +4255,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	//
-	// KAGE_SLACK_UX switches the Slack adapter between two code paths already
-	// in the image: which reaction goes on an ask and when it settles. It is
-	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
-	// value is off, the image default. It names no path, URL, credential or
-	// image, and no value of it reaches anything but the reactions the gateway
-	// adds to messages it already receives.
+	// KAGE_SLACK_UX switches the Slack adapter between code paths already in
+	// the image: which reaction goes on an ask and when it settles, whether
+	// the harness's own Slack messages (the scheduled-report wrapper, the
+	// heartbeat, restart and shutdown notices, command and system replies) are
+	// reworded or left out, and whether a triage report edits the open alert
+	// it answers into a headline, buttons and a fold. A button click is sent
+	// as the clicker's own message, after the adapter's user and channel
+	// checks. It is compared against `FLAG_ON_VALUES` in `slack_presenter.py`;
+	// any other value is off, the image default. It names no path, URL,
+	// credential or image; no value of it reaches anything but the reactions
+	// on, and the wording and layout of, Slack messages the gateway already
+	// receives or sends; and no click does what its clicker could not do by
+	// typing.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's

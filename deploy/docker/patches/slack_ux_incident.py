@@ -13,9 +13,9 @@ and the triage card's report arrives as a reply under it, so the channel
 keeps showing the alert while the diagnosis sits in the thread. With the flag
 on, the report replaces the alert in place instead: the alert message is
 edited into the report's "What's wrong" sentence, one button per option, the
-report's own links as link buttons, and the whole report in a collapsed fold,
-rendered by the Slack plugin's own ``block_kit.render_blocks`` so it reads as
-the threaded reply would.
+links on the report's 🔗 line as link buttons, and the whole report in a
+collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``
+so it reads as the threaded reply would.
 
 A button's text is ``apply Option B: <title>`` (``apply: <title>`` for the
 single-fix shape), so a click, which ``slack_ux_clicks`` sends as the
@@ -98,8 +98,8 @@ PROPOSED_FIX_LINE = re.compile(r"^\s*[-*]\s+[*_]*Proposed fix\s*" + TITLE)
 LINKS_LINE = re.compile(r"^[^\w\n]*🔗")
 #: Any option the section names, parsed or not.
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
-#: A proposed fix the section names in any shape: bullet, numbered, bold label or heading.
-PROPOSED_FIX_NAMED = re.compile(r"\bProposed fix\b")
+#: A proposed fix the section names in any shape: bullet, numbered, bold label, heading, any case.
+PROPOSED_FIX_NAMED = re.compile(r"\bproposed fix\b", re.IGNORECASE)
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
 #: word, so ``Not Recommended: Option A`` is not one.
 RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
@@ -189,9 +189,10 @@ def parse_triage(report: str) -> dict | None:
         # So would lettered buttons beside a "Proposed fix" bullet that has none.
         return None
     if not choices:
-        single = next((m for m in map(PROPOSED_FIX_LINE.match, lines) if m), None)
-        if single:
-            choices.append((SINGLE_LABEL.format(title=_presenter._plain(single.group(1))), True))
+        # One button stands for one fix; a second fix named anywhere would be left out.
+        fixes = [m for m in map(PROPOSED_FIX_LINE.match, lines) if m]
+        if len(fixes) == 1 and len(PROPOSED_FIX_NAMED.findall(named)) == 1:
+            choices.append((SINGLE_LABEL.format(title=_presenter._plain(fixes[0].group(1))), True))
     if not choices:
         return None
     headline, _body = _presenter.split_answer(_section(sections, WHATS_WRONG))

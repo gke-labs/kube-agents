@@ -16,8 +16,8 @@ With the flag on, :func:`register` adds two listeners:
 
 * A choice button (``<prefix>.choice.<n>``) is the clicker answering in the
   thread with the button's text as Slack showed it. Never its ``value``: the
-  presenter clips the text to Slack's 75 characters but keeps up to 2000 in
-  the value, and a click must not send words the clicker did not see. A
+  presenter clips the text to ``BUTTON_TEXT_MAX`` but keeps up to
+  ``BUTTON_VALUE_MAX`` in the value, and a click must not send words the clicker did not see. A
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
