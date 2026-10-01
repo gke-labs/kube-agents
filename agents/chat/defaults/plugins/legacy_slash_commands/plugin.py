@@ -41,13 +41,10 @@ _DISABLED_UNDO_TEXT = "undo"
 
 # The disable belongs to the Planning Agent, whose SOUL.md carries the answer. The operator
 # also enables this plugin on the platform profile under `experimental.platformFrontDoor`,
-# where the gateway runs with HERMES_HOME pointed at `<root>/profiles/platform`; the
-# Planning Agent's home is the root itself. That layout is the operator's convention
-# (k8s-operator/internal/controller/platformagent_manifests.go), and the other bundled
-# plugins resolve their state from HERMES_HOME the same way.
-_HERMES_HOME_ENV = "HERMES_HOME"
-_DEFAULT_HERMES_HOME = "/opt/data"
-_PROFILES_DIR_NAME = "profiles"
+# and names the profile the gateway runs as in HERMES_GATEWAY_PROFILE: empty on the
+# Planning Agent, "platform" under the flag (k8s-operator/internal/controller/
+# platformagent_manifests.go, gatewayProfileEnvVar).
+_GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 
 
 def _subcommand_map() -> Dict[str, str]:
@@ -109,10 +106,8 @@ def rewrite_legacy_hermes_command(text: str) -> Optional[str]:
 
 
 def on_planning_agent_profile() -> bool:
-    """True unless HERMES_HOME is a named profile under ``profiles/`` (the front-door flag)."""
-    home = os.environ.get(_HERMES_HOME_ENV, _DEFAULT_HERMES_HOME).rstrip("/")
-    parent = os.path.basename(os.path.dirname(home))
-    return parent != _PROFILES_DIR_NAME
+    """True unless the operator named another gateway profile (the front-door flag)."""
+    return not os.environ.get(_GATEWAY_PROFILE_ENV, "").strip()
 
 
 def disable_undo_command(text: str) -> Optional[str]:

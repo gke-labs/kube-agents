@@ -84,13 +84,13 @@ class DisableUndoCommandTest(unittest.TestCase):
             self.assertIsNone(plugin.disable_undo_command(text))
 
     def test_only_the_planning_agent_profile_disables_undo(self):
-        # The operator's front-door flag runs the gateway with HERMES_HOME under
-        # profiles/<name>; the Planning Agent's home is the root itself.
-        with mock.patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform"}):
+        # The operator names the gateway's profile in HERMES_GATEWAY_PROFILE: empty on
+        # the Planning Agent, "platform" under experimental.platformFrontDoor.
+        with mock.patch.dict(os.environ, {"HERMES_GATEWAY_PROFILE": "platform"}):
             self.assertFalse(plugin.on_planning_agent_profile())
             self.assertIsNone(plugin.disable_undo_command("/undo"))
-        for home in ("/opt/data", "/opt/data/", "/home/hermes/.hermes"):
-            with mock.patch.dict(os.environ, {"HERMES_HOME": home}):
+        for value in ("", "  "):
+            with mock.patch.dict(os.environ, {"HERMES_GATEWAY_PROFILE": value}):
                 self.assertTrue(plugin.on_planning_agent_profile())
                 self.assertEqual(plugin.disable_undo_command("/undo"), "undo")
         with mock.patch.dict(os.environ, {}, clear=True):

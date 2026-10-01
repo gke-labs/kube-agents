@@ -63,8 +63,9 @@ rewrite is the only hook result that produces one.
 The disable applies on the Planning Agent profile only. The operator also enables
 this plugin on the platform profile under `experimental.platformFrontDoor`, whose
 persona has no such answer, so there `/undo` passes through to the gateway. The
-plugin tells the two apart by `HERMES_HOME`: a named profile's home sits under
-`profiles/`, the Planning Agent's is the root.
+plugin tells the two apart by `HERMES_GATEWAY_PROFILE`, which the operator sets to
+the profile the gateway runs as: empty on the Planning Agent, `platform` under the
+flag.
 
 ## How it is wired
 
