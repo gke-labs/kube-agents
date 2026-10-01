@@ -4018,8 +4018,13 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// would mount a token for it, and leaving it behind would leave a
 		// mintable bus identity in a namespace that no longer runs a bus.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The identity map is deleted BEFORE the callout keys Secret.
+		// In reconcileA2A the keys Secret is created first and acts as the
+		// sentinel covering the map; deleting the map first ensures that if a
+		// cleanup pass dies on the map delete, the keys Secret is still standing
+		// to prevent the next pass from early-exiting.
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
@@ -4044,10 +4049,6 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 		// session pods still draining (see the function comment): a quota
 		// only gates admission, never running pods.
 		{&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionQuotaName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		// LAST, deliberately: the StatefulSet is this function's sentinel. The
-		// early exit above treats its absence as "an earlier pass reached the
-		// end", which is only true while nothing is deleted after it.
-		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 	}
 }
 
@@ -4188,13 +4189,45 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// residue: cluster-scoped objects are exactly what a security reviewer
 	// lists first. The ownership refusal above cannot apply, so it is matched
 	// on its labels instead.
+	//
+	// Ordered after the callout Deployment in a2aNamespacedTeardown so the
+	// callout has stopped answering before its authorization is reaped, and
+	// before the StatefulSet sentinel below so that a pass dying on this
+	// delete leaves the sentinel standing to resume cleanup (#2216).
 	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 		return err
 	}
 
 	// Provision Jobs carry a content hash in the name, one per generation
 	// that has been rendered here; a mode flip removes every generation.
-	return r.deleteA2AProvisionJobs(ctx, agent, "")
+	// Ordered before the StatefulSet sentinel below so that a pass dying
+	// during Job cleanup leaves the sentinel standing (#2216).
+	if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
+		return err
+	}
+
+	// LAST, deliberately: the StatefulSet is this function's sentinel. The
+	// early exit above treats its absence as "an earlier pass reached the
+	// end", which is only true while nothing is deleted after it.
+	return r.deleteA2ANATSStatefulSet(ctx, agent)
+}
+
+// deleteA2ANATSStatefulSet reaps the NATS StatefulSet.
+//
+// LAST, deliberately: the StatefulSet is cleanupA2A's sentinel. The early exit
+// treats its absence as "an earlier pass reached the end", which is only true
+// while nothing is deleted after it. It is placed after the callout
+// ClusterRoleBinding and provision Jobs so that a pass dying on either of those
+// deletes leaves the StatefulSet standing to resume cleanup (#2216).
+func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
+	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(sts, agent) {
+		return fmt.Errorf("refusing to delete unowned A2A %T %s/%s", sts, sts.GetNamespace(), sts.GetName())
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, sts))
 }
 
 // deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label

@@ -1998,6 +1998,196 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}
 }
 
+// TestCleanupA2AResumesAfterAMidPassErrorOnFullRender extends the single-role
+// failure of TestCleanupA2AResumesAfterAMidPassError to every single delete in
+// the entire teardown on a fully rendered A2A stack (#2216).
+//
+// If any delete in cleanupA2A fails, the subsequent cleanup pass must not
+// early-exit over remaining objects. In particular, the cluster-scoped
+// callout ClusterRoleBinding and provision Jobs must not outlive the
+// StatefulSet sentinel.
+func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	// First, measure how many deletes an unobstructed cleanup performs.
+	var deletes int
+	countCl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				deletes++
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	countR := &PlatformAgentReconciler{Client: countCl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, countCl, countR, next)
+	if _, err := countR.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if err := countR.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("unobstructed cleanup: %v", err)
+	}
+	if deletes == 0 {
+		t.Fatal("unobstructed cleanup performed 0 deletes; every case below would be vacuous")
+	}
+
+	for k := 1; k <= deletes; k++ {
+		t.Run(fmt.Sprintf("cleanup_dies_on_delete_%d_of_%d", k, deletes), func(t *testing.T) {
+			passDeletes, failAt := 0, k
+			var failedObj client.Object
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(next.DeepCopy()).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: fakeServerSideApplyInterceptors().Patch,
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						passDeletes++
+						if passDeletes == failAt {
+							failedObj = obj
+							return fmt.Errorf("injected: the cleanup dies on delete %d", failAt)
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				}).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+			theCalloutIsServing(t, ctx, cl, r, next)
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			// Pass 1 must fail on the injected error.
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+				t.Fatal("cleanup pass 1: want the injected error, got nil")
+			}
+
+			// Pass 2, unobstructed, must finish cleanup and not early-exit over remaining objects.
+			failAt = 0
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+				t.Fatalf("cleanup pass 2: %v", err)
+			}
+
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+					return
+				}
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("a cleanup that died on delete %d (%T %s) leaves these after the resumed pass: %v\n"+
+					"The early exit stepped over them because the sentinel it keys on had already gone.",
+					k, failedObj, failedObj.GetName(), leftovers)
+			}
+		})
+	}
+}
+
+// TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender pins Shape 2 of #2216:
+// A render that died on write 4 (after writing calloutKeys Secret and authMap
+// ConfigMap, before writing config Secret or StatefulSet), followed by a
+// cleanup pass that deletes calloutKeys Secret and dies on deleting authMap
+// ConfigMap.
+func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	writes := 0
+	stopAt := 4
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				writes++
+				if writes == stopAt {
+					return fmt.Errorf("injected: render stopped at write %d", stopAt)
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				writes++
+				if writes == stopAt {
+					return fmt.Errorf("injected: render stopped at write %d", stopAt)
+				}
+				return fakeServerSideApplyInterceptors().Patch(ctx, c, obj, patch, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+		t.Fatal("render: want injected error, got nil")
+	}
+
+	authMap := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(next), Namespace: next.Namespace}, authMap); err != nil {
+		t.Fatalf("authMap was not created: %v", err)
+	}
+
+	failAuthMap := true
+	cleanupCl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapName(next) && failAuthMap {
+					return fmt.Errorf("injected: API server error deleting authmap")
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	for _, obj := range []client.Object{
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: next.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(next), Namespace: next.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(next), Namespace: next.Namespace}},
+	} {
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err == nil {
+			obj.SetResourceVersion("")
+			_ = cleanupCl.Create(ctx, obj)
+		}
+	}
+
+	r2 := &PlatformAgentReconciler{Client: cleanupCl, Scheme: scheme}
+	if err := r2.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+		t.Fatal("cleanup pass 1: want injected error, got nil")
+	}
+
+	failAuthMap = false
+	if err := r2.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("cleanup pass 2: %v", err)
+	}
+
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cleanupCl, func(kind, name string) {
+		if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+			return
+		}
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("authmap ConfigMap survived resumed cleanup: %v\n"+
+			"The early exit stepped over it because calloutKeys was deleted before authMap", leftovers)
+	}
+}
 // TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
