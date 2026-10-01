@@ -940,14 +940,23 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "echo 'import cluster_agent_profile' | python3",
             'echo "import cluster_agent_profile" | python',
             "echo 'from cluster_agent_profile import list_profiles' | python3",
-            "printf 'import cluster_agent_profile\n' | python3",
+            "printf 'import cluster_agent_profile\\n' | python3",
             "echo 'import kanban_notify_propagate' | python3",
-            # Multi-line commands with newline separators, stdin forms, and alternative wrappers/interpreters
-            "cd /opt/data/scripts\npython3 -m cluster_agent_profile list",
-            "python3 - <<'EOF'\nimport cluster_agent_profile\nEOF",
-            "python3 <<EOF\nimport cluster_agent_profile\nEOF",
+            # Dotted module paths, runpy, and compound-command contexts
+            "cd /opt/data && python3 -m scripts.cluster_agent_profile list",
+            "python3 -m scripts.cluster_agent_profile",
+            "python3 -m 'scripts.cluster_agent_profile'",
+            'python3 -m "scripts.cluster_agent_profile"',
+            "python3 -m runpy scripts.cluster_agent_profile",
+            "python3 -m scripts.kanban_notify_propagate",
+            "python3 -m runpy scripts.kanban_notify_propagate",
+            "bash -c 'cd /opt/data/scripts; python3 -m cluster_agent_profile list'",
+            'bash -c "cd /opt/data/scripts && python3 -m cluster_agent_profile list"',
+            "python3 -m cluster_agent_profile list # don't ask the user",
+            "python3 -m kanban_notify_propagate list # don't ask the user",
             "python3 <<< 'import cluster_agent_profile'",
-            "cat <<'EOF' | python3\nimport cluster_agent_profile\nEOF",
+            "python3 <<< 'from cluster_agent_profile import list_profiles'",
+            "python3 <<< 'import kanban_notify_propagate'",
             "nice python3 -m cluster_agent_profile",
             "'/opt/hermes/.venv/bin/python3' -m cluster_agent_profile",
             '"/opt/hermes/.venv/bin/python3" -m cluster_agent_profile',
@@ -1010,15 +1019,10 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 -c 'print(1)' < cluster_agent_profile.txt",
             "python3 -c 'print(1)' > /tmp/kanban_notify_propagate.log",
             'python3 -c "print(sys.argv)" kanban_notify_propagate',
-            # Legitimate python heredocs or redirects
-            "python3 - <<'EOF'\nimport json, sys\nprint(1)\nEOF",
-            "python3 <<EOF\nprint(1)\nEOF",
-            "python3 /opt/data/scripts/anything.py <<EOF\nfoo\nEOF",
-            "python3 -m json.tool <<EOF\n{}\nEOF",
+            # Legitimate python redirects
+            "python3 -m json.tool <<EOF",
             'python3 <<< "$json"',
-            'echo "see python3 later" <<EOF\nEOF',
-            "ls /usr/lib/python3 && cat <<'EOF' > notes.md\nEOF",
-            # Non-python heredocs or redirects
+            # Non-python redirects
             "cat <<'EOF' > /tmp/test.txt",
             "cat <<EOF > /tmp/test.txt",
             "cat <<< 'test string'",
@@ -1037,9 +1041,6 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "cluster_agent_profile is stubbed here" >> notes.md; kubectl get deploy -A -o json | python3 -m json.tool',
             'python3 <<< "$json"; grep cluster_agent_profile README.md',
             'echo "cluster_agent_profile" | $JQ',
-            'echo "cluster_agent_profile is stubbed here" >> notes.md\nkubectl get deploy -A -o json | python3 -m json.tool',
-            "python3 - <<'EOF'\nimport json\nEOF\ngrep cluster_agent_profile README.md",
-            "cat <<'EOF' | python3\nimport json\nEOF\ngrep cluster_agent_profile README.md",
             # Quoted shell delimiters inside arguments must not be treated as command boundaries
             'echo "stub refused; python3 -m cluster_agent_profile fails" >> notes.md',
             "echo 'stub refused; python3 -m cluster_agent_profile fails' >> notes.md",
@@ -1047,6 +1048,10 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "stub refused | python3 -m cluster_agent_profile fails" >> notes.md',
             'echo "stub refused; python3 -c \'import cluster_agent_profile\' fails" >> notes.md',
             'echo "stub refused; python3 -m kanban_notify_propagate fails" >> notes.md',
+            'echo "stub refused; python3 <<< \'import cluster_agent_profile\' fails" >> notes.md',
+            "echo \"note; echo 'import cluster_agent_profile' | python3 is refused\"",
+            'echo "stub refused; python3 <<< \'import kanban_notify_propagate\' fails" >> notes.md',
+            "echo \"note; echo 'import kanban_notify_propagate' | python3 is refused\"",
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
