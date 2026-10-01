@@ -939,9 +939,11 @@ a told job only on a reading that shows it clean. `periodics_runs` is, per read
 job, `{build, finished_at, passed, summary}` of its latest finished build, what
 the recovery message says. `periodics_streaks` is, per watched job, `{build,
 projects{project: n}, runs}`: the last build counted, each project's
-consecutive failed builds (dropped at zero), and the run's; a failed build is
-a note only once a project's count reaches the job's threshold (three for the
-sweep, one for the reconciles) or the run's does (two, one). `periodics_since` is each open note's start, kept
+consecutive failed checks (dropped at zero; every count cleared by a clean
+build) and the run's; a failed build is a note only once the run's count
+reaches the job's threshold (two consecutive checks for the sweep, the first
+failure for the reconciles), and the poster treats a told job as recovered only
+on a build that passed (`periodics_runs`), not on a sub-threshold failure. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note
 (`scripts/eval_dashboard/periodics.py` owns the notes).

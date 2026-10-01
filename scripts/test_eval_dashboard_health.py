@@ -1282,6 +1282,9 @@ class PeriodicNote(unittest.TestCase):
         second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
         self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
         self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
+        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=True, build="102")}, prev=second, now=T0 + timedelta(minutes=30))
+        self.assertEqual(third["periodics_streaks"][self.SWEEP], {"build": "102", "projects": {}, "runs": 0}, "a clean build clears every count")
+        self.assertEqual(third["periodics"], {})
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
         stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})

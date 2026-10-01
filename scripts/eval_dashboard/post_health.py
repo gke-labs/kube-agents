@@ -931,11 +931,14 @@ def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
 
 
 def periodic_clears(health: dict, prev: dict | None) -> list[str]:
-    """The jobs the space was told about that a reading now shows clean."""
+    """The jobs the space was told about whose latest read build passed. Read
+    and not noted is not enough: a failed build under the job's threshold
+    writes no note either, and is not a recovery."""
     told = (prev or {}).get("periodics_told") or {}
     current = health.get("periodics") or {}
     read = set(health.get("periodics_read") or [])
-    return sorted(job for job in told if job in read and job not in current)
+    runs = health.get("periodics_runs") or {}
+    return sorted(job for job in told if job in read and job not in current and (runs.get(job) or {}).get("passed"))
 
 
 def _job_words(job: str, note: dict | None = None) -> dict:

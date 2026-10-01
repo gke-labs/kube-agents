@@ -380,12 +380,18 @@ to `health.py --periodics-dir`.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
-every ten minutes, so one failed build followed by a green one is a flap, and
-its note waits until one project has failed in three consecutive builds (half
-an hour, past the reaper's reset and the next run) or the run itself has failed
-two in a row; the reconciles' first failed build is the news. The counts are
-`periodics_streaks` in `health.json`, advanced once per new build and carried
-across ticks, a project the build did not reach keeping its count. One whose latest finished
+every ten minutes and this tick reads its latest finished build every fifteen,
+so the unit is the check, not the build (one sweep build in three is never
+read), and one failed check followed by a clean one is a flap. The sweep's note
+waits until two consecutive checks have failed; the reconciles' first failed
+build is the news. Any project's failure fails a sweep run, so a per-project
+threshold could never fire before the run's; the per-project counts name, in
+the message, the projects that failed in this check and the ones before it.
+The counts are `periodics_streaks` in `health.json`, advanced once per newly
+read build and carried across ticks; a failed build that did not reach a
+project (busy) keeps its count, and a clean build clears every count. A
+recovery needs a build that passed: a failed check under the threshold writes
+no note and is not one. One whose latest finished
 build is older than its stale window (an hour for the sweep, three for the
 hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
@@ -785,8 +791,8 @@ record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
 `evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
-`pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_since`,
-`metrics`, `dashboard_url`,
+`pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
+`periodics_since`, `metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line
 was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled

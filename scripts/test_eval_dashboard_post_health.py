@@ -1844,6 +1844,7 @@ class WatchedPeriodics(RunHarness):
         self.assertEqual(sorted(self.recorded()["periodics_told"]), sorted([self.WEEKLY, sweep]))
         # A clear for one beside news for the other: the news goes, the clear goes, separately.
         doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", verdict="STALE", stale_after_h=1)}
+        doc["periodics_runs"] = {self.WEEKLY: {"build": "101", "finished_at": "2026-09-14T14:40:00+00:00", "passed": True, "summary": None}}
         self.tick(doc, T14 + timedelta(hours=1))
         self.assertEqual(self.recorded()["periodics_told"], {sweep: "STALE"})
         self.assertEqual(len(self.opener.texts), 3)
@@ -1858,6 +1859,7 @@ class WatchedPeriodics(RunHarness):
         self.assertEqual(len(self.opener.texts), 1)
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
+        clean["periodics_runs"] = {self.WEEKLY: {"build": "102", "finished_at": "2026-09-14T14:40:00+00:00", "passed": True, "summary": None}}
         self.tick(clean, T14 + timedelta(hours=1), opener=FakeOpener(statuses=[500]))
         self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"}, "the clear that failed to send is not forgotten")
         self.assertEqual(self.recorded()["periodics_clean_seen"], [self.WEEKLY])
@@ -1932,15 +1934,25 @@ class WatchedPeriodics(RunHarness):
         self.tick(clean, T14 + timedelta(minutes=15))
         self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* Its 9:50 AM ET run (build 101): closed 241 pull request(s) across 12 project(s).")
 
-    def test_a_clear_without_a_run_record_still_says_which_job(self):
+    def test_a_read_failed_build_under_the_threshold_is_not_a_recovery(self):
+        # The sweep's first failed check writes no note; read and not noted is
+        # not clean, so the told job stays told until a build passes.
+        sweep = "ci-kube-agents-pull-sweep"
         doc = health("GREEN")
-        doc["periodics"] = {self.WEEKLY: periodic_note()}
-        doc["periodics_read"] = [self.WEEKLY]
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1)}
+        doc["periodics_read"] = [sweep]
         self.tick(doc, T14)
-        clean = health("GREEN")
-        clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
-        self.tick(clean, T14 + timedelta(hours=1))
-        self.assertEqual(self.opener.texts[-1], "✅ *Eval seeded fleet: planted defects are being re-applied again.* Its latest run finished clean.")
+        quiet = health("GREEN")
+        quiet["periodics"], quiet["periodics_read"] = {}, [sweep]
+        quiet["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": False, "summary": "failed in 1 of 9 project(s)"}}
+        self.tick(quiet, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "no recovery for a failed build")
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "FAILED"})
+        passed = health("GREEN")
+        passed["periodics"], passed["periodics_read"] = {}, [sweep]
+        passed["periodics_runs"] = {sweep: {"build": "102", "finished_at": "2026-09-14T14:00:00+00:00", "passed": True, "summary": None}}
+        self.tick(passed, T14 + timedelta(minutes=30))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* Its 10:00 AM ET run (build 102) finished clean.")
 
     def test_the_digest_carries_a_line_per_noted_job(self):
         doc = health("GREEN")
