@@ -327,10 +327,12 @@ dispatcher, not to scaffolding with a demolition date.
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
 path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
 dispatcher's job when it exists), no heartbeats on `agents.hb.>`, a submission whose
-events lookup keeps failing is dropped with a log line rather than redelivered (the lookup
-is retried three times with a short backoff first, so a transient refusal makes the task
-late rather than lost; the lib acks unconditionally after the handler, and a nak path is a
-lib delta if a persistent failure ever bites),
+events lookup keeps failing is dropped with a log line rather than redelivered (a failure
+from before the read opened its consumer, a cap refusal for one, is retried over six seconds
+first, so a transient refusal makes the task late rather than lost; a failure from after it is
+not retried, since that consumer is live for the inactive threshold and another attempt would
+open another; the lib acks unconditionally after the handler, so a lookup a shutdown interrupts
+is also dropped, and a nak path is a lib delta if a persistent failure ever bites),
 and a terminal publish that fails outright - a bus outage outlasting the finalize
 budget at exactly that moment - leaves the task in the registry for the NEXT
 incarnation's sweep, which may be far away on a healthy sidecar; until then the bridge

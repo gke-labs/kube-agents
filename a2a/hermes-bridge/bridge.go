@@ -206,9 +206,10 @@ type Bridge struct {
 	// so a test can keep the release pending and count slots in hand without
 	// racing the timer.
 	holdReplaySlot func(release func())
-	// tasksGet is the task lookup lookupTask retries; nil means the
-	// client's. Tests set it to drive the retry without a bus fault.
-	tasksGet func(ctx context.Context, addressee, taskID string) (*lib.Task, error)
+	// tasksGet is the task lookup lookupTask retries, in the shape of
+	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
+	// drive the retry without a bus fault.
+	tasksGet func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error)
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -347,10 +348,13 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 	case isTaskNotFound(err):
 		b.accept(ctx, env)
 	case err != nil && ctx.Err() != nil:
-		// The bridge is stopping; the lookup did not run its course. Said
-		// so, rather than counted as a cap incident by a reader grepping
-		// the drop line below.
-		b.cfg.Logger.Warn("events lookup interrupted by shutdown; submission left to redelivery",
+		// The bridge is stopping and the lookup did not run its course. The
+		// outcome is the same as the drop below (the lib acks after this
+		// handler returns, on a connection Run closes only after the
+		// handlers), so the submission is lost either way; its own line
+		// keeps a reader counting cap incidents by the drop line from
+		// counting restarts.
+		b.cfg.Logger.Error("events lookup interrupted by shutdown; submission dropped (acked, no nak path)",
 			"task", env.TaskID, "attempts", attempts, "err", err)
 	case err != nil:
 		// The lib acks after this handler returns, so the submission is
@@ -441,6 +445,9 @@ func (b *Bridge) cancelOrphan(ctx context.Context, env *lib.Envelope) {
 	switch {
 	case isTaskNotFound(err):
 		b.cfg.Logger.Warn("cancel for a task with no events; ignoring", "task", env.TaskID)
+	case err != nil && ctx.Err() != nil:
+		b.cfg.Logger.Error("cancel events lookup interrupted by shutdown; cancel dropped",
+			"task", env.TaskID, "attempts", attempts, "err", err)
 	case err != nil:
 		b.cfg.Logger.Error("cancel events lookup failed after retries", "task", env.TaskID, "attempts", attempts, "err", err)
 	case task.Final:
@@ -795,19 +802,29 @@ func tail(s string, n int) string {
 }
 
 // lookupTask is TasksGet with the bounded retry taskLookupAttempts
-// describes. A not-found answer is an answer and returns at once; any other
-// error is retried with a growing backoff and the last one is returned. The
-// count is how many lookups were made, which is what the drop log reports:
-// a context that ends the loop after one attempt (a shutdown mid-handler)
-// is one, not the bound.
+// describes. A not-found answer is an answer and returns at once. An error
+// from before the read opened its consumer (a creation refusal, which is
+// what a consumer-cap refusal is) is retried with a growing backoff; an error
+// from after it is not, because that consumer is now live for the inactive
+// threshold and each retry would open another against the same cap, which
+// is the multiplication the look-ahead's replay slots exist to prevent. The
+// count is how many lookups were made, which is what the drop log reports: a
+// context that ends the loop after one attempt (a shutdown mid-handler) is
+// one, not the bound.
 func (b *Bridge) lookupTask(ctx context.Context, taskID string) (task *lib.Task, attempts int, err error) {
 	get := b.tasksGet
 	if get == nil {
-		get = b.c.TasksGet
+		get = b.c.TasksGetOpened
 	}
 	for attempts = 1; attempts <= taskLookupAttempts; attempts++ {
-		task, err = get(ctx, b.cfg.Profile, taskID)
+		var opened bool
+		task, opened, err = get(ctx, b.cfg.Profile, taskID)
 		if err == nil || isTaskNotFound(err) || ctx.Err() != nil {
+			return task, attempts, err
+		}
+		if opened {
+			b.cfg.Logger.Warn("task lookup failed after its consumer was created; not retried",
+				"task", taskID, "attempt", attempts, "err", err)
 			return task, attempts, err
 		}
 		if attempts < taskLookupAttempts {

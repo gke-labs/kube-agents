@@ -1435,10 +1435,10 @@ func TestLookup_TransientErrorIsRetriedThenAccepted(t *testing.T) {
 	_, url := startServer(t)
 	var calls atomic.Int32
 	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
-		real := b.c.TasksGet
-		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+		real := b.c.TasksGetOpened
+		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
 			if calls.Add(1) < 3 {
-				return nil, errors.New("nats: maximum consumers limit reached")
+				return nil, false, errors.New("nats: maximum consumers limit reached")
 			}
 			return real(ctx, addressee, taskID)
 		}
@@ -1520,10 +1520,10 @@ func TestLookup_OrphanCancelRetriesThenSynthesizes(t *testing.T) {
 
 	var calls atomic.Int32
 	stop := startBridgeWith(t, url, script(t, `echo unreachable`), 1, func(b *Bridge) {
-		real := b.c.TasksGet
-		b.tasksGet = func(ctx context.Context, addressee, id string) (*lib.Task, error) {
+		real := b.c.TasksGetOpened
+		b.tasksGet = func(ctx context.Context, addressee, id string) (*lib.Task, bool, error) {
 			if id == taskID && calls.Add(1) < 3 {
-				return nil, errors.New("nats: maximum consumers limit reached")
+				return nil, false, errors.New("nats: maximum consumers limit reached")
 			}
 			return real(ctx, addressee, id)
 		}
@@ -1549,9 +1549,9 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 	_, url := startServer(t)
 	var calls atomic.Int32
 	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
-		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
 			calls.Add(1)
-			return nil, errors.New("nats: timeout")
+			return nil, false, errors.New("nats: timeout")
 		}
 	})
 	defer stop()
@@ -1567,9 +1567,9 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 
 	b := &Bridge{cfg: Config{Profile: "platform", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
 	var nf atomic.Int32
-	b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, error) {
+	b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
 		nf.Add(1)
-		return nil, &lib.A2AError{Code: lib.CodeTaskNotFound}
+		return nil, false, &lib.A2AError{Code: lib.CodeTaskNotFound}
 	}
 	if _, attempts, err := b.lookupTask(context.Background(), "x"); !isTaskNotFound(err) || nf.Load() != 1 || attempts != 1 {
 		t.Fatalf("not-found was retried or lost: err=%v calls=%d attempts=%d", err, nf.Load(), attempts)
@@ -1578,12 +1578,24 @@ func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
 	// A context that ends inside the first backoff reports one attempt, not
 	// the bound: the drop log must not count a shutdown as a cap incident.
 	ctx, cancel := context.WithCancel(context.Background())
-	b.tasksGet = func(context.Context, string, string) (*lib.Task, error) {
+	b.tasksGet = func(context.Context, string, string) (*lib.Task, bool, error) {
 		cancel()
-		return nil, errors.New("nats: timeout")
+		return nil, false, errors.New("nats: timeout")
 	}
 	if _, attempts, err := b.lookupTask(ctx, "y"); err == nil || attempts != 1 {
 		t.Fatalf("interrupted lookup: err=%v attempts=%d, want an error and 1", err, attempts)
+	}
+
+	// An error after the read opened its consumer is not retried: that
+	// consumer is live for the inactive threshold, and another attempt
+	// would open another against the same cap.
+	var opened atomic.Int32
+	b.tasksGet = func(context.Context, string, string) (*lib.Task, bool, error) {
+		opened.Add(1)
+		return nil, true, errors.New("protocol error folding events")
+	}
+	if _, attempts, err := b.lookupTask(context.Background(), "z"); err == nil || attempts != 1 || opened.Load() != 1 {
+		t.Fatalf("post-create failure: err=%v attempts=%d calls=%d, want an error after exactly one lookup", err, attempts, opened.Load())
 	}
 }
 
