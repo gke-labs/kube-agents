@@ -380,7 +380,7 @@ func TestTheLegacyChatConsumerIsNotRenderedUnderNext(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
-			env := envMapOf(*brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
 			managed := renderManagedEnv(tc.agent)
 			config := renderConfigYAML(tc.agent, nil)
 			for _, name := range legacyNames {
