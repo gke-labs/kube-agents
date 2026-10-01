@@ -259,6 +259,8 @@ kubectl exec -n kubeagents-system ${POD_NAME} -c platform-agent -- cat /opt/data
 
 `INVENTORY.raw.md` is where a stalled sweep shows itself: present means the sweep finished and prioritization is the stage that has not.
 
+`INVENTORY.md` on the sandbox pod, with `.user_aligned` present and no `.bootstrap_completed` for more than a couple of minutes, means the delivery job is not running or cannot reach the sandbox over ssh. A run that cannot reach it exits 0, and the scheduler discards a zero-exit script's stderr, so it leaves no trace; `kubectl exec` does not go over ssh, so the commands above still work. The agent's terminal connects with the same key to the same host, so a shell command the Platform Agent runs fails the same way.
+
 To deliberately re-run discovery, **archive the previous run's cards first**, while the markers
 still keep the gate idle. The board answers a `kanban_create` whose idempotency key matches a card
 that is not archived by returning that card and creating nothing, so a left-over

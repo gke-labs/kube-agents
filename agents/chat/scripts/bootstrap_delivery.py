@@ -242,8 +242,8 @@ def main(data_dir: Path | None = None) -> int:
     except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
         # Silent, and retried next tick: a non-zero exit is posted to the
         # user's chat as a failure alert on every tick. A lasting fault (a
-        # rejected key, a changed host key) lands here too; the agent's terminal
-        # shares that key and host, so it fails there too.
+        # rejected key, a changed host key, no ``ssh_host``) lands here too; the
+        # agent's terminal shares that key and host, so it fails there too.
         sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
         return 0
     except (OSError, sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed) as e:
