@@ -98,6 +98,8 @@ PROPOSED_FIX_LINE = re.compile(r"^\s*[-*]\s+[*_]*Proposed fix\s*" + TITLE)
 LINKS_LINE = re.compile(r"^[^\w\n]*🔗")
 #: Any option the section names, parsed or not.
 OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
+#: A proposed fix the section names in any shape: bullet, numbered, bold label or heading.
+PROPOSED_FIX_NAMED = re.compile(r"\bProposed fix\b")
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
 #: word, so ``Not Recommended: Option A`` is not one.
 RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
@@ -183,7 +185,7 @@ def parse_triage(report: str) -> dict | None:
     if not set(OPTION_NAMED.findall(named)) <= seen:
         # A button row missing an option the report offers would misstate it.
         return None
-    if choices and any(map(PROPOSED_FIX_LINE.match, lines)):
+    if choices and PROPOSED_FIX_NAMED.search(named):
         # So would lettered buttons beside a "Proposed fix" bullet that has none.
         return None
     if not choices:

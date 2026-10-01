@@ -198,6 +198,17 @@ class RuntimeTest(unittest.TestCase):
         report = REPORT.replace("- ✅ **Recommended", "- **Proposed fix (Restart):** Restart the pods.\n- ✅ **Recommended")
         self.assertIsNone(runtime.parse_triage(report))
 
+    def test_a_proposed_fix_in_another_shape_beside_lettered_options_keeps_the_threaded_reply(self):
+        for shape in (
+            "**Proposed fix:** Restart the pods.",
+            "1. **Proposed fix (Restart):** Restart the pods.",
+            "### Proposed fix\nRestart the pods.",
+            "```\n- **Proposed fix (Restart):** Restart the pods.\n```",
+        ):
+            with self.subTest(shape=shape):
+                report = REPORT.replace("- ✅ **Recommended", shape + "\n\n- ✅ **Recommended")
+                self.assertIsNone(runtime.parse_triage(report))
+
     def test_link_labels_are_plain_and_reach_the_fallback_text(self):
         report = REPORT.replace("[GKE Workloads]", "[**GKE Workloads**]")
         triage = runtime.parse_triage(report)
