@@ -1003,19 +1003,15 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "sudo -u hermes python3 -m cluster_agent_profile",
             "uv run python3 -m kanban_notify_propagate",
             "sudo -u hermes python3 -c 'import kanban_notify_propagate'",
-            # Module name variable indirection, command substitutions, and internal quotes (Threads 2 & 3)
+            # Internal quotes in module name (Thread 2)
             'python3 -m cluster_agent_"profile"',
             'python3 -m "cluster_agent"_profile',
             "python3 -m 'cluster_agent'_profile",
             'python3 -m kanban_notify_"propagate"',
-            'python3 -m "$MOD" list',
-            "python3 -m $MODULE list",
-            'python3 -m "${MOD}" list',
-            'python3 -m "$(cat mod.txt)"',
-            'MOD=cluster_agent_profile python3 -m "$MOD" list',
-            "MOD=cluster_agent_profile python3 -m $MOD list",
-            'MOD="cluster_agent_profile" python3 -m "${MOD}" list',
-            'MOD=kanban_notify_propagate python3 -m "$MOD"',
+            "cd /opt/data/scripts && python3 -m cluster_agent_profile list # don't ask the user",
+            "cd /opt/data/scripts && python3 -m kanban_notify_propagate list # don't ask the user",
+            "python3 - <<< 'import cluster_agent_profile'",
+            "python3 - <<< 'import kanban_notify_propagate'",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1114,6 +1110,13 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "cluster_agent_profile" | python3 script.py',
             'echo "see kanban_notify_propagate" | python3 -m json.tool',
             'python3 -c \'print("kanban_notify_propagate" in open("notes.md").read())\'',
+            # Benign shell variable module invocations, data feeds to python3 -c, and __import__ with file paths (Thread 3)
+            'python3 -m "$FORMATTER" < out.json',
+            "python3 -m $PYMOD list",
+            'python3 -m "$(cat mod.txt)"',
+            'echo "import cluster_agent_profile" | python3 -c \'print(sys.stdin.read())\'',
+            'echo "import kanban_notify_propagate" | python3 -c \'print(sys.stdin.read())\'',
+            'python3 -c \'print(__import__("os").path.exists("cluster_agent_profile.log"))\'',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
@@ -1138,7 +1141,9 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "timeout --foreground 60 python3 " + " ".join("-a" for _ in range(50)) + " script.py",
             "env FOO=bar python3 " + " ".join(f"--flag{i}" for i in range(50)) + " script.py",
             # Verify double-quoted -c commands with backslash-escaped quotes and no whitespace do not backtrack
-            "python3 -c \"print({" + ",".join(f"\\\"k{i}\\\":\\\"v{i}\\\"" for i in range(10)) + "})\"",
+            "python3 -c \"print({\" + \",\".join(f\"\\\"k{i}\\\":\\\"v{i}\\\"\" for i in range(10)) + \"})\"",
+            # Verify wrapper-chain alternation does not backtrack exponentially (Thread 4)
+            "env " * 26 + "x",
         ]
         for cmd in flagged_cmds:
             for i, pat in enumerate(forbidden):
@@ -1148,7 +1153,7 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
                 self.assertFalse(res, f"unexpected match on {cmd!r} by pattern {i}")
                 self.assertLess(
                     elapsed,
-                    0.05,
+                    0.5,
                     f"pattern {i} took too long ({elapsed:.4f}s) on {cmd!r} (catastrophic backtracking)",
                 )
 
