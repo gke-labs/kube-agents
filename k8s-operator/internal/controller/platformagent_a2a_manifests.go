@@ -759,8 +759,9 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 	return googleChatEnabled(agent) && !a2aChatArmed(agent)
 }
 
-// googleChatEnabled is the enabled test every Chat render site has always
-// made, in one place.
+// googleChatEnabled is the enabled test the Chat render sites make, in one
+// place for the sites this change touches; the agent-pod sites it did not
+// touch still spell it inline.
 func googleChatEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Integration == nil {
 		return false

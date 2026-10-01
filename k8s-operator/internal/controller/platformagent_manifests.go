@@ -91,6 +91,11 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// The legacy Chat consumer's broker env, and the fully qualified
+	// subscription form both consumers' env carries.
+	legacyGoogleChatProjectIDEnvVar    = "GOOGLE_CHAT_PROJECT_ID"
+	legacyGoogleChatSubscriptionEnvVar = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
+	googleChatSubscriptionFormat       = "projects/%s/subscriptions/%s"
 	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
 	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
 	// collector is admitted to a listener that serves counters and nothing
@@ -4075,9 +4080,9 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		)
 	}
 	if integration := agent.Spec.Integration; integration != nil {
-		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
-			subscription := fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName)
-			envVars = append(envVars, corev1.EnvVar{Name: "GOOGLE_CHAT_PROJECT_ID", Value: gchat.ProjectID})
+		if gchat := integration.GoogleChat; googleChatEnabled(agent) {
+			subscription := fmt.Sprintf(googleChatSubscriptionFormat, gchat.ProjectID, gchat.SubscriptionName)
+			envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatProjectIDEnvVar, Value: gchat.ProjectID})
 			if a2aChatArmed(agent) {
 				// The next stack takes Chat: the install's one subscription
 				// goes to the A2A relay instance and the legacy instance is
@@ -4089,7 +4094,7 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 					corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
 				)
 			} else {
-				envVars = append(envVars, corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: subscription})
+				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
 			}
 		}
 		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
@@ -4145,6 +4150,11 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
+		// And the legacy subscription name by name, not only as a managed
+		// name: under next with Chat the render no longer sets it, and a
+		// CR that could would arm a second relay instance beside the A2A
+		// one, or, naming the same subscription, refuse the broker's start.
+		legacyGoogleChatSubscriptionEnvVar,
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container
