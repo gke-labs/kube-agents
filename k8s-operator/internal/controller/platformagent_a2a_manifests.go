@@ -381,9 +381,9 @@ const (
 	// in, the projected file, and the two joined, which is the gateway's
 	// defaultGchatTokenPath and is rendered explicitly so a reader of the
 	// live Deployment sees it. One hour, like every broker token.
-	a2aGchatTokenPathEnvVar = "A2A_GCHAT_TOKEN_PATH" // #nosec G101 -- Environment variable name, not a credential
+	a2aGchatTokenPathEnvVar = "A2A_GCHAT_TOKEN_PATH"            // #nosec G101 -- Environment variable name, not a credential
 	a2aGchatTokenDir        = "/var/run/secrets/a2a-chat-relay" // #nosec G101 -- Mount path, not a credential
-	a2aGchatTokenKey        = "token" // #nosec G101 -- Projected file name, not a credential
+	a2aGchatTokenKey        = "token"                           // #nosec G101 -- Projected file name, not a credential
 	a2aGchatTokenPath       = a2aGchatTokenDir + "/" + a2aGchatTokenKey
 	a2aGchatTokenVolume     = "a2a-chat-relay-token" // #nosec G101 -- Volume name, not a credential
 	a2aGchatTokenTTLSeconds = 3600
