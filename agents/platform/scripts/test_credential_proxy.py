@@ -2441,6 +2441,90 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertIsInstance(seen[0], socket.socket)
 
 
+class SessionRoleExecutableTest(unittest.TestCase):
+    """The session caller runs kubectl and gcloud through the broker and nothing else."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        for name in ("kubectl", "git"):
+            stub = stub_dir / name
+            stub.write_text("#!/bin/bash\necho ran-$0\n", encoding="utf-8")
+            stub.chmod(0o755)
+            CredentialProxyHandler.executor.executables[name] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post_as(self, role, payload):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-a2a-session", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read())
+
+    def test_the_table(self):
+        for role, executable, want in (
+            (credential_proxy.CALLER_ROLE_SESSION, "kubectl", True),
+            (credential_proxy.CALLER_ROLE_SESSION, "gcloud", True),
+            (credential_proxy.CALLER_ROLE_SESSION, "git", False),
+            (credential_proxy.CALLER_ROLE_SESSION, "gh", False),
+            (credential_proxy.CALLER_ROLE_SHELL, "git", True),
+            ("", "gh", True),
+        ):
+            with self.subTest(role=role, executable=executable):
+                self.assertEqual(want, credential_proxy.executable_permitted(role, executable))
+
+    def test_git_from_a_session_is_refused_with_a_rule_the_shim_prints(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+        self.assertIn("session", body["message"])
+
+    def test_a_read_from_a_session_runs(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        self.assertEqual(0, body["exitCode"])
+
+    def test_a_mutation_from_a_session_is_refused_read_only(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "delete", "pod", "x"]}
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("kubernetes.read-only", body["rule"])
+
+    def test_the_shell_still_runs_git(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["git", "status"]})
+        self.assertEqual(200, status, body)
+
+
 class CommandExecutorTest(unittest.TestCase):
     CONTEXT = "gke_demo-project_us-central1_cluster-a"
 
@@ -6895,12 +6979,18 @@ class RequiredRoleTest(unittest.TestCase):
     """
 
     def test_the_shell_routes(self):
-        for path in ("/v1/exec", "/v1/github/refresh", "/v1/workspace/open"):
+        for path in ("/v1/github/refresh", "/v1/workspace/open"):
             with self.subTest(path=path):
                 self.assertEqual(
                     (credential_proxy.CALLER_ROLE_SHELL,),
                     credential_proxy.required_roles(path),
                 )
+
+    def test_the_exec_route_admits_the_shell_and_the_session(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION),
+            credential_proxy.required_roles("/v1/exec"),
+        )
 
     def test_the_chat_routes(self):
         for path in ("/v1/chat/slack/events", "/v1/chat/google/api"):
@@ -7042,6 +7132,23 @@ class RolePermitsTest(unittest.TestCase):
                 handler, principal = self._handler(path, "")
                 self.assertTrue(handler._role_permits(principal))
                 self.assertEqual([], handler.replies)
+
+    def test_the_session_reaches_exec_and_nothing_else(self):
+        handler, principal = self._handler("/v1/exec", credential_proxy.CALLER_ROLE_SESSION)
+        self.assertTrue(handler._role_permits(principal))
+        self.assertEqual([], handler.replies)
+        for path in (
+            "/v1/vcs/probe", "/v1/workspace/open", "/v1/forge/refresh", "/v1/github/refresh",
+            credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x",
+            "/v1/chat/slack/api", "/v1/chat/api", "/v1/chat/a2a/events",
+        ):
+            with self.subTest(path=path):
+                handler, principal = self._handler(path, credential_proxy.CALLER_ROLE_SESSION)
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    self.assertFalse(handler._role_permits(principal))
+                status, payload = handler.replies[0]
+                self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
 
 
 class ManagedRepositoryGateTest(unittest.TestCase):
@@ -7217,6 +7324,56 @@ class BuildAuthenticatorTest(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=True):
             authenticator = credential_proxy.build_authenticator()
         self.assertEqual({"kubeagents-credential-proxy": ""}, authenticator.audience_roles)
+
+    def test_the_session_audience_confers_its_own_role(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                "aud-session": credential_proxy.CALLER_ROLE_SESSION,
+            },
+        )
+
+    def test_the_session_audience_means_nothing_without_the_chat_split(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles, {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_SESSION_AUDIENCE" in line for line in logs.output))
+
+    def test_a_session_audience_equal_to_another_is_refused_with_a_warning(self):
+        for clash in (credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE, "aud-chat"):
+            environment = {
+                "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+                "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+                "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+                "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE": clash,
+            }
+            with self.subTest(clash=clash):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                        authenticator = credential_proxy.build_authenticator()
+                self.assertNotIn(credential_proxy.CALLER_ROLE_SESSION, authenticator.audience_roles.values())
+                self.assertTrue(any("CREDENTIAL_PROXY_SESSION_AUDIENCE" in line for line in logs.output))
 
 
 class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):

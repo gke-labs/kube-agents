@@ -393,6 +393,7 @@ AUDIT_STATUS_BUSY = "busy"
 # policy rule. The response body and the audit record name the same constant,
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
+RULE_CALLER_EXECUTABLE = "caller.executable-role"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -572,6 +573,10 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 # split would have been a control on some clusters and a comment on the rest.
 DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 
+# The fourth audience: the session pod. Same upgrade story as the a2a-chat
+# audience - unset means the role is never conferred.
+DEFAULT_CREDENTIAL_PROXY_SESSION_AUDIENCE = "kubeagents-credential-proxy-session"
+
 # The third audience: the A2A gateway. It posts through the same Chat API
 # passthrough as the legacy chat caller, but its event routes are its alone —
 # the legacy chat caller is the LLM-driven Hermes pod, and with a shared role
@@ -585,11 +590,32 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
+# The session pod the A2A gateway spawns, under the operator's
+# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it kubectl and
+# gcloud only (ROLE_EXECUTABLES): the pod executes model output, and the
+# read-only posture command_policy enforces is the view it gets. A demo aid
+# until declarative profiles carry a session's identity and tools.
+CALLER_ROLE_SESSION = "session"
 
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
 # a way that cannot tell those two apart.
-CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
+CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT, CALLER_ROLE_SESSION)
+
+# Which executables a role may hand to /v1/exec. A role absent here keeps the
+# executor's whole allowlist; the session role is narrowed to the two CLIs
+# that reach a cluster read-only. git and gh spend the installation token on
+# the artifact plane and are the shell's alone.
+ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
+    CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+}
+
+
+def executable_permitted(role: str, executable: str) -> bool:
+    """Whether ``role`` may run ``executable`` through /v1/exec."""
+    narrowed = ROLE_EXECUTABLES.get(role)
+    return narrowed is None or executable in narrowed
+
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
@@ -613,7 +639,7 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
-    ("/v1/exec", (CALLER_ROLE_SHELL,)),
+    ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -1223,6 +1249,15 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif a2a_audience:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
+        session_audience = os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip()
+        if session_audience and session_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE equals the %s audience; the session "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[session_audience] or CALLER_ROLE_SHELL,
+            )
+        elif session_audience:
+            audience_roles[session_audience] = CALLER_ROLE_SESSION
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -1232,6 +1267,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
                 "is not; the a2a-chat role only exists once the chat audience split does, "
                 "so the a2a audience is ignored"
+            )
+        if os.getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE", "").strip():
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_SESSION_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the session role only exists once the chat audience split does, "
+                "so the session audience is ignored"
             )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
@@ -6006,6 +6047,28 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_EXECUTABLE_ALLOWLIST,
                     "message": "Executable is not supported by the credential proxy.",
+                },
+            )
+            return
+        if not executable_permitted(principal.role, argv[0]):
+            LOGGER.warning(
+                "executable refused for role request_id=%s role=%s executable=%s",
+                request_id,
+                principal.role,
+                _sanitize_for_logging(argv[0]),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_EXECUTABLE),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_CALLER_EXECUTABLE,
+                    "message": (
+                        f"The {principal.role} caller may run only "
+                        f"{', '.join(sorted(ROLE_EXECUTABLES[principal.role]))} through the credential proxy."
+                    ),
                 },
             )
             return
