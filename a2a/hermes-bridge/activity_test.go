@@ -1235,3 +1235,31 @@ func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
 		t.Fatalf("calls = %d", a.calls)
 	}
 }
+
+// curl's -u folded into a cluster of boolean short flags, and a URL
+// password holding / or @, are scrubbed in full mode; --user-agent is not
+// --user, and a URL with no userinfo keeps an @ in its path.
+func TestRedactInput_CurlClustersAndUserinfoWithSlashes(t *testing.T) {
+	in := `{"command": "curl -su admin:hunter2 https://h; curl -fsSLu root:hunter3 https://i -o f; curl --user-agent ua https://j; psql postgres://u:pa/ss@h:5432/db; curl https://u:pa@ss@k/x; echo https://plain.example/a@b"}`
+	out := string(redactInput(InputValuesFull, "terminal", json.RawMessage(in)))
+	for _, leaked := range []string{"hunter2", "hunter3", "pa/ss", "pa@ss", "ss@k"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("leaked %q in %s", leaked, out)
+		}
+	}
+	for _, kept := range []string{"https://h;", "https://i -o f", "--user-agent ua https://j", "postgres://[redacted]@h:5432/db", "https://[redacted]@k/x", "https://plain.example/a@b"} {
+		if !strings.Contains(out, kept) {
+			t.Fatalf("expected %q in %s", kept, out)
+		}
+	}
+}
+
+// Shape mode never publishes a string, so it skips the credential scrub
+// over values: the length it reports is the string's own, and the markers
+// it keeps are the key-based ones.
+func TestRedactInput_ShapeModeSkipsTheValueScrub(t *testing.T) {
+	out := string(redactInput(InputValuesShape, "terminal", json.RawMessage(`{"h":"Bearer abcdefghijklmnop","token":"x"}`)))
+	if !strings.Contains(out, `"h":"\u003cstring, 23 chars\u003e"`) || !strings.Contains(out, `"token":"[redacted]"`) {
+		t.Fatalf("shape mode: %s", out)
+	}
+}

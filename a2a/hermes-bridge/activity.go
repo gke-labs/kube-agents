@@ -324,16 +324,20 @@ var (
 // curl's -u user:password and -b/--cookie: the command is found whole (so
 // "date -u 12:30" and "sort -u a:b" are not read), and only the credential
 // inside it is replaced, the URL and headers around it kept. A quoted value runs to its
-// closing quote and the attached form (-uuser:pass) is read too. The
+// closing quote, the attached form (-uuser:pass) is read, and so is the flag
+// folded into a cluster of curl's boolean short flags (-su, -fsSLu); a long
+// flag needs its separator, so --user-agent is not --user. The
 // command runs to a separator (;, |, &&, newline), not to a lone & inside a
 // quoted password, and across a backslash-newline continuation, the way a
 // model writes a long command.
 var (
 	curlCommandPattern = regexp.MustCompile(`(?i)\bcurl\b(?:[^;|&\n\\]|&[^&\n]|\\\r?\n|\\[^\n])*`)
-	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-u|--user|-b|--cookie)[\s=]*(?:"[^"\n]*"|'[^'\n]*'|\S+)`)
+	curlUserPattern    = regexp.MustCompile(`(?i)\s(?:-[sSfLkvigGjJnNqRZ46#]*[ub][\s=]*|--(?:user|cookie)[\s=]+)(?:"[^"\n]*"|'[^'\n]*'|\S+)`)
 	// Credentials in a URL's userinfo (postgres://u:p@h, https://u:tok@git):
-	// the userinfo alone goes, the scheme and host around it stay.
-	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]*:[^\s/@]+(@)`)
+	// the userinfo alone goes, the scheme and host around it stay. The
+	// password runs to the last @ that a host follows, so a / or an @ inside
+	// it (pa/ss, pa@ss) is inside the cut, not the end of it.
+	urlUserinfoPattern = regexp.MustCompile(`(://)[^\s/@:]*:\S+(@[^\s@/]+)`)
 	// A Cookie or Set-Cookie header by its key: the rest of the line, the
 	// character before the key kept.
 	cookieHeaderPattern = regexp.MustCompile(`(?i)(^|[^A-Za-z])(?:set-)?cookie["']?[ \t]*[:=][ \t]*["']?[^"'\n]+`)
@@ -733,7 +737,7 @@ func redactInput(mode, tool string, raw json.RawMessage) json.RawMessage {
 	if err := dec.Decode(&v); err != nil {
 		return json.RawMessage(unparseableInput)
 	}
-	red := redactValue(v)
+	red := redactValue(v, mode == InputValuesFull)
 	if mode != InputValuesFull {
 		red = shapeValue(red, tool)
 	}
@@ -864,23 +868,31 @@ func shapeValueIn(v any, key string, wrapper bool, depth int, callElem bool) any
 	return v
 }
 
-func redactValue(v any) any {
+// redactValue blanks the values under secret-looking keys in every mode
+// (the marker is kept by shape mode too) and, when values is set, scrubs
+// credential shapes out of every string; shape mode replaces each string
+// with its length right after, so it skips that pass, which is most of
+// the work on the door's request path.
+func redactValue(v any, values bool) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
 			if secretLookingKey(k) {
 				t[k] = redactedValue
 			} else {
-				t[k] = redactValue(val)
+				t[k] = redactValue(val, values)
 			}
 		}
 		return t
 	case []any:
 		for i := range t {
-			t[i] = redactValue(t[i])
+			t[i] = redactValue(t[i], values)
 		}
 		return t
 	case string:
+		if !values {
+			return t
+		}
 		for _, re := range redactedValuePatterns {
 			t = re.ReplaceAllString(t, redactedValue)
 		}

@@ -234,7 +234,8 @@ ACTIVITY_STATUS_TRUNCATED = "truncated"
 # naming one of them would fail on this transport where the api path
 # passes. The bridge caps a wrapper per nested call first (the large
 # ``arguments`` objects become stand-ins, then every one does, the names
-# staying), and only a wrapper that still does not fit is replaced whole. The marker counts
+# staying), and a wrapper that still does not fit, or whose ``calls`` holds
+# an element that is not an object, is replaced whole. The marker counts
 # these, and the scorer reads the count as a loss (below).
 # The stand-in is recognised by its whole shape -- exactly these three
 # keys with the flag true -- not by the flag alone, because the input is
