@@ -4255,19 +4255,32 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	//
-	// KAGE_SLACK_UX switches the Slack adapter between code paths already in
-	// the image: which reaction goes on an ask and when it settles, whether
-	// the harness's own Slack messages (the scheduled-report wrapper, the
+	// KAGE_SLACK_UX switches between code paths already in the image, all of
+	// them about Slack: which reaction goes on an ask and when it settles; how
+	// much of a delegated card's delivery posts in the thread; whether a
+	// thread's cards show as one plan message, and the session status and title
+	// Slack shows on the thread; whether an opened pull request, a card's
+	// question and an incident alert's triage options post with buttons (the
+	// triage as an edit of the alert), and whether a click on a choice runs as
+	// the clicker's turn under the adapter's own authorization; whether the
+	// harness's own Slack messages (the scheduled-report wrapper, the
 	// heartbeat, restart and shutdown notices, command and system replies) are
-	// reworded or left out, and whether a triage report edits the open alert
-	// it answers into a headline, buttons and a fold. A button click is sent
-	// as the clicker's own message, after the adapter's user and channel
-	// checks. It is compared against `FLAG_ON_VALUES` in `slack_presenter.py`;
-	// any other value is off, the image default. It names no path, URL,
-	// credential or image; no value of it reaches anything but the reactions
-	// on, and the wording and layout of, Slack messages the gateway already
-	// receives or sends; and no click does what its clicker could not do by
-	// typing.
+	// reworded or left out; and whether a fleet-audit cron report and the first
+	// inventory report post as Block Kit, laid out again as a headline, the top
+	// findings and the rest, the audit's counts read from its ledger issue.
+	// Those reports go from the Session KV server's cron relay and from
+	// bootstrap_delivery.py through the credential proxy's Slack relay. One
+	// effect reaches a model: the wake for a card question already posted
+	// carries a note telling the Planning Agent not to ask it again. It is
+	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
+	// value is off, the image default. It names no path, URL, credential or
+	// image, and no value of it adds a destination, a write or a credential:
+	// besides that wake note, it changes how the gateway presents Slack
+	// messages it already receives or sends, accepts a click the adapter
+	// already accepts as that user's message, reads through the forge broker
+	// an issue the report already links, and posts a report through the Slack
+	// relay the proxy already holds, to the channel or thread that report was
+	// already bound for.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's
