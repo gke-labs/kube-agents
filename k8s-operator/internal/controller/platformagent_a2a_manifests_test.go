@@ -1024,10 +1024,22 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
 				t.Errorf("OPERATOR_IMAGE set: %q, want the operator's registry and tag %q", got, want)
 			}
+			// A digest-only operator reference names no tag, so it falls
+			// through to the agent image rather than sending these to
+			// :latest beside a release-tagged agent.
 			t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111")
 			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":latest"; got != want {
-				t.Errorf("digest-pinned operator: %q, want %q", got, want)
+				t.Errorf("digest-pinned operator, no agent image: %q, want %q", got, want)
 			}
+			t.Setenv(platformAgentImageEnvVar, "mirror.corp.internal:5000/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("digest-pinned operator beside a tagged agent: %q, want the agent's tag %q", got, want)
+			}
+			t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator:0.3.0@sha256:1111111111111111111111111111111111111111111111111111111111111111")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("tag-and-digest operator: %q, want the operator's tag %q", got, want)
+			}
+			t.Setenv(platformAgentImageEnvVar, "")
 			t.Setenv(r.envVar, "registry.example/pinned/"+r.name+":v9")
 			if got, want := r.resolve(), "registry.example/pinned/"+r.name+":v9"; got != want {
 				t.Errorf("override set: %q, want the override %q", got, want)
@@ -1051,10 +1063,14 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if gw.Image != mirror+"/a2a-gateway:0.3.0" {
 		t.Errorf("gateway image %q does not follow the agent image's mirror", gw.Image)
 	}
+	workerEnv := ""
 	for _, e := range gw.Env {
-		if e.Name == "A2A_WORKER_IMAGE" && e.Value != mirror+"/a2a-worker:0.3.0" {
-			t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror", e.Value)
+		if e.Name == "A2A_WORKER_IMAGE" {
+			workerEnv = e.Value
 		}
+	}
+	if workerEnv != mirror+"/a2a-worker:0.3.0" {
+		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
 	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {

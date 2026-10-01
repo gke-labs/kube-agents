@@ -684,7 +684,8 @@ func a2aWorkerImage() string {
 }
 
 // a2aReleaseImage resolves one of the first-party next-stack images: the env
-// override if set; else the image name swapped into OPERATOR_IMAGE,
+// override if set; else the image name swapped into OPERATOR_IMAGE when it
+// carries a tag (a digest-only operator reference falls through),
 // the rung resolveShellSandboxImage uses and for the same reason - the
 // gateway, the callout and the worker consume what the operator renders (the
 // identity map, the env, the spawn spec), so their version contract is with
@@ -706,10 +707,24 @@ func a2aReleaseImage(envVar, name string) string {
 	if override := os.Getenv(envVar); override != "" {
 		return override
 	}
-	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" {
+	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" && imageRefHasTag(opImg) {
 		return deriveImageFromOperator(opImg, name)
 	}
 	return deriveImageFromOperator(defaultPlatformAgentImage(), name)
+}
+
+// imageRefHasTag reports whether a reference names a tag: a digest-only
+// operator reference cannot name these images' version, so the rung falls
+// through to the agent image rather than to :latest.
+func imageRefHasTag(ref string) bool {
+	last := ref
+	if i := strings.LastIndex(last, "/"); i >= 0 {
+		last = last[i+1:]
+	}
+	if i := strings.Index(last, "@"); i >= 0 {
+		last = last[:i]
+	}
+	return strings.Contains(last, ":")
 }
 
 // a2aStrictEventsWriter renders "false" for anything but an explicit "true",

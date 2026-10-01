@@ -15,7 +15,8 @@ The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the 
 the Hermes bridge sidecar, and each is in the tables below. The first-party ones (`a2a-gateway`,
 `a2a-worker`, `a2a-authcallout`, `hermes-bridge`) are built and tagged with the rest of the
 release. The operator derives the three it renders from its own image (`OPERATOR_IMAGE`, which
-the chart sets beside `PLATFORM_AGENT_IMAGE`), else from the agent image it resolves for itself:
+the chart sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it
+resolves for itself:
 the same registry and tag, so an install at a release pulls them at that release and a mirrored
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;

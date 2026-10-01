@@ -782,7 +782,6 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
                     if ":latest" in line:
                         self.assertIn("github.ref == 'refs/heads/main'", line)
 
-    _RELEASE_COMMON = _REPO_ROOT / "scripts" / "release" / "common.sh"
     # Both jobs tag through the downcased repository variable, so one shape
     # reads every step's name. The name classes admit any repository-legal
     # name (dots and underscores included), so an entry cannot slip out of
@@ -799,7 +798,7 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         refuse every commit; one in the workflow but not the sign loop ships
         unsigned. So the names the steps tag with :<sha> must equal the array,
         and each must be signed once."""
-        common = self._RELEASE_COMMON.read_text()
+        common = _COMMON_SH.read_text()
         block = re.search(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", common, re.S)
         self.assertIsNotNone(block, "REQUIRED_RELEASE_IMAGES not found in common.sh")
         entries = [line for line in block.group(1).splitlines() if line.strip()]
