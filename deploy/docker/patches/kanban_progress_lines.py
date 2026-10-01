@@ -192,6 +192,21 @@ MARKER_MAX = 2
 #: card's row in the thread's plan; see :func:`silent_event`.
 SILENT_PLAN_KINDS = ("archived", "unblocked")
 
+#: Kinds that settle a plan row past an earlier ``unblocked`` in the same
+#: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
+#: other than running, plus ``archived``. ``crashed`` and ``timed_out`` are
+#: not among them, since the dispatcher retries the card and its row stays
+#: running; see :func:`_overtaken`.
+SETTLING_KINDS = (
+    "archived",
+    "blocked",
+    "block_loop_detected",
+    "changes_requested",
+    "completed",
+    "gave_up",
+    "review_requested",
+)
+
 #: Attribute the map hangs off on the watcher instance. Same lazily-initialised
 #: pattern as upstream's ``_kanban_sub_fail_counts``.
 _ATTR = "_kanban_progress_messages"
@@ -449,8 +464,9 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     Upstream skips a ping already sent by ``last_ping_event_id``, but a silent
     kind is never recorded there, so a replayed ``unblocked`` would undo the
     ``blocked`` after it: the row running and Working… held while the card
-    waits on you. A later event that settles the card in the same batch wins
-    even when recording its ping failed and ``last_ping_event_id`` lags it.
+    waits on you. A later event that settles the card in the same batch
+    (:data:`SETTLING_KINDS`) wins even when recording its ping failed and
+    ``last_ping_event_id`` lags it; a note or a retried failure does not.
     """
     event_id = int(getattr(ev, "id", 0) or 0)
     if event_id and event_id <= int(notification.sub.get("last_ping_event_id") or 0):
@@ -459,7 +475,7 @@ def _overtaken(notification: Any, ev: Any) -> bool:
     events = batch.get("events") if isinstance(batch, dict) else None
     return any(
         int(getattr(later, "id", 0) or 0) > event_id
-        and str(getattr(later, "kind", "") or "") not in ROLLING_KINDS
+        and str(getattr(later, "kind", "") or "") in SETTLING_KINDS
         for later in events or ()
     )
 

@@ -1158,6 +1158,17 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         await silent_event(notification, events[1])
         self.assertEqual(self.settled, [("t_e0c1", "unblocked")])
 
+    async def test_a_retried_failure_after_an_unblock_leaves_the_row_running(self):
+        # crashed and timed_out leave a row alone while the dispatcher retries
+        # the card, so they settle nothing past the unblock before them.
+        for kind in ("crashed", "timed_out"):
+            with self.subTest(kind=kind):
+                self.settled.clear()
+                events = [SimpleNamespace(id=6, kind="unblocked"), SimpleNamespace(id=7, kind=kind)]
+                notification = SimpleNamespace(sub=dict(SLACK_SUB), adapter=_Adapter(), d={"events": events})
+                await silent_event(notification, events[0])
+                self.assertEqual(self.settled, [("t_e0c1", "unblocked")])
+
     async def test_other_silent_events_and_platforms_do_not(self):
         await silent_event(SimpleNamespace(sub=SLACK_SUB, adapter=_Adapter()), SimpleNamespace(kind="heartbeat"))
         await silent_event(SimpleNamespace(sub=SUB, adapter=_Adapter()), SimpleNamespace(kind="archived"))

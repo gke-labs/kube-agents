@@ -27,6 +27,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(SCRIPTS))
 
 import apply_slack_ux_status as applier
+import kanban_progress_lines
 import slack_status
 import slack_ux_status as runtime
 import verify_slack_ux_status as verifier
@@ -1270,6 +1271,12 @@ class EnabledTest(unittest.TestCase):
         for value, expected in (("1", True), ("true", True), ("", False), ("0", False)):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"KAGE_SLACK_UX": value}):
                 self.assertEqual(runtime.enabled(), expected)
+
+
+class SettlingKindsTest(unittest.TestCase):
+    def test_the_kinds_that_overtake_an_unblock_are_the_ones_that_settle_a_row(self):
+        settling = {kind for kind, status in slack_status.TASK_STATUS_BY_KIND.items() if status != slack_status.TASK_RUNNING}
+        self.assertEqual(set(kanban_progress_lines.SETTLING_KINDS), settling | {"archived"})
 
 
 if __name__ == "__main__":
