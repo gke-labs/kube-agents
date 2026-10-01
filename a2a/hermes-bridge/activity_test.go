@@ -340,9 +340,9 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 }
 
 // The scope's config.yaml is written before its .env, so a scope cut short
-// between the two is one the sweep removes rather than a credential copy it
-// never sees: a source with an unwritable destination for the env fails
-// after the config exists, and the failed scope is gone.
+// between the two is one the sweep removes (it keys on config.yaml) rather
+// than a credential copy it never sees. Observed through the write seam,
+// since two back-to-back writes share a file-time tick.
 func TestChildManagedScope_WritesTheConfigBeforeTheEnv(t *testing.T) {
 	src := t.TempDir()
 	for name, body := range map[string]string{managedConfigFile: "model: {default: m}\n", managedEnvFile: "K=v\n"} {
@@ -350,26 +350,24 @@ func TestChildManagedScope_WritesTheConfigBeforeTheEnv(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	var order []string
+	prev := writeScopeFile
+	writeScopeFile = func(name string, data []byte, perm os.FileMode) error {
+		order = append(order, filepath.Base(name))
+		return os.WriteFile(name, data, perm)
+	}
+	t.Cleanup(func() { writeScopeFile = prev })
 	scratch := t.TempDir()
 	b := &Bridge{cfg: Config{ScratchDir: scratch, ManagedScopeDir: src, ActivityListen: "127.0.0.1:0"}}
 	if err := b.listenActivity(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = b.activityLn.Close() })
-	dir, err := b.childManagedScope("task-order")
-	if err != nil {
+	if _, err := b.childManagedScope("task-order"); err != nil {
 		t.Fatal(err)
 	}
-	cfgInfo, err := os.Stat(filepath.Join(dir, managedConfigFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	envInfo, err := os.Stat(filepath.Join(dir, managedEnvFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if envInfo.ModTime().Before(cfgInfo.ModTime()) {
-		t.Fatalf("env written (%v) before config (%v)", envInfo.ModTime(), cfgInfo.ModTime())
+	if len(order) != 2 || order[0] != managedConfigFile || order[1] != managedEnvFile {
+		t.Fatalf("scope files written in order %v, want [%s %s]", order, managedConfigFile, managedEnvFile)
 	}
 }
 
@@ -828,6 +826,18 @@ func TestChildManagedScope_RefusesATaskIDThatIsNotAPathSegment(t *testing.T) {
 	for _, bad := range []string{"../escape", "a/b", "..", "", "task with space", strings.Repeat("x", 129)} {
 		if dir, err := b.childManagedScope(bad); err == nil {
 			t.Fatalf("task id %q accepted: %s", bad, dir)
+		}
+	}
+	// A legal path segment that is not a scope name the sweep reclaims is
+	// refused too, by its own reason: a scope under it would be a credential
+	// copy no start removes after a hard kill.
+	for _, bad := range []string{"nottask", "t1", "tasks-1", "Task-1"} {
+		dir, err := b.childManagedScope(bad)
+		if err == nil {
+			t.Fatalf("task id %q accepted: %s", bad, dir)
+		}
+		if !strings.Contains(err.Error(), "sweep reclaims") {
+			t.Fatalf("task id %q refused for the wrong reason: %v", bad, err)
 		}
 	}
 	entries, _ := os.ReadDir(scratch)

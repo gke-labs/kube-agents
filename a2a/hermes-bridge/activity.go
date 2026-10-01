@@ -208,6 +208,10 @@ var (
 // the sink that writes files does not lean on that.
 var taskIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// writeScopeFile writes one file of a child scope; a variable only so a
+// test can observe the order the two files are written in.
+var writeScopeFile = os.WriteFile
+
 // scopeDirPattern is the shape of a scope the start-time sweep may remove
 // and so the only shape childManagedScope writes: the gateway's task-<hex>
 // (tests use task-<word>), never a bare word.
@@ -740,11 +744,11 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	// config.yaml first, .env second: the start-time sweep takes a scope by
 	// its config.yaml, so a kill between the two writes leaves a scope the
 	// next start removes rather than a credential copy it never sees.
-	if err := os.WriteFile(filepath.Join(dir, managedConfigFile), out, childScopeFileMode); err != nil {
+	if err := writeScopeFile(filepath.Join(dir, managedConfigFile), out, childScopeFileMode); err != nil {
 		return "", fmt.Errorf("child scope config: %w", err)
 	}
 	if env != nil {
-		if err := os.WriteFile(filepath.Join(dir, managedEnvFile), env, childScopeFileMode); err != nil {
+		if err := writeScopeFile(filepath.Join(dir, managedEnvFile), env, childScopeFileMode); err != nil {
 			return "", fmt.Errorf("child scope env: %w", err)
 		}
 	}
@@ -963,8 +967,13 @@ func (b *Bridge) drainActivity(run *taskRun) {
 			b.publishActivityEntry(run, e)
 		}
 	}
-	if marker, ok := a.truncationMarker(); ok && time.Now().Before(deadline) {
-		b.publishActivityEntry(run, marker)
+	// The marker is what tells a reader the trace is short; it goes out
+	// after the drain whether or not the drain spent its budget, on its own
+	// publish timeout, and a failure is said rather than silent.
+	if marker, ok := a.truncationMarker(); ok {
+		if !b.publishActivityEntry(run, marker) {
+			b.cfg.Logger.Warn("activity truncation marker not published; the trace reads complete and is not", "task", run.origin.TaskID, "dropped", marker.Dropped)
+		}
 	}
 }
 
@@ -982,15 +991,15 @@ func (b *Bridge) waitActivity(run *taskRun) {
 	}
 }
 
-// publishActivityEntry publishes one data part onto the activity artifact.
-// Caller holds run.mu.
-func (b *Bridge) publishActivityEntry(run *taskRun, e ActivityEntry) {
+// publishActivityEntry publishes one data part onto the activity artifact
+// and reports whether it went out. Caller holds run.mu.
+func (b *Bridge) publishActivityEntry(run *taskRun, e ActivityEntry) bool {
 	data, err := json.Marshal(e)
 	if err != nil {
 		b.cfg.Logger.Warn("activity entry marshal failed", "task", run.origin.TaskID, "err", err)
-		return
+		return false
 	}
-	b.publishArtifactPart(run, lib.ArtifactActivity, lib.Part{Kind: "data", Data: data})
+	return b.publishArtifactPart(run, lib.ArtifactActivity, lib.Part{Kind: "data", Data: data})
 }
 
 // publishProgress publishes one text part onto the progress artifact.
@@ -1001,9 +1010,10 @@ func (b *Bridge) publishProgress(run *taskRun, text string) {
 
 // publishArtifactPart is the worker adapter's publishArtifactChunk: one part
 // appended onto the named artifact, artifactId "artifact-<task>-<name>",
-// append after the first, never lastChunk, best-effort. The result artifact
-// keeps its own publisher because it is chunked and load-bearing.
-func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) {
+// append after the first, never lastChunk, best-effort, and reports whether
+// the part went out. The result artifact keeps its own publisher because it
+// is chunked and load-bearing.
+func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) bool {
 	a := run.act.Load()
 	payload, err := json.Marshal(lib.ArtifactUpdate{
 		TaskID:    run.origin.TaskID,
@@ -1017,12 +1027,12 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) {
 	})
 	if err != nil {
 		b.cfg.Logger.Warn("artifact marshal failed", "task", run.origin.TaskID, "name", name, "err", err)
-		return
+		return false
 	}
 	env, err := lib.NewArtifactUpdateEnvelope(b.from, run.origin.TaskID, run.origin.ContextID, run.origin.CorrelationID, payload)
 	if err != nil {
 		b.cfg.Logger.Warn("artifact envelope failed", "task", run.origin.TaskID, "name", name, "err", err)
-		return
+		return false
 	}
 	// Marked before the publish, as the worker adapter does: a publish whose
 	// ack times out after the server stored it (a reconnect) must not make
@@ -1033,5 +1043,7 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) {
 	defer cancel()
 	if err := b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env); err != nil {
 		b.cfg.Logger.Warn("artifact publish failed", "task", run.origin.TaskID, "name", name, "err", err)
+		return false
 	}
+	return true
 }
