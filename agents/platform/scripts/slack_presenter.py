@@ -1,10 +1,11 @@
-"""Slack presentation for kube-agents: the reactions an ask gets.
+"""Slack presentation for kube-agents: the reactions an ask gets, and the flag.
 
 Pure functions only. Nothing here imports the Hermes gateway, the Slack SDK or
 the network, so any process that posts to Slack can use it, and it can move
-with Slack ingress when it leaves the gateway. Today its one caller is the
+with Slack ingress when it leaves the gateway. Today its callers are the
 gateway's reactions patch (``slack_ux_reactions``), which the kanban notifier
-also reaches.
+also reaches, and the harness-message patch (``slack_boilerplate``), which
+reads only :func:`enabled`.
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
