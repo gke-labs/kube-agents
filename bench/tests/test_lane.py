@@ -31,12 +31,13 @@ TASKS = REPO_ROOT / "bench" / "tasks"
 # A presubmit case that requests no pull request, neither through its own
 # checks nor through the file's `requesting:` list, and a nightly case that
 # requests one (its objective is a pull_request_opened check). Not
-# obtainability-remediation-proposal: it is the file's placeholder, and its
-# own check (#2088) turns it into a requesting case in either merge order.
+# obtainability-remediation-proposal: it asks for a proposal, the lane file
+# no longer lists it among the requesting, and it is the case the
+# zero-allowance safeguard exists to watch.
 READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
 # The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,
-# so the listed path is tested without pinning the real file's placeholder,
+# so the listed path is tested without pinning the real file's entries,
 # whose contents scripts/test_eval_rosters.py owns.
 LISTED_COUNT = 2
 
