@@ -183,8 +183,9 @@ for — a chart value, a Dockerfile `ARG` default, a compiled constant in the op
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
 default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
-`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
-manifests; and the kustomize integrations, which it requires to name a variable the file owns
+`k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
+fallback, the NATS and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
+worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
 rather than a literal. Two copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
 `platformAgent.harness.memory.provider`, which no render turns on — so their pins in

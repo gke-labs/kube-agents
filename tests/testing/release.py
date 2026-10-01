@@ -19,6 +19,10 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "replay-proxy",
     "pubsub-platform",
     "gke-stockout-investigator",
+    "a2a-gateway",
+    "a2a-worker",
+    "a2a-authcallout",
+    "hermes-bridge",
 ]
 
 MOCK_INITIAL_VERSION = "0.1.0"

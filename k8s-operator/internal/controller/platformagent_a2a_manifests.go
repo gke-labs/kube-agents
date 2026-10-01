@@ -176,24 +176,28 @@ const (
 	// its creation in reconcileA2A) and a CR that reads Provisioning for it.
 	a2aCalloutCPULimit    = "500m"
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
-	// The stage 1 dev registry. A dev toggle's default may name a dev
-	// registry; graduation moves this to the release pipeline alongside the
-	// other first-party images.
-	//
-	// The first-party A2A images — this one, the worker below and the auth
-	// callout (A2A_CALLOUT_IMAGE, platformagent_a2a_callout.go) — are not in
-	// images.json, deliberately: this repo builds them and publishes them
-	// only from that dev registry, off the release pipeline the inventory's
-	// first-party entries are copied from. That exemption is graduation debt
-	// alongside the registry move (#1557) — a mirrored or air-gapped install
-	// that flips next must override each of them via the env vars until then.
-	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
+	// The first-party next-stack images the operator renders — this one, the
+	// worker below and the auth callout (platformagent_a2a_callout.go) — are
+	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
+	// beside the other first-party images, images.json carries them (as
+	// a2a-gateway, a2a-worker and a2a-authcallout), and
+	// hack/check-image-inventory.sh holds these names to the inventory's
+	// entries (the name, and the repository as that name under the agent
+	// image's registry). Bare names, like shellSandboxRepositoryName: the
+	// registry is never this constant's to say. They resolve through
+	// a2aReleaseImage: the env override, else this name under the registry
+	// and tag of OPERATOR_IMAGE, else of the agent image the operator
+	// resolves for itself (whose fallback is the published registry). So a
+	// chart install at X.Y.Z pulls these at X.Y.Z, and an install that
+	// mirrored the operator has mirrored these too.
+	a2aGatewayImageName = "a2a-gateway"
 
 	// The session-pod image, on the same terms as the gateway above. The
-	// gateway binary carries this same default of its own (gateway/config.go),
-	// which is what a gateway run outside the operator falls back to; the
-	// operator renders the env unconditionally so that the override exists
-	// wherever the operator is what installed the gateway. Arming spawning
+	// gateway binary carries a default of its own for the same image
+	// (defaultWorkerRepository in gateway/config.go, the published repository
+	// at :latest), which is what a gateway run outside the operator falls
+	// back to; the operator renders the env unconditionally so that the
+	// override exists wherever the operator is what installed the gateway. Arming spawning
 	// without it would mean an install that flips next pulls an image no
 	// operator input can redirect.
 	a2aWorkerImageEnvVar = "A2A_WORKER_IMAGE"
@@ -300,7 +304,7 @@ const (
 	// on `…events` before it, and refusing those folds every recent task
 	// non-terminal. A flip that needed a new image would not get made.
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
-	defaultA2AWorkerImage       = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"
+	a2aWorkerImageName          = "a2a-worker"
 
 	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
 	// each password goes when it re-renders nats.conf for hashing. It carries
@@ -728,17 +732,55 @@ func a2aProvisionImage() string {
 }
 
 func a2aGatewayImage() string {
-	if override := os.Getenv(a2aGatewayImageEnvVar); override != "" {
-		return override
-	}
-	return defaultA2AGatewayImage
+	return a2aReleaseImage(a2aGatewayImageEnvVar, a2aGatewayImageName)
 }
 
 func a2aWorkerImage() string {
-	if override := os.Getenv(a2aWorkerImageEnvVar); override != "" {
+	return a2aReleaseImage(a2aWorkerImageEnvVar, a2aWorkerImageName)
+}
+
+// a2aReleaseImage resolves one of the first-party next-stack images: the env
+// override if set; else the image name swapped into OPERATOR_IMAGE when it
+// carries a tag (a digest-only operator reference falls through),
+// the rung resolveShellSandboxImage uses and for the same reason - the
+// gateway, the callout and the worker consume what the operator renders (the
+// identity map, the env, the spawn spec), so their version contract is with
+// the operator, and OPERATOR_IMAGE is set once per install by whoever
+// installed it: the chart sets it, and main.go discovers it from the pod
+// spec only when PLATFORM_AGENT_IMAGE is unset too, so a kustomize install
+// that sets the agent image and not the operator's skips this rung (the
+// sample manifest names both for that reason); else
+// the same swap on the agent image the operator resolves for itself
+// (defaultPlatformAgentImage: PLATFORM_AGENT_IMAGE, which the chart pins to
+// the release or the mirror, else the published default at the fallback
+// tag). One workflow builds all of these from one commit, so either tag names
+// the matching build of each, and a mirror that carries the operator or the
+// agent image carries these under the same prefix. Never a CR's
+// spec.deployment.image: a custom agent image is that agent's choice, and the
+// bus components are not. The three env vars stay the override for an
+// install that pins one apart.
+func a2aReleaseImage(envVar, name string) string {
+	if override := os.Getenv(envVar); override != "" {
 		return override
 	}
-	return defaultA2AWorkerImage
+	if opImg := os.Getenv(operatorImageEnvVar); opImg != "" && imageRefHasTag(opImg) {
+		return deriveImageFromOperator(opImg, name)
+	}
+	return deriveImageFromOperator(defaultPlatformAgentImage(), name)
+}
+
+// imageRefHasTag reports whether a reference names a tag: a digest-only
+// operator reference cannot name these images' version, so the rung falls
+// through to the agent image rather than to :latest.
+func imageRefHasTag(ref string) bool {
+	last := ref
+	if i := strings.LastIndex(last, "/"); i >= 0 {
+		last = last[i+1:]
+	}
+	if i := strings.Index(last, "@"); i >= 0 {
+		last = last[:i]
+	}
+	return strings.Contains(last, ":")
 }
 
 // a2aStrictEventsWriter renders "false" for anything but an explicit "true",

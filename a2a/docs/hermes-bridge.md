@@ -58,16 +58,20 @@ gap - its `NATS_URL` and credentials arrive as sidecar env.
 Closing it breaks this deployment method, so it stays open as a stated trade while the
 bridge exists; the bridge's demolition removes the reason.
 
-One provenance note: the bridge image is CI-only. `a2a/Dockerfile.hermes-bridge` builds it
-(`FROM` the platform-agent image plus the one static binary above), and
-`deploy/docker/cloudbuild-ci.yaml` builds it in its `a2a-bridge` step when `hack/ci-deploy.sh`
-runs under `EVAL_MODE_NEXT=1`, `FROM` the platform-agent image that same build produced,
-by the tag it just pushed and never from a registry default, so the sidecar and the agent
-container it shares a pod with are one build; the deploy then declares it on the CR for
-the eval install (`docs/designs/eval-next-transport.md`, "The CI flag"). It is not in
-`images.json` (`hack/check-image-inventory.sh` states the exclusion) and not release
-surface; it joins the release surface at stage-2 graduation or dies before it, whichever
-the dispatcher decides.
+One provenance note: the bridge image is release surface. `a2a/Dockerfile.hermes-bridge`
+builds it (`FROM` the platform-agent image plus the one static binary above), the release
+workflow publishes it as `hermes-bridge` beside the other first-party images, `FROM` the
+platform-agent image the same run pushed under the same commit tag, and `images.json`
+carries it with no operator override, since the operator renders no bridge and the
+sidecar's image is the CR's. `deploy/docker/cloudbuild-ci.yaml` builds the presubmit's own
+in its `a2a-bridge` step when `hack/ci-deploy.sh` runs under `EVAL_MODE_NEXT=1`, `FROM` the
+platform-agent image that same build produced, by the tag it just pushed and never from a
+registry default; the deploy then declares it on the CR for the eval install
+(`docs/designs/eval-next-transport.md`, "The CI flag"). Either way the sidecar and the agent
+container it shares a pod with are one build. The static `bridge` bus user the next section
+describes is the released mechanism, not scaffolding graduation removes: the password arrives
+as sidecar env from the operator's creds Secret, and it stays a password principal for the
+reason given there.
 
 ## Bus user and grants
 

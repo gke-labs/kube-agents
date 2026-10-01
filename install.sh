@@ -5260,7 +5260,7 @@ main() {
     export THIRD_PARTY_REGISTRY_PREFIX="$third_party_registry_prefix"
   fi
   # No *_IMAGE variables. The operator reads OPERATOR_IMAGE and
-  # PLATFORM_AGENT_IMAGE from its own pod environment, where the chart sets them
+  # PLATFORM_AGENT_IMAGE from its own pod environment, where the chart sets both
   # from values.yaml. The images this install pulls are decided by
   # REGISTRY_PREFIX above and the image_tag the tfvars generator writes.
 
