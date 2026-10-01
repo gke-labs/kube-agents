@@ -676,8 +676,10 @@ class Run:
         # True when the suite's own verdict said the run could not be
         # evaluated (SCHEMA.md, `eval_outcome`), with the case ids it named.
         # Absent reads as a run the suite graded, as every record did before
-        # the field existed.
-        self.not_evaluated = run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
+        # the field existed. Keyed on Prow's FAILURE like the other shapes
+        # below: the suite prints its line minutes before the job ends, so a
+        # build Prow aborted in that tail carries the field and is an abort.
+        self.not_evaluated = self.result == RUN_FAILURE and run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
         named = run.get("not_evaluated")
         self.not_evaluated_cases = [str(c) for c in named if isinstance(c, str)] if isinstance(named, list) else []
 

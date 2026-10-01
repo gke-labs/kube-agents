@@ -406,8 +406,11 @@ def is_lost_pod(run: dict) -> bool:
 def is_not_evaluated(run: dict) -> bool:
     """The suite's own verdict said the run could not be evaluated
     (SCHEMA.md, `eval_outcome`; absent is a run recorded before the field or
-    one the suite did grade, and reads as it always did)."""
-    return run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
+    one the suite did grade, and reads as it always did). A FAILURE only, as
+    health.Run reads it: the suite prints its line minutes before the job
+    ends, so a build Prow aborted in that tail carries the field and reads
+    as the abort it is."""
+    return str(run.get("result") or "").upper() == RUN_FAILURE and run.get("eval_outcome") == EVAL_OUTCOME_NOT_EVALUATED
 
 
 def not_evaluated_cases(run: dict, cases: list[dict] = ()) -> list[str]:

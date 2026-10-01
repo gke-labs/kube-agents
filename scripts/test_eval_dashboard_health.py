@@ -682,6 +682,17 @@ class DeadlineKills(unittest.TestCase):
         out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (1, 0))
 
+    def test_the_suites_word_on_an_aborted_build_is_not_the_not_evaluated_shape(self):
+        # The field keys on Prow's FAILURE like lost_pod and deadline_kill:
+        # a build aborted after the suite printed its line is an abort.
+        lost = dict(run(1, 1, T0, tasks=[task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED", eval_outcome="not_evaluated", not_evaluated=["security-overgrant-probe"])
+        self.assertTrue(health.Run(lost).not_evaluated)
+        aborted = dict(lost, result="ABORTED")
+        self.assertFalse(health.Run(aborted).not_evaluated)
+        self.assertEqual(health.Run(aborted).not_evaluated_cases, ["security-overgrant-probe"], "the list is still read; the shape is not")
+        out = adjudicate(data(aborted, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["red_runs"], out["pr_caused_reds"], out["infra_reds"], out["aborted_runs"]), (0, 0, 0, 1))
+
     def test_recovering_advice_names_the_bar_the_condition_is_left_on(self):
         self.assertIn("the newest 3 runs with a verdict, green or red, are on distinct PRs and all finished after the last kill", health.advice_for("DEGRADED", "deadline_kill", [], None, {}, recovering=True))
         self.assertIn("3 consecutive green runs on distinct PRs", health.advice_for("DEGRADED", "shared_break", [], None, {}, recovering=True))

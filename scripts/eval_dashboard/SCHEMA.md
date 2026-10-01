@@ -472,8 +472,11 @@ what the renderer does with them.
   `gate_comment.py` does not read it; no comment is left either way.
   Absent reads as a setup crash.
 - `runs[].eval_outcome`, `runs[].not_evaluated` — an `eval_outcome` of
-  `not_evaluated` is a run verdict of its own, read before every other
-  rule and never folded into `red` or `infra`: `classify.py` verdicts the
+  `not_evaluated` on a `FAILURE` is a run verdict of its own, read before
+  every other rule and never folded into `red` or `infra` (the suite prints
+  its line minutes before the job ends, so a build Prow aborted in that tail
+  carries the field and reads as `ABORTED`, as every reader keyed on
+  `result` does): `classify.py` verdicts the
   run `not_evaluated` with a headline naming the lost cases (the suite's
   list, else the admitted cases that graded nothing) and a retest-when-
   healthy `do`, and never the "absolute rule tripped" text; `gate_comment.py`

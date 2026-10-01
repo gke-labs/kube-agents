@@ -414,7 +414,8 @@ than read only as "not evaluated" on every pull request.
 Three other shapes get a comment, each one line with the same marker and
 dedupe. A run the suite marked **not evaluated** — an admitted case, or every
 case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
-2 and Prow recorded a `FAILURE` — is not a red to the tick: the collector
+2 and Prow recorded a `FAILURE`; a build Prow aborted after the suite's line
+carries the field and gets no comment, like any abort — is not a red to the tick: the collector
 recorded the suite's `outcome` on the run (`runs[].eval_outcome`,
 `SCHEMA.md`), so the comment names the cases the suite listed in
 `runs[].not_evaluated` and says nothing about the change is implied:

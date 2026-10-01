@@ -709,6 +709,25 @@ class NotEvaluatedComment(Harness):
         self.assertTrue(gate_comment.is_red(health.Run(raw)), "without the suite's word it is the hard failure it always was")
         self.assertFalse(health.Run(raw).not_evaluated)
 
+    def test_an_aborted_build_carrying_the_field_gets_no_comment_and_keeps_the_earlier_red(self):
+        # The suite prints its line minutes before the job ends (artifact
+        # dumps, dashboard publish, teardown), so a superseding push in that
+        # tail leaves `result: ABORTED` beside `eval_outcome: not_evaluated`.
+        # Every other commented shape keys on FAILURE; so does this one.
+        aborted = not_evaluated(101, 1300, NOW - timedelta(minutes=5), result="ABORTED")
+        self.assertFalse(health.Run(aborted).not_evaluated)
+        self.assertFalse(gate_comment.is_red(health.Run(aborted)))
+        self.assertFalse(gate_comment.is_commented_on(health.Run(aborted)))
+        earlier = run(100, 1300, NOW - timedelta(minutes=40), failing=("agent-kanban-smoke",))
+        self.assertEqual([r["build_id"] for r in gate_comment.newest_red_per_pr(data(aborted, earlier, *green_others()), NOW - timedelta(hours=2), NOW)], ["100"])
+        rc, _ = self.tick(data(aborted, earlier, *green_others()), green_health())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        body = self.gh.bodies()[0]
+        self.assertNotIn("run not evaluated", body)
+        self.assertNotIn("Prow reports the run red", body)
+        self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "100")
+
     def test_two_lost_cases_are_named_together(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), lost=("agent-kanban-smoke", "security-overgrant-probe"))
         self.tick(data(mine, *green_others()), green_health())

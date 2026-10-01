@@ -758,6 +758,24 @@ class NotEvaluatedTest(unittest.TestCase):
         self.assertTrue(verdict["headline"].startswith("The run is red, but no gate case failed outright."))
         self.assertNotIn("not_evaluated", verdict)
 
+    def test_an_aborted_build_carrying_the_field_reads_as_the_abort(self):
+        # Prow can abort a job in the minutes between the suite's line and
+        # the container's exit; the record then carries the field under
+        # `result: ABORTED`, and the verdict is the abort's, never a lede
+        # that says Prow reports the run red.
+        target = not_evaluated_run()
+        target["result"] = "ABORTED"
+        verdict = classify_run(target, [target])
+        self.assertEqual(verdict["verdict"], "infra")
+        self.assertEqual(verdict["headline"], "Aborted before it finished.")
+        self.assertNotIn("not_evaluated", verdict)
+        self.assertNotIn("Prow reports it red", verdict["lede"])
+        self.assertNotEqual(verdict["do"], classify.DO_NOT_EVALUATED)
+        target["tasks"] = []
+        verdict = classify_run(target, [target])
+        self.assertEqual((verdict["verdict"], verdict["headline"]), ("infra", "Aborted before it finished."))
+        self.assertNotIn("not_evaluated", verdict)
+
     def test_a_record_with_the_field_and_no_tasks_is_still_not_evaluated(self):
         target = run(1, 1782, T0, result="FAILURE", tasks=[])
         target.update({"eval_outcome": "not_evaluated", "not_evaluated": ["agent-kanban-smoke"]})

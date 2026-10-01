@@ -296,7 +296,8 @@ def is_red(run: health.Run) -> bool:
 
 def is_commented_on(run: health.Run) -> bool:
     """A red, a lost pod, a deadline kill, or a not-evaluated run: the four
-    shapes that get a comment."""
+    shapes that get a comment, each a FAILURE to Prow (health.Run keys all
+    four on `result`; an aborted build gets no comment whatever it carries)."""
     return is_red(run) or run.lost_pod or run.deadline_kill or run.not_evaluated
 
 
