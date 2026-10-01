@@ -100,6 +100,21 @@ OPEN_CARDS_SQL = (
     "AND t.status NOT IN ('done', 'archived')"
 )
 
+#: Every card subscribed to one Slack thread, closed ones included, with the
+#: card whose worker created it. Hermes keeps a subscription until the card is
+#: archived, so a follow-up's creator that has since completed is still here.
+THREAD_LINEAGE_SQL = (
+    "SELECT s.task_id, "
+    "(SELECT json_extract(e.payload, '$.creator_task_id') FROM task_events e "
+    "WHERE e.task_id = s.task_id AND e.kind = 'created') "
+    "FROM kanban_notify_subs s "
+    "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ?"
+)
+
+#: How many creator links a completion follows down to the open cards it holds
+#: the ask for. A worker's follow-up is one link; one filed under that, two.
+LINEAGE_DEPTH = 8
+
 #: ``ProcessingOutcome`` values, compared by value so this module needs no
 #: gateway import. ``cancelled`` is absent: an interrupted turn settles nothing.
 OUTCOME_SETTLES = {"success": "done", "failure": "failed"}
@@ -190,8 +205,8 @@ def _remember(store: OrderedDict, key: Any, value: Any, cap: int) -> None:
         store.popitem(last=False)
 
 
-def _query_open_cards(chat_id: str, thread_id: str) -> dict:
-    """Every open card subscribed to this thread, on every live board, as ``{(board, id): _Card}``.
+def _read_boards(sql: str, chat_id: str, thread_id: str) -> list:
+    """``sql`` run against every live board for this thread, as ``[(board, row)]``.
 
     Boards are walked as the notifier walks them: one read per database, under
     the slug the notifier stamps on that database's deliveries. So a card read
@@ -206,7 +221,7 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect
 
-    cards: dict[tuple[str, str], str] = {}
+    rows: list[tuple[str, Any]] = []
     seen: set[str] = set()
     for meta in kb.list_boards(include_archived=False):
         slug = meta.get("slug") or kb.DEFAULT_BOARD
@@ -222,11 +237,23 @@ def _query_open_cards(chat_id: str, thread_id: str) -> dict:
             continue
         conn = kanban_db_connect.connect(board=slug)
         try:
-            rows = conn.execute(OPEN_CARDS_SQL, (PLATFORM, chat_id, thread_id)).fetchall()
+            rows.extend((slug, row) for row in conn.execute(sql, (PLATFORM, chat_id, thread_id)).fetchall())
         finally:
             conn.close()
-        cards.update(((slug, row[0]), _Card(row[1], row[2], bool(row[3]))) for row in rows)
-    return cards
+    return rows
+
+
+def _query_open_cards(chat_id: str, thread_id: str) -> dict:
+    """Every open card subscribed to this thread, on every live board, as ``{(board, id): _Card}``."""
+    return {
+        (slug, row[0]): _Card(row[1], row[2], bool(row[3]))
+        for slug, row in _read_boards(OPEN_CARDS_SQL, chat_id, thread_id)
+    }
+
+
+def _query_thread_lineage(chat_id: str, thread_id: str) -> dict:
+    """Every card subscribed to this thread, closed ones included, as ``{(board, id): creator id}``."""
+    return {(slug, row[0]): row[1] for slug, row in _read_boards(THREAD_LINEAGE_SQL, chat_id, thread_id)}
 
 
 async def open_cards(chat_id: str, thread_id: str) -> dict | None:
@@ -236,6 +263,30 @@ async def open_cards(chat_id: str, thread_id: str) -> dict | None:
     except Exception as exc:  # noqa: BLE001 — a cosmetic read never fails a turn
         logger.debug("slack_ux_reactions: kanban read failed for %s/%s: %s", chat_id, thread_id, exc)
         return None
+
+
+async def thread_lineage(chat_id: str, thread_id: str) -> dict:
+    """The thread's cards as ``{(board, id): creator id}``, or ``{}`` when the boards cannot be read."""
+    try:
+        return await asyncio.to_thread(_query_thread_lineage, chat_id, thread_id)
+    except Exception as exc:  # noqa: BLE001 — a cosmetic read never fails a turn
+        logger.debug("slack_ux_reactions: lineage read failed for %s/%s: %s", chat_id, thread_id, exc)
+        return {}
+
+
+def _descendants(card: tuple, creators: dict) -> set:
+    """The cards created under ``card``, through workers' follow-ups, up to ``LINEAGE_DEPTH`` links down."""
+    found: set = set()
+    frontier = {card}
+    for _ in range(LINEAGE_DEPTH):
+        frontier = {
+            (board, task) for (board, task), creator in creators.items()
+            if (board, creator) in frontier and (board, task) not in found
+        }
+        if not frontier:
+            break
+        found |= frontier
+    return found
 
 
 def _where(event: Any) -> tuple[str | None, str]:
@@ -339,7 +390,10 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
     Before a completion takes a card off, the thread is read once for open
     cards its worker created, and each ask waiting on the card waits on those
     too: a follow-up filed with ``parents=[own id]`` starts only once the card
-    completes, so it was not on the board when the turn ended. One blocked on
+    completes, so it was not on the board when the turn ended. Cards created
+    under those count as well, through creators that have already completed,
+    which a second read of the thread's closed cards supplies; if it fails,
+    only links between open cards are followed. One blocked on
     the user is kept and puts ⏸️ on the ask. One parked by a give-up is not, and
     leaves the ask ✅ for the work it did: being subscribed to this thread, the
     follow-up has posted its own "gave up" line in it, which is the failure. A
@@ -372,10 +426,10 @@ async def settle_delegated(adapter: Any, sub: dict, kind: str, board: str | None
         return
     follow_ups = {}
     if settle == _presenter.SETTLE_DONE:
-        follow_ups = {
-            (b, task): seen for (b, task), seen in (await open_cards(*key) or {}).items()
-            if b == card[0] and seen.creator == card[1] and not seen.gave_up
-        }
+        still_open = await open_cards(*key) or {}
+        creators = {**await thread_lineage(*key), **{c: seen.creator for c, seen in still_open.items()}}
+        under = _descendants(card, creators)
+        follow_ups = {c: seen for c, seen in still_open.items() if c in under and not seen.gave_up}
     waits_on_user = any(seen.status not in RESUMED_STATUSES for seen in follow_ups.values())
     # The read awaited, so another event may have settled an ask meanwhile.
     asks = [ask for ask in _deferred.get(key, []) if card in ask.cards]

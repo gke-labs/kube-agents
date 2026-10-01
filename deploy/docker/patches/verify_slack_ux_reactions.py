@@ -262,7 +262,7 @@ def check_board_read(module, root: Path) -> None:
             kb.unblock_task(conn, revived)
         finally:
             conn.close()
-        card(kb.DEFAULT_BOARD, "finished", done=True)
+        _, finished = card(kb.DEFAULT_BOARD, "finished", done=True)
         card(kb.DEFAULT_BOARD, "another thread", thread=OTHER_THREAD)
         card(SECOND_BOARD, "another platform", platform=OTHER_PLATFORM)
         # The query itself, not open_cards(), so a drift raises here instead
@@ -277,6 +277,9 @@ def check_board_read(module, root: Path) -> None:
         stops = [read[(kb.DEFAULT_BOARD, task)] for task in (asking, parked, revived)]
         if [c.gave_up for c in stops] != [False, True, False] or stops[1].status != "blocked":
             raise _fail(f"the kanban read does not tell a give-up from a block on the user: {stops!r}")
+        lineage = module._query_thread_lineage(CHANNEL, THREAD)
+        if lineage.get((kb.DEFAULT_BOARD, child)) != creator or (kb.DEFAULT_BOARD, finished) not in lineage:
+            raise _fail(f"the lineage read misses a creator or a completed card: {lineage!r}")
     finally:
         for name, value in saved.items():
             if value is None:
@@ -331,7 +334,11 @@ async def _drive(module) -> None:
     async def open_cards(chat_id, thread_id):
         return boards.pop(0)
 
+    async def thread_lineage(chat_id, thread_id):
+        return {}
+
     module.open_cards = open_cards
+    module.thread_lineage = thread_lineage
 
     # A direct answer: arrival by kind, then the settle at once.
     adapter = _StubAdapter()

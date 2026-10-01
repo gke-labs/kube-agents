@@ -319,6 +319,14 @@ class RuntimeTest(unittest.TestCase):
         cards = mock.patch.object(runtime, "open_cards", open_cards)
         cards.start()
         self.addCleanup(cards.stop)
+        self.lineage = {}
+
+        async def thread_lineage(chat_id, thread_id):
+            return self.lineage
+
+        lineage = mock.patch.object(runtime, "thread_lineage", thread_lineage)
+        lineage.start()
+        self.addCleanup(lineage.stop)
 
     def _turn(self, text, before, after, outcome="success", adapter=None):
         adapter = adapter or _Stub()
@@ -424,6 +432,26 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
         _run(runtime.settle_delegated(adapter, self._sub("t_b"), "gave_up"))
         self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("x", False)])
+
+    def test_a_follow_up_filed_under_a_completed_follow_up_holds_the_settle(self):
+        # t_b, filed by t_a's worker, has completed; t_c, filed by t_b's worker,
+        # is still open. Only the lineage read still carries t_b.
+        adapter = self._turn("fix it", {}, _cards("t_a"))
+        self.lineage = {("default", "t_a"): None, ("default", "t_b"): "t_a", ("default", "t_c"): "t_b"}
+        self.boards[:] = [{**_cards("t_c", status="todo", creator="t_b"), **_cards("t_other", creator="t_x")}]
+        _run(runtime.settle_delegated(adapter, self._sub("t_a"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False)])
+        _run(runtime.settle_delegated(adapter, self._sub("t_c"), "completed"))
+        self.assertEqual(adapter.calls, [("hammer_and_wrench", False), ("white_check_mark", False)])
+
+    def test_the_lineage_walk_stops_at_its_depth_cap_and_on_a_cycle(self):
+        chain = {("default", f"t_{n}"): f"t_{n - 1}" for n in range(1, runtime.LINEAGE_DEPTH + 2)}
+        found = runtime._descendants(("default", "t_0"), chain)
+        self.assertEqual(found, {("default", f"t_{n}") for n in range(1, runtime.LINEAGE_DEPTH + 1)})
+        cycle = {("default", "t_a"): "t_b", ("default", "t_b"): "t_a"}
+        self.assertEqual(runtime._descendants(("default", "t_a"), cycle), {("default", "t_a"), ("default", "t_b")})
+        # Another board's card of the same id is not a descendant.
+        self.assertEqual(runtime._descendants(("default", "t_a"), {("b2", "t_b"): "t_a"}), set())
 
     def test_a_follow_up_blocked_on_the_user_holds_the_settle_and_pauses_it(self):
         adapter = self._turn("fix it", {}, _cards("t_a"))
@@ -766,7 +794,11 @@ class OpenCardsQueryTest(unittest.TestCase):
         good, bad = self._databases("good.db", "bad.db")
         Path(good).touch()
         Path(bad).touch()
-        hermes = self._fake_hermes({"default": good, "b2": bad}, {good: [("t_a", "running", None)]}, [], broken={"b2"})
+        paths, rows = {"default": good, "b2": bad}, {good: [("t_a", "running", None, None)], bad: []}
+        # The same boards read whole: the None below is the broken board's.
+        with mock.patch.dict(sys.modules, self._fake_hermes(paths, rows, [])):
+            self.assertEqual(_run(runtime.open_cards("C1", "111.000")), _cards("t_a"))
+        hermes = self._fake_hermes(paths, rows, [], broken={"b2"})
         with mock.patch.dict(sys.modules, hermes):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
         hermes["hermes_cli.kanban_db"].list_boards = mock.Mock(side_effect=RuntimeError("locked"))
@@ -776,6 +808,18 @@ class OpenCardsQueryTest(unittest.TestCase):
     def test_read_failure_is_none(self):
         with mock.patch.object(runtime, "_query_open_cards", side_effect=RuntimeError("locked")):
             self.assertIsNone(_run(runtime.open_cards("C1", "111.000")))
+
+    def test_lineage_reads_closed_cards_and_a_failure_is_empty(self):
+        good, = self._databases("good.db")
+        Path(good).touch()
+        reads = []
+        rows = {good: [("t_a", None), ("t_b", "t_a")]}
+        with mock.patch.dict(sys.modules, self._fake_hermes({"default": good}, rows, reads)):
+            found = _run(runtime.thread_lineage("C1", "111.000"))
+        self.assertEqual(found, {("default", "t_a"): None, ("default", "t_b"): "t_a"})
+        self.assertEqual(reads, [(good, ("slack", "C1", "111.000"))])
+        with mock.patch.object(runtime, "_query_thread_lineage", side_effect=RuntimeError("locked")):
+            self.assertEqual(_run(runtime.thread_lineage("C1", "111.000")), {})
 
 
 class MissingPresenterTest(unittest.TestCase):
