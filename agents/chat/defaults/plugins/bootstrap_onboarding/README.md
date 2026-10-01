@@ -352,7 +352,9 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
 - `../../../scripts/test_bootstrap_onboarding_scripts.py` — the delivery
   decision, the atomic claim and verbatim emit/archive, job retirement (the
   delivering run removes no job, a later run removes both with the delivery
-  job last, a fresh claim is left alone), the scan job's
+  job last, a fresh claim is left alone), the read from the sandbox (an
+  unreachable sandbox is a silent retry, an unreadable report or config fails
+  the run, a failed rename still counts as delivered), the scan job's
   file-once-then-skip behaviour across repeated ticks, the Cluster Agent
   roster the gate writes into the sweep card, and the prioritization handoff:
   that the sweep card hands ranking to a separate card rather than doing it
