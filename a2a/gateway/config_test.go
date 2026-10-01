@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -773,5 +774,20 @@ func TestFromEnvStrictEventsWriter(t *testing.T) {
 	}
 	if cfg.StrictEventsWriter {
 		t.Fatal("a near-miss value tightened the check; the safe direction is loose")
+	}
+}
+
+// TestDefaultAddresseeIsPlatform: "Sessions by default" phase 1 keeps the
+// platform agent as the default; /session is the per-conversation opt-in.
+func TestDefaultAddresseeIsPlatform(t *testing.T) {
+	setBaseEnv(t) // the file's shared FromEnv environment (NATS_URL, salt, principal map)
+	t.Setenv("A2A_DEFAULT_ADDRESSEE", "")
+	_ = os.Unsetenv("A2A_DEFAULT_ADDRESSEE")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultAddressee != "platform" {
+		t.Fatalf("DefaultAddressee = %q, want platform", cfg.DefaultAddressee)
 	}
 }
