@@ -2038,14 +2038,6 @@ RUN set -eu; \
 
 USER 10000:10000
 
-# Slack presentation (reactions by kind, settle reaction, choice-button
-# clicks, incident alerts edited into triage), off by
-# default. An install turns it on through the PlatformAgent's
-# spec.deployment.env (the chart's platformAgent.deployment.env), which the
-# container's environment takes over this default. Read by
-# agents/platform/scripts/slack_presenter.py.
-ENV KAGE_SLACK_UX=0
-
 # The build this image came from, for the `User-Agent` that remote MCP calls
 # carry. Hermes resolves `${KUBE_AGENTS_VERSION}` in an `mcp_servers` entry's
 # `args` from the agent process environment, so the value has to be on the
