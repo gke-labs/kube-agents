@@ -53,7 +53,7 @@ import (
 // the cause.
 //
 // The probe never runs on the reconcile worker. It is one
-// SelfSubjectAccessReview per (verb, resource) — 193 of them today — and the
+// SelfSubjectAccessReview per (verb, resource) — 195 of them today — and the
 // PlatformAgent controller has a single worker, so a reconcile that paid for
 // the round trips would stall every agent for their duration. The checker is
 // a manager Runnable that re-probes on its own ticker under a deadline;
@@ -134,7 +134,11 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
-	{Group: "", Resources: []string{"namespaces", "nodes", "events", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
+	{Group: "", Resources: []string{"namespaces", "nodes", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
+	// events: read with the rest, plus create and patch for the Recorder's
+	// Events on the PlatformAgent. On an install whose ClusterRole predates
+	// the recorder this is the shortfall the self-check names.
+	{Group: "", Resources: []string{"events"}, Verbs: []string{"get", "list", "watch", "create", "patch"}},
 	// resourcequotas: the mode-next session-pod bound is rendered and removed
 	// by the operator, so this one is write rather than read.
 	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},

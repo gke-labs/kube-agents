@@ -790,7 +790,10 @@ report_partial_verdict() {
 # cut-off night keeps (#1491). collect_gateway_log follows for the same reason
 # collect_bench_results runs on green: a green nightly whose repetitions ran to
 # the delegation ceiling used to leave no gateway log to say whether the worker
-# was starved by 429s or a stuck dispatcher.
+# was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
+# follows it: a pod replaced mid-run starts a fresh gateway log, and the
+# pod and event watch it stops, the previous containers and the restart
+# record are what say why.
 #
 # `set +e` is load-bearing, not tidying. errexit stays in force inside an EXIT
 # trap, so on any failing exit the `(exit "${exit_code}")` below returns
@@ -810,6 +813,7 @@ profile_and_dump_on_exit() {
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
+  collect_agent_pod_diagnostics
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -991,6 +995,9 @@ export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
 export BENCH_PARALLEL="false"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
+# From here to the EXIT trap, a replaced agent pod or restarted container is
+# on record however early it happens (collect_agent_pod_diagnostics).
+start_agent_pod_watch
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # The harness's default delegation wait (1800s) sits INSIDE the compliance
@@ -2138,11 +2145,16 @@ export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
 # Whether the suite aggregate -- admitted-case pass rate against main's, over
 # at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
-# the default, it is computed and written into the verdict but cannot block:
-# the 0.05 margin has never been measured against how much an unchanged pull
-# request moves the aggregate on main, and arming a flat margin before the
-# store can say is arming a guess. Set it to 1 in the Prow job config, not
-# here, once the store holds enough nights to size it.
+# the default, it is computed and written into the verdict but cannot block.
+# The margin (EVAL_AGGREGATE_MARGIN, default 0.10 in bench-gate) was measured
+# on 2026-09-29 against 94 green presubmit runs and four clean nightlies: no
+# unchanged pull request fell more than 0.063 below main, so 0.10 reds none
+# of them; at main's rate that night (0.924) it reds the seventh failed
+# repetition out of 36, the sixth once main sits near 0.94. Arming is a Prow-config
+# decision, not a default here: one `EVAL_AGGREGATE_ARMED=1` line in the
+# presubmit's job config in oss-test-infra flips it, and
+# docs/eval-gate-roster.md ("The whole-suite rate") carries the recipe and
+# what the author sees when it fires.
 export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
 
 # Reads infrastructure.stack out of a task file. The loop uses it to decide
@@ -2358,6 +2370,11 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # Tofu too: the plant waits for the cron job to file the sweep and for the
+    # sweep's worker to file its cards and end its run (up to the stack's
+    # run_wait, 900s), and the agent turn is a board read. 340-520s a
+    # repetition on 2026-09-28.
+    bootstrap-discovery-fanout) echo 600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2422,6 +2439,9 @@ unit_cost_hint() {
     # (710/710/735/1325s, 2026-09-23): the platform worker fans out to every
     # Cluster Agent profile in the fleet before the payments-api one reports.
     cluster-agent-delegation-profile-lookup) echo 720 ;;
+    # Two prepare/submit rounds and a close. Measured on `dev-1918-69fd3893`:
+    # 587-1512s a repetition, 937s the middle one.
+    vcs-spent-branch-reuse) echo 1000 ;;
     *) echo 200 ;;
   esac
 }

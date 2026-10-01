@@ -58,7 +58,8 @@ Active only when ``GITOPS_RUN_BRANCH`` is set; every other case is untouched.
 Env:
   GITOPS_RUN_BRANCH      per-run branch the PR must target (required to activate)
   GITOPS_REPO            https URL of the GitOps repository (required with GITOPS_RUN_BRANCH)
-  GITOPS_ARGO_APP        Application name (default ``b-0011``)
+  GITOPS_ARGO_APP        Application name (default: the run branch's last path segment,
+                         the task id in ``run/<cluster>/<task>``)
   GITOPS_ARGO_NAMESPACE  Application namespace (default ``argocd``)
   GITOPS_ARGO_CONTEXT    kube context of the task cluster (default: current)
   GITOPS_PR_TIMEOUT / GITOPS_MERGE_TIMEOUT / GITOPS_SYNC_TIMEOUT   seconds
@@ -207,7 +208,7 @@ def await_fix_cycle(
     if not repo:
         raise ValueError("GITOPS_RUN_BRANCH is set but GITOPS_REPO is not: the wait needs the repository the run branch lives in")
     slug = repo_slug(repo)
-    app = env.get("GITOPS_ARGO_APP") or DEFAULT_APP
+    app = env.get("GITOPS_ARGO_APP") or branch.rsplit("/", 1)[-1] or DEFAULT_APP
     app_ns = env.get("GITOPS_ARGO_NAMESPACE") or DEFAULT_APP_NAMESPACE
     context = env.get("GITOPS_ARGO_CONTEXT", "")
     poll = _seconds(env, "GITOPS_POLL_INTERVAL", DEFAULT_POLL_INTERVAL_S)

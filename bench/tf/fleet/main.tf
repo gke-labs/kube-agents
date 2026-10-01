@@ -142,6 +142,43 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
   member             = each.value
 }
 
+# ---------------------------------------------------------------------------
+# The pool-state scan's read on the project (#1967).
+#
+# The CI health bot's other hourly scan runs scripts/verify_ci_pool_project.py's
+# read-only checks against every pool project as the bot itself, so it needs
+# project-level read here: the project and its IAM policy, the service
+# accounts' policies, the service listing, the cluster listing, the
+# repository, the key and its policy, the state bucket's metadata. These
+# roles cover every read those checks make on the project; none writes. The
+# warm-cache repository's policy in the Prow project stays unread. They live in this
+# stack, beside the reader's token-creator grant, because this is the one
+# stack every pool project applies: a project provisioned after this landed
+# gets the grant with no separate step, and one applied before it is one
+# re-apply, or the loop in docs/ci-health.md ("The pool-state scan").
+locals {
+  # Kept equal to POOL_STATE_READER_ROLES in scripts/verify_ci_pool_project.py
+  # by scripts/test_verify_ci_pool_project.py.
+  pool_state_reader_roles = [
+    "roles/iam.securityReviewer",
+    "roles/container.clusterViewer",
+    "roles/artifactregistry.reader",
+    "roles/cloudkms.viewer",
+    "roles/storage.bucketViewer",
+  ]
+  pool_state_reader_grants = {
+    for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
+    "${pair[0]} ${pair[1]}" => { member = pair[0], role = pair[1] }
+  }
+}
+
+resource "google_project_iam_member" "pool_state_readers" {
+  for_each = local.pool_state_reader_grants
+  project  = var.project_id
+  role     = each.value.role
+  member   = each.value.member
+}
+
 # seeded-b is held one minor version behind whatever the REGULAR channel
 # currently defaults to, derived live rather than hardcoded so the pin does
 # not rot: each apply re-computes "current default minus one". The cluster

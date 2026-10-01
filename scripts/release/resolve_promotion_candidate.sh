@@ -60,7 +60,10 @@ SKIP_REASON=""
 release_fetch_tags
 
 if [ -z "${RC_TAG}" ]; then
-  RC_TAG="$(get_latest_validated_rc_tag)"
+  if ! RC_TAG="$(get_latest_validated_rc_tag)"; then
+    echo "❌ ERROR: Could not resolve the newest validated candidate on main — see above." >&2
+    exit 1
+  fi
 fi
 
 if [ -z "${RC_TAG}" ]; then

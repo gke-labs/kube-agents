@@ -59,6 +59,11 @@ spec:
               value: "true"
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
+            # OPERATOR_IMAGE is this container's own image; the A2A next-stack
+            # images (gateway, worker, auth callout) take their registry and
+            # tag from it, else from PLATFORM_AGENT_IMAGE. The manager
+            # discovers it from its pod spec only when PLATFORM_AGENT_IMAGE is
+            # unset too, so name both when you name the agent image.
             # PLATFORM_AGENT_IMAGE is the default agent image when a
             # PlatformAgent CR omits spec.deployment.image; the credential-proxy
             # image is derived from the agent image unless
@@ -66,6 +71,8 @@ spec:
             # the shell sandbox StatefulSet's image, which is not derived —
             # it is a separate repository — and is overridden per agent by
             # spec.harness.experimental.shellSandbox.image.
+            # - name: OPERATOR_IMAGE
+            #   value: "registry.example.com/kube-agents/k8s-operator:latest"
             # - name: PLATFORM_AGENT_IMAGE
             #   value: "registry.example.com/kube-agents/platform-agent:latest"
             # - name: CREDENTIAL_PROXY_IMAGE

@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -46,6 +47,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +60,12 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
+
+// PlatformAgentControllerName is the name this controller records Events
+// under (main.go hands it to the manager's recorder): the same name it
+// manages fields under, held to that by definition rather than by a second
+// copy of the string.
+const PlatformAgentControllerName = fieldOwner
 
 const (
 	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
@@ -241,8 +249,17 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
-	gitopsStateConfigMapSuffix         = "-gitops-state"
-	managedReposConfigMapKey           = "managed_repos"
+	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
+	// sync cannot read holds every tracked policy, so a repository removed
+	// from the lists keeps its write policy until the entry is fixed.
+	conditionReasonMinterPruningHeld = "MinterPruningHeld"
+	// agentRepoRefMaxLength is repo_ref.py's MAX_REPO_LENGTH: the agent
+	// refuses a managed_repos value longer than this before parsing it.
+	agentRepoRefMaxLength = 256
+	// minterHeldEntriesShown caps how many held entries the condition names.
+	minterHeldEntriesShown     = 3
+	gitopsStateConfigMapSuffix = "-gitops-state"
+	managedReposConfigMapKey   = "managed_repos"
 
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
@@ -291,6 +308,24 @@ type PlatformAgentReconciler struct {
 	// (#1009). Nil never probes, which is what tests and the golden harness
 	// supply; see rbac_selfcheck.go.
 	RBAC *RBACChecker
+
+	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
+	// is what tests and the golden harness supply (recordEvent).
+	//
+	// The line between a condition and an Event, drawn once here so the two
+	// do not drift. A condition is for a state this reconciler converges on
+	// and re-derives on every pass from what it renders and reads back
+	// (VolumesDropped, BusProvisioned, A2AGateway, BusCredentialsReady): the
+	// pass that owns it writes it, keeps it current and removes it. An Event
+	// is for a fact about the live install that something this reconciler
+	// ran discovered and no later pass can re-derive without running it
+	// again: what the provision Job found on the live TASKS stream
+	// (reportA2AProvisionFindings). VolumesDropped went to a condition when
+	// there was no recorder, and it stays one, because it is also a state the
+	// render re-derives on every pass. An Event costs create;patch on events
+	// in the ClusterRole, which the RBAC self-check names when an image runs
+	// ahead of its role.
+	Recorder record.EventRecorder
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -351,6 +386,9 @@ type PlatformAgentReconciler struct {
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
+// events create;patch: the Recorder's writes (see the field); patch is what
+// the recorder uses to bump the count on a repeat of the same Event.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // Full `resourcequotas` verbs exist for the mode-next session-pod quota (the
 // enforcement half of the session cap); everything else only reads quotas.
 // +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
@@ -417,23 +455,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			"name", instance.Name, "namespace", instance.Namespace)
 	}
 
-	// gitRepo validation restricts repository URLs to github.com. CRs stored
-	// before that change still reconcile, but subsequent updates will be rejected
-	// at admission by the validating webhook until corrected. Warn loudly so an
-	// administrator discovers un-updatable CRs immediately upon operator upgrade.
-	if instance.Spec.Integration != nil && instance.Spec.Integration.GitHub != nil {
-		github := instance.Spec.Integration.GitHub
-		var gitRepoErr error
-		if github.Org != "" {
-			gitRepoErr = agentv1alpha1.ValidateGitHubOrg(github.Org)
-		}
-		if gitRepoErr == nil && github.GitRepo != "" {
-			gitRepoErr = agentv1alpha1.ValidateGitRepoURLWithOrg(github.GitRepo, github.Org)
-		}
-		if gitRepoErr != nil {
-			log.Info("WARNING: spec.integration.github contains invalid gitRepo URL or org; "+
+	// The forge declaration is checked against its provider's rules at
+	// admission. CRs stored before a rule tightened still reconcile, but
+	// subsequent updates will be rejected by the validating webhook until
+	// corrected. Warn loudly so an administrator discovers un-updatable CRs
+	// immediately upon operator upgrade. Both spellings go through ValidateGit,
+	// the same call admission makes, so the warning cannot pass a declaration
+	// the webhook refuses. It names the refused fields, not their values: a
+	// clone URL can carry a token, and this is logged on every reconcile.
+	if instance.Spec.Integration != nil {
+		if err := instance.Spec.Integration.ValidateGit(); err != nil {
+			log.Info("WARNING: spec.integration.forges/repositories (or the deprecated spec.integration.github) is invalid; "+
 				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
-				"name", instance.Name, "namespace", instance.Namespace, "error", gitRepoErr.Error())
+				"name", instance.Name, "namespace", instance.Namespace, "fields", gitProblemFields(&instance.Spec.Integration.IntegrationSpec))
 		}
 	}
 
@@ -1100,26 +1134,35 @@ func (r *PlatformAgentReconciler) reconcileSettingsConfigMap(ctx context.Context
 }
 
 func parseManagedRepoEntries(raw string) ([]agentv1alpha1.ManagedRepoEntry, error) {
+	entries, _, err := parseManagedRepoEntriesAt(raw)
+	return entries, err
+}
+
+// parseManagedRepoEntriesAt is parseManagedRepoEntries with each entry's index
+// in the JSON array, which a blank entry it drops would otherwise shift.
+func parseManagedRepoEntriesAt(raw string) ([]agentv1alpha1.ManagedRepoEntry, []int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if !strings.HasPrefix(raw, "[") {
-		return nil, fmt.Errorf("managed_repos JSON must be an array starting with '['")
+		return nil, nil, fmt.Errorf("managed_repos JSON must be an array starting with '['")
 	}
 	var entries []agentv1alpha1.ManagedRepoEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal managed_repos JSON: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal managed_repos JSON: %w", err)
 	}
 	var res []agentv1alpha1.ManagedRepoEntry
-	for _, e := range entries {
+	var positions []int
+	for i, e := range entries {
 		u := strings.TrimSpace(e.URL)
 		t := strings.TrimSpace(e.Type)
 		if u != "" && t != "" {
 			res = append(res, agentv1alpha1.ManagedRepoEntry{Type: t, URL: u})
+			positions = append(positions, i)
 		}
 	}
-	return res, nil
+	return res, positions, nil
 }
 
 func parseManagedRepos(raw string) ([]string, error) {
@@ -1135,17 +1178,20 @@ func parseManagedRepos(raw string) ([]string, error) {
 }
 
 // reconcileGitopsStateConfigMap ensures the <agent-name>-gitops-state ConfigMap exists to track
-// managed repositories. If spec.integration.github.gitRepo is defined on the CR, it is seeded
-// into managed_repos and kept present on subsequent reconciles without removing any additional
-// repositories added to the ConfigMap.
+// the agent's repositories. The repositories declared in spec.integration.repositories (or the
+// deprecated spec.integration.github.gitRepo) are seeded into it — the GitOps and managed ones
+// into managed_repos, the context ones into context_repos — and kept present on subsequent
+// reconciles without removing any additional repositories added to the ConfigMap.
 //
 // Repository lifecycle and removal:
-// The reconciler appends any repository declared in spec.integration.github.gitRepo to managed_repos
-// if it is not already present in the ConfigMap, preserving all existing entries.
-// Repository removal/unregistration is administrator-driven via the ConfigMap: to unregister a
-// repository, remove its entry directly from managed_repos in the <agent-name>-gitops-state ConfigMap.
-// If the repository to be removed was declared in spec.integration.github.gitRepo on the CR, clear or
-// update gitRepo on the CR as well so the reconciler does not re-append it on subsequent passes.
+// The reconciler adds each declared repository to its list if it is not already present in
+// the ConfigMap, preserving all existing entries. A missing GitOps repository goes to the front
+// of managed_repos, because agent-side consumers read the first entry as the GitOps repository;
+// the rest are appended. An entry already present is never moved. Repository removal/unregistration is
+// administrator-driven via the ConfigMap: to unregister a repository, remove its entry directly
+// from the list in the <agent-name>-gitops-state ConfigMap. If the repository to be removed is
+// declared on the CR, remove it there as well so the reconciler does not re-append it on
+// subsequent passes.
 func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	logger := logf.FromContext(ctx)
 	cm := buildGitopsStateConfigMap(agent)
@@ -1166,56 +1212,189 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 		return err
 	}
 
-	// If the CR spec provides a repository and the existing ConfigMap does not include it,
-	// ensure the repository is recorded without overwriting other dynamically added repositories.
-	if cmRepo, ok := cm.Data["managed_repos"]; ok && cmRepo != "" {
+	// For each list the CR seeds, ensure its repositories are recorded without
+	// overwriting other dynamically added repositories. A list that cannot be
+	// parsed, on either side, is left as it is: the ConfigMap is
+	// administrator-writable, and rewriting a value the operator does not
+	// understand would lose it.
+	updated := false
+	gitops := seededGitOpsEntry(agent)
+	for _, key := range []string{gitopsStateManagedReposKey, gitopsStateContextReposKey} {
+		seeded := cm.Data[key]
+		if seeded == "" {
+			continue
+		}
 		if found.Data == nil {
 			found.Data = map[string]string{}
 		}
-		existing := strings.TrimSpace(found.Data["managed_repos"])
+		existing := strings.TrimSpace(found.Data[key])
 		if existing == "" {
-			found.Data["managed_repos"] = cmRepo
-			if err := r.Update(ctx, found); err != nil {
-				return err
-			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, cmRepo, found.Data[gitopsStateContextReposKey])
+			found.Data[key] = seeded
+			updated = true
+			continue
 		}
-		specEntries, err := parseManagedRepoEntries(cmRepo)
+		specEntries, err := parseManagedRepoEntries(seeded)
 		if err != nil {
-			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON", "list", key)
+			continue
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
-			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+			logger.Error(err, "skipping gitops state reconcile due to unparseable existing list in ConfigMap",
+				"configMap", found.Name, "list", key)
+			continue
 		}
-		updated := false
+		// A GitOps repository the list lacks goes first rather than last. The
+		// entries carry no role, and the agent's token refresh mints for the
+		// first managed entry when no repository is named, so appending would
+		// leave whichever repository was first before -- the previous GitOps
+		// repository, typically -- the one the token is scoped to. An entry
+		// already in the list is never moved.
+		var front, missing []agentv1alpha1.ManagedRepoEntry
 		for _, se := range specEntries {
 			present := false
 			for _, ee := range existingEntries {
-				if ee.URL == se.URL {
+				if sameManagedRepo(ee, se) {
 					present = true
 					break
 				}
 			}
 			if !present {
+				if key == gitopsStateManagedReposKey && gitops != nil && sameManagedRepo(se, *gitops) {
+					front = append(front, se)
+				} else {
+					missing = append(missing, se)
+				}
 				existingEntries = append(existingEntries, se)
-				updated = true
 			}
 		}
-		if updated {
-			if jsonBytes, err := json.Marshal(existingEntries); err == nil {
-				found.Data["managed_repos"] = string(jsonBytes)
+		if len(front)+len(missing) > 0 {
+			merged, err := mergeRepoEntries(existing, front, missing)
+			if err != nil {
+				logger.Error(err, "skipping gitops state reconcile; could not append to the list", "list", key)
+				continue
 			}
-			if err := r.Update(ctx, found); err != nil {
-				return err
-			}
-			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+			found.Data[key] = merged
+			updated = true
+		}
+	}
+	if updated {
+		if err := r.Update(ctx, found); err != nil {
+			return err
 		}
 	}
 
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+}
+
+// mergeRepoEntries puts front before a repository list's JSON and back after
+// it, keeping every existing element's content as written; encoding/json only
+// compacts its whitespace. Round-tripping the list through ManagedRepoEntry
+// would drop what that type does not model — a context_repos entry's `ref`,
+// or any field an administrator or a later agent version adds — and the
+// entries parseManagedRepoEntries skips as incomplete.
+func mergeRepoEntries(existing string, front, back []agentv1alpha1.ManagedRepoEntry) (string, error) {
+	var raw []json.RawMessage
+	if err := json.Unmarshal([]byte(existing), &raw); err != nil {
+		return "", err
+	}
+	encode := func(entries []agentv1alpha1.ManagedRepoEntry) ([]json.RawMessage, error) {
+		var out []json.RawMessage
+		for _, e := range entries {
+			b, err := json.Marshal(e)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, b)
+		}
+		return out, nil
+	}
+	head, err := encode(front)
+	if err != nil {
+		return "", err
+	}
+	tail, err := encode(back)
+	if err != nil {
+		return "", err
+	}
+	raw = append(append(head, raw...), tail...)
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// sameManagedRepo reports whether two managed_repos URLs name one repository.
+//
+// A string comparison is not enough across an upgrade. An entry written by
+// hand, or by an older operator, can spell the repository the operator now
+// seeds canonically as "https://github.com/o/r" with a ".git" suffix or as a
+// remote. Comparing the strings would append a second entry for the same
+// repository: the agent would sweep it twice, and the old spelling would
+// stay, since removal is administrator-driven by design. An entry in another
+// case is another spelling to the agent, which compares managed slugs exactly,
+// so it is seeded beside it, as a string comparison always did.
+//
+// Only an entry the agent reads counts as present, since treating one it
+// skips as the seeded repository would leave the agent with none. The agent
+// matches the type exactly, so "GitHub" is not "github", and it reads a GitHub
+// entry only on github.com or as the bare owner/name shorthand, so
+// "https://www.github.com/o/r" and a schemeless "www.github.com/o/r" are
+// skipped. An unregistered type, and values the provider cannot resolve, are
+// not treated as equal either: this ConfigMap is administrator-writable, so a
+// value the operator does not understand is one it must leave alone.
+func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
+	if existing.Type != seeded.Type {
+		return false
+	}
+	if existing.URL == seeded.URL {
+		return true
+	}
+	// repo_ref.py reads a host after a remote's first `@` where git and this
+	// parser read it after the last, so the agent skips an entry with two.
+	if strings.Count(existing.URL, "@") > 1 {
+		return false
+	}
+	// The agent refuses a value over its bound before it reads the syntax;
+	// this parser's bound is MaxGitRepoURLLength, so userinfo can push an
+	// entry past the agent's and still resolve here.
+	if utf8.RuneCountInString(strings.TrimSpace(existing.URL)) > agentRepoRefMaxLength {
+		return false
+	}
+	provider, err := agentv1alpha1.LookupGitProvider(seeded.Type)
+	if err != nil {
+		return false
+	}
+	// The provider lifts every spelling of its host out of a schemeless path,
+	// dropping a `user@` before it; the agent lifts only the canonical one,
+	// and only bare, so `git@github.com/o/r` (an scp remote with its colon
+	// mistyped) is one it skips, like any other host.
+	if url := strings.TrimLeft(strings.TrimSpace(existing.URL), "/"); !strings.Contains(url, "://") {
+		if first, _, _ := strings.Cut(url, "/"); strings.Contains(first, "@") && !strings.Contains(first, ":") {
+			return false
+		}
+	}
+	parsed, err := provider.ParseRepoRef(existing.URL)
+	if err != nil {
+		return false
+	}
+	if parsed.Host != "" && parsed.Host != provider.DefaultHost {
+		return false
+	}
+	existingRef, err := provider.Resolve("", existing.URL, "")
+	if err != nil {
+		return false
+	}
+	seededRef, err := provider.Resolve("", seeded.URL, "")
+	if err != nil {
+		return false
+	}
+	// The path compares exactly. GitHub folds case, but the agent's readers of
+	// managed_repos do not: the `--repo` allowlists and the token scope match
+	// the spelling, so an entry in another case is not the declared one to
+	// them, and counting it present would refuse `--repo` spelt as declared.
+	return existingRef.Host == seededRef.Host && existingRef.Path == seededRef.Path
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {
@@ -1316,26 +1495,39 @@ func renderReadOnlyPolicy(baseTemplate string, repos []string) (string, bool) {
 // always has. listName is for the log lines only. A list that is not JSON is
 // an error, never an empty result: the caller skips the whole sync on it,
 // because an empty result would read as "no repositories" and prune every
-// policy the operator tracks.
-func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) ([]string, error) {
+// policy the operator tracks. An entry that does not resolve is returned in
+// unreadable, so the caller can tell a repository that left the list from one
+// it could not read. It is named by list and index, as "managed_repos[2]",
+// never by value: a hand-written clone URL can carry a credential, and the
+// names reach the operator's log and the CR's status. The parser's errors
+// quote the value too, so they are not logged either.
+func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) (bare, unreadable []string, err error) {
 	reposStr = strings.TrimSpace(reposStr)
 	if reposStr == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	repos, err := parseManagedRepos(reposStr)
+	entries, positions, err := parseManagedRepoEntriesAt(reposStr)
 	if err != nil {
-		return nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
+		return nil, nil, fmt.Errorf("unparseable %s in ConfigMap: %w", listName, err)
 	}
-	seen := make(map[string]struct{}, len(repos))
-	var bare []string
-	for _, fullRepo := range repos {
-		fullRepo = strings.TrimSpace(fullRepo)
-		if fullRepo == "" {
+	seen := make(map[string]struct{}, len(entries))
+	for i, entry := range entries {
+		// Another forge's entry is not the minter's: it never had a policy, and
+		// the agent skips it by type too. Read as a GitHub URL it would be
+		// unreadable, and hold every tracked policy for as long as it is listed.
+		if entry.Type != agentv1alpha1.GitProviderGitHub {
+			logger.V(1).Info("skipping a non-GitHub repository entry in minter policy sync", "list", listName, "index", positions[i], "type", entry.Type)
 			continue
 		}
+		fullRepo := entry.URL
 		slug, err := agentv1alpha1.CleanRepoSlugWithOrg(fullRepo, primaryOrg)
+		if agentSpelling, ok := agentURLSpelling(fullRepo); err != nil && ok {
+			slug, err = agentv1alpha1.CleanRepoSlugWithOrg(agentSpelling, primaryOrg)
+		}
 		if err != nil {
-			logger.V(1).Info("skipping invalid repo in minter policy sync", "list", listName, "repo", fullRepo, "error", err)
+			entryName := fmt.Sprintf("%s[%d]", listName, positions[i])
+			logger.Info("skipping a repository entry the minter policy sync cannot read", "entry", entryName)
+			unreadable = append(unreadable, entryName)
 			continue
 		}
 		parts := strings.SplitN(slug, "/", 2)
@@ -1345,7 +1537,7 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		repoOrg, bareRepo := parts[0], parts[1]
 		if primaryOrg != "" && !strings.EqualFold(repoOrg, primaryOrg) {
 			logger.Info("skipping cross-org repository in minter policy sync; minter is scoped to primary org",
-				"list", listName, "repo", fullRepo, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
+				"list", listName, "repo", slug, "repoOrg", repoOrg, "primaryOrg", primaryOrg)
 			continue
 		}
 		if bareRepo+minterPolicyKeySuffix == minterBaseTemplateKey {
@@ -1354,7 +1546,7 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 			// from, and a read-only rendering there strips the write scope from
 			// every managed repository.
 			logger.Info("skipping repository whose minter policy key would be the base template",
-				"list", listName, "repo", fullRepo, "key", minterBaseTemplateKey)
+				"list", listName, "repo", slug, "key", minterBaseTemplateKey)
 			continue
 		}
 		if _, exists := seen[bareRepo]; exists {
@@ -1364,11 +1556,129 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 		bare = append(bare, bareRepo)
 	}
 	sort.Strings(bare)
-	return bare, nil
+	return bare, unreadable, nil
+}
+
+// agentURLSchemeRegex is the scheme urlsplit recognises before `://`.
+var agentURLSchemeRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+
+// agentURLSpelling reads a URL as the agent does, and returns it as the
+// `https://host/path` that names the same repository, for the parser to read
+// or refuse. The agent takes any URL through urlsplit, whose scheme is not
+// allowlisted (`git+ssh://`, `file://github.com/...`), whose hostname is the
+// text after the last `@` and before the first colon, never validating a port,
+// and whose path ends at a query or fragment; tabs and line breaks anywhere in
+// the value are deleted before any of that. This parser refuses all of
+// those, but the agent uses such an entry, so the minter must count it rather
+// than hold every policy for an entry that is not broken. What the agent
+// refuses stays refused: a value over its length bound, an empty host, and a
+// path that is one segment once the port slot is gone
+// (`https://github.com:owner/repo`).
+func agentURLSpelling(value string) (string, bool) {
+	// The bound is checked as the agent does, in code points and before
+	// urlsplit deletes every tab, carriage return and newline in the value.
+	text := strings.TrimSpace(value)
+	if utf8.RuneCountInString(text) > agentRepoRefMaxLength {
+		return "", false
+	}
+	text = strings.NewReplacer("\t", "", "\r", "", "\n", "").Replace(text)
+	scheme, rest, ok := strings.Cut(text, "://")
+	if !ok || !agentURLSchemeRegex.MatchString(scheme) {
+		return "", false
+	}
+	if cut := strings.IndexAny(rest, "?#"); cut != -1 {
+		rest = rest[:cut]
+	}
+	authority, path, _ := strings.Cut(rest, "/")
+	// urlsplit refuses a bracket without its pair anywhere in the netloc.
+	if strings.Contains(authority, "[") != strings.Contains(authority, "]") {
+		return "", false
+	}
+	if at := strings.LastIndex(authority, "@"); at != -1 {
+		// With any bracket in the userinfo, urlsplit requires the host to be
+		// an address literal, so it refuses every GitHub spelling.
+		if strings.ContainsAny(authority[:at], "[]") {
+			return "", false
+		}
+		authority = authority[at+1:]
+	}
+	if strings.HasPrefix(authority, "[") {
+		return "", false
+	}
+	host, _, _ := strings.Cut(authority, ":")
+	if host == "" {
+		return "", false
+	}
+	return "https://" + host + "/" + path, true
+}
+
+// minterPrimaryOrg is the organisation the minter policies are scoped to, or,
+// in skip, why the sync must leave them as they were.
+func minterPrimaryOrg(agent *agentv1alpha1.PlatformAgent) (primaryOrg, skip string) {
+	if agent.Spec.Integration == nil {
+		return "", ""
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		// Both spellings set. Nothing can say which forge the organisation
+		// is read from, and an empty primaryOrg would accept every
+		// organisation, so leave the policies as they were. The reconcile
+		// status already reports the declaration.
+		return "", "git integration does not resolve: " + err.Error()
+	}
+	// An empty primaryOrg accepts every organisation, and a primary
+	// organisation chosen from what validation left standing can be
+	// another forge's or another repository's. Where validation refused
+	// something the organisation is read from, syncing would widen or
+	// move the policies rather than leave them as they were. Skip the
+	// sync until the declaration is fixed; the reconcile status already
+	// reports it.
+	if resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
+		return "", "validation refuses something the github organisation is read from"
+	}
+	return resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub), ""
+}
+
+// minterHeldEntries returns the GitHub repository entries that stop
+// syncGithubTokenMinterConfigMap from pruning, for the Degraded condition: a
+// revocation that silently does not happen is what a condition reports. It is
+// nil where the sync would not run, or would have nothing to prune: no minter
+// ConfigMap, no base template, or no policy the operator tracks.
+func (r *PlatformAgentReconciler) minterHeldEntries(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) []string {
+	minterCM := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, minterCM); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(minterCM.Data[minterBaseTemplateKey]) == "" ||
+		len(parseManagedKeysAnnotation(minterCM.Annotations[AnnotationManagedMinterKeys])) == 0 {
+		return nil
+	}
+	primaryOrg, skip := minterPrimaryOrg(agent)
+	if skip != "" {
+		return nil
+	}
+	_, managed, errManaged := minterBareRepos(logr.Discard(), managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	_, contextHeld, errContext := minterBareRepos(logr.Discard(), contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	if errManaged != nil || errContext != nil {
+		return nil
+	}
+	return slices.Concat(managed, contextHeld)
+}
+
+// minterHeldMessage names at most minterHeldEntriesShown held entries, by the
+// list-and-index names minterBareRepos gives them: the values are
+// administrator-written URLs that can carry a credential, and the Degraded
+// message is readable by anyone who can read the PlatformAgent.
+func minterHeldMessage(cmName string, held []string) string {
+	shown := strings.Join(held[:min(len(held), minterHeldEntriesShown)], hostPathDroppedEntrySeparator)
+	if extra := len(held) - minterHeldEntriesShown; extra > 0 {
+		shown += fmt.Sprintf(" and %d more", extra)
+	}
+	return fmt.Sprintf("GitHub repository entries in ConfigMap %s cannot be read (%s); no minter policy is pruned, so a repository removed from the lists keeps its write policy, until they are corrected or removed", cmName, shown)
 }
 
 // syncGithubTokenMinterConfigMap ensures that for every repository in managed_repos that belongs
-// to the primary GitHub organization (spec.integration.github.org), a corresponding <repo>.yaml
+// to the primary GitHub organization (minterPrimaryOrg, from the declaration), a corresponding <repo>.yaml
 // entry exists in github-token-minter-config ConfigMap, and that every same-organization
 // repository in context_repos has a <repo>.yaml carrying the read-only scope alone.
 // Repositories belonging to a different organization are skipped because the minter instance is
@@ -1386,8 +1696,9 @@ func minterBareRepos(logger logr.Logger, reposStr, primaryOrg, listName string) 
 // adopting pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active
 // repositories is unsupported: custom edits will be overwritten with policy rendered from
 // default.yaml on reconcile, and the key will be pruned when the repository is unregistered from
-// both lists. Keys for repositories present in neither list (and default.yaml itself) are never
-// claimed or pruned.
+// both lists — unless a GitHub entry in either list cannot be read, which holds all pruning
+// (Degraded/MinterPruningHeld) until it is fixed. Keys for repositories present in neither list
+// (and default.yaml itself) are never claimed or pruned.
 func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr, contextReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}
@@ -1423,34 +1734,27 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		return nil
 	}
 
-	primaryOrg := ""
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		github := agent.Spec.Integration.GitHub
-		primaryOrg = strings.TrimSpace(github.Org)
-		if primaryOrg == "" && github.GitRepo != "" {
-			if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
-				parts := strings.SplitN(cleaned, "/", 2)
-				if len(parts) == 2 {
-					primaryOrg = parts[0]
-				}
-			}
-		}
+	primaryOrg, skip := minterPrimaryOrg(agent)
+	if skip != "" {
+		logger.Info("skipping minter policy sync: " + skip)
+		return nil
 	}
 
 	// Both lists are parsed before anything is computed from either: an
 	// unparseable one skips the sync and leaves the ConfigMap as it is, as the
 	// managed-only sync always did. Treating it as empty would prune every
 	// tracked policy and break every write until the JSON was repaired.
-	allBareRepos, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
+	allBareRepos, unreadableManaged, err := minterBareRepos(logger, managedReposStr, primaryOrg, gitopsStateManagedReposKey)
 	if err != nil {
 		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateManagedReposKey)
 		return nil
 	}
-	contextCandidates, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
+	contextCandidates, unreadableContext, err := minterBareRepos(logger, contextReposStr, primaryOrg, gitopsStateContextReposKey)
 	if err != nil {
 		logger.Error(err, "skipping minter policy sync due to unparseable repository list in ConfigMap", "list", gitopsStateContextReposKey)
 		return nil
 	}
+	unreadable := slices.Concat(unreadableManaged, unreadableContext)
 	// Managed wins: a repository registered in both lists is written to, so its
 	// policy is the write one, and it is left out of the read-only list too.
 	var contextBareRepos []string
@@ -1496,15 +1800,22 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 		}
 	}
 
-	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active
-	for key := range operatorManagedKeys {
-		if key == minterBaseTemplateKey {
-			continue
-		}
-		if _, active := expected[key]; !active {
-			delete(minterCM.Data, key)
-			delete(operatorManagedKeys, key)
-			updated = true
+	// Prune policy entries ONLY for repositories that were previously managed by the operator but are no longer active.
+	// An entry this release cannot read may be the repository a tracked policy is for -- a spelling
+	// an earlier release accepted, hand-added to the ConfigMap -- and nothing says which. Pruning
+	// then would revoke a policy that was working, so the sync only adds until every entry reads.
+	if len(unreadable) > 0 {
+		logger.Info("keeping every tracked minter policy: some repository entries cannot be read", "entries", unreadable)
+	} else {
+		for key := range operatorManagedKeys {
+			if key == minterBaseTemplateKey {
+				continue
+			}
+			if _, active := expected[key]; !active {
+				delete(minterCM.Data, key)
+				delete(operatorManagedKeys, key)
+				updated = true
+			}
 		}
 	}
 
@@ -1534,6 +1845,11 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
 	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
+	held, err := r.heldGitHubOrg(ctx, agent)
+	if err != nil {
+		return err
+	}
+	opts.heldGitHubOrg = held
 
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
@@ -1567,6 +1883,55 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return err
 	}
 	return r.applyManaged(ctx, agent, dep)
+}
+
+// heldGitHubOrg returns the GITHUB_ORG the live gateway carries, read only
+// while the declaration cannot name the organisation: it does not resolve, or
+// validation refuses something the organisation is read from. The minter sync
+// leaves its policies as they were in that state, and the pod does the same.
+// Rendering the variable unset would roll the gateway and switch off the
+// agent's cross-organisation guard for as long as the refusal lasts, on an
+// upgrade from a release that accepted the spelling now refused.
+//
+// The hold lasts only as long as each pass re-reads it, so a read that fails
+// is returned and the pass retried: rendering the variable unset would apply
+// the loss, and every later pass would read it back. The workload kind the CR
+// selects is read first, then the other one, because a storage switch renders
+// the new kind while the old one still carries the value. Neither existing
+// holds nothing, as on a first install.
+func (r *PlatformAgentReconciler) heldGitHubOrg(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+	if agent.Spec.Integration == nil || r.Client == nil {
+		return "", nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err == nil && !resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
+		return "", nil
+	}
+	kinds := []client.Object{&appsv1.Deployment{}, &appsv1.StatefulSet{}}
+	if useStatefulSet(agent) {
+		kinds[0], kinds[1] = kinds[1], kinds[0]
+	}
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
+	for _, live := range kinds {
+		if err := r.Get(ctx, key, live); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return "", fmt.Errorf("reading the live gateway's GITHUB_ORG to hold it while the git declaration is refused: %w", err)
+		}
+		for _, container := range podTemplateOf(live).Spec.Containers {
+			if container.Name != appNamePlatformAgent {
+				continue
+			}
+			for _, env := range container.Env {
+				if env.Name == "GITHUB_ORG" && env.ValueFrom == nil {
+					return env.Value, nil
+				}
+			}
+		}
+		return "", nil
+	}
+	return "", nil
 }
 
 // deleteLegacyCredentialIsolationResources removes the workload objects left
@@ -2957,15 +3322,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	gitRepoErr := error(nil)
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		if err := agentv1alpha1.ValidateGitHubOrg(agent.Spec.Integration.GitHub.Org); err != nil {
-			gitRepoErr = err
-		} else if err := agentv1alpha1.ValidateGitRepoURLWithOrg(agent.Spec.Integration.GitHub.GitRepo, agent.Spec.Integration.GitHub.Org); err != nil {
-			gitRepoErr = err
-		}
+	if agent.Spec.Integration != nil {
+		gitRepoErr = agent.Spec.Integration.ValidateGit()
 	}
 
 	managedReposErr := error(nil)
+	var minterHeld []string
 	if gitRepoErr == nil {
 		cmName := agent.Name + gitopsStateConfigMapSuffix
 		cm := &corev1.ConfigMap{}
@@ -2975,17 +3337,42 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 					managedReposErr = err
 				}
 			}
+			if managedReposErr == nil {
+				minterHeld = r.minterHeldEntries(ctx, agent, cm.Data[gitopsStateManagedReposKey], cm.Data[gitopsStateContextReposKey])
+			}
 		}
 	}
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
+	// The Degraded message is the Ready one unless a branch says otherwise.
+	degradedMsg := ""
 	if gitRepoErr != nil {
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
+		// The reason string stays InvalidGitRepoURL: it is on the status of
+		// running resources and in tests, and renaming it would be a second,
+		// unrelated break. The message names the declaration rather than the
+		// two fields only the deprecated alias has.
 		condReason = conditionReasonInvalidGitRepoURL
 		degradedReason = conditionReasonInvalidGitRepoURL
-		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
+		// Not "GitOps disabled": with the lists, every entry validation
+		// accepts is still seeded, the gitops repository included. Two kinds
+		// of withheld entry are not in the problem list, so the message names
+		// them: the repositories on a refused forge, and the managed ones
+		// while the gitops repository is refused.
+		withheld := ""
+		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
+			if n := len(resolved.OnRefusedForge()); n == 1 {
+				withheld += ", nor is the repository on a refused forge"
+			} else if n > 1 {
+				withheld += fmt.Sprintf(", nor are the %d repositories on a refused forge", n)
+			}
+			if gitopsRefusalWithholdsManaged(resolved) {
+				withheld += ", and no managed repository is seeded while the gitops repository is refused, since the agent reads the first managed_repos entry as its GitOps repository"
+			}
+		}
+		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded%s. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr), withheld)
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"
@@ -2994,6 +3381,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedReason = conditionReasonCorruptManagedRepos
 		condMsg = fmt.Sprintf("Corrupt %s in ConfigMap %s%s (%s); GitOps disabled", managedReposConfigMapKey, agent.Name, gitopsStateConfigMapSuffix, managedReposErr.Error())
 		degradedStatus = metav1.ConditionTrue
+	} else if len(minterHeld) > 0 {
+		// Degraded only: the agent runs and every readable repository still
+		// gets its policy, so Ready and the phase keep what the workload says.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonMinterPruningHeld
+		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	}
+	if degradedMsg == "" {
+		degradedMsg = condMsg
 	}
 
 	// Cluster event ingestion, reported only while it is switched off. A
@@ -3046,7 +3442,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	rbacDegradedPreserved := degradedStatus == metav1.ConditionFalse && existingDegradedCond != nil &&
 		existingDegradedCond.Reason == reasonRBACIncomplete
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
-		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == condMsg)
+		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == degradedMsg)
 
 	// From the spec alone, so it is resolved here rather than passed in like the
 	// telemetry and policy results, which take a discovery to produce.
@@ -3121,7 +3517,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			Type:               "Degraded",
 			Status:             metav1.ConditionTrue,
 			Reason:             degradedReason,
-			Message:            condMsg,
+			Message:            degradedMsg,
 			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		}
@@ -3357,6 +3753,37 @@ func hostPathDroppedEntryList(entries []string) string {
 		fmt.Fprintf(&b, hostPathDroppedOverflowFormat, rest)
 	}
 	return b.String()
+}
+
+// gitProblemList lists ValidateGit's problems under the same budget as the
+// dropped hostPath entries. There is one problem per refused list entry, and
+// each can quote an author-chosen repository of up to 2048 characters, so the
+// joined error is just as able to fail the whole status write.
+func gitProblemList(err error) string {
+	problems := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		problems = joined.Unwrap()
+	}
+	entries := make([]string, 0, len(problems))
+	for _, p := range problems {
+		entries = append(entries, p.Error())
+	}
+	return hostPathDroppedEntryList(entries)
+}
+
+// gitProblemFields names the fields ValidateGit refuses, within the status
+// message budget, and never their values. A declaration the operator cannot
+// resolve at all is named by that error, which quotes nothing.
+func gitProblemFields(in *agentv1alpha1.IntegrationSpec) string {
+	resolved, err := in.ResolveGit()
+	if err != nil {
+		return err.Error()
+	}
+	var fields []string
+	for _, p := range resolved.Problems() {
+		fields = append(fields, "integration."+p.Path.String())
+	}
+	return hostPathDroppedEntryList(fields)
 }
 
 // truncateToValidUTF8 cuts s to at most max bytes, dropping any rune the cut
@@ -3715,6 +4142,17 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	}
 	return r.Status().Update(ctx, agent)
+}
+
+// recordEvent writes an Event on obj through the manager's recorder, and
+// nothing when there is none: tests and the golden harness build the
+// reconciler without one, and no pass depends on an Event having been
+// written.
+func (r *PlatformAgentReconciler) recordEvent(obj runtime.Object, eventType, reason, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Event(obj, eventType, reason, message)
 }
 
 // SetupWithManager sets up the controller with the Manager.

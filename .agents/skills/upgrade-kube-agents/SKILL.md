@@ -47,8 +47,8 @@ that is not the release being asked for is refused by name.
 
 ## Upgrade Modes
 
-- `--upgrade-mode=harness`: one `helm upgrade --reset-then-reuse-values` re-tagging the Platform Agent image (`platformAgent.deployment.image.tag`), the shell sandbox image (`agentSandbox.image.tag`) and every plugin image tag the release's values record (`plugins.pubsubPlatform.image.tag`, `plugins.stockoutInvestigator.image.tag`), followed by a read-back of the gateway Deployment's release images against the tag. Requires `jq`.
-- `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then `helm upgrade --reset-then-reuse-values` re-tagging only the operator image.
+- `--upgrade-mode=harness`: one `helm upgrade --reset-values` over the release's recorded values re-tagging the Platform Agent image (`platformAgent.deployment.image.tag`), the shell sandbox image (`agentSandbox.image.tag`) and every plugin image tag the release's values record (`plugins.pubsubPlatform.image.tag`, `plugins.stockoutInvestigator.image.tag`), followed by a read-back of the gateway Deployment's release images against the tag. Requires `jq`.
+- `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then the same `helm upgrade` re-tagging only the operator image. Both modes stop before any of the new release is applied, naming each recorded key the chart's `values.schema.json` refuses as undeclared; on an upgrade that is a renamed or removed setting, so use `--upgrade-mode=full`. `--drop-undeclared-values` drops and names those keys instead, for a rollback to a release that predates them; a later release that declares a dropped key renders it from that chart's default until a full-mode run there.
 - `--upgrade-mode=full` (Default): applies the CRDs, then runs a full `terraform apply` at the new `--image-tag` through the install engine — both image tags move and every setting in `install.env` is re-rendered. This mode additionally requires the `terraform` CLI.
 
 Every mode requires the `kube-agents` Helm release to exist in the target namespace. An install
@@ -92,7 +92,12 @@ the same revision. A copy of the script carrying no baked version — one built 
 default, and there the flag is the only way to name a revision.
 
 Two flags change what the run targets, and both read differently depending on whether the copy of
-the script carries a baked version. A release copy's version is in place before any flag is parsed:
+the script carries a baked version. A release copy's version is in place before any flag is parsed,
+with one exception: `upgrade.sh` in a checkout of a release line (`release/<X.Y>`) that has moved
+past its latest release, with that release's tag and full history fetched, carries the release's
+version but is not the release, so run from there it drops the baked default, says which line and commit it is on, and
+behaves as a copy with no baked version below (asks for `--image-tag`, accepts `--keep-image-tag`,
+plans at the installed tag):
 
 - `--plan` reports what a full upgrade would change against the install's real Terraform state, and
   changes nothing. Exit 0 means in sync, 2 means there are changes, 1 means the plan failed. This is

@@ -147,7 +147,9 @@ in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. Se
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
-every caller with a `TokenReview` over an audience-bound projected token, and
+every caller of its credentialed listener with a `TokenReview` over an audience-bound
+projected token (the metrics-only listener, [Architecture](#architecture), serves counters
+and authenticates nobody), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds
@@ -204,7 +206,16 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. Envoy authenticates
+caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
+listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+set by the operator): it serves Prometheus counters whose label values are
+static enums and closed vocabularies, holds no route, credential or policy,
+answers at most sixteen connections at a time and cuts each off ten seconds
+after it opened whatever the peer sends (the credentialed handler shares the
+process, so a peer that reaches the port cannot spend its threads), and is
+the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
+namespace, where the managed-Prometheus collector runs, and to no other peer.
+Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
 pod, `kubeagents-credential-proxy` for the sandbox and
@@ -844,8 +855,9 @@ Consequences:
   within 60 seconds of admission. Envoy's stream idle timeout in front of the
   runtime is twenty minutes: the broker writes nothing to a stream until the
   request is answered, so the silent worst case is that deadline plus the
-  slot wait, the kill grace and the drain, a little over six minutes at the
-  defaults, and a silent request that reaches its deadline is still answered
+  slot wait, the kill grace and its settle after `SIGKILL`, and the drain, a
+  little over six minutes at the defaults, and a silent request that reaches
+  its deadline is still answered
   with its partial output and the timed-out notice rather than reset by Envoy
   first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` keeps the
   Envoy timeout above it plus the minute.

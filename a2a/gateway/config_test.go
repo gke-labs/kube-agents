@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hkdf"
 	"crypto/sha256"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -21,10 +22,13 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
 	t.Setenv("SESSION_KV_SALT", "")
 	t.Setenv("A2A_ATTRIBUTION_SALT", "")
 	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
 	t.Setenv("A2A_ASK_TTL", "")
+	t.Setenv("A2A_SESSION_TTL", "")
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
@@ -295,6 +299,163 @@ func TestFromEnvAskTTL(t *testing.T) {
 	}
 }
 
+// TestFromEnvBackendSelection: exactly one chat backend per gateway
+// process — two gateways bound to one relay durable split event deliveries
+// (Options.RelayDurable), so a second backend is a second Deployment, and
+// zero backends is a gateway with no front door. Socket Mode needs both
+// Slack tokens, so half a pair refuses too.
+func TestFromEnvBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "discord" {
+		t.Fatalf("Backend() = %q, want discord", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "slack" {
+		t.Fatalf("Backend() = %q, want slack", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "x")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("two backends accepted; one relay durable means one backend per gateway")
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("no backend accepted")
+	}
+
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("half a Slack token pair accepted; Socket Mode needs both")
+	}
+}
+
+// TestFromEnvSessionTTL: the bound on idle session records in session-state —
+// absent means 7 days (well past TASKS 72h retention), and a sub-72h
+// value or invalid format refuses at boot.
+func TestFromEnvSessionTTL(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionTTL != 7*24*time.Hour {
+		t.Fatalf("default SessionTTL = %v, want 168h", cfg.SessionTTL)
+	}
+
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionTTL != 96*time.Hour {
+		t.Fatalf("SessionTTL = %v, want 96h", cfg.SessionTTL)
+	}
+
+	for _, bad := range []string{"71h", "48h", "30m", "junk"} {
+		t.Setenv("A2A_SESSION_TTL", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_SESSION_TTL=%q accepted", bad)
+		}
+	}
+
+	// Refusal when SessionTTL <= TaskDeadline
+	t.Setenv("A2A_SESSION_TTL", "96h")
+	t.Setenv("A2A_TASK_DEADLINE_SECONDS", fmt.Sprintf("%d", int((100*time.Hour).Seconds())))
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("expected refusal when SessionTTL <= TaskDeadline, got nil")
+	}
+}
+// pairs are exactly what a hand-enumerated switch leaves a hole in — the
+// two-backend switch this merged from only knew about one pair, and a fourth
+// backend must not be addable with a combination nobody checked. Exactly one
+// real backend armed is the only accepted shape; zero, any pair, all three,
+// and any half Slack pair all refuse. The door is the other axis: it is not
+// a backend, so it must sit beside any ONE of the three without displacing
+// it, count as an ingress on its own, and change none of the refusals.
+func TestFromEnvBackendCombinations(t *testing.T) {
+	const (
+		discord = "x"
+		bot     = "xoxb-1"
+		app     = "xapp-1"
+		relay   = "http://relay.ns.svc:8081"
+		door    = ":8099"
+	)
+	for _, d := range []string{"", discord} {
+		for _, b := range []string{"", bot} {
+			for _, a := range []string{"", app} {
+				for _, g := range []string{"", relay} {
+					for _, i := range []string{"", door} {
+						name := fmt.Sprintf("discord=%t/bot=%t/app=%t/gchat=%t/door=%t", d != "", b != "", a != "", g != "", i != "")
+						t.Run(name, func(t *testing.T) {
+							setBaseEnv(t)
+							t.Setenv("DISCORD_TOKEN", d)
+							t.Setenv("SLACK_BOT_TOKEN", b)
+							t.Setenv("SLACK_APP_TOKEN", a)
+							t.Setenv("A2A_GCHAT_RELAY_URL", g)
+							t.Setenv("A2A_INJECT_LISTEN", i)
+							if i != "" {
+								t.Setenv("A2A_INJECT_TOKEN", "s3cret")
+							}
+
+							// A half Slack pair is a typo, never a choice.
+							halfPair := (b != "") != (a != "")
+							armed := 0
+							want := ""
+							if g != "" {
+								armed, want = armed+1, "gchat"
+							}
+							if b != "" {
+								armed, want = armed+1, "slack"
+							}
+							if d != "" {
+								armed, want = armed+1, "discord"
+							}
+							// The door alone is an ingress (decided 2026-09-17,
+							// see FromEnv); with nothing else armed Backend()
+							// is "" rather than a real backend's name.
+							doorOnly := armed == 0 && i != ""
+
+							cfg, err := FromEnv()
+							if halfPair || (armed != 1 && !doorOnly) {
+								if err == nil {
+									t.Fatalf("FromEnv() accepted %s (armed=%d, halfPair=%t); backend = %q",
+										name, armed, halfPair, cfg.Backend())
+								}
+								return
+							}
+							if err != nil {
+								t.Fatalf("FromEnv() refused %s: %v", name, err)
+							}
+							if got := cfg.Backend(); got != want {
+								t.Fatalf("Backend() = %q, want %q: the door must not displace or stand in for a real backend", got, want)
+							}
+							if cfg.InjectArmed() != (i != "") {
+								t.Fatalf("InjectArmed() = %t with A2A_INJECT_LISTEN=%q", cfg.InjectArmed(), i)
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestFromEnvFirstEventGrace: the bound on a task with no events at all —
 // absent means 10m (the pod deadline's pre-start budget), and a sub-minute
 // value refuses at boot.
@@ -468,6 +629,9 @@ func TestFromEnvTheDoorSitsBesideARealBackend(t *testing.T) {
 		{"beside the chat relay", map[string]string{
 			"DISCORD_TOKEN": "", "A2A_GCHAT_RELAY_URL": "http://relay.ns.svc:8081",
 		}, gchatBackend},
+		{"beside the slack pair", map[string]string{
+			"DISCORD_TOKEN": "", "SLACK_BOT_TOKEN": "xoxb-1", "SLACK_APP_TOKEN": "xapp-1",
+		}, slackBackend},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setBaseEnv(t)

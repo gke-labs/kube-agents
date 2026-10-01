@@ -3,7 +3,8 @@
 Every 15 minutes `.github/workflows/ci-health.yml` refreshes the eval dashboard
 (the incremental collect → render → publish that `hack/ci-dashboard-refresh.sh`
 runs, split across two identities: `github-actions@kube-agents-prow` reads the
-Prow archive, `eval-dashboard-publisher@kube-agents-prow` writes the bucket),
+Prow archive and the log buckets kube-agents owns,
+`eval-dashboard-publisher@kube-agents-prow` writes the bucket),
 then `scripts/eval_dashboard/health.py` reads the `data.json` just collected,
 decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 **OUTAGE** and why, and writes `health.json` next to it — before the render, so
@@ -19,7 +20,9 @@ it beside the grader's reason (builds graded before 2026-09-15 carry none).
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
 ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled and
-one when they stop ([below](#a-backed-up-pool)).
+one when they stop ([below](#a-backed-up-pool)), plus, for the watched Prow
+periodics, one when a run fails or a job stops and one when it passes again
+([below](#the-watched-periodics)).
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
@@ -49,15 +52,17 @@ store was not read for that tick, and the next tick recovers. The read reaches t
 window so the first drawn night's admission window is as whole as the gate's.
 The same tick comments on each pull request whose run went red, whose
 build node went away, or whose run Prow killed at the deadline (`gate_comment.py`), files the tracking issue a new
-OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift
-owes its owner (`gate_issue.py`), and appends `health.json` to a history
-feed. A second job in the same workflow, on its own hourly cron, scans every
-CI pool project's seeded fleet for fixtures out of their designed state and
-publishes `fixture-state.json` beside `health.json` ([The seeded-fleet
-scan](#the-seeded-fleet-scan)); the tick reads it for the `fixture_drift`
-condition and the digest carries one line on the latest scan. A
+OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
+pool-project drift owes its owner (`gate_issue.py`), and appends `health.json`
+to a history feed. A second job in the same workflow, on its own hourly cron,
+scans every CI pool project's seeded fleet for fixtures out of their designed
+state and then every project's shape against the onboarding verifier,
+publishing `fixture-state.json` and `pool-state.json` beside `health.json`
+([The seeded-fleet scan](#the-seeded-fleet-scan), [The pool-state
+scan](#the-pool-state-scan)); the tick reads them for the `fixture_drift` and
+`pool_drift` conditions and the digest carries one line on each. A
 `workflow_dispatch` of the same workflow is the on-demand refresh button
-(its `fixture_state_scan` input also runs the scan).
+(its `fixture_state_scan` input also runs both scans).
 
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
@@ -68,7 +73,8 @@ that say the pool check itself is not reporting — `wait unknown` and `pool
 check stopped` — link to the periodic's job history instead, the one place
 that shows whether it has started running again. `queue clear` and the two
 data-freshness messages carry no link: what they report is the absence of
-something to show. The scope rides in the URL
+something to show. The watched-periodic messages link to the job's Deck
+history; the passed-again one carries no link. The scope rides in the URL
 fragment because the host's login redirect drops a query string and a browser
 carries the fragment through the redirect.
 The contract, and the older `?cases=…#gate` form the pages still read (it
@@ -135,7 +141,8 @@ pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
 state on the same pool project on two consecutive scans, or on 3+ projects in
-one scan; #1550, below). A zero-task run
+one scan; #1550, below), or pool drift (the same rule over the pool-state scan's
+findings; #1967, below). A zero-task run
 is at most one of a lost pod, a conflicted merge (below), a deadline kill
 (above) and a setup death, in that order: a lost pod is never a setup death,
 whatever its duration. When more
@@ -146,7 +153,8 @@ jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the fleet owner has re-applied
 the stack — a red on a case that depends on the drifted fixture, from a run
-that leased one of those projects, is the fixture's, not the change's.
+that leased one of those projects, is the fixture's, not the change's; for pool
+drift, once the pool owner has run the repair the issue carries.
 
 A pull request that will not merge into `main` dies in the same seconds with
 no tasks and is not a setup death either (`merge_conflict` in SCHEMA.md,
@@ -182,10 +190,17 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 ## Hysteresis
 
 A single bad tick does not change the state, and a single lucky green does not
-end an incident. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
+end an incident. A scan condition (fixture drift, pool drift) that its own
+scan cannot yet read clean is not replaced by a scan condition that ranks at
+or below it, the lower-ranked scan's or its own on other units, unless the new
+drift covers the held one (it spread, so every held project stays in the exit's
+reads): the state would otherwise leave through a scan exit that never read
+the held incident's projects. Fixture drift, which ranks above pool drift, and
+any run-based condition displace it as before, and a held-back newcomer takes
+over once the hold lifts. Entering a shared-break OUTAGE or a storm or delegation-ceiling DEGRADED needs the condition to be
 current: one of the three newest completed runs carries it. Setup deaths,
-lost pods, deadline kills and fixture drift have no such signature on a
-completed run; their count is the currency. Returning to GREEN needs 3
+lost pods, deadline kills, fixture drift and pool drift have no such signature
+on a completed run; their count is the currency. Returning to GREEN needs 3
 consecutive green runs on distinct pull requests, all finished after the
 incident began and none carrying its signature — the runs that made the
 incident cannot end it. The one exception is a deadline-kill OUTAGE, left
@@ -335,8 +350,8 @@ stopped message carries **no numbers**: `latest-build.txt` keeps resolving
 after the periodic dies, so a stopped job reads as an unchanging healthy
 artifact.
 
-This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods and
-fixture drift. A full pool is a capacity fact, not a defect a code change
+This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods, fixture
+drift and pool drift. A full pool is a capacity fact, not a defect a code change
 closes; its remedies are onboarding and raising the cap, which are planned
 work. Chat, the Brief and the digest carry it, and nothing opens.
 
@@ -345,6 +360,45 @@ wrong (`typical wait`, beside `typical run`), and repeats a one-line version
 of the note while it lasts. The Brief's lede carries the same numbers. There
 is no tile for it: the tiles recompute for the reader's date range, and the
 wait is a fixed 24-hour figure that is not in the run data.
+
+## The watched periodics
+
+Three Prow periodics keep the pool in shape from outside any run, and until this
+rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
+(the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
+reconcile, hourly against the drifted projects and weekly against every free
+one. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+per job with its label, its stale window and the artifact it writes, so adding
+the next periodic is one line. The 15-minute tick's `Fetch the watched periodics'
+latest builds` step reads each job's `latest-build.txt` from
+`gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
+identities cannot write the Prow archive),
+walks back to a build with a `finished.json` (the newest is often still
+running), keeps the reconcile's `fleet-reconcile.json` when a failed build wrote
+one, and hands the readings to `health.py --periodics-dir`.
+
+Like the pool note it rides beside the state and never becomes one. A job whose
+latest finished build failed is a `FAILED` note; one whose latest finished
+build is older than its stale window (an hour for the sweep, three for the
+hourly reconcile, eight days for the weekly) is `STALE`, whatever that build's
+verdict, measured on the wall clock rather than data.json's horizon, as the
+pool note is. The note carries the build, when it finished, `since` (kept for
+the job across ticks through the previous `health.json`, ticks with no reading
+for that job included), the job's history link, where the
+recovery is written, and for the reconcile the projects it refused, failed or
+was interrupted in, with each one's reason, up to five. A job with no reading
+writes no note and ends none: that is the bot losing sight of the job, not the
+job recovering.
+
+The poster sends one message per episode and verdict: a job's first failing
+build (in orange; a newer build that fails the same way is not news, and the
+digest carries it daily), a job that has stopped (in grey, whether or not its
+last build failed; the same grey when its latest build carries no readable
+finish time, since the window cannot be measured), and one when a job the space
+was told about passes again, on a reading only. The digest carries one line per
+open note.
+Nothing here files an issue: the recovery is a person's, and the failed
+message says where it is written (`docs/ci-pool-projects.md`, sections 5.5 and 6.2).
 
 ## The comment on a red pull request
 
@@ -512,7 +566,7 @@ the top of every hour (`0 * * * *`, a second cron in the same workflow; the
 `github.event.schedule` guards send each run to one job) it runs
 `scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
 temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
-`hack/fleet-fixture-state.py --wait 0 --report`, six projects at a time, and
+`hack/fleet-fixture-state.py --wait 0 --report`, seven projects at a time, and
 publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
 own job rather than a step on the top-of-hour tick because it needs `kubectl`
 and `gke-gcloud-auth-plugin`, runs every mapped project for a few minutes (a
@@ -544,7 +598,7 @@ describes, and `FLEET_READONLY_SA` makes the runner rewrite each kubeconfig so
 `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
-grant #1238 gave the presubmit's identity — and nothing on the project itself.
+grant #1238 gave the presubmit's identity — and, for this scan, nothing on the project itself.
 The grant lives on the service account resource, so it is per project by
 nature (the pool projects sit directly under the organisation, with no folder
 to grant on). `bench/tf/fleet`'s `fleet_reader_token_creators` defaults to the bot
@@ -605,21 +659,103 @@ line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
 instead. The recovery comments on it as on any other.
-Once its `oss-test-infra` entry exists, the hourly `ci-kube-agents-fleet-reconcile`
+The hourly `ci-kube-agents-fleet-reconcile`
 periodic re-applies the stack in the projects the scan names
 (`docs/ci-pool-projects.md` §6.2), and the
 recovery comment follows the first scan after that apply, one to two hours
-after the report. No recovery by then is a drift the re-apply did not fix, a
-plan it refused, an apply that failed, or a project leased each time the
+after the report. No recovery by then is the periodic still in `--dry-run`
+(its first week), a drift the re-apply did not fix, a plan it refused, an apply that failed, or a project leased each time the
 hourly ran; the periodic's own log says which.
 
 **What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
 publisher cannot read, a missing grant, a runner or a state check that hangs
-past its ceiling (300 s per project, 1500 s for the scan): each is "not
+past its ceiling (300 s per project, 1920 s for the scan): each is "not
 checked" with its reason, the scan exits 0 and publishes, and the tick reads
 it as such. Only a repository bug — no mapping in `hack/ci-deploy.sh`, no
 catalog — reds the scan job. `fixture_state.py --projects <id> --no-impersonate`
 runs the same scan from a laptop with direct access to one project.
+
+## The pool-state scan
+
+A pool project is verified once, at onboarding (`scripts/verify_ci_pool_project.py`,
+the pool runbook's section 7), and never again, so a bundle change or a drift
+first shows up as a 403 in an agent transcript on whichever pull request leased
+the project (#1927: a role missing on all 30 projects for two weeks). The
+`fixture-state-scan` job runs the verifier on a clock instead. After the fleet
+scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
+`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,token_minter_kms --report`
+against every pool project, seven at a time, and publishes
+`gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
+The verifier is the one implementation; the scan runs it and reads its report.
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the two GitHub checks
+(each needs a credential the bot must not hold), the mapping (about the checkout).
+
+**The document.** `pool-state.json` has the fleet scan's shape. Per project,
+`checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,
+`not_checked`; a healthy or drifted check also carries `unread`, the reads the
+verifier could not make), and `findings` one entry per thing found wrong, keyed
+by the
+verifier's stable id (`iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer`,
+`gke/cluster/seeded-b`, `token-minter/signer/pull-sweeper`): `{check, detail,
+repair}`, where `repair` is the command or runbook section that closes it (empty
+for a `<check>/failed` finding, the verifier's fallback for a check that failed
+without naming one: `detail` is then what it saw), and a repair that removes
+something starts with `# confirm first:`. `previous` is the
+prior scan's `scanned_at` and its `{project: [finding ids]}` map.
+
+**The identity and the grant.** Every read runs as the bot itself,
+`eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
+`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
+and `roles/storage.bucketViewer` on each project (`POOL_STATE_READER_ROLES` in the
+verifier; together they cover every read the scan's checks make, and none writes;
+the one read outside the project, the warm-cache repository's policy in the Prow
+project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
+grants them (`pool_state_readers`), so a project gets them from its fleet apply and
+the verifier fails one that lacks them (`--report` carries the binding). Grant them
+on the project: the check reads the project's own policy, so a grant on a folder or
+the organisation, or through a group, is not seen and reads as missing on every
+project. Projects applied before that default are one loop, run once by a project
+owner:
+
+```bash
+BOT=eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
+for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
+          | sed -n 's/^[[:space:]]*\(kube-agents-evals[-0-9]*\)).*/\1/p'); do
+  for role in roles/iam.securityReviewer roles/container.clusterViewer \
+              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer; do
+    gcloud projects add-iam-policy-binding "$p" --member "serviceAccount:${BOT}" --role "$role" --quiet >/dev/null
+  done
+done
+```
+
+Until then every check on the project records `not_checked` with gcloud's words.
+
+**The condition.** `health.py`'s `pool_drift` is the fleet scan's rule over this
+document: the same finding on the same project in two consecutive scans, or on
+3 or more projects in one. DEGRADED, ranked below fixture drift; it ends the hour
+a scan that could read the incident's checks on its projects no longer shows the
+findings, and a scan that is missing, stale, blind or could not read one of them
+holds it with a note. A scan older than 3 hours is ignored; one that could check
+no project is `pool_state.unknown`, said once by the poster and never a drift. An
+extra role is drift like a missing one.
+
+**What it posts.** One Chat message naming the findings and how many projects,
+that a 403 from a run that leased one of them is the pool's and not the change's,
+and `Tracking #NNN`; one digest line on the latest scan; a `presubmit-gate` issue
+for whoever holds the pool with, per project, what was observed and the exact
+command that repairs it. An open issue whose title names every finding is adopted
+instead (title only: every bot-filed body quotes the evidence, which carries the
+scan's finding lines), as is the bot's own issue when its title fell back to a
+count, matched on the finding ids its hidden marker carries.
+
+**What never fails the bot.** A missing `gcloud`, a project the bot cannot read, a
+verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,
+past which it starts no check and cuts every command short, so a stall costs the reads it
+hit and not the report): "not checked" with the reason, exit 0, published. Only a repository bug (no mapping, no verifier) reds the step. The
+scan's own ceiling (1620 s: five waves of seven projects at the per-project ceiling, with a margin, pinned by test against the pool mapping)
+is a backstop: past it the step is killed and publishes nothing, and the tick
+reports the last document as stale. `pool_state.py --projects <id>` runs the same scan from a
+laptop as whoever is logged in.
 
 ## The history feed
 
@@ -628,8 +764,9 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `metrics`,
-`dashboard_url`, `generated_at` — plus `tick`, the ISO 8601 UTC time the line
+`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
+`periodics`, `periodics_read`, `periodics_since`, `metrics`, `dashboard_url`,
+`generated_at` — plus `tick`, the ISO 8601 UTC time the line
 was appended.
 `generated_at` is the data's horizon and `tick` the wall clock, so a stalled
 refresh shows as many ticks sharing one `generated_at`. GCS has no append: the

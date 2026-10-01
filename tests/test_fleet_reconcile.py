@@ -476,6 +476,56 @@ class MainTest(unittest.TestCase):
         self.assertEqual(boskos.released, ["kube-agents-evals-99", P7])
         self.assertEqual(tofu.verbs().count("apply"), 1, "the mapped project is still applied")
 
+    def test_the_report_is_written_for_a_pass_a_failure_and_a_termination(self):
+        # The CI health bot reads it from the job's artifacts; ARTIFACTS is
+        # where Prow's pod utilities upload from, so the default lands there.
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "fleet-reconcile.json"
+            with mock.patch.dict(os.environ, {reconcile.ARTIFACTS_ENV: tmp}):
+                rc, _ = self._main(["--project", P7, "--dry-run"], _Boskos(free=[P7]), _Tofu({P7: UPDATE_ONLY}))
+            self.assertEqual(rc, reconcile.EXIT_OK)
+            doc = json.loads(report.read_text())
+            self.assertEqual((doc["schema_version"], doc["mode"], doc["dry_run"], doc["exit"], doc["exit_code"], doc["error"]), (1, "project", True, "ok", 0, None))
+            self.assertEqual(doc["outcomes"][P7]["outcome"], reconcile.OUTCOME_PLANNED)
+            self.assertEqual(doc["summary"][reconcile.OUTCOME_PLANNED], 1)
+            self.assertTrue(doc["started_at"].endswith("Z") and doc["finished_at"] >= doc["started_at"])
+            # A refusal: the exit and the project's reason are in it.
+            explicit = pathlib.Path(tmp) / "elsewhere.json"
+            rc, _ = self._main(["--project", P7, "--report", str(explicit)], _Boskos(free=[P7]), _Tofu({P7: REPLACE}))
+            self.assertEqual(rc, reconcile.EXIT_FAILED)
+            doc = json.loads(explicit.read_text())
+            self.assertEqual((doc["exit"], doc["outcomes"][P7]["outcome"]), ("failed", reconcile.OUTCOME_REFUSED))
+            self.assertIn("1 project(s) not reconciled", doc["error"])
+            # No ARTIFACTS and no flag: no report is written anywhere.
+            with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(reconcile, "write_report") as writer:
+                os.environ.pop(reconcile.ARTIFACTS_ENV, None)
+                self._main(["--project", P7, "--dry-run"], _Boskos(free=[P7]), _Tofu({P7: UPDATE_ONLY}))
+            writer.assert_not_called()
+
+    def test_an_unhandled_exception_still_writes_its_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(reconcile, "_run", side_effect=KeyError("boom")), mock.patch.object(reconcile.signal, "signal"):
+                with self.assertRaises(KeyError):
+                    reconcile.main(["--project", P7, "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            doc = json.loads(report.read_text())
+            self.assertEqual((doc["exit"], doc["exit_code"], doc["outcomes"]), ("error", None, {}))
+            self.assertEqual(doc["error"], "KeyError: 'boom'", "the report names what killed the run")
+
+    def test_a_terminated_run_still_writes_its_report(self):
+        def tofu(argv, **_):
+            if argv[1] == "plan":
+                raise boskos_pool.Terminated("signal 2")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pathlib.Path(tmp) / "r.json"
+            with mock.patch.object(boskos_pool.urllib.request, "urlopen", _Boskos(free=[P7])), mock.patch.object(reconcile, "tofu_runner", tofu), mock.patch.object(reconcile.signal, "signal"), mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                rc = reconcile.main(["--project", P7, "--report", str(report), "--boskos-server", BOSKOS, "--boskos-owner", OWNER])
+            self.assertEqual(rc, boskos_pool.TERMINATED_EXIT_CODE)
+            doc = json.loads(report.read_text())
+            self.assertEqual((doc["exit"], doc["exit_code"], doc["outcomes"][P7]["outcome"]), ("terminated", 143, reconcile.OUTCOME_INTERRUPTED))
+            self.assertIn("terminated (signal 2)", doc["error"])
+
     def test_a_busy_pool_exits_zero(self):
         rc, _ = self._main(["--project", P7], _Boskos(free=[]), _Tofu({}))
         self.assertEqual(rc, reconcile.EXIT_OK)

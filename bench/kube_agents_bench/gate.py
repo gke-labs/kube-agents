@@ -87,6 +87,7 @@ from kube_agents_bench.baselines import (
 )
 from kube_agents_bench.cases import CaseSpecError, load_case
 from kube_agents_bench.scoring import (
+    DEFAULT_AGGREGATE_MARGIN,
     DEFAULT_AGGREGATE_MIN_SCORED,
     DEFAULT_CORRECTNESS_FLOOR,
     DEFAULT_JUDGED_MARGIN,
@@ -128,10 +129,12 @@ SUITE_HEADLINES = {
 
 #: Set to one of these (case-insensitive) and the suite aggregate may red the
 #: job. Unset, the aggregate rule still runs and is still reported -- it just
-#: cannot block. Advisory is the default because the margin is a flat 0.05
-#: against a rate whose variance on main has never been measured; the store
-#: has to fill before anyone can say what an unchanged pull request's
-#: aggregate looks like, and a rule armed before that is tuned by guess.
+#: cannot block. Advisory is the default because arming is a Prow-config
+#: decision and not this module's: the margin was measured on 2026-09-29
+#: (:data:`kube_agents_bench.scoring.DEFAULT_AGGREGATE_MARGIN`, and the
+#: sizing note in docs/designs/eval-scorer.md), so the flip is one
+#: ``EVAL_AGGREGATE_ARMED=1`` line in the presubmit's job config, and the
+#: unset default is what a laptop run and every test see.
 AGGREGATE_ARMED_ENV = "EVAL_AGGREGATE_ARMED"
 _TRUTHY = frozenset({"1", "true", "yes"})
 
@@ -1029,7 +1032,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     suite.add_argument(
         "--margin",
         type=float,
-        default=_env_float("EVAL_AGGREGATE_MARGIN", 0.05),
+        default=_env_float("EVAL_AGGREGATE_MARGIN", DEFAULT_AGGREGATE_MARGIN),
         help="non-inferiority margin on the aggregate (default: %(default)s)",
     )
     suite.add_argument(
