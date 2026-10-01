@@ -788,6 +788,7 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("cluster_agent_profile.py list", step_1)
         self.assertIn("get_k8s_resource", step_1)
         self.assertIn("describe_k8s_resource", step_1)
+        self.assertIn("uninspectable via MCP", step_1)
         self.assertIn("Do not create throwaway kanban probe cards", step_1)
         self.assertIn("Never resolve silently", step_1)
         self.assertRegex(step_1, r"[Aa]sk only after (looking|checking|searching)")
@@ -975,7 +976,15 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "bash -c 'cd /opt/data/scripts; python3 -m cluster_agent_profile list'",
             'bash -c "cd /opt/data/scripts && python3 -m cluster_agent_profile list"',
             "python3 -m cluster_agent_profile list # don't ask the user",
+            "python3 -m cluster_agent_profile list  # users' profiles",
+            "python3 -m cluster_agent_profile list  # 5' tall",
+            'python3 -m cluster_agent_profile list  # see "notes',
+            "python3 -m cluster_agent_profile list  # users'",
+            "cd /opt/data/scripts && python3 -m cluster_agent_profile list  # users' profiles",
             "python3 -m kanban_notify_propagate list # don't ask the user",
+            "python3 -m kanban_notify_propagate list  # users' profiles",
+            "python3 -m kanban_notify_propagate list  # 5' tall",
+            'python3 -m kanban_notify_propagate list  # see "notes',
             "python3 <<< 'import cluster_agent_profile'",
             "python3 <<< 'from cluster_agent_profile import list_profiles'",
             "python3 <<< 'import kanban_notify_propagate'",
@@ -1195,6 +1204,14 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             "python3 -c 'import sys' 'kanban_notify_propagate'",
             'python3 -c "import sys" kanban_notify_propagate',
             'python3 -c "import yaml" && grep kanban_notify_propagate README.md',
+            # Quoted positional script arguments after piped python (Thread 1)
+            'echo "import cluster_agent_profile" | python3 "$SCRIPT"',
+            "echo 'import cluster_agent_profile' | python3 'parse.py'",
+            'echo "import kanban_notify_propagate" | python3 "$SCRIPT"',
+            "echo 'import kanban_notify_propagate' | python3 'parse.py'",
+            # Unclosed string mentions with issue citations without shell redirect
+            'echo "stub refused; python3 -m cluster_agent_profile fails #953"',
+            'echo "stub refused; python3 -m kanban_notify_propagate fails #953"',
         ]
         for cmd in non_matching_commands:
             with self.subTest(cmd=cmd):
