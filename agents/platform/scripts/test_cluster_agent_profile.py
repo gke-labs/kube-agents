@@ -1024,6 +1024,16 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "import kanban_notify_propagate" | python3 -W ignore::DeprecationWarning',
             'python3 -W ignore::DeprecationWarning - <<< "import cluster_agent_profile"',
             'python3 -W ignore::DeprecationWarning - <<< "import kanban_notify_propagate"',
+            # Heredoc stdin feeds
+            "python3 - <<'EOF' import cluster_agent_profile EOF",
+            "python3 <<EOF import cluster_agent_profile EOF",
+            "python3 - <<'EOF' from cluster_agent_profile import list_profiles EOF",
+            "cat <<'EOF' import cluster_agent_profile EOF | python3",
+            "python3 -W ignore::DeprecationWarning - <<'EOF' import cluster_agent_profile EOF",
+            "python3 - <<'EOF' import kanban_notify_propagate EOF",
+            "python3 <<EOF import kanban_notify_propagate EOF",
+            "cat <<'EOF' import kanban_notify_propagate EOF | python3",
+            "python3 -W ignore::DeprecationWarning - <<'EOF' import kanban_notify_propagate EOF",
         ]
         for cmd in matching_commands:
             with self.subTest(cmd=cmd):
@@ -1111,6 +1121,8 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
             'echo "stub refused; python3 -m kanban_notify_propagate fails (#953)" >> notes.md',
             'echo "stub refused; python3 -c \'import kanban_notify_propagate\' fails (#953)" >> notes.md',
             'echo "stub refused; python3 <<< \'import kanban_notify_propagate\' fails (#953)" >> notes.md',
+            'echo "stub refused; python3 - <<\'EOF\' import cluster_agent_profile EOF fails" >> notes.md',
+            'echo "stub refused; python3 - <<\'EOF\' import kanban_notify_propagate EOF fails" >> notes.md',
             "echo '$(python3 -m cluster_agent_profile)'",
             "echo '$(python3 -m kanban_notify_propagate)'",
             # Tokens inside quoted data expressions or piped data without imports
