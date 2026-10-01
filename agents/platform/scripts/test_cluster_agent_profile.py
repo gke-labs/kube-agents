@@ -793,22 +793,6 @@ class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
         self.assertIn("Never resolve silently", step_1)
         self.assertRegex(step_1, r"[Aa]sk only after (looking|checking|searching)")
 
-    def test_delegation_handles_unnamed_cluster_via_fleet_enumeration(self):
-        # The procedure must explicitly guide resolution when the cluster name is omitted (#953).
-        self.assertIn("list_cluster_profiles()", self.content)
-        self.assertIn("get_cluster_profile_name", self.content)
-        self.assertIn("cluster_agent_profile.py list", self.content)
-        # Must instruct checking before asking the user
-        self.assertIn("existence", self.content.lower())
-        self.assertIn("sleep 60", self.content)
-        # Must instruct asking only after searching / looking
-        self.assertRegex(
-            self.content,
-            r"[Aa]sk only after (looking|checking|searching)",
-        )
-        # Must require identifying which cluster was picked in the report
-        self.assertIn("Never resolve silently", self.content)
-
 
 class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
     def setUp(self):

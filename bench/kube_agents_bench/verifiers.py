@@ -261,11 +261,6 @@ def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
     if entry.get("name") != _TOOL_CALL_WRAPPER:
         return set()
     args = entry.get("args")
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except (ValueError, TypeError):
-            args = None
     if not isinstance(args, dict):
         return set()
     names: set[str] = set()

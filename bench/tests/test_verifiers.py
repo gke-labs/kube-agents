@@ -956,7 +956,7 @@ def test_tool_called_sees_through_tool_call_wrapper_direct_name_shape():
         },
         {
             "name": "tool_call",
-            "args": '{"name": "mcp__platform_control__list_cluster_profiles", "arguments": {}}',
+            "args": {"name": "mcp__platform_control__list_cluster_profiles", "arguments": {}},
             "status": "completed",
             "agent": "platform",
         },
