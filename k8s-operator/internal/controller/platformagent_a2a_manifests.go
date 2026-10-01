@@ -512,12 +512,13 @@ const (
 	// two -- the primer skips the task, the sweeps retry next pass or fail
 	// the bridge's start (which restarts it) -- and the two that do not are
 	// both in the bridge's handler, which acks when it returns:
-	// handleMessage logs "events lookup failed; dropping submission", which
-	// loses the task, and cancelOrphan logs "cancel events lookup failed",
-	// which drops the cancel and leaves the orphan non-terminal for the
-	// retention window. A submission burst wide enough to reach the
-	// cap is that handler's hazard, and pacing it is a bridge change, not a
-	// number here.
+	// handleMessage logs "events lookup failed after retries; dropping
+	// submission", which loses the task, and cancelOrphan logs "cancel
+	// events lookup failed after retries", which drops the cancel and leaves
+	// the orphan non-terminal for the retention window. The retries (three,
+	// short backoff) make a brief refusal a late task rather than a lost one;
+	// a submission burst wide enough to hold the cap past them is that
+	// handler's hazard, and pacing it is a bridge change, not a number here.
 	//
 	// What this term holds is the trigger-paced callers, each counted at
 	// what can be in flight at once from the structure above, times

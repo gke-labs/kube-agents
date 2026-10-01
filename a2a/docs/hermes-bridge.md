@@ -187,9 +187,10 @@ ack just redelivers), `working` when the subprocess spawns, the stdout as a `res
 artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
 exit is terminal `failed` with the evidence in the status message: `reason: hermes-exited-nonzero -
 exit status N; session: <id>; stdout tail: …; stderr tail: …`. Both tails are bounded (2 KiB each),
-and the session id is the one `hermes chat -Q` prints last on stderr, so the transcript under the
-profile's session store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for
-a turn that gave up on the provider's rate limit; it is named `reason: hermes-rate-limited` instead,
+and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
+is the last thing the CLI writes before exiting), so the transcript under the profile's session
+store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
+gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
 which the eval harness classes as infrastructure rather than the persona's failure (the image patch
 `apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
 already did). A
@@ -326,8 +327,10 @@ dispatcher, not to scaffolding with a demolition date.
 Honest gaps, accepted for the playground: no queue-staleness guard (the lib's subscribe
 path doesn't expose server ingest timestamps, and `queueTimeoutSeconds` is the
 dispatcher's job when it exists), no heartbeats on `agents.hb.>`, a submission whose
-events lookup fails transiently is dropped with a log line rather than redelivered (the
-lib acks unconditionally after the handler; a nak path is a lib delta if it ever bites),
+events lookup keeps failing is dropped with a log line rather than redelivered (the lookup
+is retried three times with a short backoff first, so a transient refusal makes the task
+late rather than lost; the lib acks unconditionally after the handler, and a nak path is a
+lib delta if a persistent failure ever bites),
 and a terminal publish that fails outright - a bus outage outlasting the finalize
 budget at exactly that moment - leaves the task in the registry for the NEXT
 incarnation's sweep, which may be far away on a healthy sidecar; until then the bridge
