@@ -1222,9 +1222,11 @@ on a terminal that carries one. Every other post under the task is an agent mess
 the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
 the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
 hands over the artifact the stream carries), so the chunks stay history and the artifact is
-never inferred from a post's position. The door keeps up to 4 MiB of it; a longer deliverable
-is cut at a rune boundary and `metadata.resultTruncatedFrom` carries the original length, so a
-client can fall back to `history`, which carries the chunks whole. A completed task the relay
+never inferred from a post's position. The door keeps up to 4 MiB of it, and 64 MiB across
+all tasks; a longer deliverable is cut at a rune boundary with `metadata.resultTruncatedFrom`
+carrying the original length, and past the budget the oldest retained deliverables are dropped
+with `metadata.resultEvicted` set and no artifact, so a client can fall back to `history`, which
+carries the chunks whole either way. A completed task the relay
 handed nothing for (a non-text result) renders no artifact. `metadata.terminalSource` carries whose word the terminal
 is, for the reason the inject door's read route carries it. A2A clients read exactly `status`,
 `artifacts` and `history`, so nothing here is invented for them. Not mapped yet: an executor's
@@ -1264,8 +1266,10 @@ destination's name, none of which a 401 hides.
 
 **Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
 `A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
-(`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL`, which behind a
-port-forward or an ingress is not the listen address. The operator renders the door the way
+(`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
+the address the card was fetched from (the request's host, or the forwarded host and scheme
+behind a proxy), since behind a port-forward or an ingress the listen address is reachable by
+nobody. The operator renders the door the way
 it renders the inject door, under its own operator-level flag (`A2A_AGENT_DOOR=true`, never a
 CRD field): a loopback bind on its own port, its own one-entry map admitting one caller, a
 token Secret minted once, a ClusterIP Service for the port-forward, and the gateway fence

@@ -30,7 +30,6 @@ const (
 	a2aRoleAgent     = "agent"
 	a2aRoleUser      = "user"
 	a2aPartKindText  = "text"
-	a2aContentType   = "application/json"
 	a2aCardPath      = "/.well-known/agent-card.json"
 	a2aRPCPath       = "/a2a"
 	a2aTextMediaType = "text/plain"
@@ -127,16 +126,16 @@ type a2aIDParams struct {
 // fields plus the `kind` discriminator the JSON-RPC binding requires on every
 // Message. lib.Message has none because the bus carries kind on the envelope
 // and its payload structs are views, never re-serialised onto a wire; the
-// door re-serialises, so it carries its own type. a2aMessageObject is the
-// same shape for a top-level reply.
+// door re-serialises, so it carries its own type, embedding lib.Message.
 type a2aMessage struct {
-	Role      string     `json:"role"`
-	Parts     []lib.Part `json:"parts"`
-	MessageID string     `json:"messageId"`
-	TaskID    string     `json:"taskId,omitempty"`
-	ContextID string     `json:"contextId,omitempty"`
-	Kind      string     `json:"kind"`
+	lib.Message
+	Kind string `json:"kind"`
 }
+
+// a2aMessageObject is the same type at the top level: an agent Message the
+// door returns when a turn was answered without a task (a refusal, a status
+// answer, a steer's acknowledgement, a reply).
+type a2aMessageObject = a2aMessage
 
 // a2aTaskStatus is lib.TaskStatus with the door's Message type.
 type a2aTaskStatus struct {
@@ -152,19 +151,6 @@ type a2aTaskObject struct {
 	Status    a2aTaskStatus  `json:"status"`
 	Artifacts []lib.Artifact `json:"artifacts,omitempty"`
 	History   []a2aMessage   `json:"history,omitempty"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	Kind      string         `json:"kind"`
-}
-
-// a2aMessageObject is an agent Message the door returns when a turn was
-// answered without a task: a refusal, a status answer, a steer's
-// acknowledgement, a reply.
-type a2aMessageObject struct {
-	Role      string         `json:"role"`
-	Parts     []lib.Part     `json:"parts"`
-	MessageID string         `json:"messageId"`
-	ContextID string         `json:"contextId,omitempty"`
-	TaskID    string         `json:"taskId,omitempty"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
 	Kind      string         `json:"kind"`
 }
@@ -214,7 +200,9 @@ type a2aScheme struct {
 func textOf(parts []lib.Part) (string, bool) {
 	text := ""
 	for _, p := range parts {
-		if p.Kind != a2aPartKindText || len(p.Data) > 0 || p.File != nil {
+		// A RawMessage keeps a literal null (the pointer FileRef does not),
+		// and a client that serialises nil members as null is sending text.
+		if p.Kind != a2aPartKindText || (len(p.Data) > 0 && string(p.Data) != "null") || p.File != nil {
 			return "", false
 		}
 		if text != "" && p.Text != "" {

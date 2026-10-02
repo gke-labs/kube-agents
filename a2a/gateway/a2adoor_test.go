@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,14 +145,14 @@ func (r *a2aRig) rawRPC(t *testing.T, token, caller, method string, params any) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", a2aContentType)
+	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set(authorizationHeader, "Bearer "+token)
 	}
 	if caller != "" {
 		req.Header.Set(a2aCallerHeader, caller)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := a2aTestClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +168,63 @@ func (r *a2aRig) rawRPC(t *testing.T, token, caller, method string, params any) 
 }
 
 // sendParams builds message/send params for one text.
+// a2aTestClient bounds every request: a blocking send the door holds for
+// a2aBlockingWait must fail the test in under a minute, not five.
+var a2aTestClient = &http.Client{Timeout: 60 * time.Second}
+
+// sendAsync posts one request from a goroutine that calls nothing on t, so
+// the test goroutine stays free to play the executor and then collect the
+// response (or its error) with a bound of its own.
+func (r *a2aRig) sendAsync(caller string, params any) <-chan asyncRPC {
+	r.nextRPC++
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": r.nextRPC, "method": a2aMethodSend, "params": params})
+	out := make(chan asyncRPC, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, r.base+a2aRPCPath, bytes.NewReader(body))
+		if err != nil {
+			out <- asyncRPC{err: err}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(authorizationHeader, "Bearer "+a2aTestToken)
+		req.Header.Set(a2aCallerHeader, caller)
+		res, err := a2aTestClient.Do(req)
+		if err != nil {
+			out <- asyncRPC{err: err}
+			return
+		}
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		var resp rpcResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			out <- asyncRPC{err: fmt.Errorf("decode %q: %w", raw, err)}
+			return
+		}
+		out <- asyncRPC{resp: resp}
+	}()
+	return out
+}
+
+type asyncRPC struct {
+	resp rpcResponse
+	err  error
+}
+
+// collect waits for an async send on the test goroutine.
+func collect(t *testing.T, ch <-chan asyncRPC) rpcResponse {
+	t.Helper()
+	select {
+	case a := <-ch:
+		if a.err != nil {
+			t.Fatalf("async send: %v", a.err)
+		}
+		return a.resp
+	case <-time.After(90 * time.Second):
+		t.Fatal("the async send did not return inside 90s")
+	}
+	return rpcResponse{}
+}
+
 func sendParams(text, messageID, contextID string, blocking bool) map[string]any {
 	msg := map[string]any{
 		"role":      "user",
@@ -274,11 +332,9 @@ func TestA2AResultArtifactIsWholeWhenTheRelayChunksIt(t *testing.T) {
 	if len(report) <= 2*discordChunk {
 		t.Fatalf("the fixture is %d bytes; it has to exceed two chunks (%d) to prove anything", len(report), 2*discordChunk)
 	}
-	go func() {
-		origin := r.awaitTask(t, "platform")
-		r.complete(t, origin, report)
-	}()
-	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("audit the fleet", "m-1", "", true)))
+	sent := r.sendAsync(a2aTestCaller, sendParams("audit the fleet", "m-1", "", true))
+	r.complete(t, r.awaitTask(t, "platform"), report)
+	task := taskOf(t, collect(t, sent))
 	if task.Status.State != lib.StateCompleted {
 		t.Fatalf("state = %q, want completed", task.Status.State)
 	}
@@ -307,11 +363,9 @@ func TestA2AResultArtifactIsWholeWhenTheRelayChunksIt(t *testing.T) {
 // what the door puts on the wire.
 func TestA2ATaskMessagesCarryTheKindDiscriminator(t *testing.T) {
 	r := startA2ARig(t)
-	go func() {
-		origin := r.awaitTask(t, "platform")
-		r.complete(t, origin, "done")
-	}()
-	resp := r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("kinds?", "m-1", "", true))
+	sent := r.sendAsync(a2aTestCaller, sendParams("kinds?", "m-1", "", true))
+	r.complete(t, r.awaitTask(t, "platform"), "done")
+	resp := collect(t, sent)
 	raw, err := json.Marshal(resp.Result)
 	if err != nil {
 		t.Fatal(err)
@@ -576,6 +630,119 @@ func TestA2ATextPartWithAFilePayloadIsRefused(t *testing.T) {
 	if resp := r.rpc(t, a2aTestCaller, a2aMethodSend, params); resp.Error == nil || resp.Error.Code != a2aErrContentTypeNotSupp {
 		t.Fatalf("a text part with a data member was not refused: %+v", resp)
 	}
+	// A client that serialises nil members writes data: null; that is text.
+	params["message"].(map[string]any)["parts"] = []map[string]any{{"kind": "text", "text": "hi", "data": nil, "file": nil}}
+	if resp := r.rpc(t, a2aTestCaller, a2aMethodSend, params); resp.Error != nil {
+		t.Fatalf("a text part with data: null was refused: %+v", resp.Error)
+	}
+}
+
+// TestA2AReusedMessageIDOnAnotherContextIsRefused: the dedupe key is the
+// caller's message id, but the id names one message on one context; a
+// reused id on another context is answered with a refusal that says so,
+// not with the first context's task.
+func TestA2AReusedMessageIDOnAnotherContextIsRefused(t *testing.T) {
+	r := startA2ARig(t)
+	first := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("ask A", "m-1", "ctx-A", false)))
+	again := r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("ask A", "m-1", "ctx-A", false))
+	if again.Error != nil || taskOf(t, again).ID != first.ID {
+		t.Fatalf("a retry on the same context was not answered with the same task: %+v", again)
+	}
+	other := r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("a different ask", "m-1", "ctx-B", false))
+	if other.Error == nil || other.Error.Code != rpcInvalidParams {
+		t.Fatalf("a reused messageId on another context was accepted: %+v", other)
+	}
+}
+
+// TestA2AARefusedClaimDoesNotPinTheMessageID: a not-handed-over refusal is
+// forgotten, so the same id can be sent again and routed afresh.
+func TestA2AARefusedClaimDoesNotPinTheMessageID(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "ctx-1")
+	o, seen := d.claimSubmission(a2aTestCaller, "m-7", key)
+	if seen {
+		t.Fatal("first claim seen")
+	}
+	d.completeOutcome(o, "", nil, &rpcError{Code: rpcInternalError, Message: earlierTurnNote()})
+	d.forgetSubmission(a2aTestCaller, "m-7", o)
+	if _, seen := d.claimSubmission(a2aTestCaller, "m-7", key); seen {
+		t.Fatal("the refused id is still pinned; a retry would be refused for good")
+	}
+	// A different outcome claimed under the id in the meantime is not the
+	// one forgotten.
+	o2, _ := d.claimSubmission(a2aTestCaller, "m-8", key)
+	d.forgetSubmission(a2aTestCaller, "m-8", o)
+	if o3, seen := d.claimSubmission(a2aTestCaller, "m-8", key); !seen || o3 != o2 {
+		t.Fatal("forgetSubmission dropped an outcome it did not own")
+	}
+}
+
+// TestA2ACardURLFollowsTheRequestWhenNoPublicURLIsSet: without
+// A2A_DOOR_PUBLIC_URL the card points at the address it was fetched from,
+// not the pod's loopback; forwarded headers win behind a proxy; a
+// configured public URL is served as is.
+func TestA2ACardURLFollowsTheRequestWhenNoPublicURLIsSet(t *testing.T) {
+	d := bareDoor(t)
+	url := func(host, proto, fhost string) string {
+		req := httptest.NewRequest(http.MethodGet, "http://"+host+a2aCardPath, nil)
+		req.Host = host
+		if proto != "" {
+			req.Header.Set("X-Forwarded-Proto", proto)
+		}
+		if fhost != "" {
+			req.Header.Set("X-Forwarded-Host", fhost)
+		}
+		rec := httptest.NewRecorder()
+		d.handleCard(rec, req)
+		var card a2aAgentCard
+		if err := json.Unmarshal(rec.Body.Bytes(), &card); err != nil {
+			t.Fatal(err)
+		}
+		return card.URL
+	}
+	if got := url("localhost:18098", "", ""); got != "http://localhost:18098"+a2aRPCPath {
+		t.Errorf("port-forward card url = %q", got)
+	}
+	if got := url("door.internal", "https", "agents.example.com"); got != "https://agents.example.com"+a2aRPCPath {
+		t.Errorf("forwarded card url = %q", got)
+	}
+	fixed, err := NewA2ADoor("127.0.0.1:0", a2aTestToken, A2ADoorOptions{PublicURL: "https://fixed.example/a2a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d = fixed
+	if got := url("localhost:18098", "", ""); got != "https://fixed.example/a2a" {
+		t.Errorf("configured card url = %q", got)
+	}
+}
+
+// TestA2ARetainedResultsStayUnderTheBudget: deliverables are bounded across
+// tasks, oldest dropped first, each dropped Task saying so.
+func TestA2ARetainedResultsStayUnderTheBudget(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "big")
+	each := a2aMaxResultBytes - 1
+	n := a2aResultBudgetBytes/each + 2
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("task-%d", i)
+		d.TaskStarted(key, id)
+		d.TaskDelivered(key, id, strings.Repeat("r", each))
+		d.TaskTerminal(key, id, lib.StateCompleted, TerminalFromExecutor, "")
+	}
+	d.mu.Lock()
+	total := d.resultBytes
+	d.mu.Unlock()
+	if total > a2aResultBudgetBytes {
+		t.Fatalf("retained %d bytes of results, budget %d", total, a2aResultBudgetBytes)
+	}
+	oldest := d.taskObject("task-0")
+	if len(oldest.Artifacts) != 0 || oldest.Metadata["resultEvicted"] != true {
+		t.Errorf("the oldest task kept its artifact under budget pressure: %d artifacts, metadata %v", len(oldest.Artifacts), oldest.Metadata)
+	}
+	newest := d.taskObject(fmt.Sprintf("task-%d", n-1))
+	if len(newest.Artifacts) != 1 || newest.Metadata["resultEvicted"] != nil {
+		t.Errorf("the newest task lost its artifact: %d artifacts, metadata %v", len(newest.Artifacts), newest.Metadata)
+	}
 }
 
 // TestA2ACardIsServedWithoutAToken: discovery reads the card before it knows
@@ -716,11 +883,9 @@ func TestA2ATasksGetCarriesTheResultAsAnArtifact(t *testing.T) {
 // the send until the terminal, which is the one-call curl demo.
 func TestA2ABlockingSendReturnsTheCompletedTask(t *testing.T) {
 	r := startA2ARig(t)
-	go func() {
-		origin := r.awaitTask(t, "platform")
-		r.complete(t, origin, "42")
-	}()
-	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("what is the answer?", "m-1", "", true)))
+	sent := r.sendAsync(a2aTestCaller, sendParams("what is the answer?", "m-1", "", true))
+	r.complete(t, r.awaitTask(t, "platform"), "42")
+	task := taskOf(t, collect(t, sent))
 	if task.Status.State != lib.StateCompleted {
 		t.Fatalf("a blocking send returned state %q, want completed", task.Status.State)
 	}
@@ -981,6 +1146,17 @@ func TestA2AMetadataCallerReachesGetAndCancel(t *testing.T) {
 	if colon := r.rpc(t, "alice:x", a2aMethodGet, map[string]any{"id": task.ID}); colon.Error == nil || colon.Error.Code != rpcInvalidParams {
 		t.Errorf("a caller with a colon was accepted: %+v", colon)
 	}
+	// And cancel, the half this test is named for: no header, the caller in
+	// metadata, answered with the task (the cancel reached the bus) rather
+	// than -32010.
+	r.awaitTask(t, "platform")
+	canceled := r.rpc(t, "", a2aMethodCancel, map[string]any{"id": task.ID, "metadata": map[string]any{a2aCallerMetadataKey: a2aTestCaller}})
+	if canceled.Error != nil {
+		t.Fatalf("tasks/cancel with a metadata caller: %d %s", canceled.Error.Code, canceled.Error.Message)
+	}
+	if taskOf(t, canceled).ID != task.ID {
+		t.Errorf("the metadata-caller cancel answered with another task")
+	}
 }
 
 // TestA2ADoorUnderTheCompositeStillSeesItsTasks: the shipped topology. The
@@ -993,11 +1169,9 @@ func TestA2ADoorUnderTheCompositeStillSeesItsTasks(t *testing.T) {
 	r := startA2ARigWith(t, func(door *A2ADoor) Adapter {
 		return WithSideDoors(primary, []DoorSpec{A2ADoorSpec(door)}, nil)
 	})
-	go func() {
-		origin := r.awaitTask(t, "platform")
-		r.complete(t, origin, "through the composite")
-	}()
-	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("composite?", "m-1", "", true)))
+	sent := r.sendAsync(a2aTestCaller, sendParams("composite?", "m-1", "", true))
+	r.complete(t, r.awaitTask(t, "platform"), "through the composite")
+	task := taskOf(t, collect(t, sent))
 	if task.Status.State != lib.StateCompleted || len(task.Artifacts) != 1 || joinTextParts(task.Artifacts[0].Parts) != "through the composite" {
 		t.Fatalf("task through the composite = %+v", task)
 	}

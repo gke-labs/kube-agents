@@ -101,10 +101,15 @@ const (
 	// a2aMaxResultBytes bounds the artifact the door keeps. A longer
 	// deliverable is cut at a rune boundary and the Task says so in
 	// metadata.resultTruncatedFrom; history still carries the chunks whole.
-	a2aMaxResultBytes  = 4 << 20
-	a2aMaxPostsPerTask = 256
-	a2aMaxTurnPosts    = 64
-	a2aMaxSubmissions  = injectSeenCap
+	a2aMaxResultBytes = 4 << 20
+	// a2aResultBudgetBytes bounds the deliverables the door retains across
+	// all tasks, oldest dropped first (the Task then says resultEvicted and
+	// renders no artifact; history keeps the chunks). Sized against the
+	// gateway's 512Mi pod: the task cap alone would allow 4096 × 4 MiB.
+	a2aResultBudgetBytes = 64 << 20
+	a2aMaxPostsPerTask   = 256
+	a2aMaxTurnPosts      = 64
+	a2aMaxSubmissions    = injectSeenCap
 
 	// a2aSubmitWait bounds how long message/send waits for the gateway to
 	// say what it did with the message - the same bound as the inject door,
@@ -158,6 +163,8 @@ type a2aTask struct {
 	// resultCutFrom is the deliverable's length when it exceeded
 	// a2aMaxResultBytes; zero when it was kept whole.
 	resultCutFrom int
+	// resultEvicted: the deliverable was dropped under a2aResultBudgetBytes.
+	resultEvicted bool
 	// cancelPublished: a cancel for this task reached the bus, so a retried
 	// tasks/cancel is answered with the task, not refused.
 	cancelPublished bool
@@ -238,6 +245,9 @@ func (l *a2aPostLog) since(offset int) ([]a2aPost, bool) {
 // so a retry of the same message/send is answered with the same task rather
 // than routed again.
 type a2aOutcome struct {
+	// key is the conversation the message id was accepted on: a retry on
+	// another context is a different message under a reused id, refused.
+	key     string
 	taskID  string
 	message *a2aMessageObject
 	err     *rpcError
@@ -249,6 +259,7 @@ type A2ADoor struct {
 	listen           string
 	token            string
 	publicURL        string
+	publicURLSet     bool
 	agentName        string
 	agentVersion     string
 	defaultAddressee string
@@ -263,11 +274,13 @@ type A2ADoor struct {
 	convOrder     []string
 	tasks         map[string]*a2aTask
 	taskOrder     []string
-	submissions   map[string]*a2aOutcome
-	subOrder      []string
-	directOf      map[string]string
-	directOrder   []string
-	nextID        int
+	// resultBytes is the retained deliverables' total, for the budget.
+	resultBytes int
+	submissions map[string]*a2aOutcome
+	subOrder    []string
+	directOf    map[string]string
+	directOrder []string
+	nextID      int
 	// notify is closed and replaced whenever anything changes; see the
 	// inject door for why one channel serves the whole adapter.
 	notify chan struct{}
@@ -319,7 +332,8 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		log = slog.Default()
 	}
 	publicURL := strings.TrimSpace(o.PublicURL)
-	if publicURL == "" {
+	publicURLSet := publicURL != ""
+	if !publicURLSet {
 		publicURL = "http://" + listen + a2aRPCPath
 	}
 	name := o.AgentName
@@ -338,6 +352,7 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		listen:           listen,
 		token:            token,
 		publicURL:        publicURL,
+		publicURLSet:     publicURLSet,
 		agentName:        name,
 		agentVersion:     version,
 		defaultAddressee: o.DefaultAddressee,
@@ -384,7 +399,7 @@ func (d *A2ADoor) Run(ctx context.Context, handler func(InboundMessage)) error {
 	d.log.Warn("the A2A door is armed: a bearer-token holder that reaches this listener can "+
 		"submit tasks as a mapped eval principal and read the tasks it submitted. "+
 		"Dev and eval installs only until the identity classes land.",
-		"address", ln.Addr().String(), "card", d.publicURL)
+		"address", ln.Addr().String(), "rpc", d.publicURL)
 
 	errs := make(chan error, 1)
 	go func() {
@@ -420,14 +435,39 @@ func (d *A2ADoor) handleCard(w http.ResponseWriter, r *http.Request) {
 		injectError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	writeJSON(w, http.StatusOK, d.card())
+	writeJSON(w, http.StatusOK, d.card(d.rpcURLFor(r)))
+}
+
+// rpcURLFor is the endpoint the card advertises: the configured public URL,
+// else the address this card was fetched from, so a card reached through a
+// port-forward, a Service name or an ingress points back at itself rather
+// than at the pod's loopback. Behind a proxy the forwarded headers win.
+func (d *A2ADoor) rpcURLFor(r *http.Request) string {
+	if d.publicURLSet {
+		return d.publicURL
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); p != "" {
+		scheme = p
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	if host == "" {
+		return d.publicURL
+	}
+	return scheme + "://" + host + a2aRPCPath
 }
 
 // card is the catalog. One skill per destination this door routes to, which
 // today is the gateway's default addressee; when profiles land the list is
 // rendered from DIRECTORY and the caller's entitlements, and the card
 // becomes per caller.
-func (d *A2ADoor) card() a2aAgentCard {
+func (d *A2ADoor) card(rpcURL string) a2aAgentCard {
 	var skills []a2aSkill
 	if d.defaultAddressee != "" {
 		skills = append(skills, a2aSkill{
@@ -445,7 +485,7 @@ func (d *A2ADoor) card() a2aAgentCard {
 	return a2aAgentCard{
 		Name:            d.agentName,
 		Description:     "kube-agents: a fleet of Kubernetes agents behind one chat gateway. This endpoint is the gateway's A2A door.",
-		URL:             d.publicURL,
+		URL:             rpcURL,
 		Version:         d.agentVersion,
 		ProtocolVersion: a2aProtocolVersion,
 		Capabilities: a2aCapabilities{
@@ -620,8 +660,16 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 		messageID = a2aInboundIDPrefix + randHex(messageIDHexWidth)
 	} else {
 		var seen bool
-		outcome, seen = d.claimSubmission(caller, messageID)
+		outcome, seen = d.claimSubmission(caller, messageID, key)
 		if seen {
+			if outcome.key != key {
+				// The id names one message on one context (the inject
+				// door's 409): a reused id elsewhere is not a retry, and
+				// answering it with the first context's task would drop
+				// this message in silence.
+				return rpcFail(req.ID, rpcInvalidParams, "message.messageId "+messageID+
+					" was already accepted on another context; a message id names one message on one context", nil)
+			}
 			return d.answerOutcome(turnCtx, req.ID, outcome, blocking)
 		}
 		turnCtx = context.WithoutCancel(r.Context())
@@ -633,8 +681,13 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 	deadline := time.Now().Add(a2aSubmitWait)
 	prior, ok := d.claimTurn(turnCtx, key, caller, contextID, user, deadline)
 	if !ok {
+		// Nothing was handed over, so there is nothing for a retry under
+		// this id to be answered with: settle any duplicate already parked
+		// in answerOutcome with the refusal, then forget the id so the next
+		// attempt is routed afresh rather than refused for good.
 		rerr := &rpcError{Code: rpcInternalError, Message: earlierTurnNote()}
 		d.completeOutcome(outcome, "", nil, rerr)
+		d.forgetSubmission(caller, messageID, outcome)
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
 	handler(InboundMessage{
@@ -928,14 +981,14 @@ func (d *A2ADoor) awaitTerminal(ctx context.Context, taskID string, deadline tim
 // claimSubmission records a caller's message id before its turn runs; the
 // second return is true when it has been seen, and the outcome is the first
 // attempt's to wait on. Oldest-first eviction at a2aMaxSubmissions.
-func (d *A2ADoor) claimSubmission(caller, messageID string) (*a2aOutcome, bool) {
+func (d *A2ADoor) claimSubmission(caller, messageID, key string) (*a2aOutcome, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	subKey := caller + "\x00" + messageID
 	if o, ok := d.submissions[subKey]; ok {
 		return o, true
 	}
-	o := &a2aOutcome{done: make(chan struct{})}
+	o := &a2aOutcome{key: key, done: make(chan struct{})}
 	d.submissions[subKey] = o
 	d.subOrder = append(d.subOrder, subKey)
 	for len(d.subOrder) > a2aMaxSubmissions {
@@ -943,6 +996,18 @@ func (d *A2ADoor) claimSubmission(caller, messageID string) (*a2aOutcome, bool) 
 		d.subOrder = d.subOrder[1:]
 	}
 	return o, false
+}
+
+// forgetSubmission drops a settled outcome that handed nothing over, so the
+// id can be sent again. Only the outcome that was claimed is dropped: a
+// later claim under the same id is someone else's.
+func (d *A2ADoor) forgetSubmission(caller, messageID string, o *a2aOutcome) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	subKey := caller + "\x00" + messageID
+	if d.submissions[subKey] == o {
+		delete(d.submissions, subKey)
+	}
 }
 
 // completeOutcome settles a submission once; later calls are no-ops, which
@@ -1147,6 +1212,9 @@ func (d *A2ADoor) TaskStarted(conversation, taskID string) {
 	if _, exists := d.tasks[taskID]; !exists {
 		d.taskOrder = append(d.taskOrder, taskID)
 		for len(d.taskOrder) > a2aMaxTasks {
+			if old := d.tasks[d.taskOrder[0]]; old != nil {
+				d.resultBytes -= len(old.result)
+			}
 			delete(d.tasks, d.taskOrder[0])
 			d.taskOrder = d.taskOrder[1:]
 		}
@@ -1178,7 +1246,10 @@ func (d *A2ADoor) TaskTerminal(conversation, taskID string, state lib.TaskState,
 	task, ok := d.tasks[taskID]
 	if !ok {
 		// A task the door did not see start: a restart between the two
-		// ends. Record what is known so tasks/get on it says something.
+		// ends. Recorded so the line edit and the conversation's log have
+		// somewhere to land; no caller can read it (the conversation knows
+		// no caller after a restart), which is the restart gap the read
+		// through the gateway's probe will close.
 		task = &a2aTask{id: taskID, key: conversation, contextID: conv.contextID, caller: conv.caller, created: time.Now()}
 		d.tasks[taskID] = task
 		d.taskOrder = append(d.taskOrder, taskID)
@@ -1211,9 +1282,21 @@ func (d *A2ADoor) TaskDelivered(conversation, taskID, result string) {
 		task.resultCutFrom = len(result)
 		result = truncateRunes(result, a2aMaxResultBytes)
 	}
+	d.resultBytes += len(result) - len(task.result)
 	task.result = result
 	task.delivered = true
+	task.resultEvicted = false
 	task.updated = time.Now()
+	// The budget: drop the oldest retained deliverables, never this one.
+	for i := 0; d.resultBytes > a2aResultBudgetBytes && i < len(d.taskOrder); i++ {
+		old := d.tasks[d.taskOrder[i]]
+		if old == nil || old == task || old.result == "" {
+			continue
+		}
+		d.resultBytes -= len(old.result)
+		old.result = ""
+		old.resultEvicted = true
+	}
 	d.wakeLocked()
 }
 
@@ -1273,18 +1356,17 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 		line = task.reason
 	}
 	if line != "" {
-		status.Message = &a2aMessage{Role: a2aRoleAgent, Parts: textParts(line), MessageID: task.lineID, TaskID: task.id, ContextID: task.contextID, Kind: a2aKindMessage}
+		status.Message = &a2aMessage{Message: lib.Message{Role: a2aRoleAgent, Parts: textParts(line), MessageID: task.lineID, TaskID: task.id, ContextID: task.contextID}, Kind: a2aKindMessage}
 	}
 	history := make([]a2aMessage, 0, 1+len(task.posts))
 	if task.user.MessageID != "" {
-		u := task.user
-		history = append(history, a2aMessage{Role: u.Role, Parts: u.Parts, MessageID: u.MessageID, TaskID: u.TaskID, ContextID: u.ContextID, Kind: a2aKindMessage})
+		history = append(history, a2aMessage{Message: task.user, Kind: a2aKindMessage})
 	}
 	for _, p := range task.posts {
-		history = append(history, a2aMessage{Role: a2aRoleAgent, Parts: textParts(p.text), MessageID: p.id, TaskID: task.id, ContextID: task.contextID, Kind: a2aKindMessage})
+		history = append(history, a2aMessage{Message: lib.Message{Role: a2aRoleAgent, Parts: textParts(p.text), MessageID: p.id, TaskID: task.id, ContextID: task.contextID}, Kind: a2aKindMessage})
 	}
 	var artifacts []lib.Artifact
-	if state == lib.StateCompleted && task.delivered {
+	if state == lib.StateCompleted && task.delivered && !task.resultEvicted {
 		// The deliverable the relay handed over whole (TaskDelivered); the
 		// posts are the same text in chat-sized chunks and stay history.
 		// One artifact, named as the bus names it. A completed task the
@@ -1295,6 +1377,9 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 	metadata := map[string]any{"backend": a2aBackend}
 	if task.resultCutFrom > 0 {
 		metadata["resultTruncatedFrom"] = task.resultCutFrom
+	}
+	if task.resultEvicted {
+		metadata["resultEvicted"] = true
 	}
 	if task.terminal {
 		metadata["terminalSource"] = string(task.source)
@@ -1317,7 +1402,7 @@ func (d *A2ADoor) messageObjectLocked(conv *a2aConversation, posts []a2aPost) *a
 		id = posts[len(posts)-1].id
 	}
 	return &a2aMessageObject{
-		Role: a2aRoleAgent, Parts: textParts(strings.Join(texts, "\n")), MessageID: id,
-		ContextID: conv.contextID, Kind: a2aKindMessage,
+		Message: lib.Message{Role: a2aRoleAgent, Parts: textParts(strings.Join(texts, "\n")), MessageID: id, ContextID: conv.contextID},
+		Kind:    a2aKindMessage,
 	}
 }
