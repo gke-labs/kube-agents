@@ -394,6 +394,7 @@ AUDIT_STATUS_BUSY = "busy"
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
+RULE_CALLER_FILE_ARGUMENT = "caller.file-argument"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -573,10 +574,6 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 # split would have been a control on some clusters and a comment on the rest.
 DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 
-# The fourth audience: the session pod. Same upgrade story as the a2a-chat
-# audience - unset means the role is never conferred.
-DEFAULT_CREDENTIAL_PROXY_SESSION_AUDIENCE = "kubeagents-credential-proxy-session"
-
 # The third audience: the A2A gateway. It posts through the same Chat API
 # passthrough as the legacy chat caller, but its event routes are its alone —
 # the legacy chat caller is the LLM-driven Hermes pod, and with a shared role
@@ -619,6 +616,43 @@ def executable_permitted(role: str, executable: str) -> bool:
     """Whether ``role`` may run ``executable`` through /v1/exec."""
     narrowed = ROLE_EXECUTABLES.get(role)
     return narrowed is None or executable in narrowed
+
+
+# Arguments the session role may not pass, per executable. The broker runs
+# every command in its own container, so a flag that names a file or a URL is
+# read by the BROKER - its content-workspace clones, its policy and state
+# files, any HTTP endpoint its open egress reaches - and kubectl's decoder
+# echoes an unrecognised document back on stderr. The shell owns those clones
+# and holds git and gh anyway; the session is the caller the narrowing exists
+# to keep off them. Short flags match as a prefix too (`-fx.yaml`), long ones
+# exactly or with `=`, so `--field-selector` is not `-f`.
+SESSION_REFUSED_ARGUMENT_FLAGS: dict[str, frozenset[str]] = {
+    "kubectl": frozenset({"-f", "--filename", "-k", "--kustomize", "-R", "--recursive"}),
+    "gcloud": frozenset({"--flags-file"}),
+}
+
+
+def session_argument_refusal(role: str, argv: list[str]) -> str | None:
+    """The refused flag a session caller passed, or None.
+
+    Only the session role is narrowed; every other role keeps the executor's
+    behaviour. Returns the flag as the table spells it, for the refusal
+    message and the audit line, never the value beside it.
+    """
+    if role != CALLER_ROLE_SESSION or not argv:
+        return None
+    refused = SESSION_REFUSED_ARGUMENT_FLAGS.get(argv[0])
+    if not refused:
+        return None
+    for argument in argv[1:]:
+        if argument == "--":
+            break
+        for flag in refused:
+            if argument == flag or argument.startswith(flag + "="):
+                return flag
+            if not flag.startswith("--") and argument.startswith(flag) and not argument.startswith("--"):
+                return flag
+    return None
 
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
@@ -6124,6 +6158,30 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": (
                         f"The {principal.role} caller may run only "
                         f"{', '.join(sorted(ROLE_EXECUTABLES[principal.role]))} through the credential proxy."
+                    ),
+                },
+            )
+            return
+        refused_flag = session_argument_refusal(principal.role, argv)
+        if refused_flag is not None:
+            LOGGER.warning(
+                "argument refused for role request_id=%s role=%s executable=%s flag=%s",
+                request_id,
+                principal.role,
+                _sanitize_for_logging(argv[0]),
+                refused_flag,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_FILE_ARGUMENT),
+            )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_CALLER_FILE_ARGUMENT,
+                    "message": (
+                        f"The {principal.role} caller may not pass {refused_flag}: it names a file or URL "
+                        "the credential proxy, not the session, would read."
                     ),
                 },
             )

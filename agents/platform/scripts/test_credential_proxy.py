@@ -2521,6 +2521,46 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(403, status)
         self.assertEqual("kubernetes.read-only", body["rule"])
 
+    def test_the_table_of_refused_arguments(self):
+        for role, argv, want in (
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"], "-f"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-f=https://example.invalid/x.yaml"], "-f"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-fx.yaml"], "-f"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "--filename", "x.yaml"], "--filename"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "--filename=x.yaml"], "--filename"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-k", "overlay/"], "-k"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "--kustomize", "overlay/"], "--kustomize"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "-R", "-f", "dir/"], "-R"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "diff", "--recursive", "--filename", "dir/"], "--recursive"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["gcloud", "compute", "instances", "list", "--flags-file=x.yaml"], "--flags-file"),
+            (credential_proxy.CALLER_ROLE_SESSION, ["gcloud", "compute", "instances", "list", "--flags-file", "x.yaml"], "--flags-file"),
+            # Reads with no file argument, and the long flags that merely start
+            # with the short one, pass.
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "pods", "--field-selector=status.phase=Running"], None),
+            (credential_proxy.CALLER_ROLE_SESSION, ["kubectl", "get", "pods", "-o", "wide"], None),
+            (credential_proxy.CALLER_ROLE_SESSION, ["gcloud", "projects", "list", "--format=json"], None),
+            # Other roles are untouched; the shell's clones are its own.
+            (credential_proxy.CALLER_ROLE_SHELL, ["kubectl", "get", "-f", "x.yaml"], None),
+            ("", ["kubectl", "get", "-f", "x.yaml"], None),
+        ):
+            with self.subTest(role=role, argv=argv):
+                self.assertEqual(want, credential_proxy.session_argument_refusal(role, argv))
+
+    def test_a_file_argument_from_a_session_is_refused_before_it_reaches_kubectl(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SESSION,
+                {"argv": ["kubectl", "get", "-f", "/etc/credential-proxy/policy.json"]},
+            )
+        self.assertEqual(403, status)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual(credential_proxy.RULE_CALLER_FILE_ARGUMENT, body["rule"])
+        self.assertIn("-f", body["message"])
+
+    def test_the_shell_still_passes_a_file_argument_to_kubectl(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]})
+        self.assertEqual(200, status, body)
+
     def test_the_shell_still_runs_git(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["git", "status"]})
         self.assertEqual(200, status, body)
