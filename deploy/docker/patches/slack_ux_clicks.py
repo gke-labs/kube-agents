@@ -47,17 +47,19 @@ answered by typing: someone replies ``apply Option B`` in the thread, the agent
 applies it, and the buttons are still there. So before such a click counts,
 the thread is read once, and if a person the adapter would answer (its own
 interactive authorization, the check the clicker passed, and its channel gate
-with the mention rule the click skips) has replied with one
-of the call to action's forms (``apply``, ``apply Option B``, ``apply B``, or
-a button's whole text, ``apply Option B: <that option's text>``; a colon before
-anything else is not one) since the buttons appeared, the buttons are replaced with "answered in the
-thread" and the click is dropped. The buttons appear when the alert is edited
+with the mention rule the click skips) has replied with one of the call to
+action's forms (``apply``, ``apply Option B``, ``apply B``, or a button's whole
+text, ``apply Option B: <that option's text>``; a colon before anything else
+is not one) since the buttons appeared, the buttons are replaced with
+"answered in the thread" and the click is dropped. Any option typed counts, not only the one
+clicked: a typed ``apply A`` drops a click on B, and the clicker sees only
+"answered in the thread", since the agent is already applying A and a second
+apply would run on top of it. The buttons appear when the alert is edited
 into its triage, so that edit's time, which the click's payload carries, is
 the start; a reply typed during the diagnosis does not count. The match is a
 heuristic: the agent reads a typed reply as free text, so this guesses what it
-will apply. A read, or one of the adapter's checks, that fails runs the click as if
-nothing had been typed.
-Other choice buttons are not checked.
+will apply. A read, or one of the adapter's checks, that fails runs the click
+as if nothing had been typed. Other choice buttons are not checked.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
 still runs, because the click was the user's answer.

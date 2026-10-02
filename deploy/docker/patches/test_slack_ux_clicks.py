@@ -628,6 +628,13 @@ class RuntimeTest(unittest.TestCase):
         self._incident(adapter, "Apply Option A")
         self.assertEqual(len(adapter.log), 2)
 
+    def test_a_typed_apply_of_another_option_drops_the_click_too(self):
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply A", "ts": "223.000"}])
+        self._incident(adapter, "Apply Option B")
+        self._drops(adapter)
+        update = adapter.log[1][1]
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], runtime.ANSWERED_IN_THREAD)
+
     def test_typed_apply_is_matched_after_a_leading_mention_and_in_any_case(self):
         for text in ("<@U0BOT> apply Option B", "  Apply option b"):
             with self.subTest(text=text):
