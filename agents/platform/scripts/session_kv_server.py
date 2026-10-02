@@ -1007,11 +1007,13 @@ def enabled_chat_platforms() -> list[str]:
     the run is still a 200, and the platform is named in the route's
     `undelivered` field. Read that rather than reading `relay`.
 
-    This is the third copy of this question in the tree, and the copies should
-    converge rather than a fourth being added: `platform_mcp_server
-    .get_enabled_platforms` is still keyed on the absent SLACK_BOT_TOKEN (#735
-    is open against it), and `chat_platforms.enabled_chat_platforms` answers it
-    for the Cluster Agent reconcile summary (#989).
+    This question is answered in more than one place, and the copies should
+    converge rather than another being added: `chat_platforms
+    .enabled_chat_platforms` answers it for the Cluster Agent reconcile summary
+    (#989) and, since #743, for `platform_mcp_server.send_notification`, whose
+    own local copy never read the managed scope at all. Deliberately not a
+    count — `agent_common_server` records that maintaining one has already gone
+    wrong twice.
 
     Converging on `chat_platforms` is now safe on the sources as well as on the
     ORDER and the per-platform resolution. This paragraph used to warn that it
