@@ -445,13 +445,13 @@ def _link_pairs(links: Iterable[Any]) -> list[tuple[str, str]]:
 
 
 def _safe_link_url(url: str) -> bool:
-    """Whether ``url`` may back a link: :data:`LINK_SCHEMES`, a host, no userinfo, no whitespace.
+    """Whether ``url`` may back a link: :data:`LINK_SCHEMES`, a host, no userinfo, no whitespace or unprintable character.
 
     In ``https://console.cloud.google.com@evil.example/`` the host is ``evil.example``, so a
     url with a user or password is refused, as is a ``\\`` in its host part, which a browser
     reads as ``/``. No longer than :data:`BUTTON_URL_MAX`, checked first.
     """
-    if len(url) > BUTTON_URL_MAX or any(char.isspace() for char in url):
+    if len(url) > BUTTON_URL_MAX or not url.isprintable() or any(char.isspace() for char in url):
         return False
     try:
         parts = urlsplit(url)
@@ -494,15 +494,16 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
     plain pass would strip markup a code span had kept. Links become inline
     ``<url|label>``, the url escaped by :func:`_link_url` so the link opens what
     its button opens; choices become one "Reply with one of:" line. Every label
-    is escaped, so none can mention anyone, and a ``*``, ``_`` or ``~`` left in the headline
-    that Slack would read as markup is dropped.
+    is escaped, so none can mention anyone. The headline keeps every character,
+    since one a code span kept can be part of a command; one holding a ``*``,
+    ``_`` or ``~`` that Slack would read as markup goes out without the bold.
     """
     parts: list[str] = []
     title = _clip((headline or "").strip(), HEADLINE_MAX)
-    # Markup left in the headline would end or nest inside the bold it is wrapped in.
-    title = FALLBACK_LIVE_MARKER.sub("", MD_ITALIC.sub(lambda m: m.group(1) or m.group(2), title)).strip()
     if title:
-        parts.append(f"*{_escape(title)}*")
+        # A marker in the headline would end or nest inside the bold it is wrapped in.
+        live = FALLBACK_LIVE_MARKER.search(title) or MD_ITALIC.search(title)
+        parts.append(_escape(title) if live else f"*{_escape(title)}*")
     pairs = _link_pairs(links)
     if pairs:
         parts.append(CHOICE_SEPARATOR.join(f"<{_link_url(url)}|{_escape(label)}>" for label, url in pairs))

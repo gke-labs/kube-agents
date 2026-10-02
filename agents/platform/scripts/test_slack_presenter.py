@@ -393,7 +393,8 @@ class ButtonsTest(unittest.TestCase):
         for url in ("https://user:pass@host.example/x", "https://console.cloud.google.com@evil.example/logs",
                     "javascript:alert(1)", "data:text/html,<b>x</b>", "slack://open", "mailto:a@b.example",
                     "ftp://p/x", "https://github.com\\@evil.example/", "https://p\\evil.example/",
-                    "https://p/x\n", "https://p /x", "https://", "https://[::1"):
+                    "https://p/x\n", "https://p /x", "https://", "https://[::1", "https://p/\x00x",
+                    "https://p/\x7fx", "https://p/\u200bx", "https://p\u200b.example/"):
             self.assertNotIn("url", sp._button("Logs", "kage.link.0", url=url), url)
         # A scheme is case-insensitive, so an upper-case one is kept as written.
         for url in ("https://console.cloud.google.com/logs?q=a", "HTTPS://P", "http://p/a@b", "https://p?by=@me",
@@ -424,12 +425,17 @@ class FallbackTextTest(unittest.TestCase):
         text = sp.fallback_text("h", links=[("Logs", "https://p/?q=a&lt;b")])
         self.assertIn("<https://p/?q=a&amp;lt;b|Logs>", text)
 
-    def test_markup_left_in_the_headline_is_dropped(self):
-        self.assertEqual(sp.fallback_text("It is *down* now"), "*It is down now*")
-        self.assertEqual(sp.fallback_text("~gone~ and _soft_ stuff"), "*gone and soft stuff*")
-        self.assertEqual(sp.fallback_text("Remove *.log,*.tmp"), "*Remove .log,.tmp*")
+    def test_a_headline_with_markup_keeps_every_character_and_loses_the_bold(self):
+        self.assertEqual(sp.fallback_text("It is *down* now"), "It is *down* now")
+        self.assertEqual(sp.fallback_text("~gone~ and _soft_ stuff"), "~gone~ and _soft_ stuff")
+        self.assertEqual(sp.fallback_text("Remove *.log,*.tmp"), "Remove *.log,*.tmp")
         for headline in ("__init__.py is missing.", "Scale replicas 2*3 → 6", "DB_HOST is unset"):
             self.assertEqual(sp.fallback_text(headline), f"*{headline}*")
+
+    def test_a_command_a_code_span_kept_reaches_the_fallback_whole(self):
+        headline, _body = sp.split_answer("Run `rm -rf ~/x*` here.")
+        self.assertEqual(headline, "Run rm -rf ~/x* here.")
+        self.assertEqual(sp.fallback_text(headline), "Run rm -rf ~/x* here.")
 
 
 class LinkAckTest(unittest.TestCase):
