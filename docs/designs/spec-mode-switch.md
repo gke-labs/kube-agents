@@ -141,7 +141,7 @@ default posture). Until then, flipping it is a `kubectl patch` on the PlatformAg
 Helm 3's three-way merge leaves fields the chart never sets alone, so a patched mode
 should survive chart upgrades.
 
-## One thing inside `next` has its own switch
+## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
 when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`. That is not a
@@ -165,7 +165,7 @@ broker, read-only in verbs, and with the broker's permissions: under a `custom` 
 with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
 data, as
 [credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
-says of the platform agent. Operator-level for the reason above: the pod executes model output, and
+says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
 widening its fence is a property of who deployed the operator. It is a demo aid until
 declarative profiles carry a session's identity and tools, and it goes when they do.
 

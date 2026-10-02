@@ -466,8 +466,9 @@ class C1IsolationIsStructural(unittest.TestCase):
     def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
         """The premise the fence's rule set rests on.
 
-        The fence grants DNS, the bus and LiteLLM and nothing else -- no
-        API-server rule, no 443, no metadata rule beyond DNS -- and that is
+        The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
+        the operator's cluster-view flag, the credential broker on its one
+        port) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
 

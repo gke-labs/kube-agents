@@ -2431,7 +2431,7 @@ within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
-([spec-mode-switch.md](spec-mode-switch.md#one-thing-inside-next-has-its-own-switch) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 

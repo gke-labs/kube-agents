@@ -95,7 +95,7 @@ The broker authenticates every caller. A caller presents an audience-bound proje
 token (one hour; the audience is per pod: `kubeagents-credential-proxy` for the sandbox,
 `kubeagents-credential-proxy-chat` for the gateway, and, under the operator's
 `A2A_SESSION_CLUSTER_VIEW` flag, `kubeagents-credential-proxy-session` for the session pods,
-bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#one-thing-inside-next-has-its-own-switch) describes)
+bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes)
 as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path on that listener but `/healthz`;
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP

@@ -224,7 +224,7 @@ runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLE
 That list names the gateway's ServiceAccount and the sandbox's (and, under the
 operator's `A2A_SESSION_CLUSTER_VIEW` flag, a third, the session pods', bound to
 the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#one-thing-inside-next-has-its-own-switch)) and does not vary
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)) and does not vary
 on which one presented the token — the audience and the route table it feeds do —
 so the allowlist itself keeps other workloads out rather than telling those two
 apart. The token crosses the cluster network in cleartext;
