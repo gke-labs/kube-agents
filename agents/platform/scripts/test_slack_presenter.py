@@ -18,6 +18,9 @@ import slack_presenter as sp
 #: A run of this many backticks took 7 seconds while a code span's closing run was
 #: searched for once per possible opening length.
 BACKTICK_REPEATS = 20_000
+#: 40 KB of an unclosed ``**`` opener (Slack's message ceiling) took 3 seconds while a bold
+#: body could run past later markers; ``[a`` repeated took as long through the link pattern.
+MARKUP_REPEATS = 10_000
 
 
 class FlagTest(unittest.TestCase):
@@ -186,6 +189,14 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(body, ["Raise the limit."])
         self.assertEqual(sp.fallback_text(headline), "*Checkout is down.*")
 
+    def test_italic_around_the_first_sentence_leaves_no_stray_markers(self):
+        for marker in ("*", "_"):
+            headline, body = sp.split_answer(f"{marker}It is down. Restart it.{marker}")
+            self.assertEqual(headline, "It is down.")
+            self.assertEqual(body, [f"{marker}Restart it.{marker}"])
+            self.assertEqual(sp.fallback_text(headline), "*It is down.*")
+        self.assertEqual(sp.split_answer("Use *one* of them. Next *two*."), ("Use one of them.", ["Next *two*."]))
+
     def test_an_in_word_double_marker_is_not_rebalanced_as_bold(self):
         headline, body = sp.split_answer("The env var DB__HOST is unset. Pods crashloop.")
         self.assertEqual(headline, "The env var DB__HOST is unset.")
@@ -223,6 +234,27 @@ class SplitAnswerTest(unittest.TestCase):
                 started = time.monotonic()
                 lay_out(line)
                 self.assertLess(time.monotonic() - started, 0.5, lay_out.__name__)
+
+    def test_unclosed_bold_and_link_openers_stay_linear(self):
+        for line in ("**a " * MARKUP_REPEATS, "__a " * MARKUP_REPEATS, "[a" * (2 * MARKUP_REPEATS)):
+            for lay_out in (sp.split_answer, sp._plain):
+                started = time.monotonic()
+                lay_out(line)
+                self.assertLess(time.monotonic() - started, 0.5, lay_out.__name__)
+
+    def test_a_nul_in_the_answer_cannot_name_a_code_span(self):
+        self.assertEqual(sp.split_answer("a \x005\x00 b. c"), ("a 5 b. c", []))
+        self.assertEqual(sp._plain("`x` \x000\x00 and \x009\x00"), "x 0 and 9")
+
+    def test_an_unmatched_backtick_run_is_literal(self):
+        self.assertEqual(sp.split_answer("Run ```a` now. Next."), ("Run ```a` now.", ["Next."]))
+
+    def test_known_wrong_sentence_ends(self):
+        # Pinned as they are, not as they should be: "no" and "max" are abbreviations here,
+        # "Mr." is not, and a closing quote or parenthesis does not end a sentence.
+        for line in ("The answer is no. Pods are fine.", "Set replicas to max. Then wait.", 'Done.) Next.', 'Done." Next.'):
+            self.assertEqual(sp.split_answer(line), (line, []))
+        self.assertEqual(sp.split_answer("Mr. Smith says hi. Next."), ("Mr.", ["Smith says hi. Next."]))
 
     def test_plain_leaves_code_spans_and_globs_alone(self):
         self.assertEqual(sp._plain("`__init__.py` is missing"), "__init__.py is missing")
@@ -289,6 +321,27 @@ class ButtonsTest(unittest.TestCase):
         self.assertLessEqual(len(button["text"]["text"]), sp.BUTTON_TEXT_MAX)
         self.assertEqual(button["value"], "word " * 40)
 
+    def test_a_url_past_slacks_limit_is_dropped(self):
+        url = "https://x/" + "a" * (sp.BUTTON_URL_MAX - len("https://x/"))
+        self.assertEqual(sp._button("Logs", "kage.link.0", url=url)["url"], url)
+        self.assertNotIn("url", sp._button("Logs", "kage.link.0", url=url + "a"))
+
+    def test_only_an_http_url_without_userinfo_reaches_a_button(self):
+        # The host of https://console.cloud.google.com@evil.example/ is evil.example.
+        for url in ("https://user:pass@host.example/x", "https://console.cloud.google.com@evil.example/logs",
+                    "javascript:alert(1)", "data:text/html,<b>x</b>", "slack://open", "mailto:a@b.example",
+                    "ftp://p/x", "https://github.com\\@evil.example/", "https://p\\evil.example/",
+                    "https://p/x\n", "https://p /x", "https://", "https://[::1"):
+            self.assertNotIn("url", sp._button("Logs", "kage.link.0", url=url), url)
+        # A scheme is case-insensitive, so an upper-case one is kept as written.
+        for url in ("https://console.cloud.google.com/logs?q=a", "HTTPS://P", "http://p/a@b", "https://p?by=@me",
+                    "https://p/#@x"):
+            self.assertEqual(sp._button("Logs", "kage.link.0", url=url)["url"], url)
+
+    def test_a_link_with_an_unsafe_url_is_dropped_from_the_fallback(self):
+        links = [("a", "javascript:alert(1)"), ("b", "https://github.com@evil.example/x"), ("c", "https://p/a@b")]
+        self.assertEqual(sp.fallback_text("h", links=links), "*h*\n<https://p/a@b|c>")
+
 
 class FallbackTextTest(unittest.TestCase):
     def test_same_layout_as_mrkdwn(self):
@@ -308,6 +361,13 @@ class FallbackTextTest(unittest.TestCase):
     def test_an_entity_in_a_link_url_is_kept_as_written(self):
         text = sp.fallback_text("h", links=[("Logs", "https://p/?q=a&lt;b")])
         self.assertIn("<https://p/?q=a&amp;lt;b|Logs>", text)
+
+    def test_markup_left_in_the_headline_is_dropped(self):
+        self.assertEqual(sp.fallback_text("It is *down* now"), "*It is down now*")
+        self.assertEqual(sp.fallback_text("~gone~ and _soft_ stuff"), "*gone and soft stuff*")
+        self.assertEqual(sp.fallback_text("Remove *.log,*.tmp"), "*Remove .log,.tmp*")
+        for headline in ("__init__.py is missing.", "Scale replicas 2*3 → 6", "DB_HOST is unset"):
+            self.assertEqual(sp.fallback_text(headline), f"*{headline}*")
 
 
 class LinkAckTest(unittest.TestCase):
