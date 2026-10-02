@@ -6,6 +6,11 @@ design moves what it does with a new stall from filing a kanban card itself to s
 detector already use. The Cluster Agent still runs `gke-stall-detection`; what changes is where its
 report lands and whether a reply to it can be acted on.
 
+> **Status:** partly implemented. The Session KV server accepts and triages `controller-stall`
+> injects, and `autoops-controller-stall-triage` covers that path. The stall watch still files its
+> own Cluster Agent cards; the producer half of §2 and §3.1–§3.3 describe the change that moves it
+> onto the inject path.
+
 ## 1. Why
 
 Before this design, `stall_watch.py` filed a card straight to the cluster's Cluster Agent and
