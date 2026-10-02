@@ -4291,6 +4291,60 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         # Helper must only execute once: waiter queued during the failure raises without re-running
         self.assertEqual(len(calls), 1)
 
+    def test_concurrent_refreshes_for_different_orgs_do_not_share_failure(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+
+        def execute_side_effect(argv, cwd=None):
+            calls.append(list(argv))
+            if "org-alpha/repo-a" in argv:
+                started_event.set()
+                time.sleep(0.05)
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="Minty unavailable for alpha",
+                    duration_ms=50,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="org-beta/repo-b\n",
+                stderr="",
+                duration_ms=10,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = execute_side_effect
+        results = {}
+
+        def worker(repo):
+            try:
+                executor.refresh_forge_credential("github", repo)
+                results[repo] = "ok"
+            except Exception as e:
+                results[repo] = e
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            t1 = threading.Thread(target=worker, args=("org-alpha/repo-a",))
+            t2 = threading.Thread(target=worker, args=("org-beta/repo-b",))
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        # Worker 1 failed with helper error; Worker 2 succeeded for its own org
+        self.assertIsInstance(results["org-alpha/repo-a"], RuntimeError)
+        self.assertEqual(results["org-beta/repo-b"], "ok")
+        # Helper ran twice: once for alpha (which failed) and once for beta (which succeeded)
+        self.assertEqual(len(calls), 2)
+
     def test_coalesces_subsequent_refresh_within_coalesce_window(self):
         executor = credential_proxy.CommandExecutor.__new__(
             credential_proxy.CommandExecutor

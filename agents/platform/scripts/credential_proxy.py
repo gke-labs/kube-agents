@@ -3880,7 +3880,7 @@ class CommandExecutor:
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
         self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
-        self._last_forge_refresh_failure: dict[str, tuple[float, Exception]] = {}
+        self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -4446,7 +4446,7 @@ class CommandExecutor:
         return self._last_forge_refresh
 
     @property
-    def _refresh_failure_cache(self) -> dict[str, tuple[float, Exception]]:
+    def _refresh_failure_cache(self) -> dict[tuple[str, str], tuple[float, Exception]]:
         if getattr(self, "_last_forge_refresh_failure", None) is None:
             self._last_forge_refresh_failure = {}
         return self._last_forge_refresh_failure
@@ -4468,6 +4468,8 @@ class CommandExecutor:
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
         clean_repo = repository.strip().lower()
+        org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
+        failure_key = (provider, org)
         queued_at = time.monotonic()
         with self._refresh_lock:
             now = time.monotonic()
@@ -4476,7 +4478,7 @@ class CommandExecutor:
                 last_refresh, cached_scoped = current
                 if clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
                     return
-            failure = self._refresh_failure_cache.get(provider)
+            failure = self._refresh_failure_cache.get(failure_key)
             if failure is not None:
                 failed_at, exc = failure
                 if failed_at >= queued_at:
@@ -4488,9 +4490,11 @@ class CommandExecutor:
                 # stale entry would coalesce the next caller onto a token that
                 # is not theirs.
                 self._refresh_cache.pop(provider, None)
-                self._refresh_failure_cache[provider] = (time.monotonic(), e)
+                is_timeout = isinstance(e, TimeoutError) or "timed out" in str(e).lower()
+                if not is_timeout:
+                    self._refresh_failure_cache[failure_key] = (time.monotonic(), e)
                 raise
-            self._refresh_failure_cache.pop(provider, None)
+            self._refresh_failure_cache.pop(failure_key, None)
             scoped = frozenset(
                 line.strip().lower()
                 for line in (result.stdout or "").splitlines()
