@@ -227,7 +227,10 @@ required phrase that was never reported and false-fails a forbidden one that onl
 in quoted material. `worker_commands` reads the route a worker took through its terminal
 commands, not its MCP tool calls, and only for cards the run delegated — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. What it reads is the one-line rendering hermes writes to the card log, not the command
+as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
+command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
+chained behind another. `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,

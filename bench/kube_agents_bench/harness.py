@@ -272,7 +272,10 @@ _ARCHIVED_PREFIX = "Archived "
 _LOG_EXCERPT_CHARS = 200
 # One terminal command per line in a card's worker log, as hermes renders it:
 # ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
-# are stripped; the command is kept verbatim otherwise.
+# are stripped; the rendering is kept verbatim otherwise, and it is hermes's
+# one-line summary of the command rather than the text as typed (a chain
+# arrives as its first command plus `` + N command(s)``; the verifier's
+# docstring lists the rest).
 _WORKER_COMMAND_RE = re.compile(
     r"💻 \$\s+(?P<command>.+?)(?:\s+\d+(?:\.\d+)?s(?: \[exit \d+\])?)?\s*$"
 )

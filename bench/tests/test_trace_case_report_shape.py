@@ -83,6 +83,18 @@ PASTED_BREAKDOWN_REPORT = (
     "```\n"
 )
 
+# The id on a heading or a bold line of its own, a blank line, then the
+# first row of a table or a list: ordinary Markdown for a per-trace section,
+# which puts the share two lines below the id.
+HEADING_BREAKDOWN_REPORTS = [
+    "### Trace 0384e171d360c91c96df3124562dcc59\n\n"
+    "| Total duration | Spans | Slowest span | Share |\n|---|---|---|---|\n"
+    "| 2.590s | 1 | `api.model-default` | 100.0% |",
+    "**Trace 0384e171d360c91c96df3124562dcc59**\n\n"
+    "- Total duration: 2.590s (1 span)\n"
+    "- Slowest span: `api.model-default`, 2.590s, 100.0% of the trace",
+]
+
 # One row in each shape the three recorded green runs wrote: a Markdown
 # table row, a bullet naming the total, and a console link around the id.
 RECORDED_ROW_REPORTS = [
@@ -124,7 +136,7 @@ def test_a_stray_id_beside_a_percentage_fails_the_breakdown_check():
 
 
 @pytest.mark.parametrize(
-    "report", [BREAKDOWN_REPORT, PASTED_BREAKDOWN_REPORT, *RECORDED_ROW_REPORTS]
+    "report", [BREAKDOWN_REPORT, PASTED_BREAKDOWN_REPORT, *HEADING_BREAKDOWN_REPORTS, *RECORDED_ROW_REPORTS]
 )
 def test_the_helpers_breakdown_passes_every_objective_check(report):
     transcript.set(report, [])
