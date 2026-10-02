@@ -701,6 +701,30 @@ class GetChatUsersTest(unittest.TestCase):
                 self.assertEqual("", out)
                 self.assertIn("did not return a JSON list", err)
 
+    def test_the_helper_waits_longer_than_the_brokers_command_deadline_and_slot_wait(self):
+        # Read from the broker's source rather than imported, as the relay
+        # helpers' test does for API_RELAY_DEADLINE_S: the broker's deadline
+        # runs from when the command starts, after up to the slot wait in its
+        # queue, while the helper's clock starts before the shim connects, so
+        # a timeout at or below the sum fires first and the broker's answer,
+        # its output or its own timeout notice, never reaches the helper.
+        broker = (Path(credential_proxy_client.__file__).with_name("credential_proxy.py")).read_text(encoding="utf-8")
+        deadline = re.search(r'os\.getenv\("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "(\d+)"\)', broker)
+        self.assertIsNotNone(deadline, "the broker's CREDENTIAL_PROXY_TIMEOUT_SECONDS default was not found")
+        slot_wait = re.search(r"^COMMAND_SLOT_WAIT_SECONDS = (\d+)$", broker, re.MULTILINE)
+        self.assertIsNotNone(slot_wait, "the broker's COMMAND_SLOT_WAIT_SECONDS was not found")
+        self.assertGreater(get_chat_users.GCLOUD_TIMEOUT_SECONDS, int(deadline.group(1)) + int(slot_wait.group(1)))
+
+    def test_a_read_the_broker_never_answers_names_the_broker_and_exits_one(self):
+        expired = subprocess.TimeoutExpired(cmd=["gcloud"], timeout=get_chat_users.GCLOUD_TIMEOUT_SECONDS)
+        with patch.object(get_chat_users.subprocess, "run", side_effect=expired) as run_mock:
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.GCLOUD_TIMEOUT_SECONDS, run_mock.call_args.kwargs["timeout"])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertEqual("", out)
+        self.assertIn("credential broker did not answer", err)
+        self.assertIn(f"{get_chat_users.GCLOUD_TIMEOUT_SECONDS}s", err)
+
     def test_an_empty_read_is_an_empty_count(self):
         with patch.object(get_chat_users.subprocess, "run", return_value=self.completed(stdout="[]")):
             code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
