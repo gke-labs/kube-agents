@@ -391,7 +391,7 @@ class ButtonsTest(unittest.TestCase):
     def test_a_url_past_slacks_limit_is_dropped(self):
         url = "https://x/" + "a" * (sp.BUTTON_URL_MAX - len("https://x/"))
         self.assertEqual(sp._button("Logs", "kage.link.0", url=url)["url"], url)
-        self.assertNotIn("url", sp._button("Logs", "kage.link.0", url=url + "a"))
+        self.assertIsNone(sp._button("Logs", "kage.link.0", url=url + "a"))
 
     def test_only_an_http_url_without_userinfo_reaches_a_button(self):
         # The host of https://console.cloud.google.com@evil.example/ is evil.example.
@@ -400,11 +400,20 @@ class ButtonsTest(unittest.TestCase):
                     "ftp://p/x", "https://github.com\\@evil.example/", "https://p\\evil.example/",
                     "https://p/x\n", "https://p /x", "https://", "https://[::1", "https://p/\x00x",
                     "https://p/\x7fx", "https://p/\u200bx", "https://p\u200b.example/"):
-            self.assertNotIn("url", sp._button("Logs", "kage.link.0", url=url), url)
+            self.assertIsNone(sp._button("Logs", "kage.link.0", url=url), url)
         # A scheme is case-insensitive, so an upper-case one is kept as written.
         for url in ("https://console.cloud.google.com/logs?q=a", "HTTPS://P", "http://p/a@b", "https://p?by=@me",
                     "https://p/#@x"):
             self.assertEqual(sp._button("Logs", "kage.link.0", url=url)["url"], url)
+
+    def test_a_refused_url_gives_no_link_button_and_no_link(self):
+        # A link button with no url still reads as a .link.<n> button: a click on it is acked and opens nothing.
+        refused, kept = "https://github.com@evil.example/x", "https://p/a"
+        self.assertIsNone(sp._button("Logs", "kage.link.0", url=refused))
+        rows = sp._actions([sp._button("Logs", "kage.link.0", url=refused), sp._button("Docs", "kage.link.1", url=kept)])
+        self.assertEqual([[(e["action_id"], e.get("url")) for e in r["elements"]] for r in rows], [[("kage.link.1", kept)]])
+        self.assertEqual(sp._actions([sp._button("Logs", "kage.link.0", url=refused)]), [])
+        self.assertEqual(sp.fallback_text("h", links=[("Logs", refused)]), "*h*")
 
     def test_a_link_with_an_unsafe_url_is_dropped_from_the_fallback(self):
         links = [("a", "javascript:alert(1)"), ("b", "https://github.com@evil.example/x"), ("c", "https://p/a@b")]

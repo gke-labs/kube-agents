@@ -1,8 +1,9 @@
 """Slack presentation for kube-agents: answer layout, buttons and reactions.
 
 Nothing here imports the Hermes gateway, the Slack SDK or the network, and
-every function is pure but :func:`ack_link_click`, the coroutine a caller
-registers to acknowledge a link-button click, so any process that posts to
+every function is pure but :func:`enabled`, which reads the environment, and
+:func:`ack_link_click`, the coroutine a caller registers to acknowledge a
+link-button click, so any process that posts to
 Slack can use it, and it can move with Slack ingress when it leaves the
 gateway. Its callers include the gateway patches for reactions
 (``slack_ux_reactions``, which the kanban notifier also reaches), incident
@@ -15,8 +16,9 @@ Everything a caller changes on screen is gated on :func:`enabled`, the
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
-answer; url link buttons and choice buttons, whose value is the label, are
-built by ``_button`` and wrapped into rows by ``_actions``; :func:`fallback_text`
+answer; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
+buttons, whose value the caller sets, are built by ``_button`` and wrapped into
+rows by ``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field.
 
@@ -401,7 +403,8 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     The headline is the first sentence of the first paragraph, as plain text
     capped at ``HEADLINE_MAX``. The rest of that paragraph and every later
     paragraph are the body sections, still markdown, in order. Empty input
-    gives ``("", [])``.
+    gives ``("", [])``, and an answer that opens with a code fence has no
+    headline: ``("", paragraphs)``.
     """
     paragraphs = _paragraphs((markdown or "").replace("\x00", ""))
     if not paragraphs:
@@ -467,21 +470,26 @@ def _safe_link_url(url: str) -> bool:
         return False
 
 
-def _button(label: str, action_id: str, *, url: str | None = None, value: str | None = None) -> dict:
-    """A Block Kit button; callers drop an unsafe url first, and the check here is the backstop."""
+def _button(label: str, action_id: str, *, url: str | None = None, value: str | None = None) -> dict | None:
+    """A button, or ``None`` for a ``url`` :func:`_safe_link_url` refuses. Callers drop an unsafe url
+    first and this is the backstop: a button with no url would still read as a link button, and a click
+    on it would open nothing. ``_actions`` skips ``None``."""
     button: dict = {
         "type": "button",
         "text": {"type": "plain_text", "text": _clip(label, BUTTON_TEXT_MAX), "emoji": True},
         "action_id": action_id,
     }
-    if url is not None and _safe_link_url(url):
+    if url is not None:
+        if not _safe_link_url(url):
+            return None
         button["url"] = url
     if value is not None:
         button["value"] = value[:BUTTON_VALUE_MAX]
     return button
 
 
-def _actions(buttons: Sequence[dict]) -> list[dict]:
+def _actions(buttons: Sequence[dict | None]) -> list[dict]:
+    buttons = [button for button in buttons if button is not None]
     return [
         {"type": "actions", "elements": list(buttons[i : i + BUTTONS_PER_ROW])}
         for i in range(0, len(buttons), BUTTONS_PER_ROW)
@@ -496,9 +504,10 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
     plain pass would strip markup a code span had kept. Links become inline
     ``<url|label>``, the url escaped by :func:`_link_url` so the link opens what
     its button opens; choices become one "Reply with one of:" line. Every label
-    is escaped, so none can mention anyone. The headline keeps every character,
-    since one a code span kept can be part of a command; one holding a ``*``,
-    ``_`` or ``~`` that Slack would read as markup goes out without the bold.
+    is escaped, so none can mention anyone. The headline loses no character but
+    to the ``HEADLINE_MAX`` clip, since one a code span kept can be part of a
+    command; one holding a ``*``, ``_`` or ``~`` that Slack would read as markup
+    goes out without the bold.
     """
     parts: list[str] = []
     title = _clip((headline or "").strip(), HEADLINE_MAX)
