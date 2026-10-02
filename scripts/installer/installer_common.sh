@@ -304,6 +304,12 @@ is_non_negative_integer() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+# LITELLM_REDACTION_IP_ACTION: what the gateway does with IP literals, the
+# chart's litellm.redaction.ip.action.
+is_valid_redaction_ip_action() {
+  [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
+}
+
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
@@ -410,6 +416,18 @@ is_truthy() {
   val="${val//[[:space:]]/}"
   case "$val" in
     [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A spelling is_truthy reads as true, or one that plainly means false. For a
+# security toggle whose off state must not be reachable by a typo.
+is_bool_spelling() {
+  is_truthy "${1:-}" && return 0
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Nn] | 0 | [Oo][Ff][Ff]) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -928,6 +946,65 @@ hcl_scope_block() {
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
     "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")" \
     "$(hcl_csv_list "$exclude_projects")" "$clusters"
+}
+
+# LITELLM_REDACTION_RULES, a JSON array of rule objects, as an HCL list for the
+# composition's litellm_redaction.rules. Shape only -- a list of objects whose
+# keys are name, pattern, literal and action, each a string; the name, the one
+# source and the action are the variable's validations. Strings are re-escaped
+# rather than copied: a regular expression may hold ${ or %{, which HCL would
+# read as a template. Prints nothing and returns 1, naming the key, on a value
+# it cannot use. Caller defines print_error.
+hcl_redaction_rules() {
+  local rules_json="${1:-}" out
+  if ! out="$(trap - ERR; printf '%s' "$rules_json" | python3 -c '
+import json, sys
+try:
+    rules = json.load(sys.stdin)
+except ValueError as e:
+    sys.exit(f"is not valid JSON ({e})")
+if not isinstance(rules, list):
+    sys.exit("must be a JSON array of rule objects")
+def hcl(s):
+    out = []
+    for ch in s:
+        if ch in "\\\"":
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return "\"" + "".join(out).replace("${", "$${").replace("%{", "%%{") + "\""
+items = []
+for i, rule in enumerate(rules):
+    if not isinstance(rule, dict):
+        sys.exit(f"entry {i} is not an object")
+    if "name" not in rule:
+        sys.exit(f"entry {i} has no name; every rule needs one")
+    unknown = sorted(set(rule) - {"name", "pattern", "literal", "action"})
+    if unknown:
+        sys.exit(f"entry {i} has unknown key(s) {unknown}; a rule takes name, pattern or literal, and action")
+    for key, value in rule.items():
+        if not isinstance(value, str):
+            sys.exit(f"entry {i}: {key} must be a string")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            sys.exit(f"entry {i}: {key} is not valid UTF-8 text (a lone \\u surrogate escape?)")
+    items.append("{ " + ", ".join(f"{k} = {hcl(v)}" for k, v in rule.items()) + " }")
+print("[" + ", ".join(items) + "]")
+' 2>&1)"; then
+    # To stderr: the caller runs this inside $(...), which would swallow it.
+    print_error "LITELLM_REDACTION_RULES ${out}. Fix it in install.env; the site's inference-gateway page shows the rule format." >&2
+    return 1
+  fi
+  printf '%s' "$out"
 }
 
 # Every SCOPE_FOLDERS and SCOPE_ORGANIZATIONS entry is a bare numeric ID, or
@@ -2792,6 +2869,27 @@ write_tfvars_from_state() {
   # terraform with a message naming neither the key nor the entry.
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
+  # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
+  # regenerate from install.env without install.sh's checks. A misspelt toggle
+  # is refused rather than read as off, which would forward requests
+  # unredacted while the file says otherwise. While it is off the other three
+  # keys are inert, as they are in the chart, and are neither read nor checked.
+  local redaction_enabled="${LITELLM_REDACTION_ENABLED:-$DEFAULT_LITELLM_REDACTION_ENABLED}"
+  if ! is_bool_spelling "$redaction_enabled"; then
+    print_error "LITELLM_REDACTION_ENABLED='${redaction_enabled}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  local redaction_ip_action="" redaction_rules="[]"
+  if is_truthy "$redaction_enabled"; then
+    redaction_ip_action="${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
+    if ! is_valid_redaction_ip_action "$redaction_ip_action"; then
+      print_error "LITELLM_REDACTION_IP_ACTION='${redaction_ip_action}' is not one of mask, pseudonym, off. Fix it in install.env."
+      return 1
+    fi
+    if [ -n "${LITELLM_REDACTION_RULES:-}" ]; then
+      redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
+    fi
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -2844,6 +2942,19 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    echo ""
+    echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
+    echo "# renders nothing into the chart while enabled is false."
+    if is_truthy "$redaction_enabled"; then
+      echo "litellm_redaction = {"
+      echo "  enabled     = true"
+      echo "  ip_action   = $(hcl_str "$redaction_ip_action")"
+      echo "  allow_cidrs = $(hcl_csv_list "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}")"
+      echo "  rules       = ${redaction_rules}"
+      echo "}"
+    else
+      echo "litellm_redaction = { enabled = false }"
+    fi
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"

@@ -52,7 +52,10 @@ install without the interview.
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
   `model_default_name` overrides the per-provider default model;
   `model_max_tokens` (default `0`, meaning none) sets the output-token budget
-  the gateway asks for on a request that names none.
+  the gateway asks for on a request that names none; `litellm_redaction`
+  (off by default) redacts every request body the gateway forwards to the
+  provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
+  `install.env`.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.

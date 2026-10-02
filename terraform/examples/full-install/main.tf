@@ -706,6 +706,19 @@ resource "helm_release" "kube_agents" {
           projectId = local.vertex_project
           location  = local.vertex_location
         }
+      } : {},
+      # Only while on, so an install that never turns redaction on renders the
+      # gateway ConfigMap, and its checksum, exactly as before. Unset rule keys
+      # are dropped: yamlencode writes them as null, which the chart refuses.
+      var.litellm_redaction.enabled ? {
+        redaction = {
+          enabled = true
+          ip = {
+            action     = var.litellm_redaction.ip_action
+            allowCidrs = var.litellm_redaction.allow_cidrs
+          }
+          rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
+        }
       } : {}
     )
     platformAgent = {

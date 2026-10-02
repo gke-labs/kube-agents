@@ -2083,6 +2083,443 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}
 }
 
+// TestCleanupA2AResumesAfterAMidPassErrorOnFullRender extends the single-role
+// failure of TestCleanupA2AResumesAfterAMidPassError to every single delete in
+// the entire teardown on a fully rendered A2A stack (#2216).
+//
+// If any delete in cleanupA2A fails, the subsequent cleanup pass must not
+// early-exit over remaining objects. In particular, the cluster-scoped
+// callout ClusterRoleBinding and provision Jobs must not outlive the
+// StatefulSet sentinel.
+func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	// First, measure how many deletes an unobstructed cleanup performs.
+	var deletes int
+	countCl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				deletes++
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	countR := &PlatformAgentReconciler{Client: countCl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, countCl, countR, next)
+	if _, err := countR.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if err := countR.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("unobstructed cleanup: %v", err)
+	}
+	if deletes == 0 {
+		t.Fatal("unobstructed cleanup performed 0 deletes; every case below would be vacuous")
+	}
+
+	for k := 1; k <= deletes; k++ {
+		t.Run(fmt.Sprintf("cleanup_dies_on_delete_%d_of_%d", k, deletes), func(t *testing.T) {
+			passDeletes, failAt := 0, k
+			var failedObj client.Object
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(next.DeepCopy()).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: fakeServerSideApplyInterceptors().Patch,
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						passDeletes++
+						if passDeletes == failAt {
+							failedObj = obj
+							return fmt.Errorf("injected: the cleanup dies on delete %d", failAt)
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				}).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+			theCalloutIsServing(t, ctx, cl, r, next)
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			// Pass 1 must fail on the injected error.
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+				t.Fatal("cleanup pass 1: want the injected error, got nil")
+			}
+
+			// Pass 2, unobstructed, must finish cleanup and not early-exit over remaining objects.
+			failAt = 0
+			if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+				t.Fatalf("cleanup pass 2: %v", err)
+			}
+
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+					return
+				}
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("a cleanup that died on delete %d (%T %s) leaves these after the resumed pass: %v\n"+
+					"The early exit stepped over them because the sentinel it keys on had already gone.",
+					k, failedObj, failedObj.GetName(), leftovers)
+			}
+		})
+	}
+}
+
+// TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender pins Shape 2 of #2216:
+// A render that died on write 4 (after writing calloutKeys Secret and authMap
+// ConfigMap, before writing config Secret or StatefulSet), followed by a
+// cleanup pass that deletes calloutKeys Secret and dies on deleting authMap
+// ConfigMap.
+func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	writes := 0
+	stopAt := 4
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				writes++
+				if writes == stopAt {
+					return fmt.Errorf("injected: render stopped at write %d", stopAt)
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				writes++
+				if writes == stopAt {
+					return fmt.Errorf("injected: render stopped at write %d", stopAt)
+				}
+				return fakeServerSideApplyInterceptors().Patch(ctx, c, obj, patch, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+		t.Fatal("render: want injected error, got nil")
+	}
+
+	authMap := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(next), Namespace: next.Namespace}, authMap); err != nil {
+		t.Fatalf("authMap was not created: %v", err)
+	}
+
+	failAuthMap := true
+	cleanupCl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapName(next) && failAuthMap {
+					return fmt.Errorf("injected: API server error deleting authmap")
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	for _, obj := range []client.Object{
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: next.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(next), Namespace: next.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(next), Namespace: next.Namespace}},
+	} {
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err == nil {
+			obj.SetResourceVersion("")
+			_ = cleanupCl.Create(ctx, obj)
+		}
+	}
+
+	r2 := &PlatformAgentReconciler{Client: cleanupCl, Scheme: scheme}
+	if err := r2.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+		t.Fatal("cleanup pass 1: want injected error, got nil")
+	}
+
+	failAuthMap = false
+	if err := r2.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("cleanup pass 2: %v", err)
+	}
+
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cleanupCl, func(kind, name string) {
+		if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+			return
+		}
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("authmap ConfigMap survived resumed cleanup: %v\n"+
+			"The early exit stepped over it because calloutKeys was deleted before authMap", leftovers)
+	}
+}
+
+// TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError pins
+// the invariant that an error deleting an owned callout ClusterRoleBinding
+// (such as a ValidatingAdmissionPolicy or RBAC restriction) halts cleanupA2A
+// before the NATS bus resources (Service, NetworkPolicy fences, config Secret)
+// and StatefulSet sentinel are deleted.
+//
+// The bus resources and StatefulSet sentinel must remain standing across failed
+// reconcile passes so that the running bus remains fenced and intact, and
+// subsequent reconciles continue driving teardown rather than early-exiting
+// and silently leaking the cluster-scoped tokenreviews/create grant behind (#2216 / #2226).
+func TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError(t *testing.T) {
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	crbName := a2aCalloutClusterRoleBindingName(next)
+	stsName := a2aNATSName(next)
+
+	refuseDelete := true
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if refuseDelete && (obj.GetObjectKind().GroupVersionKind().Kind == "ClusterRoleBinding" ||
+					(obj.GetName() == crbName && reflect.TypeOf(obj).Elem().Name() == "ClusterRoleBinding")) {
+					return errors.NewForbidden(rbacv1.Resource("clusterrolebindings"), crbName, fmt.Errorf("denied by validating admission policy"))
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, next)
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	// Verify StatefulSet and ClusterRoleBinding stand before cleanup.
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+		t.Fatalf("StatefulSet must exist before cleanup: %v", err)
+	}
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+		t.Fatalf("ClusterRoleBinding must exist before cleanup: %v", err)
+	}
+
+	// Pass 1: cleanup encounters the failure on the ClusterRoleBinding.
+	// Must return an error, and the StatefulSet MUST NOT have been deleted.
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+		t.Fatal("cleanup pass 1: want error, got nil")
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+		t.Fatalf("cleanup pass 1: NATS StatefulSet sentinel was deleted prematurely: %v", err)
+	}
+
+	// NATS bus resources must also still stand: Service, NetworkPolicy fences, and config Secret
+	// are not deleted when CRB delete halts teardown, ensuring NATS remains fenced and intact.
+	netpol := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSNetpolName(next), Namespace: next.Namespace}, netpol); err != nil {
+		t.Fatalf("cleanup pass 1: NATS NetworkPolicy fence was deleted prematurely: %v", err)
+	}
+	cfgSecret := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSConfigSecretName(next), Namespace: next.Namespace}, cfgSecret); err != nil {
+		t.Fatalf("cleanup pass 1: NATS config Secret was deleted prematurely: %v", err)
+	}
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}, svc); err != nil {
+		t.Fatalf("cleanup pass 1: NATS Service was deleted prematurely: %v", err)
+	}
+
+	// Pass 2: Failure persists on the subsequent reconcile pass.
+	// Because the StatefulSet sentinel is still standing, cleanupA2A enters
+	// teardown rather than early-exiting. It must fail again and the StatefulSet
+	// and bus resources must STILL stand.
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err == nil {
+		t.Fatal("cleanup pass 2 (persisted failure): want error, got nil early-exit")
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+		t.Fatalf("cleanup pass 2: NATS StatefulSet sentinel was deleted prematurely: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSNetpolName(next), Namespace: next.Namespace}, netpol); err != nil {
+		t.Fatalf("cleanup pass 2: NATS NetworkPolicy fence was deleted prematurely: %v", err)
+	}
+
+	// Now resolve the failure.
+	refuseDelete = false
+
+	// Pass 3: With the failure resolved, cleanupA2A completes cleanly.
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("cleanup pass 3 (cleared): %v", err)
+	}
+
+	// StatefulSet, ClusterRoleBinding, and bus resources must now all be gone.
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); !errors.IsNotFound(err) {
+		t.Errorf("cleanup pass 3: NATS StatefulSet survived: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); !errors.IsNotFound(err) {
+		t.Errorf("cleanup pass 3: ClusterRoleBinding survived: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSNetpolName(next), Namespace: next.Namespace}, netpol); !errors.IsNotFound(err) {
+		t.Errorf("cleanup pass 3: NATS NetworkPolicy fence survived: %v", err)
+	}
+
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+		if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+			return
+		}
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("cleanup pass 3 left unexpected residue: %v", leftovers)
+	}
+}
+
+// TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet pins the invariant
+// that an unowned or squatted callout ClusterRoleBinding does not prevent cleanupA2A
+// from deleting the NATS StatefulSet sentinel and completing teardown cleanly.
+//
+// An unowned binding is skipped (leaving it to its owner) rather than wedging
+// teardown, so the bus and all owned resources are deleted on pass 1, the foreign
+// binding remains untouched, and subsequent reconcile passes early-exit cleanly with nil.
+func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testing.T) {
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	crbName := a2aCalloutClusterRoleBindingName(next)
+	stsName := a2aNATSName(next)
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, next)
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	crb := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+		t.Fatalf("get ClusterRoleBinding: %v", err)
+	}
+	// Simulate an unowned / squatted ClusterRoleBinding by setting a foreign instance label.
+	crb.Labels[labelInstance] = "foreign-agent"
+	if err := cl.Update(ctx, crb); err != nil {
+		t.Fatalf("update ClusterRoleBinding label: %v", err)
+	}
+
+	// Verify StatefulSet exists before cleanup.
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); err != nil {
+		t.Fatalf("StatefulSet must exist before cleanup: %v", err)
+	}
+
+	// Pass 1: cleanupA2A must skip the unowned binding and complete cleanly (return nil).
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("cleanup pass 1: want nil (unowned binding skipped), got %v", err)
+	}
+
+	// The NATS StatefulSet MUST be deleted.
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: next.Namespace}, sts); !errors.IsNotFound(err) {
+		t.Errorf("cleanup pass 1: NATS StatefulSet survived: %v", err)
+	}
+
+	// The foreign ClusterRoleBinding must NOT have been deleted.
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+		t.Errorf("cleanup pass 1: foreign ClusterRoleBinding was deleted or errored: %v", err)
+	}
+	if crb.Labels[labelInstance] != "foreign-agent" {
+		t.Errorf("cleanup pass 1: foreign ClusterRoleBinding label modified: %v", crb.Labels[labelInstance])
+	}
+
+	// Pass 2: With the StatefulSet and other owned sentinels gone, cleanupA2A must early-exit
+	// cleanly with nil instead of wedging on the foreign ClusterRoleBinding.
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("cleanup pass 2 (subsequent reconcile): want nil early-exit, got %v", err)
+	}
+
+	// The foreign ClusterRoleBinding must still stand untouched.
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
+		t.Errorf("cleanup pass 2: foreign ClusterRoleBinding was deleted or errored: %v", err)
+	}
+}
+
+// TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding pins the invariant
+// that on CR deletion (handleDeletion), an unowned or squatted callout
+// ClusterRoleBinding is logged and skipped rather than wedging finalizer removal,
+// allowing PlatformAgent deletion to complete while leaving the foreign
+// binding untouched.
+func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Finalizers = []string{platformAgentFinalizer}
+	now := metav1.Now()
+	agent.DeletionTimestamp = &now
+
+	crbName := a2aCalloutClusterRoleBindingName(agent)
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: crbName,
+			Labels: map[string]string{
+				labelInstance: "foreign-agent",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent.DeepCopy(), crb.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	currentAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, currentAgent); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if _, err := r.handleDeletion(ctx, currentAgent); err != nil {
+		t.Fatalf("handleDeletion failed: %v", err)
+	}
+
+	// The foreign ClusterRoleBinding must still exist untouched.
+	gotCRB := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, gotCRB); err != nil {
+		t.Errorf("foreign ClusterRoleBinding was deleted or errored: %v", err)
+	}
+	if gotCRB.Labels[labelInstance] != "foreign-agent" {
+		t.Errorf("foreign ClusterRoleBinding label modified: %v", gotCRB.Labels[labelInstance])
+	}
+}
+
 // TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
