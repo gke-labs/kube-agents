@@ -1258,7 +1258,11 @@ class TestExecutePolicyBlocked(unittest.TestCase):
             raise http_error
 
         stderr = io.StringIO()
-        environ = {"CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path)}
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
                 with patch("sys.stderr", new=stderr):
