@@ -125,7 +125,7 @@ def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(c
     "invitation", [" Share your team's runbooks here anytime.", " Share your team's runbooks here any time."]
 )
 def test_an_invitation_promising_any_time_fails_the_invitation_check(case, invitation):
-    # Later turns have no runbook path to keep that promise.
+    # The greeting must not promise a runbook path the agent has not been given.
     assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
 
 
@@ -278,6 +278,10 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " Like many teams, we'll follow your runbooks.",
         " Most clusters look healthy, and happy to follow your runbooks.",
         " Like most teams, happy to follow your runbooks.",
+        " I'll help you follow your runbooks.",
+        " I'll make sure you get answers that follow your runbooks.",
+        " I can walk you through applying your runbooks.",
+        " I'll check with you, then follow your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
@@ -316,6 +320,7 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
     "promise",
     [
         " I'll stick to your runbooks.",
+        " I'll do my best to help your team follow its runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
     ],
 )
