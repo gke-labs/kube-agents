@@ -38,10 +38,17 @@ from _run_make import run_make  # noqa: E402
 
 REPO_ROOT = _HERE.parent
 
-#: A file in a directory that does not exist, so the sweep's `cd` fails before
-#: the per-file command runs at all. Cheaper than a file holding a deliberately
-#: failing test, and it exercises the same path out of the worker.
+#: A file in a directory that does not exist, so the worker's regular-file
+#: check fails before the per-file command runs at all. Cheaper than a file
+#: holding a deliberately failing test, and it exercises the same path out of
+#: the worker.
 MISSING_FILE = "nosuchdir/test_missing.py"
+#: A name nothing writes under the fixture directory: a path whose directory
+#: exists and whose file does not, which is the shape the `cd` would not catch.
+ABSENT_FILE = "test_absent.py"
+#: The old way to narrow a run, which the per-file sweep must refuse rather
+#: than accept and ignore.
+DIRS_OVERRIDE = "PYTHON_TEST_DIRS=tests/"
 #: The two fixture files `fixture_files` writes: one test that passes and one
 #: that fails, side by side in one directory, so a case can show that the
 #: failing one does not take its sibling down with it.
@@ -222,6 +229,22 @@ class SweepVerdictTest(unittest.TestCase):
             self.assertIn("Ran 1 test", red_block)
             self.assertIn("FAILED (failures=1)", red_block)
 
+    def test_a_path_that_is_not_a_file_is_named_in_failed(self):
+        # A directory, or a file that is not there, must not read green. Rooted
+        # at its dirname with its basename as the pattern, either collects
+        # nothing, and Python 3.11 exits 0 on an empty collection -- so the
+        # worker refuses the path before discovery runs and says why in the
+        # block. The directory is the old `PYTHON_TEST_DIRS=tests/` habit typed
+        # onto the new variable; the absent file is the shape a failing `cd`
+        # would never catch.
+        with fixture_files() as (green, _):
+            directory = os.path.dirname(green)
+            for path in (directory, os.path.join(directory, ABSENT_FILE)):
+                with self.subTest(path=path):
+                    done, failed = sweep([green, path], max(JOB_COUNTS), DISCOVER_MAKEFILE)
+                    self.assertEqual(path, failed, done.stdout + done.stderr)
+                    self.assertIn("not a file", _block(done.stdout, path))
+
 
 class DerivedDirectoriesTest(unittest.TestCase):
     def test_python_test_dirs_is_the_parents_of_python_test_files(self):
@@ -238,6 +261,28 @@ class DerivedDirectoriesTest(unittest.TestCase):
         dirs = {d.rstrip("/") for d in lines[DIRS_MARKER.rstrip(":")].split()}
         self.assertTrue(files, "PYTHON_TEST_FILES expanded to nothing")
         self.assertEqual({posixpath.dirname(f) for f in files}, dirs)
+
+    def test_a_command_line_python_test_dirs_is_refused(self):
+        # Derived means not an input. A command-line value would still beat the
+        # derivation, so the discovery test's wrapper would print it as the
+        # whole list while the sweep, which reads only PYTHON_TEST_FILES, ran
+        # every file: the caller asked for one directory and paid for the
+        # tree. Make refuses it at parse time, before any target runs, naming
+        # the variable that does narrow a run. PYTHON_TEST_FILES is set to one
+        # green file so that, were the guard missing, this would fail in a
+        # second on a passing sweep rather than after a run of the whole tree.
+        with fixture_files() as (green, _):
+            done = _run_make(
+                [
+                    "test-python",
+                    DIRS_OVERRIDE,
+                    f"PYTHON_TEST_FILES={green}",
+                    "PYTHON_TEST_IMPORTS=",
+                ]
+            )
+        self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertIn("PYTHON_TEST_FILES", done.stderr)
+        self.assertNotIn("==> ", done.stdout)
 
 
 class TestPythonExitStatusTest(unittest.TestCase):

@@ -212,6 +212,19 @@ PYTHON_TEST_FILES := $(sort \
 # what the discovery test reads.
 PYTHON_TEST_DIRS := $(sort $(dir $(PYTHON_TEST_FILES)))
 
+# Derived, so it is not an input. While the sweep ran per directory, a
+# command-line `PYTHON_TEST_DIRS=tests/` narrowed it to that directory. The
+# sweep now reads PYTHON_TEST_FILES and nothing else, so the same override
+# would still be accepted -- a command-line value beats the assignment above,
+# and the discovery test's wrapper would print it as the whole list -- while
+# both targets ran the full tree: the caller asks for one directory and
+# silently pays for every file. Refused instead, naming the variable that does
+# narrow a run. `file` is the origin the assignment above gives it; a command
+# line, an `override`, or `make -e` reads as anything else.
+ifneq ($(origin PYTHON_TEST_DIRS),file)
+$(error PYTHON_TEST_DIRS is derived from PYTHON_TEST_FILES and the sweep does not read it; narrow a run with PYTHON_TEST_FILES instead, for example PYTHON_TEST_FILES="$$(ls tests/test_*.py)")
+endif
+
 # What both callers of the sweep below -- test-python and coverage -- export as
 # PYTHONPATH, prepended to whatever the caller already has. Declared once
 # because the two had already drifted: coverage exported only $(CURDIR), so it
@@ -275,6 +288,13 @@ PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 # shards make likelier than the old loop did -- would silently drop a red file
 # and let the gate pass. Absence has to mean failure, not success.
 #
+# The worker refuses a path that is not a regular file before discovery runs.
+# A directory, or a file that is not there, would otherwise reach `discover -p`
+# as a pattern that matches nothing, and Python 3.11 exits 0 on an empty
+# collection: the shard reads green having run nothing. The globs above only
+# ever produce files that exist; a hand-typed PYTHON_TEST_FILES=tests/, the
+# old per-directory habit on the new variable, is how such a path arrives.
+#
 # $(1) is interpolated into a single-quoted sh -c string, so it must not contain
 # a single quote. It also must not contain a comma: $(call) splits arguments on
 # commas before the body ever sees them, so `python3 -c "import os, sys"` would
@@ -288,7 +308,8 @@ printf '%s\n' $(PYTHON_TEST_FILES) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
 	dir="$$(dirname "$$file")"; \
 	name="$$(basename "$$file")"; \
 	stem="$$work/$$(printf "%s" "$$file" | tr "/" "_")"; \
-	if (cd "$$dir" && $(1) -p "$$name") >"$$stem.log" 2>&1; then \
+	if ( [ -f "$$file" ] || { echo "not a file: $$file"; exit 1; }; \
+	     cd "$$dir" && $(1) -p "$$name" ) >"$$stem.log" 2>&1; then \
 		rc=0; printf "    ok  %s\n" "$$file"; \
 	else \
 		rc=1; printf "  FAIL  %s\n" "$$file"; \
