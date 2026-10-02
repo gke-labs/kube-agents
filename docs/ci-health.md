@@ -683,7 +683,9 @@ the fleet owner, labelled `presubmit-gate`: `Seeded fleet drift:
 crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM
 ET`, with the roles, per project the assertion and what was observed, the
 window, the evidence, and the reconcile — re-apply `bench/tf/fleet` in each
-project named (`bench/tf/fleet/README.md`, "State and reconcile") — and the
+project named (`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
+drift where an in-cluster heal started the container, hand-delete the pod in `seeded-stall`
+and replace the Deployment if the condition persists) — and the
 line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
