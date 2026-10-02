@@ -206,6 +206,9 @@ describe("App finds its bus", () => {
     render(<App />);
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toContain("503: no console credential at /var/run/secrets/a2a-console/console-password");
+    expect(alert.textContent).not.toContain("Error:");
+    expect(screen.getByText(/has no credential yet/)).toBeTruthy();
+    expect(screen.queryByText(/port-forward svc\/platform-agent-a2a-console/)).toBeNull();
     expect(startBus).not.toHaveBeenCalled();
   });
 

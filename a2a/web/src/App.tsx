@@ -61,6 +61,14 @@ function initialStage(): Stage {
   return namedUser !== null ? { kind: "unconfigured", error: null, namedUser } : { kind: "looking" };
 }
 
+/**
+ * An error's own message.  `String(error)` prefixes "Error: ", which hides the
+ * server's "503:" from NotConnected's missing-credential check.
+ */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function App() {
   const [state, dispatch] = useReducer(reduce, initialState);
   const [stage, setStage] = useState<Stage>(initialStage);
@@ -99,7 +107,7 @@ export default function App() {
         );
       },
       (error: unknown) => {
-        if (!cancelled) setStage({ kind: "unconfigured", error: String(error), namedUser: null });
+        if (!cancelled) setStage({ kind: "unconfigured", error: errorText(error), namedUser: null });
       },
     );
     return () => {
@@ -141,7 +149,7 @@ export default function App() {
           // No retry on reload with the same bad config. Retry goes back to
           // the server, which is what fixing a port-forward wants.
           clearConfig();
-          setStage({ kind: "unconfigured", error: String(error), namedUser: null });
+          setStage({ kind: "unconfigured", error: errorText(error), namedUser: null });
         }
       }
     })();
