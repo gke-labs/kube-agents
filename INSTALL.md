@@ -97,9 +97,9 @@ Four behaviours worth knowing before the first run:
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
   reports it. It costs three GCP resources — a Log Router sink, a Pub/Sub topic and a pull
-  subscription — and it is the one default whose reach extends past this install: the sink exports
-  the admin-activity audit records of every GKE cluster in the project, including clusters this
-  install does not manage, and the subscription retains them for 31 days. Opt out with
+  subscription — and it reaches past the clusters this install manages: the sink exports the
+  admin-activity audit records of every GKE cluster in the project, including clusters this
+  install does not manage, and the subscription retains a copy of them for 31 days. Opt out with
   `ENABLE_DRIFT_DETECTOR=false` in `install.env` rather than the `--enable-drift-detector=false`
   flag, which applies to one run and is recorded nowhere. A second install in the same project
   names its own three (`TF_VAR_drift_pubsub_topic`, `_subscription`, `_sink`) or `lifecycle.sh`

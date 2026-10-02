@@ -178,18 +178,25 @@ the hazard is a hand edit that deletes a line rather than setting it to `false`.
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
 configuration first and real drift second.
 
-`ENABLE_DRIFT_DETECTOR` has the same sharp edge pointing the other way, because it is the
-one key here whose absence provisions. Other keys default to `true` in
-`install.defaults.env` — `ENABLE_GVISOR` is one, four paragraphs up — but
-`write_tfvars_from_state` falls back to `false` for those, which is what makes a missing
-line destroy. This key is the one it resolves against `install.defaults.env` instead. A full
+`ENABLE_DRIFT_DETECTOR` has the same sharp edge pointing the other way, because its absence
+provisions rather than destroys. Two things have to hold for that, and most keys fail one of
+them: `write_tfvars_from_state` has to resolve the key against `install.defaults.env` rather
+than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR`, in
+the paragraph above, clears the second and fails the first — it defaults to `true` and still
+destroys, because the generator hardcodes `${ENABLE_GVISOR:-false}`. `ENABLE_GKE_BACKUP_PLAN`,
+`ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
+second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
+re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving
+project. A full
 upgrade over an `install.env` written before the key existed adds the Log Router sink,
 Pub/Sub topic and subscription that carry the project's GKE audit records, and starts the
 detector that reads them. That is intended — running an installer is the consent — but it
 means opting out has to be a `ENABLE_DRIFT_DETECTOR=false` line in the file. A
 `--enable-drift-detector=false` flag applies to the run it is passed to and is recorded
 nowhere, so the next run resolves the default again, and `upgrade.sh` accepts no such flag
-at all; `install.sh` warns when you pass it over a file that does not carry the line.
+at all. `install.sh` warns when you pass that flag over a file that does not carry the line;
+an exported `ENABLE_DRIFT_DETECTOR=false` is just as unrecorded and currently warns about
+nothing, so the file is the only opt-out that survives the shell it was typed in.
 Setting it to `false` is still the one boolean `write_tfvars_from_state` omits rather than
 writing, so an install carrying a `TF_VAR_enable_drift_pubsub=true` line keeps its ingress
 and only loses the detector — a written `false` would outrank that line and take the sink,
