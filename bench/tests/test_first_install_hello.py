@@ -282,6 +282,8 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " I'll make sure you get answers that follow your runbooks.",
         " I can walk you through applying your runbooks.",
         " I'll check with you, then follow your runbooks.",
+        " Happy to help you follow your runbooks.",
+        " Glad to help you apply your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
@@ -321,6 +323,7 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
     [
         " I'll stick to your runbooks.",
         " I'll do my best to help your team follow its runbooks.",
+        " Let me help you use your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
     ],
 )
@@ -330,7 +333,8 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
     assert "no-runbook-promise" not in _failing(case, reply)
 
 
-# Known costs: after an I/we opener only other people clear the clause, so a "you" that is the subject of an embedded clause fails it too.
+# Known costs: after a first-person opener only other people clear the clause, so a "you" that is the subject of an
+# embedded clause fails it too, and a sentence-initial imperative to the reader reads as the promise.
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
     "aside",
@@ -339,6 +343,9 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " I'll share what you use runbooks for.",
         " I'll learn how you follow runbooks today.",
         " I can tell you use runbooks.",
+        " Happy to hear how you use runbooks.",
+        " Glad to learn whether you follow runbooks.",
+        " Use this chat for runbooks.",
     ],
 )
 def test_the_promise_safeguards_known_costs_fail_it(case, aside):
