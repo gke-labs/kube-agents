@@ -55,8 +55,9 @@ RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
 # those crash after the broker has already run the command. Nothing else is
 # installed; no native kubectl, gcloud, gh or git exist in this image, and the
 # guard below keeps it so. With the flag off the pod has no
-# CREDENTIAL_PROXY_URL and the shim refuses with that name. gh and git are deliberately not linked: the broker's session role
-# refuses them anyway, and a name that is not on PATH is a clearer answer.
+# CREDENTIAL_PROXY_URL and the shim refuses with that name. gh and git are
+# deliberately not linked: the broker's session role refuses them anyway, and
+# a name that is not on PATH is a clearer answer.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-yaml \
     && rm -rf /var/lib/apt/lists/* \
