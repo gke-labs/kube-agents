@@ -44,6 +44,7 @@ func TestRunMapsUsageErrorToExitUsage(t *testing.T) {
 func TestRunMapsDialFailureToExitFailure(t *testing.T) {
 	t.Setenv("NATS_URL", unreachableNATSURL)
 	t.Setenv("NATS_USER", "")
+	t.Setenv(apiServerKeyEnv, "loopback-key")
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	err := realMain(context.Background(), log)
 	if !errors.Is(err, nats.ErrNoServers) {
@@ -54,6 +55,25 @@ func TestRunMapsDialFailureToExitFailure(t *testing.T) {
 	}
 	if got := run(); got != exitFailure {
 		t.Errorf("run() = %d, want %d", got, exitFailure)
+	}
+}
+
+// The daemon's default executor is the API server's, which needs the pod's
+// key before it honours the session headers: a sidecar declared without it
+// fails at start, before the bus is dialled, rather than once per task. The
+// subprocess executor needs no key.
+func TestRunRefusesAPIExecutorWithoutKey(t *testing.T) {
+	t.Setenv("NATS_URL", unreachableNATSURL)
+	t.Setenv("NATS_USER", "")
+	t.Setenv(apiServerKeyEnv, "")
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	err := realMain(context.Background(), log)
+	if err == nil || errors.Is(err, nats.ErrNoServers) || !strings.Contains(err.Error(), "APIKey") {
+		t.Fatalf("realMain with no %s returned %v, want the missing-key refusal before any dial", apiServerKeyEnv, err)
+	}
+	t.Setenv("BRIDGE_EXECUTOR", "cli")
+	if err := realMain(context.Background(), log); !errors.Is(err, nats.ErrNoServers) {
+		t.Fatalf("realMain with BRIDGE_EXECUTOR=cli and no key returned %v, want the dial failure", err)
 	}
 }
 

@@ -92,8 +92,33 @@ type Config struct {
 	NATSURL string
 	// Profile is the addressee token the bridge executes for ("platform").
 	Profile string
-	// Command is the invocation prefix; the task prompt is appended as the
-	// final argument. Default: ["hermes", "-p", <profile>, "chat", "-Q", "-q"].
+	// Executor is how a task runs: ExecutorAPI posts it as a turn in the
+	// conversation's Hermes session through the pod's API server;
+	// ExecutorCLI spawns Command per task (api.go has the why). The zero
+	// value is ExecutorCLI, so a bridge under test calls no server it did
+	// not ask for; the daemon defaults to ExecutorAPI.
+	Executor string
+	// APIURL, APIKey and APIModel are the API executor's endpoint, bearer
+	// token (the pod's API_SERVER_KEY, which the server needs before it
+	// honours the session headers) and model name. URL and model default
+	// to DefaultAPIURL and DefaultAPIModel; the key has no default.
+	APIURL   string
+	APIKey   string
+	APIModel string
+	// APIConnectRetry is how long a refused connection to the API server is
+	// retried before the task ends hermes-api-unreachable; zero is
+	// DefaultAPIConnectRetry.
+	APIConnectRetry time.Duration
+	// ActivitySecret signs the API executor's hook deliveries: the pod's
+	// managed config carries one hooks.outbound entry for the whole
+	// gateway with secret_env A2A_ACTIVITY_SECRET, and the door attributes
+	// a delivery to a task by the session id in its payload. Empty leaves
+	// the API executor's tasks without a trace (the CLI executor's children
+	// carry their own per-task key either way).
+	ActivitySecret string
+	// Command is the CLI executor's invocation prefix; the task prompt is
+	// appended as the final argument. Default: ["hermes", "-p", <profile>,
+	// "chat", "-Q", "-q"].
 	Command []string
 	// Concurrency caps simultaneous hermes subprocesses (default 2, the
 	// platform profile's concurrency in the profiles spec).
@@ -147,6 +172,18 @@ func (c *Config) defaults() {
 		// box around the answer - stdout is the response.
 		c.Command = []string{"hermes", "-p", c.Profile, "chat", "-Q", "-q"}
 	}
+	if c.Executor == "" {
+		c.Executor = ExecutorCLI
+	}
+	if c.APIURL == "" {
+		c.APIURL = DefaultAPIURL
+	}
+	if c.APIConnectRetry <= 0 {
+		c.APIConnectRetry = DefaultAPIConnectRetry
+	}
+	if c.APIModel == "" {
+		c.APIModel = DefaultAPIModel
+	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
 	}
@@ -193,6 +230,9 @@ type taskRun struct {
 	state      runState
 	proc       *exec.Cmd
 	killTimers []*time.Timer
+	// cancelReq ends the API executor's request (api.go); nil outside one.
+	// Under mu like proc, which it is the counterpart of.
+	cancelReq context.CancelFunc
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -224,6 +264,9 @@ type Bridge struct {
 	queue chan *taskRun
 	wg    sync.WaitGroup
 
+	// turns serializes the API executor's turns per Hermes session (api.go).
+	turns sessionTurns
+
 	// closing marks shutdown, so a worker whose subprocess died to the
 	// shutdown SIGKILL reports bridge-shutdown, not a bogus exit code.
 	closing atomic.Bool
@@ -254,6 +297,8 @@ type Bridge struct {
 	// racing the timer.
 	holdReplaySlot func(release func())
 
+	// apiClient is the API executor's HTTP client (api.go).
+	apiClient *http.Client
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server
@@ -268,6 +313,15 @@ type Bridge struct {
 // New connects and sweeps but does not consume yet; Run does.
 func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	cfg.defaults()
+	switch cfg.Executor {
+	case ExecutorAPI:
+		if err := apiExecutorValid(&cfg); err != nil {
+			return nil, err
+		}
+	case ExecutorCLI:
+	default:
+		return nil, fmt.Errorf("unknown executor %q: %q or %q", cfg.Executor, ExecutorAPI, ExecutorCLI)
+	}
 	b := &Bridge{
 		cfg: cfg,
 		from: lib.Party{
@@ -278,6 +332,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		tasks:       make(map[string]*taskRun),
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
+		apiClient:   newAPIClient(),
 	}
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
@@ -370,6 +425,9 @@ func (b *Bridge) shutdownTasks() {
 		r.mu.Lock()
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
+		}
+		if r.state == stateRunning && r.cancelReq != nil {
+			r.cancelReq()
 		}
 		r.mu.Unlock()
 		b.finalize(r, lib.StateFailed, shutdownReason, nil)
@@ -478,6 +536,9 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	pending := run.state == statePending
 	if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {
 		b.killGroup(run, run.proc.Process.Pid)
+	}
+	if run.state == stateRunning && run.cancelReq != nil {
+		run.cancelReq()
 	}
 	run.mu.Unlock()
 	if pending {
@@ -745,6 +806,10 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
+	if b.cfg.Executor == ExecutorAPI {
+		b.runTaskAPI(ctx, run)
+		return
+	}
 	taskID := run.origin.TaskID
 	prompt, ok := promptFromMessage(run.origin.Payload)
 	if !ok {

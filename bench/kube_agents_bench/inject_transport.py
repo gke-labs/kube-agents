@@ -333,6 +333,10 @@ REASON_BUS_SUBSCRIBE_FAILED = "bus-subscribe-failed"
 # reserves for both). A quota storm is the install's, not the persona's: the
 # turn never got an answer to grade.
 REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
+# The bridge's api executor never reached the pod's Hermes API server: the
+# connection was still refused after the bridge's startup retry window. No
+# turn ran, so there is nothing to grade.
+REASON_HERMES_API_UNREACHABLE = "hermes-api-unreachable"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -343,14 +347,29 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_WORKER_EVICTED,
         REASON_BUS_SUBSCRIBE_FAILED,
         REASON_HERMES_RATE_LIMITED,
+        REASON_HERMES_API_UNREACHABLE,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
-# the bridge's own deadline. Listed for the record and the tests; an unknown
-# token lands in the same class, so nothing here is consulted to grade.
+# the bridge's own deadline; under the api executor, the API server answered
+# with an error, an unparseable completion, or a body that broke off mid-read
+# -- the turn's own failure, as a non-zero exit is for the subprocess. Listed
+# for the record and the tests; an unknown token lands in the same class, so
+# nothing here is consulted to grade.
 REASON_HERMES_EXITED_NONZERO = "hermes-exited-nonzero"
 REASON_DEADLINE_EXCEEDED = "deadline-exceeded"
-PERSONA_REASONS = frozenset({REASON_HERMES_EXITED_NONZERO, REASON_DEADLINE_EXCEEDED})
+REASON_HERMES_API_FAILED = "hermes-api-failed"
+REASON_HERMES_API_UNREADABLE = "hermes-api-unreadable"
+REASON_HERMES_API_READ_FAILED = "hermes-api-read-failed"
+PERSONA_REASONS = frozenset(
+    {
+        REASON_HERMES_EXITED_NONZERO,
+        REASON_DEADLINE_EXCEEDED,
+        REASON_HERMES_API_FAILED,
+        REASON_HERMES_API_UNREADABLE,
+        REASON_HERMES_API_READ_FAILED,
+    }
+)
 # The two canceled terminals. After this transport's own cancel the executor
 # answers canceled-by-request, which is the graded timeout; a task the bridge
 # cancelled out of its queue before ever spawning answers

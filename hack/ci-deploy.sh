@@ -180,6 +180,13 @@ readonly A2A_NATS_URL_FORMAT='nats://%s.%s.svc:%d'
 readonly A2A_CREDS_SECRET_NAME="${A2A_NATS_SERVICE_NAME}-creds"
 readonly A2A_BRIDGE_USER="bridge"
 readonly A2A_BRIDGE_PASSWORD_KEY="bridge-password"
+# The key that signs the agent's pod-wide tool-call hook, and the env both the
+# agent and the bridge read it from (a2aBridgeActivityKey and
+# a2aActivitySecretEnvVar). The operator adds it to the agent container only
+# once the sidecar is declared, so the copy of the agent's env below predates
+# it and the sidecar names it itself. Optional, as the operator renders it.
+readonly A2A_BRIDGE_ACTIVITY_KEY="bridge-activity-key"
+readonly BRIDGE_ACTIVITY_SECRET_ENV_VAR="A2A_ACTIVITY_SECRET"
 # The bridge's own env (a2a/cmd/hermes-bridge/main.go), the entrypoint switch
 # that keeps a second container of the agent image out of the shared tree
 # (deploy/shared/docker-entrypoint.sh, step 1.5; buildBaseContainers sets it
@@ -1234,10 +1241,10 @@ import sys
 
 (agent_container, sidecar, image, url_env, url, user_env, user, password_env,
  creds_secret, password_key, concurrency_env, concurrency, reserved_volume,
- shared_state_env, shared_state_value) = sys.argv[1:16]
+ shared_state_env, shared_state_value, activity_env, activity_key) = sys.argv[1:18]
 pod = json.load(sys.stdin)["spec"]["template"]["spec"]
 agent = next(c for c in pod["containers"] if c["name"] == agent_container)
-own = {url_env, user_env, password_env, concurrency_env, shared_state_env}
+own = {url_env, user_env, password_env, concurrency_env, shared_state_env, activity_env}
 env = [e for e in agent.get("env", []) if e["name"] not in own]
 env += [
     {"name": shared_state_env, "value": shared_state_value},
@@ -1245,6 +1252,7 @@ env += [
     {"name": user_env, "value": user},
     {"name": password_env, "valueFrom": {"secretKeyRef": {"name": creds_secret, "key": password_key}}},
     {"name": concurrency_env, "value": concurrency},
+    {"name": activity_env, "valueFrom": {"secretKeyRef": {"name": creds_secret, "key": activity_key, "optional": True}}},
 ]
 container = {
     "name": sidecar,
@@ -1322,7 +1330,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
       "${BRIDGE_NATS_PASSWORD_ENV_VAR}" "${A2A_CREDS_SECRET_NAME}" "${A2A_BRIDGE_PASSWORD_KEY}" \
       "${BRIDGE_CONCURRENCY_ENV_VAR}" "${MODE_NEXT_BRIDGE_CONCURRENCY}" \
       "${A2A_BUS_TOKEN_VOLUME}" \
-      "${AGENT_SHARED_STATE_SETUP_ENV_VAR}" "${AGENT_SHARED_STATE_SETUP_SKIP}")"
+      "${AGENT_SHARED_STATE_SETUP_ENV_VAR}" "${AGENT_SHARED_STATE_SETUP_SKIP}" \
+      "${BRIDGE_ACTIVITY_SECRET_ENV_VAR}" "${A2A_BRIDGE_ACTIVITY_KEY}")"
   # Names only, for the artifact: the copied env carries the agent's own
   # values, and a rendered Secret reference is a name either way.
   echo "Declaring the ${BRIDGE_SIDECAR_NAME} sidecar (${A2A_BRIDGE_URI}, ${BRIDGE_CONCURRENCY_ENV_VAR}=${MODE_NEXT_BRIDGE_CONCURRENCY}) with env:"

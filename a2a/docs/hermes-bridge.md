@@ -11,9 +11,11 @@
 The retargeted first wave routes every gateway task to the addressee `platform`, and
 nothing answers on that subject yet - the worker adapter (W4) fast-follows, and the
 dispatcher is stage 3. The bridge is the stand-in executor: a small Go daemon on
-`a2a/lib` that consumes tasks addressed to `platform`, runs
-`hermes -p platform chat -Q -q <prompt>` per task, and publishes the lifecycle events with
-the output as the `result` artifact and the persona's tool calls as `activity`. It is scaffolding with a planned demolition date:
+`a2a/lib` that consumes tasks addressed to `platform`, runs each as a turn in its
+conversation's Hermes session through the pod's API server (or, as the fallback, as a
+`hermes -p platform chat -Q -q <prompt>` subprocess; [executors](#executors)), and publishes
+the lifecycle events with the answer as the `result` artifact and the persona's tool calls as
+`activity`. It is scaffolding with a planned demolition date:
 when the dispatcher and worker adapter land, the bridge retires. Nothing here is
 protocol - the wire contract is the payload spec's, unchanged.
 
@@ -187,6 +189,45 @@ One user-visible consequence — topic entries the `a2a` CLI writes now carry
 `from.session` of `agent` rather than `worker`, so a query matching on the old value
 returns nothing for entries written after the upgrade.
 
+## Executors
+
+`BRIDGE_EXECUTOR` picks how a task runs. The daemon defaults to `api`; `cli` is the
+subprocess executor the bridge started with, kept as the fallback.
+
+**`api`: a turn in the conversation's session.** The bridge POSTs the task's text to the
+Hermes API server in the same pod (`BRIDGE_API_URL`, default
+`http://127.0.0.1:8642/v1/chat/completions`, model `BRIDGE_API_MODEL`, default
+`model-default`) with `Authorization: Bearer $API_SERVER_KEY` and three headers:
+`X-Hermes-Session-Key` and `X-Hermes-Session-Id`, both set to the session id below, and
+`Idempotency-Key`, set to the task id so a redelivered task does not run its turn twice. The
+server loads the session's history from its own store before the turn and appends to it after,
+so the second task in a thread sees the first. The session id is `a2a-` plus the task's
+`contextId`, which the gateway mints once per backend conversation. A `contextId` that is not
+letters, digits, `_` and `-`, or is longer than 128 characters, is replaced by `a2a-h-` and 32
+hex characters of its SHA-256, so an odd one still maps to one session and never to a path. A
+task with no `contextId` gets a session of its own, `a2a-task-<task id>`.
+
+The turn runs under the API server's profile, the gateway's `default` one that answers the
+same message on the chat path and delegates through kanban, not under `BRIDGE_PROFILE`. Two
+tasks in one session are serialized: the second waits for the first's turn to end, as a second
+chat message waits in a chat platform's session. Tasks in different sessions run side by side
+up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a worker.
+
+The sidecar starts with the agent container, so the bridge can be consuming before the API
+server listens. A refused connection is retried every second for two minutes; it never reached
+the server, so the retry cannot run a turn twice. The bridge refuses to start under `api`
+without `API_SERVER_KEY`, since the server ignores the session headers without one; the
+sidecar has it because the deploy copies the agent container's env into it.
+
+Two things the `api` executor does not do. A kanban card the persona creates completes after
+the turn has answered, and the API server has no channel to push that completion back, so it
+never reaches the A2A thread; the `cli` executor loses it the same way. And a running turn
+cannot be steered: a follow-up to a running task gets the refusal described below.
+
+**`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q -q <prompt>`, a fresh
+session for every task, with no memory of the thread's earlier tasks. The rest of this page
+describes it where the two differ.
+
 ## Lifecycle, steering, cancel
 
 Per task: `submitted` on accept (before the consumer ack, so a bridge death before the
@@ -221,7 +262,8 @@ follow-up message to a running task is acked and answered with a non-final statu
 echoing the task's current state (`working` once the subprocess spawned, `submitted`
 while still queued) whose message says the input cannot be absorbed mid-run and cancel
 is available.
-Honest, never silent. This does not change task state (payload spec assertion 12).
+Honest, never silent. This does not change task state (payload spec assertion 12). The
+`api` executor answers the same way.
 
 **Cancel:** SIGTERM to the subprocess's process group, SIGKILL after a grace period,
 then terminal `canceled` (`reason: canceled-by-request`). A task racing to completion may
@@ -264,6 +306,20 @@ before finalize drops the run it finds it final and returns, finalize being idem
 that fails, a bus error or its 10s bound, is logged and the run spawns
 anyway; the cancel still arrives on the durable and kills it, the bound the bridge always
 had, where a read failure that dropped the task would leave it open with no terminal event.
+
+Under the `api` executor `working` is published before the request goes out, and cancel,
+shutdown and the deadline end the HTTP request where the `cli` executor kills a process group,
+with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
+the request ends the bridge's wait; whether the server abandons the turn it was running is the
+server's. The failures name themselves in the status message:
+
+| Reason                   | When                                                                              | Eval harness class |
+| ------------------------ | --------------------------------------------------------------------------------- | ------------------ |
+| `hermes-rate-limited`    | the server answered 429, the provider's rate limit or billing                     | infrastructure     |
+| `hermes-api-unreachable` | no response: still refused after the two-minute retry, or the connection failed   | infrastructure     |
+| `hermes-api-failed`      | any other non-2xx answer; the message carries the status, session and a body tail | persona            |
+| `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice               | persona            |
+| `hermes-api-read-failed` | the response body broke off mid-read                                              | persona            |
 
 ## Sizing against the eval harness
 
@@ -387,8 +443,26 @@ the count has nothing to move it, so the line says so instead: `running 1m30s, t
 The relay renders progress as one edited rolling line, so this is one chat edit per minute,
 and it is what tells a stuck task from a slow one from outside the pod.
 
+Under the `api` executor there is no child to hand a key or a scope to: the turn runs in
+the long-lived gateway process, which serves the chat platforms, cron and kanban dispatch too.
+So the operator renders the entry in the pod's managed config instead, when the CR is in
+`mode: next` and declares the bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`):
+`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
+`http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, which both
+containers read from the `bridge-activity-key` entry of the a2a creds Secret. Every hermes
+process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
+it counts for the task whose session id matches and which holds that session's turn at the
+moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which
+carry their own session ids, never reach an A2A trace. Kanban work the turn delegates is
+therefore absent from the trace; only the default profile's own calls appear. The `cli`
+executor still uses a per-task key, and a child it spawns drops the pod-wide entry from the
+managed config it is given, so a delivery is never signed twice.
+
 Trust boundary, stated: everything in the pod is reachable from the persona's own terminal
-tool, its environment included. The trace is "as reported by the executor's process", the
+tool, its environment included. The shared key widens that under `api`: any process holding
+the agent's environment can sign a delivery naming another conversation's session id while
+that session has a turn in flight, and so add entries to that task's trace. The trace is
+informational, read by the eval harness and by debug views, and nothing authorizes on it. The trace is "as reported by the executor's process", the
 worker adapter's posture too; the key rejects cross-talk, not adversaries.
 
 ## Supervision

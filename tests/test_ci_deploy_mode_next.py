@@ -317,6 +317,8 @@ def render_sidecar(deployment: dict, concurrency: str = "4") -> dict:
         consts["A2A_BUS_TOKEN_VOLUME"],
         consts["AGENT_SHARED_STATE_SETUP_ENV_VAR"],
         consts["AGENT_SHARED_STATE_SETUP_SKIP"],
+        consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"],
+        consts["A2A_BRIDGE_ACTIVITY_KEY"],
     ]
     quoted = " ".join(f"'{a}'" for a in args)
     result = subprocess.run(
@@ -484,6 +486,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(consts["A2A_INJECT_TOKEN_KEY"], go_constant(_A2A_MANIFESTS, "a2aInjectTokenKey"))
         self.assertEqual(consts["A2A_BRIDGE_USER"], go_constant(_A2A_IDENTITIES, "a2aBridgeUser"))
         self.assertEqual(consts["A2A_BRIDGE_PASSWORD_KEY"], go_constant(_A2A_MANIFESTS, "a2aBridgePasswordKey"))
+        self.assertEqual(consts["A2A_BRIDGE_ACTIVITY_KEY"], go_constant(_A2A_MANIFESTS, "a2aBridgeActivityKey"))
+        self.assertEqual(consts["BRIDGE_ACTIVITY_SECRET_ENV_VAR"], go_constant(_A2A_MANIFESTS, "a2aActivitySecretEnvVar"))
         self.assertEqual(consts["A2A_BUS_TOKEN_VOLUME"], go_constant(_A2A_CALLOUT, "a2aBusTokenVolume"))
         self.assertIn(f'"{consts["A2A_BUS_TOKEN_VOLUME"]}": {{}}', text(_API_TYPES))
         self.assertEqual(consts["AGENT_SHARED_STATE_SETUP_ENV_VAR"], go_constant(_AGENT_MANIFESTS, "sharedStateSetupEnvVar"))
@@ -989,6 +993,10 @@ class SidecarPatchTest(unittest.TestCase):
                 {"name": "NATS_USER", "value": "bridge"},
                 {"name": "NATS_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-password"}}},
                 {"name": "BRIDGE_CONCURRENCY", "value": "4"},
+                {
+                    "name": "A2A_ACTIVITY_SECRET",
+                    "valueFrom": {"secretKeyRef": {"name": "platform-agent-a2a-nats-creds", "key": "bridge-activity-key", "optional": True}},
+                },
             ],
         )
         self.assertEqual(names.count("NATS_URL"), 1, "the agent's NATS_URL is replaced, not shadowed")
@@ -1024,8 +1032,8 @@ class SidecarPatchTest(unittest.TestCase):
         sidecar = render_sidecar(bare, concurrency="6")["spec"]["deployment"]["sidecars"][0]
         self.assertEqual(set(sidecar), {"name", "image", "env", "volumeMounts"})
         self.assertEqual(sidecar["volumeMounts"], [])
-        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_CONCURRENCY"])
-        self.assertEqual(sidecar["env"][-1]["value"], "6")
+        self.assertEqual([e["name"] for e in sidecar["env"]], ["AGENT_SHARED_STATE_SETUP", "NATS_URL", "NATS_USER", "NATS_PASSWORD", "BRIDGE_CONCURRENCY", "A2A_ACTIVITY_SECRET"])
+        self.assertEqual(sidecar["env"][-2]["value"], "6")
 
     def test_the_context_the_operator_renders_is_one_the_webhook_admits(self) -> None:
         """The renderer copies the agent container's securityContext verbatim,

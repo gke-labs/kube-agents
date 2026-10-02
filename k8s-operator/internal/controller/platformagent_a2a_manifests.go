@@ -354,6 +354,24 @@ const (
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
+	// bridge's activity door when the bridge runs tasks through the pod's API
+	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
+	// with it, the bridge sidecar verifies with it. Not a bus password; it
+	// lives here because this Secret is minted once, repaired when a key is
+	// missing, and already read by the bridge.
+	a2aBridgeActivityKey = "bridge-activity-key"
+
+	// The pod-wide hooks.outbound entry the managed config carries for the
+	// bridge's activity door, each value the bridge's own
+	// (a2a/hermes-bridge/activity.go): the entry name, which a CLI child's
+	// scope drops in favour of its per-task entry; the env var hermes reads
+	// the signing key from; the door's loopback URL (DefaultActivityListen
+	// plus ActivityPath); and the delivery timeout.
+	a2aActivityHookName       = "a2a-bridge-activity"
+	a2aActivitySecretEnvVar   = "A2A_ACTIVITY_SECRET" // #nosec G101 -- Environment variable name, not a credential
+	a2aActivityHookURL        = "http://127.0.0.1:8651/hermes/tool-events"
+	a2aActivityHookTimeoutSec = 10
 
 	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
 	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
@@ -984,7 +1002,11 @@ func randomA2APassword() (string, error) {
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
 	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aBridgeActivityKey,
 }
+
+// a2aActivityHookEvents are the hook events the door reads.
+var a2aActivityHookEvents = []string{"pre_tool_call", "post_tool_call"}
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and
 // the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
@@ -2880,6 +2902,71 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
 	n, _, _ := a2aBridgeWorkers(agent)
 	return n
+}
+
+// a2aBridgeDeclared reports whether the CR declares a bridge sidecar, by the
+// rule a2aBridgeWorkers uses: a sidecar whose env sets BRIDGE_CONCURRENCY.
+// The activity hook (a2aActivityHook) is rendered only then, so an install
+// with no door does not post every tool call to a closed port.
+func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, c := range agent.Spec.Deployment.Sidecars {
+		if _, set := a2aBridgeConcurrencyValue(c); set {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aActivityHookWanted is the gate for both halves of the pod-wide activity
+// hook: the managed config's entry and the agent container's signing key.
+func a2aActivityHookWanted(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aAgentSurface(agent) && a2aBridgeDeclared(agent)
+}
+
+// managedHookOutbound is one hooks.outbound entry in hermes's config.
+type managedHookOutbound struct {
+	Name      string   `json:"name"`
+	URL       string   `json:"url"`
+	Events    []string `json:"events"`
+	SecretEnv string   `json:"secret_env"`
+	Timeout   int      `json:"timeout"`
+}
+
+// managedHooks is the config's hooks mapping, the outbound list only.
+type managedHooks struct {
+	Outbound []managedHookOutbound `json:"outbound"`
+}
+
+// a2aActivityHook is the pod-wide entry: every tool call the pod's hermes
+// makes is delivered to the bridge's door, signed with the creds Secret's
+// a2aBridgeActivityKey, and the door keeps the ones whose session is a
+// bridge task's turn. nil when a2aActivityHookWanted is false.
+func a2aActivityHook(agent *agentv1alpha1.PlatformAgent) *managedHooks {
+	if !a2aActivityHookWanted(agent) {
+		return nil
+	}
+	return &managedHooks{Outbound: []managedHookOutbound{{
+		Name:      a2aActivityHookName,
+		URL:       a2aActivityHookURL,
+		Events:    a2aActivityHookEvents,
+		SecretEnv: a2aActivitySecretEnvVar,
+		Timeout:   a2aActivityHookTimeoutSec,
+	}}}
+}
+
+// a2aActivitySecretEnv is the agent container's signing key for the
+// activity hook, from the creds Secret. Optional, so a pod rendered before
+// the Secret gains the key starts without it (and delivers nothing the door
+// accepts) rather than failing CreateContainerConfig.
+func a2aActivitySecretEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
+	return corev1.EnvVar{Name: a2aActivitySecretEnvVar, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+		Key:                  a2aBridgeActivityKey,
+		Optional:             ptr.To(true),
+	}}}
 }
 
 // a2aBridgeWorkers is a2aBridgeConcurrency and two facts about how the count

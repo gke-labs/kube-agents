@@ -69,6 +69,10 @@ const (
 	// Config zero value means "off" but an empty environment variable reads
 	// as unset, so the daemon needs a word for it.
 	activityListenOff = "off"
+	// apiServerKeyEnv is the pod's API server key, which the sidecar's
+	// environment carries from the agent container's; the API executor's
+	// bearer token.
+	apiServerKeyEnv = "API_SERVER_KEY"
 )
 
 // errUsage is what realMain returns when NATS_URL is missing, so run can
@@ -135,7 +139,15 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
 		ManagedScopeDir:  managedScopeDir(),
 		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
-		Logger:           log,
+		// The executor (a2a/hermes-bridge/api.go): a turn in the
+		// conversation's session through the pod's API server by default,
+		// BRIDGE_EXECUTOR=cli for the subprocess per task.
+		Executor:       envOr("BRIDGE_EXECUTOR", hermesbridge.ExecutorAPI),
+		APIURL:         envOr("BRIDGE_API_URL", hermesbridge.DefaultAPIURL),
+		APIModel:       envOr("BRIDGE_API_MODEL", hermesbridge.DefaultAPIModel),
+		APIKey:         os.Getenv(apiServerKeyEnv),
+		ActivitySecret: os.Getenv(hermesbridge.ActivitySecretEnv),
+		Logger:         log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
 		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
