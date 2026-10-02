@@ -291,8 +291,7 @@ turn; `/session off` releases the incarnation (refused while a session task runs
 first) and re-homes to the default addressee. The conversation's `contextId` is unchanged by
 either. Without a spawner the on-forms answer with a note and change nothing, and the way back
 still works; on an install whose default is already the session route the bare forms answer
-with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <text>` while a task is still running turns
-the route on and holds the text. On Slack a leading slash belongs to the Slack client, which
+with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <text>` while a task is still running turns the route on and holds the text, unless the running task is the session's own, in which case the text steers it as a plain message would. On Slack a leading slash belongs to the Slack client, which
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there, and
