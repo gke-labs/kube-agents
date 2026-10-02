@@ -140,6 +140,7 @@ def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(c
         " 📚 Share your team's runbooks here.",
         " - Share your team's runbooks here.",
         " Please feel free to share your team's runbooks here.",
+        " If you want, share your team's runbooks here.",
     ],
 )
 def test_a_short_lead_in_without_a_negation_still_counts_as_the_invitation(case, invitation):
@@ -163,6 +164,9 @@ def test_a_colon_or_dash_join_still_opens_the_invitation(case, join):
         " I can't read them if you share your team's runbooks here.",
         " Please don't share your team's runbooks here.",
         " Never share your team's runbooks here.",
+        " Nobody needs to share your team's runbooks here.",
+        " Please dont share your team's runbooks here.",
+        " You shouldnt share your team's runbooks here.",
     ],
 )
 def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, invitation):
@@ -178,6 +182,7 @@ def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, in
         " In this chat, share your team's runbooks here.",
         " In the chat, share your team's runbooks here.",
         " Whenever you like, send or share your team's runbooks here.",
+        " In this chatroom, share your team's runbooks here.",
     ],
 )
 def test_a_lead_in_holding_a_results_word_fails_the_invitation_check(case, invitation):
@@ -451,6 +456,7 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " Fixes sent to your team follow your runbooks.",
         " You'll get fixes that follow your runbooks.",
         " Your team will get pull requests that follow your runbooks.",
+        " I'll apply fixes according to your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
         " Also," + " x" * 150 + " follow your runbooks.",
     ],

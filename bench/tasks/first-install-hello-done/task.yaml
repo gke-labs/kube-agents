@@ -110,15 +110,19 @@ verification_spec:
   # check whose words cannot leak into the others. At most 40 characters
   # sit between the sentence's start and it ("And share...", "You can also
   # share...", "One more thing: share...", "📚 Share..."), with no negation
-  # among them (no, not, n't, never, nor, neither, none, nothing, without,
-  # cannot, unless), because a negation can withdraw it ("There's no need to
+  # among them (no, not, n't or a common contraction without its
+  # apostrophe such as "dont", never, nor, neither, none, nothing, nobody,
+  # nowhere, without, cannot, unless), because a negation can withdraw it ("There's no need to
   # share...", "Please don't share...", "I can't read them if you
-  # share..."), and none of the results checks' words (here, chat, or a word
-  # starting post, shar or send), because the results checks read the
+  # share..."), and none of the results checks' words (here, or a word
+  # starting post, shar, send or chat), because the results checks read the
   # lead-in ("Here you can post or share...", "In this chat, share..."). A
   # negation that only qualifies it ("No pressure, but share...") fails it,
   # a known cost, and so does a results word in the lead-in of a reply that
-  # also has a results sentence. A sentence opens at the start of the reply, after ".", "!",
+  # also has a results sentence. This case's results check reads only
+  # "chat" and "posted"; here, shar and send are refused to keep the pattern
+  # identical to the running case's, at the cost of failing a lead-in such as
+  # "Whenever you like, send or share...". A sentence opens at the start of the reply, after ".", "!",
   # "?" or "…" past any closing bracket or quote and a space, at a line
   # break, after "; ", ": " or ", and", or at a dash with a space on each
   # side. A longer lead-in fails it, a known cost; a lead-in that withdraws
@@ -147,7 +151,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|without|cannot|unless|here|chat)\b|n[''’]t\b|\b(?:post|shar|send))[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|nobody|nowhere|without|cannot|unless|here)\b|n[''’]t\b|\b(?:do|does|did|ca|wo|should|need|is|are|would|could|must)nt\b|\b(?:post|shar|send|chat))[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -242,7 +246,8 @@ verification_spec:
   # you...", "happy, as always, to help you..."), a clearing word after "to"
   # or "with", which are not in the preposition list ("fixes sent to your
   # team follow your runbooks"), the reader or their team as the promise's
-  # subject ("you'll get fixes that follow your runbooks"), more than six
+  # subject ("you'll get fixes that follow your runbooks"), "to" inside the
+  # object ("I'll apply fixes according to your runbooks"), more than six
   # words between the verb and
   # runbooks ("I'll follow the long list of incident and on-call runbooks"),
   # or more than 300 characters between the clause start and the verb,
