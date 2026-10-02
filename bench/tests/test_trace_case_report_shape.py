@@ -29,6 +29,9 @@ fails here rather than on the nightly.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -38,6 +41,23 @@ from kube_agents_bench.verifiers import ReportContainsVerifier
 from conftest import TASKS
 
 CASE = TASKS / "observability-trace-latency-brokered" / "task.yaml"
+
+# The skill doc the case tells the worker to follow prints a complete
+# breakdown under "Example Output", with a fixed trace id on its "Trace ID:"
+# line: an id in a row that a worker whose helper never ran has seen, and
+# may quote as what the helper should have printed. The case forbids that
+# id by value; reading it from the doc here, rather than copying it, is
+# what keeps the two from drifting apart when the example is rewritten.
+SKILL_DOC = (
+    Path(__file__).resolve().parents[2]
+    / "agents"
+    / "platform"
+    / "skills"
+    / "kube-agents-observability"
+    / "SKILL.md"
+)
+EXAMPLE_OUTPUT_HEADING = "**Example Output:**"
+EXAMPLE_ID_LINE = re.compile(r"^\s*Trace ID: ([0-9a-f]{32})\s*$", re.MULTILINE)
 
 # The prompt's own vocabulary, every word of it, around a helper that failed.
 FAILURE_REPORT = (
@@ -62,6 +82,37 @@ STRAY_ID_FAILURE_REPORT = (
     "```\n\n"
     "Session `t_405326f2` (id `9c1e4f0a2b3d4e5f6a7b8c9d0e1f2a3b`)."
 )
+
+
+
+def _doc_example_block() -> str:
+    text = SKILL_DOC.read_text(encoding="utf-8")
+    start = text.index(EXAMPLE_OUTPUT_HEADING)
+    fence_open = text.index("```text", start) + len("```text")
+    fence_close = text.index("```", fence_open)
+    block = text[fence_open:fence_close].strip("\n")
+    assert EXAMPLE_ID_LINE.search(block), f"{SKILL_DOC} Example Output has no 'Trace ID:' line"
+    return block
+
+
+# The same failure, by a worker that quoted the skill doc's Example Output
+# as what the helper should have printed: the doc's id sits on its "Trace
+# ID:" line over "Total Duration:" and three span rows, every shape the id
+# check wants, from a run in which the helper read nothing. The second
+# quotes only the two lines that suffice.
+def _doc_quoting_failure_reports() -> list[str]:
+    block = _doc_example_block()
+    two_lines = "\n".join(
+        line.strip() for line in block.splitlines() if line.strip().startswith(("Trace ID:", "Total Duration:"))
+    )
+    lead = (
+        "## No traces analyzed\n\n"
+        "The analyzer exited 1 at its auth step, so I have 0% of the three requested "
+        "traces and no slowest span to report. Per the skill doc it should have "
+        "produced output like:\n\n"
+    )
+    return [lead + "```\n" + block + "\n```\n", lead + two_lines + "\n"]
+
 
 # One row of the helper's breakdown as a worker relays it.
 BREAKDOWN_REPORT = (
@@ -146,11 +197,34 @@ def _objective_report_checks() -> list[ReportContainsVerifier]:
     return checks
 
 
-@pytest.mark.parametrize("report", [FAILURE_REPORT, STRAY_ID_FAILURE_REPORT, TIMED_FAILURE_REPORT])
+@pytest.mark.parametrize(
+    "report",
+    [FAILURE_REPORT, STRAY_ID_FAILURE_REPORT, TIMED_FAILURE_REPORT, *_doc_quoting_failure_reports()],
+)
 def test_a_failure_report_in_the_prompts_words_fails_an_objective_check(report):
     transcript.set(report, [])
     verdicts = {c.verify(5.0).status for c in _objective_report_checks()}
     assert "fail" in verdicts, "every objective report check passed a report of the helper's failure"
+
+
+def test_the_skill_docs_example_id_is_forbidden_by_the_id_check():
+    # The doc's example is the one breakdown a worker has in front of it
+    # without the helper running, so its id is forbidden by value, and the
+    # value the case forbids is the one the doc prints today.
+    (example_id,) = EXAMPLE_ID_LINE.findall(_doc_example_block())
+    (id_check,) = [c for c in _objective_report_checks() if len(c.required_patterns) == 3]
+    assert example_id in id_check.forbidden_patterns, (
+        f"{SKILL_DOC} prints {example_id} in its Example Output and {CASE} does not forbid it"
+    )
+
+
+@pytest.mark.parametrize("report", _doc_quoting_failure_reports())
+def test_a_quoted_doc_example_fails_the_id_check_on_its_id(report):
+    transcript.set(report, [])
+    (id_check,) = [c for c in _objective_report_checks() if len(c.required_patterns) == 3]
+    res = id_check.verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "forbidden patterns matched" in res.reason, res.reason
 
 
 def test_a_stray_id_beside_a_percentage_fails_the_breakdown_check():
