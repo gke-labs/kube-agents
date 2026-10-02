@@ -53,7 +53,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 The Cluster Agent is **read-only** and does not open Pull Requests. After reading the completed card:
 
 1. Review the RCA in the card's `result` and the proposed manifest patch in its `metadata`.
-2. If a change is warranted, **you** open (or update) the Pull Request via the `submit-suggestion` skill — you own the GitOps write path. Reconcile against any existing branch/PR for the same workload before creating a new one.
+2. If a change is warranted **and the request asked for it**, **you** open (or update) the Pull Request via the `submit-suggestion` skill — you own the GitOps write path. Reconcile against any existing branch/PR for the same workload before creating a new one. If the request asked for a diagnosis, the RCA and the proposed patch go back in your reply as a recommendation (`SOUL.md` §3, item 3).
 3. Report the outcome to the user as a clean SRE status update.
 
 ## When to delete a profile

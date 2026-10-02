@@ -64,12 +64,12 @@ func forDoor(conversation string) bool {
 // Run delivers from both ingresses until ctx is done, or until either stops
 // on its own.
 //
-// Either one returning ends the gateway. That is deliberate rather than
-// tolerant: a gateway that kept running with its Chat backend dead would look
-// healthy while consuming nothing, which is the failure the one-backend guard
-// exists to prevent, and a gateway that kept running with a dead door would
-// hang every eval on a listener nothing answers. Exiting lets the Deployment
-// restart both.
+// Either one returning ends the gateway. The primary returns only when the
+// console does: a chat backend that stops is restarted inside the mux, and
+// the console is the gateway's way in when chat is broken, so a dead console
+// is a restart. A gateway that kept running with a dead door would hang every
+// eval on a listener nothing answers. Exiting lets the Deployment restart
+// both.
 func (s *sideDoorAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -81,7 +81,7 @@ func (s *sideDoorAdapter) Run(ctx context.Context, handler func(InboundMessage))
 		// cancel, or the cancel below after the other half failed -- is a
 		// clean shutdown, not an error to report.
 		if err != nil && ctx.Err() == nil {
-			s.log.Error("the chat backend stopped; the gateway is going with it", "err", err)
+			s.log.Error("the console stopped; the gateway is going with it", "err", err)
 		}
 		errs <- err
 	}()

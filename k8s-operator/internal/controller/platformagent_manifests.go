@@ -4315,6 +4315,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"OTEL_SDK_DISABLED":           {},
 		"OTEL_SERVICE_NAME":           {},
 	}
+	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
+	// default suggested prompts (`apply_slack_agent_view.py`), under the same
+	// bound: fixed strings in the image, chosen by the flag and nothing else.
 	var result []corev1.EnvVar
 	for _, env := range custom {
 		// Only literal values are copied. A ValueFrom source can reference a

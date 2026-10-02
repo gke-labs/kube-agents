@@ -647,6 +647,11 @@ terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `te
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
+	    stale="$$(ls "$$dir"*_override.tf 2>/dev/null)"; \
+	    if [ -n "$$stale" ]; then \
+	      echo "terraform-test: $$dir holds an override file that terraform test would merge silently, so its assertions would run against the override rather than the module; remove it first (lifecycle.sh writes one around each import and removes it, unless killed outright):" >&2; \
+	      printf '  %s\n' $$stale >&2; failed="$$failed $$dir"; continue; \
+	    fi; \
 	    echo "Testing $$dir..."; \
 	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
 	  fi; \

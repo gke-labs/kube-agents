@@ -427,6 +427,56 @@ func TestSideDoorForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
 	}
 }
 
+// TestMuxForwardsObserverAndLookupToASlackPrimary: in production the Slack
+// adapter sits behind the console mux, alone or with the inject door above
+// it, so the gateway's TaskStarted and SetSessionLookup reach the mux first.
+// Dropping them there leaves no thread ever marked and the registry never
+// wired, and every unmentioned reply in a session thread drops.
+func TestMuxForwardsObserverAndLookupToASlackPrimary(t *testing.T) {
+	for _, withDoor := range []bool{false, true} {
+		t.Run(map[bool]string{false: "mux on top", true: "door above the mux"}[withDoor], func(t *testing.T) {
+			a := newTestSlackAdapter(&fakeSlackAPI{})
+			mux, err := NewMultiAdapter(slackBackend, consoleBackend, map[string]Adapter{slackBackend: a, consoleBackend: newFakeAdapter()}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var top Adapter = mux
+			if withDoor {
+				door, err := NewInjectAdapter("127.0.0.1:0", "side-door-test-token", time.Minute, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				top = WithSideDoor(mux, door, nil)
+			}
+			observer, ok := top.(TaskObserver)
+			if !ok {
+				t.Fatal("the stack must implement TaskObserver")
+			}
+			observer.TaskStarted("slack:C1/9.0", "task-chat")
+			observer.TaskStarted("console:tab-1", "task-console")
+			if len(a.sessionThreads) != 1 || !a.sessionThreads["C1/9.0"] {
+				t.Fatalf("TaskStarted did not reach the Slack adapter alone: sessionThreads = %v", a.sessionThreads)
+			}
+			observer.TaskAccepted("slack:C1/9.0", "task-chat")
+			observer.CancelPublished("slack:C1/9.0", "task-chat")
+			observer.TaskTerminal("slack:C1/9.0", "task-chat", lib.StateCompleted, TerminalFromExecutor, "")
+			observer.TaskStarted("noprefix", "task-x")
+
+			sink, ok := top.(SessionLookupSink)
+			if !ok {
+				t.Fatal("the stack must implement SessionLookupSink")
+			}
+			sink.SetSessionLookup(func(context.Context, string) (bool, time.Time, error) { return true, time.Time{}, nil }, 7*time.Minute)
+			a.mu.Lock()
+			forwarded, ttl := a.sessions != nil, a.sessionTTL
+			a.mu.Unlock()
+			if !forwarded || ttl != 7*time.Minute {
+				t.Fatalf("SetSessionLookup did not reach the Slack adapter: forwarded=%v ttl=%v", forwarded, ttl)
+			}
+		})
+	}
+}
+
 // TestSlackSessionMarkExpiresOnTheIdleTTL: a true in sessionThreads is not
 // forever. It is stamped when written, and once the stamp is sessionTTL old
 // the next unmentioned reply re-asks the registry and takes its answer,

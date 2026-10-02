@@ -60,6 +60,15 @@ is the scope's exclude list. `members` maps each selector's snapshot name (`shar
 `metricsScopes/<scope>`) to the sorted project IDs it reaches, the shape `kube-agents-iam` takes and
 the one the reconcile's `fleet_scope.json` `containers` array can be read beside.
 
+[`lifecycle.sh`](../../examples/full-install/lifecycle.sh) in the full-install composition writes a
+gitignored `scope_resolver_lifecycle_override.tf` into this directory for the duration of each
+`terraform import`, pinning `data.http.scope_monitored_project` to no instances and the `members`
+output to an empty list per declared selector; its unit tests fail on a rename of either, and the
+composition's README says why the file exists. The script removes the file again, but one left by a
+`lifecycle.sh` killed outright would be merged silently into the next `terraform test` here, where
+every assertion on resolved members fails against the pin rather than the module. `make
+terraform-test` refuses to run a suite beside such a file and names it; remove the file first.
+
 ## Tests
 
 `tests/*.tftest.hcl` plan the module with both providers mocked and every HTTP read overridden, so

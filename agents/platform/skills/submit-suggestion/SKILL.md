@@ -17,6 +17,15 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
 
 ## When NOT to Use
 
+- **Answering a request that asked for a diagnosis, not a change.** "Investigate
+  and report the root cause", "why is this crashlooping", "what would you
+  change" are questions; their answer is the finding and the proposed manifest
+  in the reply, marked as a recommendation. Open the pull request only when the
+  request asks for one, or for the change to be submitted or fixed; `SOUL.md`
+  §3, item 3 draws the line, and the unattended case is `fleet-audit`'s own
+  promotion, which `finish` does on a scheduled run, never this skill. A pull
+  request nobody asked for is a write on their repository they now have to
+  triage.
 - **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
   security patch, a policy update — which is exactly why this warning exists. If
   the change addresses a fleet-audit finding (it carries a finding id, or an
@@ -72,7 +81,7 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py pre
 
 _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` or `--repo "acme/fleet" --branch "platform-agent/upgrade-policy-baseline"`)_
 
-In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.4).
+In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.5).
 
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because

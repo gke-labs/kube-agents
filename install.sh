@@ -2429,6 +2429,27 @@ run_with_spinner() {
   return "$rc"
 }
 
+# lifecycle.sh writes two gitignored override files around each `terraform
+# import` -- a helm provider placeholder beside the composition and a scope
+# resolver pin inside that module's directory -- and removes them on an EXIT
+# trap and again at the start of every subcommand, because a lifecycle.sh
+# killed by a signal the trap cannot see leaves them behind. The dry run below
+# reads the same composition directly, through the checkout acquire_source_repo
+# reuses from run to run, and a plan that merged the scope pin would resolve
+# every declared selector to no members and preview the removal of the bindings
+# those members hold, under a banner calling it what a real run would do. So the
+# dry run clears them the way the engine does, through the engine's own
+# function, so the file names have one home. Runs in the composition directory
+# the caller has cd'd into; the subshell keeps the engine's `set -u`, its `cd`
+# and its definitions out of this script. lifecycle.sh is linted on its own.
+drop_stale_import_overrides() {
+  (
+    # shellcheck disable=SC1091
+    KUBE_AGENTS_SOURCE_ONLY=true source ./lifecycle.sh
+    drop_override
+  )
+}
+
 # The dry run's Terraform check. At file scope, rather than inside main(), so the
 # test suite can source install.sh and drive this exact function instead of its
 # own copy of the chain -- a copy asserts that the copy short-circuits, which is
@@ -5709,6 +5730,9 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
+      # Before terraform first reads the configuration; the plan further down
+      # runs in this same directory and nothing between the two writes them.
+      drop_stale_import_overrides
       local tf_log=""
       tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
       local rc=0

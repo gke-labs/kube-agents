@@ -2149,6 +2149,103 @@ class GithubAppInstallationTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
 
 
+class GitopsDefaultBranchTest(unittest.TestCase):
+    """The GitOps repository defaults to main. Four pool repositories sat on a
+    platform-agent/* default from late August to 2026-09-30 and one on master,
+    and every rca write on them was a no-op that quoted a leftover proposal;
+    nothing read the pointer until a triage did by hand. What moved them is
+    not known (no repository events; the org audit log needs an owner), so
+    the check is cause-agnostic; #1970 is the guard on the product side."""
+
+    def _check(self, rc, out="", err="", project="kube-agents-evals-27"):
+        with mock.patch.object(checker, "run_cmd", return_value=(rc, out, err)) as run:
+            result = checker.check_gitops_default_branch(project)
+        return result, run
+
+    def test_main_passes_on_one_metadata_read(self):
+        result, run = self._check(0, "main\n")
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_PASS)
+        self.assertEqual((result.findings, result.warnings), ([], []))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["gh", "api", "repos/gke-agentic/kube-agents-evals-27-infra", "--jq", ".default_branch"])
+
+    def test_an_agent_branch_as_the_default_is_drift_with_the_patch_as_the_repair(self):
+        result, _ = self._check(0, "platform-agent/fix-payments-api-crashloop\n")
+        self.assertFalse(result.passed)
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_FAIL)
+        [finding] = result.findings
+        self.assertEqual(finding.id, "gitops/default-branch")
+        self.assertIn("gke-agentic/kube-agents-evals-27-infra's default branch is platform-agent/fix-payments-api-crashloop, not main", finding.observed)
+        self.assertIn("submit_suggestion.py prepare", finding.observed)
+        self.assertIn("owner of gke-agentic", finding.observed)
+        self.assertEqual(finding.repair, "gh api -X PATCH repos/gke-agentic/kube-agents-evals-27-infra -f default_branch=main")
+        self.assertEqual(result.details, [finding.observed])
+
+    def test_master_is_drift_too(self):
+        result, _ = self._check(0, "master\n", project="kube-agents-evals-9")
+        self.assertFalse(result.passed)
+        self.assertEqual(result.findings[0].repair, "gh api -X PATCH repos/gke-agentic/kube-agents-evals-9-infra -f default_branch=main")
+
+    def test_no_credential_is_not_checked_and_names_the_variable(self):
+        err = "To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n"
+        result, _ = self._check(4, "", err)
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
+        [warning] = result.warnings
+        self.assertIsInstance(warning, checker.Unread)
+        self.assertIn(checker.GITOPS_READ_TOKEN_ENV, warning)
+        self.assertIn("gke-agentic/kube-agents-evals-27-infra", warning)
+        self.assertEqual(result.findings, [])
+
+    def test_a_repository_the_token_cannot_see_is_not_checked_not_absent(self):
+        # 404 for a private repository the credential cannot open and 404 for
+        # one that does not exist read the same; check_github_repo_and_app is
+        # the check that decides absence, at onboarding, as an org member.
+        result, _ = self._check(1, '{"message":"Not Found","status":"404"}', "gh: Not Found (HTTP 404)\n")
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
+        self.assertIn("HTTP 404", result.warnings[0])
+        self.assertEqual(result.findings, [])
+
+    def test_no_gh_and_no_answer_are_not_checked(self):
+        for rc, out, err in ((127, "", "gh: command not found"), (0, "", ""), (1, "", "")):
+            result, _ = self._check(rc, out, err)
+            self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED, (rc, out, err))
+            self.assertEqual(result.findings, [])
+        self.assertIn(checker.NO_OUTPUT_REASON, self._check(1, "", "")[0].warnings[0])
+
+    def test_a_transient_github_error_is_not_checked_never_drift(self):
+        # gh exits 1 on every non-2xx and puts the error body on stdout; a
+        # rate limit, a 5xx and a revoked token all read as "could not read",
+        # with gh's own line as the reason, and never as a moved default.
+        for rc, out, err, mark in (
+            (1, '{"message":"API rate limit exceeded for user ID 1."}', "gh: API rate limit exceeded for user ID 1 (HTTP 403)\n", "HTTP 403"),
+            (1, "", "gh: Bad Gateway (HTTP 502)\n", "HTTP 502"),
+            (1, '{"message":"Bad credentials"}', "gh: Bad credentials (HTTP 401)\n", "HTTP 401"),
+        ):
+            result, _ = self._check(rc, out, err)
+            self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED, (rc, out, err))
+            self.assertTrue(result.passed)
+            self.assertIs(result.read, False)
+            self.assertEqual(result.findings, [])
+            self.assertIn(mark, result.warnings[0])
+
+    def test_the_scan_selects_it_and_is_not_stopped_at_the_door_for_it(self):
+        self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.POOL_STATE_CHECKS)
+        self.assertNotIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.GITHUB_CHECKS)
+        self.assertNotIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.GCP_CHECKS)
+        self.assertEqual(checker.parse_checks("gitops_default_branch"), [checker.CHECK_GITOPS_DEFAULT_BRANCH])
+        self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.CHECK_DISPLAY_NAMES)
+        self.assertEqual(checker.CHECK_IDS.index(checker.CHECK_GITOPS_DEFAULT_BRANCH), checker.CHECK_IDS.index(checker.CHECK_GITHUB_REPO_AND_APP) + 1)
+        with mock.patch.object(checker, "run_cmd", return_value=(0, "master\n", "")):
+            [result] = checker.run_checks("kube-agents-evals-9", checks=[checker.CHECK_GITOPS_DEFAULT_BRANCH])
+        self.assertEqual(result.check_id, checker.CHECK_GITOPS_DEFAULT_BRANCH)
+        doc = checker.report_document("kube-agents-evals-9", [result])
+        self.assertEqual(doc["checks"]["gitops_default_branch"]["status"], "fail")
+        self.assertEqual(doc["checks"]["gitops_default_branch"]["findings"][0]["id"], "gitops/default-branch")
+
+
 class TokenMinterTest(unittest.TestCase):
     """check_token_minter reads four things over gcloud, then probes GitHub.
 
@@ -4067,6 +4164,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
@@ -4090,6 +4188,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
@@ -4109,7 +4208,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_declaration", "check_ledger_read_credential", "check_warm_cache_readers")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_ledger_read_credential", "check_warm_cache_readers")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -4153,10 +4252,11 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_declaration"] as note, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_ledger_read_credential"] as ledger, \
              mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
+            branch.assert_called_once_with("kube-agents-evals-3")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
             for never in (mapping, fleet, app, note, ledger):
                 never.assert_not_called()
@@ -4178,7 +4278,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # check alone runs on a machine with neither tool.
         with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("no tool was asked for")):
             self.assertEqual(checker.check_toolchain(needs_gh=False, needs_gcloud=False), [])
-        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING} - checker.GITHUB_CHECKS)
+        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS)
         seen = {}
         with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
             checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_CODEBASE_MAPPING])
@@ -4193,9 +4293,14 @@ class ChecksSelectionTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd", side_effect=[(0, "me@example.com\n", ""), (127, "", "no gh")]):
             self.assertEqual(len(checker.check_toolchain(needs_gh=True)), 1)
         self.assertFalse(checker.GITHUB_CHECKS.intersection(checker.POOL_STATE_CHECKS))
-        # The repo-and-app and declared-intent-note checks shell out to gh; the
-        # minter and ledger checks read GitHub over urllib and KMS over gcloud.
+        # The repo-and-app and declared-intent-note checks stop the run at the
+        # door for gh; the minter and ledger checks read GitHub over urllib and
+        # KMS over gcloud, and the default-branch check, which the scan selects,
+        # files its own unread when gh or its credential is missing so the GCP
+        # checks run.
         self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION})
+        self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.POOL_STATE_CHECKS)
+        self.assertNotIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.GCP_CHECKS)
 
 
 class ReportDocumentTest(unittest.TestCase):
@@ -4257,6 +4362,7 @@ class ReportDocumentTest(unittest.TestCase):
              mock.patch.object(checker, "check_iam_and_service_accounts", return_value=checker.CheckResult("i", True)) as iam, \
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)), \
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
+             mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("d", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS), deadline=time.monotonic() + 60)
         self.assertEqual(iam.call_count, 1)
