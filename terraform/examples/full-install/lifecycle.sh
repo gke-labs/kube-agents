@@ -51,9 +51,8 @@
 #   ./lifecycle.sh adopt-kms
 #
 # `plan` reports what an apply would change and touches nothing — no state lock,
-# no state bucket creation, no adoption imports — beyond removing the two
-# override files an interrupted import of this script's own left behind. Pass
-# -detailed-exitcode to get 0 for "in sync" and 2 for "there are changes".
+# no state bucket creation, no adoption imports. Pass -detailed-exitcode to get
+# 0 for "in sync" and 2 for "there are changes".
 #
 # `plan`, `apply` and `destroy` hide helm_release's `metadata` block, which
 # may contain secrets, from Terraform's output; an `apply` that will ask for
@@ -351,15 +350,19 @@ OVERRIDE_FILE="providers_lifecycle_override.tf"
 # read, so the key set is unknown and Terraform refuses every import before it
 # calls the provider ("Invalid for_each argument"), with or without a scope
 # declared. A second override pins that for_each to an empty set, and pins the
-# module's `members` output to {}: the IAM module keys its scope bindings on
-# it, and the same walk leaves it unknown once a Shared VPC host or Metrics
-# Scope is declared. Import reads nothing and plans nothing, so what the
-# selectors resolve to is never consulted while the file exists. Terraform
-# merges *_override.tf per module directory, so the file goes where main.tf
-# sources the module from; neither file needs an init. An override of a block
-# the module no longer defines fails the import loudly, which is what a rename
-# in the module should do here. SCOPE_OVERRIDE_FILE, above with the other
-# paths, is where it goes.
+# module's `members` output to an empty member list under each declared
+# selector's name: the IAM module keys its scope bindings on that output,
+# which the same walk leaves unknown once a Shared VPC host or Metrics Scope
+# is declared, and its precondition wants an entry per declared selector, so
+# a bare {} would put a "Resource precondition failed" warning on every
+# import. Import plans nothing (it refreshes the reads whose keys are known
+# and changes no resource), so what the selectors resolve to is consulted
+# by nothing while the file exists. Terraform merges
+# *_override.tf per module directory, so the file goes where main.tf sources
+# the module from; neither file needs an init. An override of a block the
+# module no longer defines fails the import loudly, which is what a rename in
+# the module should do here. SCOPE_OVERRIDE_FILE, above with the other paths,
+# is where it goes.
 drop_override() { rm -f "$OVERRIDE_FILE" "$SCOPE_OVERRIDE_FILE"; }
 
 with_override() {
@@ -377,30 +380,41 @@ EOF
   cat >"$SCOPE_OVERRIDE_FILE" <<'EOF'
 # Written by lifecycle.sh for the duration of a terraform import; always removed
 # again. If you are reading this in a committed diff, something went wrong.
-# A plan or apply that merged this file would resolve every selector to
-# nothing and retire its bindings; lifecycle.sh removes it before either runs.
+# A plan or apply that merged this file would resolve every declared selector
+# to no members and plan the removal of the bindings those members hold;
+# lifecycle.sh removes it before either runs.
 data "http" "scope_monitored_project" {
   for_each = toset([])
 }
 
 output "members" {
-  value = {}
+  value = merge(
+    { for host in var.shared_vpc_hosts : "sharedVpcHosts/${host}" => [] },
+    { for scope in var.metrics_scopes : "metricsScopes/${scope}" => [] },
+  )
 }
 EOF
   trap drop_override EXIT
 }
 
 # Runs an import with both overrides in place. Successful imports stay quiet;
-# a failed one prints Terraform's own error ahead of the warning, because the
+# a failed one prints Terraform's own error under the warning, because the
 # warning alone cannot say whether the resource, the credentials or the
-# configuration was the problem.
+# configuration was the problem. Only the lines from the first `Error` on are
+# printed: the "Importing from ID", "Import prepared!" and "Refreshing state"
+# lines above it are what a successful import prints too. An output with no
+# such line is printed whole. -no-color keeps the escapes Terraform writes
+# even into a pipe out of the log.
 import_resource() { # <address> <id>
-  local output
-  if output=$(terraform import -input=false "$1" "$2" 2>&1); then
+  local output errors line
+  if output=$(terraform import -input=false -no-color "$1" "$2" 2>&1); then
     return 0
   fi
-  printf '%s\n' "$output" >&2
   warn "could not import $1 ($2); the apply will fail with a 409"
+  warn "terraform import said:"
+  errors=$(awk '/Error/ { found = 1 } found' <<<"$output")
+  [[ -n "$errors" ]] || errors="$output"
+  while IFS= read -r line; do printf '     %s\n' "$line"; done <<<"$errors" >&2
   return 1
 }
 
@@ -1183,6 +1197,13 @@ if [[ "${KUBE_AGENTS_SOURCE_ONLY:-false}" == "true" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
+# A lifecycle.sh killed by a signal the EXIT trap cannot see (SIGKILL, an
+# OOM-kill, a lost machine) leaves the two import overrides behind, and a
+# plan or apply that merged the scope one would resolve every declared
+# selector to no members. Whatever subcommand runs next clears them before
+# terraform reads the configuration; an import rewrites them first anyway.
+drop_override
+
 case "${1:-}" in
   adopt-kms)
     shift
@@ -1192,9 +1213,6 @@ case "${1:-}" in
     ;;
   plan)
     shift
-    # A lifecycle.sh killed mid-import leaves the overrides behind, and a plan
-    # that merged the scope one would show every selector's bindings retired.
-    drop_override
     # Read-only, and every argument here is what makes it so:
     #
     #   readonly       do not create the state bucket (see ensure_backend)
@@ -1218,9 +1236,6 @@ case "${1:-}" in
     ;;
   apply)
     shift
-    # As under plan: an apply that merged a stale scope override would retire
-    # the bindings of every declared selector.
-    drop_override
     ensure_init
     log "verifying pre-apply safety guards (cluster, IAM, KMS)..."
     guard_cluster_ownership
@@ -1251,7 +1266,6 @@ case "${1:-}" in
     ;;
   destroy)
     shift
-    drop_override
     ensure_init
     # Confirm before the FIRST side effect, not at terraform's own prompt: by
     # the time `terraform destroy` asks, this script has already deleted the
@@ -1295,7 +1309,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,68p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

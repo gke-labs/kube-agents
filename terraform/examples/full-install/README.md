@@ -366,9 +366,12 @@ neither means what it looks like:
   import (`Invalid for_each argument`) until it is pinned to an empty set, and
   the IAM module keys its scope bindings on that module's `members` output,
   unknown for the same reason once a Shared VPC host or Metrics Scope is
-  declared. The second file pins both, and goes into the module's own
-  directory because Terraform merges override files per module. The filename
-  suffix is what makes Terraform treat each as an override, so keep it:
+  declared. The second file pins both, the lookup to no instances and
+  `members` to an empty list under each declared selector's name (the IAM
+  module's precondition wants an entry per selector, so a bare `{}` would warn
+  on every import), and goes into the module's own directory because
+  Terraform merges override files per module. The filename suffix is what
+  makes Terraform treat each as an override, so keep it:
 
   ```bash
   cat > providers_lifecycle_override.tf <<'EOF'
@@ -385,7 +388,10 @@ neither means what it looks like:
   }
 
   output "members" {
-    value = {}
+    value = merge(
+      { for host in var.shared_vpc_hosts : "sharedVpcHosts/${host}" => [] },
+      { for scope in var.metrics_scopes : "metricsScopes/${scope}" => [] },
+    )
   }
   EOF
   terraform import 'module.gke_backup_plan[0].google_gke_backup_backup_plan.this' \
@@ -396,9 +402,12 @@ neither means what it looks like:
 
   Remove both overrides before the next apply — they are never meant to
   survive an import, which is why `lifecycle.sh` deletes them on an `EXIT` trap
-  and again at the start of `plan`, `apply` and `destroy`. A plan that merged
-  the scope override would resolve every declared selector to nothing and
-  retire its bindings.
+  and again at the start of every subcommand. A plan or apply that merged the
+  scope override would resolve every declared selector to no members and plan
+  the removal of the bindings those members hold, and the resolver module's
+  own `terraform test` suite would assert against the pin instead of the
+  module, which is why `make terraform-test` refuses to run beside the file
+  and names it.
 
 - **A retry that would create a cluster that already exists.** State left by an
   apply that died before the cluster finished creating can hold a managed

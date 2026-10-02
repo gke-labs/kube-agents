@@ -36,6 +36,10 @@ _SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
 _SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
 _OVERRIDE_DATA_RE = re.compile(r'^data "(\w+)" "(\w+)"', re.MULTILINE)
 _OVERRIDE_OUTPUT_RE = re.compile(r'^output "(\w+)"', re.MULTILINE)
+# The members pin is keyed on the module's own variables (var.<name>) under
+# the selector names the module's output uses (<prefix>/${...}).
+_OVERRIDE_VAR_RE = re.compile(r"\bvar\.(\w+)")
+_OVERRIDE_KEY_RE = re.compile(r'"(\w+)/\$\{')
 # The README's hand-run import recipe writes the scope override itself: the
 # path it writes to, and the heredoc body up to the terminator.
 _README_SCOPE_OVERRIDE_RE = re.compile(
@@ -49,6 +53,11 @@ def _scope_resolver_source():
     match = _SCOPE_RESOLVER_SOURCE_RE.search((_FULL_INSTALL / "main.tf").read_text())
     assert match, "main.tf no longer sources a scope_resolver module"
     return match.group(1)
+
+
+def _override_body(text):
+    """An override's lines less comments and blank lines, each stripped."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
 
 def _scratch_composition(root):
@@ -1573,8 +1582,8 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         """A lifecycle.sh killed mid-import leaves both override files behind.
 
         Merged into a plan or apply, the scope one resolves every declared
-        selector to nothing and retires its bindings, so each subcommand
-        removes the pair before terraform reads the configuration.
+        selector to no members and plans the removal of their bindings, so the
+        script removes the pair before any subcommand reads the configuration.
         """
         for args in (["plan"], ["apply", "-auto-approve"], ["destroy", "-auto-approve"]):
             with self.subTest(args=args), tempfile.TemporaryDirectory() as tmp:
@@ -1732,14 +1741,26 @@ class ImportOverrideTest(unittest.TestCase):
     scratch module directory and never into the checkout's.
     """
 
+    # What a failed import prints, shaped like Terraform's: the lines a
+    # successful import prints too, then the error box.
+    _IMPORT_PREAMBLE = [
+        'module.m.google_kms_key_ring.k[0]: Importing from ID "projects/p/locations/l/keyRings/r"...',
+        "module.m.google_kms_key_ring.k[0]: Import prepared!",
+        "  Prepared google_kms_key_ring for import",
+        "module.m.google_kms_key_ring.k[0]: Refreshing state... [id=projects/p/locations/l/keyRings/r]",
+    ]
     _IMPORT_ERROR = "Error: Invalid for_each argument (stub)"
+    _IMPORT_ERROR_DETAIL = "on ../../modules/kube-agents-scope-resolver/main.tf line 249 (stub)"
+    _IMPORT_FAILURE = [*_IMPORT_PREAMBLE, "|", f"| {_IMPORT_ERROR}", "|", f"|   {_IMPORT_ERROR_DETAIL}", "|"]
 
-    def _run(self, func_call, import_rc=0, enable_drift="true", enable_chat="false"):
+    def _run(self, func_call, import_rc=0, enable_drift="true", enable_chat="false", import_output=None):
         """Run one adoption function against stubs that record each import.
 
-        Returns the process, one line per `terraform import` saying whether
-        each override file existed at that moment, the scope override's text
-        as the last import saw it, and the two paths the files were at.
+        Returns the process, one line per `terraform import` with its
+        arguments and whether each override file existed at that moment, the
+        scope override's text as the last import saw it, and the two paths the
+        files were at. A failing import prints `import_output` (the realistic
+        transcript above by default) to stderr before exiting `import_rc`.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -1748,6 +1769,8 @@ class ImportOverrideTest(unittest.TestCase):
             bash = shutil.which("bash")
             imports = root / "imports"
             captured = root / "captured-scope-override.tf"
+            failure = root / "import-failure.txt"
+            failure.write_text("".join(f"{line}\n" for line in (import_output or self._IMPORT_FAILURE)))
             provider_override = comp / _PROVIDER_OVERRIDE
             scope_override = (comp / _scope_resolver_source() / _SCOPE_OVERRIDE).resolve()
             # An empty state; a console that enables the drift trio (three
@@ -1775,9 +1798,9 @@ class ImportOverrideTest(unittest.TestCase):
                 "  import)\n"
                 f'    provider=no; [ -f "{provider_override}" ] && provider=yes\n'
                 f'    scope=no; [ -f "{scope_override}" ] && scope=yes\n'
-                f'    echo "import $3 provider=$provider scope=$scope" >> "{imports}"\n'
+                f'    echo "import ${{*:2}} provider=$provider scope=$scope" >> "{imports}"\n'
                 f'    [ -f "{scope_override}" ] && cp "{scope_override}" "{captured}"\n'
-                f'    [ {import_rc} -eq 0 ] || echo "{self._IMPORT_ERROR}" >&2\n'
+                f'    [ {import_rc} -eq 0 ] || cat "{failure}" >&2\n'
                 f"    exit {import_rc} ;;\n"
                 "esac\n"
                 "exit 0\n"
@@ -1813,13 +1836,20 @@ class ImportOverrideTest(unittest.TestCase):
                 self.assertEqual(len(seen), expected_imports, seen)
                 for line in seen:
                     self.assertIn("provider=yes scope=yes", line)
+                    # Terraform colours its output even into a pipe; the
+                    # error a failed import prints must not carry escapes.
+                    self.assertIn(" -no-color ", line)
+                    self.assertIn(" -input=false ", line)
                 self.assertEqual(left, [])
                 self.assertIn(summary, proc.stdout)
                 self.assertEqual(proc.stderr, "")
 
     def test_a_failed_import_prints_terraforms_error_and_still_removes_both_overrides(self):
         """The warning alone cannot say why; before this, the error went to /dev/null
-        and the first sign of trouble was the apply's 409."""
+        and the first sign of trouble was the apply's 409. What is printed is
+        the transcript from its first Error line on, indented under the
+        warning: the import-prepared and refreshing lines above it are what a
+        successful import prints too."""
         for func_call in ("adopt_kms", "adopt_pubsub"):
             with self.subTest(func_call=func_call):
                 proc, seen, _, left = self._run(
@@ -1830,10 +1860,26 @@ class ImportOverrideTest(unittest.TestCase):
                 for line in seen:
                     self.assertIn("provider=yes scope=yes", line)
                 self.assertEqual(left, [])
-                self.assertIn(self._IMPORT_ERROR, proc.stderr)
                 self.assertIn("could not import module.", proc.stderr)
                 self.assertIn("the apply will fail with a 409", proc.stderr)
+                self.assertIn("terraform import said:", proc.stderr)
+                self.assertIn(f"     | {self._IMPORT_ERROR}\n", proc.stderr)
+                self.assertIn(self._IMPORT_ERROR_DETAIL, proc.stderr)
+                self.assertLess(proc.stderr.index("could not import"), proc.stderr.index(self._IMPORT_ERROR))
+                for line in self._IMPORT_PREAMBLE:
+                    self.assertNotIn(line.strip(), proc.stderr)
                 self.assertNotIn("imported", proc.stdout.replace("0 imported", ""))
+
+    def test_a_failed_import_with_no_error_line_is_printed_whole(self):
+        """Trimming to the first Error line must not hide an output that has none."""
+        odd = ["something the stub cannot explain", "and a second line of it"]
+        proc, seen, _, left = self._run("adopt_kms", import_rc=1, import_output=odd)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertGreater(len(seen), 0)
+        self.assertEqual(left, [])
+        self.assertIn("terraform import said:", proc.stderr)
+        for line in odd:
+            self.assertIn(f"     {line}\n", proc.stderr)
 
     def test_the_scope_override_pins_blocks_the_module_defines(self):
         """An override of a block the module does not define fails every import
@@ -1842,7 +1888,12 @@ class ImportOverrideTest(unittest.TestCase):
         _, seen, text, _ = self._run("adopt_kms")
         self.assertGreater(len(seen), 0)
         module = (_FULL_INSTALL / _scope_resolver_source()).resolve()
-        module_text = "".join(path.read_text() for path in sorted(module.glob("*.tf")))
+        # The checkout's module, less any import override an interrupted
+        # lifecycle.sh left in it: that file defines the very blocks this test
+        # looks for, and would make a rename in the module pass here.
+        module_text = "".join(
+            path.read_text() for path in sorted(module.glob("*.tf")) if not path.name.endswith("_override.tf")
+        )
         data_blocks = _OVERRIDE_DATA_RE.findall(text)
         outputs = _OVERRIDE_OUTPUT_RE.findall(text)
         self.assertEqual(len(data_blocks), 1, text)
@@ -1852,7 +1903,20 @@ class ImportOverrideTest(unittest.TestCase):
             self.assertRegex(text, rf'data "{provider}" "{name}" \{{\s*for_each\s*=\s*toset\(\[\]\)')
         for name in outputs:
             self.assertIn(f'output "{name}"', module_text)
-            self.assertRegex(text, rf'output "{name}" \{{\s*value\s*=\s*\{{\}}')
+            self.assertRegex(text, rf'output "{name}" \{{\s*value\s*=\s*merge\(')
+        # The pin keys an empty member list under each declared selector's
+        # name, so the IAM module's per-selector precondition holds during
+        # the import: every variable it reads is one the module declares, and
+        # every key prefix is one the module's own output builds.
+        variables = _OVERRIDE_VAR_RE.findall(text)
+        self.assertEqual(sorted(variables), ["metrics_scopes", "shared_vpc_hosts"], text)
+        for name in variables:
+            self.assertIn(f'variable "{name}"', module_text)
+        prefixes = _OVERRIDE_KEY_RE.findall(text)
+        self.assertEqual(sorted(prefixes), ["metricsScopes", "sharedVpcHosts"], text)
+        for prefix in prefixes:
+            self.assertIn(f'"{prefix}/${{', module_text)
+        self.assertEqual(text.count("=> []"), len(prefixes), text)
 
     def test_the_readme_recipe_writes_the_scope_override_the_script_writes(self):
         """The README's BackupPlan import recipe carries its own copy of the
@@ -1870,11 +1934,8 @@ class ImportOverrideTest(unittest.TestCase):
             pathlib.PurePosixPath(path),
             pathlib.PurePosixPath(_scope_resolver_source()) / _SCOPE_OVERRIDE,
         )
-        body = "\n".join(line.strip() for line in body.splitlines())
-        self.assertEqual(_OVERRIDE_DATA_RE.findall(body), _OVERRIDE_DATA_RE.findall(text))
-        self.assertEqual(_OVERRIDE_OUTPUT_RE.findall(body), _OVERRIDE_OUTPUT_RE.findall(text))
-        self.assertIn("for_each = toset([])", body)
-        self.assertIn("value = {}", body)
+        # Line for line, less the script's comment header: the recipe omits it.
+        self.assertEqual(_override_body(body), _override_body(text))
 
 
 if __name__ == "__main__":
