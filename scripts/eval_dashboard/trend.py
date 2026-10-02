@@ -67,7 +67,8 @@ TREND_PAGE = "trend.html"
 # baselines.py: DEFAULT_ADMISSION_RATE, DEFAULT_ADMISSION_MIN_RUNS). The
 # page draws the bar and pools the window by these; the gate reads its own
 # from the environment, so a tuned bar shows here only when these move too.
-ADMISSION_RATE = 0.95
+# 0.90 since 2026-09-29 (#1493): the roster page's bar, measured first.
+ADMISSION_RATE = 0.90
 ADMISSION_MIN_RUNS = 20
 # How many trailing nights a case's judged range spans (a week of nightlies:
 # the same span that fills an admission window at three repetitions).

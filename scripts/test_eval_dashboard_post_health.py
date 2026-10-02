@@ -1657,8 +1657,8 @@ BLIND_REASON = "cannot mint a token as seeded-fleet-reader@kube-agents-evals-1.i
 T14 = datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc)  # 9:30 AM EDT, outside the digest window
 
 
-def fixture_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None):
-    return {"scanned_at": scanned, "projects": projects, "checked": checked, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
+def fixture_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None, unread_units=0):
+    return {"scanned_at": scanned, "projects": projects, "checked": checked, "unread_units": unread_units, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
 
 
 def fixture_drift(since=SCAN_AT, roles=(DRIFT_ROLE,), projects=DRIFT_PROJECTS, evidence=()):
@@ -1742,6 +1742,10 @@ class FixtureDrift(RunHarness):
         self.assertEqual(line(None), [], "before the scan has ever published, no line")
         self.assertEqual(line(fixture_block()), ["🧭 *Seeded fleet:* 30 of 30 pool projects checked at 9:00 AM ET, every fixture in its designed state."])
         self.assertEqual(line(fixture_block(checked=28)), ["🧭 *Seeded fleet:* 28 of 30 pool projects checked at 9:00 AM ET, every fixture in its designed state, 2 not checked."])
+        # A role the scan could not read -- one never planted in that project --
+        # must not be counted into the all-clear.
+        self.assertEqual(line(fixture_block(unread_units=90)), ["🧭 *Seeded fleet:* 30 of 30 pool projects checked at 9:00 AM ET, no drift in what was read; 90 roles not read."])
+        self.assertEqual(line(fixture_block(checked=28, unread_units=1)), ["🧭 *Seeded fleet:* 28 of 30 pool projects checked at 9:00 AM ET, no drift in what was read; 1 role not read, 2 not checked."])
         self.assertEqual(
             line(fixture_block(drifted={"kube-agents-evals-1": [DRIFT_ROLE], "kube-agents-evals-4": [DRIFT_ROLE, "no-pdb-workload"]})),
             ["🧭 *Seeded fleet:* 2 of 30 checked pool projects drifted at 9:00 AM ET (crashloop-workload, no-pdb-workload); a red on a case that depends on them there is the fixture, not the code."],

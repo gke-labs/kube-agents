@@ -17,14 +17,14 @@
 A case addresses the standing fleet (``bench/tf/fleet/``) by the role a
 fixture plays -- ``crashloop-workload``, ``idle-nodepool``, ``drift-outlier``
 -- and never by cluster name or project id. Every eval project carries its own
-trio of seeded clusters, so a check naming ``seeded-a`` in project X is a check
+set of seeded clusters, so a check naming ``seeded-a`` in project X is a check
 that cannot run in project Y, and the pool of eval projects is meant to grow.
 
 The mapping from role to cluster is NOT here. It lives in
 ``bench/tf/fleet/fixtures.json`` beside the Terraform that plants the fixtures,
 and at run time ``hack/fleet-kubeconfigs.sh`` is the only thing that reads it:
 for each role it writes ``<dir>/<role>.kubeconfig`` holding credentials for
-whichever cluster of the leased project's trio carries that role. This module's
+whichever cluster of the leased project's fleet carries that role. This module's
 whole job is the last hop -- role name to file path -- which keeps the
 resolution single-sourced and makes this side testable without a cloud.
 

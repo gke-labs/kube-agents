@@ -29,7 +29,7 @@ SANDBOX_IMAGE_ARGS := $(foreach v,$(SANDBOX_IMAGE_VARS),$(if $($(v)),--build-arg
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox docker-push docker-push-agents docker-push-credential-proxy docker-push-sandbox dev-rebuild-agent mirror-images images-check status prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-audience docs-check-context-budget chart-sync chart-check iac-parity-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -75,20 +75,6 @@ docker-build-sandbox: ## Build the agent shell sandbox image.
 docker-smoke-sandbox: docker-build-sandbox ## Build the sandbox image and exercise it over ssh.
 	deploy/sandbox/smoke-test.sh $(REPO)/agent-sandbox:latest
 
-# Docker pushes
-docker-push: docker-push-agents docker-push-credential-proxy docker-push-sandbox ## Build and push every image to $$REPO.
-docker-push-agents: $(foreach agent,$(AGENTS),docker-push-$(agent)) ## Build and push the agent images.
-
-.PHONY: $(foreach agent,$(AGENTS),docker-push-$(agent))
-$(foreach agent,$(AGENTS),docker-push-$(agent)): docker-push-%: docker-build-%
-	docker push $(REPO)/$*-agent:latest
-
-docker-push-credential-proxy: docker-build-credential-proxy ## Build and push the credential-proxy image.
-	docker push $(REPO)/credential-proxy:latest
-
-docker-push-sandbox: docker-build-sandbox ## Build and push the agent shell sandbox image.
-	docker push $(REPO)/agent-sandbox:latest
-
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/installer/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
@@ -101,10 +87,6 @@ mirror-images: ## Mirror the images in images.json into MIRROR_PREFIX (e.g. make
 
 images-check: ## Verify images.json still matches every pin it mirrors, that the Go builder pin matches k8s-operator/go.mod, and that the chart renders nothing off a public registry when mirrored (CI runs this).
 	@./hack/check-image-inventory.sh
-
-
-status: ## Show the working tree status.
-	git status
 
 # Prefer an installed `prettier` over `npx prettier`, falling back to npx where
 # there is none (CI installs a pinned version first). npx re-resolves the
@@ -322,12 +304,8 @@ test-python-deps: ## Install the third-party imports `make test-python` needs.
 e2e-tests: ## Run the live E2E promotion test suite against the target GKE cluster.
 	@./scripts/release/execute_e2e_tests.sh
 
-test-e2e: e2e-tests ## Alias for e2e-tests.
-
 test-e2e-deps: ## Install dependencies required to run the E2E test suite.
 	@python3 -m pip install -r tests/e2e/requirements.txt
-
-e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 
 # One command for "is this branch landable": everything a PR must pass, ordered
 # so the cheapest check fails first.

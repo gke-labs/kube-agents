@@ -360,11 +360,17 @@ def test_a_leftover_pre_jsonl_file_is_refused(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_the_default_bar_is_nineteen_of_twenty():
+def test_the_default_bar_is_eighteen_of_twenty():
+    """0.90 over 20: the roster page's bar (>= 90 % of graded repetitions),
+    set 2026-09-29 from the store's movement (#1493). 18/20 and 19/21 clear
+    it; 17/20 and 18/21 do not."""
     bar = AdmissionBar()
     assert (bar.rate, bar.min_runs) == (DEFAULT_ADMISSION_RATE, DEFAULT_ADMISSION_MIN_RUNS)
-    assert BaselineRecord(key=KEY, runs=20, passes=19).admits(bar) is True
-    assert BaselineRecord(key=KEY, runs=20, passes=18).admits(bar) is False
+    assert (bar.rate, bar.min_runs) == (0.90, 20)
+    assert BaselineRecord(key=KEY, runs=20, passes=18).admits(bar) is True
+    assert BaselineRecord(key=KEY, runs=20, passes=17).admits(bar) is False
+    assert BaselineRecord(key=KEY, runs=21, passes=19).admits(bar) is True
+    assert BaselineRecord(key=KEY, runs=21, passes=18).admits(bar) is False
 
 
 def test_a_lucky_single_run_does_not_admit():
@@ -807,7 +813,7 @@ def test_the_record_verdict_is_the_same_five_states_in_either_mode(tmp_path):
     write_store(tmp_path, "planted-pdb", [record(runs=20, passes=20)])
     verdict = BaselineStore.load(tmp_path).record_verdict("planted-pdb", KEY, bar=AdmissionBar())
     assert verdict.state == "would-admit" and verdict.full_window
-    assert verdict.detail == "20/20 screening runs across 1 recorded run(s) (bar 95% over 20)"
+    assert verdict.detail == "20/20 screening runs across 1 recorded run(s) (bar 90% over 20)"
 
     for mode in ("roster", "record"):
         decision = BaselineStore.load(tmp_path).admission(
@@ -830,7 +836,7 @@ def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
     assert kept.reason == (
         "admitted by BOOTSTRAP_ADMITTED (transition bridge); the record would "
         "demote it: screened at 12/20 across 1 recorded run(s), below the bar "
-        "of 95% over 20 runs"
+        "of 90% over 20 runs"
     )
 
     out = store.admission("unlisted", KEY, bar=AdmissionBar(), bootstrap=listed, mode="roster")
@@ -838,7 +844,7 @@ def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
     assert out.record == "would-admit"
     assert out.reason == (
         "the record would admit it: 20/20 screening runs across 1 recorded "
-        "run(s) (bar 95% over 20) -- EVAL_ADMISSION_MODE=roster, so "
+        "run(s) (bar 90% over 20) -- EVAL_ADMISSION_MODE=roster, so "
         "BOOTSTRAP_ADMITTED decides and does not name this case"
     )
 

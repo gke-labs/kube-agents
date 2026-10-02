@@ -704,30 +704,6 @@ save_var() {
   umask "$old_umask"
 }
 
-save_secret_var() {
-  local var_name=$1
-  local var_val=$2
-  export "${var_name}=${var_val}"
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
-    return 0
-  fi
-  if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
-    save_var "$var_name" "$var_val"
-  else
-    if [ -f "$VARS_FILE" ]; then
-      local old_umask
-      old_umask=$(umask)
-      umask 077
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      grep -E -v "^[[:space:]]*export[[:space:]]+${var_name}=" "$VARS_FILE" > "$VARS_FILE.tmp" 2>/dev/null || true
-      chmod 600 "$VARS_FILE.tmp" 2>/dev/null || true
-      mv "$VARS_FILE.tmp" "$VARS_FILE"
-      chmod 600 "$VARS_FILE" 2>/dev/null || true
-      umask "$old_umask"
-    fi
-  fi
-}
-
 # ─── Locations ────────────────────────────────────────────────────────────────
 # Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
 # "us-central1-c") is not a valid key location. Default to the enclosing region.

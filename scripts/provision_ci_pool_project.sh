@@ -136,7 +136,7 @@ fi
 # land it silently -- the verifier matches clusters by name and reports green.
 if [ "${REGION}" != "us-central1" ]; then
   echo "FATAL: --region=${REGION} is not supported. bench/tf/fleet is pinned to" >&2
-  echo "       us-central1-a, so the seeded trio would not follow the host cluster." >&2
+  echo "       us-central1-a, so the seeded fleet would not follow the host cluster." >&2
   echo "       Give bench/tf/fleet a zone in ${REGION} first." >&2
   exit 1
 fi
