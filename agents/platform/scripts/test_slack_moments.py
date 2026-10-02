@@ -134,6 +134,15 @@ class OpenedPrTest(unittest.TestCase):
         self.assertIsNone(m.opened_pr(f"Bob opened PR #412 against main: {PR}"))
         self.assertIsNone(m.opened_pr(f"Opened PR #412 against main. The fix is {PR}"))
 
+    def test_a_pr_the_sentence_only_cites_is_not_the_opened_one(self):
+        for line in (
+            f"Opened PR #500, which reverts {PR}",
+            f"Opened a PR to supersede {PR}",
+            f"Opened PR #500 as a follow-up to {PR}",
+            f"Opened PR #500 in acme/x: {PR}",
+        ):
+            self.assertIsNone(m.opened_pr(line), line)
+
     def test_a_name_before_a_colon_or_comma_is_someone_else(self):
         self.assertIsNone(m.opened_pr(f"Dependabot: opened {PR}"))
         self.assertIsNone(m.opened_pr(f"Renovate, as usual, opened {PR}"))

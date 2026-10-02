@@ -52,11 +52,15 @@ OPENED_BEFORE_URL = re.compile(
 #: The verb and "PR" with more words before the url, in the same sentence:
 #: "Opened PR #412 in acme/x: <url>", "Opened a PR against main: <url>".
 OPENED_PR_THEN = re.compile(
-    r"\b(?:opened|created|raised|filed|submitted)[*_`]*\s+" + PR_ARTICLE + r"(?:PR|pull\s+request)\b",
+    r"\b(?:opened|created|raised|filed|submitted)[*_`]*\s+" + PR_ARTICLE
+    + r"(?:PR|pull\s+request)\b(?:\s*#(\d+))?",
     re.IGNORECASE,
 )
 #: A sentence end between "PR" and the url; a colon does not end it here.
 GAP_BREAK = re.compile(r"[.!?](?=[*_`]*\s+[A-Z])|;(?=[*_`]*\s)")
+#: Those words end in a colon or dash that labels the url, so a url the
+#: sentence only cites ("Opened PR #412, which reverts <url>") is not the one.
+GAP_LABEL = re.compile(r"[:—–-][*_`]*\s*[*_`]*(?:\[[^\]]*\]\(|<)?$")
 #: A negation just before the verb: "not opened", "haven't yet opened".
 NEGATED_VERB = re.compile(r"(?:\bnot|\bnever|n't)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
 #: Where a sentence ends: ".", "!" or "?" before a space and a capital, or
@@ -161,7 +165,9 @@ def opened_pr(text: str) -> tuple[str, str, str, str] | None:
     """``(url, repo, number, line)`` for the first PR ``text`` says was opened, else None."""
     for line in str(text or "").splitlines():
         for match in PR_URL.finditer(line):
-            verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(line[: match.start()])
+            verb = OPENED_BEFORE_URL.search(line[: match.start()]) or _opened_pr_then(
+                line[: match.start()], match.group(3)
+            )
             if not verb:
                 continue
             before = line[: verb.start()]
@@ -171,12 +177,16 @@ def opened_pr(text: str) -> tuple[str, str, str, str] | None:
     return None
 
 
-def _opened_pr_then(before: str) -> re.Match | None:
-    """The last "opened PR" in ``before`` with no sentence end between it and the url."""
+def _opened_pr_then(before: str, number: str) -> re.Match | None:
+    """The last "opened PR" in ``before`` with no sentence end between it and the
+    url, a label just before the url, and no other PR number named."""
     verbs = list(OPENED_PR_THEN.finditer(before))
-    if not verbs or GAP_BREAK.search(before, verbs[-1].end()):
+    if not verbs:
         return None
-    return verbs[-1]
+    verb = verbs[-1]
+    if GAP_BREAK.search(before, verb.end()) or not GAP_LABEL.search(before, verb.end()):
+        return None
+    return verb if verb.group(1) in (None, number) else None
 
 
 def _a_name(clause: str) -> bool:

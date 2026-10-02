@@ -62,8 +62,8 @@ answered there runs on it again: it becomes the thread's plan once more, or,
 beside a newer plan, holds ``processing`` for another hold. Past
 :data:`LAPSED_PER_THREAD` a thread drops a set-aside plan that is quiet and
 has no card waiting first. A set-aside plan with no card waiting on the user
-or given up is dropped once :data:`SET_ASIDE_MAX_SECONDS` pass without a note
-or settled row, its session sent, so a rolling card or running row whose
+or given up is dropped once :data:`SET_ASIDE_MAX_SECONDS` pass after its last
+touch before it was set aside, or after a card on it resumed, its session sent, so a rolling card or running row whose
 terminal event was lost does not keep it for good. A plan evicted at
 :data:`PLANS_MAX`, current or set
 aside, has its session sent again on the way out, since nothing else would;
@@ -123,9 +123,9 @@ SESSION_REFRESH_SECONDS = 60.0
 #: reach no one.
 PLAN_HOLD_SECONDS = 1800.0
 
-#: How long a set-aside plan is kept after its last note or settled row when
-#: nothing on it waits on a person: no card waiting on the user and none that
-#: gave up. Its running rows and rolling cards lost their terminal events, or
+#: How long a set-aside plan is kept after its last touch before it was set
+#: aside, or after a card on it resumed, when nothing on it waits on a person:
+#: no card waiting on the user and none that gave up. Its running rows and rolling cards lost their terminal events, or
 #: their cards have been quiet this long; well past a card's silent stretches,
 #: so a late event almost always still finds its row.
 SET_ASIDE_MAX_SECONDS = 4 * 3600.0
@@ -192,7 +192,8 @@ class _Plan:
         self.rolling: set[str] = set()
         #: The rolling cards now waiting on the user.
         self.waiting: set[str] = set()
-        #: ``time.monotonic()`` at the last note or settled row.
+        #: ``time.monotonic()`` at the last note or settled row while current, or
+        #: when a card resumed once set aside; a settled row then does not move it.
         self.touched = time.monotonic()
         #: The timer that sets the plan aside after :data:`PLAN_HOLD_SECONDS`.
         self.lapse: asyncio.TimerHandle | None = None
@@ -470,7 +471,7 @@ async def _expire(adapter: Any, key: tuple, plan: _Plan) -> None:
     """Drop a set-aside plan untouched for :data:`SET_ASIDE_MAX_SECONDS`, and send its session.
 
     A plan that waits on a person (:func:`_kept`) stays, bounded by the caps,
-    and is looked at again a full period later, as is one touched since.
+    and is looked at again a full period later, as is one a resumed card touched since.
     """
     plans = _lapsed.get(key)
     if not plans or not any(old is plan for old in plans):
