@@ -992,11 +992,11 @@ func TestAgentPodStagesTheClientKey(t *testing.T) {
 
 // The Hermes base image ships HERMES_WRITE_SAFE_ROOT=/opt/data. With the sandbox on,
 // file_safety.py checks the path prefix in the agent process before routing writes.
-// Now that the sandbox home is root-owned (#2180/#2245), uid 1000 cannot write anything
-// in it, so HERMES_WRITE_SAFE_ROOT names only shellSandboxDataPath (#2284).
-// This ensures write attempts naming /home/agent/... fail fast with "outside HERMES_WRITE_SAFE_ROOT"
-// at the gateway's prefix check rather than failing in the sandbox with "Permission denied",
-// and does not list /home/agent as a permitted write root.
+// Since durable work is pinned to shellSandboxDataPath (/opt/data) via TERMINAL_CWD,
+// the ephemeral home (/home/agent) is not a durable or supported write destination
+// (see #2180/#2245 for making it root-owned in the image). HERMES_WRITE_SAFE_ROOT
+// names only shellSandboxDataPath (#2284), refusing write attempts naming /home/agent/...
+// upfront at the gateway's prefix check and omitting /home/agent from refusal errors.
 func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	safeRoot := func(pod corev1.PodSpec) (string, bool) {
 		for _, c := range pod.Containers {
@@ -1021,12 +1021,13 @@ func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	if got != want {
 		t.Errorf("write safe root = %q, want %q", got, want)
 	}
-	// The home must NOT be included: with a root-owned sandbox home (#2180/#2245),
-	// allowing /home/agent passes prefix validation only to fail with EACCES in the
-	// sandbox and misleadingly advertises /home/agent in refusal errors (#2284).
+	// The home must NOT be included: durable work is pinned to shellSandboxDataPath,
+	// and write attempts naming /home/agent/... should fail fast at the gateway prefix check
+	// rather than writing to non-durable container scratch space (and see #2180/#2245 for
+	// making the sandbox home root-owned in the image).
 	for _, p := range strings.Split(got, ":") {
 		if p == shellSandboxHomePath {
-			t.Errorf("write safe root entry %q includes the root-owned sandbox home; expected only %q", p, shellSandboxDataPath)
+			t.Errorf("write safe root entry %q includes the sandbox home; expected only %q", p, shellSandboxDataPath)
 		}
 		if p != shellSandboxDataPath {
 			t.Errorf("write safe root entry %q is not a sandbox data path", p)
