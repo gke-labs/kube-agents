@@ -806,7 +806,15 @@ for whoever holds the pool with, per project, what was observed and the exact
 command that repairs it. An open issue whose title names every finding is adopted
 instead (title only: every bot-filed body quotes the evidence, which carries the
 scan's finding lines), as is the bot's own issue when its title fell back to a
-count, matched on the finding ids its hidden marker carries.
+count, matched on the finding ids its hidden marker carries. A finding a leased
+run passes with is said the other way round: the verifier lists those in
+`LEASE_SILENT_FINDINGS` (today `gke/host-otel-scope`, a host cluster that serves
+the lease and exports no traces), `health.py` copies the firing ones into the
+incident's `passes_leases`, and the advice, the Chat sentence, the digest line
+and the issue body then say that no run reds from it and a 403 on one of those
+projects is the change's to read; when such a finding fires beside one that
+does red a run, the 403 sentence names the latter and its projects and the
+exception follows it.
 
 **What never fails the bot.** A missing `gcloud`, a project the bot cannot read, a
 verifier past the per-project ceiling (300 s; the verifier's own deadline is 270 s in,

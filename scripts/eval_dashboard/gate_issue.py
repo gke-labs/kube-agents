@@ -194,7 +194,7 @@ POOL_DRIFT_MARKER = "<!-- kube-agents-bot:pool-drift {findings} -->"
 POOL_DRIFT_MARKER_RE = re.compile(r"<!-- kube-agents-bot:pool-drift ([^ >]*) -->")
 POOL_DRIFT_BODY = """\
 {marker}
-The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so a run that leases one of these projects fails on the missing grant, API, key or cluster -- a 403 or a missing resource in the agent's transcript -- and that red is the pool's, not the pull request's. A retest is worth it only after the repair below.
+The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), {consequence}
 
 **Findings**
 
@@ -215,6 +215,19 @@ Incident brief: {brief}
 
 Filed automatically by the smoke health bot; whoever holds the pool should run the repairs in the projects named; the bot will not close it.
 """
+# POOL_DRIFT_BODY's consequence for a pull request, by whether a leased run
+# reds on the findings; health.py's incident lists the ones it does not under
+# `passes_leases` (the verifier's LEASE_SILENT_FINDINGS).
+POOL_DRIFT_REDS_RUNS = (
+    "so a run that leases one of these projects fails on the missing grant, API, key or cluster -- a 403 or a missing"
+    " resource in the agent's transcript -- and that red is the pool's, not the pull request's. A retest is worth it only after the repair below."
+)
+POOL_DRIFT_PASSES_LEASES = (
+    "and a run that leases one of these projects passes with the gap: {findings} reds no run (the install serves and grades;"
+    " only what the finding names is missing), so a 403 or a missing-resource red there is the pull request's to read, not the"
+    " pool's, and nothing on a pull request waits for the repair below."
+)
+POOL_DRIFT_PASSES_LEASES_TAIL = " {findings} on its own reds no run; a red is the pool's only on a project with one of the other findings."
 RECOVERY_COMMENT = "Healthy again after {lasted}; bot will not close it."
 NO_EVIDENCE = "- (none recorded)"
 UNKNOWN_NODE = "(node name not recorded)"
@@ -401,6 +414,12 @@ def _pool_evidence(lines, findings):
 def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
+    silent = [finding for finding in findings if finding in set(incident.get("passes_leases") or [])]
+    loud = [finding for finding in findings if finding not in silent]
+    if findings and not loud:
+        consequence = POOL_DRIFT_PASSES_LEASES.format(findings=", ".join(silent))
+    else:
+        consequence = POOL_DRIFT_REDS_RUNS + (POOL_DRIFT_PASSES_LEASES_TAIL.format(findings=", ".join(silent)) if silent else "")
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
     evidence = [f"- {line}" for line in _pool_evidence(health.get("evidence") or [], findings)]
@@ -425,6 +444,7 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
         projects = list(kept) + ([POOL_DRIFT_PROJECTS_OMITTED.format(count=omitted)] if omitted else [])
         return POOL_DRIFT_BODY.format(
             marker=POOL_DRIFT_MARKER.format(findings=",".join(findings)),
+            consequence=consequence,
             findings="\n".join(f"- `{finding}`" for finding in findings) or "- (none recorded)",
             projects="\n".join(projects) or "- (none recorded)",
             since=since_text,

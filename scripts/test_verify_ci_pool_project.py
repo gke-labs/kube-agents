@@ -417,6 +417,16 @@ class GkeAndCmekTest(unittest.TestCase):
         self.assertIn("'unset'", ids["gke/host-cmek"].observed)
         self.assertNotIn("gke/host-otel-scope", ids)
 
+    def test_the_otel_scope_finding_is_the_one_a_leased_run_passes_with(self):
+        # The health bot words its pool-drift advice from this set: every
+        # other finding is a 403 or a missing resource in the leased run's
+        # transcript and the advice says so; a host cluster without the scope
+        # serves the lease and only its traces are missing, so the advice for
+        # it says the opposite. Widening the set is a claim about a finding's
+        # effect on a run, made here beside the finding that emits it.
+        self.assertEqual(checker.FINDING_HOST_OTEL_SCOPE, "gke/host-otel-scope")
+        self.assertEqual(checker.LEASE_SILENT_FINDINGS, frozenset({checker.FINDING_HOST_OTEL_SCOPE}))
+
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
         # set the scope; a fleet cluster with any value, or none, is not drift.

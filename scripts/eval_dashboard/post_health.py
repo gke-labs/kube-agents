@@ -235,6 +235,21 @@ FIXTURE_RECONCILE_HINT = "Fleet owner: re-apply bench/tf/fleet in the projects n
 # (an adopted human issue, or a failed filing, does not). The space is told
 # where to look rather than what to type.
 POOL_REPAIR_HINT = "Pool owner: the repair command per project (or, for a check that failed without naming one, what was observed) is in pool-state.json (docs/ci-health.md, The pool-state scan) and in the bot's tracking issue when it filed one."
+# The consequence of a pool drift for a pull request, by whether a leased run
+# reds on the findings; health.py's incident lists the ones it does not under
+# `passes_leases` (the verifier's LEASE_SILENT_FINDINGS). The default reading
+# sends a real 403 to the pool, so a finding a run passes with is said the
+# other way round, alone or as a tail after the findings that do red a run.
+POOL_REDS_RUNS = " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
+POOL_PASSES_LEASES = (
+    " no run reds from {findings}: an install there passes its lease with that gap,"
+    " so a 403 or a missing-resource red on one of those projects is the code's to read, not the pool's."
+)
+POOL_PASSES_LEASES_TAIL = " {findings} reds no run; a red is the pool's only on a project with one of the other findings."
+POOL_RETEST = "Retest once the pool owner has run the repair."
+POOL_NO_RETEST = "Nothing on a pull request waits for the repair."
+POOL_DIGEST_REDS_RUNS = " a 403 from a run that leased one of them is the pool's, not the code."
+POOL_DIGEST_PASSES_LEASES = " no run reds from that; a 403 on one of them is the code's to read."
 
 # Rule 8 sends the reader somewhere. The build cluster is named by its real
 # identifiers because `build-kube-agents` is Prow's context alias for it
@@ -638,15 +653,31 @@ def fixture_drift_sentence(health: dict, since: str) -> str:
     )
 
 
+def _pool_findings_split(incident: dict) -> tuple[list[str], list[str]]:
+    """(findings a leased run reds on, findings it passes with)."""
+    findings = list(incident.get("roles") or [])
+    silent = [finding for finding in findings if finding in set(incident.get("passes_leases") or [])]
+    return [finding for finding in findings if finding not in silent], silent
+
+
 def pool_drift_sentence(health: dict, since: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
     projects = list(incident.get("projects") or [])
-    return (
+    loud, silent = _pool_findings_split(incident)
+    head = (
         f"pool {plural(len(findings), 'finding')} {', '.join(findings) or '(unnamed)'}"
         f" on {len(projects)} pool {plural(len(projects), 'project')} since {since};"
-        " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
     )
+    if findings and not loud:
+        return head + POOL_PASSES_LEASES.format(findings=", ".join(silent))
+    return head + POOL_REDS_RUNS + (POOL_PASSES_LEASES_TAIL.format(findings=", ".join(silent)) if silent else "")
+
+
+def pool_drift_retest(health: dict) -> str:
+    """Whether a pull request has anything to wait for."""
+    loud, silent = _pool_findings_split(health.get("incident") or {})
+    return POOL_NO_RETEST if silent and not loud else POOL_RETEST
 
 
 def cause_sentence(health: dict) -> str:
@@ -720,7 +751,7 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the pool owner has run the repair. {POOL_REPAIR_HINT}{tracking}"]
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} {pool_drift_retest(health)} {POOL_REPAIR_HINT}{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))
@@ -1066,9 +1097,15 @@ def pool_state_digest_line(health: dict) -> str | None:
     drifted = block.get("drifted") or {}
     if drifted:
         findings = sorted({finding for findings in drifted.values() for finding in findings})
+        silent = [finding for finding in findings if finding in set(block.get("passes_leases") or [])]
+        loud = [finding for finding in findings if finding not in silent]
+        if findings and not loud:
+            consequence = POOL_DIGEST_PASSES_LEASES
+        else:
+            consequence = POOL_DIGEST_REDS_RUNS + (POOL_PASSES_LEASES_TAIL.format(findings=", ".join(silent)) if silent else "")
         return (
             f"🧭 *Pool projects:* {len(drifted)} of {checked} checked pool projects drifted at {when}"
-            f" ({', '.join(findings)}); a 403 from a run that leased one of them is the pool's, not the code."
+            f" ({', '.join(findings)});{consequence}"
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)

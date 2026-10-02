@@ -1977,16 +1977,18 @@ class WatchedPeriodics(RunHarness):
 # --------------------------------------------------------------------------- #
 
 FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
+# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+SILENT_FINDING = "gke/host-otel-scope"
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
 FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'
 POOL_BLIND_REASON = "Could not describe kube-agents-evals-1, so neither it nor anything derived from its project number was checked: PERMISSION_DENIED"
 
 
-def pool_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None, unread_units=0):
-    return {"scanned_at": scanned, "projects": projects, "checked": checked, "unread_units": unread_units, "drifted": drifted or {}, "unknown": unknown, "stale": stale, "reason": reason}
+def pool_block(drifted=None, scanned=SCAN_AT, projects=30, checked=30, unknown=False, stale=False, reason=None, unread_units=0, passes_leases=()):
+    return {"scanned_at": scanned, "projects": projects, "checked": checked, "unread_units": unread_units, "drifted": drifted or {}, "passes_leases": list(passes_leases), "unknown": unknown, "stale": stale, "reason": reason}
 
 
-def pool_drift(since=SCAN_AT, findings=(FINDING,), projects=DRIFT_PROJECTS, evidence=()):
+def pool_drift(since=SCAN_AT, findings=(FINDING,), projects=DRIFT_PROJECTS, evidence=(), passes_leases=()):
     doc = health("DEGRADED", f"pool drift: {', '.join(findings)} on {len(projects)} pool project(s)", since=since, condition="pool_drift", window=(since, None))
     doc["incident"].update({
         "roles": list(findings),
@@ -1994,9 +1996,10 @@ def pool_drift(since=SCAN_AT, findings=(FINDING,), projects=DRIFT_PROJECTS, evid
         "drift": {p: {f: [FINDING_DETAIL.format(project=p)] for f in findings} for p in projects},
         "repairs": {p: {f: FINDING_REPAIR.format(project=p) for f in findings} for p in projects},
         "reads": {p: ["iam"] for p in projects},
+        "passes_leases": list(passes_leases),
     })
     doc["evidence"] = list(evidence)
-    doc["pool_state"] = pool_block(drifted={p: list(findings) for p in projects})
+    doc["pool_state"] = pool_block(drifted={p: list(findings) for p in projects}, passes_leases=passes_leases)
     return doc
 
 
@@ -2127,6 +2130,58 @@ class PoolDrift(RunHarness):
         self.setUp()
         self.tick(pool_drift(findings=(many[1],)), T14, environ=self.environ(), gh=stale)
         self.assertEqual([call[:2] for call in stale.writes()], [("POST", "repos/gke-labs/kube-agents/issues")])
+
+    def test_a_finding_a_leased_run_passes_with_is_posted_the_other_way_round(self):
+        # A host cluster without the managed OpenTelemetry scope serves its
+        # lease; the default sentence would send a pull request's own 403 to
+        # the pool for as long as the repair takes.
+        rc, err = self.tick(pool_drift(findings=(SILENT_FINDING,), passes_leases=(SILENT_FINDING,)), T14, environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            self.opener.texts[0].splitlines()[0],
+            f"🟡 *Smoke gate: flaky* — pool finding {SILENT_FINDING} on 3 pool projects since 9:00 AM ET;"
+            f" no run reds from {SILENT_FINDING}: an install there passes its lease with that gap,"
+            " so a 403 or a missing-resource red on one of those projects is the code's to read, not the pool's."
+            f" Nothing on a pull request waits for the repair. {post_health.POOL_REPAIR_HINT} Tracking #1300.",
+        )
+        method, path, body = self.gh.calls[-1]
+        self.assertEqual((method, path), ("POST", "repos/gke-labs/kube-agents/issues"))
+        self.assertIn(f"and a run that leases one of these projects passes with the gap: {SILENT_FINDING} reds no run", body["body"])
+        self.assertNotIn("that red is the pool's", body["body"])
+        self.assertIn("```", body["body"], "the repair block is still there: the pool is drifted")
+
+    def test_a_finding_that_reds_runs_beside_one_that_does_not_keeps_the_403_sentence_and_names_the_exception(self):
+        doc = pool_drift(findings=(SILENT_FINDING, FINDING), passes_leases=(SILENT_FINDING,))
+        self.assertEqual(
+            post_health.pool_drift_sentence(doc, "9:00 AM ET"),
+            f"pool findings {SILENT_FINDING}, {FINDING} on 3 pool projects since 9:00 AM ET;"
+            " a 403 or a missing-resource red from a run that leased one of those projects is the pool's, not the code."
+            f" {SILENT_FINDING} reds no run; a red is the pool's only on a project with one of the other findings.",
+        )
+        self.assertEqual(post_health.pool_drift_retest(doc), post_health.POOL_RETEST)
+        body = post_health.gate_issue.render_pool_drift_body(doc, "Mon 9:00 AM ET", "brief")
+        self.assertIn("that red is the pool's, not the pull request's", body)
+        self.assertIn(f"{SILENT_FINDING} on its own reds no run", body)
+
+    def test_the_digest_line_says_which_way_a_drift_cuts(self):
+        def line(block):
+            doc = health("GREEN")
+            doc["pool_state"] = block
+            return [text for text in post_health.render_digest(doc, T14).splitlines() if text.startswith("🧭 *Pool projects:*")]
+
+        drifted = {"kube-agents-evals-1": [SILENT_FINDING], "kube-agents-evals-4": [SILENT_FINDING]}
+        self.assertEqual(
+            line(pool_block(drifted=drifted, passes_leases=(SILENT_FINDING,))),
+            [f"🧭 *Pool projects:* 2 of 30 checked pool projects drifted at 9:00 AM ET ({SILENT_FINDING}); no run reds from that; a 403 on one of them is the code's to read."],
+        )
+        mixed = {"kube-agents-evals-1": [FINDING, SILENT_FINDING], "kube-agents-evals-4": [SILENT_FINDING]}
+        self.assertEqual(
+            line(pool_block(drifted=mixed, passes_leases=(SILENT_FINDING,))),
+            [
+                f"🧭 *Pool projects:* 2 of 30 checked pool projects drifted at 9:00 AM ET ({SILENT_FINDING}, {FINDING});"
+                f" a 403 from a run that leased one of them is the pool's, not the code. {SILENT_FINDING} reds no run; a red is the pool's only on a project with one of the other findings."
+            ],
+        )
 
     def test_the_recovery_says_the_pool_had_drifted_and_comments(self):
         self.tick(pool_drift(), T14, environ=self.environ())

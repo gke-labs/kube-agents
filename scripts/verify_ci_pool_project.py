@@ -348,6 +348,16 @@ REPAIR_HOST_OTEL_SCOPE = (
     f"gcloud container clusters update {HOST_CLUSTER} --project={{project_id}} --location=us-central1 "
     f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
 )
+FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
+# Findings a leased run passes with. Every other finding reds the run that
+# leases the project -- a missing grant, API, key or cluster is a 403 or a
+# missing resource in the agent's transcript -- and the health bot's pool-drift
+# advice tells the pull request so. A host cluster without the scope installs,
+# serves and grades like any other; only its traces are missing. The bot reads
+# this set (scripts/eval_dashboard/pool_state.py `passes_leases`, for
+# health.py's rule 3e) before wording the advice, so a 403 on a project whose
+# findings are all here is reported as the change's to read, not the pool's.
+LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -2091,7 +2101,7 @@ def check_gke_and_state(project_id: str) -> CheckResult:
             if scope != HOST_OTEL_SCOPE:
                 passed = False
                 _drift(
-                    details, findings, "gke/host-otel-scope",
+                    details, findings, FINDING_HOST_OTEL_SCOPE,
                     f"{HOST_CLUSTER} managedOpentelemetryConfig.scope is '{scope or 'unset'}', not "
                     f"{HOST_OTEL_SCOPE}; an install on it finds no managed collector and exports no traces",
                     REPAIR_HOST_OTEL_SCOPE.format(project_id=project_id),
