@@ -669,6 +669,9 @@ class BaseTestCase(unittest.TestCase):
         # it changes holds, `unpublished_candidates` and the lost-store answer.
         # `TestCollectorStreamsRequireAManifest` holds the real set.
         self.patch_attr("COLLECTOR_AUDITS", frozenset())
+        # Off the real filesystem for every test, not only the harness ones:
+        # the default is /opt/data, which no dev machine or CI runner has.
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
         return json.dumps([{"number": number, "url": url}])
@@ -685,11 +688,6 @@ class BaseTestCase(unittest.TestCase):
             # The record `start` leaves and `finish` measures the search
             # against; the generic stream declares postures now, so a run
             # that never called `start` here needs it or reads as no search.
-            # A test that left SCRATCH_DIR at its default gets one under the
-            # test's own directory: the default is /opt/data, which no dev
-            # machine or CI runner can create.
-            if not Path(audit_report.SCRATCH_DIR).parent.exists():
-                self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
             self.record_run(audit=AUDIT)
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -5315,11 +5313,32 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertEqual(left["remediation"]["kind"], "manual")
         # The shield comes first: the worker's text is the shared-account fix,
         # and the renderer clips a long note from the end.
-        self.assertTrue(left["remediation"]["note"].startswith(audit_report.SHARED_ACCOUNT_SHIELD_PREFIX))
+        self.assertTrue(left["remediation"]["note"].startswith("_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off"))
         self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
         self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
         self.assertEqual(audit_report.shielded_finding_ids(doc), {left["id"]})
+        self.assertEqual(doc[audit_report.SHIELDED_FINDINGS_KEY], [left["id"]])
+
+    def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
+        worker = self._sa_finding("worker", "Deployment/worker")
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        declarations = [{"check": "default-sa-automount", "namespace": "payments", "object": f"Deployment/api{i}", "repo": "acme/fleet", "path": f"knowledge/api{i}.md", "excerpt": "x"} for i in range(5)]
+        # Declared entries the worker filed by hand, one per declaration.
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": d["object"], "title": "t", "declaration": {"repo": d["repo"], "path": d["path"], "excerpt": "x"}} for d in declarations]
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.shield_declared_account_siblings(doc)
+        note = doc["findings"][0]["remediation"]["note"]
+        self.assertIn("`Deployment/api2` declared at acme/fleet:knowledge/api2.md and 2 more.)_", note)
+        self.assertNotIn("api3", note)
+        self.assertLess(note.index("so this stays manual"), note.index("Declared:"))
+
+    def test_a_worker_written_shield_sentence_does_not_mark_a_finding_shielded(self):
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/default-sa-automount.yaml", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/x`")}
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+        self.assertEqual(audit_report.shielded_finding_ids(doc), set())
 
     def test_the_shield_folds_cluster_and_namespace_as_the_id_does(self):
         api = self._sa_finding("api", "Deployment/api")
@@ -15371,6 +15390,8 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertTrue(self.harness.gh_calls("pr", "close"))
         comment = " ".join(b for b in self.harness.bodies if b)
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+        self.assertIn("The finding has not gone", comment)
+        self.assertNotIn("If the finding comes back", comment)
 
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""
