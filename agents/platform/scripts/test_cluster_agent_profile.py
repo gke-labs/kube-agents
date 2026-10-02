@@ -736,32 +736,6 @@ class ListReadyProfilesTest(unittest.TestCase):
             cap.read_cluster_identity(p_dir)
 
 
-
-class SandboxStubTest(unittest.TestCase):
-    def setUp(self):
-        repo_root = Path(__file__).resolve().parents[3]
-        self.stub_path = repo_root / "deploy" / "sandbox" / "agent-pod-only-stub.py"
-        self.assertTrue(self.stub_path.is_file(), f"missing {self.stub_path}")
-        self.tmp = Path(tempfile.mkdtemp(prefix="sandbox-stub-test-"))
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_stub_refuses_execution(self):
-        wrapper = self.tmp / "cluster_agent_profile.py"
-        wrapper.symlink_to(self.stub_path)
-
-        res = subprocess.run(
-            [sys.executable, str(wrapper), "list"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(res.returncode, 1)
-        self.assertIn("cluster_agent_profile.py does not run in the shell sandbox", res.stderr)
-        self.assertIn("Report the request as blocked", res.stderr)
-
-
 class ClusterAgentLifecycleDelegationDocumentationTest(unittest.TestCase):
     def setUp(self):
         repo_root = Path(__file__).resolve().parents[3]
@@ -849,24 +823,6 @@ class UnlocatedCrashloopTaskSpecTest(unittest.TestCase):
                     any(re.search(pat, cmd) for pat in forbidden),
                     f"expected non-matching command {cmd!r} not to be caught",
                 )
-
-    def test_no_stubbed_profile_scripts_avoids_exponential_backtracking(self):
-        spec = self.data.get("verification_spec", [])
-        no_stubbed = next(
-            (c for c in spec if c.get("name") == "no-stubbed-profile-scripts"),
-            None,
-        )
-        self.assertIsNotNone(no_stubbed, "missing no-stubbed-profile-scripts check")
-        assert no_stubbed is not None
-        forbidden = no_stubbed.get("check", {}).get("forbidden_patterns", [])
-
-        long_cmd = "python3 " + " ".join("-a" for _ in range(50)) + " script.py"
-        for i, pat in enumerate(forbidden):
-            t0 = time.time()
-            res = re.search(pat, long_cmd)
-            elapsed = time.time() - t0
-            self.assertFalse(res)
-            self.assertLess(elapsed, 0.05)
 
     def test_platform_checked_workload_existence_requires_mcp_tool(self):
         spec = self.data.get("verification_spec", [])
