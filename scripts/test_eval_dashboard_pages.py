@@ -85,6 +85,14 @@ BARE_ANCHOR_SHIM = '<script>history.replaceState(null, "", "#{anchor}");</script
 # The first line of the page's own inline script, which follows the shims
 # and #app in the document; dom_text's slice ends there.
 PAGE_SCRIPT_MARKER = "<script>\n/* The Brief"
+# What Chrome's URL parser removes from both ends of its input before it
+# parses (WHATWG URL, "basic URL parser", step 1: C0 controls and space),
+# besides tab, CR and LF anywhere. CPython's urlsplit removes the same
+# three anywhere and the leading run only; it keeps a trailing run, so
+# "#gate " is `gate ` to Python and `gate` to Chrome. launched_anchor trims
+# the URL the way Chrome does before it parses, and every reading of a
+# launched URL's anchor goes through it.
+URL_C0_CONTROL_OR_SPACE = "".join(map(chr, range(0x21)))
 # The Brief's bare view anchors (#gate, #agent), each the id of a section
 # and the fragment a reader's old links carry. dom_html refuses one on the
 # launch URL on every budget: that shape is the one constant across every
@@ -206,6 +214,17 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
+def launched_anchor(url: str) -> str:
+    """The anchor Chrome reads from ``url``: the URL trimmed of C0 controls
+    and spaces at both ends, as Chrome trims its input, then parsed and its
+    fragment percent-decoded, as Chrome's anchor step and pages.js decode.
+    dom_html's guard and DomHtmlGuardTest's assertions on a launched URL
+    all read the anchor through this one function, so Python's parse and
+    Chrome's are reconciled in one place: the next way the two disagree
+    is fixed here, not found again in a guard that reads one of them."""
+    return urllib.parse.unquote(urllib.parse.urlparse(url.strip(URL_C0_CONTROL_OR_SPACE)).fragment)
+
+
 def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = DEFAULT_BUDGET_MS) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
@@ -213,17 +232,18 @@ def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms:
     virtual time the page is given; timers fire inside it, so a budget past
     PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
     on every budget: the Brief's view anchors reach Chrome's launch URL
-    from no call. The guard reads the URL it is about to launch, not the
-    ``fragment`` argument, so a `#` inside ``query`` and a percent-encoded
-    anchor (#%67ate), both of which Chrome reads as the anchor, are refused
-    too. A test that needs the bare-anchor path sets the hash from inside
-    the page with bare_anchor_page."""
+    from no call. The guard reads the URL it is about to launch as Chrome
+    reads it (launched_anchor), not the ``fragment`` argument, so a `#`
+    inside ``query``, a percent-encoded anchor (#%67ate) and a trailing
+    space or C0 control Chrome trims off (`#gate `), each of which Chrome
+    reads as the anchor, are refused too. A test that needs the bare-anchor
+    path sets the hash from inside the page with bare_anchor_page."""
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
-    launched = urllib.parse.urlparse(url).fragment
-    anchor = urllib.parse.unquote(launched)
+    anchor = launched_anchor(url)
     if anchor in BRIEF_VIEW_ANCHORS:
+        written = url.partition("#")[2]
         raise ValueError(
-            f"#{launched}: a bare view anchor on Chrome's launch URL is the shape in every stall of headless Chrome "
+            f"#{anchor} (written {written!r}): a bare view anchor on Chrome's launch URL is the shape in every stall of headless Chrome "
             f"on CI (#2227, #2278) and is refused on every budget, however it reaches the URL; "
             f"use #view={anchor}, or bare_anchor_page(page, {anchor!r})"
         )
@@ -712,23 +732,29 @@ class DomHtmlGuardTest(unittest.TestCase):
 
     def test_the_guard_reads_the_launch_url_not_the_fragment_argument(self):
         # The anchor can reach the launch URL without being the `fragment`
-        # argument: a `#` inside `query` is a fragment to Chrome, and a
+        # argument: a `#` inside `query` is a fragment to Chrome, a
         # percent-encoded view id is decoded by Chrome's anchor step and by
-        # pages.js alike. Both are refused, by the decoded fragment of the
-        # URL about to be launched, and neither reaches the mocked Chrome.
-        # The encoded `#` a urlencode'd query carries (%23) is not a
-        # fragment and stays admitted, as does the view= form.
+        # pages.js alike, and a trailing space or C0 control is trimmed off
+        # the URL by Chrome where Python's parse keeps it in the fragment.
+        # All are refused, by the anchor of the URL about to be launched as
+        # Chrome reads it, and none reaches the mocked Chrome. The encoded
+        # `#` a urlencode'd query carries (%23) is not a fragment and stays
+        # admitted, as do the view= form and an encoded trailing space
+        # (%20), which Chrome does not trim and which matches no view.
         refused = [
             {"query": "cases=cluster-agent-crashloop-debug#gate"},
             {"query": "cases=cluster-agent-crashloop-debug#agent", "budget_ms": TWO_POLLS_BUDGET_MS},
             {"fragment": "#%67ate"},
             {"fragment": "#a%67ent"},
             {"query": "cases=x#%67ate"},
+            {"fragment": "#gate "},
+            {"query": "cases=x#agent\x0b"},
         ]
         admitted = [
             {"query": urllib.parse.urlencode({"cases": "x#gate"})},
             {"fragment": "#view=gate"},
             {"query": urllib.parse.urlencode({"cases": "x#gate"}), "fragment": "#view=agent"},
+            {"fragment": "#gate%20"},
         ]
         with self.no_chrome() as run:
             for call in refused:
@@ -742,8 +768,7 @@ class DomHtmlGuardTest(unittest.TestCase):
                     dom_html(self.index, **call)
         self.assertEqual(run.call_count, len(admitted))
         for call, invocation in zip(admitted, run.call_args_list):
-            launched = urllib.parse.urlparse(invocation.args[0][-1]).fragment
-            self.assertNotIn(urllib.parse.unquote(launched), BRIEF_VIEW_ANCHORS, call)
+            self.assertNotIn(launched_anchor(invocation.args[0][-1]), BRIEF_VIEW_ANCHORS, call)
 
     def test_the_bare_anchor_page_carries_the_anchor_and_takes_only_a_view(self):
         # The shim sits in <head>, before the page's data and script, and
@@ -811,7 +836,7 @@ class DomHtmlGuardTest(unittest.TestCase):
             self.assertIn(f"--virtual-time-budget={call.get('budget_ms', DEFAULT_BUDGET_MS)}", argv, call)
             query = f"?{call['query']}" if call.get("query") else ""
             self.assertEqual(argv[-1], page.as_uri() + query + call.get("fragment", ""), call)
-            self.assertNotIn(urllib.parse.unquote(urllib.parse.urlparse(argv[-1]).fragment), BRIEF_VIEW_ANCHORS, call)
+            self.assertNotIn(launched_anchor(argv[-1]), BRIEF_VIEW_ANCHORS, call)
             if page is anchored:
                 self.assertNotIn("#", argv[-1], "the shimmed copy's URL carries no fragment")
 
