@@ -158,7 +158,7 @@ class BrokerSessionCase(unittest.TestCase):
         for call in self.http.calls:
             with self.subTest(url=call["url"]):
                 self.assertEqual({"Authorization": "Bearer caller-token"}, call["headers"])
-                self.assertEqual(google_api.RELAY_TIMEOUT_SECONDS, call["timeout"])
+                self.assertEqual(google_api.RELAY_TIMEOUT, call["timeout"])
                 self.assertTrue(call["url"].startswith(ENDPOINT + credential_proxy_client.API_RELAY_PREFIX))
                 host, _, path = call["url"][len(ENDPOINT + credential_proxy_client.API_RELAY_PREFIX):].partition("/")
                 query = urllib.parse.urlencode(call["params"] or {})
@@ -323,6 +323,28 @@ class AnalyzeTraceLatencyTest(BrokerSessionCase):
         self.assertIn("Total Duration: 1.000 seconds", out)
         self.assertNotIn("no-times", out)
 
+    def test_spans_whose_timestamps_are_not_strings_are_skipped_not_a_traceback(self):
+        # Cloud Trace types the field as an RFC 3339 string; anything else
+        # JSON can carry in the slot is skipped the way the retired loop's
+        # bare except skipped it, and the traces after it are still analysed.
+        detail = {"spans": [
+            {"name": "good", "startTime": "2026-08-19T10:00:00Z", "endTime": "2026-08-19T10:00:01Z"},
+            {"name": "numeric", "startTime": 1755597600, "endTime": 1755597601},
+            {"name": "object", "startTime": {"seconds": 1}, "endTime": "2026-08-19T10:00:01Z"},
+        ]}
+        session = self.session({
+            RELAYED_TRACES: {"traces": [{"traceId": TRACE_A}, {"traceId": TRACE_B}]},
+            f"{RELAYED_TRACES}/{TRACE_A}": detail,
+            f"{RELAYED_TRACES}/{TRACE_B}": TRACE_B_DETAIL,
+        })
+        code, out, err = run(analyze_trace_latency.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(0, code, err)
+        self.assertIn("Total Spans: 3", out)
+        self.assertIn("Total Duration: 1.000 seconds", out)
+        self.assertNotIn("numeric", out)
+        self.assertNotIn("object", out)
+        self.assertEqual(3, len(self.http.calls), "the second trace was not read after the odd span")
+
     def test_parse_timestamp_reads_nanoseconds_and_offsets(self):
         parsed = analyze_trace_latency.parse_timestamp("2026-09-28T10:00:00.123456789Z")
         self.assertEqual(123456, parsed.microsecond)
@@ -396,14 +418,18 @@ class FetchTracesTest(BrokerSessionCase):
 
 
 class CheckTokenUsageTest(BrokerSessionCase):
+    # Two pods' series, told apart by their resource labels the way the API
+    # returns them (a series with no labels at all is not a shape Monitoring
+    # answers with).
     SERIES = {
         "timeSeries": [
-            {"points": [
+            {"resource": {"labels": {"pod": "a"}}, "points": [
                 {"interval": {"endTime": "2026-09-28T10:00:00Z"}, "value": {"int64Value": "50"}},
                 {"interval": {"endTime": "2026-09-28T09:00:00Z"}, "value": {"int64Value": "20"}},
                 {"interval": {"endTime": "2026-09-28T08:00:00Z"}, "value": {"int64Value": "80"}},
             ]},
-            {"points": [{"interval": {"endTime": "2026-09-28T10:00:00Z"}, "value": {"doubleValue": 5.0}}]},
+            {"resource": {"labels": {"pod": "b"}},
+             "points": [{"interval": {"endTime": "2026-09-28T10:00:00Z"}, "value": {"doubleValue": 5.0}}]},
         ]
     }
 
@@ -474,12 +500,58 @@ class CheckTokenUsageTest(BrokerSessionCase):
 
     def test_deltas_sum_across_pods(self):
         result = self.usage({"timeSeries": [
-            {"points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
+            {"resource": {"labels": {"pod": "a"}},
+             "points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
                         self.point("2026-08-19T10:05:00Z", {"doubleValue": 100.0})]},
-            {"points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
+            {"resource": {"labels": {"pod": "b"}},
+             "points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
                         self.point("2026-08-19T10:05:00Z", {"doubleValue": 42.0})]},
         ]})
         self.assertEqual(142, result["input_tokens"])
+
+    def test_pages_are_followed_and_a_series_split_across_them_is_one_series(self):
+        # Monitoring pages points, not series: a series can straddle a page
+        # boundary and arrive as two entries with the same labels. The
+        # second page's points count, and the step across the boundary too.
+        labels = {"metric": {"type": check_token_usage.INPUT_TOKENS_METRIC, "labels": {"key": "k1"}},
+                  "resource": {"type": "prometheus_target", "labels": {"cluster": "c"}}}
+        first = {"timeSeries": [{**labels, "points": [
+            self.point("2026-08-19T10:05:00Z", {"doubleValue": 100.0}),
+            self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
+        ]}], "nextPageToken": "p2"}
+        second = {"timeSeries": [
+            {**labels, "points": [self.point("2026-08-19T10:10:00Z", {"doubleValue": 150.0})]},
+            {"metric": {"type": check_token_usage.INPUT_TOKENS_METRIC, "labels": {"key": "k2"}},
+             "resource": labels["resource"],
+             "points": [self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
+                        self.point("2026-08-19T10:10:00Z", {"doubleValue": 7.0})]},
+        ]}
+        empty = {"timeSeries": []}
+        session = self.paged_session({RELAYED_TIME_SERIES: [first, second, empty, empty]})
+        code, out, err = run(check_token_usage.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(0, code, err)
+        self.assert_every_call_is_a_relayed_read_the_policy_admits()
+        # 0 -> 100 on page one, 100 -> 150 across the boundary, 0 -> 7 on the other series.
+        self.assertEqual(157, json.loads(out)["input_tokens"])
+        self.assertEqual(4, len(self.http.calls))
+        self.assertEqual("p2", self.http.calls[1]["params"][google_api.PAGE_TOKEN_PARAM])
+        self.assertNotIn(google_api.PAGE_TOKEN_PARAM, self.http.calls[0]["params"])
+        for call in self.http.calls:
+            self.assertEqual(check_token_usage.PAGE_SIZE, call["params"]["pageSize"])
+
+    def test_a_list_that_never_runs_dry_is_a_failed_read_not_a_partial_sum(self):
+        # A sum over part of the list is a wrong number stated fluently, so
+        # the page cap exits 1 here even with points in hand.
+        page = {"timeSeries": [{"points": [
+            self.point("2026-08-19T10:00:00Z", {"doubleValue": 0.0}),
+            self.point("2026-08-19T10:05:00Z", {"doubleValue": 1.0}),
+        ]}], "nextPageToken": "again"}
+        session = self.paged_session({RELAYED_TIME_SERIES: [page] * (google_api.MAX_LIST_PAGES + 5)})
+        code, out, err = run(check_token_usage.main, ["--project-id", PROJECT], session=session)
+        self.assertEqual(google_api.EXIT_READ_FAILED, code)
+        self.assertEqual("", out)
+        self.assertIn(google_api.PAGE_CAP_NOTE.format(pages=google_api.MAX_LIST_PAGES), err)
+        self.assertEqual(google_api.MAX_LIST_PAGES, len(self.http.calls))
 
     def test_no_data_reports_zeroes_in_the_documented_shape(self):
         self.assertEqual(
@@ -593,6 +665,34 @@ class GoogleApiTest(BrokerSessionCase):
         self.assertIn("HTTP 504", str(raised.exception))
         self.assertIn("UPSTREAM_TIMEOUT", str(raised.exception))
         self.assertNotIn("could not reach", str(raised.exception))
+
+    def test_a_dropped_connect_is_reported_as_unreachable_after_the_clients_connect_bound(self):
+        # A SYN nobody answers is what a default-deny egress policy does; the
+        # shim gives up after BROKER_CONNECT_TIMEOUT_SECONDS and so must the
+        # relay helpers, with the message saying the broker was not reached
+        # rather than that it went quiet past its upstream deadline.
+        requests = requests_or_skip(self)
+
+        class Dropped:
+            def get(self, url, **kwargs):
+                raise requests.exceptions.ConnectTimeout("HTTPConnectionPool: connect timeout=10")
+
+        session = credential_proxy_client.ApiSession(http=Dropped())
+        with self.assertRaises(google_api.RelayError) as raised:
+            google_api.get_json(session, google_api.TRACE_LIST_URL.format(project=PROJECT))
+        self.assertIn("could not reach", str(raised.exception))
+        self.assertIn(f"{credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS:g}s", str(raised.exception))
+        self.assertNotIn("did not answer within", str(raised.exception))
+
+    def test_the_connect_is_bounded_by_the_clients_figure_and_the_read_by_the_helpers(self):
+        # requests reads a (connect, read) pair; a scalar would put the read
+        # timeout on the connect too, 150 s of silence where the shim's
+        # opener gives up at 10.
+        self.assertEqual(
+            (credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, google_api.RELAY_TIMEOUT_SECONDS),
+            google_api.RELAY_TIMEOUT,
+        )
+        self.assertLess(credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, google_api.RELAY_TIMEOUT_SECONDS)
 
     def test_the_helper_waits_longer_than_the_brokers_relay_deadline(self):
         # Read from the broker's source rather than imported: the helper's
@@ -722,7 +822,9 @@ class GetChatUsersTest(unittest.TestCase):
         self.assertEqual(get_chat_users.GCLOUD_TIMEOUT_SECONDS, run_mock.call_args.kwargs["timeout"])
         self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
         self.assertEqual("", out)
-        self.assertIn("credential broker did not answer", err)
+        self.assertIn("did not return within", err)
+        self.assertIn("this helper's own limit", err)
+        self.assertIn("longer deadline may still have been working", err)
         self.assertIn(f"{get_chat_users.GCLOUD_TIMEOUT_SECONDS}s", err)
 
     def test_an_empty_read_is_an_empty_count(self):

@@ -27,16 +27,21 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import credential_proxy_client  # noqa: E402
 
-# The longest silence a helper waits through on one relayed read: `requests`
-# applies it to the connect and then to each wait for bytes, not to the whole
-# read. The broker buffers the upstream's body before it writes a status
-# line, and answers 504 (UPSTREAM_TIMEOUT) when the upstream passes its own
-# API_RELAY_DEADLINE_S, 120 s in credential_proxy.py. This value sits above
-# that deadline so a slow Monitoring or Trace page is reported as the
-# broker's 504 naming the upstream, and the helper's own timeout means the
-# broker itself went quiet past the deadline it enforces. The test beside the
-# helpers holds the ordering against the broker's constant.
+# The longest silence a helper waits through for bytes on one relayed read,
+# per wait, not for the whole read. The broker buffers the upstream's body
+# before it writes a status line, and answers 504 (UPSTREAM_TIMEOUT) when the
+# upstream passes its own API_RELAY_DEADLINE_S, 120 s in credential_proxy.py.
+# This value sits above that deadline so a slow Monitoring or Trace page is
+# reported as the broker's 504 naming the upstream, and the helper's own
+# timeout means the broker itself went quiet past the deadline it enforces.
+# The test beside the helpers holds the ordering against the broker's
+# constant.
 RELAY_TIMEOUT_SECONDS = 150
+# The connect is bounded separately, by the client's own figure: `requests`
+# takes a (connect, read) pair, and a scalar would make a SYN nobody answers
+# (a default-deny egress policy drops rather than refuses) a 150 s silence
+# where the shim gives up after BROKER_CONNECT_TIMEOUT_SECONDS.
+RELAY_TIMEOUT = (credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, RELAY_TIMEOUT_SECONDS)
 
 # The keys of the broker's refusal body (`/v1/gcp` answers 403 the way
 # `/v1/exec` does, naming the api_policy rule) and of a Google API error body.
@@ -135,12 +140,27 @@ def timeout_exceptions() -> tuple[type[BaseException], ...]:
     return (TimeoutError, requests.exceptions.Timeout)
 
 
+def connect_timeout_exceptions() -> tuple[type[BaseException], ...]:
+    """What a connect nobody answered raises; a `Timeout` too, so it is told apart first."""
+    try:
+        import requests
+    except ImportError:
+        return ()
+    return (requests.exceptions.ConnectTimeout,)
+
+
 def get_json(session, url: str, *, params=None) -> dict:
     """One relayed GET, decoded; raises RelayError with the reason on anything else."""
     try:
-        response = session.get(url, params=params, timeout=RELAY_TIMEOUT_SECONDS)
+        response = session.get(url, params=params, timeout=RELAY_TIMEOUT)
     except credential_proxy_client.TokenUnavailable as exc:
         raise RelayError(f"no caller token for the credential broker: {exc}") from exc
+    except connect_timeout_exceptions() as exc:
+        raise RelayError(
+            f"could not reach the credential broker for {url}: no connection within "
+            f"{credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS:g}s, so the path to it is "
+            f"closed or the broker is not listening: {exc}"
+        ) from exc
     except timeout_exceptions() as exc:
         raise RelayError(
             f"the credential broker did not answer within {RELAY_TIMEOUT_SECONDS}s for {url}, "
@@ -164,7 +184,9 @@ def window(hours: int) -> tuple[str, str]:
     return start_time.strftime(TIMESTAMP_FORMAT), end_time.strftime(TIMESTAMP_FORMAT)
 
 
-def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int | None = None) -> list:
+def get_paginated(
+    session, url: str, *, params: dict, items_key: str, limit: int | None = None, whole: bool = False
+) -> list:
     """The `items_key` entries of a paged list read, across pages.
 
     Follows `nextPageToken` until the list runs dry or `limit` items are in
@@ -173,7 +195,10 @@ def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int
     default page and the trim would discard it. A list still holding
     a token after MAX_LIST_PAGES pages raises RelayError when nothing was
     read, so the caller cannot report an empty window it never saw the end
-    of, and otherwise returns what was read with a note on stderr.
+    of, and otherwise returns what was read with a note on stderr -- unless
+    `whole` is set, for a caller that sums the list (a partial sum is a
+    wrong number stated fluently), in which case the cap is a RelayError
+    whatever is in hand.
     """
     if limit is not None and limit < MIN_LIMIT:
         raise ValueError(f"limit must be at least {MIN_LIMIT} or None, got {limit}")
@@ -192,6 +217,8 @@ def get_paginated(session, url: str, *, params: dict, items_key: str, limit: int
         note = PAGE_CAP_NOTE.format(pages=MAX_LIST_PAGES)
         if not items:
             raise RelayError(f"{url}: {note} and nothing in hand; the window may not be empty")
+        if whole:
+            raise RelayError(f"{url}: {note}; a sum over {len(items)} item(s) of a longer list would be wrong")
         print(f"warning: {url}: {note}; the {len(items)} item(s) returned are not the whole list", file=sys.stderr)
     return items if limit is None else items[:limit]
 
