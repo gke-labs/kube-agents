@@ -846,6 +846,26 @@ class RuntimeTest(unittest.TestCase):
                     self._options_incident(adapter, *labels)
                     check(adapter)
 
+    def test_a_colon_form_with_a_hostname_slack_linked_still_counts(self):
+        # Slack sends a typed hostname as <http://host|host>, and a typed url as <url>.
+        labels = (
+            "apply Option A: Drain checkout.example.com", "apply Option B: Open https://grafana.example.com/d/x",
+            "apply Option C: Ping @U0BOT",
+        )
+        cases = (
+            (self._drops, "apply A: Drain <http://checkout.example.com|checkout.example.com>"),
+            (self._drops, "apply B: Open <https://grafana.example.com/d/x>"),
+            (self._runs, "apply A: Drain <http://checkout.example.com|other.example.com>"),
+            # Only a link is unwrapped: a mention names someone, not the option's text.
+            (self._runs, "apply C: Ping <@U0BOT>"),
+        )
+        for check, text in cases:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, *labels)
+                check(adapter)
+
     def test_a_colon_on_a_message_without_the_option_buttons_does_not_drop_the_click(self):
         adapter = _Adapter(replies=[
             {"type": "message", "user": "U2", "text": "apply option b: Restore the secret", "ts": "223.000"},

@@ -156,6 +156,9 @@ SLACK_ESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 #: Trailing characters typed option text may end in and still be the option's own.
 OPTION_TEXT_END = ".! "
 
+#: A link Slack made of a typed url or hostname: ``<url|as typed>``, or ``<url>`` when the url was typed.
+SLACK_LINK = re.compile(r"<(https?://[^|>]+)(?:\|([^>]*))?>")
+
 #: The one reply subtype that is still a person typing: "also send to channel".
 TYPED_SUBTYPES = frozenset({"thread_broadcast"})
 
@@ -324,7 +327,8 @@ def _typed_apply(text: str, options: frozenset[tuple[str, str]]) -> bool:
     typed = TYPED_APPLY.match(text, TYPED_LEAD.match(text).end())
     if not typed or not typed.group(0).endswith(":"):
         return bool(typed)
-    return ((typed.group(1) or "").upper(), _option_text(text[typed.end():])) in options
+    tail = SLACK_LINK.sub(lambda link: link.group(2) or link.group(1), text[typed.end():])
+    return ((typed.group(1) or "").upper(), _option_text(tail)) in options
 
 
 def _mention_text(adapter: Any, reply: dict) -> str:
