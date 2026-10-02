@@ -82,11 +82,12 @@ obtainability audit lists this posture under Declared intent rather than as a fi
 HOST_CLUSTER_NAME="platform-agent-host"
 # The managed OpenTelemetry collection scope Step 2.1 sets on the host cluster
 # after the apply. Neither google provider has a field for it, so full-install
-# cannot; without it the operator finds no managed collector and wires the
-# agent with OTEL_SDK_DISABLED=true, so the install exports no traces and the
-# evals that read them back fail on every lease of the project. The verifier
-# fails a project whose host cluster lacks this exact value and its tests pin
-# the two copies equal (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
+# cannot; without it the operator finds no managed collector, resolves
+# status.telemetry.otlpEndpointSource to None and wires the agent with
+# OTEL_SDK_DISABLED=true, so an install on the cluster exports no traces and
+# the project's Cloud Trace stays empty. The verifier fails a project whose
+# host cluster lacks this exact value and its tests pin the two copies equal
+# (HOST_OTEL_SCOPE in scripts/verify_ci_pool_project.py).
 readonly HOST_OTEL_SCOPE="COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 
 usage() {
@@ -101,7 +102,8 @@ Options:
                             bench/tf/fleet is pinned to us-central1-a.
   --app-id=APP_ID           GitHub App ID (default: 4675512)
   --pem-file=PATH           Path to GitHub App private key PEM file for KMS import
-  --skip-host-cluster       Skip terraform/examples/full-install (if host cluster already exists)
+  --skip-host-cluster       Skip terraform/examples/full-install (if host cluster already exists).
+                            The post-apply managed-OTel scope update still runs.
   --skip-fleet              Skip bench/tf/fleet (if seeded fleet clusters already exist)
   --allow-unmapped          Proceed even though the project is not yet mapped in
                             hack/ci-deploy.sh. The run will still end red at the
@@ -200,7 +202,9 @@ echo "✓ Toolchain present (gcloud, gh, git, go, jq, python3, terraform, tofu)"
 # so the version is checked here. An unreadable version is a warning for the
 # reason scripts/installer/min_versions.sh gives: `gcloud version` has changed
 # shape before, and a missed regex should not refuse a usable SDK.
-GCLOUD_VERSION="$(gcloud_core_version)"
+# `|| true`: under set -e and pipefail a `gcloud version` that exits non-zero
+# would otherwise end the script here, silently, instead of reaching the warning.
+GCLOUD_VERSION="$(gcloud_core_version || true)"
 if [ -z "${GCLOUD_VERSION}" ]; then
   echo "⚠️ Could not determine the Google Cloud SDK version; skipping the >= ${MIN_GCLOUD_VERSION} check." >&2
   echo "   Step 2.1 needs --managed-otel-scope on \`gcloud container clusters update\`, which arrived in ${MIN_GCLOUD_VERSION}." >&2
@@ -591,22 +595,26 @@ EOF
     KUBE_AGENTS_STATE_PREFIX="full-install/${HOST_CLUSTER_NAME}" \
     ./lifecycle.sh apply -auto-approve
   )
-
-  # The one post-apply step Terraform cannot carry (see HOST_OTEL_SCOPE above).
-  # install.sh warns and goes on when this fails; here it stops the run, under
-  # set -e: a pool project without the scope passes every lease and fails the
-  # trace evals one by one, and the verifier in Step 5 would fail it anyway.
-  # Re-running this one command repairs it.
-  echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
-  gcloud container clusters update "${HOST_CLUSTER_NAME}" \
-    --project="${PROJECT_ID}" \
-    --location="${REGION}" \
-    --managed-otel-scope="${HOST_OTEL_SCOPE}" \
-    --quiet
-  echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 else
   echo -e "\n==> [Step 2.1] Skipping Host GKE Cluster (--skip-host-cluster set)..."
 fi
+
+# The one post-apply step Terraform cannot carry (see HOST_OTEL_SCOPE above).
+# Outside the --skip-host-cluster branch on purpose: the flag skips the apply,
+# and the cluster it keeps still needs the scope -- a first run that died after
+# the apply resumes with the flag, and a host cluster that predates this step
+# is onboarded with it. The update is idempotent. install.sh warns and goes on
+# when this fails; here it stops the run, under set -e: a pool project without
+# the scope passes every lease and exports no traces, and the verifier in Step
+# 5 would fail it anyway. Re-running the script with --skip-host-cluster, or
+# this one command, repairs it.
+echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
+gcloud container clusters update "${HOST_CLUSTER_NAME}" \
+  --project="${PROJECT_ID}" \
+  --location="${REGION}" \
+  --managed-otel-scope="${HOST_OTEL_SCOPE}" \
+  --quiet
+echo "✓ Managed OpenTelemetry scope ${HOST_OTEL_SCOPE} set on ${HOST_CLUSTER_NAME}"
 
 if [ "${SKIP_FLEET}" != "true" ]; then
   echo -e "\n==> [Step 2.2] Provisioning Seeded Dirty Fleet (bench/tf/fleet) with remote state..."

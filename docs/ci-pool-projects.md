@@ -45,7 +45,7 @@ A long-lived GKE cluster hosting the Platform Agent and evaluation infrastructur
 - **Cluster Name**: `platform-agent-host`
 - **Location**: `us-central1` (regional or zonal, matching `hack/ci-env.sh`)
 - **Database Encryption**: CMEK encryption enabled (`ALL_OBJECTS_ENCRYPTION_ENABLED`). `full-install` creates the cluster this way, so any other state is drift.
-- **Managed OpenTelemetry scope**: `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`. Neither google Terraform provider has a field for it, so `full-install` cannot set it; `scripts/provision_ci_pool_project.sh` sets it with one `gcloud container clusters update` after the apply, and the verifier (section 7) fails a project whose host cluster lacks it and prints that command as the repair. Without it an install on the cluster exports no traces: the operator's collector discovery finds no `gke-managed-otel` collector and starts the agent with `OTEL_SDK_DISABLED=true`, so Cloud Trace stays empty and an eval that reads the install's own traces back fails on every lease of the project.
+- **Managed OpenTelemetry scope**: `COLLECTION_AND_INSTRUMENTATION_COMPONENTS`. Neither google Terraform provider has a field for it, so `full-install` cannot set it; `scripts/provision_ci_pool_project.sh` sets it with one `gcloud container clusters update` after the apply, and the verifier (section 7) fails a project whose host cluster lacks it and prints that command as the repair. Without it an install on the cluster exports no traces: the operator's collector discovery ([Telemetry, Discovery](site/src/content/docs/deploy/telemetry.md#discovery)) finds no `gke-managed-otel` collector, resolves `status.telemetry.otlpEndpointSource` to `None` and starts the agent with `OTEL_SDK_DISABLED=true`, so the project's Cloud Trace stays empty and nothing on the lease says so.
 
 The cluster is provisioned by the `terraform/examples/full-install` composition, through its `lifecycle.sh` rather than a bare `terraform apply` — `cluster_name`, `location`, and `api_server_key` have no defaults, so the bare form fails on the missing variables:
 
@@ -72,7 +72,7 @@ gcloud container clusters update platform-agent-host \
   --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS
 ```
 
-Read 2026-10-01, `kube-agents-evals-2` was the one host cluster in the pool carrying the scope; every project was provisioned before the script set it, the other 27 lacked it, and installs on them had exported no traces on any lease. The command above is the hand repair for each of them, run between leases on a project Boskos holds, and it is idempotent. The verifier's `gke/host-otel-scope` finding, in the hourly pool-state scan as in a hand run, names the projects still without it.
+Every registered project was provisioned before the script ran this step. Measured 2026-10-01, `kube-agents-evals-2`'s host cluster was the only one of the 28 mapped carrying the scope, and the rest had no traces in Cloud Trace from any lease. The command above is the hand repair for each, run between leases on a project Boskos holds, and it is idempotent. The current list is the verifier's `gke/host-otel-scope` finding, in the hourly pool-state scan as in a hand run, not the count here.
 
 ## 3. Service accounts and IAM
 

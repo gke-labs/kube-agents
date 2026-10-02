@@ -335,8 +335,9 @@ VALID_CMEK_STATES = {"ENCRYPTED", "ALL_OBJECTS_ENCRYPTION_ENABLED"}
 # The managed OpenTelemetry collection scope the host cluster must carry. The
 # operator's collector discovery (k8s-operator/internal/controller/telemetry.go)
 # finds the gke-managed-otel collector only on a cluster with this scope; on
-# any other it wires the agent with OTEL_SDK_DISABLED=true and the install
-# exports no traces, which is invisible until an eval reads them back. Neither
+# any other it resolves status.telemetry.otlpEndpointSource to None, wires the
+# agent with OTEL_SDK_DISABLED=true, and the install exports no traces: the
+# project's Cloud Trace stays empty, and nothing on the lease says so. Neither
 # google provider has a field for it, so full-install cannot set it:
 # scripts/provision_ci_pool_project.sh sets it with a post-apply
 # `gcloud container clusters update --managed-otel-scope` (the value there is

@@ -384,16 +384,16 @@ class GkeAndCmekTest(unittest.TestCase):
         )
         self.assertNotIn("gke/host-cmek", [f.id for f in result.findings])
 
-    def test_a_host_cluster_with_another_otel_scope_fails(self):
-        # Only the collection scope deploys the managed collector the operator
-        # discovers; an instrumentation-only scope leaves the install as silent
-        # as none.
+    def test_a_host_cluster_with_the_scope_set_to_none_fails(self):
+        # The API's enum is SCOPE_UNSPECIFIED, NONE and the collection scope,
+        # and `--managed-otel-scope=NONE` is how an operator turns the pipeline
+        # off: an explicit NONE is as silent as an unset scope, and is drift.
         with mock.patch.object(checker, "run_cmd") as run:
-            run.side_effect = [_ok(self._clusters("ENCRYPTED", host_scope="INSTRUMENTATION_COMPONENTS_ONLY")), _ok("bucket")]
+            run.side_effect = [_ok(self._clusters("ENCRYPTED", host_scope="NONE")), _ok("bucket")]
             result = checker.check_gke_and_state("kube-agents-evals-4")
         self.assertFalse(result.passed)
         finding = next(f for f in result.findings if f.id == "gke/host-otel-scope")
-        self.assertIn("'INSTRUMENTATION_COMPONENTS_ONLY'", finding.observed)
+        self.assertIn("'NONE'", finding.observed)
 
     def test_an_empty_cmek_column_beside_a_scope_is_unset_cmek_not_a_shifted_scope(self):
         # `value()` leaves an unset middle column empty between two tabs. The
@@ -424,7 +424,7 @@ class GkeAndCmekTest(unittest.TestCase):
             [
                 f"{checker.HOST_CLUSTER}\tENCRYPTED\t{checker.HOST_OTEL_SCOPE}",
                 "seeded-a\tENCRYPTED\t",
-                "seeded-b\tENCRYPTED\tINSTRUMENTATION_COMPONENTS_ONLY",
+                "seeded-b\tENCRYPTED\tNONE",
                 "seeded-c\tENCRYPTED",
             ]
         )
