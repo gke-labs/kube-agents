@@ -94,6 +94,51 @@ func TestDefaultToolSurfaceNeedsNoEgressTheFenceDenies(t *testing.T) {
 	}
 }
 
+// TestClusterViewAllowsBashAndSaysInspectOnly: A2A_CLUSTER_VIEW=true is the
+// spawner telling the adapter the pod has the broker's read-only wrappers;
+// Bash joins the surface and the system prompt says what the fence is.
+func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
+	for _, key := range []string{"A2A_ALLOWED_TOOLS", "A2A_HARNESS_CMD", "A2A_HARNESS_EXTRA_ARGS"} {
+		t.Setenv(key, "")
+		_ = os.Unsetenv(key)
+	}
+	flags := func(argv []string) (allowed, disallowed, prompt string) {
+		for i, arg := range argv {
+			if i+1 >= len(argv) {
+				break
+			}
+			switch arg {
+			case "--allowedTools":
+				allowed = argv[i+1]
+			case "--disallowedTools":
+				disallowed = argv[i+1]
+			case "--append-system-prompt":
+				prompt = argv[i+1]
+			}
+		}
+		return
+	}
+	t.Setenv("A2A_CLUSTER_VIEW", "")
+	_ = os.Unsetenv("A2A_CLUSTER_VIEW")
+	allowed, disallowed, prompt := flags(harnessCommand())
+	if strings.Contains(allowed, "Bash") || !strings.Contains(disallowed, "Bash") || prompt != "" {
+		t.Fatalf("view off: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
+	}
+	t.Setenv("A2A_CLUSTER_VIEW", "true")
+	allowed, disallowed, prompt = flags(harnessCommand())
+	if !strings.Contains(allowed, "Bash") || strings.Contains(disallowed, "Bash") {
+		t.Fatalf("view on: allowed=%q disallowed=%q", allowed, disallowed)
+	}
+	for _, still := range []string{"Edit", "NotebookEdit"} {
+		if !strings.Contains(disallowed, still) {
+			t.Errorf("view on dropped %s from the disallowed list", still)
+		}
+	}
+	if prompt != clusterViewPrompt || !strings.Contains(prompt, "policy rule") {
+		t.Fatalf("view on prompt = %q", prompt)
+	}
+}
+
 // originSeq is the join between the two halves the origin-sequence fix already
 // pins: the spawner renders lib.EnvOriginSeq (spawn_test.go) and the adapter
 // honours Config.OriginSeq / Config.OriginSeqStated (adapter_origin_cap_test.go,

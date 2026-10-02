@@ -60,6 +60,20 @@ const (
 	// agree with the session pod's egress fence -- see the comment at its use.
 	defaultAllowedTools = "Read,Write,Glob,Grep,TodoWrite"
 
+	// envClusterView is the spawner's signal that this pod has the credential
+	// broker's read-only kubectl/gcloud wrappers on PATH (a2a/gateway/spawn.go,
+	// the operator's A2A_SESSION_CLUSTER_VIEW). Only then is Bash allowed,
+	// and only with clusterViewPrompt appended: the fence is the broker's
+	// read-only gate, and the prompt tells the model what the fence is so a
+	// refusal is reported rather than retried.
+	envClusterView          = "A2A_CLUSTER_VIEW"
+	clusterViewAllowedTools = defaultAllowedTools + ",Bash"
+	defaultDisallowedTools  = "Bash,Edit,NotebookEdit"
+	clusterViewDisallowed   = "Edit,NotebookEdit"
+	clusterViewPrompt       = "You have read-only `kubectl` and `gcloud` on PATH. They run through a credential broker " +
+		"that permits read verbs only: inspect and report, never change anything. A refused command prints " +
+		"`policy rule: <rule>` on stderr; report the refusal instead of retrying or working around it."
+
 	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey
 	// is not a credential: the gateway here runs keyless and the harness only
 	// checks that the variable is non-empty.
@@ -164,9 +178,19 @@ func harnessCommand() []string {
 	// egress under NetworkPolicy is a black hole, and each call would burn
 	// its connect timeout against the task deadline. The fence is the
 	// control; this list agreeing with it is what keeps the failure legible.
+	// Under A2A_CLUSTER_VIEW the egress fence has one more peer, the
+	// credential broker, and Bash is what reaches it.
 	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
+	disallowed := defaultDisallowedTools
+	clusterView := os.Getenv(envClusterView) == "true"
 	if allowed == "" {
 		allowed = defaultAllowedTools
+		if clusterView {
+			allowed = clusterViewAllowedTools
+		}
+	}
+	if clusterView {
+		disallowed = clusterViewDisallowed
 	}
 	argv := []string{
 		path,
@@ -177,7 +201,10 @@ func harnessCommand() []string {
 		"--model", model,
 		"--max-turns", maxTurns,
 		"--allowedTools", allowed,
-		"--disallowedTools", "Bash,Edit,NotebookEdit",
+		"--disallowedTools", disallowed,
+	}
+	if clusterView {
+		argv = append(argv, "--append-system-prompt", clusterViewPrompt)
 	}
 	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
 		argv = append(argv, strings.Fields(extra)...)
