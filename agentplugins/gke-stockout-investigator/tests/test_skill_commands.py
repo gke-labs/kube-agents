@@ -10,6 +10,7 @@ which that check skips.
 """
 
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,19 @@ SKILL_MD = (
     Path(__file__).resolve().parents[1]
     / "files/skills/gke-stockout-investigator/SKILL.md"
 )
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from deploy.docker.check_skill_commands import skill_blocks
+    from tools.tirith_security import check_command_security
+
+    TIRITH_AVAILABLE = True
+except ImportError:
+    skill_blocks = None
+    check_command_security = None
+    TIRITH_AVAILABLE = False
 
 # A variable run as the program: at the start of a line or a code span, after
 # a shell join, as in `cd <workspace> && $G add`, or inside `$(`, and after a
@@ -101,6 +115,21 @@ class SkillCommandsTest(unittest.TestCase):
         ):
             with self.subTest(command):
                 self.assertFalse(any(pattern.search(command) for pattern in PATTERNS))
+
+    @unittest.skipUnless(TIRITH_AVAILABLE, "Hermes tools.tirith_security not installed")
+    def test_all_shell_blocks_pass_real_tirith_scanner(self):
+        assert skill_blocks is not None and check_command_security is not None
+        blocks = skill_blocks(
+            "agentplugins/gke-stockout-investigator/files/skills", SKILL_MD.parent.parent
+        )
+        self.assertGreater(len(blocks), 0, "No shell blocks discovered in SKILL.md")
+        for block in blocks:
+            verdict = check_command_security(block.scanned)
+            self.assertEqual(
+                "allow",
+                verdict.get("action"),
+                f"Tirith refused block at {block.path}:{block.line}: {verdict.get('findings')}",
+            )
 
 
 if __name__ == "__main__":
