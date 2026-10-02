@@ -19,13 +19,17 @@ is the same plan as plain text, for the message's ``text`` field, with ``&``,
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
 ``closed`` and refuses free text with ``invalid_arguments``, which is what
-Hermes's thread status sends it. A title is at most 80 characters and
-``agents.sessions.rename`` refuses ``:``, ``/`` and ``·``.
+Hermes's thread status sends it. ``agents.sessions.rename`` refuses a whole
+title with ``invalid_name`` when it runs over 80 characters or holds a single
+character outside a narrow set: letters, digits, spaces and a little ASCII
+punctuation. ``:``, ``/``, ``#``, ``%``, the ellipsis and every dash but ``-``
+are refused.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -38,11 +42,37 @@ SESSION_SUSPENDED = "suspended"
 SESSION_CLOSED = "closed"
 SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLOSED})
 
-#: ``agents.sessions.rename`` limits, and what each refused character becomes.
-#: A slash becomes the division slash (U+2215), which reads the same, so
-#: ``kube-system/coredns`` stays one name rather than two alternatives.
+#: ``agents.sessions.rename`` limits, measured against Slack: a letter or a
+#: decimal digit in any script passes, and of everything else only
+#: :data:`TITLE_KEPT`. A refused character an ask is likely to hold becomes an
+#: ASCII stand-in from :data:`TITLE_REPLACEMENTS`; any other becomes a space.
+#: A slash between two words becomes a hyphen (:data:`SLASH_IN_NAME`), so
+#: ``kube-system/coredns`` stays one name rather than two alternatives; one that
+#: leads a path like ``/metrics`` becomes a space. A clipped title ends on
+#: :data:`TITLE_ELLIPSIS`, since "…" is refused.
 TITLE_MAX = 80
-TITLE_REPLACEMENTS = ((":", ","), ("·", ","), ("/", "\u2215"))
+TITLE_KEPT = frozenset(" -'\"&|_!?.,()=“”")
+TITLE_REPLACEMENTS = {
+    ":": ",",
+    ";": ",",
+    "·": ",",
+    "•": ",",
+    "‒": " - ",
+    "–": " - ",
+    "—": " - ",
+    "―": " - ",
+    "−": "-",
+    "…": "...",
+    "‘": "'",
+    "’": "'",
+    "[": "(",
+    "]": ")",
+    "{": "(",
+    "}": ")",
+    "%": " percent",
+    "×": "x",
+}
+TITLE_ELLIPSIS = "..."
 ELLIPSIS = "…"
 #: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
@@ -56,6 +86,7 @@ MENTION = re.compile(r"<[@!][^<>]*>")
 CHANNEL = re.compile(r"<#[A-Z0-9]+\|([^<>]*)>")
 LINK = re.compile(r"<([^<>|]+)(?:\|([^<>]*))?>")
 WHITESPACE = re.compile(r"\s+")
+SLASH_IN_NAME = re.compile(r"(?<=\w)/(?=\w)")
 REPEATED_COMMA = re.compile(r"\s*,[\s,]*")
 
 # --- the plan --------------------------------------------------------------
@@ -125,33 +156,41 @@ def session_status(text: Any) -> str:
     return SESSION_PROCESSING if status else SESSION_CLOSED
 
 
-def _clip(text: str, limit: int) -> str:
-    """``text`` cut on a word to ``limit`` characters, ellipsis included."""
+def _clip(text: str, limit: int, ellipsis: str = ELLIPSIS) -> str:
+    """``text`` cut on a word to ``limit`` characters, ``ellipsis`` included."""
     if len(text) <= limit:
         return text
-    hard = text[: limit - len(ELLIPSIS)]
+    hard = text[: limit - len(ellipsis)]
     cut = hard.rsplit(" ", 1)[0]
     # A long unbroken word would otherwise take everything after the last space with it.
     if len(cut) * CLIP_MIN_SHARE < len(hard):
         cut = hard
-    return cut.rstrip(" ,") + ELLIPSIS
+    return cut.rstrip(" ,") + ellipsis
+
+
+def _title_char(char: str) -> str:
+    """``char`` if ``agents.sessions.rename`` accepts it, else its stand-in or a space."""
+    if char.isalpha() or char.isdecimal() or char in TITLE_KEPT:
+        return char
+    return TITLE_REPLACEMENTS.get(char, " ")
 
 
 def session_title(text: Any) -> str:
     """A title ``agents.sessions.rename`` accepts, from the ask's words, or ``""``.
 
-    Mentions and bare links are dropped, a channel keeps its name and a link its label, the
-    refused characters are replaced, and the result is clipped on a word to
-    :data:`TITLE_MAX`.
+    Mentions and bare links are dropped, a channel keeps its name and a link its label, each
+    refused character is replaced, and the result is clipped on a word to :data:`TITLE_MAX`,
+    ending on :data:`TITLE_ELLIPSIS`. NFC first, so an accent typed as a combining mark stays
+    on its letter.
     """
     title = MENTION.sub(" ", str(text or ""))
-    title = CHANNEL.sub(r"#\1", title)
+    title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
-    for refused, replacement in TITLE_REPLACEMENTS:
-        title = title.replace(refused, replacement)
+    title = SLASH_IN_NAME.sub("-", title)
+    title = "".join(map(_title_char, unicodedata.normalize("NFC", title)))
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
-    return _clip(title, TITLE_MAX)
+    return _clip(title, TITLE_MAX, TITLE_ELLIPSIS)
 
 
 def task_status(kind: str) -> str | None:

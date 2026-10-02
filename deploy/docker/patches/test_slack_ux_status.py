@@ -417,12 +417,12 @@ class SessionTest(_RuntimeCase):
             adapter.calls,
             [
                 ("setStatus", "processing"),
-                ("rename", "why is #payments slow, see dash"),
+                ("rename", "why is payments slow, see dash"),
                 ("setStatus", "closed"),
                 ("setStatus", "processing"),
             ],
         )
-        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is #payments slow, see dash")
+        self.assertEqual(runtime._titles[(CHANNEL, THREAD)], "why is payments slow, see dash")
 
     def test_a_follow_up_ask_keeps_the_title(self):
         adapter = _Adapter()
@@ -450,6 +450,13 @@ class SessionTest(_RuntimeCase):
         runtime.note_ask(CHANNEL, THREAD, "scale it")
         self._status(adapter, PHRASE)
         self.assertNotIn((CHANNEL, THREAD), runtime._titles)
+
+    def test_a_refused_rename_is_a_warning(self):
+        adapter = _Adapter(_Client(fail={"rename"}))
+        runtime.note_ask(CHANNEL, THREAD, "scale it")
+        with self.assertLogs(runtime.logger, "WARNING") as logs:
+            self._status(adapter, PHRASE)
+        self.assertIn("agents.sessions.rename refused", logs.output[0])
 
     def test_a_refused_rename_keeps_the_first_ask_for_the_next_session(self):
         adapter = _Adapter(_Client(fail={"rename"}))
@@ -481,7 +488,7 @@ class TitleTest(unittest.TestCase):
     def test_clipped_to_the_limit_on_a_word(self):
         title = slack_status.session_title("word " * 40)
         self.assertLessEqual(len(title), slack_status.TITLE_MAX)
-        self.assertTrue(title.endswith("word" + slack_status.ELLIPSIS))
+        self.assertTrue(title.endswith("word" + slack_status.TITLE_ELLIPSIS))
 
     def test_blank_is_empty(self):
         self.assertEqual(slack_status.session_title("<@U1>"), "")

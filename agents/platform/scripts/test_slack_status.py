@@ -14,6 +14,12 @@ import slack_status as s
 #: Slack's cap on a message's text, and how long a title of one that size may take.
 SLACK_MESSAGE_MAX = 40_000
 LINEAR_BUDGET_SECONDS = 1.0
+#: Characters agents.sessions.rename answered invalid_name for, one per call, on a live
+#: workspace (2026-10-02). Each one alone refuses the whole title.
+RENAME_REFUSED = "/:·…∕—–‒―−•→×<>#@\\*~`%;[]{}+$^‘’²½Ⅳ\u00a0"
+#: The outermost Unicode code point of the Basic Multilingual Plane, and its surrogate block.
+BMP_END = 0xFFFF
+SURROGATES = range(0xD800, 0xE000)
 
 
 def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING):
@@ -29,7 +35,7 @@ class StandaloneTest(unittest.TestCase):
                 roots.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 roots.add(node.module.split(".")[0])
-        self.assertEqual(roots - {"__future__", "re", "collections", "typing"}, set())
+        self.assertEqual(roots - {"__future__", "re", "unicodedata", "collections", "typing"}, set())
 
 
 class TaskStatusTest(unittest.TestCase):
@@ -131,23 +137,59 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(s.session_status("closed"), s.SESSION_CLOSED)
 
     def test_title(self):
-        self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is #prod ok")
+        self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
 
     def test_a_long_word_after_a_short_one_is_cut_not_dropped(self):
-        self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 71 + s.ELLIPSIS)
-        self.assertEqual(s.session_title("word " * 40), ("word " * 15).rstrip() + s.ELLIPSIS)
+        self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 69 + s.TITLE_ELLIPSIS)
+        self.assertEqual(s.session_title("word " * 40), ("word " * 15).rstrip() + s.TITLE_ELLIPSIS)
 
     def test_title_keeps_what_real_markup_gives(self):
         cases = {
             "is <@U123> ok with <#C1|ops> and <https://x.example/a|the doc> or <https://y.example>?": (
-                "is ok with #ops and the doc or ?"
+                "is ok with ops and the doc or ?"
             ),
-            "check <!here> <!subteam^S1|@oncall> kube-system/coredns: now": "check kube-system\u2215coredns, now",
+            "check <!here> <!subteam^S1|@oncall> kube-system/coredns: now": "check kube-system-coredns, now",
         }
         for ask, title in cases.items():
             with self.subTest(ask=ask):
                 self.assertEqual(s.session_title(ask), title)
+
+    def test_no_character_slack_refused_survives(self):
+        for refused in RENAME_REFUSED:
+            with self.subTest(char=f"U+{ord(refused):04X}"):
+                self.assertNotIn(refused, s.session_title(f"pods {refused} restarts"))
+
+    def test_every_title_character_is_one_slack_accepts(self):
+        for code in range(BMP_END + 1):
+            if code in SURROGATES:
+                continue
+            title = s.session_title(f"a{chr(code)}b")
+            with self.subTest(char=f"U+{code:04X}"):
+                self.assertTrue(all(c.isalpha() or c.isdecimal() or c in s.TITLE_KEPT for c in title), title)
+
+    def test_dashes_ellipses_and_quotes_become_ascii(self):
+        cases = {
+            "pods — restarts": "pods - restarts",
+            "wait…": "wait...",
+            "check /metrics on a/b": "check metrics on a-b",
+            "what’s down?": "what's down?",
+            "cpu at 90% × 3": "cpu at 90 percent x 3",
+            "café": "café",
+            "cafe\u0301": "café",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
+    def test_a_clipped_title_ends_in_ascii_within_the_limit(self):
+        ask = (
+            "Check the platform-agent-host cluster: are any pods outside kube-system not Running, "
+            "and is any node under memory pressure?"
+        )
+        title = s.session_title(ask)
+        self.assertEqual(title, "Check the platform-agent-host cluster, are any pods outside kube-system not...")
+        self.assertLessEqual(len(title), s.TITLE_MAX)
 
     def test_title_stays_linear_on_unclosed_markup(self):
         # It runs on the gateway's event loop: a pattern that rescans to the end from every
