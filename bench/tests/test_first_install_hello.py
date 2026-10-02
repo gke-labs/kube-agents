@@ -99,9 +99,9 @@ def test_asking_for_runbooks_is_a_stacked_ask_and_no_invitation(case, ask):
         " Drop any runbooks your team keeps here anytime.",
     ],
 )
-def test_a_reworded_invitation_satisfies_the_invitation_check(case, invitation):
-    # Only the invitation is under test: a longer wording can cross sixty words.
-    assert "invites-runbooks" not in _failing(case, _example(case).replace(INVITATION, invitation))
+def test_a_reworded_invitation_fails_the_invitation_check(case, invitation):
+    # The check is the prompts' sentence, so a paraphrase reds the case.
+    assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -112,9 +112,11 @@ def test_a_reworded_invitation_satisfies_the_invitation_check(case, invitation):
         ' "Share your team\'s runbooks here anytime."',
         " “Share your team's runbooks here anytime.”",
         " Share your team's runbooks here anytime…",
+        " Share your team’s runbooks here anytime.",
+        " Share  your team's\trunbooks here anytime.",
     ],
 )
-def test_a_closing_bracket_quote_or_ellipsis_still_ends_the_invitation(case, invitation):
+def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(case, invitation):
     assert _failing(case, _example(case).replace(INVITATION, invitation)) == []
 
 
@@ -145,14 +147,27 @@ def test_a_runbook_question_after_the_invitation_is_a_stacked_ask(case, ask):
     assert "no-stacked-asks" in _failing(case, reply)
 
 
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "joined",
+    [
+        " Share your team's runbooks here anytime, and is there anything you want me to look at first?",
+        " Share your team's runbooks here anytime - is there anything you want me to look at first?",
+    ],
+)
+def test_the_invitation_joined_to_the_closing_question_fails_the_invitation_check(case, joined):
+    example = _example(case)
+    reply = example[: example.index(INVITATION)] + joined
+    assert "invites-runbooks" in _failing(case, reply)
+
+
 @pytest.mark.parametrize(
     "invitation",
     [
         " Share your team's runbooks here anytime.",
-        " Share your team's runbooks (v1.2+) here anytime.",
-        " Share your team's runbooks, the on-call ones, here anytime.",
-        " You can share your team's runbooks with me here anytime.",
-        " Share your team's runbooks in this chat anytime.",
+        " Share your team’s runbooks here anytime.",
+        " Share your team's runbooks here anytime, and I'll be in touch.",
+        " Share your team's runbooks here anytime - I'll be in touch.",
     ],
 )
 def test_the_invitation_alone_does_not_say_where_results_go(invitation):
@@ -163,10 +178,10 @@ def test_the_invitation_alone_does_not_say_where_results_go(invitation):
         + invitation
         + " Is there anything you want me to look at first?"
     )
-    assert _failing("first-install-hello-running", reply) == [
-        "says-results-will-be-posted",
-        "says-results-come-to-this-chat",
-    ]
+    # A comma or dash after "anytime" also fails invites-runbooks; the results
+    # checks must not see the invitation's "share" and "here" either way.
+    results = ["says-results-will-be-posted", "says-results-come-to-this-chat"]
+    assert [name for name in _failing("first-install-hello-running", reply) if name in results] == results
 
 
 @pytest.mark.parametrize(

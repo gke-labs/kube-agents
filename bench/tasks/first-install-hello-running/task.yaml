@@ -97,22 +97,19 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["pull request", "as a pr", "a pr for"]
 
-  # The two results checks look for their word in a sentence with the
-  # runbook invitation taken out: from "runbooks" to where it says to share
-  # them (here, in this chat, with me), and for the verb check back to the
-  # nearest "share", "post" or "send" before it. The invitation carries
-  # "share" and "here", so on the whole reply it satisfied both with no
-  # results sentence present. Sentences end as in no-stacked-asks. Each
-  # pattern is forbidden when no such sentence carries its word, which is a
-  # required pattern. Known limit: the rest of the invitation's sentence
-  # counts, so "runbooks here anytime, e.g. post them in this chat" passes.
+  # The two results checks read the reply with the invitation, "Share your
+  # team's runbooks here anytime", taken out: the patterns step over it whole,
+  # so a word inside it is never reached however it is joined to the rest.
+  # It carries "share" and "here", so on the whole reply it satisfied both
+  # with no results sentence present. Each pattern is forbidden when its word
+  # appears nowhere else, which is a required pattern.
   - name: says-results-will-be-posted
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|(?<=\n)|(?<!\be\.g)(?<!\bi\.e)[.!?…][)\]"''”’]*\s+)(?:(?>(?:\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b(?:(?!\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b|\b(?:here|this chat)\b)(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z))))*?)?run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*)|(?!(?>(?:\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b(?:(?!\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b|\b(?:here|this chat)\b)(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z))))*?)?run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*))(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z))))*?(?!(?>(?:\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b(?:(?!\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b|\b(?:here|this chat)\b)(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z))))*?)?run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*))\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b)'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b)'
 
   - name: says-results-come-to-this-chat
     role: objective
@@ -122,25 +119,28 @@ verification_spec:
       # Word-bounded: a bare "here" is inside "there", which the prompt's
       # closing question and its "Hi there" fallback both carry.
       forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|(?<=\n)|(?<!\be\.g)(?<!\bi\.e)[.!?…][)\]"''”’]*\s+)(?:(?>run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*)|(?!(?>run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*))(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z))))*?(?!(?>run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*))\b(?:here|this chat)\b)'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)\b(?:here|this chat)\b)'
 
-  # The one standing invitation, stated rather than asked: "runbooks" in any
-  # spelling, then here, in this chat or with me, in a sentence that ends on
-  # ".", "!" or "…", never "?". A required pattern, like the results checks.
+  # The one standing invitation: the prompts' sentence, "Share your team's
+  # runbooks here anytime", ended by ".", "!" or "…" past any closing bracket
+  # or quote, never "?". The reply is lowercased; any run of whitespace and
+  # either apostrophe match. A required pattern, like the results checks. A
+  # reworded invitation fails it, which is the accepted cost of a check whose
+  # words cannot leak into the others; so does the invitation joined to the
+  # closing question by a comma or a dash, which no-stacked-asks also fails,
+  # though it asks nothing about runbooks.
   # Known limits of lexical checks, left to the judge's expected output and
   # the prompt rule: a question that never names runbooks ("Do you have
   # any?"), or that holds an abbreviation ending in a period other than
-  # "e.g." and "i.e." ("etc."), passes no-stacked-asks; the invitation and
-  # the closing question joined into one sentence (a dash or a comma for the
-  # period, or a period with no space after it) fails no-stacked-asks and
-  # this check though it asks nothing about runbooks.
+  # "e.g." and "i.e." ("etc.") or an ellipsis typed as three periods ("Any
+  # runbooks here... I should read first?"), passes no-stacked-asks.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*(?:(?<!\be\.g)(?<!\bi\.e)[.!…][)\]"''”’]*(?=\s|\Z)|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -191,8 +191,7 @@ verification_spec:
         # a space or the end, past any closing bracket or quote; a dot inside
         # a word (v1.2, runbooks.md) or in "e.g." or "i.e." does not end it.
         # A line break ends it too. This is the segment model of
-        # obtainability-design-quota-vs-capacity with those additions; the
-        # invitation and results checks share it.
+        # obtainability-design-quota-vs-capacity with those additions.
         - 'run[ -]?book(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*\?'
 
   - name: claims-no-save

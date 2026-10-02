@@ -103,26 +103,26 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["in this chat", "in the chat", "posted"]
 
-  # The one standing invitation, stated rather than asked: "runbooks" in any
-  # spelling, then here, in this chat or with me, in a sentence that ends on
-  # ".", "!" or "…", never "?". Forbidden when no such sentence exists, which
-  # is a required pattern.
-  # Accepting "in this chat" lets an invitation worded that way also satisfy
-  # says-the-results-are-in-this-chat above.
+  # The one standing invitation: the prompts' sentence, "Share your team's
+  # runbooks here anytime", ended by ".", "!" or "…" past any closing bracket
+  # or quote, never "?". The reply is lowercased; any run of whitespace and
+  # either apostrophe match. A required pattern. A reworded invitation
+  # fails it, which is the accepted cost of a check whose words cannot leak
+  # into the others; so does the invitation joined to the closing question
+  # by a comma or a dash, which no-stacked-asks also fails, though it asks
+  # nothing about runbooks.
   # Known limits of lexical checks, left to the judge's expected output and
   # the prompt rule: a question that never names runbooks ("Do you have
   # any?"), or that holds an abbreviation ending in a period other than
-  # "e.g." and "i.e." ("etc."), passes no-stacked-asks; the invitation and
-  # the closing question joined into one sentence (a dash or a comma for the
-  # period, or a period with no space after it) fails no-stacked-asks and
-  # this check though it asks nothing about runbooks.
+  # "e.g." and "i.e." ("etc.") or an ellipsis typed as three periods ("Any
+  # runbooks here... I should read first?"), passes no-stacked-asks.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?run[ -]?books?\b(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*?\b(?:here|in this chat|with me)\b(?:\s+(?:here|in this chat|with me)\b)*(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*(?:(?<!\be\.g)(?<!\bi\.e)[.!…][)\]"''”’]*(?=\s|\Z)|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
