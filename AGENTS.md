@@ -416,7 +416,7 @@ opts a pull request out and outranks both.
 run, and `.github/workflows/auto_request_review.yml` waits for it to go green before assigning
 anyone from `.github/auto_request_review.yml`. A first review is green only if it found nothing; a
 later review of it holds the check on 🔴 High alone, with 🟠 Medium posted, not held
-([what the check means](docs/pull-request-workflow.md#what-the-check-means) has the cases). A green
+([the cases](docs/pull-request-workflow.md#what-the-check-means)). A green
 pass after `/review` is what reaches a reviewer. Exceptions: a pull request opened by a bot is
 assigned as soon as the check completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
 owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
