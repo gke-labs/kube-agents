@@ -52,9 +52,11 @@ process too). A gateway restart between the turn and the settle loses the
 settle, and the ask keeps its arrival reaction alone; nothing is ever put on a
 message this process did not see arrive.
 
-Fail-soft throughout: a kanban read that fails, on any board, settles the ask
-at once as a direct answer, and a reaction that fails is logged at debug and
-the turn carries on, as upstream's ``_react`` already does.
+Fail-soft throughout: an open-card read that fails, on any board, settles the
+ask at once as a direct answer; a lineage read that fails leaves the turn to the
+open-card reads, so a card under a creator that closed within the turn counts as
+the turn's; and a reaction that fails is logged at debug and the turn carries
+on, as upstream's ``_react`` already does.
 """
 
 from __future__ import annotations
@@ -313,8 +315,9 @@ def _own_cards(before: dict, after: dict, finished: dict, lineage: dict | None =
     the unblock was its own rather than the CLI's or another turn's. Nor is a
     new card whose creator was open at the start, such as a follow-up an
     earlier ask's worker files, nor one created under such a card, through
-    creators the end read shows or, for one already closed, ``lineage``: the
-    thread's ``{(board, id): creator id}``. Only workers set a creator; the
+    creators the end read shows or, for one completed since, ``lineage``: the
+    thread's ``{(board, id): creator id}``. An archived creator is in neither,
+    so a card under it counts as the turn's. Only workers set a creator; the
     parents a turn names do not make a card anyone else's. A creator whose own
     chain reaches no card open at the start opened within the turn, so it and
     the cards it created are the turn's, even when it closed before the
@@ -332,7 +335,12 @@ def _own_cards(before: dict, after: dict, finished: dict, lineage: dict | None =
 
 
 def _creator_unseen(before: dict, after: dict, finished: dict) -> bool:
-    """Whether a card the turn would own has a creator neither read shows, or is closed and its creator unknown."""
+    """Whether a card the turn would own has a creator neither read shows, or is closed and its creator unknown.
+
+    The closed case is not only a link in a chain: an earlier ask's follow-up
+    that gave up within the turn is closed with no creator in either read, and
+    counted as the turn's it would turn the ask ❌.
+    """
     return any(
         card not in after or (after[card].creator and (card[0], after[card].creator) not in after)
         for card in _own_cards(before, after, finished)

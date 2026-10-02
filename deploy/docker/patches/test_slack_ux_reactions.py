@@ -677,6 +677,16 @@ class RuntimeTest(unittest.TestCase):
                 self.assertEqual(log[-1], ("111.001", "white_check_mark"))
                 self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
 
+    def test_an_earlier_asks_follow_up_that_gave_up_within_the_turn_does_not_fail_it(self):
+        # t_c's worker files t_a while "why?" is answered, and t_a gives up and
+        # closes before the turn ends: no own card is left open, and only the
+        # closed t_a has a creator neither read shows.
+        adapter = _Stub()
+        self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c"}
+        self._turn_racing("why?", _cards("t_c"), _cards("t_c"), [("t_a", "gave_up")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertEqual(self.lineage_reads, 1)
+
     def test_the_turn_reads_the_lineage_only_for_a_creator_neither_read_shows(self):
         self._turn("why?", _cards("t_old"), _cards("t_old"))
         self._turn("fix it", {}, {**_cards("t_a"), **_cards("t_b", creator="t_a")})
