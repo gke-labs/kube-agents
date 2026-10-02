@@ -718,6 +718,7 @@ class RuntimeTest(unittest.TestCase):
         self._incident(adapter)
         self._runs(adapter)
         self.assertEqual(adapter.asked, [("U3", CHANNEL, TEAM)])
+        self.assertEqual(adapter.gated, [])
 
     def test_a_typed_apply_the_gateway_would_not_hear_does_not_drop_the_click(self):
         # A channel that requires an @-mention: the gateway ignored U4's bare "apply B".
@@ -866,7 +867,7 @@ class RuntimeTest(unittest.TestCase):
         # Slack sends a typed hostname as <http://host|host>, and a typed url as <url>.
         labels = (
             "apply Option A: Drain checkout.example.com", "apply Option B: Open https://grafana.example.com/d/x",
-            "apply Option C: Ping @U0BOT",
+            "apply Option C: Ping @U0BOT", "apply Option D: Drain\ncheckout",
         )
         cases = (
             (self._drops, "apply A: Drain <http://checkout.example.com|checkout.example.com>"),
@@ -874,6 +875,7 @@ class RuntimeTest(unittest.TestCase):
             (self._runs, "apply A: Drain <http://checkout.example.com|other.example.com>"),
             # Only a link is unwrapped: a mention names someone, not the option's text.
             (self._runs, "apply C: Ping <@U0BOT>"),
+            (self._drops, "apply D: Drain checkout"),
         )
         for check, text in cases:
             with self.subTest(text=text):
@@ -920,7 +922,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_struck_through_apply_does_not_drop_the_click(self):
         for text, check in (("~apply B~", self._runs), ("~apply A~ apply B", self._drops), ("~no~ apply B", self._drops),
-                            ("~no~ apply B ~now~", self._drops)):
+                            ("~no~ apply B ~now~", self._drops), ("~no\n~ apply B", self._runs)):
             with self.subTest(text=text):
                 importlib.reload(runtime)
                 adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
