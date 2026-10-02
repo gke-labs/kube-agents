@@ -5,10 +5,12 @@
 # per-component NATS user and reaches the model through the install's
 # LiteLLM with no per-worker credential. Each of these has a decided design
 # in the specs (auth callout, Vertex/WI per profile); none of them gates
-# "Adam can play." Static creds are the playground, not the product.
+# "Adam can play." Static creds are the playground, not the product. The
+# temporary cluster view (A2A_SESSION_CLUSTER_VIEW) is the other playground
+# posture here: it is a stopgap, not the product.
 
-# Build from the a2a/ module root:
-#   docker build -f Dockerfile.worker -t <registry>/a2a-worker:<tag> .
+# Build from the REPOSITORY root (the shim client below lives outside a2a/):
+#   docker build -f a2a/Dockerfile.worker -t <registry>/a2a-worker:<tag> .
 
 # Bases come from images.json, the repo's image inventory, spelled the way
 # a2a/Dockerfile.gateway spells them so `make mirror-images` and the pinning
@@ -27,9 +29,9 @@ FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
 # fetches a newer one instead of failing the build (#1138).
 ENV GOTOOLCHAIN=local
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY a2a/go.mod a2a/go.sum ./
 RUN go mod download
-COPY . .
+COPY a2a/ .
 RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-w -s" -o /out/worker-adapter ./cmd/worker-adapter
 
@@ -43,6 +45,29 @@ WORKDIR /app
 # version these stream-json shapes were proved against.
 RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
     && npm cache clean --force
+
+# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): kubectl
+# and gcloud on PATH are the credential broker's shim, which forwards an argv
+# to the broker and prints its refusal as `policy rule: <rule>`. The shim is
+# stdlib Python, so python3 and nothing else is installed; no native kubectl,
+# gcloud, gh or git exist in this image, and the guard below keeps it so. With
+# the flag off the pod has no CREDENTIAL_PROXY_URL and the shim refuses with
+# that name. gh and git are deliberately not linked: the broker's session role
+# refuses them anyway, and a name that is not on PATH is a clearer answer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
+RUN mkdir -p /opt/credential-proxy/bin \
+    && for binary in kubectl gcloud; do \
+         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
+       done \
+    && for binary in gcloud kubectl gh git; do \
+         if command -v "${binary}" >/dev/null 2>&1; then \
+           echo "unexpected credential-aware CLI in the worker image: ${binary}" >&2; exit 1; \
+         fi; \
+       done
+ENV PATH="/opt/credential-proxy/bin:${PATH}"
 
 COPY --from=build /out/worker-adapter /usr/local/bin/worker-adapter
 
