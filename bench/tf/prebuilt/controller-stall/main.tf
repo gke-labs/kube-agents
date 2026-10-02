@@ -219,9 +219,10 @@ resource "null_resource" "stall" {
         echo "WARNING: the Session KV daemon does not advertise the 'controller-stall' inject kind (it advertises: $kinds); the record will take the event path." >&2
       fi
 
-      # The Cluster Agent profile the watch would name, resolved the way it
-      # resolves it, and dropped if the profile is not there: the daemon then
-      # tells the Planning Agent to find the cluster's agent itself.
+      # The Cluster Agent profile the watch would name, from the watch's own
+      # resolver (which also checks the profile's cluster_identity, since two
+      # clusters can share a profile name), and dropped when it finds none:
+      # the daemon then tells the Planning Agent to find the cluster's agent.
       pod_python=""
       for candidate in python3 /opt/hermes/.venv/bin/python3; do
         if "$${exec_in_pod[@]}" "$candidate" -c 'pass' >/dev/null 2>&1; then
@@ -233,11 +234,10 @@ resource "null_resource" "stall" {
         echo "ERROR: no python interpreter found in ${var.agent_container}." >&2
         exit 1
       fi
-      assignee="$("$${exec_in_pod[@]}" "$pod_python" -c 'import os, sys
+      assignee="$("$${exec_in_pod[@]}" "$pod_python" -c 'import sys
       sys.path.insert(0, "/opt/defaults/scripts")
-      from cluster_agent_profile import profile_name
-      name = profile_name(*sys.argv[1:4])
-      print(name if os.path.isdir(os.path.join("/opt/data/profiles", name)) else "")' \
+      import stall_watch
+      print(stall_watch.cluster_agent_for(*sys.argv[1:4]) or "")' \
         "$project" "${var.host_cluster_name}" "${var.host_cluster_location}" 2>/dev/null || true)"
 
       session_id="$("$${exec_in_pod[@]}" sh -c \

@@ -1901,7 +1901,7 @@ def _stall_rows(payload: Dict[str, Any]) -> list[Dict[str, str]]:
     raw = payload.get("objects")
     rows = []
     for item in raw if isinstance(raw, list) else []:
-        if not isinstance(item, dict) or not isinstance(item.get("object"), str):
+        if not isinstance(item, dict) or not _stall_raw_name(item.get("object")):
             continue
         obj = _defang_drift_field(item.get("object")).strip()
         if not obj:
@@ -1916,6 +1916,18 @@ def _stall_rows(payload: Dict[str, Any]) -> list[Dict[str, str]]:
             "stalled_for": stalled_for if isinstance(stalled_for, str) and _STALL_DURATION_RE.fullmatch(stalled_for) else STALL_UNKNOWN_FIELD,
         })
     return rows
+
+
+def _stall_raw_name(value: Any) -> bool:
+    """Whether a name in a stall record is one the card can carry unaltered:
+    a non-blank string within the defang's length cut with nothing in it the
+    defang would replace. A Kubernetes or GKE name never fails this."""
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= DRIFT_MAX_FIELD_CHARS
+        and not _DRIFT_UNSAFE_CHARS_RE.search(value)
+    )
 
 
 def _stall_object_names(rows: list[Dict[str, str]]) -> list[str]:
@@ -3084,9 +3096,10 @@ def _inject_stall(
     act on. The event path defaults those fields instead; it has to, since a
     Kubernetes event can arrive without them.
     """
-    # Typed before the defang, which would turn a list or a number into
-    # non-empty text that passes the emptiness test below.
-    typed = isinstance(payload.get("namespace"), str) and isinstance(payload.get("cluster"), str)
+    # Checked raw, before the defang: it turns a list or a number into text, and
+    # a value it would replace into a non-empty placeholder, both of which pass
+    # the emptiness test below.
+    typed = _stall_raw_name(payload.get("namespace")) and _stall_raw_name(payload.get("cluster"))
     namespace = _stall_field(payload, "namespace")
     cluster = _stall_field(payload, "cluster")
     names = _stall_object_names(_stall_rows(payload))
