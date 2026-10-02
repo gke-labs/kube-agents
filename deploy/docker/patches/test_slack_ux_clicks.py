@@ -85,6 +85,9 @@ class SlackAdapter:
     def _get_client(self, chat_id, team_id=None):
         return None
 
+    def _client_for(self, chat_id, metadata):
+        return None
+
     async def _handle_slack_message(self, event, payload=None):
         return bool(event.get("_hermes_force_process"))
 
@@ -194,8 +197,9 @@ class ApplierTest(unittest.TestCase):
             ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, *, team=None)",
              "_get_client no longer accepts"),
             ("*, team_scoped=True)", "*, team_scoped)", "_begin_interaction requires a keyword"),
-            ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, team_id)",
-             "_get_client no longer accepts 1 positional argument(s) and ()"),
+            ("def _client_for(", "def _workspace_client(", "_client_for"),
+            ("def _client_for(self, chat_id, metadata)", "def _client_for(self, chat_id)",
+             "_client_for no longer accepts"),
             ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, team_id=None, /)",
              "_get_client no longer accepts 1 positional argument(s) and ('team_id',)"),
             ("    def _get_client(", "    @property\n    def _get_client(", "_get_client is no longer a method"),

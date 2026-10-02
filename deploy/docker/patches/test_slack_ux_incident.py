@@ -108,7 +108,8 @@ class _Adapter:
         self.fail_update = fail_update
         self.name = "slack-adapter"
 
-    def _get_client(self, chat_id, team_id=None):
+    def _client_for(self, chat_id, metadata):
+        self.client_metadata = metadata
         return _Client(self.log, self.fail_update)
 
     async def send(self, chat_id, content, metadata=None):
@@ -293,6 +294,15 @@ class RuntimeTest(unittest.TestCase):
         self.assertIs(fold["is_collapsible"], True)
         self.assertIs(fold["default_collapsed"], True)
         self.assertIn("apply Option A", update["text"])
+        # The whole report is in the text, the only place a thread read-back finds it.
+        self.assertTrue(update["text"].endswith(REPORT.strip()))
+        self.assertEqual(adapter.client_metadata, {"thread_id": ALERT_TS})
+
+    def test_the_message_text_is_the_report_as_mrkdwn(self):
+        adapter = _Adapter()
+        adapter.format_message = lambda s: "fmt:" + s
+        self.deliver(adapter)
+        self.assertIn("\n\nfmt:" + REPORT.strip(), adapter.log[0][1]["text"])
 
     def test_the_fold_is_the_plugins_rendering_of_the_whole_report(self):
         adapter = _Adapter()

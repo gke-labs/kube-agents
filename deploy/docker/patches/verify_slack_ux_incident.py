@@ -117,7 +117,7 @@ class _StubAdapter:
     def __init__(self) -> None:
         self.log: list[tuple] = []
 
-    def _get_client(self, chat_id, team_id=None):
+    def _client_for(self, chat_id, metadata):
         adapter = self
 
         class _Client:
