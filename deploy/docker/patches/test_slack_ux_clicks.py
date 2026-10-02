@@ -429,6 +429,13 @@ class RuntimeTest(unittest.TestCase):
         self.assertNotIn("<!channel>", update["blocks"][-1]["elements"][0]["text"])
         self.assertEqual(turn["text"], "<!channel> & go")
 
+    def test_slacks_entities_in_the_shown_text_are_decoded_once(self):
+        adapter = _Adapter()
+        self._answer(adapter, *_choice(value="Logs & metrics", shown="Logs &amp; metrics &amp;lt;b&amp;gt;"))
+        _, echo, turn = (entry[1] for entry in adapter.log)
+        self.assertEqual(turn["text"], "Logs & metrics &lt;b&gt;")
+        self.assertEqual(echo["text"], "↳ <@U1>: Logs &amp; metrics &amp;lt;b&amp;gt;")
+
     def test_turn_and_echo_carry_the_shown_text_never_the_longer_value(self):
         label = "Yes, roll back checkout-gateway to the previous revision in namespace prod " * 3
         button = presenter._button(label, "kage.choice.0", value=label)
@@ -478,6 +485,23 @@ class RuntimeTest(unittest.TestCase):
         listed = _Adapter(allowed_channels={CHANNEL})
         self._answer(listed, *_choice())
         self.assertEqual(len(listed.log), 3)
+
+    def test_allowed_channels_gates_channels_and_group_dms_but_not_a_one_to_one_dm(self):
+        # Upstream's message handler skips the channel gate for an im; DMs are disable_dms's.
+        adapter = _Adapter(allowed_channels={"C2"})
+        adapter._begin_interaction = self._dm_begin(adapter)
+        self._answer(adapter, *_choice())
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
+        self.assertEqual(adapter.log[-1][1]["channel"], "D1")
+        for name, channel in (("a channel", CHANNEL), ("a group dm", "mpdm-alice--bob--kage-1")):
+            with self.subTest(name):
+                importlib.reload(runtime)
+                outside = _Adapter(allowed_channels={"C2"})
+                body, action = _choice()
+                if channel.startswith("mpdm-"):
+                    body["channel"] = {"id": CHANNEL, "name": channel}
+                self._answer(outside, body, action)
+                self.assertEqual(outside.log, [])
 
     def test_a_click_in_a_group_dm_with_dms_disabled_changes_nothing(self):
         # The gateway ignores an mpim as it does an im when DMs are disabled.
@@ -595,6 +619,21 @@ class AnsweredBlocksTest(unittest.TestCase):
         self.assertEqual(out[0], blocks[0])
         self.assertEqual(out[-1], {"type": "context", "elements": [{"type": "mrkdwn", "text": "note"}]})
         self.assertEqual(blocks[1]["elements"][1]["action_id"], "kage.choice.0")  # input untouched
+
+    def test_texts_and_block_count_are_clamped_to_slacks_caps_keeping_the_note(self):
+        # Slack echoes ``&`` back as ``&amp;``, so a text sent at the cap returns past it.
+        long_text = "&amp; " * runtime.SECTION_TEXT_MAX
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": long_text}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": long_text}, {"type": "image", "image_url": "u"}]},
+        ] + [{"type": "divider"}] * (runtime.MESSAGE_BLOCKS_MAX + 5)
+        out = runtime.answered_blocks(blocks, lambda i: False, "note")
+        self.assertEqual(len(out), runtime.MESSAGE_BLOCKS_MAX)
+        self.assertEqual(out[-1], {"type": "context", "elements": [{"type": "mrkdwn", "text": "note"}]})
+        self.assertLessEqual(len(out[0]["text"]["text"]), runtime.SECTION_TEXT_MAX)
+        self.assertLessEqual(len(out[1]["elements"][0]["text"]), runtime.SECTION_TEXT_MAX)
+        self.assertEqual(out[1]["elements"][1], {"type": "image", "image_url": "u"})
+        self.assertEqual(len(blocks[0]["text"]["text"]), len(long_text))  # input untouched
 
 
 if __name__ == "__main__":

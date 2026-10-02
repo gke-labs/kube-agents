@@ -21,7 +21,9 @@ With the flag on, :func:`register` adds two listeners:
   label that starts like a command (``/`` or ``!``) is sent as text, since a
   choice is an answer. The click goes through the adapter's own interactive
   authorization; an unlisted user's click is logged and changes nothing, and
-  so does one in a channel or DM the adapter would ignore a typed message in.
+  so does one in a channel or DM the adapter would ignore a typed message in:
+  ``allowed_channels`` gates channels and group DMs, never a 1:1 DM, which
+  only ``disable_dms`` gates, as upstream's message handler does.
   Then the message is rewritten with the choice buttons replaced by
   a line naming who chose what (the same line goes above the message's text,
   which is kept: a later read of the thread looks nowhere else), a short echo ("↳ @user: label") is posted in
@@ -40,6 +42,12 @@ logged rather than running a second apply. That memory is this process's and
 holds the last ``ANSWERED_MAX`` answers, so only a failed rewrite followed by a
 gateway restart, or by that many later answers, lets the leftover buttons run
 again.
+
+The rewrite sends back the blocks Slack echoed in the payload, clamped as
+upstream clamps every ``chat.update``: Slack stores ``< > &`` escaped, so an
+echoed text can come back longer than the send path budgeted for. A section or
+context text past ``SECTION_TEXT_MAX`` is clipped and the message is cut to
+``MESSAGE_BLOCKS_MAX`` blocks, keeping the answered note last.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
 still runs, because the click was the user's answer.
@@ -73,10 +81,6 @@ CHOICE_KIND = "kage choice"
 ECHO = "↳ <@{user}>: {label}"
 ANSWERED = "✓ <@{user}>: {label}"
 
-#: Slack mrkdwn control characters in a label, escaped before it is echoed so a
-#: label cannot mention a user or a channel.
-MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
-
 #: A choice label starting with one of these would run as a gateway command;
 #: the guard in front keeps it an answer. Zero-width, so the agent reads the label.
 COMMAND_PREFIXES = ("/", "!")
@@ -97,6 +101,11 @@ ANSWERED_MAX = 512
 
 #: Slack truncates a message's ``text`` past this many characters.
 SLACK_TEXT_MAX = 40000
+
+#: Slack's caps on a section or context text and on a message's blocks; past
+#: either, ``chat.update`` fails whole with ``invalid_blocks``.
+SECTION_TEXT_MAX = 3000
+MESSAGE_BLOCKS_MAX = 50
 
 #: ``(channel, ts, kind)`` a click answered.
 _answered: OrderedDict[tuple, None] = OrderedDict()
@@ -128,9 +137,10 @@ def register(adapter: Any) -> None:
     logger.info("slack_ux_clicks: choice and link button handlers registered")
 
 
-def _escape(text: str) -> str:
-    for raw, escaped in MRKDWN_ESCAPES:
-        text = text.replace(raw, escaped)
+def _unescape(text: str) -> str:
+    """``text`` with Slack's three entities decoded, ``&amp;`` last so ``&amp;lt;`` stays ``&lt;``."""
+    for raw, escaped in reversed(_presenter.MRKDWN_ESCAPES):
+        text = text.replace(escaped, raw)
     return text
 
 
@@ -143,7 +153,9 @@ def answered_blocks(blocks: Any, answered: Any, note: str) -> list[dict]:
     """``blocks`` with the answered buttons dropped, and ``note`` as a context line after them.
 
     An actions block left with no buttons is dropped; one that still holds a
-    link keeps it.
+    link keeps it. Section and context texts are clipped to Slack's cap and the
+    message to its block cap, the note kept. Section fields and header texts
+    are not clipped: the presenter lays out neither.
     """
     out: list[dict] = []
     for block in blocks or ():
@@ -154,9 +166,26 @@ def answered_blocks(blocks: Any, answered: Any, note: str) -> list[dict]:
                 continue
             if len(kept) != len(elements):
                 block = {**block, "elements": kept}
-        out.append(block)
-    out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
-    return out
+        out.append(_clamped(block) if isinstance(block, dict) else block)
+    note_text = {"type": "mrkdwn", "text": note}
+    return out[: MESSAGE_BLOCKS_MAX - 1] + [{"type": "context", "elements": [_clamped_text(note_text)]}]
+
+
+def _clamped_text(obj: Any) -> Any:
+    """A text object clipped to ``SECTION_TEXT_MAX``; anything else unchanged."""
+    if not isinstance(obj, dict) or obj.get("type") not in ("mrkdwn", "plain_text"):
+        return obj
+    text = str(obj.get("text") or "")
+    return {**obj, "text": _presenter._clip(text, SECTION_TEXT_MAX)} if len(text) > SECTION_TEXT_MAX else obj
+
+
+def _clamped(block: dict) -> dict:
+    """``block`` with its section text, or each context text, clipped to ``SECTION_TEXT_MAX``."""
+    if block.get("type") == "section" and "text" in block:
+        return {**block, "text": _clamped_text(block["text"])}
+    if block.get("type") == "context":
+        return {**block, "elements": [_clamped_text(e) for e in block.get("elements") or []]}
+    return block
 
 
 def _without_choices_line(text: str) -> str:
@@ -180,21 +209,24 @@ def _answered_text(note: str, message: dict) -> str:
 
 
 def _shown_text(action: dict) -> str:
-    """The clicked button's text as Slack displayed it."""
+    """The clicked button's text as Slack displayed it, with Slack's entities decoded."""
     text = action.get("text") or {}
-    return str(text.get("text") or "").strip() if isinstance(text, dict) else ""
+    return _unescape(str(text.get("text") or "").strip()) if isinstance(text, dict) else ""
 
 
 def _gated_out(adapter: Any, channel_id: str, body: dict) -> bool:
     """Whether the adapter would ignore a typed message in ``channel_id``: an ignored
-    channel, outside ``allowed_channels``, or a DM, 1:1 or group, with DMs disabled.
-    Checked before anything is shown."""
+    channel or group DM outside ``allowed_channels``, or a DM, 1:1 or group, with
+    DMs disabled. A 1:1 DM skips ``allowed_channels``, as upstream's message
+    handler does. Checked before anything is shown."""
     if adapter._is_ignored_channel(channel_id):
         return True
+    group_dm = _is_group_dm(body)
+    one_to_one = channel_id.startswith(DM_CHANNEL_PREFIX) and not group_dm
     allowed = adapter._slack_allowed_channels()
-    if allowed and channel_id not in allowed:
+    if allowed and not one_to_one and channel_id not in allowed:
         return True
-    return (channel_id.startswith(DM_CHANNEL_PREFIX) or _is_group_dm(body)) and bool(adapter._slack_disable_dms())
+    return (one_to_one or group_dm) and bool(adapter._slack_disable_dms())
 
 
 def _as_answer(label: str) -> str:
@@ -243,7 +275,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     while len(_answered) > ANSWERED_MAX:
         _answered.popitem(last=False)
 
-    shown = _escape(label)
+    shown = _presenter._escape(label)
     note = ANSWERED.format(user=user_id, label=shown)
     try:
         await client.chat_update(
