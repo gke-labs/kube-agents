@@ -229,14 +229,17 @@ class ApplierTest(unittest.TestCase):
             verifier.check_adapter(self.root.dir)
 
     def test_verifier_reads_the_hooks_off_the_adapter_class(self):
-        # Guarded hooks on another class after the adapter do not guard the
-        # adapter's own, which the runtime calls; a whole-module walk takes them.
+        # Guarded hooks on another class do not guard the adapter's own, which
+        # the runtime calls. Placed before the adapter they catch a module walk
+        # that takes the first match; after it, one that takes the last.
         applier.apply(self.root.dir)
         path = self.root.dir / applier.RELATIVE
         other = path.read_text().replace("class SlackAdapter", "class Other", 1)
-        path.write_text(UPSTREAM + "\n\n" + other)
-        with self.assertRaises(SystemExit):
-            verifier.check_adapter(self.root.dir)
+        for name, source in (("other first", other + "\n\n" + UPSTREAM), ("other last", UPSTREAM + "\n\n" + other)):
+            with self.subTest(name):
+                path.write_text(source)
+                with self.assertRaises(SystemExit):
+                    verifier.check_adapter(self.root.dir)
 
     def test_verifier_refuses_unpatched_tree(self):
         with self.assertRaises(SystemExit):
