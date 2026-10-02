@@ -956,6 +956,46 @@ describe("choosing among matching pending turns", () => {
     expect(state.pending.map((p) => p.messageId)).toEqual(["m-drop"]);
   });
 
+  it("attaches a resend within 30s of a queue-full notice to the resend", () => {
+    let state = reduce(up, { type: "consoleSent", messageId: "m-drop", text: "yes", conversation: "console:abc", at: SENT_AT });
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "c-x-1", text: "⚠️ 8 messages are already waiting in this conversation, so new ones are dropped until it catches up", edit: false },
+      conversation: "console:abc",
+      at: SENT_AT + 10,
+    });
+    state = reduce(state, { type: "consoleSent", messageId: "m-again", text: "yes", conversation: "console:abc", at: SENT_AT + 5_000 });
+    state = consoleTurn(state, "task-9", "yes");
+    const byId = new Map(state.chat.map((c) => [c.id, c]));
+    expect(byId.get("pending:m-again")).toMatchObject({ kind: "user", taskId: "task-9" });
+    expect(byId.get("pending:m-drop")).toMatchObject({ kind: "pending" });
+    expect(state.pending.map((p) => p.messageId)).toEqual(["m-drop"]);
+  });
+
+  it("leaves turns in other conversations, and turns sent after the notice, unmarked", () => {
+    let state = reduce(up, { type: "consoleSent", messageId: "m-other", text: "yes", conversation: "console:def", at: SENT_AT });
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "c-x-1", text: "busy", edit: false },
+      conversation: "console:abc",
+      at: SENT_AT + 10,
+    });
+    state = reduce(state, { type: "consoleSent", messageId: "m-after", text: "yes", conversation: "console:abc", at: SENT_AT + 20 });
+    expect(state.pending.map((p) => [p.messageId, p.noticed])).toEqual([
+      ["m-other", false],
+      ["m-after", false],
+    ]);
+  });
+
+  it("gives a plain retry's task to the plain turn, not to an older delegate turn that strips to it", () => {
+    let state = sent(up, "m-del", "delegate: check the nodes");
+    state = sent(state, "m-plain", "check the nodes");
+    state = consoleTurn(state, "task-1", "check the nodes");
+    const byId = new Map(state.chat.map((c) => [c.id, c]));
+    expect(byId.get("pending:m-plain")).toMatchObject({ kind: "user", taskId: "task-1" });
+    expect(byId.get("pending:m-del")).toMatchObject({ kind: "pending" });
+  });
+
   it("attaches FIFO when every match is stale (a queue of slow turns)", () => {
     let state = sent(up, "m-1", "go");
     state = sent(state, "m-2", "go");

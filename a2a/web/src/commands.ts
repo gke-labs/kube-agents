@@ -44,7 +44,9 @@ export const HELP_TEXT = [
 
 /** The parsed command, or null when the line's first word is not one of the page's own. */
 function parseCommand(line: string): Command | null {
-  const [head, ...rest] = line.slice(COMMAND_PREFIX.length).split(COMMAND_SPLIT_RE);
+  const [word, ...rest] = line.slice(COMMAND_PREFIX.length).split(COMMAND_SPLIT_RE);
+  // Case-insensitive, so a typo like /Clear stays local instead of going out as a turn.
+  const head = word.toLowerCase();
   switch (head) {
     case "new":
     case "tasks":

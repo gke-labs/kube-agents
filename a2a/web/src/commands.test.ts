@@ -37,6 +37,15 @@ describe("classifyInput", () => {
     }
   });
 
+  it("reads the page's own command words case-insensitively", () => {
+    expect(classifyInput("/Clear")).toEqual({ kind: "command", command: { name: "clear" } });
+    expect(classifyInput("/HELP")).toEqual({ kind: "command", command: { name: "help" } });
+    expect(classifyInput("/Replay platform-bridge")).toEqual({
+      kind: "command",
+      command: { name: "replay", session: "platform-bridge" },
+    });
+  });
+
   it("gives a usage line for /replay without a session", () => {
     expect(classifyInput("/replay")).toEqual({
       kind: "command",

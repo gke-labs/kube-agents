@@ -256,6 +256,12 @@ export interface PendingTurn {
   conversation: string;
   at: number;
   stale: boolean;
+  /**
+   * A gateway notice reached this conversation after the turn was sent. The
+   * notice may have been this turn's answer (a full queue, a refusal), so a
+   * resend of the same words matches ahead of it.
+   */
+  noticed: boolean;
 }
 
 export interface UiState {
@@ -480,11 +486,12 @@ function reduceMessage(
   // tab really did just send can replay as non-live. Genuinely old history
   // (from before this page connected) has a ts before any pending turn's
   // send time, so it still can't match. FIFO within a conversation, so two
-  // identical texts attach in order, but the oldest turn that has not gone
-  // stale wins over a stale one: a stale turn may be one the gateway dropped
-  // or answered with a notice, and the same words sent again must attach to
-  // the resend, not to it. Only when every match is stale (a queue of slow
-  // turns) does the oldest stale one take it.
+  // identical texts attach in order. Two things outrank age. A turn sent
+  // with exactly this text beats one that only strips to it (a delegate
+  // candidate must not take a plain retry's task). And a turn that has gone
+  // stale, or that a gateway notice followed, ranks below one that has not:
+  // either may be a turn the gateway dropped or answered with a notice, and
+  // the same words sent again must attach to the resend, not to it.
   const match =
     authority.conversation !== undefined
       ? pendingMatch(state.pending, authority.conversation, text, live, tsMs(env))
@@ -519,14 +526,18 @@ function reduceMessage(
 }
 
 function pendingMatch(pending: PendingTurn[], conversation: string, text: string, live: boolean, ts: number): number {
-  let stale = -1;
+  let best = -1;
+  let bestRank = Infinity;
   for (let i = 0; i < pending.length; i++) {
     const p = pending[i];
     if (p.conversation !== conversation || !p.texts.includes(text) || !(live || p.at < ts)) continue;
-    if (!p.stale) return i;
-    if (stale < 0) stale = i;
+    const rank = (p.stale || p.noticed ? 2 : 0) + (p.text === text ? 0 : 1);
+    if (rank < bestRank) {
+      best = i;
+      bestRank = rank;
+    }
   }
-  return stale;
+  return best;
 }
 
 function reduceStatusUpdate(
@@ -906,6 +917,7 @@ export function reduce(state: UiState, event: BusEvent): UiState {
             conversation: event.conversation,
             at: event.at,
             stale: false,
+            noticed: false,
           },
         ],
         chat: [...state.chat, { id, kind: "pending", text: event.text, correlationId: id }],
@@ -928,6 +940,9 @@ export function reduce(state: UiState, event: BusEvent): UiState {
       }
       return {
         ...state,
+        pending: state.pending.map((p) =>
+          p.conversation === event.conversation && p.at <= event.at && !p.noticed ? { ...p, noticed: true } : p,
+        ),
         chat: [
           ...state.chat,
           {

@@ -77,7 +77,7 @@ export default function Chat({
         return;
       case "command":
         onCommand?.(c.command);
-        // A refused command keeps its text so it can be fixed.
+        // A usage error keeps its text so it can be fixed.
         if (c.command.name !== "error") setDraft("");
         return;
       case "send":

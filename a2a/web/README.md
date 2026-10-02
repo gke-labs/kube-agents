@@ -26,7 +26,7 @@ npm install --legacy-peer-deps && npm run dev
 # or pass it in the URL: /?ws=ws://localhost:9222&user=console&pass=...
 ```
 
-Type into the chat pane. A turn shows as pending and attaches in place once its submission shows up on TASKS; a `delegate` turn attaches to the stripped task the gateway submits. A stop word, a bare `/session` and `/session off` never become a task, so they show as sent at once and the gateway answers with a notice. A turn with no task after 30s gets a note saying so: status questions and refused turns get a gateway notice instead of a task, and if no notice came, the gateway may be slow or may have dropped it. After 10 minutes a pending turn stops waiting. `/help` lists the local commands, which are never published; any other slash line is sent.
+Type into the chat pane. A turn shows as pending and attaches in place once its submission shows up on TASKS; a `delegate` turn attaches to the stripped task the gateway submits. A stop word, a bare `/session`, `/session off` and `/session stop` never become a task, so they show as sent at once and the gateway answers with a notice. A turn with no task after 30s gets a note saying so: status questions and refused turns get a gateway notice instead of a task, and if no notice came, the gateway may be slow or may have dropped it. After 10 minutes a pending turn stops waiting. `/help` lists the local commands, which are never published; any other slash line is sent.
 
 The read-only view still works with `user=web` and the install's `web-password`. It has no input box.
 
