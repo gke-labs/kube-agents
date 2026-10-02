@@ -2878,9 +2878,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// supported write destination (see #2180/#2245 for making it root-owned in
 	// the image), so it is omitted here (#2284): write attempts naming
 	// /home/agent/... fail fast with "outside HERMES_WRITE_SAFE_ROOT" at the
-	// gateway's prefix check rather than writing to non-durable scratch space,
-	// and the denial message does not list /home/agent as an allowed write
-	// location. (Writes to `~` expand in the agent process against HOME under
+	// gateway's prefix check rather than writing to non-durable scratch space.
+	// (Writes to `~` expand in the agent process against HOME under
 	// /opt/data/home and are admitted under /opt/data).
 	// The value is written out rather than left to the image default so the policy is
 	// visible in the pod spec. It gives up no isolation: with backend: ssh the file
