@@ -103,14 +103,16 @@ sandbox wrote under a workspace root ran in the credential holder on the next
 floor nor the argument-level deny policy reached it. Separate Pods close it. There is no
 writable volume both sides mount — the one object both Pods project is the
 `<agent>-gitops-state` ConfigMap, read-only in each, a list of repository names rather
-than a filesystem either can write into — the broker owns the only checkout, and the
-skills that write to a forge hand it file content and a commit message rather than a
-directory.
+than a filesystem either can write into. And no skill that writes to a forge hands the
+broker a directory: the version-control verbs hand it a bundle of revisions, which it
+fetches into a scratch repository of its own, and `fleet-audit`, still on the older path,
+hands it file content and a commit message. A checkout the caller wrote is never a
+checkout the credential holder runs `git` in.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
-OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, and the
-`FEEDBACK_PROMPT_*` switch and delay —
+OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
+`FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or change what code runs; `safeSandboxEnvOverrides` in
@@ -137,16 +139,17 @@ resolver — and it does not close that path either. Adding a NetworkPolicy is m
 policies selecting one Pod are unioned and the API has no deny rule — and the gateway Pod
 is already selected for egress
 by the `<agent>-gateway-netpol` this same operator renders (unless
-`spec.networkPolicy.enabled: false` withholds it — on a Helm install the one shape where
-the allowlist stands alone and enforces; a Kustomize install's static
-`platform-agent-core-egress` still selects the same Pod), which permits the metadata
+`spec.networkPolicy.enabled: false` withholds it, the one shape where the allowlist
+stands alone and enforces), which permits the metadata
 path. So enabling the allowlist widens what the Pod may send and narrows nothing; it is
 an auditable object rather than a control until that gateway policy is narrowed. It would
 in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
-every caller with a `TokenReview` over an audience-bound projected token, and
+every caller of its credentialed listener with a `TokenReview` over an audience-bound
+projected token (the metrics-only listener, [Architecture](#architecture), serves counters
+and authenticates nobody), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds
@@ -203,7 +206,16 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. Envoy authenticates
+caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
+listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+set by the operator): it serves Prometheus counters whose label values are
+static enums and closed vocabularies, holds no route, credential or policy,
+answers at most sixteen connections at a time and cuts each off ten seconds
+after it opened whatever the peer sends (the credentialed handler shares the
+process, so a peer that reaches the port cannot spend its threads), and is
+the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
+namespace, where the managed-Prometheus collector runs, and to no other peer.
+Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
 pod, `kubeagents-credential-proxy` for the sandbox and
@@ -253,10 +265,12 @@ already have.
 
 They cannot go behind the proxy, because the sandbox is not the client — it is
 the server. `session_kv_server.py` runs in the sandbox and binds
-`127.0.0.1:8699`; its callers are the event watcher in `agent-api-auth`,
-the Platform MCP server, the `incident_context` plugin, and the gateway's
-kanban notifier, which keys a delivered triage report to the thread it went
-into. The key exists so
+`127.0.0.1:8699`; its callers are the event watcher and the drift detector in
+`agent-api-auth`, the Platform MCP server, the `incident_context` plugin, the
+gateway's kanban notifier, which keys a delivered triage report to the thread it
+went into, the chat adapter's scheduled-report relay, and the two findings
+scripts. Deliberately not stated as a total: the list has grown twice and a
+count is the part that goes stale first. The key exists so
 that the server can reject a request that did not come from one of them, which
 means the server has to hold it. The salt is read by the Chat Agent plugins,
 which also run in the sandbox, before any identity is written to disk; hashing
@@ -267,12 +281,13 @@ Deliberately _not_ `API_SERVER_KEY`: that value is the non-secret loopback
 sentinel `cluster-internal-trusted`, so reusing it here would authenticate
 nothing. Both keys are optional in the CRD, so a Secret without them yields
 containers without the variables rather than a pod that will not start. What
-that costs is worth stating precisely, because one of the three consequences is
-not a degradation: the `k8s-event-watcher` in `agent-api-auth`
+that costs is worth stating precisely, because two of the consequences are
+not degradations: the `k8s-event-watcher` in `agent-api-auth`
 authenticates to the Session KV server with `SESSION_KV_API_KEY` and treats an
 empty value as fatal, so it exits on every start and **no cluster events are
 watched at all** — silently, since the container stays Ready and no probe covers
-the watcher. The other two are degradations: the Session KV server refuses every
+the watcher. The drift detector, in the same container and on the same key,
+fails the same way and as quietly, where an install has enabled it. The rest are degradations: the Session KV server refuses every
 authenticated request with a 503 and says why, and identity hashing falls back
 to a per-process random salt with one warning.
 
@@ -321,8 +336,12 @@ including:
 - interactive TTY programs and password prompts;
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
-- background processes or commands that outlive the request; and
-- commands exceeding request, output, or timeout limits.
+- background processes or commands that outlive the request;
+- commands exceeding request, output, or timeout limits; and
+- more commands at once than the broker's concurrency cap admits
+  (`CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS`, 8 by default): a request waits
+  up to 60 seconds for a slot and is then refused with `503
+CREDENTIAL_PROXY_BUSY`.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -629,6 +648,15 @@ clone**, so the two defaults multiply out to about 2 GiB retained across eight
 open workspaces, by design. Size the node's ephemeral storage against the
 product, not against either number.
 
+The cap counts a list the runtime keeps in memory, so a worker that dies without
+closing its workspace would otherwise hold a slot until the pod restarts. Two
+things bound that. A workspace no verb has named for
+`CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
+the next `open`, and every tree a previous process left under the root is removed
+when the runtime starts. A refusal at the cap logs each holder's handle prefix,
+repository, caller label (the card or session id the client sends), age and idle
+time, so a full store is diagnosable from the runtime's log.
+
 The ceiling is also measured after the clone finishes, so it bounds what is
 _retained_ and not the peak: a repository far over the limit still lands on the
 disk before it is removed, and the only thing bounding that is the runtime's
@@ -636,10 +664,12 @@ per-invocation timeout. A shallow clone plus the ceiling would bound both and is
 the right follow-up; neither alone does.
 
 Separately, the content routes raise the request-body cap to twice the
-total-payload limit, and the listener is threaded with no connection cap, so peak
-heap is roughly concurrency times that figure. None of this is reachable from
-outside the Pod, but it is worth knowing before the flag is armed anywhere it
-matters.
+total-payload limit, and the listener is threaded with no connection cap, so
+peak heap on those routes is roughly concurrency times that figure: the bodies
+are read before any command runs, so the broker's command cap does not bound
+them, and the git these verbs run is serialised by the store's lock rather than
+counted against that cap. None of this is reachable from outside the Pod, but
+it is worth knowing before the flag is armed anywhere it matters.
 
 Every verb takes a lock for its whole duration. The handler is threaded, so two
 requests naming one handle genuinely interleave, and each verb is a read-then-act
@@ -693,10 +723,12 @@ because the sandbox never had a handle on the document that is opened.
 
 The same substitution is applied to a `--kubeconfig` flag in the argument
 vector, which `kubectl` prefers over the environment; covering only the
-environment would leave the flag as an equivalent path. `get-credentials` is
-handled as the one command permitted to author a kubeconfig: it writes into the
-broker's own directory, the result is filed under the context it selects, and the
-context name is what the caller gets back. The visible pin
+environment would leave the flag as an equivalent path. Shim and broker scan
+only up to the `--` where kubectl's own flags end. `get-credentials` is
+handled as the one command permitted to author a kubeconfig: gcloud writes into
+the broker's own directory, the result is filed under the context it selects, and
+the context name is what the caller gets back; the shim files the returned copy
+on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
@@ -723,6 +755,112 @@ Consequences:
   `SIGSEGV` on a deeply nested document, where the Python loader raises a
   catchable error. The input is chosen by the sandbox, so this is a
   denial-of-service boundary rather than a performance choice.
+- `gcloud container clusters get-credentials` runs against an isolated scratch
+  kubeconfig, and the result is filed under the context it names. It never writes
+  the broker's own base kubeconfig. That base file is where a request naming no
+  cluster resolves, and `bootstrap` sets its `current-context` — and its
+  default namespace — to the host cluster once at startup. Leaving it alone is
+  what keeps a context-less `kubectl` on the host cluster instead of following
+  whichever cluster was fetched last, pod-wide. A caller names a different
+  cluster in one of three ways, all resolved by the sandbox's shim
+  (`credential_proxy_client.py`) to the context name the broker regenerates from:
+  `KUBECONFIG` or `--kubeconfig` pointing at a per-target file, which keep
+  precedence; a `--context` that is a GKE context name, forwarded as that name;
+  or, later in the same command line, nothing at all — a context-less `kubectl`
+  run after a `get-credentials` that was given no `KUBECONFIG` destination, as
+  in `get-credentials seeded-a && kubectl get pods`, reaches that cluster, as
+  `gcloud` would on a workstation. The pin is keyed on the nearest shell
+  process above the `get-credentials` (its pid and start time), and a `kubectl`
+  finds it by the same walk, after first checking its own pid for the case
+  where bash exec'd it in the shell's place: both step over `timeout`, `xargs`
+  or a helper script and key only processes whose `/proc` command name is a
+  shell. So a `timeout 60 gcloud …`
+  fetch pins the line and replaces an earlier fetch's pin in it. sshd, which
+  outlives every command line on the Hermes connection, is never keyed, so no
+  pin outlives the line. sshd is pid 1 in the sandbox and the walk stops
+  there, so no shell above it can be keyed either. A pin counts only when it is
+  a regular file, not a link or a FIFO, owned by the uid reading it, so the hermes
+  principal, whose `HERMES_HOME` is the agent-owned `/opt/data`, is not steered
+  or stalled by a file the agent planted. The pin lasts one command line and
+  never becomes the pod's default: the next command and a resumed card have a
+  different shell and read the host cluster. A backgrounded subshell of two or more
+  commands, `( get-credentials a && … ) &`, pins that subshell alone, so
+  parallel fetches written that way do not race; bash execs a one-command
+  `( get-credentials a ) &`, so that fetch pins the line's own shell, as it
+  would without the parentheses. Other parallel fetches in one line also share
+  the line's pin, last writer wins: bare
+  `get-credentials a & get-credentials b &`, `xargs -P`, and `#!/bin/bash`
+  helper scripts run by path, whose command
+  name is the script's rather than a shell's. Parallel work that needs
+  different clusters exports `KUBECONFIG` per target. A fetch inside a forked
+  stage of several commands, `{ get-credentials a; … } | tee log` or `$( … )`,
+  pins that stage, and a `kubectl` after it reads the host. Bash also execs the last command of a bare
+  `bash -c`, so a helper script run there holds the shell's pid under its own
+  name and a `kubectl` it starts reads the host; the Hermes command wrapper
+  runs the command inside an `eval` that is not its last line, so this does
+  not arise there. A
+  `get-credentials` given no `KUBECONFIG` destination also asks for its file
+  back and lands it at
+  `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
+  and prints the `export KUBECONFIG=` and `--context` lines that reach that
+  cluster from later commands.
+- Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
+  so an unreachable control plane fails in seconds rather than holding a broker
+  worker for `kubectl`'s 300-second client default. Commands that are meant to
+  block are exempt and keep that default: `wait`, `rollout`, `delete`, the
+  interactive verbs (`exec`, `attach`, `debug`, `port-forward`, `proxy`),
+  `logs --follow`, anything watching with `-w`, and any command whose caller
+  supplied its own `--timeout` or `--request-timeout`.
+- The broker reads a command's output as it streams and keeps at most
+  `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` of each stream (8 MiB as the operator
+  deploys it); the rest is drained and dropped, so what a command prints past
+  the cap costs the broker nothing. The same bound applies to the decoded
+  text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
+  three-byte replacement character, cannot cost more than text does. At most
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
+  flight at once (8; the operator sets it, as it sets the output cap, and
+  reserves the name). A slot is held from admission until the response is on
+  the wire, because everything a request costs lives that long: a child
+  process plus about six times the output cap of transient copies in the
+  broker (the captured streams, their decoded text, the JSON body and its
+  encoding). The two caps together are therefore what the broker container's
+  memory limit is sized against, and they move with that limit in the
+  operator rather than through the CR. The exec and vcs routes hold a slot;
+  the vcs route reads its body, which may carry a bundle of tens of MiB, only
+  once admitted, while the exec route's body (at most 1 MiB) is read before.
+  The forge refresh (a short call to the minter), the content workspace's git
+  (serialised by the store's own lock) and the Cloud API relay (a bounded read
+  of its own) take none. A request that waits more than 60 seconds for a slot
+  is answered `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
+  `the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly`.
+  A long-running command holds its slot for as long as it runs, and a caller
+  that stops reading its response is given up on after 60 seconds so that it
+  cannot keep one.
+- An exec command whose caller disconnects while it runs is ended rather than
+  left to run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two
+  seconds later, to the whole process group it started. The same two-step end
+  applies at the deadline. On both the exec and vcs routes, a caller that
+  disconnects while queued for a slot is dropped without anything being
+  started; a vcs verb's own git commands, once started, run to completion
+  unwatched. Slots go in arrival order, so the caller refused after the wait
+  is the one that waited longest. Disconnecting means the peer closed for good
+  (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
+  half is still answered, and a broker spoken to over TCP, where a closed peer
+  and a half-closed one look alike, runs its commands unwatched.
+- All the commands one request runs share one deadline,
+  `CREDENTIAL_PROXY_TIMEOUT_SECONDS` (five minutes) counted from admission: a
+  vcs publish's several network git commands, and a first kubectl's
+  credential fetch (itself on the shorter kubectl deadline) followed by the
+  kubectl, are each capped to what is left of it. A vcs body must also arrive
+  within 60 seconds of admission. Envoy's stream idle timeout in front of the
+  runtime is twenty minutes: the broker writes nothing to a stream until the
+  request is answered, so the silent worst case is that deadline plus the
+  slot wait, the kill grace and its settle after `SIGKILL`, and the drain, a
+  little over six minutes at the defaults, and a silent request that reaches
+  its deadline is still answered
+  with its partial output and the timed-out notice rather than reset by Envoy
+  first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` keeps the
+  Envoy timeout above it plus the minute.
 
 ### Cloud API reads
 
@@ -873,6 +1011,14 @@ place holding cluster credentials, GCP tokens, and chat secrets, and everything 
 stdout leaves the cluster through Cloud Logging. The same rule covers the event watcher in the
 gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespace, pod, event
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
+
+The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
+the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+[observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
+as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
+mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
+command line out of the record by construction rather than by scrubbing. The `message` beside the
+mapping is the ordinary log text, and keeps to the identifier-over-value rule above.
 
 The exposure to watch when changing this code is **wrapped errors**, not deliberate logging. A
 failure from parsing a profile's `kubeconfig.yaml`, minting a token, or an API server rejecting a

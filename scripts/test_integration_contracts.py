@@ -90,16 +90,40 @@ class SpecToolRegistryTest(unittest.TestCase):
     """Every tool name in a verification spec exists in a live registry."""
 
     # Hermes-image built-in tools this repository references but does not
-    # define: the kanban pool. Evidence of each lives in the image patches
-    # (deploy/docker/patches/*kanban*); a name added here needs the same.
-    HERMES_BUILTIN_TOOLS = {
-        "kanban_create",
-        "kanban_list",
-        "kanban_show",
-        "kanban_complete",
-        "kanban_block",
-        "kanban_heartbeat",
+    # define: the kanban pool, and the skill writer the image gates. Evidence
+    # of each lives in the image patches that touch them, and only in its own
+    # family's files (HERMES_BUILTIN_EVIDENCE); a name added here needs the same.
+    HERMES_BUILTIN_EVIDENCE = {
+        "*kanban*": {
+            "kanban_create",
+            "kanban_list",
+            "kanban_show",
+            "kanban_complete",
+            "kanban_block",
+            "kanban_heartbeat",
+        },
+        "*skill_manage_image_owned*": {"skill_manage"},
     }
+    HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
+
+    # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
+    # as (server alias, tool): nothing in this repository can enumerate them,
+    # so a spec may name one only through this list, registered under both
+    # separator spellings like the local servers. Evidence of each lives in
+    # the personas or the skill references that tell the agent about the
+    # tool (test_the_remote_allowlist_still_has_evidence_in_the_agent_text);
+    # a name added here needs the same, and its alias must still be a
+    # remote-proxy server in some agent config.
+    REMOTE_MCP_TOOLS = {
+        # #1765: the 50-a-day Developer Knowledge method the personas forbid
+        # and knowledge-grounding-sources-probe's safeguard names.
+        ("developer_knowledge", "answer_query"),
+    }
+    REMOTE_TOOL_EVIDENCE = (
+        "agents/platform/SOUL.md",
+        "agents/cluster/SOUL.md",
+        "agents/platform/skills/gke-basics/references/mcp-usage.md",
+    )
 
     def _mcp_server_aliases(self):
         """Alias → the local server script it launches, from every agent config.
@@ -124,6 +148,30 @@ class SpecToolRegistryTest(unittest.TestCase):
                     if arg.endswith(".py"):
                         aliases[alias] = Path(arg).name
         return aliases
+
+    def _remote_mcp_aliases(self):
+        """Aliases whose server is the remote proxy, from every agent config."""
+        yaml = _yaml()
+        aliases = set()
+        configs = list((REPO_ROOT / "agents").glob("*/config.yaml"))
+        configs.append(REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml")
+        for config_path in configs:
+            if not config_path.exists():
+                continue
+            document = yaml.safe_load(config_path.read_text()) or {}
+            for alias, spec in (document.get("mcp_servers") or {}).items():
+                args = (spec or {}).get("args") or []
+                if any(str(arg).endswith("proxy.js") for arg in args):
+                    aliases.add(alias)
+        return aliases
+
+    def _remote_mcp_tools(self):
+        """REMOTE_MCP_TOOLS in the two namespaced spellings a trajectory carries."""
+        names = set()
+        for alias, tool in self.REMOTE_MCP_TOOLS:
+            names.add(f"mcp_{alias}_{tool}")
+            names.add(f"mcp__{alias}__{tool}")
+        return names
 
     def _registered_mcp_tools(self):
         """The tool names a trajectory can actually carry, not the bare ones.
@@ -200,7 +248,7 @@ class SpecToolRegistryTest(unittest.TestCase):
         return wanted
 
     def test_every_spec_tool_name_resolves_to_a_registry(self):
-        registry = self._registered_mcp_tools() | self.HERMES_BUILTIN_TOOLS
+        registry = self._registered_mcp_tools() | self._remote_mcp_tools() | self.HERMES_BUILTIN_TOOLS
         unresolved = [
             f"{path.parent.name}: {name}"
             for path, name in self._spec_tool_names()
@@ -213,17 +261,55 @@ class SpecToolRegistryTest(unittest.TestCase):
             "can never trip, which is a silent-green gate: " + ", ".join(unresolved),
         )
 
+    @staticmethod
+    def _names_builtin(name, corpus):
+        """Whether the corpus names the tool as a call or a quoted name.
+
+        A bare substring is not enough: `skill_manage` is part of the patch
+        module's own file name, which every file of that family imports. A
+        kanban tool also counts by its quoted action (`"create"`), the form
+        the kanban patches dispatch on.
+        """
+        root = name.removeprefix("kanban_")
+        forms = [f"{name}(", f"'{name}'", f'"{name}"']
+        if root != name:
+            forms += [f"'{root}'", f'"{root}"']
+        return any(form in corpus for form in forms)
+
     def test_the_builtin_allowlist_still_has_evidence_in_the_image_patches(self):
         patches = REPO_ROOT / "deploy" / "docker" / "patches"
+        for pattern, names in sorted(self.HERMES_BUILTIN_EVIDENCE.items()):
+            corpus = "\n".join(p.read_text(errors="replace") for p in patches.glob(pattern))
+            for name in sorted(names):
+                self.assertTrue(
+                    self._names_builtin(name, corpus),
+                    f"{name} is allowlisted as a hermes builtin but the {pattern} "
+                    "image patches carry no evidence of it — stale allowlist entry",
+                )
+
+    def test_builtin_evidence_is_a_call_or_a_quoted_name(self):
+        self.assertFalse(self._names_builtin("skill_manage", "from tools.skill_manage_image_owned import x"))
+        self.assertTrue(self._names_builtin("skill_manage", "raw = smt.skill_manage(**kwargs)"))
+        self.assertTrue(self._names_builtin("kanban_create", 'if action == "create":'))
+        self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
+
+
+    def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):
+        remote = self._remote_mcp_aliases()
         corpus = "\n".join(
-            p.read_text(errors="replace") for p in patches.glob("*kanban*")
+            (REPO_ROOT / rel).read_text(errors="replace") for rel in self.REMOTE_TOOL_EVIDENCE
         )
-        for name in sorted(self.HERMES_BUILTIN_TOOLS):
-            root = name.removeprefix("kanban_")
+        for alias, tool in sorted(self.REMOTE_MCP_TOOLS):
+            self.assertIn(
+                alias,
+                remote,
+                f"{alias} is allowlisted as a remote MCP server but no agent config "
+                "launches it through the remote proxy — stale allowlist entry",
+            )
             self.assertTrue(
-                name in corpus or f"'{root}'" in corpus or f'"{root}"' in corpus,
-                f"{name} is allowlisted as a hermes builtin but the image "
-                "patches carry no evidence of it — stale allowlist entry",
+                f"{alias}__{tool}" in corpus or f"`{tool}`" in corpus,
+                f"{alias}/{tool} is allowlisted as a remote MCP tool but the personas "
+                "and skill references carry no evidence of it — stale allowlist entry",
             )
 
 

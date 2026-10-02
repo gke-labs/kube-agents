@@ -83,7 +83,7 @@ model:
   provider: custom
   model: model-default
   default: model-default
-  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
   # The wire protocol a custom provider on this base_url resolves to anyway. Stated
   # explicitly to match the operator's managed render, where its purpose is to pin the
@@ -398,3 +398,11 @@ plugins:
     # The operator writes the deployed copy of this list; keep the two in sync
     # (k8s-operator/internal/controller/platformagent_manifests.go).
     - agent_roster
+
+# Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
+# prompt. Without it Hermes falls back to 20,000 whenever the model window is
+# unknown or reported small, and SOUL.md here is past that, so the middle of the
+# persona would be cut. Rationale lives in agents/platform/config.yaml, which pins
+# the same value. A key this file adds reaches an existing install through step
+# 2d's back-fill.
+context_file_max_chars: 100000

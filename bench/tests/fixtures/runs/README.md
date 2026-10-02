@@ -1,6 +1,6 @@
 # Captured run fixtures
 
-Five real devops-bench run directories, kept as captured but for one redaction
+Six real devops-bench run directories, kept as captured but for one redaction
 (below). #899 asks for exactly this — "capture a handful of real `results.json`
 records now and treat them as fixtures" — because the record's shape is not
 documented anywhere and guessing at it is how a scorer ends up keying on a
@@ -36,16 +36,18 @@ moves, which is the event that can change the schema.
 
 ## Provenance
 
-Captured 2026-08-24 against a live management-cluster install from a cloudtop
-runner, at `b35543c`, with devops-bench pinned at `4670d76`.
+The five api records were captured 2026-08-24 against a live management-cluster
+install from a cloudtop runner, at `b35543c`, with devops-bench pinned at
+`4670d76`; the inject record's provenance is in its own paragraph below the
+table.
 
 **One field is redacted.** `kanban_red_1`'s `output` was a 2,252-character
 agent report that had delegated to the platform agent and pasted back a fleet
 inventory — project name, cluster names, node counts, control-plane version,
 console links. It is replaced by a short placeholder. Nothing else in any of
-the five is altered.
+the six is altered.
 
-The redaction is safe because `output` is one of the 21 keys on the record that
+The redaction is safe because `output` is one of the keys on the record that
 no rung reads: the ladder reads `scores`, `status`, `trajectory`, `tokens`,
 `latency`, `verification_report` and `verification_parse_errors`, and nothing
 else (`bench-gate case` quotes `output`'s first 300 characters into the build
@@ -56,13 +58,36 @@ consistent with that record's `report-states-the-probe-title: fail`, and so
 `test_rung_3_ignores_an_empty_output` — which blanks `output` and asserts the
 case still greens — keeps testing a real transition instead of a no-op.
 
-| Directory        | `runId`                      | Task                 | Correctness | `OutcomeValidity` |
-| ---------------- | ---------------------------- | -------------------- | ----------- | ----------------- |
-| `kanban_red_1`   | `run_20260824_190758_251089` | `agent-kanban-smoke` | 0.5         | 0.9               |
-| `kanban_red_2`   | `run_20260824_191145_500787` | `agent-kanban-smoke` | 0.5         | 1.0               |
-| `kanban_red_3`   | `run_20260824_191325_408901` | `agent-kanban-smoke` | 0.5         | 0.2               |
-| `kanban_green_1` | `run_20260824_192134_593628` | local prompt variant | 1.0         | 1.0               |
-| `kanban_green_2` | `run_20260824_192454_771682` | local prompt variant | 1.0         | 1.0               |
+| Directory         | `runId`                            | Task                 | Correctness | `OutcomeValidity` |
+| ----------------- | ---------------------------------- | -------------------- | ----------- | ----------------- |
+| `kanban_red_1`    | `run_20260824_190758_251089`       | `agent-kanban-smoke` | 0.5         | 0.9               |
+| `kanban_red_2`    | `run_20260824_191145_500787`       | `agent-kanban-smoke` | 0.5         | 1.0               |
+| `kanban_red_3`    | `run_20260824_191325_408901`       | `agent-kanban-smoke` | 0.5         | 0.2               |
+| `kanban_green_1`  | `run_20260824_192134_593628`       | local prompt variant | 1.0         | 1.0               |
+| `kanban_green_2`  | `run_20260824_192454_771682`       | local prompt variant | 1.0         | 1.0               |
+| `kanban_inject_1` | build `2103530656385470464`, rep 1 | `agent-kanban-smoke` | 0.5         | --                |
+
+**The inject record is a different transport, captured a month later.**
+`kanban_inject_1` is repetition 1 of `agent-kanban-smoke` from the first
+presubmit matrix run under `spec.mode: next` through the A2A gateway's inject
+door (Prow build `2103530656385470464` on PR #2026, 2026-09-25; the
+measurement is on #2007). `results.json` only: that job's artifact set carries
+the per-repetition record and not the run directory's `manifest.json` or
+`rows.json`, so `load_run` reads it without a version key. Nothing in it is
+altered, `output` included: unlike `kanban_red_1`'s 2,252-character inventory
+this is a 458-character answer, and what it names — the three seeded clusters,
+the host cluster and the pool project — is the case's own planted contract,
+already in the repository (`bench/tf/fleet/`, `hack/ci-deploy.sh`); its first
+line is also the `Unknown toolsets` warning the measurement recorded on 34 of
+36 answers, which is worth keeping as captured. It is the shape the inject
+lane's tests need and no mutation of an
+api record can produce honestly: the trajectory is the transport's envelope
+(`inject.task`, `inject.post`, `inject.edit`, `a2a.status-update`) with no
+tool call in it, every token bucket is null, the answer names the three seeded
+clusters, and `the-kanban-card-was-actually-filed` is `fail` at
+`VerificationCorrectness: 0.5` with coverage 1.0 — the collapse #2039 is
+about. It carries no `OutcomeValidity`: the judge did not emit one for this
+run.
 
 **The three reds are the pre-#893 prompt.** At capture time
 `agent-kanban-smoke` asked the agent for the card's _id_ while its

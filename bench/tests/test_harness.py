@@ -315,7 +315,9 @@ def test_run_parses_agent_response(stub_agent: _StubAgentServer) -> None:
     # The session row replaces the envelope's counts wholesale. input is the
     # *non-cached* prompt per TOKEN_BUCKETS, so it is the row's 1076 and not
     # the envelope's cache-inclusive 60468. reasoning sits inside output, so
-    # the total leaves it out rather than billing the thinking twice.
+    # the total leaves it out rather than billing the thinking twice. This
+    # turn filed no card, so there is no ``workers`` key: that key, even as
+    # None, means the run delegated.
     assert result.tokens == {
         "input": 1076,
         "cached": 51200,
@@ -1889,6 +1891,45 @@ def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
     assert reads
 
 
+def test_a_ceiling_hit_keeps_the_stalled_cards_transcript_under_artifacts(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deadline path is the one that names stalled cards to ``_settle``."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0")
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    _board(monkeypatch, "running")
+    board_shell = harness._agent_shell
+
+    def _shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script and "head -c" in script:
+            return f"{harness._LOG_PRESENT} 1758579012 4096\nworker was here\n"
+        return board_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("running")]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.DELEGATION_CEILING_MARKER)
+    index = (tmp_path / "worker-logs" / "index.txt").read_text().splitlines()
+    assert index[1] == f"{_TASK_ID}\t1758579012\t4096\t{harness._LOG_PRESENT}"
+    assert (tmp_path / "worker-logs" / f"{_TASK_ID}.log").read_text() == "worker was here\n"
+
+
+def test_a_mute_agent_leaves_no_transcript_behind(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A wait the silent-turn ceiling ended did not stall, so nothing is dumped."""
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    stub_agent.turns = [_create_turn(), _turn(_text("I would rather not."))]
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert "reported no status" in result.errors[0]
+    assert not (tmp_path / "worker-logs").exists()
+
+
 def test_a_card_the_board_does_not_know_is_asked_of_the_agent(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2101,6 +2142,7 @@ def test_the_session_row_is_looked_up_once_after_the_last_turn(
         "reasoning": 1024,
         "output": 79,
         "total": 60547,
+        "workers": None,
     }
 
 
@@ -2124,6 +2166,93 @@ def test_reasoning_is_reported_but_not_added_to_the_total(
 
     assert inflated.tokens["reasoning"] == 4096
     assert inflated.tokens["total"] == baseline.tokens["total"]
+
+
+_WORKER_READ = {
+    "cards": [
+        {
+            "task": _TASK_ID,
+            "assignee": "platform",
+            "status": "done",
+            "runs": 1,
+            "children": [],
+            "sessions": [
+                {
+                    "id": "20260922_170000_ab12cd",
+                    "agent": "platform",
+                    "match": "worker_prompt",
+                    "calls": 0,
+                    "tokens": {
+                        "input_tokens": 1000,
+                        "output_tokens": 100,
+                        "cache_read_tokens": 2000,
+                        "cache_write_tokens": 0,
+                        "reasoning_tokens": 50,
+                    },
+                }
+            ],
+        }
+    ],
+    "calls": [],
+    "errors": [],
+    "truncated": False,
+}
+
+
+def test_the_workers_tokens_are_added_after_the_front_doors_row(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's buckets are router plus workers; each half stays readable on its own.
+
+    The order is the point: the session row replaces the envelopes wholesale,
+    so the workers have to land after it or be overwritten by it.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    reply = f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(_WORKER_READ)}"
+    monkeypatch.setattr(
+        harness,
+        "_agent_shell",
+        lambda script, timeout: reply if worker_trajectory.CAPTURE_PRESENT in script else "",
+    )
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    front_door = {
+        "input": 1076,
+        "cached": 51200,
+        "cache_write": 8192,
+        "reasoning": 1024,
+        "output": 79,
+        "total": 60547,
+    }
+    workers = {
+        "input": 1000,
+        "cached": 2000,
+        "cache_write": 0,
+        "reasoning": 50,
+        "output": 100,
+        "total": 3100,
+    }
+    assert result.tokens["front_door"] == front_door
+    assert result.tokens["workers"] == {
+        **workers,
+        "by_agent": {"platform": workers},
+        "unbilled": [],
+    }
+    assert {k: result.tokens[k] for k in front_door} == {
+        k: front_door[k] + workers[k] for k in front_door
+    }
+
+
+def test_a_run_whose_workers_could_not_be_billed_keeps_the_routers_totals() -> None:
+    """``workers: None`` is "delegated, unreadable": nothing is added and nothing moves."""
+    tokens: dict[str, Any] = {"input": 10, "output": 1, "total": 11, "workers": None}
+    harness._fold_worker_tokens(tokens)
+    assert tokens == {"input": 10, "output": 1, "total": 11, "workers": None}
+
+    undelegated: dict[str, Any] = {"input": 10, "output": 1, "total": 11}
+    harness._fold_worker_tokens(undelegated)
+    assert undelegated == {"input": 10, "output": 1, "total": 11}
 
 
 def test_a_transient_transport_failure_is_retried_not_abandoned(

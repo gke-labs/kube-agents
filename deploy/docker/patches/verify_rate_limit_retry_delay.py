@@ -54,7 +54,7 @@ HEADER_RETRY_AFTER_SECONDS = 7
 
 #: Where the storm's requests went, and what the agent called the model. Only
 #: ``compute_error_backoff``'s signature needs them; the values are inert.
-STORM_BASE_URL = "http://litellm/v1"
+STORM_BASE_URL = "http://inference-gateway/v1"
 STORM_MODEL = "gemini"
 
 GOOGLE_429_BODY = {

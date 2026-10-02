@@ -183,7 +183,7 @@ and says so below:
 - **Node-pool skew** (§3.2). Per pool, the target control plane's minor minus the pool's minor:
   more than 2, or a different major, blocks the control-plane upgrade until the pool moves
   (GKE keeps nodes within two minors of the control plane); exactly 2 is at the ceiling and
-  goes in the note. Autopilot members read `n/a`, as the SOP's `pool-skew` check does.
+  goes in the note. Autopilot members read `n/a`.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule could not be evaluated (the cluster read failed, there is no target,
@@ -213,8 +213,8 @@ error (exit 2).
   content workspaces as a shallow read-only clone, or, on an install whose broker is not armed
   for content-passing, through a leased checkout on the shared volume. That checkout is under
   a lease of the scan's own (`--lease` overrides it), so positioning it on the base branch
-  never resets the session's working tree, the one `submit-suggestion` `prepare` hands you to
-  edit. It runs no `gcloud` and writes to no repository. A repository the broker or git cannot
+  never resets a checkout another skill is working in -- `fleet-audit`'s remediation clone is
+  leased on its audit id on the same volume. It runs no `gcloud` and writes to no repository. A repository the broker or git cannot
   serve is listed under errors and sets exit code 1; the other repositories are still reported.
 - Removal data is `removed_apis.json` beside the script: Kubernetes 1.16 through 1.32, from the
   upstream Deprecated API Migration Guide, whose URL and `as_of` version the report prints. The

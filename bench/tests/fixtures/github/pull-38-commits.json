@@ -1,0 +1,22 @@
+[
+  {
+    "sha": "1da86d09b5b457d01c64e3a1d729124ac609411c",
+    "commit": {
+      "message": "Add PodDisruptionBudget for checkout-gateway in seeded-a",
+      "committer": {
+        "name": "kube-agents platform agent",
+        "date": "2026-09-25T00:39:50Z"
+      }
+    }
+  },
+  {
+    "sha": "0d7264e14d68865f5bcde8983e44ad0ecd42a979",
+    "commit": {
+      "message": "feat(fleet): add PDB for checkout-gateway",
+      "committer": {
+        "name": "kube-agents platform agent",
+        "date": "2026-09-25T17:42:45Z"
+      }
+    }
+  }
+]

@@ -21,6 +21,7 @@ other profiles, so the migration aborts and the model's files never arrive.
 
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -319,6 +320,28 @@ class SandboxEntrypointDatabaseTripwireTest(_SandboxEntrypointHarness):
         self.assertTrue(
             marker.is_file(),
             "step 1b tore down a tripwire it had already put there",
+        )
+
+
+class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
+    def test_forwarded_env_names_include_context_and_gke_variables(self) -> None:
+        """KUBE_CONTEXT_NAME and GKE_* variables must be forwarded to ssh sessions."""
+        content = _ENTRYPOINT.read_text()
+        match = re.search(r'SANDBOX_FORWARDED_ENV_NAMES=["\']([^"\']+)["\']', content)
+        self.assertIsNotNone(match, "SANDBOX_FORWARDED_ENV_NAMES definition not found")
+        assert match is not None
+        names = set(match.group(1).split())
+        required = {
+            "CREDENTIAL_PROXY_URL",
+            "CREDENTIAL_PROXY_TOKEN_FILE",
+            "KUBE_CONTEXT_NAME",
+            "GKE_PROJECT_ID",
+            "GKE_CLUSTER_NAME",
+            "GKE_LOCATION",
+        }
+        self.assertTrue(
+            required.issubset(names),
+            f"expected {required} to be subset of {names}",
         )
 
 

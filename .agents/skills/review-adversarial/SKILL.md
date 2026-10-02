@@ -218,15 +218,29 @@ cite the rule when it applies. Judge by whether a change serves the stated inten
 it is — a big diff that does one thing is in scope, and a three-line change that does a second
 thing is not.
 
-Read the pull request's **Self-Review** and **Testing** sections when there is a body. `AGENTS.md`
-is canonical for what each owes a reviewer — "What any reviewer reads first" for the Self-Review,
-and the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
-Testing; what this angle adds is that they are claims the tree can check: every path, script, or
-command the Testing section credits must exist and do what it is credited with, and a guard or test
-the description says covers a case must reach that case. A claim the diff does not support is the
-finding that page describes. One exception: on a preflight re-run of your own branch the Self-Review
-is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is not handed
-those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
+Read the pull request's **Self-Review** and **Testing** sections when there is a body, and on a
+`fix`-type pull request its **Bug Fix: Preventing Recurrence** section. `AGENTS.md` is canonical
+for what the first two owe a reviewer — "What any reviewer reads first" for the Self-Review, and
+the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
+Testing — and `pre_pr_review.md` for the third. What this angle adds is that they are claims
+the tree can check: every path, script, or command the Testing section credits must exist and do
+what it is credited with, and a guard or test the description says covers a case must reach that
+case. A claim the diff does not support is the finding "What any reviewer reads first" describes;
+a recurrence section left empty or answered "Not a bug fix" on a `fix` is the one
+`pre_pr_review.md` describes. One exception: on a preflight re-run of your own branch the
+Self-Review is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is
+not handed those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
+
+A section that hands a required artifact to another pull request has not answered, and no rule
+opens the route for either artifact it is usually tried on. "The PR that installs it carries the
+eval case" — `.agents/rules/eval_driven_development.md`, "What does not count", says the answer to
+a stack is merge order, so the sibling lands first and this pull request runs the loop against the
+`main` that includes it; where neither change is observable without the other, they are one change
+and belong in one pull request. "Live-tested in the next one" —
+`.agents/rules/pre_pr_review.md` gives exercising the change, or "Not live-tested" with the
+reason, and nothing else. The deferral is
+visible in the body alone, so raise it whether or not you can reach the sibling, and say which of
+those two is owed. Angle J follows the hand-off where `gh` is available.
 
 Then check that the intent is actually tested: for each behaviour the change claims, name the test
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
@@ -247,17 +261,30 @@ which it was. A red-then-green test is the one answer in this whole pass that do
 your own reading, which is what makes it worth more than any amount of staring at the diff.
 
 **Angle J — sibling pull requests.** Every angle so far has looked only at this change. Widen
-once, to the open pull requests touching adjacent paths:
+once, to the pull requests touching adjacent paths — the open ones, and any the body names:
 
 ```bash
 gh pr list --repo gke-labs/kube-agents --state open --limit 100 --json number,title,author,files
+# A sibling the body names may already have merged. Fetch it by number: `gh pr list --state merged`
+# orders by creation, so its limit reaches back days and can miss an old branch merged last week.
+gh pr view <number> --repo gke-labs/kube-agents --json number,title,state,files,body
 ```
 
-Three things come out of this that nothing else can see. A finding already accepted on a sibling
+Four things come out of this that nothing else can see. A finding already accepted on a sibling
 usually applies here unchanged — apply it rather than rediscovering it. A near-identical change
 that has diverged is itself a finding: name which copy carries the fix and which does not, because
-merge order then decides whether the fix survives. And where one change is a superset of another,
-say so — reviewing the subset in isolation spends effort on a diff that may never merge.
+merge order then decides whether the fix survives. Where one change is a superset of another,
+say so — reviewing the subset in isolation spends effort on a diff that may never merge. And where
+this body hands a required artifact to a sibling, open that sibling and see what it actually
+carries rather than reading the hand-off as a disposition. Neither artifact has a route, as Angle I
+says: for the eval case quote `.agents/rules/eval_driven_development.md`, "What does not count" —
+and where the sibling has already merged, its case is on `main`, so this pull request owed a red
+against it; for live validation quote `.agents/rules/pre_pr_review.md`, whose only alternative to
+exercising the change is "Not live-tested" and the reason, which no sibling's body supplies. Two
+bodies that each point at the other is the sharper form, because both merge and the artifact
+reaches `main` in neither. A hand-off points backwards as often as forwards, so fetch a named
+sibling that has already merged rather than concluding from the listing that there is none, and
+check that what it carries exercises this diff rather than only the sibling's own.
 
 For the cleanup, altitude, conventions, scope, and sibling candidates the `failure_scenario` states
 the concrete cost — what is duplicated, wasted, harder to maintain, out of scope, or which rule or

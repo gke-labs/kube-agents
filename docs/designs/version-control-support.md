@@ -1,15 +1,26 @@
 # Version control and issue tracking
 
 > **STATUS — design of record; the seam, the provider layer with GitHub behind
-> it, and the sandbox's own git are in; the consumer migration, the declarative
-> surface and the second forge are not.** On `main`, repository identity runs
+> it, the sandbox's own git, the consumer migration and the declarative surface
+> are in; the second forge is not.** On `main`, repository identity runs
 > through one parser (`repo_ref.py`); the broker serves the version-control verbs
 > over `/v1/vcs/*` from a forge-neutral `providers/` layer whose one implementation
 > is `providers/github/`; the `version-control` skill drives those verbs from a
-> sandbox that holds a credential-free git. Every shipped consumer still reaches
-> GitHub by name through `gh` and the credential shim, the CRD still knows only
-> `spec.integration.github`, and no second forge exists. This is the design for
-> driving any forge, and the order the rest has to happen in.
+> sandbox that holds a credential-free git; and the consumers reach the forge
+> through those verbs rather than by naming GitHub. Two things are deliberately
+> left behind by that migration and are not scheduling slips: `audit_report.py`
+> and the `fleet-audit` prose around it still shell `gh`, and
+> `inspect_repository.py` stays on the broker's content-workspace route rather
+> than moving to the verbs, because it reads repositories this install does not
+> manage and does it with a shallow clone — neither of which the verbs offer,
+> the second on purpose ([The seam](#3-the-seam)). Its fallback, `git clone`
+> through the sandbox's credential shim, is taken only against a broker that
+> does not serve that route, which no shipped install is; it goes when the shim
+> does. The CRD declares forges and repositories in `spec.integration.forges`
+> and `spec.integration.repositories` with only `github` registered, and no
+> second forge exists.
+> This is the design for driving any forge, and the order the rest has to
+> happen in.
 
 **Scope:** what it takes for a kube-agents install to read and change a
 repository, open and answer change proposals, and file and resolve issues on a
@@ -64,7 +75,7 @@ Writing costs it more turns than today's design does. Method and results in
 | The shared provider contract | `agents/platform/scripts/providers/`                                 |
 | Each provider                | `providers/github/`, `providers/gitlab/` — one directory each        |
 | Registration                 | `providers/registry.py` — the one shared file a new provider edits   |
-| The declarative surface      | `spec.integration.git` on the CR                                     |
+| The declarative surface      | `spec.integration.forges` and `.repositories` on the CR              |
 | The local git                | `/opt/vcs/libexec/git` in the sandbox image                          |
 
 ## How to read this document
@@ -116,38 +127,40 @@ repository lives on GitLab cannot use any of it.
 
 The coupling runs through five layers, each with a different owner and a different cost to unwind:
 
-1. **The consumers.** Six scripts call the forge's API to get work done. Three go through a
+1. **The consumers.** Six scripts call the forge's API to get work done. Three went through a
    provider abstraction — `pr_conversation.py`, `pr_triggers.py` and `github_scan_gate.py`, all on
-   `forge.py`; three shell `gh` directly — `resolver.py`, `submit_suggestion.py` and
+   `forge.py`; three shelled `gh` directly — `resolver.py`, `submit_suggestion.py` and
    `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
-   `inspect_repository.py`, reaches a repository rather than an API, and does it by running
-   `git clone` through the sandbox's credential shim. (`github_token_refresh.py` and
+   `inspect_repository.py`, reaches a repository rather than an API, and does it through the
+   broker's content-workspace route, which clones on the credential side and honours `--depth`.
+   (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.)
+   layer 3.) Five of the six are now on the verbs, and `forge.py` with them — it holds typed
+   values and three policy rules and no forge implementation. `audit_report.py` is the sixth and
+   has not moved. `inspect_repository.py` will not move: see the status banner.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
-   and the one least visible from any single file. Every Python assertion now runs through one
-   parser ([Repository identity](#repository-identity)); the Go one, which is also the CRD's
-   admission check, does not.
+   and the one least visible from any single file. Each language now runs its assertions through
+   one parser ([Repository identity](#repository-identity)): `repo_ref.py` in Python, and in Go
+   `repo_ref.go` behind the declared provider's `Resolve`, which is also the CRD's admission check.
 3. **The credential plane.** The sandbox may hold no token, so every forge call is brokered. The
    broker's executable allowlist, its refresh route, the git credential shape it writes, and the
    token-minting pipeline behind it are each written for GitHub specifically — as is the FQDN
    network policy that decides where the pod may reach at all.
-4. **The declarative surface.** `GitHubSpec` is the only forge integration in the CRD, its `org`
-   field takes GitHub's namespace grammar, the state ConfigMap the operator writes labels every
-   repository `github` by a constant, and the chart, installer and Terraform composition all carry
-   GitHub App inputs.
-5. **The prompts.** Four `SKILL.md` files instruct the model in `gh` spellings; seven governance
-   SOPs name `gh` to forbid it and call the artefact a pull request throughout.
+4. **The declarative surface.** The CRD declares forges and repositories in
+   `spec.integration.forges` and `spec.integration.repositories` and labels each state-ConfigMap
+   entry with its forge's provider, but the chart, installer and Terraform
+   composition all carry GitHub App inputs, and GitHub is the only provider registered.
+5. **The prompts.** Four `SKILL.md` files instructed the model in `gh` spellings; seven governance
+   SOPs name `gh` to forbid it and call the artefact a pull request throughout. Three of the four
+   are on the verbs; `fleet-audit/SKILL.md` and the seven SOPs are `audit_report.py`'s prose and
+   move when it does.
 
 Layers 1, 2 and 3 are worth changing whether or not a second forge ever arrives — each one removes a
 duplicated parser, a silent fallback, or a hardcoded host. Layer 2's half of that is done: the
 duplicated parser and `provider_for`'s silent fallback both went with the identity work. Layer 5 is
 only worth changing for a
-second forge, and layer 4 almost is: its one standalone defect is that the CR silently rewrites a
-host-like shorthand such as `gitlab.com/project` into a GitHub URL it invents
-([Repository identity](#repository-identity)), which is worth fixing on its own but does not need any
-of this. That split says what is worth doing. It does not say in what order, and neither does the
+second forge, and so is what remains of layer 4. That split says what is worth doing. It does not say in what order, and neither does the
 rest of this document — with one exception that is a property of the design rather than of a
 schedule: the provider discriminator crosses a process boundary, so the Python reader has to accept
 it before the Go writer emits it, or a valid CR reconciles successfully and is then rejected inside
@@ -199,15 +212,19 @@ transport rather than the reason for the work.
 
 Two things exist and do not need designing again.
 
-**The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` as seven
+**The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` as eight
 operations, normalises three GitHub-isms behind them (`can_write` as a boolean rather than
 `author_association`, `supports_acknowledge` as a capability rather than an assumption,
-`normalise_login` folding the spellings one account gets), and funnels every provider call through
-one `_call()` override point. `pr-comment-conversation.md` §3 explains each of those and why live
-validation forced two of them; this document does not restate it.
+`normalise_login` folding the spellings one account gets), and funnels every call through one
+`call()`. `pr-comment-conversation.md` §3 explains each of those and why live validation forced two
+of them; this document does not restate it.
 
-**Provider selection.** `PROVIDERS` is a host-keyed table and `provider_for` reads it. Adding a
-forge is a registration rather than a branch in a sweep.
+**Provider selection.** There is one implementation of that protocol and it serves every forge:
+each of its eight operations is a version-control verb, and which forge answers is decided from the
+repository on the credential side by `providers/registry.py`. Adding a forge is a registration
+there rather than a branch in a sweep — and, as [One provider implementation, not
+two](#one-provider-implementation-not-two) argues, a second host table on the agent side would be a
+second place to register it and a second answer to give the third forge.
 
 A third is half-built, and the missing half is the one this design turns on. **A place to record
 which forge a repository belongs to now exists.** The `managed_repos` state ConfigMap carries a list
@@ -223,15 +240,17 @@ repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry there
 reconciliation intact and reaches the agent — where `get_managed_github_repos()` keeps the `github`
 entries and returns bare slugs. It logs the ones it skips rather than dropping them in silence, so a
 repository an administrator registered is visible as unsupported instead of indistinguishable from
-one that was never registered; it is still skipped, because there is one provider to skip it in
-favour of. The `pr_comments` sweep then calls `forge.provider_for()` with no argument at all, having
-just discovered its repositories through that function, so it gets `GitHubProvider` from the default
-rather than from the data.
+one that was never registered; it is still skipped, and the discriminator the administrator wrote
+is discarded at the point of that skip.
 
-`provider_for` takes a repository and parses its host, so a host the table does not know is a
-rejection rather than a silent fallback — [Repository identity](#repository-identity) covers how.
-What is still missing is the other direction: the entry's declared `type` reaching the selection at
-all. That needs a second provider to select, and lands with one.
+Nothing downstream of it needs the discriminator. The sweep calls `forge.provider_for()` and gets
+the one provider there is, and the host each repository is on is re-read from the repository itself
+when a verb reaches the broker. So the missing half is upstream: `get_managed_github_repos()`
+keeping entries whose `type` is not `github`, and returning a value that still names the host it
+came from. A repository value that names no repository at all is refused before a round trip is
+spent on it, and a host no forge module serves is the broker's refusal, reported to an operator as
+`FORGE_HOST_UNSUPPORTED` — [Repository identity](#repository-identity) covers the parse behind
+both.
 
 ### How this compares to what we have
 
@@ -366,52 +385,34 @@ sidecar validates across a trust boundary and must not pull in a module that she
   it had quietly trimmed would be answering about a string nobody holds.
 - `forge._parse_repo` was the sixth. #504 removed the `SETTINGS.md` path that called it, so it is
   deleted rather than converted; `provider_for` calls `repo_ref.parse` directly.
-- `CleanRepoSlugWithOrg` in the operator is the Go one, and is unchanged: it strips the scheme and a
-  `user@` prefix, then — for an SCP `host:path` or a `host/owner/repo` form — rejects any host that
-  is not `github.com` or `www.github.com`, and requires exactly one slash in what is left.
-  `ValidateGitRepoURLWithOrg` — the CRD's admission check — is a call to it, so admission and
-  normalisation are one rule. [The declarative surface](#6-the-declarative-surface) owns moving it.
+- `CleanRepoSlugWithOrg` in the operator was the Go one. It is now a deprecated wrapper over the
+  GitHub provider's resolution: `repo_ref.go` parses the value with its host kept, and the
+  provider refuses any host that is not one of its spellings — `github.com`, `www.github.com`,
+  `ssh.github.com` — before its two-segment rule runs. `ValidateGitRepoURLWithOrg`, no longer on
+  the admission path, goes through the same `Resolve`, so it and normalisation are still one
+  rule, now a provider's.
 
 The regex behind the bare-slug form used to be copy-pasted under its own name into `forge.py`,
 `gitops_workspace.py`, `resolver.py`, `pr_conversation.py`, `audit_report.py` and
 `submit_suggestion.py`, two of the copies already dead. All of them are gone.
 
 GitLab projects live at arbitrary depth — `group/subgroup/project` is ordinary, not exotic. The
-parser now carries one; what refuses it is the GitHub provider's two-segment rule, at the points
-where GitHub is the provider, and the operator's Go rule at admission. The difference is that the
+parser now carries one; what refuses it is the GitHub provider's two-segment rule, in Python and
+in Go alike, at the points where GitHub is the provider. The difference is that the
 refusal is a provider's, and states a reason, instead of being an invariant of the whole stack
 expressed in four dialects.
 
-**The one non-GitHub input that is not refused.** `CleanRepoSlugWithOrg` has two host checks, and
-both fire only when a host is syntactically identifiable: the SCP branch when the value contains a
-`:`, and the `host/owner/repo` branch when it holds more than one slash. Either rejects anything that
-is not `github.com` or `www.github.com`. A shorthand with exactly one slash goes through neither, and
-its first segment is then validated only as a slug component — a character class that permits dots.
-
-So `gitlab.com/project` is admitted, and `CleanRepoURLWithOrg`, which prefixes a literal
-`https://github.com/` to any shorthand, writes it into the state ConfigMap as
-`{"type": "github", "url": "https://github.com/gitlab.com/project"}`. The repository is not
-rejected; it is rewritten into a GitHub one and labelled `github` by the operator itself. Every
-reader downstream then behaves correctly, on a repository the operator invented.
-`evil.example/repo` takes the same path for the same reason, so this is a shape defect rather than
-anything specific to GitLab. This is the layer-4 defect
-[Where GitHub is named today](#where-github-is-named-today) says is worth fixing on its own.
-
-What is **not** admitted is the form GitLab's clone button actually hands you.
-`git@gitlab.com:group/project` reaches the SCP branch, which reads `gitlab.com` as the host and
-returns `unsupported host "gitlab.com" for GitHub repository`; `common_types_test.go` asserts exactly
-that, for the SCP and the `https://gitlab.com/...` forms both. GitLab is refused at admission today.
-That is worth stating precisely, because it inverts the obvious reading: admitting
-`spec.integration.git` for GitLab is **relaxing an existing host check under provider dispatch**, not
-adding a host check where a host-blind shape check stood.
+A GitLab remote in any spelling is refused at admission, by the GitHub provider's host check,
+because GitHub is the only provider registered. That inverts the obvious reading: admitting a
+GitLab forge in `spec.integration.forges` is **relaxing an existing host check under provider dispatch**,
+not adding a host check where a host-blind shape check stood.
 
 **What remains.** The Python side has one parser and one set of rules, and the host survives the
 parse instead of being discarded before the slashes are counted. What it does not yet have is
 `RepoRef` as the currency between modules: every caller parses at its own boundary and hands on a
 string, so the ref is a local variable rather than something passed. Making it the parameter type
 travels with [the consumer migration](#the-protocol-past-its-first-feature), alongside the callers
-that would carry it. Two other things are outstanding: the Go rule above, which
-[the declarative surface](#6-the-declarative-surface) moves, and the entry's declared `type`
+that would carry it. One other thing is outstanding: the entry's declared `type`
 reaching provider selection, which [What already generalises](#what-already-generalises) describes
 and which needs a second provider before it selects anything.
 
@@ -425,10 +426,7 @@ admission, each by the explicit host check rather than by any slash count. The h
 deferred, "decide separately whether `ValidateGitRepoURL` should reject a non-GitHub host at
 admission", has been decided the same way: it does reject one.
 
-So #1085 is closed on both halves, and the residue is not the one the issue was about. What the same
-code path still costs is the single-slash rewrite in the paragraph above — an invented GitHub
-repository rather than a confused host — which no host check catches because there is no host in the
-input to check.
+So #1085 is closed on both halves.
 
 **A latent defect this removed.** `provider_for` used to have two ways of choosing wrong. It
 selected by asking whether any key of the host table appeared anywhere in the repository string — a
@@ -441,22 +439,26 @@ host table was reached only from tests.
 
 That was sound while there is one provider and a bare slug means GitHub. It stops being sound at
 the second, because the table becomes load-bearing at exactly the moment a caller starts passing
-hosts — and [the consumer migration](#the-protocol-past-its-first-feature) is about to add three
-callers that resolve repositories their own way. So selection parses the host now, an unparseable
-repository raises `RepoUnparseable`, and a host the table does not know raises `UnknownForgeHost`
-with a reason code, the way every other unresolvable input in this stack does. A repository with no
-host still selects GitHub, which is what the shorthand means until
-[the declarative surface](#6-the-declarative-surface) gives the CR somewhere else to point.
+hosts — and [the consumer migration](#the-protocol-past-its-first-feature) adds three callers that
+resolve repositories their own way. The answer is not a better table on this side: there is no host
+table on this side at all. `provider_for` parses the repository and refuses one nobody can read
+(`RepoUnparseable`, reason `GIT_REPO_UNPARSEABLE`), and then hands every readable one to the broker.
+Which forge serves a host is the broker's answer, and a host no forge module there serves comes back
+as `UnknownForgeHost`. One of the two ends had to be the one that knows; a table here would be a
+second answer for the third forge to disagree with. A repository with no host still means GitHub,
+which is what the shorthand means until [the declarative surface](#6-the-declarative-surface) gives
+the CR somewhere else to point.
 
 ### The vocabulary in prompts and procedures
 
 Two kinds of prompt name the forge, and they need different work.
 
-Four `SKILL.md` files instruct the model in `gh` spellings and call the artefact a pull request:
+Four `SKILL.md` files instructed the model in `gh` spellings and called the artefact a pull request:
 `fleet-audit`, `pr-conversation` and `submit-suggestion` under `agents/platform/skills/`, and
 `gke-stockout-investigator` under `agentplugins/`, which reaches an install through the
 `AgentPlugin` CRD rather than through the agent image and so is easy to miss. These want the command
-behind a wrapper and the noun taken from configuration.
+behind a wrapper and the noun taken from configuration. Three are done; `fleet-audit` is the one
+still written in `gh`, and it travels with `audit_report.py` for the reason the banner gives.
 
 The seven governance SOPs name `gh` only to forbid it — "never run `gh issue create`", "the helper
 owns every `git`/`gh` operation" — because `audit_report.py` owns their write path. A prohibition has
@@ -540,11 +542,21 @@ the target is. The client, which alone knows which branch its copy was cloned
 from, refuses to publish that branch under any target, and tells the broker
 which branch that was (`clonedFrom`) so the broker refuses it too,
 `CLONED_BRANCH` — defence in depth for a confused caller, since a client that
-lied would gain nothing it could not get by omitting the field. In addition to
+lied would gain nothing it could not get by omitting the field. `advance` is
+the one waiver of that last refusal, for the copy that was cloned _of_ a
+proposal branch in order to add a round to it, and the broker does not take it
+on the caller's word alone: it asks the forge for an open proposal whose source
+is that branch and refuses without one. That is a bar rather than a proof — the
+same caller can open a proposal with `proposal-create` first — but the bar is a
+pull request under the install's own name, visible on the forge, and the
+default-branch and protected-branch refusals do not depend on it. In addition to
 the remote's default branch, the broker enforces protected branch policy on
 `/v1/vcs/publish`: `main`, `master`, `production`, any operator-configured base
 override (`CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH`), and any `run/**`
 branch are strictly refused without a pull request (`PROTECTED_BRANCH`, status 409).
+`/v1/vcs/branch-delete` refuses to remove any of them, whatever proposals exist:
+outside `platform-agent/` as `BRANCH_NOT_OURS`, inside it (a default branch or
+base override under the prefix) as `PROTECTED_BRANCH`.
 Across the broker's other write doors, protected branch policy is enforced under
 their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
 with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
@@ -773,20 +785,106 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
-| Verb                                 | Request                                                    | Response                                              |
-| ------------------------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |
-| `capabilities`                       | `{repository}`                                             | `{forge, repo, proposalNoun, verbs, missing}`         |
-| `clone`                              | `{repository, branch?}`                                    | `{forge, repo, branch, revision, size, bundleBase64}` |
-| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64}` | `{forge, repo, branch, revision}`                     |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`       | `{proposal}`                                          |
-| `proposal-list` / `issue-list`       | `{repository, state?, limit?, labels?}`                    | `{proposals\|issues, count, truncated}`               |
-| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?}`                   | `{proposal\|issue, comments?, diff?}`                 |
-| `proposal-comment` / `issue-comment` | `{repository, number, body}`                               | `{comment}`                                           |
-| `issue-create`                       | `{repository, title, body?, labels?}`                      | `{issue}`                                             |
+| Verb                                 | Request                                                              | Response                                                                 |
+| ------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing}`               |
+| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64}`                    |
+| `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                        |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                             |
+| `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                          |
+| `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                             |
+| `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}` |
+| `proposal-comment` / `issue-comment` | `{repository, number, body}`                                         | `{comment}`                                                              |
+| `issue-create`                       | `{repository, title, body?, labels?}`                                | `{issue}`                                                                |
+| `proposal-update` / `issue-update`   | `{repository, number, title?, body?, labelsAdd?, labelsRemove?}`     | `{proposal\|issue}`                                                      |
+| `proposal-close` / `issue-close`     | `{repository, number}` / `{repository, number, reason?}`             | `{proposal\|issue}`                                                      |
+| `proposal-commits`                   | `{repository, number, limit?, page?}`                                | `{commits, count, truncated}`                                            |
+| `proposal-acknowledge`               | `{repository, number, comment: {id, kind}}`                          | `{acknowledged}`                                                         |
+| `label-ensure`                       | `{repository, name, color?, description?}`                           | `{label}`                                                                |
+| `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                 |
+| `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                     |
+| `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                    |
+
+The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
+what the shipped consumers do to a forge — edit and close what they opened, read
+a proposal's commits, acknowledge a comment, keep a label in existence, ask who
+the credential is and whether a login may write — decided by the callers rather
+than by any forge's API surface, as [the migration](#the-protocol-past-its-first-feature)
+requires. `issue-list`'s `query?` is free text each forge composes into
+its own search grammar, and its `excludeLabels?` is what a sweep that must skip
+its own claim marker asks with. `proposal-list` filters on the branches instead
+— `source?` and `target?` — because "is there already a proposal for this
+branch" is the question every write flow opens with. A comment carries `id` and
+`kind` (`issue`, `review_comment`, `review`) because a proposal's discussion
+spans three places on GitHub and the kind decides whether it can be
+acknowledged; `capabilities` answers `acknowledge` for whether the forge
+supports it at all. A comment also carries `bot`, which is the forge's own
+answer to whether the author is an automation — not the login's spelling, which
+is normalised before a caller ever sees it, and which is what keeps two agents
+from answering each other forever. Where a view reads comments it says how many
+it read (`commentCount`) and whether there were more (`commentsTruncated`): a
+conversation read short and reported as whole is a decision made on half the
+thread. `identity` is a broker verb
+rather than a forge verb because half of it is a property of how the call is
+authenticated — a CLI reads its login out of its credential store, an HTTP
+client asks the current-user route — and the other half, `canWrite`, is the
+forge's normalised answer to a question every forge spells differently.
+
+`branch-view` and `branch-delete` exist because a branch name outlives its
+proposal. A squash merge or a close leaves the source branch on the remote at a
+revision the base does not contain — on GitHub by default, and on somebody
+else's repository not a setting this install controls — so a branch cut afresh
+under the same name does not build on it and its publish is refused as
+`BRANCH_DIVERGED`. Every flow that derives a branch name from what it is fixing
+(one name per workload, so a repeat alert finds the earlier pull request) meets
+this on its second run. `branch-view` answers whether the remote holds the
+branch and at what revision; `branch-delete` removes a spent one. Both are broker
+verbs — the question is `ls-remote` and the delete is a push, identical on every
+forge — but the delete's gate needs `proposal-list`, so a forge without it does
+not list `branch-delete` in `capabilities` and is refused `FORGE_UNSUPPORTED`. The skill spells them `remote-branch view|delete`,
+because `branch` is already the local verb.
+
+The delete is held to exactly that one case. The branch must be under the
+install's own prefix (`BRANCH_NOT_OURS` otherwise); it must not be protected, by
+the rule `publish` applies (`PROTECTED_BRANCH`); no proposal from it may be open
+(`OPEN_PROPOSAL`), and no open proposal may target it, since deleting a
+proposal's target closes it (`BRANCH_NOT_OURS`); and its tip must be the revision some merged or closed
+proposal from it carried (`NOT_SPENT`), so a branch that moved on after its
+proposal closed keeps the revisions no proposal holds. The comparison is sound
+only because GitHub freezes that revision when the proposal closes rather than
+following the branch; a forge whose closed proposals keep tracking their branch
+cannot serve `branch-delete` until it reports the revision at close. The prefix is a convention anyone who can push
+can use, so the proposal that carried the tip must also be this install's —
+opened from this repository by the credential's own login — and no proposal
+from it may be anybody else's, or the delete is `BRANCH_NOT_OURS` too — a
+history that fills the one page the broker reads (the largest one call
+returns) included, since that page cannot show the rest; a
+credential that cannot name itself leaves the prefix and the same-repository
+rule as the bar, as it does for `advance`. That bar holds against a mistake,
+not against the caller itself, which can open and close a proposal on a branch
+with `proposal-create` to make its tip carried. It still cannot lose work that
+way: the revision stays reachable from the proposal it opened, and a branch a
+person proposed from stays refused. `revision` is the tip the
+caller read, and the push is conditional on it: a sibling that published to the
+name in between wins, and the delete is refused `BRANCH_MOVED`. A branch already
+gone is answered `deleted: false`, not refused — the caller wanted it gone.
+A remote that answers the delete with a refusal of its own — a branch rule or
+hook, or a credential without the right — is `DELETE_REFUSED`, not
+`GIT_FAILED`: it answers every attempt alike, so the name is not usable and a
+retry is pointless.
+The gate does not know which flow kept a branch on purpose: fleet-audit leaves a
+closed remediation pull request's branch in place so the fix can be proposed
+again on it, and that branch passes every check above. Keeping it is that skill's
+instruction, not the broker's refusal.
+`submit-suggestion prepare` makes this call itself whenever a spent proposal's
+tip is not in the fresh copy, so no caller has to know which setting the
+repository has.
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
-`TARGET_IS_BRANCH`, `CLONED_BRANCH` and `PROTECTED_BRANCH`, 502 `GIT_FAILED`.
+`TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `BRANCH_NOT_OURS`,
+`OPEN_PROPOSAL`, `BRANCH_MOVED`, `NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
 is written for the reader it has. That reader is a model choosing its next tool
@@ -894,10 +992,11 @@ without a binary to carry it.
 
 What this does not remove is the dependency elsewhere. `gh` stays on the
 broker's executable allowlist, because the GitHub module uses `gh api` as an
-authenticated HTTP client, and these still name it from outside the sandbox: the
-seven governance SOPs under `agents/platform/governance/`, `forge.py`, the
-`fleet-audit`, `github-issue-resolver`, `pr-conversation` and `submit-suggestion`
-skills. Each is a port, not a rewrite. `forge.py` is the load-bearing one: it is
+authenticated HTTP client. When this was written six things still named it from
+outside the sandbox: the seven governance SOPs under
+`agents/platform/governance/`, `forge.py`, and the `fleet-audit`,
+`github-issue-resolver`, `pr-conversation` and `submit-suggestion` skills. Each
+is a port, not a rewrite. `forge.py` was the load-bearing one: it is
 already a provider seam of its own, it is what the four skills call, and
 [One implementation, not two](#one-provider-implementation-not-two) is the decision that
 it converges with `providers/` rather than becoming a second copy of it. Until
@@ -927,18 +1026,18 @@ than something the broker decides on the forge's behalf, and
 [Modularity](#5-modularity) is why the boundary they draw holds at the third
 forge.
 
-| Member               | What it decides                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------ |
-| `hosts`              | which hostnames are this forge's; also what the credential allowlist is built from   |
-| `parse(url)`         | the repository a URL names, and the only validator of that repository's shape        |
-| `clone_url(repo)`    | the URL to clone, composed from validated segments                                   |
-| `capabilities(repo)` | what this install can do here, without spending a credential or touching the network |
-| `verbs`              | which of the eight collaboration verbs this forge serves                             |
-| `credential`         | the acquisition strategy, the API header and the git config — one object             |
-| `transport`          | which transport the broker builds for it: `"cli"` or `"http"`                        |
-| `for_config(config)` | how many instances of this forge this install has: 0, 1, or n                        |
-| the eight verbs      | each describes a request and translates the response                                 |
-| `error_overrides`    | the few statuses whose shared guidance this forge disagrees with                     |
+| Member                  | What it decides                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| `hosts`                 | which hostnames are this forge's; also what the credential allowlist is built from   |
+| `parse(url)`            | the repository a URL names, and the only validator of that repository's shape        |
+| `clone_url(repo)`       | the URL to clone, composed from validated segments                                   |
+| `capabilities(repo)`    | what this install can do here, without spending a credential or touching the network |
+| `verbs`                 | which of the collaboration verbs this forge serves                                   |
+| `credential`            | the acquisition strategy, the API header and the git config — one object             |
+| `transport`             | which transport the broker builds for it: `"cli"` or `"http"`                        |
+| `for_config(config)`    | how many instances of this forge this install has: 0, 1, or n                        |
+| the collaboration verbs | each describes a request and translates the response                                 |
+| `error_overrides`       | the few statuses whose shared guidance this forge disagrees with                     |
 
 Three of these are the modularity requirement rather than GitLab. `for_config` is
 what lets `registry.py` stay ignorant of any particular forge. `credential` is
@@ -1176,15 +1275,23 @@ choice of transport rather than a special case.
 
 **Egress.** A pod that cannot resolve the host makes no calls, so the FQDN
 network policy is part of the credential plane whether or not it looks like it.
-The allowed hosts derive from the configured forges, in both places the policy is
+The allowed forge hosts derive from the declared forge where the policy is
 written: the operator renders it in
-`k8s-operator/internal/controller/platformagent_manifests.go`, which is what a
-real install gets, and `deploy/kustomize/gke-dataplane-v2/fqdn-networkpolicy.yaml`
-carries the dev path. Both have to derive it, because changing only the kustomize
-copy leaves every shipped install unable to reach the forge it was configured
-for. This is also the clearest case for deriving rather than listing: a
+`k8s-operator/internal/controller/platformagent_manifests.go`, and no static copy
+of it ships. This is also the clearest case for deriving rather than listing: a
 self-managed GitLab is at a customer-chosen hostname, so no literal in this
-repository could ever have covered it.
+repository could ever have covered it. GitHub's hosts stay in the list whatever
+is declared, because a repository can be registered in the state ConfigMap
+without being declared, and an invalid declaration should be fixed through
+admission rather than by a pod that silently loses its forge.
+
+What the derived policy protects is the **gateway** pod — the one it selects.
+It does not reach the broker, which is the pod that actually calls the forge:
+the broker's egress is open, and the sandbox is confined to DNS and the broker
+by a policy of its own. So derivation keeps the gateway's allowlist correct for
+any forge; it does not narrow where a brokered call may go. Whether the broker
+should get an FQDN policy of its own is open — see
+[Open questions](#11-open-questions).
 
 ### The request is a request, not argv
 
@@ -1250,9 +1357,9 @@ the cost side:
 
 - **The broker process makes direct outbound HTTPS**, where its other network
   I/O is in subprocesses. At the NetworkPolicy layer nothing changes — egress is
-  per pod, and `git clone` already leaves that pod for the same host — but the
-  egress policy needs the GitLab host, and for self-managed that host is
-  customer-chosen and cannot be a literal in the repository. See
+  per pod, and `git clone` already leaves that pod for the same host. The
+  gateway's FQDN policy picks up a self-managed host from the declaration; the
+  broker's own egress is open, and whether to narrow it is in
   [Open questions](#11-open-questions).
 - **Timeouts and output caps are not inherited.** A subprocess runner enforces
   both for the CLI path. `HttpTransport` has to enforce them itself, and a test
@@ -1340,7 +1447,9 @@ before this one is read as arriving on empty ground.
 `agents/platform/scripts/forge.py` is agent-side: a `ForgeProvider` protocol of
 seven read operations, a `GitHubProvider` shelling `gh` behind it, and typed
 `PullRequest` / `Comment` / `Commit` values. It exists to serve one feature — the
-pull-request review conversation — and it stops where that feature stops.
+pull-request review conversation — and it stops where that feature stops. That
+is the state this section argues against; what it now holds is the outcome of
+the argument, one `BrokerProvider` over the verbs.
 
 The broker described here needs the same furniture on its own side of the
 credential boundary: a provider protocol, a GitHub implementation, a host
@@ -1366,7 +1475,7 @@ superset of the other:
 
 The union is roughly thirty methods, which is unimplementable without `verbs` and
 `ForgeUnsupported` to make partial support a first-class answer — and the eight
-broker verbs are too narrow to serve the skills. Neither can simply absorb the
+verbs the skill started with were too narrow to serve the other consumers. Neither can simply absorb the
 other, which is why the shape above is designed rather than inherited from
 whichever side happened to be written first.
 
@@ -1380,10 +1489,12 @@ Restructuring afterwards is the work nobody schedules, and a second GitHub
 implementation is far harder to remove once merged than to not write.
 
 The constraint is deliberately narrow: it says where the code lands, not what
-order it is written in. `forge.py`'s two current consumers keep working untouched
-until they are migrated, so neither the abstraction nor the migration blocks the
+order it is written in. `forge.py`'s two consumers kept working untouched until
+they were migrated, so neither the abstraction nor the migration blocked the
 other. The state worth preventing is the third one, where two GitHub
-implementations arrive independently and each acquires consumers.
+implementations arrive independently and each acquires consumers. That is what
+the sequencing bought: `forge.py` now holds no implementation to be the second
+of.
 
 ### The protocol past its first feature
 
@@ -1395,13 +1506,12 @@ sites. A second forge implemented against `forge.py` alone therefore buys a revi
 and no issue resolution, no audit ledger, and no way to open a change.
 
 Migrating those three onto the provider is the step that makes a forge a class rather than four
-rewrites. It is anticipated rather than planned:
+rewrites. It was anticipated rather than planned:
 [`pr-comment-conversation.md`](pr-comment-conversation.md) §7 names `resolver.py` as the module's
-obvious next consumer while holding the migration itself out of scope. Half of that has since
-happened by another route — `resolver.py` dropped its own repository parser and imports
-`gitops_workspace` for one instead — but it still runs its own `gh`, which is the half this section
-is about. Migrating the remaining three is what makes the provider the only way to reach a forge;
-until it happens, a second forge buys a reviewer conversation and nothing else.
+obvious next consumer while holding the migration itself out of scope. Two of the three have since
+made the move, onto the verbs rather than onto `forge.py` — which is the same destination, since
+`forge.py`'s operations are verbs now. `audit_report.py` is the one left, and until it moves the
+ledger is the one forge surface a second forge would not serve.
 
 The protocol grows to the union of what the four need. Beyond the existing seven, that is opening a
 change (branch plus pull request), editing and reading one back, listing and commenting on issues,
@@ -1568,7 +1678,7 @@ every change rather than in a nightly.
 
 The verb tests are one suite parameterised over `AVAILABLE`, not a file per
 forge. Each forge supplies a directory of recorded API responses — the JSON its
-host actually returns for each of the eight verbs — under
+host actually returns for each verb it claims — under
 `testdata/providers/<forge name>/`, beside the tests and outside the package the
 images ship, and the suite finds it by the forge's name.
 
@@ -1756,7 +1866,8 @@ another, which today happen to be the same object for GitHub and GitLab.
    "forge" for the three systems that are actually forges.
 
 **What it does not do:** no Jira package, no second credential plane, no
-declarative surface for "issues live over there", and no split of the protocol
+declarative entry for "issues live over there" beyond the sibling list §6 leaves
+room for, and no split of the protocol
 into capability groups beyond what `verbs` already expresses. Those are a
 design of their own, and the first install that needs one will specify it better
 than speculation would.
@@ -1769,43 +1880,81 @@ the first three forges and not a property of the domain.**
 
 ## 6. The declarative surface
 
-`IntegrationSpec` holds exactly one forge field, `GitHub *GitHubSpec`, and `GitHubSpec` holds two:
-`GitRepo` and `Org`. (`PlatformAgentIntegrationSpec` embeds it alongside `GoogleChat` and `Slack`, so
-GitHub is the only _forge_ integration rather than the only integration.) `Org` carries GitHub's
-namespace grammar in a CRD pattern — alphanumerics and hyphens, at most 39 characters — which is not
-GitLab's: a group path admits dots and underscores, and a project can sit several groups deep, so no
-value of `org` names a nested GitLab namespace. `GitRepo`'s validation,
-`ValidateGitRepoURLWithOrg`, checks length and non-graphic runes and then defers to
-`CleanRepoSlugWithOrg`, which enforces two things: exactly one slash once the host has been
-discarded, and — wherever the input carries an identifiable host — that the host is `github.com` or
-`www.github.com`. So the declarative surface names GitHub twice over, in the field path and in the
-validation, and a GitLab URL is refused at admission today.
+`IntegrationSpec` declares two lists. `forges` names each forge the install talks to: a `name`
+the rest of the spec refers to it by, a `provider`, an optional `host`, an optional default
+`namespace`, and an optional `credentialsRef`. `repositories` names each repository the operator
+registers: the `forge` it lives on, the `repository` itself, an optional `namespace` of its own
+for a repository given as a bare name, and a `role`. (`PlatformAgentIntegrationSpec` embeds it
+alongside `GoogleChat` and `Slack`, so version control is one integration among several.)
 
-The direction of travel is the opposite of what a reader might assume from a field called
-`GitRepo`: accepting GitLab means **relaxing** a host check that exists, under provider dispatch,
-rather than adding one where none stood. What the host check does not reach is an input
-with no identifiable host in it, which is the single-slash rewrite
-[Repository identity](#repository-identity) describes.
+```yaml
+integration:
+  forges:
+    - name: github
+      provider: github
+      namespace: my-org
+  repositories:
+    - { forge: github, repository: infra, role: gitops }
+    - { forge: github, repository: app, role: managed }
+    - { forge: github, repository: platform-terraform, role: context }
+```
 
-The operator then writes the repository into the `managed_repos` state ConfigMap as a
-`ManagedRepoEntry` whose `type` is the literal `"github"`. The discriminator this design needs
-therefore already has a field, a schema and a transport, and the only thing missing at this layer is
-a way to _declare_ it — which is why an administrator who writes one straight into the ConfigMap
-today gets an entry the operator preserves and the agent discards.
+The role says what the agent may do with a repository. `gitops` is the repository the agent
+publishes its own changes to, at most one per install. `managed` repositories are read-write like
+it. `context` repositories are read-only declared intent — a Terraform repository an audit
+consults before it reports a posture as a finding — which the broker never commits to or pushes.
+The state ConfigMap draws only the read-write/read-only line, as two keys: the operator seeds
+`gitops` and `managed` entries into `managed_repos` and `context` entries into `context_repos`,
+and only ever adds. Its entries carry no role, so the GitOps repository is the one listed first —
+the entry the token refresh mints for when nothing names a repository — and a GitOps repository
+the list does not yet hold is added at the front rather than the end. The skills' own resolvers
+refuse to guess among several entries, so once a `managed` repository sits beside the GitOps one,
+a caller names its target with `--repo`.
 
-**The surface is `spec.integration.git`**, carrying a provider, a host and a repository, with
-`spec.integration.github` retained as a deprecated alias that maps onto it. Validation is
-provider-dispatched — each provider asserting its own namespace grammar, and each rejecting a host
-that is not its own — rather than one hardcoded GitHub host check standing in for all of them.
-`ManagedRepoEntry.Type` carries the declared provider rather than a constant, which is how the
-discriminator reaches the agent: written down by the operator, rather than inferred from the URL's
-text.
+The two lists are separate because the relation between them is many-to-one: a forge carries a
+host and a credential once, however many repositories sit on it, and a second instance of the
+same provider — gitlab.com beside a self-managed GitLab — is a second forge entry with its own
+host rather than a special case. A repository names its forge instead of repeating a host, so
+the two can never disagree. An issue tracker that is not part of a forge
+([Not every provider is a forge](#not-every-provider-is-a-forge)) would be a third sibling list
+of the same shape; nothing in these two has to change to admit one.
+
+`github` (`GitRepo` and `Org`) is kept as a deprecated alias for one forge with provider
+`github`, namespace `Org`, and — when `GitRepo` is set — one `gitops` repository. Setting both
+spellings is refused by the schema, as is a repository naming a forge the list does not declare
+and a second `gitops` repository. `GitHubSpec.Org` still carries GitHub's namespace grammar in a
+CRD pattern — alphanumerics and hyphens, at most 39 characters — which is not GitLab's: a group
+path admits dots and underscores, and a project can sit several groups deep. That is why the new
+spelling's `namespace` is a plain string and the grammar lives with the provider.
+
+`credentialsRef` names a Secret in the agent's namespace for a provider whose credential is a
+token an administrator holds. GitHub's is not: its tokens are minted per call from the GitHub
+App, so on a `github` forge the field is ignored, and admission says so with a warning rather
+than an error, so a values file can carry it ahead of the provider that reads it.
+
+Validation dispatches on each repository's forge. Its provider parses the repository with its
+host kept, refuses a host that is neither the forge's declared one nor one of its own, and asserts
+its own namespace grammar and path depth; the admission webhook, the reconciler's status and the
+operator's warning all ask the same question through one call, and every refusal names the list
+entry at fault. GitHub is the only provider registered, so a GitLab URL is refused at admission —
+by GitHub's host check, which accepting GitLab relaxes under dispatch rather than removes.
+
+The operator writes each repository into the state ConfigMap as a `ManagedRepoEntry` whose `type`
+is its forge's provider, which is how the discriminator reaches the agent: written down by the
+operator, rather than inferred from the URL's text. What the agent side does not yet do is select
+a provider from it — an administrator who writes a non-GitHub entry straight into the ConfigMap
+gets one the operator preserves and the agent discards. Entries already in the ConfigMap are kept
+as written, including fields the operator does not model, such as a context repository's `ref`.
+
+The gateway's FQDN egress policy takes its forge hosts from the declared forges, and always
+includes GitHub's, because the agent image's own GitHub calls need them whatever forge holds the
+repositories.
 
 Provisioning follows the same rule. `install.sh` and `terraform/examples/full-install` carry the
 GitHub App inputs as `github_app_id`, `enable_github_minter` and `github_minter_kms_*`, and the
 chart spells the same settings `githubMinter.appId`, `githubMinter.enabled` and
-`githubMinter.kms.*`. All of them are provider-conditional: an install that declares GitLab
-provisions no KMS key and no minter.
+`githubMinter.kms.*`. All of them are provider-conditional: an install that declares no GitHub
+forge provisions no KMS key and no minter.
 
 **What the surface does not carry is a switch for the abstraction itself.** An
 install declares _which_ forge it uses, never _whether_ the abstraction is in
@@ -1987,6 +2136,9 @@ side of each.
 | `draft`             | `draft`                           | `work_in_progress` on older instances; read `draft`, fall back |
 | `author`            | `author.username`                 | no `[bot]` suffix to strip                                     |
 | `source` / `target` | `source_branch` / `target_branch` | direct                                                         |
+| `sourceRepo`        | `source_project_id`               | an id, not a path; resolved through `/projects/:id`            |
+| `sourceRevision`    | `sha`                             | the diff head; GitHub spells it `head.sha`                     |
+| `ref` (comment)     | `"note-{id}"`                     | one notes endpoint, so the kind is constant                    |
 | `url`               | `web_url`                         |                                                                |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                  |
 | `body`              | `description`                     | GitLab's name for it                                           |
@@ -2309,13 +2461,18 @@ that question.
 read of a large upstream repository, and there is no shallow option to make it
 cheaper.
 
-Throttling is legible to the agent and not to an operator.
+Throttling is legible to the agent and only partly to an operator.
 [Where the error contract splits](#where-the-error-contract-splits) puts the
-counters on the broker, but there is no Python metrics surface in this
-repository for them to join — the only convention that exists belongs to a
-single Go binary — so what they are called and what scrapes them is settled
-elsewhere, and until it is, an install approaching its token quota is visible in
-the broker's logs and nowhere else. The refusal is also thinner than it could
+counters on the broker, which now has a metrics surface for them to join: the
+`kubeagents_*` families the credential-proxy Pod serves and the chart's
+`<name>-credential-proxy-monitoring` scrapes
+([Concepts → Observability](../site/src/content/docs/concepts/observability.md)).
+The per-provider throttle counters that section assigns to the broker have not
+been added to it, so until they are, an install approaching its token quota is
+visible in the broker's logs and, by status code alone, as `429`s under
+`endpoint="/v1/vcs"` in `kubeagents_credential_proxy_requests_total`, the route
+family every forge verb travels (`/v1/forge` reaches only the credential
+refresh, which spends no quota). The refusal is also thinner than it could
 be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
 telling it when, and the `Retry-After` and `RateLimit-*` values both forges
 return are read to classify the failure and then dropped rather than carried
@@ -2336,8 +2493,8 @@ other path to a credential is not this design's question to answer, and
 [`../credential-isolation-design.md`](../credential-isolation-design.md) is where
 it is answered. What it does not buy
 is protection against the model being talked into an action it is allowed to
-take. `publish`, `proposal create` and `issue create` are reachable to any agent that
-can reach the read verbs, so an install that wants an agent to read history
+take. `publish`, `proposal create`, `issue create` and `branch-delete` are reachable
+to any agent that can reach the read verbs, so an install that wants an agent to read history
 without being able to write to a forge has no way to say so. A read-only mode is
 the smallest thing that would fix it, and it is not designed here.
 
@@ -2409,10 +2566,12 @@ credential-less read path for public repositories remains open as above.
    not settle is whether the token models diverge far enough to want two classes
    anyway. On the evidence so far they do not.
 
-3. **Whether there is a read-only mode, and where it is declared.** The verbs
-   arrive as one set, which [What this does not fix](#10-what-this-does-not-fix)
-   names as a real gap: an install that wants an agent to read history without
-   being able to write to a forge cannot say so. This is a permission question,
+3. **Whether there is a read-only mode, and where it is declared.** A
+   repository's `role` already declares read-only for one repository at a time:
+   a `context` repository is never written. What is open is the forge-wide
+   version, which [What this does not fix](#10-what-this-does-not-fix) names as a
+   real gap: an install that wants an agent to read history without being able
+   to write to a forge at all cannot say so. This is a permission question,
    not a feature toggle — the abstraction itself is not optional — so it belongs
    on the declarative surface of §6 alongside whatever answers
    [the token's scope boundary](#the-gitlab-credential), and the two should be
@@ -2422,11 +2581,25 @@ credential-less read path for public repositories remains open as above.
    as one token carrying a mode, which argues the declaration attaches to the
    credential and not to the install.
 
-4. **Whether `GitHubProvider` moves onto the in-process HTTP transport.** Not
+4. **Whether the GitHub module moves onto the in-process HTTP transport.** Not
    proposed. It would take `gh` out of the broker entirely, which
    [Replacing `gh`](#replacing-gh) wants for other reasons, and the transport
    split makes it a small change. It needs the App token reachable by the broker
-   without `gh auth`, which is not true today.
+   without `gh auth`, which is not true today. (The question is about
+   `providers/github/`, the broker-side module. The agent-side `GitHubProvider`
+   this once also named is gone; there is one `BrokerProvider` for every forge
+   and it speaks verbs, not HTTP.)
+
+5. **Whether the broker gets an FQDN egress policy of its own.** The derived
+   policy in [the credential plane](#what-the-credential-plane-holds-up) selects
+   the gateway pod. The broker — which holds the forge credential and makes
+   every forge call — has open egress, so a brokered call can reach any host the
+   broker is asked for. Narrowing it to the declared forges' hosts is the same
+   derivation applied to a second pod, and the costs are what make it a
+   question: the broker also reaches Google APIs for token minting and the
+   cluster API for `kubectl`, a policy that forgets one of those breaks every
+   agent on the install, and on a cluster without Dataplane V2 the policy is
+   inert, so it would be a guard some installs have and others silently do not.
 
 ## Related
 

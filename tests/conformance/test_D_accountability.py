@@ -115,6 +115,13 @@ class D2AutonomyIsADial(unittest.TestCase):
         """
         api_types = sorted((h.REPO_ROOT / "k8s-operator" / "api").rglob("*.go"))
         self.assertTrue(api_types, "the operator API package is gone")
+        # Tied to the registry: the two files the test below reads through it
+        # have to be in this set, or the walk is over some other tree that
+        # happens to hold Go files.
+        for key in ("operator_bus_api", "operator_platformagent_api"):
+            self.assertIn(
+                h.path_of(key), api_types, f"{h.SOURCES[key].path} is not under the walked tree"
+            )
         for path in api_types:
             text = path.read_text()
             with self.subTest(file=path.name):
@@ -132,41 +139,114 @@ class D2AutonomyIsADial(unittest.TestCase):
         an image build. D2 forbids a global autonomy setting, so the mitigation
         is that it is not offered: it is absent from the CRD, absent from the
         chart values, and absent from the customer-facing reference.
+
+        Every file surface is read through the registry, the one tree that
+        cannot be is tied to a registered page under it, and every absence is
+        paired with something that has to be present in the same text -- the
+        place the switch would be offered if it were. An absence on its own is
+        true of the wrong file, of a gutted file and of a directory that has
+        moved: this test read three surfaces by raw path and skipped the
+        fourth when the path was not a directory, and the chart block moving
+        out, the CRD root being stubbed and the site tree being moved all
+        stayed green (gke-labs/kube-agents#1752).
         """
         name = "CREDENTIAL_PROXY_ENFORCE_READ_ONLY"
-        surfaces = [
-            h.REPO_ROOT / "charts/kube-agents/values.yaml",
-            h.REPO_ROOT / "k8s-operator/api/v1alpha1/common_types.go",
-            h.REPO_ROOT / "k8s-operator/api/v1alpha1/platformagent_types.go",
-        ]
-        for path in surfaces:
-            with self.subTest(surface=path.name):
-                self.assertTrue(path.is_file(), f"{path} has moved")
-                text = path.read_text()
-                if path.name == "common_types.go" and "SensitiveEnvVars" in text:
-                    # Main added the knob's name to SensitiveEnvVars — the
-                    # denylist that makes the webhook *refuse* it on
-                    # spec.deployment.env with an explanation, which is the
-                    # mitigation, not an offering. Strip that one block and
-                    # the surface must still be clean: the name appearing in
-                    # a field description or kubebuilder marker stays red.
-                    start = text.index("var SensitiveEnvVars")
-                    end = text.index("\n}", start) + 2
-                    text = text[:start] + text[end:]
-                self.assertNotIn(name, text)
 
-        docs = h.REPO_ROOT / "docs/site/src/content/docs"
-        if docs.is_dir():
-            offenders = [
-                str(page.relative_to(h.REPO_ROOT))
-                # .mdx too: the site's index and several install pages are
-                # MDX, and an escape hatch documented there is documented.
-                for page in list(docs.rglob("*.md")) + list(docs.rglob("*.mdx"))
-                if name in page.read_text()
-            ]
-            self.assertEqual(
-                [], offenders, "the escape hatch is documented as a supported knob"
+        with self.subTest(surface="chart values"):
+            values = h.text("chart_values")
+            self.assertIn(
+                "\nplatformAgent:\n",
+                values,
+                "the platformAgent block is gone from values.yaml; the surface a "
+                "chart value would be offered on is not being read",
             )
+            # The comments are part of this surface -- the mutation offers the
+            # switch as a helpful comment beside a boolean -- so the control is
+            # that they still describe the broker's environment at all.
+            self.assertIn(
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL",
+                values,
+                "values.yaml names no credential-proxy variable; the block that "
+                "documents the broker has moved out of it",
+            )
+            self.assertNotIn(name, values, "the escape hatch is offered as a chart value")
+
+        with self.subTest(surface="operator API, common types"):
+            api = h.text("operator_bus_api")
+            # Main added the switch's name to SensitiveEnvVars -- the denylist
+            # that makes the webhook *refuse* it on spec.deployment.env with an
+            # explanation, which is the mitigation, not an offering. That block
+            # is cut out before the scan, and the cut is checked both ways: the
+            # entry has to be in what was removed, or the refusal is gone and
+            # the carve-out is cutting nothing; and the name has to be nowhere
+            # in what remains, where a field description or a kubebuilder
+            # marker naming it would be an offering.
+            declaration = "var SensitiveEnvVars = map[string]struct{}{"
+            self.assertIn(
+                declaration,
+                api,
+                "SensitiveEnvVars is gone from common_types.go; nothing refuses "
+                "the switch on spec.deployment.env any more",
+            )
+            start = api.index(declaration)
+            end = api.index("\n}\n", start) + len("\n}\n")
+            denylist, remainder = api[start:end], api[:start] + api[end:]
+            # The key up to its colon: gofmt pads after it to align the run.
+            self.assertIn(
+                f'"{name}":',
+                denylist,
+                "the read-only switch is off the env denylist, so a CR entry "
+                "naming it is admitted and merged: the switch, offered through "
+                "spec.deployment.env",
+            )
+            self.assertIn(
+                "type SecuritySpec struct {",
+                remainder,
+                "SecuritySpec is gone from common_types.go; the struct a "
+                "CRD-level switch would be declared in is not being read",
+            )
+            self.assertNotIn(
+                name, remainder, "the escape hatch is named in the CRD types outside the denylist"
+            )
+
+        with self.subTest(surface="operator API, PlatformAgent root"):
+            root = h.text("operator_platformagent_api")
+            self.assertIn(
+                "type PlatformAgentSpec struct {",
+                root,
+                "PlatformAgentSpec is gone from platformagent_types.go; the CRD's "
+                "root is not being read",
+            )
+            self.assertNotIn(name, root, "the escape hatch is a field on PlatformAgentSpec")
+
+        with self.subTest(surface="documentation site"):
+            # A directory rather than a file, so site_pages() answers for the
+            # empty set, and two controls answer for the wrong tree: the
+            # security reference is among the pages, and the pages between
+            # them name the broker's other variables. Only then does "no page
+            # names the switch" mean what it says.
+            texts = {page: page.read_text() for page in h.site_pages()}
+            self.assertIn(
+                h.path_of("site_security_reference"),
+                texts,
+                "the security reference is not among the site's pages",
+            )
+            documented = {
+                variable
+                for text in texts.values()
+                for variable in re.findall(r"CREDENTIAL_PROXY_[A-Z_]+", text)
+            } - {name}
+            self.assertTrue(
+                documented,
+                "no page names any credential-proxy variable; the site is no "
+                "longer the reference that would document this one",
+            )
+            offenders = sorted(
+                str(page.relative_to(h.REPO_ROOT))
+                for page, text in texts.items()
+                if name in text
+            )
+            self.assertEqual([], offenders, "the escape hatch is documented as a supported knob")
 
 
 class D4CredentialsAreShortLivedAndBound(unittest.TestCase):

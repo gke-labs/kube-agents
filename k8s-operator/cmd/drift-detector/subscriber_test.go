@@ -160,7 +160,8 @@ func TestProcessBatchNacksUndecodableMessage(t *testing.T) {
 // On SIGTERM the loop's context is already cancelled by the time the batch it
 // was working on has to be settled. Settling on that context would abort every
 // ack, and the whole batch -- already handled -- would be redelivered to the
-// next instance. At T4 that is a duplicate inject on every restart.
+// next instance. With --daemon-url set that is a duplicate inject on every
+// non-graceful restart, which the in-memory insertId set cannot suppress.
 func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
 	source := &fakeSource{recordCtxErr: true}
 	sub := newSubscriber(source, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
@@ -173,12 +174,67 @@ func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
 		{AckID: "ack-failed", Data: []byte(malformedEntry)},
 	})
 
-	if !equalStrings(source.acked, []string{"ack-parsed"}) {
-		t.Errorf("acked = %v, want [ack-parsed]", source.acked)
+	// Both go back to the subscription. Acking the parsed one would say it was
+	// handled, and on a cancelled context nothing was: the join fails at once
+	// and so does the inject.
+	if len(source.acked) != 0 {
+		t.Errorf("acked = %v, want none: a record handled on a dead context was not handled", source.acked)
 	}
-	if !equalStrings(source.nacked, []string{"ack-failed"}) {
-		t.Errorf("nacked = %v, want [ack-failed]", source.nacked)
+	if !equalStrings(source.nacked, []string{"ack-parsed", "ack-failed"}) {
+		t.Errorf("nacked = %v, want [ack-parsed ack-failed]", source.nacked)
 	}
+	if source.nackCtxErr != nil {
+		t.Errorf("Nack ran on a cancelled context (%v); it must survive shutdown", source.nackCtxErr)
+	}
+	// The matching assertion for Ack is not here, and deliberately: nothing in
+	// this batch is acked, so `fakeSource.Ack` records no context state to
+	// assert on and the check would pass whatever settleContext did. It lives
+	// in TestProcessBatchReturnsTheRestOfTheBatchOnShutdown, where the record
+	// handled before the cancellation gives Ack something to carry.
+}
+
+func TestProcessBatchReturnsTheRestOfTheBatchOnShutdown(t *testing.T) {
+	// The records after the one being handled when SIGTERM lands. Before this
+	// was fixed they were handled on a dead context -- join fails instantly,
+	// inject fails with it -- and acked anyway, so a rolling restart that
+	// caught a full batch silently dropped the escalation for every surviving
+	// human change in it, with no redelivery.
+	const batchSize = 5
+
+	ctx, cancel := context.WithCancel(context.Background())
+	source := &fakeSource{recordCtxErr: true}
+
+	handled := 0
+	sub := newSubscriber(source, func(context.Context, AuditRecord) {
+		handled++
+		// SIGTERM lands while the first record is in flight.
+		cancel()
+	}, defaultMaxMessages, defaultBatchJoinBudget)
+	defer cancel()
+
+	messages := make([]receivedMessage, 0, batchSize)
+	for i := range batchSize {
+		messages = append(messages, receivedMessage{
+			AckID: fmt.Sprintf("ack-%d", i),
+			Data:  []byte(humanPatchEntry),
+		})
+	}
+	sub.processBatch(ctx, messages)
+
+	if handled != 1 {
+		t.Errorf("handled %d records after cancellation, want 1: the loop kept going past SIGTERM", handled)
+	}
+	// The first was genuinely handled before the cancel, so it is acked.
+	if !equalStrings(source.acked, []string{"ack-0"}) {
+		t.Errorf("acked = %v, want [ack-0]", source.acked)
+	}
+	if !equalStrings(source.nacked, []string{"ack-1", "ack-2", "ack-3", "ack-4"}) {
+		t.Errorf("nacked = %v, want the four unhandled records returned to the subscription", source.nacked)
+	}
+	// This batch is the one that settles both ways on a cancelled parent, so it
+	// is where settleContext is worth asserting on: an Ack aborted by the
+	// cancellation would put ack-0 -- genuinely handled, inject and all -- back
+	// on the subscription for the next instance to handle again.
 	if source.ackCtxErr != nil {
 		t.Errorf("Ack ran on a cancelled context (%v); it must survive shutdown", source.ackCtxErr)
 	}
@@ -191,7 +247,7 @@ func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
 // since T3 the handler does a network lookup per record. Without a bound on the
 // batch, a slow control plane holds a hundred messages past the deadline and
 // Pub/Sub redelivers the batch this process is still working on -- duplicate
-// drift lines now, a duplicate inject per cycle at T4. The guard is the deadline
+// drift lines, and a duplicate inject per cycle. The guard is the deadline
 // on the context the handler is given, so that is what this asserts: not that
 // the lookups are fast, but that they cannot run unbounded.
 func TestProcessBatchBoundsHandlingWithABudget(t *testing.T) {
@@ -229,20 +285,38 @@ func TestProcessBatchBoundsHandlingWithABudget(t *testing.T) {
 // A context.WithTimeout(context.Background(), ...) would compile, pass the test
 // above, and quietly make SIGTERM wait out the full budget on every in-flight
 // batch.
+//
+// The cancel has to land from inside the handler, because that is the only
+// place left where it proves anything. processBatch now checks the parent
+// between records and stops, so a batch entered on an already-dead context
+// never reaches a handler at all -- asserting from out here would pass against
+// a detached handleCtx, since the guard reads the parent directly and would
+// break out either way. Mid-record is the case the guard cannot cover and
+// derivation is the only thing that does.
 func TestProcessBatchBudgetStillHonoursShutdown(t *testing.T) {
-	source := &fakeSource{recordCtxErr: true}
-	var handlerErr error
-	sub := newSubscriber(source, func(ctx context.Context, _ AuditRecord) {
-		handlerErr = ctx.Err()
-	}, defaultMaxMessages, defaultBatchJoinBudget)
+	// A detached handleCtx never fires, so the wait needs its own end. Long
+	// enough not to flake on a loaded machine, short enough that a real
+	// regression fails quickly rather than sitting out the join budget.
+	const cancelPropagation = 5 * time.Second
 
+	source := &fakeSource{recordCtxErr: true}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
+
+	var handlerErr error
+	sub := newSubscriber(source, func(handleCtx context.Context, _ AuditRecord) {
+		cancel()
+		select {
+		case <-handleCtx.Done():
+			handlerErr = handleCtx.Err()
+		case <-time.After(cancelPropagation):
+		}
+	}, defaultMaxMessages, defaultBatchJoinBudget)
 
 	sub.processBatch(ctx, []receivedMessage{{AckID: "ack-parsed", Data: []byte(humanPatchEntry)}})
 
 	if handlerErr == nil {
-		t.Error("the handler ran on a live context after SIGTERM; the budget must derive from the loop's context, not replace it")
+		t.Error("the handler's context outlived SIGTERM; the budget must derive from the loop's context, not replace it")
 	}
 }
 

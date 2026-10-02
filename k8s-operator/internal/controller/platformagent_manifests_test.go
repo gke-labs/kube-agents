@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -127,7 +128,7 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "model: model-default") {
 		t.Errorf("expected config to contain model: model-default, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "base_url: http://litellm.test-ns.svc.cluster.local/v1") {
+	if !strings.Contains(yamlContent, "base_url: http://inference-gateway.test-ns.svc.cluster.local/v1") {
 		t.Errorf("expected config to contain correct base_url, got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "api_key: none") {
@@ -1145,6 +1146,67 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	}
 }
 
+func TestCredentialProxyBootstrapsInClusterOnKind(t *testing.T) {
+	// A kind install sets projectId, location and clusterName to "kind". The
+	// proxy must not reach for gcloud; it writes an in-cluster context from
+	// the pod's service account, and the agent is told the same context name.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"},
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{Image: "example/platform-agent", Tag: ptr.To("v1")},
+				Security:   &agentv1alpha1.SecuritySpec{ServiceAccountName: "credential-sa"},
+			},
+		},
+	}
+
+	env := make(map[string]corev1.EnvVar)
+	for _, item := range buildCredentialProxyEnv(agent) {
+		env[item.Name] = item
+	}
+	if env["KUBE_CONTEXT_NAME"].Value != inClusterContextName {
+		t.Errorf("expected the in-cluster context, got %#v", env["KUBE_CONTEXT_NAME"])
+	}
+	if env["KUBE_DEFAULT_NAMESPACE"].Value != "test-ns" {
+		t.Errorf("expected the agent's namespace as default, got %#v", env["KUBE_DEFAULT_NAMESPACE"])
+	}
+	if _, set := env["GKE_PROJECT_ID"]; set {
+		t.Errorf("expected no GKE project on kind, got %#v", env["GKE_PROJECT_ID"])
+	}
+	bootstrap := env["CREDENTIAL_PROXY_BOOTSTRAP_COMMAND"].Value
+	for _, expected := range []string{
+		"kubectl config set-cluster", inClusterAPIServer, kubeAPIAccessMountPath + "/ca.crt",
+		".tokenFile", kubeAPIAccessMountPath + "/token", "kubectl config set-context", "kubectl config use-context",
+	} {
+		if !strings.Contains(bootstrap, expected) {
+			t.Errorf("expected in-cluster bootstrap to contain %q, got %q", expected, bootstrap)
+		}
+	}
+	if strings.Contains(bootstrap, "gcloud") {
+		t.Errorf("in-cluster bootstrap must not call gcloud, got %q", bootstrap)
+	}
+
+	pod := buildPodTemplateSpec(agent, "cfg", "fb", "settings", "policy", nil, renderOptions{})
+	agentEnv := map[string]string{}
+	for _, container := range pod.Spec.Containers {
+		if container.Name != "platform-agent" {
+			continue
+		}
+		for _, item := range container.Env {
+			agentEnv[item.Name] = item.Value
+		}
+	}
+	if agentEnv["KUBE_CONTEXT_NAME"] != inClusterContextName {
+		t.Errorf("expected the agent container to carry the in-cluster context, got %q", agentEnv["KUBE_CONTEXT_NAME"])
+	}
+	for _, name := range []string{"GKE_PROJECT_ID", "GKE_CLUSTER_NAME", "GKE_LOCATION", "GCP_PROJECT_ID"} {
+		if value, set := agentEnv[name]; set {
+			t.Errorf("expected no %s on kind, got %q", name, value)
+		}
+	}
+}
+
 func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 	custom := []corev1.EnvVar{
 		{Name: "OTEL_SERVICE_NAME", Value: "platform-agent"},
@@ -1199,9 +1261,11 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// so an operator has to be able to tune or disable them on the CR. Without
 	// these names on the allowlist the documented override silently does
 	// nothing and the only way to change a limit is a new image. One name per
-	// severity the server caps, Info included.
+	// bucket the server caps: the three severities, Info included, and the
+	// drift detector's own bucket, which is not a severity.
 	custom := []corev1.EnvVar{
 		{Name: "ALERT_DAILY_LIMIT_CRITICAL", Value: "25"},
+		{Name: "ALERT_DAILY_LIMIT_DRIFT", Value: "50"},
 		{Name: "ALERT_DAILY_LIMIT_INFO", Value: "3"},
 		{Name: "ALERT_DAILY_LIMIT_WARNING", Value: "0"},
 		{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
@@ -1225,6 +1289,15 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 
 	if values["ALERT_DAILY_LIMIT_CRITICAL"] != "25" {
 		t.Errorf("expected the critical ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_CRITICAL"])
+	}
+	// Drift bills a bucket of its own rather than the Warning one it displays
+	// as, so its ceiling is a fourth variable and has to be overridable by the
+	// same route. Off the allowlist, one multi-object `kubectl apply` spends
+	// the default of 5 and every later drift record that day is lost for good
+	// — the detector cannot re-offer one — with no way to raise the cap short
+	// of a new image.
+	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
+		t.Errorf("expected the drift ceiling to be overridable, got %q", values["ALERT_DAILY_LIMIT_DRIFT"])
 	}
 	// Info is capped too — nothing on the watcher path filters on Event.Type,
 	// so Normal-type events with an allowlisted reason arrive as Info.
@@ -1277,6 +1350,28 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 	// row would make one cluster's noise read as another's.
 	if _, ok := values["GKE_CLUSTER_NAME"]; ok {
 		t.Errorf("GKE_CLUSTER_NAME must stay operator-owned, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
+	// The Slack UX flag is read by the gateway's Slack adapter and kanban
+	// notifier, both in this container. Off the allowlist, the documented
+	// `spec.deployment.env` override renders on the CR and never reaches them,
+	// so the feature cannot be turned on at all.
+	custom := []corev1.EnvVar{
+		{Name: "KAGE_SLACK_UX", Value: "1"},
+		{
+			Name: "KAGE_SLACK_UX",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "1" || got[0].ValueFrom != nil {
+		t.Errorf("expected only the literal KAGE_SLACK_UX=1 to pass, got %#v", got)
 	}
 }
 
@@ -1350,6 +1445,21 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	if len(container.Command) != 1 || container.Command[0] != "/usr/local/bin/start-services" {
 		t.Errorf("unexpected proxy command: %v", container.Command)
 	}
+	// Pinned here as well as in the goldens: a golden regeneration blesses
+	// whatever the builder renders, so a request that drifted back down would
+	// otherwise pass every test. 500m is what lets a mint finish inside its
+	// five-second timeouts while an evicted pod's replacement warms up, and
+	// 512Mi is the memory Autopilot admits a 500m pod at, declared so the
+	// rendered request is the admitted one on both cluster modes.
+	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
+		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Requests.Memory().String(); got != "512Mi" {
+		t.Errorf("expected a 512Mi memory request on the proxy container, got %s", got)
+	}
+	if got := container.Resources.Limits.Cpu().String(); got != "1" {
+		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
 		env[item.Name] = item
@@ -1411,6 +1521,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 				Deployment: &agentv1alpha1.DeploymentSpec{
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1434,6 +1545,13 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
 		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
 	}
+	// The concurrency cap is the other half of what the limit is sized
+	// against, so it is the operator's in the same way: set here, and not a
+	// CR's to raise past what the limit below can hold.
+	const wantConcurrent = "8"
+	if got := env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"]; got != wantConcurrent {
+		t.Errorf("expected the proxy concurrency cap %s, got %q — a CR override must not reach it", wantConcurrent, got)
+	}
 	// The measured worst case, so a future reduction of the cap has to argue
 	// with the number rather than pass silently.
 	const largestObservedDump = 3866719
@@ -1447,42 +1565,42 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The other half of the argument, which the floor above cannot make: a cap
 	// this side of the fleet's needs is still wrong if the container cannot
-	// hold it. Five live copies of a capped output exist per in-flight command
-	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
-	// response -- and the commands in flight are one per kanban worker plus
-	// the front-door session. Nothing bounds that concurrency inside the
-	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
-	// memory limit alongside what the container holds at rest, or an OOMKill
-	// takes gcloud, kubectl, gh and git away from every agent the proxy serves.
+	// hold it. credential_proxy.py reads a command's output as it streams,
+	// keeps at most the cap per stream and bounds the decoded text to the
+	// same size, so what the broker holds per in-flight request is about six
+	// times the cap, transiently: the two capped stream buffers, their decoded
+	// text, and the JSON body and its encoding (measured at 48 MiB per request
+	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
+	// A request holds its slot until its response is written, and concurrency
+	// is bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+	// read here off the rendered env like the output cap, so the test models
+	// what the operator deploys rather than a copy of it. The burst has to
+	// fit under the memory limit alongside what the container holds at rest,
+	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
+	// the proxy serves.
 	//
-	// Five workers rather than defaultKanbanMaxInProgress, because that
-	// default is overridable and resolveResources sizes the agent container
-	// for the five-way fan-out it has actually observed. The proxy is sized
-	// for the same install.
-	//
-	// And two capped streams per command, not one. `_execute` truncates stdout
-	// and stderr in two independent calls -- see the pair of `self._truncate`
-	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
-	// single command can hold 2x it. Modelling one stream understates the
-	// burst by half, which is the direction that lets a too-large cap pass.
+	// The children -- one kubectl or gcloud per in-flight command -- are
+	// outside this arithmetic. A kubectl listing thousands of objects runs to
+	// hundreds of MiB on its own, and the rest of the limit is what holds it.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 5
-	const streamsPerCommand = 2
-	const observedFanOut = 5
-	inFlight := int64(observedFanOut + 1)
-	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	const copiesPerCommand = 6
+	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
+	if err != nil || inFlight < 1 {
+		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
+	}
+	burst := int64(capBytes) * copiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
 	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
-		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
 	}
 }
@@ -1822,161 +1940,6 @@ func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
 	t.Fatalf("%s passes --token-env=%s, but the container hosting the watcher has no such variable; the watcher will exit on every start", path, tokenEnv)
 }
 
-func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "platform-agent",
-			Namespace: "kubeagents-system",
-		},
-	}
-	expectedLabels := commonLabels(agent)
-	expectedName := expectedLabels[labelName] // "platform-agent"
-
-	policyFiles := []string{
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-ingress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-internal-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-apiserver-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-external-egress.yaml"),
-		filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml"),
-	}
-
-	for _, path := range policyFiles {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("failed to read policy file %s: %v", path, err)
-		}
-		var manifest struct {
-			Metadata struct {
-				Name string `yaml:"name"`
-			} `yaml:"metadata"`
-			Spec struct {
-				PodSelector struct {
-					MatchLabels map[string]string `yaml:"matchLabels"`
-				} `yaml:"podSelector"`
-			} `yaml:"spec"`
-		}
-		if err := yaml.Unmarshal(data, &manifest); err != nil {
-			t.Fatalf("failed to unmarshal YAML %s: %v", path, err)
-		}
-		got := manifest.Spec.PodSelector.MatchLabels[labelName]
-		if got != expectedName {
-			t.Errorf("policy %s (%s): expected podSelector.matchLabels[%q]=%q, got %q", manifest.Metadata.Name, path, labelName, expectedName, got)
-		}
-	}
-}
-
-// TestKustomizeCoreEgressDNSPeersMatchTheOperator pins the static Kustomize DNS
-// rule to the one buildNetworkPolicy renders. They are two hand-maintained
-// copies of the same peer list, and nothing else compares them: the only other
-// test reading these files checks podSelector alone.
-//
-// The drift is not hypothetical. Every other static copy in the tree — the
-// chart's litellm and github-minter policies, the LiteLLM integration base, the
-// examples — already named the Cloud DNS resolver while this file did not, and
-// no test noticed until a Cloud DNS install lost name resolution. The regression
-// this catches is the reverse: someone edits the builder, `go test ./...` stays
-// green, and Kustomize installs quietly get a different resolver set.
-//
-// It compares ipBlock CIDRs only. The selector peers are equivalent but not
-// textually comparable across a Go literal and a YAML document, and pinning
-// those would make the test fail on cosmetic edits rather than on drift.
-func TestKustomizeCoreEgressDNSPeersMatchTheOperator(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", path, err)
-	}
-	var manifest struct {
-		Spec struct {
-			Egress []struct {
-				Ports []struct {
-					Port int32 `yaml:"port"`
-				} `yaml:"ports"`
-				To []struct {
-					IPBlock struct {
-						CIDR string `yaml:"cidr"`
-					} `yaml:"ipBlock"`
-				} `yaml:"to"`
-			} `yaml:"egress"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("failed to unmarshal %s: %v", path, err)
-	}
-
-	// The static file's DNS rule carries a 0.0.0.0/0 peer with an except list,
-	// which the operator's does not; compare the single-host grants, which are
-	// the resolvers themselves.
-	static := map[string]bool{}
-	for _, rule := range manifest.Spec.Egress {
-		isDNS := len(rule.Ports) > 0
-		for _, port := range rule.Ports {
-			if port.Port != dnsPort {
-				isDNS = false
-			}
-		}
-		if !isDNS {
-			continue
-		}
-		for _, peer := range rule.To {
-			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
-				static[peer.IPBlock.CIDR] = true
-			}
-		}
-	}
-
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
-	}
-	// Every port-53 rule, not egressCIDRsForPort, which returns at the first one
-	// it finds. The static side above iterates the whole file, and comparing one
-	// operator rule against all of the manifest's would report parity for a
-	// second operator rule nobody had mirrored — the exact drift this test is
-	// here to catch, and a split into two port-53 rules is a plausible edit given
-	// that separate rules are how this policy keeps grants from widening one
-	// another.
-	rendered := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-	operator := map[string]bool{}
-	for _, rule := range rendered.Spec.Egress {
-		// Written out rather than through ruleNamesPort, which counts a rule with
-		// no ports as naming every one of them. That is right for its callers and
-		// wrong here: such a rule's peers are not DNS peers, and folding them into
-		// this set would report drift against the static file for peers the static
-		// file's DNS rule was never supposed to carry.
-		namesDNS := false
-		for _, candidate := range rule.Ports {
-			if candidate.Port != nil && candidate.Port.IntValue() == dnsPort {
-				namesDNS = true
-				break
-			}
-		}
-		if !namesDNS {
-			continue
-		}
-		for _, peer := range rule.To {
-			if peer.IPBlock == nil {
-				continue
-			}
-			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
-				operator[peer.IPBlock.CIDR] = true
-			}
-		}
-	}
-
-	for cidr := range operator {
-		if !static[cidr] {
-			t.Errorf("the operator's DNS rule grants %s and %s does not; a Kustomize install gets a "+
-				"different resolver set from an operator-managed one", cidr, filepath.Base(path))
-		}
-	}
-	for cidr := range static {
-		if !operator[cidr] {
-			t.Errorf("%s grants %s on port 53 and the operator's DNS rule does not", filepath.Base(path), cidr)
-		}
-	}
-}
-
 // fqdnPatternsFromPolicy returns the egress match patterns buildFQDNNetworkPolicy emits.
 func fqdnPatternsFromPolicy(t *testing.T) []string {
 	t.Helper()
@@ -2027,10 +1990,10 @@ func fqdnPatternToRegexp(t *testing.T, pattern string) *regexp.Regexp {
 }
 
 // TestFQDNPatternList_MatchesRealHostnames pins the egress allowlist against
-// hostnames the gateway actually dials. TestFQDNPatternList_MatchesKustomizeManifest
-// only proves the two copies of the list agree — it would pass just as happily
-// if both were wrong, which is how "*.gke.goog" was first shipped one label
-// short of every DNS control-plane endpoint it was added to allow.
+// hostnames the gateway actually dials rather than against another copy of the
+// list — a copy-to-copy comparison passes just as happily when both are wrong,
+// which is how "*.gke.goog" was first shipped one label short of every DNS
+// control-plane endpoint it was added to allow.
 func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 	patterns := fqdnPatternsFromPolicy(t)
 
@@ -2070,39 +2033,6 @@ func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 		if !matched {
 			t.Errorf("no FQDN egress pattern matches %q; the gateway cannot reach it under FQDN network policy (patterns: %v)", host, patterns)
 		}
-	}
-}
-
-func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
-	goPatterns := fqdnPatternsFromPolicy(t)
-
-	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("failed to read %s: %v", path, err)
-	}
-	var manifest struct {
-		Spec struct {
-			Egress []struct {
-				Matches []struct {
-					Pattern string `yaml:"pattern"`
-				} `yaml:"matches"`
-			} `yaml:"egress"`
-		} `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("failed to unmarshal %s: %v", path, err)
-	}
-	if len(manifest.Spec.Egress) == 0 {
-		t.Fatalf("expected egress in YAML manifest %s", path)
-	}
-	var yamlPatterns []string
-	for _, m := range manifest.Spec.Egress[0].Matches {
-		yamlPatterns = append(yamlPatterns, m.Pattern)
-	}
-
-	if !reflect.DeepEqual(goPatterns, yamlPatterns) {
-		t.Errorf("FQDN patterns diverge between Go code and YAML manifest: Go=%v, YAML=%v", goPatterns, yamlPatterns)
 	}
 }
 
@@ -2521,6 +2451,82 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(fbConf, "Name              tail") {
 		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+// The audit lift: the sidecar recognises a tool_call_audit or chat_message_audit
+// line, captures its JSON object and decodes it into top-level fields, in that
+// order and before the record modifier stamps the record. The regex is checked
+// against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
+// translated to Go's, since the two engines agree on everything else in it.
+// Those lines are frozen here: the test holds the regex to the format as
+// sampled and cannot notice a Hermes release that changes it. That check is a
+// live one after an agent image change: jsonPayload.audit_event in Logs
+// Explorer, a key the broker's own records do not carry, as the observability
+// page says.
+func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
+	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	})
+	fbConf := cm.Data["fluent-bit.conf"]
+	parsers := cm.Data["parsers.conf"]
+
+	order := []string{"Parser        gchat_event", "Parser        hermes_audit_line", "Key_Name      audit_json", "Parser        audit_json", "Name              record_modifier"}
+	last := -1
+	for _, needle := range order {
+		at := strings.Index(fbConf, needle)
+		if at < 0 {
+			t.Fatalf("fluent-bit.conf lacks %q", needle)
+		}
+		if at < last {
+			t.Errorf("%q is out of order in fluent-bit.conf; the lift has to capture before it decodes and decode before the record is stamped", needle)
+		}
+		last = at
+	}
+	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
+		t.Errorf("parsers.conf lacks the json decoder the lift needs; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	}
+
+	var expr string
+	for _, line := range strings.Split(parsers, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "Regex   ^") {
+			expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Regex"))
+		}
+	}
+	if expr == "" {
+		t.Fatal("parsers.conf has no anchored Regex line for hermes_audit_line")
+	}
+	re := regexp.MustCompile(strings.ReplaceAll(expr, "(?<", "(?P<"))
+	const sample = `2026-09-28 15:45:43,391 INFO hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "duration_ms": 53, "result": "{\"ok\": true}", "task_id": "k8s-evt-a9c4f17a", "tool_name": "kanban_create"}`
+	match := re.FindStringSubmatch(sample)
+	if match == nil {
+		t.Fatalf("the audit regex does not match a line Hermes wrote: %q", sample)
+	}
+	captured := match[re.SubexpIndex("audit_json")]
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(captured), &decoded); err != nil {
+		t.Fatalf("the capture is not the JSON object: %v (%q)", err, captured)
+	}
+	if decoded["tool_name"] != "kanban_create" {
+		t.Errorf("decoded record = %v, want the plugin's fields", decoded)
+	}
+	if re.MatchString(`2026-09-28 15:45:43,376 WARNING tools.kanban_event_routing: kanban event routing: {"not": "an audit record"}`) {
+		t.Error("the audit regex matches a line from another logger; only the two audit emitters may be lifted")
+	}
+	if !re.MatchString(`2026-09-28 15:45:43,391 INFO hermes.hook.chat_message_audit: {"audit_event": "chat_message_end"}`) {
+		t.Error("the audit regex does not match the chat_message_audit hook's lines")
+	}
+	// Hermes tags a record emitted on a thread holding a session context with
+	// ` [<session id>]` between the level and the logger name; the tools it
+	// runs inline on the turn thread log that way, and an unmatched line passes
+	// through the sidecar unlifted with no signal.
+	tagged := `2026-09-28 15:45:43,391 INFO [20260928_154543_50074bf0] hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "tool_name": "clarify"}`
+	match = re.FindStringSubmatch(tagged)
+	if match == nil {
+		t.Fatalf("the audit regex does not match a session-tagged line: %q", tagged)
+	}
+	if !strings.HasPrefix(match[re.SubexpIndex("audit_json")], `{"audit_event": "tool_call_end"`) {
+		t.Errorf("the capture on a tagged line is not the JSON object: %q", match[re.SubexpIndex("audit_json")])
 	}
 }
 
@@ -5397,6 +5403,243 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 	}
 }
 
+// agentWithDriftDetector builds a PlatformAgent whose harness names the drift
+// detector. The harness triple is filled in, because the detector's own gate
+// requires it and a fixture without it would make every "enabled" case look
+// like a disabled one for the wrong reason; the tests that care about a missing
+// triple clear a field themselves.
+func agentWithDriftDetector(drift *agentv1alpha1.DriftDetectorSpec) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID:     "test-project",
+		Location:      "us-central1",
+		ClusterName:   "test-cluster",
+		DriftDetector: drift,
+	}
+	return a
+}
+
+// The default has to be "not detecting", which is the opposite of the watcher's
+// and for a reason the watcher does not have: the detector reads a Pub/Sub
+// subscription that only exists where the drift-pubsub Terraform module was
+// applied. A resolver that read absence as on would start, on every install
+// without one, a process that never exits and never reports a change: the
+// subscription is not checked at startup and the failing pull is retried for the
+// life of the pod, on a pod that stays Ready throughout.
+func TestDriftDetectorDefaultsOffWhenUnspecified(t *testing.T) {
+	if driftDetectorEnabled(newTestPlatformAgent()) {
+		t.Error("an agent with no harness at all must not run the detector")
+	}
+	if driftDetectorEnabled(agentWithTuning(nil)) {
+		t.Error("a harness that says nothing about the detector must not run it")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{})) {
+		t.Error("a driftDetector block with no enabled key must not run the detector")
+	}
+	if !driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})) {
+		t.Error("enabled: true with a complete harness must run the detector")
+	}
+	if driftDetectorEnabled(agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})) {
+		t.Error("enabled: false must turn the detector off")
+	}
+}
+
+// Enabling it is necessary and not sufficient. The detector checks the cluster
+// name it is given against the cluster its credentials actually reach and stops
+// on a disagreement, so starting it with a half-filled harness gives a restart
+// loop rather than a degraded detector. The gate is here, in the operator,
+// because that is the layer that can see the whole harness.
+func TestDriftDetectorStaysOffWithoutTheWholeHarnessTriple(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		clear func(*agentv1alpha1.HarnessSpec)
+	}{
+		{"no project", func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" }},
+		{"no location", func(h *agentv1alpha1.HarnessSpec) { h.Location = "" }},
+		{"no cluster name", func(h *agentv1alpha1.HarnessSpec) { h.ClusterName = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			tc.clear(agent.Spec.Harness)
+			if driftDetectorEnabled(agent) {
+				t.Errorf("enabled: true with %s must not start the detector", tc.name)
+			}
+		})
+	}
+}
+
+// A populated projectId is not a usable one. The detector refuses an all-digits
+// --project before it starts any loop, and start-services.sh always passes
+// --in-cluster and --profiles-dir, so that refusal is always reachable in the
+// shipped path -- which makes a numeric projectId the restart loop the gate's own
+// doc comment says it prevents. Nothing else reading the harness triple minds a
+// number, so the install is otherwise healthy and nothing else would catch it.
+//
+// The pairs below are the detector's own boundary, not a restatement of the gate:
+// a project ID must begin with a lowercase letter, so all-digits is the whole test
+// and anything with one non-digit is an ID. The mixed cases are what a mutation
+// widening the check to "contains a digit" would take down.
+func TestDriftDetectorGateRejectsAProjectNumber(t *testing.T) {
+	for _, tc := range []struct {
+		project string
+		want    bool
+	}{
+		{"123456789012", false},
+		{"0", false},
+		{"test-project", true},
+		{"project-123456789012", true},
+		{"123456789012-project", true},
+		{"my-project-2", true},
+	} {
+		t.Run(tc.project, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			agent.Spec.Harness.ProjectID = tc.project
+			if got := driftDetectorEnabled(agent); got != tc.want {
+				t.Errorf("driftDetectorEnabled with projectId %q = %v, want %v", tc.project, got, tc.want)
+			}
+		})
+	}
+}
+
+// The gate must refuse exactly what the detector refuses, and the two implement
+// the test separately -- isProjectNumber here, looksLikeProjectNumber in
+// cmd/drift-detector/main.go, each with its own copy of the digit set. A gate that
+// drifted narrower would admit a project the binary rejects, which is the defect
+// above returning; one that drifted wider would report a working install as off,
+// which is silent. This pins the character set rather than the two functions,
+// because the operator does not import the detector's package.
+func TestDriftDetectorGateUsesTheDetectorsDigitSet(t *testing.T) {
+	if driftDetectorProjectNumberDigits != "0123456789" {
+		t.Errorf("digit set = %q, want the detector's 0123456789", driftDetectorProjectNumberDigits)
+	}
+	if isProjectNumber("") {
+		t.Error("an empty project is absent, not a number; the triple check reports that")
+	}
+}
+
+// The entrypoint reads these six and nothing else carries the configuration into
+// the pod. Written on every reconcile rather than only when the detector is on,
+// for the same reason the watcher's switch is: from outside the container an
+// install that never asked for drift detection and one whose detector cannot
+// start look identical, and the Deployment is where that is answered.
+//
+// The harness triple is repeated under the detector's own names rather than read
+// from GKE_PROJECT_ID and friends, which buildPodTemplateSpec sets on the agent
+// container and not on this sidecar. Asserting the values here is what catches a
+// later change that assumes the two containers share an environment.
+func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{
+		Enabled:        ptr.To(true),
+		Subscription:   "drift-audit-sub",
+		GitopsManagers: "argocd-controller,flux",
+	})
+
+	want := map[string]string{
+		"DRIFT_DETECTOR_ENABLED":          "true",
+		"DRIFT_DETECTOR_PROJECT_ID":       "test-project",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION": "us-central1",
+		"DRIFT_DETECTOR_CLUSTER_NAME":     "test-cluster",
+		"DRIFT_DETECTOR_SUBSCRIPTION":     "drift-audit-sub",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS":  "argocd-controller,flux",
+	}
+
+	got := map[string][]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if _, ours := want[e.Name]; ours {
+			got[e.Name] = append(got[e.Name], e.Value)
+		}
+	}
+	for name, value := range want {
+		if len(got[name]) != 1 {
+			t.Fatalf("want exactly one %s, got %d (%q)", name, len(got[name]), got[name])
+		}
+		if got[name][0] != value {
+			t.Errorf("%s = %q, want %q", name, got[name][0], value)
+		}
+	}
+}
+
+// An unconfigured detector still gets its switch, set to "false" rather than
+// left out, and gets none of its settings. Both halves matter. The switch is
+// there so that a Deployment says whether the detector is meant to be running;
+// the settings are not, because every install that has not applied the
+// drift-pubsub module is in this state, and writing them would repeat the
+// harness triple under five more names on every credential proxy in the fleet
+// for a process that is not started.
+//
+// The CR supplies all six here to make the second half a real assertion rather
+// than an observation about a fixture: the names are reserved in
+// mergeCredentialProxyEnv whether or not the operator writes them, so an entry
+// the operator skips has to be dropped, not passed through.
+func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "DRIFT_DETECTOR_ENABLED", Value: "true"},
+			{Name: "DRIFT_DETECTOR_PROJECT_ID", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_LOCATION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_CLUSTER_NAME", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_SUBSCRIPTION", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_GITOPS_MANAGERS", Value: "cr-supplied"},
+		},
+	}
+
+	var switches []string
+	var settings []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		switch {
+		case e.Name == "DRIFT_DETECTOR_ENABLED":
+			switches = append(switches, e.Value)
+		case strings.HasPrefix(e.Name, "DRIFT_DETECTOR_"):
+			settings = append(settings, e.Name+"="+e.Value)
+		}
+	}
+	if len(switches) != 1 || switches[0] != "false" {
+		t.Errorf("DRIFT_DETECTOR_ENABLED = %q, want exactly one \"false\"", switches)
+	}
+	if len(settings) != 0 {
+		t.Errorf("a detector that is off must carry no settings, got %q", settings)
+	}
+}
+
+// Same property as the watcher's switch, and the same failure mode if it breaks:
+// `containers[].env` is a listType=map keyed on name, so a duplicate makes the
+// Deployment unappliable and the operator stops reconciling altogether. The
+// operator appends these six after mergeCredentialProxyEnv runs, so the only
+// thing standing between a CR naming one of them and a frozen reconcile is the
+// reserved list.
+func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
+	names := []string{
+		"DRIFT_DETECTOR_ENABLED",
+		"DRIFT_DETECTOR_PROJECT_ID",
+		"DRIFT_DETECTOR_CLUSTER_LOCATION",
+		"DRIFT_DETECTOR_CLUSTER_NAME",
+		"DRIFT_DETECTOR_SUBSCRIPTION",
+		"DRIFT_DETECTOR_GITOPS_MANAGERS",
+	}
+
+	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+	for _, name := range names {
+		agent.Spec.Deployment.Env = append(agent.Spec.Deployment.Env, corev1.EnvVar{Name: name, Value: "cr-supplied"})
+	}
+
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		counts[e.Name]++
+		values[e.Name] = e.Value
+	}
+	for _, name := range names {
+		if counts[name] != 1 {
+			t.Fatalf("want exactly one %s entry, got %d; server-side apply rejects a duplicate key in env", name, counts[name])
+		}
+		if values[name] == "cr-supplied" {
+			t.Errorf("%s took its value from spec.deployment.env; the operator's must win", name)
+		}
+	}
+}
+
 // A CR that already mounts /tmp must not collide with the operator's tmp-scratch mount.
 // Two VolumeMounts on one mountPath make the Deployment unappliable, so the failure is not
 // a redundant mount but a reconcile that stops on an upgrade.
@@ -6650,5 +6893,261 @@ func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 					"only caller disagree", hasPods, armed)
 			}
 		})
+	}
+}
+
+// TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider covers the state
+// ConfigMap half of docs/designs/version-control-support.md §6: each entry's
+// `type` is its forge's provider, each role lands in its own list, and a
+// repository on a host the provider does not serve seeds nothing rather than
+// being rewritten onto a host it does.
+func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
+	const githubEntry = `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"}]`
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "gke-labs"}}
+	gitops := func(repository string) []agentv1alpha1.RepositorySpec {
+		return []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: repository, Role: "gitops"}}
+	}
+
+	cases := []struct {
+		name    string
+		spec    agentv1alpha1.IntegrationSpec
+		managed string
+		context string
+	}{
+		{
+			name:    "lists",
+			spec:    agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("kube-agents")},
+			managed: githubEntry,
+		},
+		{
+			name: "lists with the provider defaulted",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "github"}},
+				Repositories: gitops("https://github.com/gke-labs/kube-agents.git")},
+			managed: githubEntry,
+		},
+		{
+			// The two spellings must seed the identical entry, or the deprecated
+			// alias is a second code path rather than an alias.
+			name: "deprecated github alias",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				Org: "gke-labs", GitRepo: "kube-agents"}},
+			managed: githubEntry,
+		},
+		{
+			// GitOps first whatever the declaration order, because the agent
+			// reads the first managed entry as the repository its GitOps work
+			// lands in; context entries go to their own list.
+			name: "every role",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"},` +
+				`{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			// An invalid entry is skipped, not the list: one typo must not take
+			// the GitOps repository out of the ConfigMap with it.
+			name: "an invalid repository does not drop its neighbours",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "git@gitlab.com:group/project.git", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			// With the webhook off (the chart default) nothing but the seeding
+			// itself stops an entry Problems refuses: "None" would qualify into
+			// gke-labs/None, a duplicate would be written twice, and a namespace
+			// outside GitHub's grammar would reach the minter's scopes.
+			name: "entries Problems refuses are not seeded",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "None", Role: "managed"},
+				{Forge: "github", Repository: "https://github.com/gke-labs/kube-agents", Role: "context"},
+				{Forge: "github", Repository: "apps", Namespace: "my.org", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			name: "a repository on a forge with a bad namespace is not seeded",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "my.org"}},
+				Repositories: gitops("kube-agents"),
+			},
+		},
+		{
+			// The agent reads the first managed_repos entry as its GitOps
+			// repository, so an accepted managed one must not take the place of
+			// a refused gitops one. Context repositories hold no such place.
+			name: "a refused gitops repository seeds no managed one in its place",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "in fra", Role: "gitops"},
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+			}},
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			name: "managed repositories are seeded where no gitops one is declared",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+		},
+		{
+			// Before this change the operator wrote
+			// {"type":"github","url":"https://github.com/group/project"} here: the
+			// host was discarded, the two remaining slashes passed the shape check,
+			// and the URL was rebuilt against github.com. The agent then had a
+			// registered repository nobody had declared.
+			name: "an scp remote on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("git@gitlab.com:group/project.git")},
+		},
+		{
+			// The other half of the same defect: CleanRepoURLWithOrg returned an
+			// https URL verbatim, so this seeded a gitlab.com URL under
+			// "type":"github" — an entry whose two fields named different forges.
+			name: "an https URL on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("https://gitlab.com/group/project")},
+		},
+		{
+			name: "a repository on an undeclared forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "gitlab", Repository: "group/project", Role: "gitops"}}},
+		},
+		{
+			name: "both spellings at once seed nothing",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       gh,
+				Repositories: gitops("kube-agents"),
+				GitHub:       &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+			},
+		},
+		{
+			name: "the no-repository sentinel seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: agentv1alpha1.NoRepositorySentinel}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: tc.spec},
+				},
+			}
+			data := buildGitopsStateConfigMap(agent).Data
+			if got := data["managed_repos"]; got != tc.managed {
+				t.Errorf("managed_repos = %q, expected %q", got, tc.managed)
+			}
+			if got := data["context_repos"]; got != tc.context {
+				t.Errorf("context_repos = %q, expected %q", got, tc.context)
+			}
+		})
+	}
+}
+
+// TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub is the upgrade half
+// of deriving the forge egress: an install that declares nothing, one on the
+// deprecated `github` alias, and one on the forge lists with GitHub must all
+// render the identical allowlist — and the forge patterns must sit where the
+// literals used to, so an upgrade re-renders a GitHub install's policy
+// unchanged rather than churning every FQDNNetworkPolicy in the fleet.
+func TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub(t *testing.T) {
+	render := func(integration *agentv1alpha1.PlatformAgentIntegrationSpec) []string {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+			Spec:       agentv1alpha1.PlatformAgentSpec{Integration: integration},
+		}
+		spec := buildFQDNNetworkPolicy(agent).Object["spec"].(map[string]interface{})
+		rule := spec["egress"].([]interface{})[0].(map[string]interface{})
+		var patterns []string
+		for _, m := range rule["matches"].([]interface{}) {
+			patterns = append(patterns, m.(map[string]interface{})["pattern"].(string))
+		}
+		return patterns
+	}
+
+	baseline := render(nil)
+	at := slices.Index(baseline, "*.pkg.dev")
+	if at < 0 || !slices.Equal(baseline[at+1:at+4], []string{"github.com", "*.github.com", "*.githubusercontent.com"}) {
+		t.Fatalf("GitHub's patterns moved from their pre-derivation position after *.pkg.dev: %v", baseline)
+	}
+
+	for name, integration := range map[string]*agentv1alpha1.PlatformAgentIntegrationSpec{
+		"deprecated alias": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "gke-labs", GitRepo: "kube-agents"}}},
+		"lists": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "github.com"}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "gke-labs/kube-agents", Role: "gitops"}}}},
+		"two github forges": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "ours", Namespace: "gke-labs"}, {Name: "upstream", Host: "www.github.com"}}}},
+	} {
+		if got := render(integration); !slices.Equal(got, baseline) {
+			t.Errorf("%s renders %v, expected the undeclared install's %v", name, got, baseline)
+		}
+	}
+}
+
+// The watcher's metrics listener, declared on the sidecar. Three things have
+// to agree for a scrape to work — the port the entrypoint binds, the container
+// port, and the collector's ingress rule — and all three read one constant.
+// This pins the constant's value and checks the two declarations here read it;
+// the ingress rule is TestBuildNetworkPolicy's.
+func TestAgentAPIAuthSidecarDeclaresTheWatcherMetricsPort(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var ports []corev1.ContainerPort
+	for _, p := range sidecar.Ports {
+		if p.Name == "event-metrics" {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) != 1 || ports[0].ContainerPort != 9095 {
+		t.Fatalf("want exactly one event-metrics container port on 9095, got %#v", sidecar.Ports)
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_METRICS_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_METRICS_PORT entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].Value != "9095" {
+		t.Errorf("EVENT_WATCHER_METRICS_PORT = %q, want the declared container port 9095", found[0].Value)
+	}
+}
+
+// Same hole as the three watcher variables beside it: appended after the merge,
+// so an unreserved name would sit beside a same-named spec.deployment.env entry
+// and server-side apply would reject the Deployment. And a CR that moved the
+// listener would leave the container port and the ingress rule pointing at a
+// port nothing answers on, so the operator's value has to be the only one.
+func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_METRICS_PORT", Value: "1"}},
+	}
+
+	var found []string
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_METRICS_PORT" {
+			found = append(found, e.Value)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_METRICS_PORT entry, got %d (%q); server-side apply rejects a duplicate key in env", len(found), found)
+	}
+	if found[0] != "9095" {
+		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
 	}
 }

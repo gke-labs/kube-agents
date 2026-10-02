@@ -1,0 +1,31 @@
+
+## 2026-09-29T14:22:41Z [runtime/before-runtime] K get nodes -l role=work -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+NAME                                  RUNTIME
+gke-upg-13b-work-pool-f7924c19-fbrz   containerd://1.7.34
+## exit 0
+
+## 2026-09-29T14:22:42Z [runtime/before-crictl] K -n scen logs ds/cri-v1alpha2-agent --tail=4
+Defaulted container "agent" out of: agent, fetch (init)
+Version:  0.1.0
+RuntimeName:  containerd
+RuntimeVersion:  1.7.34
+RuntimeApiVersion:  v1alpha2
+## exit 0
+## 2026-09-29T14:22:44Z [runtime/note] patch-only node upgrade 1.31.14-gke.2704000 -> 1.31.14-gke.2759000
+
+## 2026-09-29T14:26:11Z [runtime/after-runtime] K get nodes -l role=work -o custom-columns=NAME:.metadata.name,RUNTIME:.status.nodeInfo.containerRuntimeVersion
+NAME                                  RUNTIME
+gke-upg-13b-work-pool-f7924c19-7rz8   containerd://2.0.10
+gke-upg-13b-work-pool-f7924c19-fbrz   containerd://1.7.34
+## exit 0
+
+## 2026-09-29T14:26:13Z [runtime/after-crictl] K -n scen logs ds/cri-v1alpha2-agent --tail=6
+Found 2 pods, using pod/cri-v1alpha2-agent-ph6x5
+Defaulted container "agent" out of: agent, fetch (init)
+Tue Sep 29 14:24:45 UTC 2026
+time="2026-09-29T14:24:45Z" level=fatal msg="getting the runtime version: rpc error: code = Unimplemented desc = unknown service runtime.v1alpha2.RuntimeService"
+CRICTL-FAILED
+Tue Sep 29 14:25:45 UTC 2026
+time="2026-09-29T14:25:45Z" level=fatal msg="getting the runtime version: rpc error: code = Unimplemented desc = unknown service runtime.v1alpha2.RuntimeService"
+CRICTL-FAILED
+## exit 0

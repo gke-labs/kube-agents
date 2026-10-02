@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -70,6 +71,15 @@ const (
 
 	// fieldOwner identifies this controller in Server-Side Apply managedFields.
 	fieldOwner = "platformagent-controller"
+
+	// The values status.usage.activeInterfaces is made of, one per channel the
+	// spec can enable. A status vocabulary of its own rather than Hermes' platform
+	// keys ("google_chat" in the rendered config): the status is read by people and
+	// dashboards, and one lower-case word per channel reads the same everywhere.
+	interfaceDashboard  = "dashboard"
+	interfaceGoogleChat = "googlechat"
+	interfaceSlack      = "slack"
+	interfaceTeams      = "teams"
 )
 
 // The Kubernetes recommended labels, stamped on every object this controller
@@ -228,10 +238,13 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 
 // deriveImageFromOperator is the same substitution for any repository built and
 // released alongside the operator, not the platform agent alone. The sandbox is
-// the second caller: it is a fourth image from the same workflow and the same
+// the second caller: it is an image from the same workflow and the same
 // commit, so an install that mirrored the operator has mirrored it too, and
 // reaching ghcr.io for it on a private-registry install is the same failure
-// this derivation exists to avoid for the agent.
+// this derivation exists to avoid for the agent. The three A2A next-stack
+// images are the third, through a2aReleaseImage, which passes OPERATOR_IMAGE
+// when set and the resolved agent image otherwise; the substitution is the
+// same.
 func deriveImageFromOperator(operatorImage, repository string) string {
 	lastSlash := strings.LastIndex(operatorImage, "/")
 	prefix := ""
@@ -275,11 +288,8 @@ func fluentBitImage() string {
 }
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
-//
-// qualify_image_ref() in scripts/installer/common.sh is the provisioning-time
-// twin of this rule and must agree on how a reference is split. The no-tag
-// fallback deliberately differs: this path is serving a live CR and settles for
-// "latest", while the shell helper can still abort the run and does.
+// A reference with no tag or digest settles for "latest": this path is serving
+// a live CR and cannot abort the run.
 func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage string) string {
 	image := defaultImage
 	if deployment != nil && deployment.Image != "" {
@@ -576,4 +586,32 @@ func defaultSecretRef(ref *corev1.SecretKeySelector, secretName, defaultKey stri
 		Key:                  defaultKey,
 		Optional:             ptr.To(true),
 	}
+}
+
+// resolveActiveInterfaces lists the interfaces agent's spec enables, sorted, for
+// status.usage.activeInterfaces. Nil-safe on every pointer along the way: the
+// integration block and each channel in it are optional, and a channel's Enabled
+// is a *bool defaulting to false, so a present block is not an enabled one. The
+// dashboard is the exception, on unless the spec turns it off, which
+// isDashboardEnabled already encodes. Sorted so that two specs enabling the same
+// set compare equal in the status gate whatever order the checks run in.
+func resolveActiveInterfaces(agent *agentv1alpha1.PlatformAgent) []string {
+	var interfaces []string
+	if isDashboardEnabled(agent) {
+		interfaces = append(interfaces, interfaceDashboard)
+	}
+	if agent != nil && agent.Spec.Integration != nil {
+		integration := agent.Spec.Integration
+		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+			interfaces = append(interfaces, interfaceGoogleChat)
+		}
+		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
+			interfaces = append(interfaces, interfaceSlack)
+		}
+		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
+			interfaces = append(interfaces, interfaceTeams)
+		}
+	}
+	slices.Sort(interfaces)
+	return interfaces
 }

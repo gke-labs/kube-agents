@@ -62,21 +62,39 @@ __all__ = [
     "listing",
 ]
 
-# The eight verbs a forge may serve, plus the three the broker serves for every
-# forge. Spelled with hyphens because that is how they appear in a route and in
-# the `verbs` list a caller reads back from `capabilities`.
+# The verbs a forge may serve, plus the ones the broker serves for every forge.
+# Spelled with hyphens because that is how they appear in a route and in the
+# `verbs` list a caller reads back from `capabilities`.
+#
+# The first eight were the version-control skill's; the rest arrived with the
+# consumer migration and are the union of what the shipped callers actually do
+# to a forge -- edit and close what they opened, read a proposal's commits,
+# acknowledge a comment, keep a label in existence. Decided by the callers,
+# not by any forge's API surface.
 COLLABORATION_VERBS: tuple[str, ...] = (
     "proposal-create",
     "proposal-list",
     "proposal-view",
     "proposal-comment",
+    "proposal-update",
+    "proposal-close",
+    "proposal-commits",
+    "proposal-acknowledge",
     "issue-create",
     "issue-list",
     "issue-view",
     "issue-comment",
+    "issue-update",
+    "issue-close",
+    "label-ensure",
 )
 
-BROKER_VERBS: tuple[str, ...] = ("capabilities", "clone", "publish")
+# `branch-view` and `branch-delete` are the broker's rather than a forge's for the
+# reason `publish` is: which refs a remote holds, and removing one, is git
+# against a URL on every forge.
+BROKER_VERBS: tuple[str, ...] = (
+    "capabilities", "clone", "publish", "identity", "branch-view", "branch-delete",
+)
 
 
 class ForgeUnsupported(WorkspaceError):
@@ -112,8 +130,8 @@ class Forge:
     # What this forge calls a change proposal, for messages the caller reads.
     proposal_noun = "change proposal"
     # Which of the collaboration verbs this forge serves. A forge that serves
-    # all of them says so; one with no issue tracker omits four and gets a
-    # named refusal for free.
+    # all of them says so; one with no issue tracker omits the six `issue-*`
+    # verbs and gets a named refusal for free.
     verbs: tuple[str, ...] = ()
     # "cli" or "http". A declaration; the broker builds the thing. `cli` is the
     # second half of the same declaration and is meaningful only for the first:
@@ -125,6 +143,11 @@ class Forge:
     cli = ""
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
+    # Whether `proposal-acknowledge` does anything here. A capability rather
+    # than an assumption: Bitbucket Cloud has no reactions on pull-request
+    # comments, and a caller that assumed one would either crash there or
+    # silently skip it. Read back from `capabilities`.
+    acknowledges = False
 
     def __init__(self) -> None:
         self.credential: Credential = NoCredential()
@@ -185,11 +208,40 @@ class Forge:
             "forge": self.name,
             "repo": repo,
             "proposalNoun": self.proposal_noun,
-            "verbs": sorted({*BROKER_VERBS, *self.verbs}),
+            # `branch-delete` is served for every forge but decided by
+            # `proposal-list`: without it whether a branch is spent cannot be
+            # read, and the broker refuses the delete. Advertising it would
+            # send a caller to a refusal it could have seen here.
+            "verbs": sorted(
+                {*BROKER_VERBS, *self.verbs}
+                - (set() if "proposal-list" in self.verbs else {"branch-delete"})
+            ),
+            "acknowledge": self.acknowledges,
             "missing": [],
         }
 
-    # -- the eight verbs ----------------------------------------------------
+    def can_write(
+        self, api: Callable, repo: str, login: str, bot: bool = False
+    ) -> bool | None:
+        """Whether `login` may write to `repo`: True, False, or None for unknown.
+
+        The normalised answer to a question every forge spells differently and
+        the agent-side policy asks of every comment author. `None` is not
+        `False`: a forge that could not find out -- a proxy fault, a timeout --
+        must not be read as a refusal, because the caller that asks this writes
+        a permanent refusal marker on a `False`. A forge that cannot answer at
+        all leaves this alone and callers treat every login as unknown.
+
+        `bot` says the login is an automation's, as this forge reported it on
+        the comment the caller is asking about. The translation strips whatever
+        marks an automation's login apart from a person's, so the caller cannot
+        put it back; a forge whose App accounts are a different principal from
+        a same-named user re-applies its own spelling here. A forge with no
+        such distinction ignores it.
+        """
+        return None
+
+    # -- the collaboration verbs----------------------------------------------
     #
     # Each takes the transport's `api` callable, the parsed repository, and the
     # caller's payload; each returns the normalised shape for its concept.
@@ -232,6 +284,27 @@ class Forge:
 
     def issue_comment(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("issue-comment")
+
+    def proposal_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("proposal-update")
+
+    def proposal_close(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("proposal-close")
+
+    def proposal_commits(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("proposal-commits")
+
+    def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("proposal-acknowledge")
+
+    def issue_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("issue-update")
+
+    def issue_close(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("issue-close")
+
+    def label_ensure(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        return self._unsupported("label-ensure")
 
 
 class StubForge(Forge):
@@ -288,6 +361,7 @@ class StubForge(Forge):
             "repo": repo,
             "proposalNoun": self.proposal_noun,
             "verbs": [],
+            "acknowledge": False,
             "missing": list(self.missing),
         }
 
@@ -295,4 +369,6 @@ class StubForge(Forge):
         raise ForgeUnsupported(f"{self.name}: {self.missing[-1]}")
 
     proposal_create = proposal_list = proposal_view = proposal_comment = _refuse
+    proposal_update = proposal_close = proposal_commits = proposal_acknowledge = _refuse
     issue_create = issue_list = issue_view = issue_comment = _refuse
+    issue_update = issue_close = label_ensure = _refuse

@@ -14,14 +14,15 @@
 # slot and no entry in a catalogue keyed by one).
 #
 # A case names a fixture by role and never by a cluster name or a project id.
-# Each eval project carries its own trio of clusters (`bench/tf/fleet/`,
+# Each eval project carries its own set of clusters (`bench/tf/fleet/`,
 # `var.cluster_prefix` defaults to "seeded", so the live names are
-# seeded-a/b/c), and a case written against one project has to run unchanged
+# seeded-a to seeded-d), and a case written against one project has to run unchanged
 # against the next. The slot letter is the addressable thing; the name is a
 # rendering of it.
 #
 # scripts/validate_bench_cases.py reads this file and rejects a task.yaml whose
-# `fixtures:` list names a role that is in neither catalogue. docs/designs/
+# `fixtures:` list names a role that is in neither catalogue, unless the case
+# is parked in FIXTURE_NOT_READY on the issue that plants it. docs/designs/
 # bench-fleet-catalog.md is the prose contract; bench/tf/fleet/ is the
 # implementation and the source of every object name below.
 #
@@ -31,18 +32,21 @@
 # runs per project, so a fleet-wide assertion holds only from the most recently
 # applied project's date.
 
-# The three cluster slots. `slot` is what a case addresses; `suffix` is what
+# The cluster slots. `slot` is what a case addresses; `suffix` is what
 # the Terraform appends to var.cluster_prefix to render the live name.
 slots:
   - slot: a
     suffix: a
-    carries: The four seeded workload namespaces and the two defect node pools
+    carries: The seeded namespaces and the two defect node pools
   - slot: b
     suffix: b
-    carries: The held-back control plane, and no workloads
+    carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
     carries: The configuration outlier, and no workloads
+  - slot: d
+    suffix: d
+    carries: Nodes in two zones, and the zonal-skew workloads
 
 fixtures:
   - role: rbac-overgrant
@@ -65,6 +69,18 @@ fixtures:
     defect: >-
       Two replicas with no PodDisruptionBudget. Two rather than one because the
       reliability SOP flags spec.replicas >= 2 only.
+
+  - role: declared-no-pdb-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/notification-relay
+    namespace: seeded-intent
+    defect: >-
+      Two replicas with no PodDisruptionBudget, the posture a knowledge/ note in
+      the pool project's GitOps repository declares on purpose. A second such
+      workload so the declaration silences none of the cases that grade
+      checkout-gateway.
 
   - role: crashloop-workload
     slot: a
@@ -90,6 +106,26 @@ fixtures:
       is not the role slug, see bench-fleet-catalog.md. The desired replica
       count is not stable across projects (measured 3/2/3 on 2026-08-24), so
       assert the pin and the unmet demand and never a number.
+
+  - role: deprecated-api-caller
+    slot: a
+    available_from_day: 0
+    objects:
+      - cronjob/legacy-endpoints-writer
+      - service/legacy-endpoints-lane
+      - endpoints/legacy-endpoints-lane
+    namespace: seeded-deprecation
+    defect: >-
+      A CronJob on a dedicated ServiceAccount that merge-patches an annotation
+      onto a hand-written Endpoints v1 object every ten minutes. Endpoints is
+      deprecated and still served (the fleet README says since when), so on
+      every fleet master each write is audit-stamped k8s.io/deprecated=true
+      with no k8s.io/removed-release label and no Recommender insight; a case
+      reads the trail by principal plus methodName, never by the label alone,
+      because kube-system's endpoint-controller is stamped the same way. The
+      first run is a Job the apply waits on, so day 0 already has an entry.
+      The writer refuses to write below 1.33, so a master that old shows as a
+      retained failed Job rather than as a silent fixture.
 
   - role: idle-nodepool
     slot: a
@@ -125,8 +161,9 @@ fixtures:
       SOP's master-behind check at all. Held between reconciles by a
       NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from the
       location-wide valid_master_versions rather than the channel's own list,
-      so the held version is absent from REGULAR and upgrade check 3.1 branch
-      (a) fires at critical too -- an undeclared finding, see
+      so the held version can be absent from REGULAR; it is still offered at
+      the location, so upgrade check 3.1 branch (a) does not fire and the
+      cluster carries branch (b) at major. See
       docs/designs/bench-fleet-catalog.md.
 
   - role: drift-outlier
@@ -135,7 +172,83 @@ fixtures:
     objects:
       - cluster/self
     defect: >-
-      Master authorized networks absent, where slots a and b carry an
+      Master authorized networks absent, where slots a, b and d carry an
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
-      under 24 hours old from every cohort, and its cohort floor of three
-      clusters means a replaced cluster silences the audit fleet-wide for a day.
+      under 24 hours old from every cohort, and its cohort floor is three
+      clusters: replacing c silences the finding for a day, and so does
+      replacing any cluster on a project whose fleet predates slot d.
+
+  - role: readiness-surge-blocked
+    slot: b
+    available_from_day: 0
+    objects:
+      - nodepool/no-surge-pool
+    defect: >-
+      A node pool with maxSurge 0 and maxUnavailable 1, so an upgrade recreates
+      its only node in place. Tainted seeded-role=no-surge so only the pinned
+      workload lands there. Not a Blocker on its own: the gke-upgrades skill
+      prescribes the setting for reservation-bound pools.
+
+  - role: readiness-pinned-workload
+    slot: b
+    available_from_day: 0
+    objects:
+      - deployment/pinned-batch-runner
+    namespace: seeded-upgrade
+    defect: >-
+      One replica whose nodeSelector names no-surge-pool alone, so it is down
+      for the whole of each in-place node recreate.
+
+  - role: readiness-drain-blocked
+    slot: b
+    available_from_day: 0
+    objects:
+      - poddisruptionbudget/pinned-batch-runner
+    namespace: seeded-upgrade
+    defect: >-
+      A PodDisruptionBudget with maxUnavailable 0 over the pinned workload, so
+      disruptionsAllowed is 0 permanently and no drain that touches it can
+      finish.
+
+  - role: readiness-failclosed-webhook
+    slot: b
+    available_from_day: 0
+    objects:
+      - validatingwebhookconfiguration/seeded-fail-closed-gate
+    defect: >-
+      failurePolicy Fail with the maximum 30-second timeout, pointing at a
+      Service that does not exist. The missing backend is the defect; Fail
+      alone is set by healthy webhooks. Selectors confine it so it rejects no
+      other scenario's writes.
+
+  - role: zonal-skew-scheduling
+    slot: d
+    available_from_day: 0
+    objects:
+      - deployment/zone-pinned-api
+    namespace: seeded-topology
+    defect: >-
+      Two replicas with a ScheduleAnyway zonal spread beside a required
+      nodeAffinity only one zone satisfies, so both land in one zone. The fix
+      is a manifest edit.
+
+  - role: zonal-skew-volume
+    slot: d
+    available_from_day: 0
+    objects:
+      - statefulset/zone-bound-store
+    namespace: seeded-topology
+    defect: >-
+      One replica on a zonal standard-rwo claim, so the pod cannot change zone
+      without leaving its data. The fix is a migration, not an edit.
+
+  - role: zonal-skew-capacity
+    slot: d
+    available_from_day: 0
+    objects:
+      - deployment/capacity-starved-worker
+    namespace: seeded-topology
+    defect: >-
+      Four replicas at 120m CPU against two e2-small nodes, so those that do
+      not fit stay Pending on insufficient CPU. Its distribution looks like
+      the scheduling case; only the Pending pods' events say otherwise.

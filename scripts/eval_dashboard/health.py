@@ -6,16 +6,23 @@ same mechanical procedure: open the dashboard, find the reds of the last few
 hours, ask whether the same cases failed on unrelated pull requests (a shared
 fixture broke -- #1278), whether the repetitions were lost to 429s and empty
 records rather than graded (a quota storm -- #1225, #1097), whether runs
-died before any task ran (setup failures), or whether the build cluster lost
-the node the pod was on (lost pods -- #1478). Nobody derives that from a
-heatmap at 8am, so this turns the procedure into a job.
+died before any task ran (setup failures), whether the build cluster lost
+the node the pod was on (lost pods -- #1478), or whether Prow killed the
+runs at the job deadline with nothing graded (deadline kills -- #1894).
+Nobody derives that from a heatmap at 8am, so this turns the procedure into
+a job.
 
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
-written health.json in -- and, when the hourly seeded-fleet scan has
-published one, fixture-state.json (scripts/eval_dashboard/fixture_state.py)
--- health.json out::
+written health.json in -- and, when the hourly scans have published them,
+fixture-state.json (scripts/eval_dashboard/fixture_state.py) and
+pool-state.json (scripts/eval_dashboard/pool_state.py), and the watched
+periodics' readings (`--periodics-dir`, scripts/eval_dashboard/periodics.py)
+-- health.json out (abridged; SCHEMA.md has every key)::
 
-    {state, since, cause, failing_cases, evidence, advice, slow, pool, metrics, generated_at}
+    {state, since, cause, failing_cases, evidence, advice, slow, pool,
+     fixture_state, pool_state, periodics, periodics_read, periodics_runs,
+     periodics_streaks, periodics_since,
+     metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
 constants below -- each names the incident it was tuned on -- and the state
@@ -60,10 +67,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, tiers
+    from . import fixture_state, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import fixture_state
+    import periodics
+    import pool_state
     import tiers
 try:
     import eval_rosters
@@ -85,13 +94,21 @@ STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
 LOST_PODS = "lost_pods"
 FIXTURE_DRIFT = "fixture_drift"
+# Rule 3e (#1967): the hourly pool-state scan found a pool project no longer
+# shaped the way the verifier requires -- a role missing or extra, an API
+# off, a key or cluster gone.
+POOL_DRIFT = "pool_drift"
 # A ceiling wave: enough repetitions across enough pull requests ended at the
 # harness's delegation wait with the worker still running (rule 2b, #1874).
 DELEGATION_CEILING = "delegation_ceiling"
-# The conditions whose evidence is not a full run -- a count of runs that
-# never became one, or the fleet scan's verdict; rule 6's entry check takes
-# the evidence itself as currency.
-COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT)
+# Rule 3d (#1894): runs Prow killed at the job deadline with no verdict.
+DEADLINE_KILL = "deadline_kill"
+# The conditions whose evidence is a count rather than a full run's
+# signature -- runs that never became one, runs Prow killed, or a scan's
+# verdict; rule 6's entry check takes the count itself as currency.
+COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS, FIXTURE_DRIFT, POOL_DRIFT, DEADLINE_KILL)
+# The two scan-based conditions, which share one rule and one exit.
+SCAN_CONDITIONS = (FIXTURE_DRIFT, POOL_DRIFT)
 
 # Prow's job verdicts (SCHEMA.md: runs[].result). ABORTED is a superseded
 # push, not a statement about the gate, and is counted nowhere below except
@@ -262,6 +279,34 @@ LOST_POD_SPAN = timedelta(minutes=30)
 LOST_POD_MIN = 3
 LOST_POD_EVENT_MIN = 8
 POD_EVENT_NODE_NOT_READY = "NodeNotReady"
+
+# --- Rule 3d: deadline kills -> OUTAGE (#1894) -------------------------------
+# Incident: from the evening of 2026-09-22 (UTC) the Hermes bump wedged the
+# workers (#1880) and presubmit runs were killed at Prow's 360m deadline with
+# every unit at the delegation ceiling and nothing graded -- 33 kills against
+# 10 verdicts in the fixture's 32 hours -- and the bot stayed GREEN: a
+# deadline death after a successful deploy matched no rule.
+#
+# The rule: a run is a deadline kill when it concluded FAILURE with no eval
+# verdict, is neither a lost pod nor a conflicted merge, and lasted at least
+# PROW_JOB_TIMEOUT minus DEADLINE_KILL_MARGIN. Not "no tasks": since #1875 the
+# harness records cases as they finish, so a killed run may carry graded
+# tasks and still no verdict. DEADLINE_KILL_MIN of them finishing inside
+# DEADLINE_KILL_WINDOW on DEADLINE_KILL_MIN_PRS distinct pull requests is an
+# OUTAGE -- the gate can pass nobody -- ranked below a shared break, which
+# names cases, and above every DEGRADED condition. Recovery is
+# RECOVERY_GREEN_RUNS runs WITH A VERDICT, green or red, on distinct pull
+# requests after the last kill: a red that graded proves the gate grades.
+#
+# The timeout is the job's decoration_config.timeout in oss-test-infra
+# (prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml); data.json
+# does not carry it. The margin covers the 362-365 minutes Prow records for
+# a killed run without reaching a long green.
+PROW_JOB_TIMEOUT = timedelta(minutes=360)
+DEADLINE_KILL_MARGIN = timedelta(minutes=15)
+DEADLINE_KILL_WINDOW = timedelta(hours=2)
+DEADLINE_KILL_MIN = 3
+DEADLINE_KILL_MIN_PRS = 2
 # The lost-pod advice names the loss on the reader's clock, the way
 # post_health.py writes every time a person reads (docs/ci-health.md, Times);
 # zone and label are fixed together there and mirrored here rather than
@@ -300,6 +345,18 @@ NOON = 12
 FIXTURE_DRIFT_MIN_PROJECTS = 3
 FIXTURE_DRIFT_CONSECUTIVE_SCANS = 2
 FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
+# Rule 3e, pool drift, is the same rule over pool-state.json with the same
+# thresholds: the same finding failing on the same project in two
+# consecutive scans, or on three projects in one (#1927's shape was all 30).
+# A run that leases a drifted project fails on the missing grant with a 403
+# in the agent's transcript, not on the change; the run-based rules see that
+# red, this one names the cause and carries the repair.
+POOL_STATE_LABEL = "pool-state"
+# The verifier's synthesised finding for a check that failed with nothing more
+# specific to say: `<check>/failed` (REPORT_FINDING_FAILED in
+# scripts/verify_ci_pool_project.py; the pool-state tests pin the two equal).
+SCAN_FAILED_SUFFIX = "/failed"
+FIXTURE_STATE_LABEL = "fixture-state"
 # How many projects an evidence line names before "and N more".
 EVIDENCE_MAX_PROJECTS = 4
 
@@ -313,13 +370,15 @@ EVIDENCE_MAX_PRS = 6
 # Entering OUTAGE or DEGRADED needs the condition to be current, not merely
 # inside the window: one of the last TRANSITION_MIN_RUNS completed full runs
 # has to carry the condition's signature (the rules themselves already need
-# three runs' worth of evidence). Setup deaths are exempt -- they are not
-# full runs, so the count is the currency. Leaving for GREEN needs
+# three runs' worth of evidence). COUNTED_CONDITIONS are exempt -- setup
+# deaths, lost pods, deadline kills and fixture drift have no signature on a
+# full run, so the count is the currency. Leaving for GREEN needs
 # RECOVERY_GREEN_RUNS consecutive green runs on distinct pull requests, all
 # finished after the incident began and none carrying the signature of the
 # condition being left -- a single lucky green does not declare victory, and
 # the runs that made the incident cannot end it (#1213 is the false-green
-# risk in the other direction).
+# risk in the other direction). A deadline-kill OUTAGE is left on the same
+# count of runs WITH A VERDICT, green or red (`recovered`).
 TRANSITION_MIN_RUNS = 3
 RECOVERY_GREEN_RUNS = 3
 
@@ -334,8 +393,17 @@ RECOVERY_GREEN_RUNS = 3
 # broken and /retest does not help.
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
-# concluded run of at least SLOW_MIN_TASKS cases (the presubmit runs 18; a
-# run Prow cut short at its ceiling recorded fewer and is not one) -- all of
+# concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
+# presubmit file lists, read from hack/eval/presubmit-cases.txt: 13 for the
+# fourteen the presubmit runs since 2026-09-29 (twelve on the roster plus the
+# two held-out seats, the compliance canary, #2013, and pdb-remediation-pr,
+# #2016; twelve from 2026-09-22, when it became the
+# blocking roster only, #1023, having run 18-19 before); a run Prow cut short
+# at its ceiling recorded fewer and is not one; the floor was a literal 15
+# until the roster shrank under it, which would have made every run since a
+# partial one and the rule silent, so it follows the file and sits one
+# demotion below the roster on purpose, an admission or a demotion moving
+# it without an edit here) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
@@ -348,7 +416,19 @@ RECOVERY_GREEN_RUNS = 3
 # hovering at the bar is one episode rather than a note every tick.
 SLOW_RUNS = 5
 SLOW_WINDOW = timedelta(hours=6)
-SLOW_MIN_TASKS = 15
+
+
+def _slow_min_tasks(default: int = 11) -> int:
+    """One fewer than the presubmit file's case count; `default` when the
+    file cannot be read (a checkout without hack/eval/, an old era)."""
+    try:
+        cases = eval_rosters.presubmit_cases()
+    except (OSError, ValueError):
+        return default
+    return max(1, len(cases) - 1) if cases else default
+
+
+SLOW_MIN_TASKS = _slow_min_tasks()
 SLOW_BASELINE = timedelta(days=7)
 SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2
@@ -411,7 +491,9 @@ CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
 CAUSE_FIXTURE_DRIFT = "seeded fixture drift: {roles} out of designed state on {projects} pool project(s)"
+CAUSE_POOL_DRIFT = "pool drift: {findings} on {projects} pool project(s)"
 CAUSE_CEILING = "delegation ceiling: {reps} repetitions on {prs} PRs ended with the worker still running {start}–{end} UTC"
+CAUSE_DEADLINE_KILL = "deadline kills: {count} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict {start}–{end} UTC"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
 ADVICE_STORM = "Retest after {when} UTC; runs started inside the storm lose repetitions to 429s."
@@ -429,13 +511,30 @@ ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest once the fleet owner has re-applied bench/tf/fleet there (README, State and reconcile)."
 )
+ADVICE_POOL_DRIFT = (
+    "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
+    " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
+)
 ADVICE_CEILING = (
     "Retest once workers are finishing again; those runs read NOT EVALUATED, not red."
     " platform-agent-gateway.log in a run's artifacts says whether the dispatcher stalled (#1879) or 429s starved the workers."
 )
+ADVICE_DEADLINE_KILL = (
+    "Don't retest; runs are being killed at the {minutes}-minute deadline before anything is graded,"
+    " so nothing can pass. Tracking: {tracking}"
+)
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
     " after {count} consecutive green runs on distinct PRs."
+)
+# Leaving a deadline-kill outage: a verdict either way proves the gate grades
+# (`recovered`); the evidence line names the bar with recovery_bar().
+RECOVERY_BAR_GREEN = "green runs"
+RECOVERY_BAR_VERDICT = "runs with a verdict"
+ADVICE_RECOVERING_VERDICT = (
+    "The condition has cleared; a retest is reasonable. GREEN is reported once"
+    " the newest {count} runs with a verdict, green or red, are on distinct PRs"
+    " and all finished after the last kill."
 )
 ADVICE_STALE = "data.json last refreshed {generated_at} ({age} ago); the dashboard refresh is stalled and this state is that old."
 ADVICE_GREEN = ""
@@ -450,9 +549,10 @@ GZIP_SUFFIX = ".gz"
 # every phrase STORM_REASON_RE matches sits inside the first 96 characters
 # of the harness's phrasings, and the dashboard keeps 300.
 TRIM_REASON_CHARS = 96
-# The optional "how the build ended" run fields (SCHEMA.md) the trimmer
-# carries when the source has them; absent stays absent.
-ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict")
+# The optional run fields (SCHEMA.md) the trimmer carries when the source has
+# them; absent stays absent: how the build ended, and the eval's own verdict,
+# which is what tells a deadline kill from a long red.
+ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event", "merge_conflict", "eval_verdict")
 
 UTC = timezone.utc
 
@@ -544,7 +644,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -567,6 +667,11 @@ class Run:
         # Unknown stays a setup death: a document written before the collector
         # recorded the field must keep reading the way it did.
         self.merge_conflict = run.get("merge_conflict") if isinstance(run.get("merge_conflict"), bool) else None
+        # The eval loop's own verdict (SCHEMA.md, optional): None when the
+        # run never reached one, which a deadline kill never does. A document
+        # without the key is unknown, not "no verdict": it never makes a kill.
+        self.eval_verdict = run.get("eval_verdict") if isinstance(run.get("eval_verdict"), str) else None
+        self.eval_verdict_recorded = "eval_verdict" in run
 
     @property
     def full(self) -> bool:
@@ -612,6 +717,34 @@ class Run:
             and self.duration is not None
             and self.duration < SETUP_DEATH_MAX_DURATION
         )
+
+    @property
+    def deadline_kill(self) -> bool:
+        """Rule 3d's unit: Prow's deadline ended it, not the eval."""
+        return (
+            self.result == RUN_FAILURE
+            and self.eval_verdict_recorded
+            and self.eval_verdict is None
+            and not self.lost_pod
+            and self.merge_conflict is not True
+            and self.duration is not None
+            and self.duration >= PROW_JOB_TIMEOUT - DEADLINE_KILL_MARGIN
+        )
+
+    @property
+    def has_verdict(self) -> bool:
+        """Reached a verdict, which is what proves the gate grades: the
+        eval's own, or -- only for a document written before `eval_verdict`
+        existed, which is never a kill -- a concluded run. Either way at
+        least one repetition has to have been graded: NOT EVALUATED records
+        as RED (SCHEMA.md; the collector reads the `Failed` word), and a red
+        whose every repetition was lost to infrastructure graded nothing. A
+        recorded null is no verdict whatever the run carries: the harness
+        died after some cases and before its line."""
+        graded = any(task.graded for task in self.tasks)
+        if self.eval_verdict is not None:
+            return graded
+        return not self.eval_verdict_recorded and self.result in (RUN_SUCCESS, RUN_FAILURE) and graded
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
@@ -844,6 +977,31 @@ def setup_deaths(runs, now: datetime) -> dict:
     return {"fires": fires, "deaths": deaths, "prs": prs, "evidence": evidence}
 
 
+def deadline_kills(runs, now: datetime) -> dict:
+    """Rule 3d. Returns {fires, killed, prs, start, end, evidence}."""
+    killed = [run for run in _in_window(runs, now, DEADLINE_KILL_WINDOW) if run.deadline_kill]
+    prs = _prs(killed)
+    start = min((run.finished for run in killed), default=None)
+    end = max((run.finished for run in killed), default=None)
+    evidence = []
+    if killed:
+        evidence.append(_deadline_cause(killed, prs, start, end) + f" ({_pr_list(prs)})")
+    return {
+        "fires": len(killed) >= DEADLINE_KILL_MIN and len(prs) >= DEADLINE_KILL_MIN_PRS,
+        "killed": killed,
+        "prs": prs,
+        "start": start,
+        "end": end,
+        "evidence": evidence,
+    }
+
+
+def _deadline_cause(killed, prs, start, end) -> str:
+    return CAUSE_DEADLINE_KILL.format(
+        count=len(killed), prs=len(prs), minutes=int(PROW_JOB_TIMEOUT.total_seconds() // 60), start=hhmm(start), end=hhmm(end)
+    )
+
+
 def node_counts(runs) -> dict[str, int]:
     """{node: lost pods on it}, by name; runs with no recorded node skipped."""
     counts: dict[str, int] = {}
@@ -906,15 +1064,35 @@ def _project_list(projects) -> str:
     return f"{shown} and {extra} more" if extra > 0 else shown
 
 
-def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
-    """Rule 3c over fixture-state.json. Returns {fires, known, stale, unknown,
-    scanned_at, roles, projects, drift, current, checked, total, reason,
-    evidence}.
+class ScanKind:
+    """One hourly scan as rule 3c/3e reads it: the module that owns its
+    document, the label its evidence lines carry, and how a drifted unit
+    (a fixture role, a pool finding) maps to what the scan reads per project
+    (the role itself; the finding's check). Rule 6's exit asks whether a
+    later scan read those same units on the incident's projects."""
 
-    `current` is every project's drifted roles this scan, firing or not;
-    `roles` and `projects` are the ones that fire; `drift` is
-    {project: {role: [what the scan observed]}} for those; `read` is
-    {project: [roles the scan could read there]}, what rule 6's exit checks.
+    def __init__(self, module, label: str, verb: str, unit_read):
+        self.module = module
+        self.label = label
+        self.verb = verb
+        self.unit_read = unit_read
+
+
+FIXTURE_SCAN = ScanKind(fixture_state, FIXTURE_STATE_LABEL, "drifted on", lambda doc, project, role: role)
+POOL_SCAN = ScanKind(pool_state, POOL_STATE_LABEL, "found on", pool_state.check_of)
+
+
+def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
+    """Rules 3c and 3e over a scan document. Returns {fires, known, stale,
+    unknown, scanned_at, roles, projects, drift, repairs, reads, current,
+    read, checked, total, reason, evidence}.
+
+    `current` is every project's drifted units this scan, firing or not;
+    `roles` and `projects` are the units and projects that fire; `drift` is
+    {project: {unit: [what the scan observed]}} for those and `repairs`
+    {project: {unit: repair}}; `read` is {project: [what the scan could read
+    there]} and `reads` the subset of it the firing units need, which is
+    what rule 6's exit checks against a later scan.
     """
     out = {
         "fires": False,
@@ -922,54 +1100,70 @@ def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
         "stale": False,
         "unknown": False,
         "scanned_at": None,
+        "unread_units": 0,
         "roles": [],
         "projects": [],
         "drift": {},
+        "repairs": {},
+        "reads": {},
         "current": {},
         "read": {},
         "checked": 0,
         "total": 0,
+        "scanned": [],
+        "partial": False,
         "reason": None,
         "evidence": [],
     }
     if not isinstance(state_doc, dict):
         return out
+    module = scan.module
     out["known"] = True
-    scanned_at = parse_iso(state_doc.get(fixture_state.KEY_SCANNED_AT))
+    scanned_at = parse_iso(state_doc.get(module.KEY_SCANNED_AT))
     out["scanned_at"] = scanned_at
-    projects = state_doc.get(fixture_state.KEY_PROJECTS)
+    projects = state_doc.get(module.KEY_PROJECTS)
     out["total"] = len(projects) if isinstance(projects, dict) else 0
-    out["checked"] = fixture_state.checked_projects(state_doc)
+    out["scanned"] = sorted(projects) if isinstance(projects, dict) else []
+    # A document a hand run wrote for a few named projects says so; a project
+    # absent from it was not read, where one absent from the pool's document
+    # has left the mapping.
+    scope_key = getattr(module, "KEY_SCOPE", None)
+    out["partial"] = bool(scope_key) and state_doc.get(scope_key) == getattr(module, "SCOPE_SELECTED", None)
+    out["checked"] = module.checked_projects(state_doc)
+    out["unread_units"] = module.unread_units(state_doc)
     if scanned_at is None or now - scanned_at > FIXTURE_STATE_MAX_AGE:
         out["stale"] = True
         age = f"{int((now - scanned_at).total_seconds() // 3600)}h" if scanned_at else "of unknown age"
-        out["evidence"].append(f"fixture-state scan is {age} old (last {iso(scanned_at) or 'never'}); ignored, check the scan job")
+        out["evidence"].append(f"{scan.label} scan is {age} old (last {iso(scanned_at) or 'never'}); ignored, check the scan job")
         return out
     if out["total"] and out["checked"] == 0:
         out["unknown"] = True
-        out["reason"] = fixture_state.not_checked_reason(state_doc)
+        out["reason"] = module.not_checked_reason(state_doc)
         out["evidence"].append(
-            f"fixture-state scan at {hhmm(scanned_at)} UTC could check none of {out['total']} pool projects"
+            f"{scan.label} scan at {hhmm(scanned_at)} UTC could check none of {out['total']} pool projects"
             + (f" ({out['reason']})" if out["reason"] else "")
         )
         return out
-    current = fixture_state.drift_map(state_doc)
-    previous = fixture_state.previous_drift_map(state_doc)
+    current = module.drift_map(state_doc)
+    previous = module.previous_drift_map(state_doc)
     out["current"] = current
-    out["read"] = fixture_state.read_map(state_doc)
-    role_projects: dict[str, list[str]] = {}
-    for project, roles in current.items():
-        for role in roles:
-            role_projects.setdefault(role, []).append(project)
+    # The checks failing per project, for the exit of a `<check>/failed`
+    # unit; a fleet scan's units are its roles, so its failing set is current.
+    out["failing"] = module.failing_map(state_doc) if hasattr(module, "failing_map") else current
+    out["read"] = module.read_map(state_doc)
+    unit_projects: dict[str, list[str]] = {}
+    for project, units in current.items():
+        for unit in units:
+            unit_projects.setdefault(unit, []).append(project)
     firing: dict[str, list[str]] = {}
-    for role, projs in sorted(role_projects.items()):
-        repeated = [project for project in projs if role in previous.get(project, [])]
-        line = f"{role} drifted on {len(projs)} pool project(s) ({_project_list(projs)}) at the {hhmm(scanned_at)} UTC scan"
+    for unit, projs in sorted(unit_projects.items()):
+        repeated = [project for project in projs if unit in previous.get(project, [])]
+        line = f"{unit} {scan.verb} {len(projs)} pool project(s) ({_project_list(projs)}) at the {hhmm(scanned_at)} UTC scan"
         if repeated:
             line += f", the {FIXTURE_DRIFT_CONSECUTIVE_SCANS}nd consecutive scan on {_project_list(repeated)}"
         fires = len(projs) >= FIXTURE_DRIFT_MIN_PROJECTS or bool(repeated)
         if fires:
-            firing[role] = projs
+            firing[unit] = projs
         else:
             line += "; not yet repeated or widespread"
         out["evidence"].append(line)
@@ -978,10 +1172,32 @@ def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
         out["roles"] = sorted(firing)
         out["projects"] = sorted({project for projs in firing.values() for project in projs})
         out["drift"] = {
-            project: {role: fixture_state.drift_detail(state_doc, project, role) for role in out["roles"] if project in firing[role]}
+            project: {unit: module.drift_detail(state_doc, project, unit) for unit in out["roles"] if project in firing[unit]}
+            for project in out["projects"]
+        }
+        repair_for = getattr(module, "repair_for", None)
+        if repair_for is not None:
+            out["repairs"] = {
+                project: {unit: repair_for(state_doc, project, unit) for unit in out["roles"] if project in firing[unit]}
+                for project in out["projects"]
+            }
+        out["reads"] = {
+            project: sorted({scan.unit_read(state_doc, project, unit) for unit in out["roles"] if project in firing[unit]})
             for project in out["projects"]
         }
     return out
+
+
+def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
+    """Rule 3c over fixture-state.json (see _scan_drift)."""
+    return _scan_drift(state_doc, now, FIXTURE_SCAN)
+
+
+def pool_drift(state_doc: dict | None, now: datetime) -> dict:
+    """Rule 3e over pool-state.json (see _scan_drift): the units are the
+    verifier's finding ids, and what the scan reads per project is its
+    checks, so `reads` names the check each firing finding belongs to."""
+    return _scan_drift(state_doc, now, POOL_SCAN)
 
 
 def percentile(values: list[float], pct: int) -> float | None:
@@ -1004,7 +1220,10 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
             prs_by_case.setdefault(case, set()).add(run.pr)
     count = 0
     for run in full_runs:
-        if run.result != RUN_FAILURE:
+        # A killed run that recorded cases (#1875) stays in the population --
+        # its collapse still makes another PR's red shared -- but is never the
+        # PR's own: the kill is the gate's, whatever those cases did.
+        if run.result != RUN_FAILURE or run.deadline_kill:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
         if mine and all(prs_by_case[case] == {run.pr} for case in mine):
@@ -1025,6 +1244,10 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     own = pr_caused_reds(full, roster)
     deaths = sum(1 for run in window if run.setup_death)
     lost = sum(1 for run in window if run.lost_pod)
+    kills = [run for run in window if run.deadline_kill]
+    # A killed run that recorded cases (#1875) is already among the full
+    # reds (and never among the PR's own, see pr_caused_reds).
+    kills_not_counted = sum(1 for run in kills if not run.full)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
         "full_runs": len(full),
@@ -1033,13 +1256,14 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         "red_runs": reds,
         # The digest's split of the reds: the pull request's own, and
         # everything else (shared breaks, storms, empty records, setup
-        # deaths, lost pods) as "infra".
+        # deaths, lost pods, deadline kills) as "infra".
         "pr_caused_reds": own,
-        "infra_reds": reds - own + deaths + lost,
+        "infra_reds": reds - own + deaths + lost + kills_not_counted,
         "green_rate": round(len(green) / len(concluded), 3) if concluded else None,
         "aborted_runs": sum(1 for run in window if run.result not in (RUN_SUCCESS, RUN_FAILURE)),
         "setup_deaths": deaths,
         "lost_pods": lost,
+        "deadline_kills": len(kills),
         "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
         "infra_reps": storm_reps,
         # Apart from the storm's count: repetitions the harness stopped
@@ -1446,6 +1670,11 @@ def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     return issues
 
 
+def recovery_bar(condition: str | None) -> str:
+    """What `recovered` counts on the way out of `condition`, in words."""
+    return RECOVERY_BAR_VERDICT if condition == DEADLINE_KILL else RECOVERY_BAR_GREEN
+
+
 def advice_for(
     state: str,
     condition: str | None,
@@ -1462,11 +1691,19 @@ def advice_for(
     the lost-pod advice's nodes, time and count."""
     if state == GREEN:
         return ADVICE_GREEN
+    if recovering and condition == DEADLINE_KILL:
+        return ADVICE_RECOVERING_VERDICT.format(count=RECOVERY_GREEN_RUNS)
     if recovering:
         return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS)
     if condition == SHARED_BREAK:
         issues = all_tracking(cases, notes, issue)
         return ADVICE_OUTAGE.format(tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE)
+    if condition == DEADLINE_KILL:
+        issues = all_tracking(cases, notes, issue)
+        return ADVICE_DEADLINE_KILL.format(
+            minutes=int(PROW_JOB_TIMEOUT.total_seconds() // 60),
+            tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE,
+        )
     if condition == STORM:
         when = hhmm(storm_end + STORM_COOLDOWN) if storm_end else "the storm ends"
         return ADVICE_STORM.format(when=when)
@@ -1485,6 +1722,12 @@ def advice_for(
             roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
+    if condition == POOL_DRIFT:
+        incident = incident or {}
+        return ADVICE_POOL_DRIFT.format(
+            findings=", ".join(incident.get("roles") or []) or "the findings",
+            projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
+        )
     return ADVICE_SETUP
 
 
@@ -1493,9 +1736,9 @@ def advice_for(
 # --------------------------------------------------------------------------- #
 
 
-def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None = None) -> dict:
-    """Apply rules 1-4 to the runs visible at `now`, and rule 3c to the
-    fleet scan when one was given; no hysteresis yet."""
+def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None = None, pool_state_doc: dict | None = None) -> dict:
+    """Apply rules 1-4 to the runs visible at `now`, rule 3c to the fleet
+    scan and rule 3e to the pool scan when one was given; no hysteresis yet."""
     visible = [run for run in runs if run.finished <= now]
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
@@ -1504,10 +1747,15 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
     r3c = fixture_drift(fixture_state_doc, now)
+    r3d = deadline_kills(visible, now)
+    r3e = pool_drift(pool_state_doc, now)
 
     if r1["fires"]:
         state, condition = OUTAGE, SHARED_BREAK
         cause = CAUSE_SHARED_BREAK.format(cases=", ".join(r1["cases"]))
+    elif r3d["fires"]:
+        state, condition = OUTAGE, DEADLINE_KILL
+        cause = _deadline_cause(r3d["killed"], r3d["prs"], r3d["start"], r3d["end"])
     elif r3b["fires"]:
         state, condition = DEGRADED, LOST_PODS
         cause = CAUSE_LOST_PODS.format(count=len(r3b["lost"]), prs=len(r3b["prs"]), start=hhmm(r3b["start"]), end=hhmm(r3b["end"]))
@@ -1523,18 +1771,24 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     elif r3c["fires"]:
         state, condition = DEGRADED, FIXTURE_DRIFT
         cause = CAUSE_FIXTURE_DRIFT.format(roles=", ".join(r3c["roles"]), projects=len(r3c["projects"]))
+    elif r3e["fires"]:
+        # Below fixture drift: a drifted fixture reds the cases that read it,
+        # a drifted grant reds whatever the agent asks of it; both are the
+        # pool's and neither is a run-based signal.
+        state, condition = DEGRADED, POOL_DRIFT
+        cause = CAUSE_POOL_DRIFT.format(findings=", ".join(r3e["roles"]), projects=len(r3e["projects"]))
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3d["evidence"] + r3b["evidence"] + r2["evidence"] + r2b["evidence"] + r3["evidence"] + r3c["evidence"] + r3e["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
         evidence.append(CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"])) + " overlaps the break")
 
     # Currency for rule 6's entry check: whether one of the newest full runs
-    # carries the firing condition's signature. Setup deaths and lost pods
-    # are not full runs; their count is their currency.
+    # carries the firing condition's signature. Setup deaths, lost pods and
+    # deadline kills are counted, not signed; their count is their currency.
     recent = full_runs[-TRANSITION_MIN_RUNS:]
     if condition == SHARED_BREAK:
         signature = r1["signature_runs"]
@@ -1559,6 +1813,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         incident = {"prs": r2b["prs"], "runs": r2b["runs"], "reps": r2b["reps"], "window_start": iso(r2b["start"]), "window_end": iso(r2b["end"])}
     elif condition == SETUP_DEATHS:
         incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
+    elif condition == DEADLINE_KILL:
+        incident = {"prs": r3d["prs"], "runs": len(r3d["killed"]), "window_start": iso(r3d["start"]), "window_end": iso(r3d["end"])}
     elif condition == LOST_PODS:
         incident = {
             "prs": r3b["prs"],
@@ -1580,6 +1836,22 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
             "roles": r3c["roles"],
             "projects": r3c["projects"],
             "drift": r3c["drift"],
+            "reads": r3c["reads"],
+        }
+    elif condition == POOL_DRIFT:
+        # The same shape as fixture drift, with the verifier's finding ids
+        # as `roles`, the repair command per project and finding beside what
+        # was observed, and the checks the exit has to see read again.
+        incident = {
+            "prs": [],
+            "runs": 0,
+            "window_start": iso(r3e["scanned_at"]),
+            "window_end": None,
+            "roles": r3e["roles"],
+            "projects": r3e["projects"],
+            "drift": r3e["drift"],
+            "repairs": r3e["repairs"],
+            "reads": r3e["reads"],
         }
     else:
         incident = None
@@ -1595,21 +1867,34 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
         "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
+        "last_deadline_kill": max((run.finished for run in visible if run.deadline_kill), default=None),
         "roster": roster,
         "fixture": r3c,
+        "pool_state": r3e,
     }
 
 
-def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None) -> bool:
+def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:
     """Rule 6's exit: the last RECOVERY_GREEN_RUNS full runs are green, on
     distinct pull requests, all finished after the incident began, and none
     carries the signature of the condition being left -- a collapse of one
     of its cases for a shared break, STORM_RUN_SIGNATURE_REPS storm
     repetitions for a storm, CEILING_RUN_SIGNATURE_REPS ceiling repetitions
     for a delegation-ceiling wave, a setup death after it for setup deaths,
-    a lost pod after it for lost pods. Judged from the runs themselves rather than
+    a lost pod after it for lost pods. A deadline-kill outage is the one
+    exception: the same count of runs with a verdict, green or red, after the
+    last kill. Judged from the runs themselves rather than
     from the rule's window, so the runs that constituted the incident never
     count as its recovery once the window has rolled past them."""
+    if prev.get("condition") == DEADLINE_KILL:
+        # A verdict either way is the proof: the gate is grading again. Green
+        # alone would hold the outage through a stretch of honest reds.
+        recent = [run for run in full_runs if run.has_verdict][-RECOVERY_GREEN_RUNS:]
+        if len(recent) < RECOVERY_GREEN_RUNS:
+            return False
+        if any(run.finished <= since or (last_deadline_kill is not None and run.finished <= last_deadline_kill) for run in recent):
+            return False
+        return len(_prs(recent)) >= RECOVERY_GREEN_RUNS
     recent = full_runs[-RECOVERY_GREEN_RUNS:]
     if len(recent) < RECOVERY_GREEN_RUNS:
         return False
@@ -1633,26 +1918,96 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     return not any(carries(run) for run in recent)
 
 
-def fixture_drift_hold(fixture: dict, incident: dict | None) -> str | None:
-    """Rule 6's exit for fixture_drift: why this tick's scan cannot end the
-    incident, or None when it can. Entering took a scan that saw the drift;
-    leaving takes a scan that could see the same roles on the same projects
-    and no longer shows it. A scan that is missing, stale, blind, or that
-    recorded one of the incident's projects as not checked (its runner timed
-    out, the grant went away) shows nothing about the fixture, so the
-    incident holds rather than posting a recovery nothing observed."""
-    if not fixture.get("known"):
-        return "no fixture-state scan was read this tick"
-    if fixture.get("stale"):
-        return "the fixture-state scan is stale"
-    if fixture.get("unknown"):
-        return "the fixture-state scan could check no project"
-    roles = set((incident or {}).get("roles") or [])
-    read = fixture.get("read") or {}
-    unread = sorted(project for project in (incident or {}).get("projects") or [] if not roles <= set(read.get(project, [])))
+def _failed_checks(shown) -> set[str]:
+    """The checks a project's current `<check>/failed` findings name."""
+    return {unit[: -len(SCAN_FAILED_SUFFIX)] for unit in shown if unit.endswith(SCAN_FAILED_SUFFIX)}
+
+
+def _units_still_shown(units: set[str], shown, failing) -> bool:
+    """Whether any of an incident's units is still in a project's current
+    findings. The verifier's synthesised `<check>/failed` names a check that
+    failed with nothing more specific to say; it stands for the check, so it
+    is still shown while that check is still failing (`failing`: the
+    project's drifted checks), whatever its findings are now named -- a named
+    finding joining it must not read as its recovery."""
+    if units & set(shown):
+        return True
+    failing = set(failing)
+    return any(unit.endswith(SCAN_FAILED_SUFFIX) and unit[: -len(SCAN_FAILED_SUFFIX)] in failing for unit in units)
+
+
+def _scan_hold(scan_result: dict, incident: dict | None, label: str) -> str | None:
+    """Rule 6's exit for a scan condition: why this tick's scan cannot end
+    the incident, or None when it can. Entering took a scan that saw the
+    drift; leaving takes a scan that could see the same units on the same
+    projects and no longer shows it. A scan that is missing, stale, blind, or
+    that recorded one of the incident's projects as not checked (its runner
+    timed out, the grant went away) shows nothing about the item, so the
+    incident holds rather than posting a recovery nothing observed.
+
+    What has to be read again is the incident's `reads` per project -- the
+    roles themselves for the fleet, the findings' checks for the pool; an
+    incident recorded before `reads` existed falls back to its roles."""
+    if not scan_result.get("known"):
+        return f"no {label} scan was read this tick"
+    if scan_result.get("stale"):
+        return f"the {label} scan is stale"
+    if scan_result.get("unknown"):
+        return f"the {label} scan could check no project"
+    incident = incident or {}
+    roles = set(incident.get("roles") or [])
+    reads = incident.get("reads") if isinstance(incident.get("reads"), dict) else None
+    read = scan_result.get("read") or {}
+    # A project the pool's document no longer lists has left the mapping; it
+    # is not waited on, or an incident on a retired project would hold
+    # forever (one whose every project was retired ends here). A document a
+    # hand run wrote for named projects is different: a project absent from
+    # it was not read, and holds as unread below.
+    scanned = set(scan_result.get("scanned") or [])
+    named = list(incident.get("projects") or [])
+    waiting = named if scan_result.get("partial") else [project for project in named if not scanned or project in scanned]
+    current = scan_result.get("current") or {}
+
+    def required(project):
+        return set(reads.get(project, roles) if reads is not None else roles)
+
+    # A check that failed with nothing named (`<check>/failed`) did not read
+    # what the incident needs read again -- a policy that would not parse, a
+    # listing that failed outside the unread grammar -- so it is not proof the
+    # named finding is gone.
+    unread = sorted(
+        project
+        for project in waiting
+        if not required(project) <= set(read.get(project, [])) or required(project) & _failed_checks(current.get(project) or [])
+    )
     if unread:
-        return f"the fixture-state scan could not read {_project_list(unread)}"
+        return f"the {label} scan could not read {_project_list(unread)}"
+    # Readable is not clean: the repeat rule that re-fires a persisting drift
+    # reads the previous document, so an unread scan or a lost prior in
+    # between lets the same drift arrive as "new" and not fire. The exit asks
+    # the scan itself.
+    failing = scan_result.get("failing") or {}
+    still = sorted(project for project in waiting if _units_still_shown(roles, current.get(project) or [], failing.get(project) or []))
+    if still:
+        return f"the {label} scan still shows the drift on {_project_list(still)}"
     return None
+
+
+def fixture_drift_hold(fixture: dict, incident: dict | None) -> str | None:
+    """Rule 6's exit for fixture_drift (see _scan_hold)."""
+    return _scan_hold(fixture, incident, FIXTURE_STATE_LABEL)
+
+
+def pool_drift_hold(pool: dict, incident: dict | None) -> str | None:
+    """Rule 6's exit for pool_drift (see _scan_hold)."""
+    return _scan_hold(pool, incident, POOL_STATE_LABEL)
+
+
+def scan_hold_for(condition: str, assessed: dict, incident: dict | None) -> str | None:
+    """The hold reason for whichever scan condition is being left."""
+    if condition == POOL_DRIFT:
+        return pool_drift_hold(assessed["pool_state"], incident)
+    return fixture_drift_hold(assessed["fixture"], incident)
 
 
 def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
@@ -1682,6 +2037,31 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
         # Same severity. The cause follows the evidence (a second case
         # joining a break changes what the reader should be told), but a
         # condition that has stopped firing does not reset `since`.
+        # One exception: a scan condition that is being held (its scan is
+        # stale, blind, or still shows the drift) is not replaced by a scan
+        # condition that ranks at or below it -- the lower-ranked scan's, or
+        # its own firing on other units -- unless the newcomer's incident
+        # covers the held one (the drift spread: every held project is still
+        # in `reads`, so the exit still needs them read clean). Replacing it
+        # otherwise would let the state leave through a scan exit that never
+        # read this incident's projects; the newcomer takes over once this
+        # hold lifts. A higher-ranked scan condition (fixture drift over pool
+        # drift, as assess() ranks them) and a run-based condition (a break,
+        # lost pods, a storm) still displace it, as on every tick before.
+        prev_condition = prev.get("condition")
+        newcomer = assessed["condition"]
+        if (
+            prev_condition in SCAN_CONDITIONS
+            and newcomer in SCAN_CONDITIONS
+            and SCAN_CONDITIONS.index(newcomer) >= SCAN_CONDITIONS.index(prev_condition)
+            and not (newcomer == prev_condition and _covers(assessed.get("incident"), prev.get("incident")))
+            and scan_hold_for(prev_condition, assessed, prev.get("incident")) is not None
+        ):
+            kept = _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
+            # The assessment's condition may be this very one on other
+            # units; `held` is what tells adjudicate to keep the incident too.
+            kept["held"] = True
+            return kept
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], since, recovering=False)
 
     # Down. Leaving OUTAGE for a lesser live condition is immediate: the
@@ -1690,18 +2070,29 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
     if raw_state != GREEN:
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], now, recovering=False)
     prev_condition = prev.get("condition")
-    if prev_condition == FIXTURE_DRIFT:
+    if prev_condition in SCAN_CONDITIONS:
         # The scan is the evidence both ways: the hourly scan that could read
         # the incident's roles on its projects and no longer shows the
         # repeated or widespread drift is the recovery (three green runs
         # could all have leased healthy projects and say nothing about the
-        # fixture), and a scan that could not see them is not.
-        if fixture_drift_hold(assessed["fixture"], prev.get("incident")) is None:
+        # fixture or the grant), and a scan that could not see them is not.
+        if scan_hold_for(prev_condition, assessed, prev.get("incident")) is None:
             return _keep(GREEN, None, "", [], now, recovering=False)
         return _keep(prev_state, prev_condition, prev.get("cause") or "", [], since, recovering=False)
-    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"]):
+    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"], assessed.get("last_deadline_kill")):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
+
+
+def _covers(new_incident, old_incident) -> bool:
+    """Whether a scan incident includes every project and unit of another:
+    the drift spread rather than moved, so taking the new one loses no read
+    the old one's exit needed."""
+    if not isinstance(new_incident, dict) or not isinstance(old_incident, dict):
+        return False
+    return set(old_incident.get("projects") or []) <= set(new_incident.get("projects") or []) and set(
+        old_incident.get("roles") or []
+    ) <= set(new_incident.get("roles") or [])
 
 
 def _keep(state, condition, cause, cases, since, recovering):
@@ -1727,6 +2118,8 @@ def adjudicate(
     posted: dict | None = None,
     pool_pressure: dict | None = None,
     fixture_state_doc: dict | None = None,
+    pool_state_doc: dict | None = None,
+    periodics_readings: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
@@ -1741,11 +2134,18 @@ def adjudicate(
     artifact (rule 8); absent, the note and the digest's wait are None.
     `fixture_state_doc` is the hourly fleet scan's fixture-state.json when one
     is published; rule 3c reads it and the `fixture_state` block below
-    summarises it for the poster.
+    summarises it for the poster. `pool_state_doc` is the pool scan's
+    pool-state.json the same way, for rule 3e and the `pool_state` block.
+    summarises it for the poster. `periodics_readings` is what
+    periodics.py fetched of the watched Prow periodics' latest finished
+    builds, by job; a failed or overdue one is a note beside the state
+    (`periodics`), never a state, and `periodics_read` names the jobs a
+    reading arrived for, so the poster can tell a job that recovered from
+    one it lost sight of.
     """
     if runs is None:
         runs = load_runs(data)
-    assessed = assess(runs, now, roster, fixture_state_doc)
+    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc)
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
@@ -1757,18 +2157,28 @@ def adjudicate(
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
         evidence.append(
-            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive green runs"
+            f"condition cleared; waiting for {RECOVERY_GREEN_RUNS} consecutive {recovery_bar(decided['condition'])}"
             " on distinct PRs before reporting GREEN"
         )
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:
         evidence.append(f"{assessed['state']} condition seen but not yet current; holding {decided['state']}")
-    elif decided["condition"] == FIXTURE_DRIFT and not assessed["fixture"]["fires"]:
-        evidence.append(f"fixture drift held: {fixture_drift_hold(assessed['fixture'], (prev or {}).get('incident'))}; a scan that reads those projects clean ends it")
+    elif decided.get("held") or (decided["condition"] == FIXTURE_DRIFT and not assessed["fixture"]["fires"]) or (decided["condition"] == POOL_DRIFT and not assessed["pool_state"]["fires"]):
+        label = "fixture drift" if decided["condition"] == FIXTURE_DRIFT else "pool drift"
+        evidence.append(f"{label} held: {scan_hold_for(decided['condition'], assessed, (prev or {}).get('incident'))}; a scan that reads those projects clean ends it")
 
-    # A held state (recovering, or a worse condition not yet current) keeps
-    # the previous tick's numbers: the assessment's incident describes the
-    # raw state, not the one being reported.
-    incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
+    # A held state (recovering, a worse condition not yet current, or a scan
+    # condition held against a scan newcomer, its own on other units
+    # included) keeps the previous tick's numbers: the assessment's incident
+    # describes the raw state and condition, not the ones being reported.
+    kept_assessment = decided["state"] == assessed["state"] and decided["condition"] == assessed["condition"] and not decided.get("held")
+    incident = assessed["incident"] if kept_assessment else (prev or {}).get("incident")
+    if decided["condition"] == DEADLINE_KILL and decided["state"] != GREEN and isinstance(incident, dict):
+        # The rule's window slides, so `window_start` is the oldest kill still
+        # inside it; the outage's first kill is kept across ticks for the
+        # surfaces that date the whole episode (the comment, the issue).
+        previous = (prev or {}).get("incident") if (prev or {}).get("condition") == DEADLINE_KILL and (prev or {}).get("state") != GREEN else None
+        starts = [s for s in ((previous or {}).get("first_kill"), (previous or {}).get("window_start"), incident.get("window_start")) if s]
+        incident = dict(incident, first_kill=min(starts) if starts else None)
     advice = advice_for(
         decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue, incident
     )
@@ -1805,6 +2215,35 @@ def adjudicate(
     pool = pool_note(pool_pressure, pool_clock, {"since": held, "breach_seen": bool(seen)})
     if pool:
         evidence.append(pool_evidence(pool))
+    readings = periodics_readings if isinstance(periodics_readings, dict) else {}
+    # An open note's start survives a blind tick through `periodics_since`,
+    # as the pool episode's does through `pool_since`: a tick with readings
+    # and no note for a job ends its episode; one with no readings keeps it.
+    # `periodics_since` carries every open note's start, noted or blind, so it
+    # is the one source the notes start from; jobs no longer watched drop out.
+    before_since = {
+        job: since
+        for job, since in ((prev or {}).get("periodics_since") or {}).items()
+        if isinstance(since, str) and job in periodics.WATCHED_BY_JOB
+    }
+    prev_notes = {job: {"since": since} for job, since in before_since.items()}
+    # The wall clock, as the pool note's: a job that stopped is measured
+    # against the time it is, not data.json's horizon, which a stalled
+    # archive freezes together with the jobs.
+    # Per job, consecutive failed checks (and per project, for the message),
+    # so a ten-minute job's single flap is not news and two in a row are. The
+    # counts live in the previous health.json; a tick that could not fetch it
+    # starts them over, which would hide a told, still-failing job for a tick
+    # or two, so on that tick the thresholds are off: a failed build is a note,
+    # and the poster, which keys on the verdict, does not re-announce one it
+    # has told.
+    streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
+    evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
+    # Per job: a job read this tick keeps its start only while it is noted;
+    # a job with no reading this tick keeps whatever start it had.
+    periodics_since = {job: since for job, since in before_since.items() if job not in readings}
+    periodics_since.update({job: note["since"] for job, note in watched.items()})
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
         stale_after = timedelta(seconds=data["stale_after_s"])
@@ -1829,8 +2268,14 @@ def adjudicate(
         "recovering": decided["recovering"],
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
+        "pool_state": scan_block(assessed["pool_state"]),
         "slow": slow,
         "pool": pool,
+        "periodics": watched,
+        "periodics_read": sorted(readings),
+        "periodics_runs": periodics.runs(readings),
+        "periodics_streaks": streaks,
+        "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
@@ -1853,22 +2298,26 @@ def adjudicate(
     return out
 
 
-def fixture_state_block(fixture: dict) -> dict | None:
-    """health.json's `fixture_state`: the scan's time, how many projects it
-    could read, every project's drifted roles this scan, and whether the
-    scan was stale or saw nothing (`unknown`, with the commonest reason).
-    None when no fixture-state.json was given."""
-    if not fixture.get("known"):
+def scan_block(scan_result: dict) -> dict | None:
+    """health.json's `fixture_state` / `pool_state`: the scan's time, how
+    many projects it could read, every project's drifted units this scan
+    (roles or finding ids), and whether the scan was stale or saw nothing
+    (`unknown`, with the commonest reason). None when no document was given."""
+    if not scan_result.get("known"):
         return None
     return {
-        "scanned_at": iso(fixture["scanned_at"]),
-        "projects": fixture["total"],
-        "checked": fixture["checked"],
-        "drifted": fixture["current"],
-        "unknown": fixture["unknown"],
-        "stale": fixture["stale"],
-        "reason": fixture["reason"],
+        "scanned_at": iso(scan_result["scanned_at"]),
+        "projects": scan_result["total"],
+        "checked": scan_result["checked"],
+        "unread_units": scan_result.get("unread_units", 0),
+        "drifted": scan_result["current"],
+        "unknown": scan_result["unknown"],
+        "stale": scan_result["stale"],
+        "reason": scan_result["reason"],
     }
+
+
+fixture_state_block = scan_block
 
 
 # --------------------------------------------------------------------------- #
@@ -1945,8 +2394,8 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
 
     Runs that finished in [start, end); per run build_id, pr, started,
     finished, result, duration_s and tasks, plus how the build ended
-    (has_build_log, the pod_* trio, merge_conflict) when the source recorded
-    it; per task
+    (has_build_log, the pod_* trio, merge_conflict) and eval_verdict when the
+    source recorded them; per task
     name, result and reps; per rep result and the first TRIM_REASON_CHARS of
     the reason (null for passing reps, as the collector writes them).
     """
@@ -2068,6 +2517,8 @@ def parse_args(argv):
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
     parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
+    parser.add_argument("--pool-state", type=pathlib.Path, help="the hourly pool scan's pool-state.json, for the pool_drift condition (missing is fine)")
+    parser.add_argument("--periodics-dir", type=pathlib.Path, help="the directory periodics.py fetch wrote, one <job>.json per watched Prow periodic (missing is fine)")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
     roster.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
@@ -2116,6 +2567,8 @@ def main(argv=None) -> int:
             posted=load_json(args.posted_state),
             pool_pressure=load_json(args.pool_pressure),
             fixture_state_doc=load_json(args.fixture_state),
+            pool_state_doc=load_json(args.pool_state),
+            periodics_readings=periodics.load_readings(args.periodics_dir),
         )
         text = json.dumps(health, indent=2) + "\n"
 

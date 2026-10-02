@@ -12,6 +12,8 @@ deletes, are the add-ons compatible, will the pods survive nodes being drained o
 then repeating all of it for the next group of clusters. A team running hundreds of clusters does
 this over and over. This document lists the checks an agent should run on a schedule instead, so
 the answer is waiting for them.
+The failures those checks are chosen from, each with its pre- and post-upgrade signal, are
+catalogued in [`upgrade-failure-catalogue.md`](upgrade-failure-catalogue.md).
 
 Two things to know about the checks. They are **read-only**: they look and report, and never
 upgrade anything — that stays a human's decision. And they are **grouped by cluster family**, a
@@ -116,9 +118,9 @@ cluster is lagging — the check in the GKE deprecation insights section below.
 1.25 removed PodSecurityPolicy, `helm upgrade` fails on any release whose **stored** manifest
 contains one. Nothing crashes; the workloads keep running. You cannot deploy that release again,
 and removing the PSP from your chart does not help, because the failure is in reading the old
-release Secret. Operators in the thread report that `helm mapkubeapis` does not fully resolve it
-either — it rewrites `apiVersion`/`kind` pairs rather than removing a kind the new version does not
-serve ([issue thread](https://github.com/helm/helm/issues/11287)).
+release Secret. The issue's opener reported that `helm mapkubeapis` did not resolve it at the
+time, because it only rewrote `apiVersion`/`kind` pairs; from v0.4.0 it also removes the resources
+whose kind has no successor ([issue thread](https://github.com/helm/helm/issues/11287)).
 _Caught by:_ scanning stored Helm release state and GitOps manifests for removed kinds, not only
 live objects. GKE's deprecation insights cannot see this: they are generated from live API-server
 traffic over a 30-day observation window, so a manifest that is applied only after the upgrade is

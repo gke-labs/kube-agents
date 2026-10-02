@@ -100,7 +100,7 @@ const (
 	// settles only after every record in it has been handled: at the 100-message
 	// default a batch of slow lookups would run for far longer than any ack
 	// deadline, and Pub/Sub would redeliver the whole batch while this process
-	// was still working on it -- producing duplicate drift lines, and at T4 a
+	// was still working on it -- producing duplicate drift lines, and a
 	// duplicate inject per cycle, for as long as the control plane stayed slow.
 	//
 	// Thirty seconds is half the drift-pubsub module's 60-second deadline,
@@ -141,8 +141,9 @@ const (
 	// settleGracePeriod bounds the ack and nack calls issued while shutting
 	// down. The pull loop's context is already cancelled by then, so settling
 	// on it would abort: up to maxMessages records would be handled and then
-	// redelivered to the next instance, which at T4 is a duplicate inject per
-	// restart.
+	// redelivered to the next instance. The insertId set that suppresses a
+	// duplicate inject is in memory and per-process, so this is the one case it
+	// does not cover: a duplicate inject per non-graceful restart.
 	settleGracePeriod = 10 * time.Second
 )
 
@@ -226,8 +227,8 @@ type messageSource interface {
 //
 // Moving to StreamingPull would replace that cap with deadline extension, and
 // becomes worth the dependency if handling ever grows past what one budget can
-// hold -- a per-record inject at T4, or a fan-in doing several clusters' lookups
-// per record.
+// hold -- the per-record inject now behind --daemon-url, or a fan-in doing
+// several clusters' lookups per record.
 type pubsubSource struct {
 	service      *pubsub.Service
 	subscription string
@@ -330,17 +331,21 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 	return nil
 }
 
-// recordHandler consumes one parsed audit record. T4 injects behind this
-// signature; what ships behind it today is driftFilter.Handle, which classifies
-// and then forwards what survives to the T3 join.
+// recordHandler consumes one parsed audit record. What ships behind it is
+// driftFilter.Handle, which classifies and then forwards what survives to the
+// join, whose own terminal handler logs and -- with --daemon-url set -- injects.
 //
 // The context is derived from the pull loop's, so a handler doing network I/O
 // -- which the join does, one lookup per forwarded record -- is interrupted by
 // SIGTERM rather than holding shutdown open for its timeout. It is deliberately
 // not the settle context: an in-flight lookup abandoned at shutdown leaves its
-// message acked and its drift unreported, which matches what realMain already
-// documents about an interrupted batch, and is preferable to delaying the ack of
-// every other message in the batch behind it.
+// message acked and its drift unreported, which is preferable to delaying the
+// ack of every other message in the batch behind it.
+//
+// That loss is confined to the one record the handler was inside. Every record
+// the loop had not reached is nacked instead and redelivered to the next
+// instance -- the ctx.Err() branch in processBatch below, and the shutdown
+// comment on realMain's signal context, which describe that half.
 //
 // Derived rather than passed through, because processBatch also puts the batch's
 // join budget on it. A handler is therefore cut short by whichever comes first,
@@ -486,7 +491,27 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 	handleCtx, cancelHandle := context.WithTimeout(ctx, s.joinBudget)
 	defer cancelHandle()
 
-	for _, msg := range messages {
+	for i, msg := range messages {
+		// A cancelled *parent* context is SIGTERM: the process is going away.
+		// That is not the same as handleCtx expiring, which is the join budget
+		// running out and is handled below by forwarding the record anyway --
+		// there, the work still happens and the DRIFT line is still written.
+		// Here nothing can happen: the join fails instantly on a dead context,
+		// the inject fails with it, and the record is acked regardless, so
+		// every surviving human change left in the batch loses its escalation
+		// with no redelivery. Nacking returns them to the subscription for the
+		// next instance, which is what a rolling restart needs. settleCtx
+		// deliberately outlives the cancellation, so this nack is delivered.
+		if ctx.Err() != nil {
+			for _, unhandled := range messages[i:] {
+				nackIDs = append(nackIDs, unhandled.AckID)
+			}
+			log.Printf("drift-detector: shutting down mid-batch; returned %d of %d message(s) "+
+				"to the subscription unhandled rather than acking them undelivered",
+				len(messages)-i, len(messages))
+			break
+		}
+
 		record, err := parseAuditEntry(msg.Data)
 		switch {
 		case err == nil:

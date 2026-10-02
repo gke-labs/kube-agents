@@ -107,7 +107,7 @@ version-control abstraction lands.
 
 | Layer                          | Where it lives                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`. **Unset everywhere in this repo** → `local`                                                                                                                                                                                               |
+| Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`: `ssh`, pinned in the operator's managed scope and copied into each profile's `.env` by `deploy/shared/terminal_env_pin.py`                                                                                                                |
 | The agent's Hermes config      | [`agents/platform/config.yaml`](../../agents/platform/config.yaml)                                                                                                                                                                                                                    |
 | The pod that hosts the shell   | a `<agent>-shell` StatefulSet, one per `PlatformAgent`, reconciled by the operator — [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)                                                                                                |
 | The image it runs              | [`deploy/sandbox/`](../../deploy/sandbox/) — first-party, `sshd` plus the credential-proxy wrappers                                                                                                                                                                                   |
@@ -748,7 +748,32 @@ ability to author a skill with it. Denying at the source is the narrower cut:
 it is scoped to code the model ran in the sandbox, which is the thing the
 sandbox exists to distrust.
 
-Two things this does not close. Skills are not the only executable content under
+There is a third option that paragraph did not consider, and the image now
+takes it: deny by name inside the tool rather than by path on the tree.
+`deploy/docker/patches/skill_manage_image_owned.py` gates `skill_manage` so a
+write to a skill the image ships for the running profile is refused, while a
+new agent-authored name is accepted, which a filesystem mode cannot tell apart;
+the same module makes the file tools' write guard refuse any target under a
+Hermes home's `skills/` or `scripts/`, because those tools write the sandbox's
+copy of the tree and are where a worker refused by `skill_manage` goes next.
+It closes the write the closed writeback channel left open, the gateway's own
+tool editing a shipped skill between two restarts, which is how a graded run
+came to rewrite its own instructions in gke-labs/kube-agents#1848. It also
+settles a conflict prose could not: upstream's system prompt tells the model to
+fix a skill that has issues with `skill_manage(action='patch')`, so a rule in
+`AGENTS.md` that says the opposite competes with the framework on every turn,
+and the tool refusing is what decides it. It costs
+less than the earlier paragraph priced a read-only tree at: entrypoint step
+2.6a replaces every specialist profile's `skills/` from the image on each
+start, so what `skill_manage` authors there was never durable. The sandbox's
+copy of the same trees is still writable by what runs in the sandbox (a shell
+command, `execute_code`, or a file tool writing through a symlink made there,
+which the gateway-side guard cannot see) for as long as that sandbox pod runs;
+that edit never reaches the gateway and is replaced from the image when the
+sandbox restarts. Leaving that copy root-owned would close it
+(gke-labs/kube-agents#2096).
+
+Two things the sandbox-end closure does not close. Skills are not the only executable content under
 `~/.hermes`, so the guarantee rests on the directory being unwritable rather
 than on an enumeration of paths — a future Hermes that creates the parent
 itself, or syncs to a different root, would reopen it and nothing here would
@@ -1089,6 +1114,15 @@ helpers which shell into the sandbox read the sandbox's layout from one place
 instead of each hard-coding it, which is the same reason `sandbox_exec.py` reads
 `ssh_host` from the managed config rather than re-deriving the Service name.
 
+Scheduled runs and kanban wake turns do not read this block. Hermes builds their terminal with
+`tools/terminal_scope.build_profile_terminal_scope`, from the profile's own `.env` and
+`config.yaml` only, so `deploy/shared/terminal_env_pin.py` copies the block's
+Hermes keys into each profile's `.env` and asks Hermes to confirm they resolve: at
+start-up (entrypoint step 4b; [Container entrypoint](/kube-agents/deploy/docker-images/#container-entrypoint)
+says which failures stop the container) and when `cluster_agent_profile.py` scaffolds a profile. The image build's
+`--build-check` fails when a Hermes bump breaks the copy, and warns once Hermes
+resolves the managed backend without it.
+
 #### Two sharp edges left
 
 - **Rotation is ordered.** Write the Secret, restart the sandbox, then restart the
@@ -1166,12 +1200,13 @@ wrong if the sandbox ever holds credentials of its own.
 
 The sandbox has three directories that matter and only one of them keeps anything.
 
-| Path                    | Backing                        | Owner    | What it is                   |
-| ----------------------- | ------------------------------ | -------- | ---------------------------- |
-| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work             |
-| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home             |
-| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home |
-| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                |
+| Path                    | Backing                        | Owner    | What it is                      |
+| ----------------------- | ------------------------------ | -------- | ------------------------------- |
+| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                |
+| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                |
+| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home    |
+| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                   |
+| `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs |
 
 **The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
 it for a non-interactive `ssh host cmd`, and the model can delete Debian's
@@ -1199,23 +1234,43 @@ narrowed by anything.
 as well, named in 59 files across `agents/`, and the alternative was a sandbox path that
 no existing SOP, skill or model-written script would resolve. The cost is one path naming
 two different directories on two different volumes, and one rule that follows from it:
-**no handoff may assume write-here-read-there.** Nothing is copied between them and
-nothing can read across, so a script that writes `/opt/data/x` in the agent pod and reads
+**no handoff may assume write-here-read-there.** Only what the sentences below name crosses between
+them, so a script that writes `/opt/data/x` in the agent pod and reads
 `/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
-the path itself looking wrong. One thing crosses, and only one: a file a finished card
-names in `artifacts` is copied sandbox-to-gateway for the length of its delivery and
-deleted after, which is
+the path itself looking wrong. What crosses sandbox-to-gateway is read by name. A file a finished card names in `artifacts` is copied for the length of its
+delivery and deleted after, which is
 [declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
-built for that one caller. Nothing crosses the other way, and nothing crosses because a path
+built for that one caller. The onboarding report is read by `bootstrap_delivery.py` once
+its markers say a delivery is due, as the bootstrap onboarding section below describes.
+What crosses the other way is `sandbox_mirror.py`'s work, described above: it copies the
+working directories once on first start, and on every start and each new profile it creates
+the profile's working directories and copies each Cluster Agent's identity file. Nothing
+crosses because a path
 happened to match. The entrypoint writes a `.sandbox` marker into the
-sandbox's copy, which is how a script or a person tells which side they are on. The
-bootstrap inventory handoff is the known case; it has its own issue.
+sandbox's copy, which is how a script or a person tells which side they are on.
 
 The kubeconfig the platform MCP server writes stays out of `/opt/data` for the reason
 under [The SSH principal cannot be the shell user](#the-ssh-principal-cannot-be-the-shell-user):
 a kubeconfig names an `exec` credential plugin and `kubectl` runs it, so one the model
 can author is arbitrary code execution as `hermes`. `/opt/data` is now durable as well
 as model-writable, which makes it a worse place for that file rather than a better one.
+
+**The same rule reaches what an agent-pod caller executes here, not just what it reads.**
+The shared scripts are staged twice. `/opt/data/scripts` is the model's copy — that is
+the path every SKILL.md names, the entrypoint replaces it from the image on each start,
+and an edit the model makes to it stands until then. `/opt/vcs/libexec/platform` is the
+second copy, root-owned and mode 0755, and it is the one a caller that logs in as
+`hermes` runs: the pull-request and issue crons forward a forge verb into this container
+rather than holding a forge CLI themselves, and running the model's copy over that
+session would be the credential handed to whatever the model last wrote there. The whole
+import closure is staged, because `sys.path[0]` is the script's own directory and a
+module missing from the root-owned copy would be found in the model's one instead. The
+build proves the staging is complete by importing each entry point and reading `__file__`
+off every module that loaded: one that resolved outside the root-owned copy and the
+standard library fails the image. What those scripts put on `sys.path` themselves — the
+two agent-pod directories they use to find their siblings — is left off when the file
+they are running from is the root-owned copy, so a gap a later edit opens has nothing
+model-writable to fall through to.
 
 `volumeClaimTemplates` is immutable, so an install that already ran the single-volume
 layout does not roll into this one. The StatefulSet has to be deleted with
@@ -1646,10 +1701,11 @@ volume on every start, before sshd is exec'd.
 
 The sync replaces rather than merges. Copying over the top leaves a skill deleted from
 the image, or a script renamed in it, sitting on the volume for as long as the PVC
-lives and looking current. That makes the trees image-owned: the model can edit a
-script it is debugging and the edit is gone at the next restart, which is the same
-contract the agent pod's force-sync gives. Model-written files belong in
-`/opt/data/scratch` and `/opt/data/gitops`, which the sync does not touch.
+lives and looking current. That makes the trees image-owned, and they are not the
+model's to change: the personas forbid it, because an edit made anyway is run by every
+later session in the pod until the next restart. To debug a script, copy it to
+`/opt/data/scratch` and run the copy. Model-written files belong in `/opt/data/scratch`
+and `/opt/data/gitops`, which the sync does not touch.
 
 Extending Hermes' sync to cover governance and scripts was the alternative, and it
 keeps one mechanism instead of two. It was rejected before the measurement above and
@@ -1663,9 +1719,12 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
-`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`
-and `stall_report.py` — the entry points an agent is told to run, plus the transitive
-closure of what they import.
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
+`stall_report.py` and `inventory_findings.py` — the entry points an agent is told to run,
+plus the transitive closure of what they import. Only `inventory_findings.py extract` works
+there: `register` and `ranked` call the Session KV server on the agent pod's loopback and
+exit 13 from the sandbox, and the prioritization SOP answers that exit by ranking from its own
+scores and writing the report without the findings queue.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An
 earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
@@ -1677,21 +1736,24 @@ qualifying question is the one the cron section below already asks — does it n
 agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
 databases, Hermes' own Python namespace.
 
-Three scripts an agent is told to run fail it: `cluster_agent_profile.py`,
-`cluster_agent_reconcile.py` and `kanban_notify_propagate.py`. Each gets a stub at its
-path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
+Three scripts fail an agent that runs them from the shell: `cluster_agent_profile.py`,
+`cluster_agent_reconcile.py`, and `eod_report_generator.py`, which reads the session
+database and is named by its SOP for a hand run. Each gets a stub at its path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
 path empty was the other option and reads worse — the model gets `No such file or
 directory`, concludes the image is broken, and spends a turn proving it. The fuller
 answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
-pod; `platform_mcp_server.py` exposes no profile tool today.
+pod. `platform_mcp_server.py` carries the two reads, `list_cluster_profiles` and
+`get_cluster_profile_name`, which is how the agent finds a kanban assignee; creating and
+deleting a profile still has no tool.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
 reads the allowlist out of the Dockerfile and checks it against the agents' own
-instructions: every shared script named by a runtime path is baked or stubbed, the
-allowlist is closed under import, and nothing on it names an interpreter the sandbox
-does not have. Adding a skill that calls a new shared script fails that test rather
-than failing in a pod.
+instructions, which include the governance SOPs a card's worker follows and the Planning
+Agent's tree (`agents/chat/`) that writes those cards: every shared script named by a runtime path is
+baked or stubbed, the allowlist is closed under import, and nothing on it names an
+interpreter the sandbox does not have. Adding a skill that calls a new shared script
+fails that test rather than failing in a pod.
 
 **`SETTINGS.md` is mounted, at `/opt/data/SETTINGS.md`.** Its content is per-install:
 the operator renders it from `spec.integration.github.gitRepo` into an
@@ -1760,22 +1822,22 @@ into that directory and then register a cron job pointing at it. With file tools
 to the sandbox it cannot, which raises the stakes on the `sync_back` channel above:
 whatever that syncs back must not be able to land in a scripts directory.
 
-What it does break is bootstrap onboarding, and quietly. The inventory pipeline
+What it broke was bootstrap onboarding, and quietly. The inventory pipeline
 straddles the boundary in the wrong direction: `INVENTORY.raw.md` is written by the
 `platform` kanban worker and `INVENTORY.md` by the prioritization worker — both agent
-turns, so both writes now go to the sandbox, where `/opt/data` neither exists nor is
-writable. The readers did not move. `bootstrap_delivery.py` and `bootstrap_scan_gate.py`
-are `no_agent` scripts hardcoding `/opt/data/INVENTORY*.md` on the PVC, so the delivery
-job ticks every minute against a file that will never appear. A silent run is its normal
-no-op, so onboarding simply never delivers and nothing logs an error.
+turns, so both writes go to the sandbox's `/opt/data`. The readers did not move.
+`bootstrap_delivery.py` and `bootstrap_scan_gate.py` were `no_agent` scripts that read
+`/opt/data/INVENTORY*.md` on the PVC, so the delivery job ticked every minute against a
+file that never appeared there. A silent run is its normal no-op, so onboarding never
+delivered and nothing logged an error.
 
 **Moving the scripts into the sandbox was the obvious fix and does not work.** The
 mechanism is sound — `subprocess.run(capture_output=True)` returns stdout verbatim and
 `ssh` forwards both remote stdout and the remote exit code, so verbatim delivery
 survives the hop. There is just nothing left to wrap. Every one of the five is bound to
 the agent pod: `profile_cron_tick.py` and `cluster_agent_reconcile.py` drive `hermes`
-against profile state on the PVC; `bootstrap_scan_gate.py` shells
-`/opt/hermes/.venv/bin/hermes profile list`; and `bootstrap_delivery.py` and
+against profile state on the PVC; `bootstrap_scan_gate.py` reads each profile's
+`config.yaml` on the PVC; and it, `bootstrap_delivery.py` and
 `github_scan_gate.py` import Hermes' own Python namespace — `from cron.jobs import
 remove_job` and `from hermes_cli.kanban import run_slash`, which no amount of packaging
 reproduces in the sandbox. Moving them would make both of the deferred problems below
@@ -1806,6 +1868,27 @@ sandbox — so the split is one function, `run_resolver_poll`, becoming an `ssh`
 That split is now the smaller half of what has already happened. `resolver.py` reaches
 `gh` through `sandbox_exec.run`, so every `gh` call the poll makes executes in the
 sandbox today; what is left to move is the script around them.
+
+`bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
+`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+first; only once they say a delivery is due does it read `INVENTORY.md` out of the
+sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
+and rename it to `INVENTORY.delivered.md` in the sandbox. The rename connects as `agent`,
+for the reason `kanban_workspace_gc.py` does below: the sandbox's `/opt/data` is
+`agent:agent 755`. An unreachable sandbox is a silent run retried on the next tick,
+because a failing `no_agent` script posts an alert to the user's chat on every tick it
+fails. A read that reaches the sandbox and does not return the report fails the run with
+the reason, as an unreadable report does on the agent pod, instead of waiting on it
+silently. The next tick reads again, so a passing read failure clears and a lasting one alerts on
+each tick until it is fixed. `bootstrap_scan_gate.py`'s decision needs no change: `.bootstrap_scan_filed` is on
+the PVC from the moment the card is filed, so the report files it also checks add
+nothing. Its sweep card still calls `/opt/data/INVENTORY.md` the Chat Agent's home,
+which is wrong about the pod and right about the path the worker must write.
+
+The one agent-pod reader whose behaviour the move changes is the onboarding plugin. It
+picks its first greeting by checking `INVENTORY.md` on the PVC, so with the sandbox on it always greets
+as though the scan were still running. The report still arrives on the next delivery
+tick.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -1849,8 +1932,8 @@ sandbox has `/opt/data/tmp/t_384aaaba` and `/opt/data/gitops/t_dc3f1647`, and a
 used only to narrow that set, never to add to it, so the account the model owns can at
 worst hide a directory from the sweep.
 
-It connects as `agent` rather than `hermes`, which is the one place in the repository
-that does, and the reason is permissions: the workspaces are `agent:agent 755` to the
+It connects as `agent` rather than `hermes`, as `cluster_agent_profile.py` and
+`bootstrap_delivery.py` also do, and the reason is permissions: the workspaces are `agent:agent 755` to the
 leaves, so uid 1001 cannot unlink inside them. The alternative was a shared group, a
 setgid workspaces root and a `umask 002` for every session, which grants the trusted
 account standing write access to the model's tree in order to delete from it — a wider
@@ -1891,13 +1974,28 @@ is not on the build PATH.
 
 `gh` needed one step the others did not.
 [`github_scan_gate.py`](../../agents/platform/scripts/github_scan_gate.py) runs
-`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shells out to
-`gh` at every call site. Both modules funnel those invocations through one function —
+`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shelled out to
+`gh` at every call site. Both modules funnelled those invocations through one function —
 `forge.run_gh` and `resolver._run_gh_once` — so routing that pair through
 `sandbox_exec.run` carried the whole sweep across without moving the script. Both files
 also run on the far side of the boundary when the model invokes them from its shell, and
 one call site serves both: `sandbox_enabled()` reads an agent-pod file, so in the sandbox
 it is false and `run()` executes locally.
+
+Neither of those two functions exists any more. The consumer migration replaced every `gh`
+call in both with a version-control verb, over the same `sandbox_exec.run` and for the
+same reason — the credential is on the far side. What this paragraph describes is the
+shape that made the crossing cheap enough to do at all.
+
+It did not stay one seam, and the reason is worth keeping. `forge.py` crosses per verb: it
+runs a copy of itself in the sandbox (`forge.SANDBOX_FORGE`) and gets one answer back, so
+the gate's sweep is a sequence of small crossings. `resolver.py` crosses **once, as the
+whole subcommand** (`resolver._forward_to_sandbox`), because a poll visits every managed
+repository and the per-call shape paid an ssh hop for each one — against a budget spent on
+the connection as readily as on the forge. Crossing once also keeps the ranking, the
+sanitizer and the JSON envelope on one side, so a connection that drops mid-poll drops a
+whole poll rather than half of one. The two shapes answer different questions: how many
+calls the work is, and whether a partial result is worth anything.
 
 `git` is the one that turns on placement. `credential_proxy.py::_execute` confines a git
 command's working directory to `CREDENTIAL_PROXY_WORKSPACE_ROOT` and re-runs it on the
@@ -1959,7 +2057,9 @@ to that. What is left in the agent pod is trusted code: the MCP server, the cron
 the gateway. The point of the proxy is that raw credentials never reach the agent, not
 that no process can invoke a command, so this is the property that matters. What settles
 the rest of it is per-caller authentication: the broker is in a pod of its own, its
-callers reach it over a Service, and none gets in without a bearer token.
+callers reach it over a Service, and none reaches the credentialed listener without a
+bearer token; the one other TCP listener in that pod serves Prometheus counters and
+nothing else ([credential isolation](../credential-isolation-design.md#architecture)).
 
 The kubeconfig entanglement that used to argue for a shared volume is gone. `gcloud
 container clusters get-credentials` writes a kubeconfig, and the broker used to validate
@@ -2013,11 +2113,11 @@ was the alternative: it would put the tools next to the binaries and make the
 `_run_env()` leak harmless, since the sandbox environment holds nothing worth taking. It
 was rejected on cost. It needs a bearer token in a mounted Secret, a Service, a readiness
 probe and a supervised server process — a second mechanism running parallel to an SSH
-helper the three scripts need anyway — and it needs the file split, because
+helper the two profile scripts need anyway — and it needs the file split, because
 `send_notification` reads `SESSION_KV_API_KEY` and the module is also the parent process
 of the Session KV server, so moving it wholesale would put the incident's exact target
 inside the sandbox. The dedicated principal, meanwhile, is not a cost the HTTP design
-avoids: the three scripts need it either way. Once it exists, the MCP server using the
+avoids: the two profile scripts need it either way. Once it exists, the MCP server using the
 same helper is nearly free.
 
 It also degrades better. Hermes recovers a dropped MCP transport with five retries at
@@ -2051,19 +2151,22 @@ are not re-walked.
 it read-only (`mode=ro`) for its invariant and blocked-card queries and shells out to
 `hermes kanban diagnostics --json` for the rule engine; its docstring records that a
 read-write open of `/opt/data/kanban.db` from an agent shell is what the persona forbids.
-[`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
-does open it, `sqlite3.connect` at line 63 — and the Platform Agent's `SOUL.md` (§0, the
-sub-card paragraph under _Show your progress_; §6's fan-out bullet repeats it) tells the
-agent to run it from the shell. That is coherent today, where §0's ban on touching the
-board is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not
-survive the move.
+`kanban_notify_propagate.py`, since deleted, did open it read-write — and the Platform
+Agent's `SOUL.md` (§0, the sub-card paragraph under _Show your progress_; §6's fan-out
+bullet repeated it) told the agent to run it from the shell. That was coherent before the split, where §0's ban on
+touching the board is a ban on ad-hoc edits and the script was a sanctioned writer, but
+it did not survive the move.
 
 Mounting `kanban.db` into the sandbox is ruled out. It would hand the shell exactly the
 write path that the rule exists to close, after a worker used that path on 2026-08-07
 to mark three cards `done` with an invented result. Under the split,
 `kanban_board_health.py` stays agent-side and stops being a problem;
 `kanban_notify_propagate.py` needs to become something the agent calls rather than
-something it runs.
+something it runs. It turned out to need neither: `kanban_create` copies the creating
+worker's subscription onto the child (upstream `create_task`, and the
+`kanban_auto_subscribe` image patch), so the instructions to run it were removed and
+the script deleted. An operator back-fills a card with no subscription with the built-in
+`hermes kanban notify-subscribe`, run in the agent pod.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
 `hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
@@ -2146,11 +2249,13 @@ are questions about this pod that a file in the other one cannot answer.
 
 Reading that as the general answer would be a mistake. It crosses what one
 notifier was already going to deliver, at one moment in a card's life, into a
-directory nothing else reads. Every other agent-side reader still looks on the
-gateway's volume and still finds nothing, and generalising this — a tool the model
-can call to bring a file across on demand, with a landing directory that persists
-past a single delivery — is a decision about the boundary that still wants its own
-design.
+directory nothing else reads. The one other agent-side reader that crosses is
+`bootstrap_delivery.py`, which reads the single file it posts, `INVENTORY.md`, by
+name once its markers say a delivery is due, and lands nothing on disk. Every other
+agent-side reader still looks on the gateway's volume and still finds nothing, and
+generalising either — a tool the model can call to bring a file across on demand,
+with a landing directory that persists past a single delivery — is a decision about
+the boundary that still wants its own design.
 
 ### Three of the proxy's five roles move
 
@@ -2182,7 +2287,7 @@ So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 | Role        | Starts                                               | Runs in                              |
 | ----------- | ---------------------------------------------------- | ------------------------------------ |
 | `broker`    | credential exec broker, Google Chat and Slack relays | the `<agent>-credential-proxy` pod   |
-| `api-proxy` | API authenticator, k8s-event-watcher                 | the gateway pod, as `agent-api-auth` |
+| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector | the gateway pod, as `agent-api-auth` |
 | `combined`  | all of them                                          | nothing, now — the default           |
 
 `combined` is the default, so an image paired with an operator that does not set the
@@ -2261,7 +2366,7 @@ but it is still mintable from `169.254.169.254` by anything that gets execution 
 
 Emptying the gateway pod of credentials breaks the one class of work that still needs them
 there. A roster entry marked `no_agent` runs as a Python subprocess on the gateway rather
-than as a model turn, so it never touches the terminal backend and never reaches the
+than as a model turn, and at the time touched neither the terminal backend nor the
 sandbox. `refresh_git_credentials` in `agents/platform/scripts/github_token_refresh.py`
 prefers `CREDENTIAL_PROXY_URL` and falls back to `gcloud auth print-identity-token`; with
 the variable gone from the gateway and no `gcloud` in the agent image, both branches are
@@ -2281,8 +2386,10 @@ the gateway's managed Hermes config, which the sandbox image does not carry.
 
 What is still open is the wider question this exposed: what `no_agent` should mean once the
 gateway holds nothing. Either the entry declares that it needs credentials and is scheduled
-into the sandbox, or it is restricted to work that needs none. The forward above fixes the one
-credential a `no_agent` job actually asks for; it does not decide that.
+into the sandbox, or it is restricted to work that needs none. The forward above, `kanban-workspace-gc`'s
+listing and removal, `cluster-agent-reconcile`'s `gcloud` calls and `stall-watch`'s cluster
+sweep are among the `no_agent` jobs already scheduled into the sandbox through
+`sandbox_exec`; none of them decides that.
 
 ### Caller authentication
 
@@ -2292,8 +2399,8 @@ dial the Service by name.
 
 What replaced the loopback listener and the `0600` socket is a projected ServiceAccount
 token: one hour, presented as a bearer header and verified with a `TokenReview` against the
-API server. Every path except `/healthz` requires it, and an unidentified caller gets an
-undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
+API server. Every path on the credentialed listener except `/healthz` requires it, and an
+unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
 the same listener, and, once the operator renders it, the A2A gateway's. The operator grants
@@ -2419,8 +2526,11 @@ exist and takes the same fork for the whole run. An unreachable broker answers "
 publishes through the leased clone, which is the one question in a run where falling back beats
 failing — every other call still fails loudly. It answers "no" by code as well as by status:
 `CONTENT_WORKSPACES_DISABLED` on a 404 says the broker does not have them armed, where a bare
-404 says that and "no such route" indistinguishably. The migrated skills are
-`submit-suggestion` and `fleet-audit`, and `fleet-audit` needed the read side to replace what
+404 says that and "no such route" indistinguishably. The migrated skills were
+`submit-suggestion` and `fleet-audit`. `submit-suggestion` has since left content mode
+entirely — the version-control verbs give it a real checkout in its own container, with the
+credential in another, so there is nothing for the contentless fork to buy — and what is
+written here now describes `fleet-audit` alone. It needed the read side to replace what
 the clone used to answer: `list` pages the repository's tracked files, `read` fetches them
 singly or in a batch, and `grep` searches them, which is how a remediation path stays something
 discovered rather than invented when there is nothing local to search.
@@ -2767,21 +2877,24 @@ anyway is in [The Session KV store](#the-session-kv-store).
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
-- **The SSH helper reaches the sandbox; nothing behind it runs yet.**
-  `agents/platform/scripts/sandbox_exec.py` routes all fifteen agent-side call sites,
+- **The SSH helper reaches the sandbox, and the commands behind it now run.**
+  `agents/platform/scripts/sandbox_exec.py` routes every credentialed call site that
+  runs in the agent pod (the `gitops_workspace._read_state_key` kubectl fallback aside),
   and the `hermes` account, its authorised key and the `.bashrc` isolation are covered
-  by `make docker-smoke-sandbox`. Run from the agent pod against a live install it
-  connects as uid 1001 on the sandbox host, and a routed `gcloud` or `kubectl` stops at
-  `CREDENTIAL_PROXY_URL is not configured` — a message the agent pod cannot produce,
-  since the variable is set there. So the connection is proven and the command behind
-  it is not. The helper had to land before the agent image can drop
-  `credential-proxy-exec`, which makes it the gate on that change.
-- **The MCP server's kubeconfig has moved and the credential proxy does not know.**
-  `_thread_kubeconfig_path` writes into `/home/hermes/.kubeconfigs` when the sandbox is
-  on, because a kubeconfig names an `exec` credential plugin that kubectl runs, and any
-  path uid 1000 can write is code execution as the trusted principal. The proxy accepts
-  a caller-supplied `KUBECONFIG` only inside its workspace root, so that directory needs
-  standing there or the tools fail one step later than they do now.
+  by `make docker-smoke-sandbox`. When the helper landed, a routed `gcloud` or `kubectl`
+  stopped at `CREDENTIAL_PROXY_URL is not configured`, so the connection was proven and
+  the command behind it was not; since then `stall-watch`, a shipped roster entry, runs `gcloud container clusters
+get-credentials` and `kubectl` behind it on every tick, and `github_token_refresh.py`'s
+  forward mints through it. The helper had to land before
+  the agent image can drop `credential-proxy-exec`, which makes it the gate on that change.
+- **The MCP server's kubeconfig moved to `/home/hermes/.kubeconfigs`, and the proxy
+  never sees the path.** `_thread_kubeconfig_path` writes there when the sandbox is on,
+  because a kubeconfig names an `exec` credential plugin that kubectl runs, and any path
+  uid 1000 can write is code execution as the trusted principal. The shim resolves
+  `KUBECONFIG` to a context name on the sandbox side and forwards the name, never the
+  path (`credential_proxy_client.py`), so the proxy's workspace-root check does not apply
+  and `stall-watch` keeps its own files in the same directory. The docstring on
+  `_thread_kubeconfig_path` still describes the older check and is what is left to update.
 - **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
   earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
   pod's PVC and shells out to `hermes`, so it is one of the three scripts the sandbox
@@ -2791,11 +2904,6 @@ anyway is in [The Session KV store](#the-session-kv-store).
   MCP tool that lets the model ask the agent pod to create a profile rather than
   running a script that has to live there. Inventing that layout inside a call site was
   the alternative, and it is how two layouts end up shipping.
-- **Cron has not been exercised against a sandboxed agent.** The finding that
-  `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
-  doubt, but no roster has run in this configuration, and the bootstrap handoff the
-  section above specifies is designed and unimplemented. Onboarding is broken until it
-  lands, and broken silently.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
   backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
   would be a hole rather than a degradation.

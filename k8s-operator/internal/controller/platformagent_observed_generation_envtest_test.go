@@ -61,11 +61,19 @@ const (
 // silent skip here would leave this file looking like coverage it is not.
 func startEnvtestConfig(t *testing.T) (*rest.Config, *runtime.Scheme) {
 	t.Helper()
+	return startEnvtestConfigWithCRDs(t, envtestCRDDir)
+}
+
+// startEnvtestConfigWithCRDs is startEnvtestConfig serving the CRDs in crdDirs
+// instead of the operator's own, for a test whose API server has to serve a
+// schema this release does not ship — an older one, say.
+func startEnvtestConfigWithCRDs(t *testing.T, crdDirs ...string) (*rest.Config, *runtime.Scheme) {
+	t.Helper()
 	if os.Getenv(envtestAssetsEnvVar) == "" {
 		t.Skipf("%s is unset: run through `make -C k8s-operator test`, or export it from `bin/setup-envtest use -p path`", envtestAssetsEnvVar)
 	}
 	env := &envtest.Environment{
-		CRDDirectoryPaths:     []string{envtestCRDDir},
+		CRDDirectoryPaths:     crdDirs,
 		ErrorIfCRDPathMissing: true,
 	}
 	cfg, err := env.Start()

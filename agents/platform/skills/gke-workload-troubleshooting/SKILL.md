@@ -224,8 +224,12 @@ Following the GitOps boundary, **do not apply patches directly to the cluster**.
     to 256Mi while actual usage spiked to 270Mi"*).
 2.  Generate the corrected YAML manifest patch (e.g. increase memory limits, add
     missing Secret mounts, or add tolerations for Spot nodes).
-3.  Check if a branch or Pull Request (PR) already exists for this
-    workload/failure. If so, update the existing branch/PR or notify the user
-    instead of creating a duplicate. Otherwise, create a branch, commit the
-    change, open a Pull Request (PR) on GitHub, and conclude the workflow (do
-    not wait for human merge).
+3.  If the request asked for the fix to be submitted or applied ("fix it",
+    "open a PR", a card whose task says so), check whether a branch or Pull
+    Request (PR) already exists for this workload/failure. If so, update the
+    existing branch/PR or notify the user instead of creating a duplicate.
+    Otherwise, create a branch, commit the change, open a Pull Request (PR) on
+    GitHub, and conclude the workflow (do not wait for human merge).
+4.  If the request asked you to investigate, diagnose or report, the manifest
+    from step 2 goes in your reply as a recommendation and the pull request is
+    one message away; do not open one (`SOUL.md` §3, item 3).

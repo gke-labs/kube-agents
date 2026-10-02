@@ -56,11 +56,17 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --permission-set="read-only"
 ```
 
-Or delegate setup directly to your AI coding agent:
+Or give this prompt to an AI coding assistant. It needs no checkout of this repository, and tells the assistant to confirm the target with you and show you the `--dry-run` summary before it creates any cloud resources:
 
 ```text
-"Using kube-agents/INSTALL.md provision the latest official release of k8s agentic harness"
+Install the latest official release of kube-agents (github.com/gke-labs/kube-agents) into my GCP project.
+Follow INSTALL.md from that release tag — do not invent installer URLs, namespaces, or model names.
+First inspect my gcloud project and existing GKE clusters and confirm the target, cluster, model provider,
+and credential with me. Run install.sh with --dry-run and show me its printed summary before you change anything.
+Only run the real install after I say yes.
 ```
+
+The full procedure behind the prompt, including the credential and consent-flag checks, is in [INSTALL.md](INSTALL.md#ai-assisted-installation). An assistant working in a checkout of this repository also picks up the [`install-kube-agents`](.agents/skills/install-kube-agents/SKILL.md) skill, which covers the same install.
 
 Prefer to drive the engine by hand? Unpack `kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended), or clone the repository at an official release tag if a Git checkout is needed:
 
@@ -84,7 +90,7 @@ Both paths run the same engine: `terraform/examples/full-install` provisions eve
 The harness runs co-located agents in a single operator-deployed pod: the **Planning Agent** — the conversational front door that receives every chat message, works out what it needs, and delegates that work over a shared kanban board — the **Platform Agent** — the master custodian and agent architect that manages the GKE infrastructure lifecycle, establishes multi-tenancy boundaries, and enforces fleet-wide compliance — and a **Cluster Agent** per managed cluster, a single-cluster SRE persona the Platform Agent scaffolds from the [`agents/cluster/`](agents/cluster/) template for runtime operations and workload debugging, with read-only access to the cluster it watches. The Platform Agent is driven by:
 
 - 🧬 **A persona** — [`agents/platform/SOUL.md`](agents/platform/SOUL.md) defines its identity, its _Automation First_ rule (no manual cluster mutations; changes flow through declarative, PR-based workflows), and its _Least Privilege_ constraint.
-- 📚 **Governance playbooks** — SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, and lifecycle management.
+- 📚 **Governance playbooks** — SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering compliance and security audits, fleet consistency drift, cost analysis, stockout prevention, and security patch orchestration.
 - 🛠️ **Skills** — task-focused `SKILL.md` bundles under [`agents/platform/skills/`](agents/platform/skills/): cluster creation, app onboarding, cost analysis, backup & DR, and manifest generation. Single-cluster runtime skills — workload troubleshooting, observability, autoscaling, storage — belong to the Cluster Agent in [`agents/cluster/skills/`](agents/cluster/skills/). See the [skill catalog](https://gke-labs.github.io/kube-agents/skills/).
 - ⏰ **Autonomous watchdogs** — cron-driven governance jobs in [`agents/platform/cron/jobs.json`](agents/platform/cron/jobs.json) that keep the fleet honest without human prompting. Ticking belongs to the Planning Agent's gateway, the only running one, so a job on its roster advances the Platform Agent's schedule once a minute. See [proactive autonomy](https://gke-labs.github.io/kube-agents/overview/proactive-autonomy/).
 

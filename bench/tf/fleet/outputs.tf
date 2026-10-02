@@ -13,16 +13,17 @@
 # limitations under the License.
 
 output "cluster_names" {
-  description = "The three seeded clusters. seeded-b is the version laggard; seeded-c is the consistency outlier."
+  description = "The seeded clusters. seeded-b is the version laggard; seeded-c is the consistency outlier; seeded-d is multi-zonal and carries the zonal-skew fixtures."
   value = [
     google_container_cluster.seeded_a.name,
     google_container_cluster.seeded_b.name,
     google_container_cluster.seeded_c.name,
+    google_container_cluster.seeded_d.name,
   ]
 }
 
 output "fleet_reader_service_account" {
-  description = "Read-only service account the evaluation checks read the fleet as. Export it as FLEET_READONLY_SA in the Prow job so hack/fleet-kubeconfigs.sh mints its token instead of using the runner's own credential."
+  description = "Read-only service account the evaluation checks read the fleet as. hack/ci-eval-pr.sh defaults FLEET_READONLY_SA to it from the leased project; export it yourself for a fleet outside the pool. hack/fleet-kubeconfigs.sh mints its token as this account and writes nothing without one."
   value       = google_service_account.fleet_reader.email
 }
 

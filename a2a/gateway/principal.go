@@ -12,22 +12,24 @@ import (
 )
 
 // PrincipalMap resolves backend-native user ids to principals in our trust
-// domain. For Discord it is a mounted install-side mapping table (a
-// ConfigMap; nothing is checked into the repo) and a test fixture by
-// construction: a Discord identity never maps to a real cloud principal,
-// full stop (spec-chatops-gateway.md). A sender with no entry cannot be
-// verified and their message is dropped at ingress.
+// domain. For Discord it is a mounted install-side ConfigMap (nothing is
+// checked into the repo) and a test fixture by construction: a Discord
+// identity never maps to a real cloud principal, full stop. For Slack it is
+// the admin-owned a2a-slack-principal-map Secret, joining the immutable
+// user_id to an IdP-sourced principal (spec-chatops-gateway.md, "The Slack
+// adapter"). A sender with no entry cannot be verified and their message is
+// dropped at ingress.
 type PrincipalMap struct {
 	mu sync.RWMutex
 	m  map[string]string
 }
 
-// LoadPrincipalMap reads the map from a directory of files (the mounted
-// principal-map ConfigMap: one file per backend user id, content is the
+// LoadPrincipalMap reads the map from a directory of files (a mounted
+// ConfigMap or Secret: one file per backend user id, content is the
 // principal) or from a single file of "id principal" lines. A missing path
 // yields an empty map — the gateway runs, and every message drops at
-// verification, which is the honest failure for an install without W0's
-// ConfigMap.
+// verification, which is the honest failure for an install without its
+// mapping table.
 func LoadPrincipalMap(path string) (*PrincipalMap, error) {
 	pm := &PrincipalMap{m: map[string]string{}}
 	info, err := os.Stat(path)
@@ -75,6 +77,26 @@ func (p *PrincipalMap) Resolve(userID string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.m[userID]
+}
+
+// Section returns the entries under keyPrefix as a map of their own, with
+// the prefix removed from every key and only values under valuePrefix kept.
+// It is how the inject door's prefixed map is read by the code that resolves
+// a roster's raw author ids (BuildAuthority, hashRoster), so the requester
+// hashes to the same principal there as in the authority block's requester
+// field. The refusal of a value outside valuePrefix is the same refusal
+// Gateway.resolveInjectPrincipal makes; here it is a drop, there it is a
+// logged error, and neither honours the entry.
+func (p *PrincipalMap) Section(keyPrefix, valuePrefix string) *PrincipalMap {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := &PrincipalMap{m: map[string]string{}}
+	for k, v := range p.m {
+		if strings.HasPrefix(k, keyPrefix) && strings.HasPrefix(v, valuePrefix) {
+			out.m[strings.TrimPrefix(k, keyPrefix)] = v
+		}
+	}
+	return out
 }
 
 // Len reports how many identities are mapped.

@@ -28,9 +28,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -60,6 +62,13 @@ const (
 	defaultTaskDeadlineSeconds = 7200
 	defaultKillGraceSeconds    = 10
 	defaultKVBucket            = "runtime-state"
+	// defaultProgressIntervalSeconds is hermesbridge.DefaultProgressInterval
+	// in the environment's unit.
+	defaultProgressIntervalSeconds = 60
+	// activityListenOff is the value that closes the activity door. The
+	// Config zero value means "off" but an empty environment variable reads
+	// as unset, so the daemon needs a word for it.
+	activityListenOff = "off"
 )
 
 // errUsage is what realMain returns when NATS_URL is missing, so run can
@@ -88,6 +97,22 @@ func run() int {
 	return 0
 }
 
+// managedScopeDir is hermes's managed scope as this process sees it, the
+// source each child's scope is copied from: HERMES_MANAGED_DIR when set, else
+// /etc/hermes when it is a directory, else none (the child gets a hook-only
+// scope). Resolved here with the rest of the environment, so the library's
+// defaults stay environment-free and a test's bridge copies nothing from
+// the machine it runs on.
+func managedScopeDir() string {
+	if v := strings.TrimSpace(os.Getenv(hermesbridge.ManagedDirEnv)); v != "" {
+		return v
+	}
+	if st, err := os.Stat(hermesbridge.DefaultManagedDir); err == nil && st.IsDir() {
+		return hermesbridge.DefaultManagedDir
+	}
+	return ""
+}
+
 // realMain is the bridge from environment to shutdown. Every failure is
 // logged where it is found and then returned; a missing NATS_URL returns
 // errUsage before anything is dialed.
@@ -104,7 +129,13 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
 		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
 		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
-		Logger:       log,
+		// The activity door (a2a/hermes-bridge/activity.go): on by default;
+		// each child is handed whatever address the door bound.
+		ActivityListen:   activityListen(envOr("BRIDGE_ACTIVITY_LISTEN", hermesbridge.DefaultActivityListen)),
+		ScratchDir:       os.Getenv("BRIDGE_SCRATCH_DIR"),
+		ManagedScopeDir:  managedScopeDir(),
+		ProgressInterval: progressInterval(log, envInt(log, "BRIDGE_PROGRESS_INTERVAL_SECONDS", defaultProgressIntervalSeconds)),
+		Logger:           log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
 		cfg.Command = []string{bin, "-p", cfg.Profile, "chat", "-Q", "-q"}
@@ -128,6 +159,34 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	log.Info("bridge shut down cleanly")
 	return nil
+}
+
+// maxDurationSeconds is the largest count of seconds a time.Duration holds;
+// past it the multiplication wraps negative, which the Config reads as off.
+const maxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
+
+// progressInterval maps the environment's seconds to the Config's duration:
+// 0 is off there (the Config's off is negative; its zero is the default). A
+// count the duration cannot hold is refused the way envInt refuses a
+// non-integer, loudly and with the default in its place, rather than
+// wrapping into a silent off.
+func progressInterval(log *slog.Logger, seconds int) time.Duration {
+	if seconds <= 0 {
+		return -1
+	}
+	if int64(seconds) > maxDurationSeconds {
+		log.Error("progress interval out of range; using default", "key", "BRIDGE_PROGRESS_INTERVAL_SECONDS", "value", seconds, "default", defaultProgressIntervalSeconds)
+		return time.Duration(defaultProgressIntervalSeconds) * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// activityListen maps the environment's spelling of "off" to the Config's.
+func activityListen(v string) string {
+	if v == activityListenOff {
+		return ""
+	}
+	return v
 }
 
 func envOr(key, def string) string {

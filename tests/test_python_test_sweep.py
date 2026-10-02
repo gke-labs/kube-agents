@@ -57,10 +57,9 @@ def _has_coverage():
     is the interpreter the Makefile invokes -- this test may be running under
     a different one.
 
-    Everything above needs only make and python3, which is what lets
-    agent-startup-test.yml run this file with pyyaml as its single dependency,
-    deliberately, so the tests run anywhere the agent image does. The coverage
-    cases below need the package too. Without this they do not fail honestly
+    Everything above needs only make and python3, so those cases run anywhere
+    the agent image does, with nothing installed. The coverage cases below need
+    the package too. Without this they do not fail honestly
     there: the strict case asserts a non-zero exit and gets one from the
     missing package rather than from the gate, so it passes while testing
     nothing. The `test` job installs requirements-test.txt, which is the job

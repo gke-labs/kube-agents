@@ -35,9 +35,6 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # not run under `make test-python`. Every entry carries its reason; an entry
 # without one should not survive review.
 EXCLUDED = {
-    # Has its own Makefile target (`make -C k8s-operator test-python`) and its
-    # own CI workflow; the root suite does not reach into the operator.
-    "k8s-operator": "own suite, k8s-operator-test.yml",
     # Has its own runner (`make conformance` -> tests/conformance/run.py) and
     # its own unfiltered workflow (conformance.yml), deliberately outside the
     # globs: the suite's premise is that its CI entry must not depend on a
@@ -51,8 +48,10 @@ EXCLUDED = {
     # of its tests and errors on both. Runs under `make test-bench`.
     "bench/tests": "pytest-native, runs under make test-bench",
     # Live GKE cluster E2E test suite; pytest-native, requires live cluster, Workload Identity,
-    # and KMS. Runs under `make test-e2e` in e2e-run.yml and e2e-manual-runner.yml.
-    "tests/e2e": "live cluster E2E suite, runs under make test-e2e",
+    # and KMS. e2e-run.yml and e2e-manual-runner.yml run
+    # scripts/release/execute_e2e_tests.sh directly; `make e2e-tests` is the
+    # local entry to the same script.
+    "tests/e2e": "live cluster E2E suite, runs through scripts/release/execute_e2e_tests.sh",
     # Live black-box CUJ journeys against a provisioned kube-agents install;
     # they open an admin portal and talk to a deployed agent, so they are
     # deliberately manual: `uv run --project bench pytest -s bench/cuj`.

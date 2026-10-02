@@ -50,6 +50,65 @@ SETUP_DEATHS_SINCE = "2026-09-07T15:00:00+00:00"
 SETUP_DEATH_BUILD = "2097273589702070272"
 SETUP_DEATH_LABEL = "PR #1274 at Tue 6:39 AM ET"
 HOSTILE_PR = "<<script>script>"
+# The poll-timing tests run the page's setInterval this many times faster, so
+# two polls fit in a budget of a few virtual seconds (see fast_timers_page).
+TIMER_SPEEDUP = 100
+# A bare integer literal only: `60 * 1000`, `60_000` or `6e4` would otherwise
+# read as 60 or 6 and shrink the budget below to almost nothing.
+_REFRESH_MATCH = re.search(r"^\s*refreshMs:\s*(\d+)\s*(?:,|\}|$)", PAGES_JS.read_text(), re.MULTILINE)
+if _REFRESH_MATCH is None:
+    raise RuntimeError(f"{PAGES_JS}: PAGE.refreshMs is not a bare integer literal; the poll-timing tests cannot derive their budget")
+PAGE_REFRESH_MS = int(_REFRESH_MATCH.group(1))
+# Boot, then two polls, then half an interval of slack, on the sped-up clock.
+TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEEDUP
+# dom_html's budget when a test names none: boot and the refresh after it;
+# the first poll is far outside it unless the page's timers are sped up.
+DEFAULT_BUDGET_MS = 3000
+# fast_timers_page names its copies with this stem suffix and writes this shim
+# into them. dom_html reads the shim from the copy, not the suffix from the
+# name: every page-copy helper appends its own suffix after whatever it is
+# handed, so the name says which wrapper was outermost, and only the shim
+# says how soon the page polls.
+FAST_TIMERS_SUFFIX = "-fast"
+FAST_TIMERS_SHIM = ("<script>(() => { const native = window.setInterval;"
+                    f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
+# The Brief's bare view anchors (#gate, #agent), each the id of a section.
+# dom_html refuses one on a budget the poll fires inside: a fragment naming
+# an element, polled under virtual time, is what stalls headless Chrome on CI.
+def brief_view_anchors(pages_js: str) -> frozenset:
+    """PAGE.views' values from pages.js's text, a flat object of quoted
+    strings. Any other shape raises, so a reshaped literal fails the import
+    rather than the guard: the match cannot cross a nested brace, where one
+    stopping at the first `}` would read a nested value's first strings as
+    the anchors, keep the import quiet, and let the views after it reach
+    Chrome on the poll budget."""
+    match = re.search(r"^\s*views:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views is not a flat object literal; dom_html cannot tell a bare view anchor")
+    anchors = frozenset(re.findall(r'"([^"]+)"', match.group(1)))
+    if not anchors:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views names no quoted view; dom_html cannot tell a bare view anchor")
+    return anchors
+
+
+BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+# The Cases page's one polled call, in
+# test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
+# the bare case name, under boot and two polls on the page's real clock.
+# The element it scrolls to is id="case-<name>" (pages.js renders the row
+# and reads the hash through linkState's caseHash), so Chrome's native
+# anchor matches nothing and the call has no stall on record. The call
+# site and DomHtmlGuardTest's kept list read these two names, not copies.
+CASES_ROW_ANCHOR = "#cluster-agent-crashloop-evidence-chain"
+CASES_TWO_POLLS_BUDGET_MS = 130000
+# Below this the page may not finish booting inside the budget, and the
+# scroll-once test would pass or fail on load time rather than on the poll.
+MIN_TWO_POLLS_BUDGET_MS = 1000
+if TWO_POLLS_BUDGET_MS < MIN_TWO_POLLS_BUDGET_MS:
+    raise RuntimeError(
+        f"two polls of PAGE.refreshMs={PAGE_REFRESH_MS} at TIMER_SPEEDUP={TIMER_SPEEDUP} give a "
+        f"{TWO_POLLS_BUDGET_MS} ms budget, under {MIN_TWO_POLLS_BUDGET_MS} ms; lower TIMER_SPEEDUP"
+    )
 
 
 # The scorer's marker-led reason for a delegation-ceiling repetition (#1874);
@@ -131,12 +190,20 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = 3000) -> str:
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = DEFAULT_BUDGET_MS) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
     an XHR with a login redirect puts the pages in. ``budget_ms`` is the
     virtual time the page is given; timers fire inside it, so a budget past
-    PAGE.refreshMs runs the poll too."""
+    PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
+    on a budget the poll fires inside; see fast_timers_page for the stall."""
+    anchor = fragment.lstrip("#")
+    poll_ms = PAGE_REFRESH_MS // TIMER_SPEEDUP if FAST_TIMERS_SHIM in page.read_text() else PAGE_REFRESH_MS
+    if budget_ms >= poll_ms and anchor in BRIEF_VIEW_ANCHORS:
+        raise ValueError(
+            f"{fragment} on a {budget_ms} ms budget of a page that polls every {poll_ms} ms: a bare view anchor "
+            f"polled under virtual time stalled headless Chrome on CI (#2227); use #view={anchor}, or a budget the poll is outside"
+        )
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
         [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
@@ -152,6 +219,30 @@ def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
             " document.body.dataset.scrolls = String(Number(document.body.dataset.scrolls || 0) + 1); };</script>")
     copy = page.with_name(page.stem + "-scrolls" + page.suffix)
     copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
+
+
+def scrolls(html: str) -> "re.Match[str] | None":
+    """The scroll count a scroll_counting_page recorded, or None when
+    nothing scrolled."""
+    return re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
+
+
+def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
+    """A copy of the rendered page whose setInterval runs TIMER_SPEEDUP
+    times faster, so the poll every PAGE.refreshMs fires inside a short
+    virtual-time budget. A budget spanning real polls (130 s) on a URL whose
+    fragment names an element on the page (#gate) intermittently stalled
+    headless Chrome's virtual clock on CI until the wall-clock timeout;
+    bare anchors on short budgets have a clean record. The sped-up clock
+    alone did not remove the stall: #gate under TWO_POLLS_BUDGET_MS stalled
+    the same way, so no call on the poll budget carries a fragment that
+    names an element (test_the_bare_anchor_scrolls_once), and dom_html
+    refuses a bare view anchor on a budget the poll fires inside, telling
+    the sped-up clock by this shim in the copy, whichever wrapper is
+    outermost."""
+    copy = page.with_name(page.stem + FAST_TIMERS_SUFFIX + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + FAST_TIMERS_SHIM, 1))
     return copy
 
 
@@ -512,6 +603,118 @@ class RenderedFilesTest(unittest.TestCase):
         self.assertNotRegex(script, r"prLink\([^)]*\)\s*\.replace", "prLink's anchor is markup, never stripped back to text")
 
 
+# The blocking roster as the split left it (test_eval_rosters.ROSTER_AT_SPLIT).
+# BrowserTest renders the fixture week against THIS roster, not the live
+# hack/eval/blocking-roster.txt: the run page counts gate cases from the
+# roster, so every admission since (#1023 admitted two on 2026-09-22) would
+# otherwise move the "10 gate cases" the expectations below pin.
+ROSTER_AT_SPLIT = frozenset({
+    "reliability-pdb-probe",
+    "security-overgrant-probe",
+    "upgrades-lagging-master-probe",
+    "consistency-authorized-networks-probe",
+    "cost-idle-pool-probe",
+    "obtainability-remediation-proposal",
+    "cluster-agent-crashloop-debug",
+    "cluster-agent-crashloop-misleading-symptom",
+    "cluster-agent-crashloop-evidence-chain",
+    "agent-kanban-smoke",
+})
+
+
+class DomHtmlGuardTest(unittest.TestCase):
+    """dom_html's refusal of a bare view anchor on a budget the poll fires
+    inside, and the parse of PAGE.views it reads the anchors from. Both are
+    decided before Chrome runs, so they hold on a host without one, and the
+    admitted calls are checked against a mocked subprocess."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        data = load_fixture()
+        data["generated_at"] = NOW
+        out = render_to(cls.tmp.name, data, health=health_doc())
+        cls.index = out / "index.html"
+        cls.cases = out / render.CASES_PAGE
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def no_chrome():
+        """subprocess.run replaced, so a call the guard admits is recorded
+        and never launches a browser: the refused shapes below are the
+        ones that stalled CI, and a guard that let one through must fail
+        the test, not hang it."""
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        return unittest.mock.patch.object(subprocess, "run", return_value=completed)
+
+    def test_a_bare_view_anchor_on_the_poll_budget_is_refused_whichever_wrapper_is_outermost(self):
+        # The sped-up clock is read from the shim in the copy, not from the
+        # file name: scroll_counting_page(fast_timers_page(...)) is named
+        # "-fast-scrolls", and a check on the name's end would admit the
+        # exact call that stalled CI (#2227).
+        pages = (fast_timers_page(scroll_counting_page(self.index)),
+                 scroll_counting_page(fast_timers_page(self.index)),
+                 clock_page(fast_timers_page(self.index), NOW))
+        with self.no_chrome():
+            for page in pages:
+                for anchor in sorted(BRIEF_VIEW_ANCHORS):
+                    with self.subTest(page=page.name, anchor=anchor):
+                        with self.assertRaises(ValueError) as refused:
+                            dom_html(page, fragment=f"#{anchor}", budget_ms=TWO_POLLS_BUDGET_MS)
+                        self.assertIn(f"polls every {PAGE_REFRESH_MS // TIMER_SPEEDUP} ms", str(refused.exception))
+                        self.assertIn(f"use #view={anchor}", str(refused.exception))
+            with self.assertRaises(ValueError) as refused:
+                dom_html(scroll_counting_page(self.index), fragment="#gate", budget_ms=CASES_TWO_POLLS_BUDGET_MS)
+            self.assertIn(f"polls every {PAGE_REFRESH_MS} ms", str(refused.exception), "a plain page polls at PAGE.refreshMs")
+
+    def test_a_reshaped_views_literal_fails_the_import_not_the_guard(self):
+        # The guard refuses exactly the anchors the parse found, so a parse
+        # that misreads a reshaped literal loses an anchor with no test
+        # noticing: a match stopping at the first `}` reads the nested
+        # literal below as {"gate", "Gate"}, non-empty, and #agent on the
+        # poll budget then reaches Chrome. The parse must raise instead,
+        # naming the file, as it does for a literal with no quoted value.
+        flat = 'const PAGE = {\n  views: { gate: "gate", agent: "agent" },\n  refreshMs: 60000,\n};\n'
+        nested = ('const PAGE = {\n  views: { gate: { id: "gate", label: "Gate" }, agent: { id: "agent", label: "Agent" } },\n'
+                  '  refreshMs: 60000,\n};\n')
+        unquoted = 'const PAGE = {\n  views: { gate: GATE, agent: AGENT },\n};\n'
+        self.assertEqual(brief_view_anchors(flat), frozenset({"gate", "agent"}))
+        for shape, text in (("nested", nested), ("unquoted", unquoted), ("empty", "const PAGE = {\n  views: {},\n};\n")):
+            with self.subTest(shape=shape):
+                with self.assertRaises(RuntimeError) as refused:
+                    brief_view_anchors(text)
+                self.assertIn(str(PAGES_JS), str(refused.exception))
+
+    def test_the_calls_the_suite_keeps_reach_chrome(self):
+        # The polled calls the suite makes, each on the page copy its call
+        # site uses: the Brief's two under the sped-up clock, the bare
+        # anchor on the default budget, and the Cases page's row anchor,
+        # which is the bare case name (its element is case-<name>), not a
+        # fragment naming the element. The Cases shape reads the call
+        # site's constants so the list cannot drift from the call.
+        fast = scroll_counting_page(fast_timers_page(self.index))
+        plain = scroll_counting_page(self.index)
+        cases = scroll_counting_page(self.cases)
+        kept = [
+            (fast, {"fragment": "#since=2026-09-07T14:00:00Z&view=gate", "budget_ms": TWO_POLLS_BUDGET_MS}),
+            (fast, {"budget_ms": TWO_POLLS_BUDGET_MS}),
+            (plain, {"fragment": "#gate"}),
+            (cases, {"fragment": CASES_ROW_ANCHOR, "budget_ms": CASES_TWO_POLLS_BUDGET_MS}),
+        ]
+        self.assertFalse(CASES_ROW_ANCHOR.lstrip("#").startswith("case-"), "the Cases call names the row by case name; case-<name> is the element id")
+        with self.no_chrome() as run:
+            for page, call in kept:
+                dom_html(page, **call)
+        self.assertEqual(run.call_count, len(kept))
+        for (page, call), invocation in zip(kept, run.call_args_list):
+            argv = invocation.args[0]
+            self.assertIn(f"--virtual-time-budget={call.get('budget_ms', DEFAULT_BUDGET_MS)}", argv, call)
+            self.assertEqual(argv[-1], page.as_uri() + call.get("fragment", ""), call)
+
+
 @unittest.skipUnless(chrome(), "headless Chrome not found")
 class BrowserTest(unittest.TestCase):
     """The pages as a browser renders them. Data: the real fixture week with
@@ -521,6 +724,8 @@ class BrowserTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        cls.roster_patch = unittest.mock.patch.object(render.classify, "admitted_cases", return_value=ROSTER_AT_SPLIT)
+        cls.roster_patch.start()
         data = load_fixture()
         data["generated_at"] = NOW
         data["cases"] = [{"name": n, "active": True} for n in CRASHLOOP_TRIO]
@@ -540,6 +745,7 @@ class BrowserTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.roster_patch.stop()
         cls.tmp.cleanup()
 
     def render_state(self, health, sub="s"):
@@ -584,6 +790,86 @@ class BrowserTest(unittest.TestCase):
         run_page = dom_text(out / "run.html", query="build=2097282860221206528")
         self.assertIn("Workers not finishing", run_page)
         self.assertIn("those runs read not evaluated, not red", run_page)
+
+    def test_a_deadline_kill_outage_has_its_own_brief_and_banner(self):
+        # #1894: runs Prow killed at the job deadline with no verdict.
+        health = health_doc(
+            "OUTAGE", condition="deadline_kill", failing_cases=[], tracking_issues=[],
+            cause="deadline kills: 3 runs on 2 PRs killed at the 360-minute deadline with no verdict 12:00–14:00 UTC",
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(),
+            incident={"prs": [1, 2], "runs": 3, "window_start": "2026-09-08T12:00:00+00:00", "window_end": "2026-09-08T14:00:00+00:00"},
+        )
+        data = json.loads(json.dumps(self.data))
+        killed = {
+            "build_id": "2097282860221206599", "pr": 1, "project": "kube-agents-evals-7", "tier": "presubmit",
+            "started": "2026-09-08T07:55:00+00:00", "finished": "2026-09-08T13:58:00+00:00",
+            "result": "FAILURE", "eval_verdict": None, "duration_s": 21780, "has_build_log": True,
+            "pod_phase": "Failed", "pod_last_event": None, "merge_conflict": False, "tasks": [],
+        }
+        data["runs"].append(killed)
+        # #1875: a killed run that recorded a case before Prow stopped it.
+        partial = dict(killed, build_id="2097282860221206600", pr=2, finished="2026-09-08T13:59:00+00:00", tasks=[copy.deepcopy(next(r for r in data["runs"] if r.get("tasks"))["tasks"][0])])
+        data["runs"].append(partial)
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief", data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("OUTAGE · since Tue 8:00 AM ET", app)
+        self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
+        self.assertIn("Why we think it's the gate, not the PRs", app)
+        # Both kills count, the one with cases too (the Brief reads the run-level cls).
+        self.assertIn("<b>2 runs</b> on 2 PRs ran to the job deadline and ended with no verdict", app)
+        # The run list marks both kills; the one with a recorded case does not
+        # read "all gate cases passed".
+        self.assertEqual(app.count("killed at the deadline"), 2, app.count("killed at the deadline"))
+        self.assertIn("killed at the deadline, 1 case recorded first", app)
+        run_page = dom_text(out / "run.html", query="build=2097282860221206599")
+        self.assertIn("Prow killed this run at its 360-minute deadline", run_page)
+        self.assertIn("Runs killed at the deadline", run_page)
+        partial_page = dom_text(out / "run.html", query="build=2097282860221206600")
+        self.assertIn("Prow killed this run at its 360-minute deadline", partial_page)
+        self.assertIn("Retest once the brief says runs are finishing again", partial_page)
+        # The run-level item, not the copied case's own "Do:" line.
+        self.assertNotIn("<li><b>Fix the PR.</b>", partial_page)
+        # A lead window holding only zero-task kills is not an empty window.
+        only = dict(data, runs=[killed, dict(killed, build_id="2097282860221206601", pr=2, finished="2026-09-08T13:30:00+00:00"), dict(killed, build_id="2097282860221206602", finished="2026-09-08T13:00:00+00:00")])
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-brief-only", only, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("Runs are being killed at the job deadline with nothing graded", app)
+        self.assertNotIn("No runs on record for this window", app)
+        # Recovering: a zero-task kill newer than every verdict run stops the
+        # count, as health.py counts only verdicts after the last kill -- the
+        # page must not say 3 of 3 while the bot holds.
+        late = dict(killed, build_id="2097282860221206603", started="2026-09-08T13:27:00+00:00", finished="2026-09-08T19:30:00+00:00")
+        recovering = health_doc(
+            "OUTAGE", condition="deadline_kill", failing_cases=[], tracking_issues=[], recovering=True,
+            since="2026-09-08T12:00:00+00:00", advice=health_module_advice(), incident=health["incident"],
+        )
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering", dict(data, runs=data["runs"] + [late]), health=recovering)
+        app = dom_text(out / "index.html")
+        self.assertIn("0 of 3 runs with a verdict on distinct PRs so far", app)
+        # health.recovered's bar is the NEWEST three verdict runs on distinct
+        # PRs: greens on 41, 41, 42 after the kill are two PRs, not three, and
+        # a recorded null with cases is not a verdict at all.
+        green = copy.deepcopy(next(r for r in data["runs"] if str(r.get("result") or "").upper() == "SUCCESS" and r.get("tasks")))
+        after = [
+            dict(green, build_id=f"209728286022120661{i}", pr=pr, started=f"2026-09-08T{18 + i}:00:00+00:00", finished=f"2026-09-08T{20 + i}:00:00+00:00", eval_verdict="GREEN")
+            for i, pr in enumerate([41, 41, 42])
+        ]
+        nulled = dict(after[0], build_id="2097282860221206620", pr=43, finished="2026-09-08T23:30:00+00:00", result="FAILURE", eval_verdict=None, duration_s=7200)
+        # NOT EVALUATED: eval_verdict RED with every repetition lost to
+        # infrastructure. Not a verdict either (health.Run.has_verdict).
+        not_evaluated = copy.deepcopy(dict(after[0], build_id="2097282860221206621", pr=44, finished="2026-09-08T23:45:00+00:00", result="FAILURE", eval_verdict="RED"))
+        for t in not_evaluated["tasks"]:
+            t["result"] = "infra"
+            for rep in t.get("reps") or []:
+                rep.update(result="infra", reason="the harness exhausted its retries")
+        out = render_to(pathlib.Path(self.tmp.name) / "deadline-recovering-2", dict(data, runs=data["runs"] + [late, *after, nulled, not_evaluated]), health=recovering)
+        app = dom_text(out / "index.html")
+        self.assertIn("2 of 3 runs with a verdict on distinct PRs so far", app)
+        # The banner on a kill's page during the hold agrees with its lede.
+        late_page = dom_text(out / "run.html", query="build=2097282860221206603")
+        self.assertIn("Deadline-kill outage recovering", late_page)
+        self.assertIn("this kill holds it back", late_page)
+        self.assertNotIn("nothing about the branch", late_page)
 
     def test_a_run_of_ceiling_hits_is_not_a_pass_in_the_brief_and_counts_in_the_storms_totals(self):
         """A run whose every case ended at the ceiling passed nothing, so its row
@@ -925,14 +1211,26 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('href="index.html#view=agent"', app, "the footer link is the fragment form")
 
     def test_a_view_scrolls_once_on_navigation_and_not_on_the_poll(self):
-        # 130 s of virtual time: boot, the refresh after it, and two polls.
-        # The section is scrolled to once; the polls, which re-render the
-        # page, must not pull a reader back to it.
+        # Boot, the refresh after it, and two polls, on a clock sped up so
+        # they fit in a short budget. The section is scrolled to once; the
+        # polls, which re-render the page, must not pull a reader back to it.
+        page = fast_timers_page(scroll_counting_page(self.index))
+        self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1")
+        self.assertIsNone(scrolls(dom_html(page, budget_ms=TWO_POLLS_BUDGET_MS)), "no view, no scroll")
+
+    def test_the_bare_anchor_scrolls_once(self):
+        # The bare anchor selects the view the same way (#gate and view=gate
+        # reach the same link.view in linkState), so the poll test above
+        # covers its poll. This call stays off the poll budget: #gate under
+        # TWO_POLLS_BUDGET_MS, the fast-timer shim in effect, still stalled
+        # headless Chrome on CI until the 90 s wall-clock timeout (#2227,
+        # after #2202's sped-up clock). A fragment naming an element, polled
+        # under virtual time, is the condition that stalls it; the default
+        # budget ends before the first poll, the shape
+        # test_agent_view_shows_the_numbers uses for #agent, and dom_html
+        # refuses #gate on a budget the poll fires inside.
         page = scroll_counting_page(self.index)
-        scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
-        self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=130000)).group(1), "1")
-        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=130000)).group(1), "1", "the bare anchor, the same way")
-        self.assertIsNone(scrolls(dom_html(page, budget_ms=130000)), "no view, no scroll")
+        self.assertEqual(scrolls(dom_html(page, fragment="#gate")).group(1), "1", "the bare anchor, the same way")
 
     def test_hostile_parameters_never_reach_the_dom(self):
         for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):
@@ -1182,6 +1480,10 @@ class CasesAndGridPagesTest(unittest.TestCase):
                              "finished": "2026-08-20T11:00:00+00:00", "result": "FAILURE", "duration_s": 3600,
                              "tasks": [{"name": "old-failure-case", "result": "fail", "reps": [{"n": 1, "result": "fail", "reason": "check ancient: required phrases absent"}]}]})
         data["cases"].append({"name": "old-failure-case", "domain": "cost", "active": True})
+        # A case demoted under the 2026-09-22 protocol: off both presubmit
+        # files, in the nightly one, dated on the roster page. It is a
+        # held-out row with the demoted pill, not a "nightly only" one.
+        data["cases"].append({"name": "demoted-nightly-case", "domain": "cost", "active": False, "nightly_active": True})
         history = history_lines(
             dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
             dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
@@ -1191,7 +1493,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         )
         admitted = frozenset(CRASHLOOP_TRIO[:2])
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=admitted), \
-                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02"}), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02", "demoted-nightly-case": "2026-09-02"}), \
                 unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
             cls.out = render_to(cls.tmp.name, data, health=health_doc(), history=history)
         cls.cases_page = cls.out / "cases.html"
@@ -1208,7 +1510,8 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('id="case-cluster-agent-crashloop-debug"', app)
         self.assertIn('<span class="st blocking">blocking</span>', app)
         self.assertIn('<span class="st demoted">demoted 09-02</span>', app)
-        self.assertIn("held out · 2 cases", app)
+        self.assertIn("held out · 3 cases", app, "the active demoted case, the active held-out one and the nightly demoted one")
+        self.assertEqual(app.count("demoted 09-02"), 2, "the nightly demoted case carries the dated pill too")
         self.assertIn("not in any matrix · 1 case", app)
         self.assertNotIn('id="case-retired-probe"', app, "retired cases are folded until asked for")
         self.assertIn('class="rate ', app)
@@ -1234,14 +1537,15 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('<span class="st blocking">blocking</span>', blocking)
         held = dom_text(self.cases_page, query="show=held")
         self.assertIn("demoted 09-02", held)
+        self.assertIn('id="case-demoted-nightly-case"', held, "a case demoted to the nightly is a held-out row")
         self.assertNotIn('class="st blocking"', held)
+        self.assertNotIn('id="case-demoted-nightly-case"', blocking)
         highlighted = dom_text(self.cases_page, fragment="#cluster-agent-crashloop-evidence-chain")
         self.assertIn('<tr id="case-cluster-agent-crashloop-evidence-chain" class="main hl">', highlighted)
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
         # The row is scrolled to once, on navigation; the polls that follow
         # re-render without pulling the reader back to it.
-        scrolls = re.search(r'<body[^>]*data-scrolls="(\d+)"', dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000))
-        self.assertEqual(scrolls.group(1), "1")
+        self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment=CASES_ROW_ANCHOR, budget_ms=CASES_TWO_POLLS_BUDGET_MS)).group(1), "1")
         clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
         self.assertIn('id="case-retired-probe"', clicked)
 

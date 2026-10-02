@@ -25,7 +25,12 @@ periodic's deadline arrives as SIGTERM and Prow records FAILURE, so ABORTED
 alone would miss it -- and **incomplete** when it concluded but recorded
 fewer cases than the nightly matrix on this checkout expects
 (``cases[].nightly_active``). Either way the page and the digest say so
-instead of reporting the counts as if the whole matrix had run.
+instead of reporting the counts as if the whole matrix had run. Since
+2026-09-22 ``hack/ci-eval-pr.sh`` grades each case inside its fan-out, the
+moment the case's last repetition finishes, so a truncated night still
+carries every case graded before the deadline and its counts are those
+cases, flagged truncated (the collector's fixture 2102186223282950144);
+before that a deadline-cut night recorded nothing at all (#1491).
 
 Only stdlib, like ``tiers.py``: ``post_health.py`` imports it and must stay
 free of third-party dependencies.

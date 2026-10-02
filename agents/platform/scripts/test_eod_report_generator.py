@@ -24,6 +24,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -645,6 +646,44 @@ class TestLedgerLoading(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+
+    def test_drift_rows_are_not_counted_as_watcher_events(self):
+        """`intercepted_events` has two writers; this recap reports one of them.
+
+        The drift detector's injects land in the same table under
+        `reason = 'OutOfBandChange'`. Every number this report prints is
+        labelled as the event watcher's — "Forwarded N events", "N alerts went
+        to chat", the clusters in the fan-in header — so a drift row counted
+        here inflates all of them with no way to separate them again.
+        """
+        path = self._db(
+            [
+                ("prod", "api", "OOMKilled", 1, 2),
+                ("prod", "checkout", eod_report_generator.DRIFT_LEDGER_REASON, 1, 2),
+                ("prod", "billing", eod_report_generator.DRIFT_LEDGER_REASON, 0, 2),
+            ]
+        )
+        rows = load_intercepted_events(path, window_hours=24)
+
+        self.assertEqual(
+            [row["workload"] for row in rows],
+            ["api"],
+            "a drift row reached the event watcher's recap",
+        )
+
+    def test_the_drift_reason_matches_the_writer(self):
+        """The constant is copied rather than imported; this is what pins it.
+
+        Importing session_kv_server here would pull in FastAPI for a cron
+        script that needs neither. The cost of copying is that a rename can
+        miss one side, and the failure is silent: drift rows fold back into the
+        watcher's totals and every number goes up a little.
+        """
+        source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
+        self.assertIn(
+            f'DRIFT_LEDGER_REASON = "{eod_report_generator.DRIFT_LEDGER_REASON}"',
+            source,
+        )
 
     def test_window_excludes_older_rows(self):
         path = self._db(

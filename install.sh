@@ -14,6 +14,10 @@
 
 set -Eeuo pipefail
 
+# This script's own name, for the abort banner when it runs piped through
+# stdin (curl | bash): bash then has no file to name its frames after.
+INSTALL_SCRIPT_NAME="install.sh"
+
 # ─── Install sources ──────────────────────────────────────────────────────────
 # Where the sources come from when this script runs alone (curl | bash) and
 # where it puts them. upgrade.sh and uninstall.sh carry the same URL for the
@@ -29,6 +33,7 @@ kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones 
 # clone is moved to the requested release only when its HEAD tracks this file,
 # so a repository that merely shares the directory name is left alone.
 KUBE_AGENTS_CLONE_MARKER="install.sh"
+KUBE_AGENTS_INSTALLER_COMMON_MARKER="scripts/installer/installer_common.sh"
 # The fetch depth the fresh clone uses, and that a clone which is already
 # shallow (one an earlier install left) keeps; a complete clone is fetched
 # without it so it does not become shallow.
@@ -63,6 +68,14 @@ readonly NETWORK_POLICY_ENFORCEMENT_ANNOTATION="kubeagents.x-k8s.io/network-poli
 readonly NP_ENFORCEMENT_ENFORCED="enforced"
 readonly NP_ENFORCEMENT_ENABLED_BY_INSTALL="enabled-by-install"
 readonly NP_ENFORCEMENT_ABSENT_ACCEPTED="absent-accepted"
+# Where read_recorded_install_env_values parks what one evaluation of
+# install.env found, mangled onto the key. A key the file can assign is a shell
+# name, so the mangled slot is one too.
+readonly RECORDED_VALUE_PREFIX="_RECORDED_INSTALL_ENV_VALUE_"
+readonly RECORDED_SET_PREFIX="_RECORDED_INSTALL_ENV_SET_"
+# The file those slots hold answers for, and the keys parked so far.
+RECORDED_INSTALL_ENV_FILE=""
+RECORDED_INSTALL_ENV_KEYS=""
 # The report field's key, and the value in the report until a run has decided.
 readonly NETWORK_POLICY_REPORT_FIELD="network_policy_enforcement"
 NETWORK_POLICY_ENFORCEMENT=""
@@ -112,7 +125,30 @@ on_error() {
   local exit_code="$1"
   local line_no="$2"
   local bash_cmd="$3"
-  echo -e "\n\033[91m\033[1m✗ Error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
+  # An inherited firing inside a subshell: `set -E` hands this trap to every
+  # `$(...)`, and a probe whose miss the caller handles (`if !`, `||`) still
+  # fires it there on bash 3.2 (macOS's /bin/bash) before the caller is
+  # consulted. The parent decides: it prints the banner and writes the report
+  # itself when the failure reaches it, and nothing when it is handled. Exit,
+  # not return: command substitution does not inherit errexit, so a returning
+  # handler would let a multi-step probe run on past its failure. Process
+  # substitution (`< <(...)`) keeps the counter at 0 on bash 3.2 and clears
+  # the trap inline instead.
+  if [ "${BASH_SUBSHELL:-0}" -gt 0 ]; then
+    exit "$exit_code"
+  fi
+  # The frame that ran the failing command: a sourced library's file and the
+  # function it was in, or this script and `main` at top level. $LINENO alone
+  # counts from the top of whichever file the command sat in, so a bare line
+  # number sent the reader to that line of install.sh instead. Piped through
+  # stdin, bash labels this script's frames `main` or not at all, and $0 is
+  # `bash`; both read as the script by name.
+  local source_file="${BASH_SOURCE[1]:-}"
+  case "$source_file" in
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+  esac
+  local func_name="${FUNCNAME[1]:-main}"
+  echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_json_report "FAILED" "${line_no}" "${bash_cmd}" 2>/dev/null || true
   # A half-written install.env must not be left where the next run would load
   # it. The real file is only ever moved into place complete.
@@ -219,48 +255,7 @@ else
   unset _install_env_dir
 fi
 
-# The state file install.env replaces. Loaded FIRST so install.env wins on
-# every key it carries, and only from a checkout -- a fresh clone has none.
-# This is the migration: an existing install keeps working with no action from
-# its owner, and the run writes their values into install.env on the way out.
-#
-# Resolved against the same checkout, for the same reason: under
-# `curl … | bash` a script-relative path names the invocation directory, not
-# the clone the migration has to read.
-LEGACY_VARS_FILE=""
-if [ -f "${_state_repo_dir}/k8s-operator/scripts/vars.sh" ]; then
-  LEGACY_VARS_FILE="${_state_repo_dir}/k8s-operator/scripts/vars.sh"
-fi
 unset _state_repo_dir
-
-load_legacy_vars_file() {
-  local file="${1:-}"
-  [ -n "$file" ] && [ -f "$file" ] || return 0
-  if ! bash -n "$file" 2>/dev/null; then
-    print_error "Legacy install state '$file' is not valid shell and could not be loaded."
-    exit 1
-  fi
-  set -a
-  # shellcheck disable=SC1090
-  . "$file"
-  set +a
-  # stderr, like the load message below and for the same reason.
-  print_warning "Loaded legacy install state from ${file}; install.env replaces it." >&2
-  # Telling the operator to delete vars.sh is only safe once its values are
-  # somewhere else, and this function cannot promise that. bootstrap_install_env_file
-  # is the sole writer, it runs near the end of main(), and it returns early
-  # when install.env already exists -- so --help, --menu, --dry-run, any abort,
-  # and every run against a file the operator wrote themselves reach the write
-  # never or as a no-op. An existing install.env is the dangerous case rather
-  # than the safe-looking one: `cp install.env.example install.env` carries no
-  # MEMORY, so discarding vars.sh there loses the only record that the install
-  # runs Hindsight, and the next apply derives multiuser_memory and tears it down.
-  if [ -f "$INSTALL_ENV_FILE" ]; then
-    print_info "${INSTALL_ENV_FILE} already exists and this run will not rewrite it. Copy anything you still need from vars.sh into it before deleting vars.sh." >&2
-  else
-    print_info "Once this run creates ${INSTALL_ENV_FILE}, check it against vars.sh and then delete vars.sh." >&2
-  fi
-}
 
 # Named apart from installer_common.sh's load_install_env, which this file
 # sources later and which upgrade.sh and uninstall.sh use. The two differ on
@@ -289,6 +284,15 @@ bootstrap_install_env() {
     fi
     return 0
   fi
+  # The scope keys render into the PlatformAgent and are recorded only by a
+  # first install, so once this file exists it is the only way in for them,
+  # as load_install_env makes it for upgrade.sh, uninstall.sh and the menu: a
+  # value inherited from the shell would declare a project the file does not
+  # record, applied for this run and dropped again, with its profiles, by the
+  # next run from a clean shell. A first install, which has no file yet, keeps
+  # the environment and records it; a typed --scope-* flag still overrides
+  # for one run and is warned about.
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -354,7 +358,6 @@ wants_help_only() {
 }
 
 if ! wants_help_only "$@"; then
-  load_legacy_vars_file "$LEGACY_VARS_FILE"
   bootstrap_install_env "$INSTALL_ENV_FILE"
 fi
 
@@ -392,10 +395,43 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # helpers are sourced, so no default is spelled twice.
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+# The multi-project scope (spec.scope): empty means the management project
+# alone, so there is no default to resolve.
+PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
+PARAM_SCOPE_FOLDERS="${SCOPE_FOLDERS:-}"
+PARAM_SCOPE_ORGANIZATIONS="${SCOPE_ORGANIZATIONS:-}"
+PARAM_SCOPE_SHARED_VPC_HOSTS="${SCOPE_SHARED_VPC_HOSTS:-}"
+PARAM_SCOPE_METRICS_SCOPES="${SCOPE_METRICS_SCOPES:-}"
+PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
+# Whether a --scope-* flag was typed: the Day-2 menu reads the keys from
+# install.env alone and refuses a flag it would otherwise validate and drop.
+SCOPE_FLAG_PASSED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-}"
+# Not filled by resolve_shared_defaults, and PARAM_ENABLE_GKE_BACKUP_PLAN below
+# is the pattern: warn_flag_beats_unrecorded_file_value reads an empty PARAM as
+# "nobody chose", and that is the only thing that keeps the destroyed-ingress
+# warning off every install over a file predating this key. Filling it and
+# recovering the distinction with a separate "was it typed" marker reads the
+# flag alone, so an exported ENABLE_DRIFT_DETECTOR -- a documented route, above
+# install.env in precedence when the file does not name the key -- would
+# provision the ingress with no warning that the next upgrade.sh destroys it.
+# main() therefore exports this one conditionally, as it does the backup plan.
+PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
+# The same value again, under a name nothing downstream writes. That
+# conditional export in main() overwrites ENABLE_DRIFT_DETECTOR with the
+# chosen value, and it runs before bootstrap_install_env_file, so by the time
+# the warning below asks "does this shell ask for the detector", the answer it
+# would read back is this run's own flag. `--enable-drift-detector=false` in a
+# shell exporting true would then look like nobody had asked for it, the
+# warning would stay silent, and the next run from that shell -- seeding
+# PARAM from the export again -- would provision the ingress the operator
+# thought they had just declined. This line is the last moment the shell's
+# answer and the run's answer are distinguishable.
+SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
@@ -432,6 +468,10 @@ memory_mode_from_provider() {
   esac
 }
 PARAM_MEMORY="${MEMORY:-$(memory_mode_from_provider "${MEMORY_PROVIDER:-}")}"
+PARAM_MEMORY_EXPLICIT="false"
+if [ -n "$PARAM_MEMORY" ]; then
+  PARAM_MEMORY_EXPLICIT="true"
+fi
 PARAM_ALLOWED_USERS="${ALLOWED_USERS:-}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
@@ -544,6 +584,23 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
+  --scope-projects=IDS          GCP projects beyond the install's whose GKE clusters get a
+                                Cluster Agent (space- or comma-separated); the agent's
+                                service account is granted the read roles in each
+  --scope-folders=IDS           Numeric GCP folder IDs; every project beneath, at any depth,
+                                is in scope, the read roles and roles/cloudasset.viewer are
+                                bound on the folder, and the Cloud Asset API is enabled
+  --scope-organizations=IDS     Numeric GCP organisation IDs, bound the same way (wide;
+                                prefer folders)
+  --scope-shared-vpc-hosts=IDS  Shared VPC host project IDs; every attached service project
+                                is in scope, resolved when Terraform plans and granted the
+                                read roles (and roles/compute.viewer in the host, for the lookup)
+  --scope-metrics-scopes=IDS    Metrics Scope scoping-project IDs; every project the scope
+                                monitors is in scope, resolved and granted the same way
+  --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
+                                unmanaged
+  --scope-exclude-clusters=TRIPLES
+                                Clusters to leave unmanaged, each as project/location/cluster
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -594,6 +651,10 @@ Flags for AI Agents & Automation:
                                 Enable Pub/Sub platform adapter AgentPlugin (default: false)
   --enable-stockout-investigator[=true|false]
                                 Enable GKE Stockout Investigator AgentPlugin (default: false)
+  --enable-drift-detector[=true|false]
+                                Report cluster changes made outside git. Exports this
+                                project's GKE audit log to Pub/Sub and starts the
+                                detector that reads it (default: false)
   --google-chat-allowed-users=EMAILS
                                 Comma-separated user emails allowed to talk to the
                                 agent over Google Chat. Empty allows all users
@@ -694,6 +755,31 @@ validate_bool_flag_value() {
   fi
 }
 
+# A scope flag given nothing cannot mean "leave the recorded scope alone" (the
+# flag is what overrides the file for one run) and must not mean "drop every
+# project" in silence: applied, an empty --scope-projects= would revoke the
+# scoped projects' roles and retire their profiles while install.env still
+# named them, and the next upgrade would add them back. Refused, like an empty
+# toggle; the file is where a scope is emptied on purpose.
+require_scope_flag_value() {
+  local flag="$1" value="${2:-}" key
+  # A value that is nothing but separators (`,`, a space) renders the same
+  # empty list an empty value does, so it is refused the same way.
+  [[ "$value" == *[![:space:],]* ]] && return 0
+  case "$flag" in
+    --scope-projects) key="SCOPE_PROJECTS" ;;
+    --scope-folders) key="SCOPE_FOLDERS" ;;
+    --scope-organizations) key="SCOPE_ORGANIZATIONS" ;;
+    --scope-shared-vpc-hosts) key="SCOPE_SHARED_VPC_HOSTS" ;;
+    --scope-metrics-scopes) key="SCOPE_METRICS_SCOPES" ;;
+    --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
+  esac
+  print_error "${flag}= was given an empty value."
+  print_info "To clear it, set ${key}= (empty) in install.env and re-run; to keep the recorded value, omit the flag."
+  exit 1
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -723,6 +809,27 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
+      --scope-projects=*)
+        PARAM_SCOPE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_PROJECTS"; shift ;;
+      --scope-folders=*)
+        PARAM_SCOPE_FOLDERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_FOLDERS"; shift ;;
+      --scope-organizations=*)
+        PARAM_SCOPE_ORGANIZATIONS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_ORGANIZATIONS"; shift ;;
+      --scope-shared-vpc-hosts=*)
+        PARAM_SCOPE_SHARED_VPC_HOSTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_SHARED_VPC_HOSTS"; shift ;;
+      --scope-metrics-scopes=*)
+        PARAM_SCOPE_METRICS_SCOPES="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_METRICS_SCOPES"; shift ;;
+      --scope-exclude-projects=*)
+        PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_PROJECTS"; shift ;;
+      --scope-exclude-clusters=*)
+        PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
+        require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -744,7 +851,27 @@ parse_args() {
       --enable-stockout-investigator|--enable-stockout|--enable-stockout-investigator=*|--enable-stockout=*)
         PARAM_ENABLE_STOCKOUT_INVESTIGATOR="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"; shift ;;
-      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
+      --enable-drift-detector|--enable-drift|--enable-drift-detector=*|--enable-drift=*)
+        PARAM_ENABLE_DRIFT_DETECTOR="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_DRIFT_DETECTOR"; shift ;;
+      # Validated for emptiness here, ahead of resolve_shared_defaults.
+      # PARAM_MEMORY is seeded from MEMORY and resolved with
+      # ${PARAM_MEMORY:-$DEFAULT_MEMORY}, so `--memory=` out of a wrapper
+      # expanding an unset variable would arrive at main() as the well-formed
+      # default ("file") WITH PARAM_MEMORY_EXPLICIT="true" -- replacing a
+      # recorded MEMORY=hindsight and telling write_tfvars_from_state not to
+      # probe the live cluster before planning hindsight-postgresql away.
+      --memory=*)
+        PARAM_MEMORY="${1#*=}"
+        if [ -n "$PARAM_MEMORY" ]; then
+          PARAM_MEMORY_EXPLICIT="true"
+        else
+          print_error "--memory= was given an empty value."
+          print_info "Pass --memory=off, --memory=file, or --memory=hindsight, or omit the flag to keep the recorded setting."
+          exit 1
+        fi
+        shift
+        ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --third-party-registry-prefix=*) PARAM_THIRD_PARTY_REGISTRY_PREFIX="${1#*=}"; shift ;;
@@ -948,14 +1075,128 @@ cluster_mode_label() {
   esac
 }
 
+# A release-line checkout between stamps. A patch is stamped as a child of the
+# line's head, so every backport that lands on release/<X.Y> after a release
+# descends from a stamped commit and carries its BAKED_RELEASE_VERSION, which is
+# the previous release's. True when this is a Git checkout whose HEAD descends
+# from the baked release's commit without being it: unreleased development on
+# the line, whose images are built per commit, so the release's tag is not the
+# tag to default to. Exactly the tag's commit is the release checkout, and a
+# HEAD that is neither is left to verify_local_source_ref, which refuses the
+# mismatch as before. A tag the checkout does not hold reads as "not past": the
+# release's own commit is on the line's history, so a clone of the line brings
+# the tag with it, and a checkout that lacks it is not one of these (the
+# refusal that follows says to fetch the tags). And only when the script that
+# is running is that checkout's own install.sh, carrying the same version: the
+# baked version belongs to the running script, so a release's piped installer
+# keeps its release as the default wherever it runs, whether standing in some
+# other checkout or resolving its sources to a HOME clone that has moved onto
+# a line, and verify_local_source_ref then fetches or refuses as before.
+# The directory this script runs from, when that is a kube-agents checkout;
+# empty under `curl … | bash`, where no file names one (BASH_SOURCE is then
+# empty, `main`, or the interpreter's path, none of which is a file in a
+# checkout). What acquire_source_repo prefers as the sources, so the
+# release-line reads below judge the same tree it will install from, whatever
+# the working directory is.
+script_checkout_dir() {
+  local script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+    printf '%s' "$script_dir"
+  fi
+}
+
+# The release a tree's own install.sh is stamped with, read the way
+# upgrade.sh's release_version_of_source_tree reads it (quotes and whitespace
+# stripped), so the two front doors agree on which trees carry a version.
+# Empty for the plain repository content.
+baked_version_of_tree() {
+  local repo_dir="${1:-.}"
+  grep -m1 -E '^BAKED_RELEASE_VERSION=' "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || echo ""
+}
+
+# What stands between such a tree and being recognised, for the refusals that
+# follow, mirroring checkout_is_past_baked_release's conditions: the release's
+# tag not fetched, or a shallow history the ancestry walk cannot cross (a
+# `--depth 1` clone of the line, which `git fetch --tags` alone does not mend);
+# else a running install.sh that is not the tree's own (piped, or run from
+# elsewhere); else a HEAD that does not descend from the release, which no
+# fetch mends. Printed only for a tree whose own install.sh carries the
+# version; the caller checks that.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" descends="false" line="${BAKED_RELEASE_VERSION%.*}"
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    descends="true"
+  fi
+  # The fetches the predicate's walk would need, and only those: no tag, or a
+  # shallow history the walk could not cross. A shallow clone deep enough to
+  # hold the release needs nothing fetched.
+  if [ -z "$tag_commit" ]; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$descends" != "true" ] && [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  script_dir="$(script_checkout_dir)"
+  local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
+  if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release install.sh, or one run from another directory: only the
+    # checkout's own install.sh recognises a release-line checkout, so that comes
+    # first, with whatever fetch it would also need.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the install.sh running is not this checkout's. If it is a checkout of a release line, run its own ./install.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ "$descends" = "true" ]; then
+    # Recognisable, and asked for the release by name anyway (--image-tag, or
+    # IMAGE_TAG in the shell or install.env, naming the baked version): the
+    # checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; run this checkout's ./install.sh with no --image-tag and IMAGE_TAG unset (in the shell and in install.env) to default to this commit's own images, or ${own_images}."
+  elif [ -n "$remedies" ]; then
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
+  else
+    # Tag present, history complete, the checkout's own script running: HEAD
+    # simply does not descend from the release (a cherry-picked or rebased
+    # stamp). No fetch changes that.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but ${head_commit:0:7} is neither that release's commit nor a descendant of it, so it is not a release-line checkout past it. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
+  fi
+}
+
+checkout_is_past_baked_release() {
+  local repo_dir="${1:-.}" tag_commit head_commit own_dir
+  [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
+  own_dir="$(script_checkout_dir)"
+  [ -n "$own_dir" ] && [ "$own_dir" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
+  [ "$(baked_version_of_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
+  head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  [ "$tag_commit" != "$head_commit" ] || return 1
+  git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
+}
+
 # The image tag doubles as the source ref that verify_local_source_ref checks the
 # checkout against. When downloaded as an official release via curl | bash, the baked
 # release tag takes precedence. In local Git checkouts, an exact SemVer release tag or
 # HEAD commit SHA is used as the default.
 default_image_tag() {
   local repo_dir="${1:-.}"
-  # 1. Baked release version takes precedence (for curl | bash from official release URLs)
+  # 1. Baked release version takes precedence (for curl | bash from official release URLs),
+  #    except in a checkout of a release line that has moved past that release: there the
+  #    baked version is the previous release's, and the checkout defaults the way a main
+  #    checkout does, to its own HEAD, whose images a merge onto the line built. Returned
+  #    here rather than through step 4, so a directory that happens to be named
+  #    kube-agents-<X.Y.Z> (step 3) cannot hand the release back.
+  #    Judged on the script's own checkout, which is what acquire_source_repo
+  #    installs from, so running one checkout's install.sh from inside another
+  #    resolves the same way as running it from its own directory.
   if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+    local own_dir
+    own_dir="$(script_checkout_dir)"
+    if [ -n "$own_dir" ] && checkout_is_past_baked_release "$own_dir"; then
+      git -C "$own_dir" rev-parse HEAD 2>/dev/null || echo ""
+      return 0
+    fi
     echo "$BAKED_RELEASE_VERSION"
     return 0
   fi
@@ -996,6 +1237,12 @@ default_image_tag_label() {
 
   if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "$tag" = "$BAKED_RELEASE_VERSION" ]; then
     printf 'official release %s' "$tag"
+  elif [ -n "$(script_checkout_dir)" ] && checkout_is_past_baked_release "$(script_checkout_dir)"; then
+    # Say what the checkout is, since its scripts still name the previous release.
+    printf 'release line %s checkout %s, %s commit(s) past release %s' \
+      "${BAKED_RELEASE_VERSION%.*}" "${tag:0:7}" \
+      "$(git -C "$(script_checkout_dir)" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")" \
+      "$BAKED_RELEASE_VERSION"
   elif [ "$tag" = "$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")" ]; then
     printf 'release tag %s' "$tag"
   elif [[ "$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")" =~ ^kube-agents-${tag}$ ]]; then
@@ -1103,66 +1350,176 @@ write_secret_env_var() {
 # are recomputed wherever they are used, and the cluster shape written here is
 # the one the interview asked for, never the probed TFVARS_CLUSTER_MODE, which
 # write_tfvars_from_state re-derives on every run.
+
+# What install.env records for a set of keys, and whether it records them at
+# all, from one evaluation of the file.
+#
+# Asks bash rather than parsing the file, because bash is the other reader and
+# the only one whose answer matters: bootstrap_install_env sources install.env
+# at startup and load_install_env again on every front door, into the
+# environment every guard here compares against. A reader that parses the line
+# instead has to reimplement the grammar bash applies to it -- assignment
+# prefixes and command words, redirections, `&>`, comments, quoting, backslash
+# escapes, parameter and command substitution, a reassignment later on the same
+# line -- and stay right about all of it.
+#
+# Sourced inside a function, because that is where both live readers source it,
+# and the scope changes the answer. `declare -x K=true` is a global at the top
+# level of a script and a local inside a function, so a top-level reader hands
+# back `true` for a line whose value dies with bootstrap_install_env's return
+# and never reaches write_tfvars_from_state. Matching the scope is what makes
+# "what the file records" mean "what a run that does not already hold the key
+# reads back from it" -- which is the question the guards ask, because the run
+# they warn about is a later one from a shell nobody here can see. It is not
+# "what this run read": see the `unset` paragraph below for the one class where
+# those two come apart.
+#
+# Set-ness travels with the value, so no caller needs a presence test of its
+# own. A `grep -E "^[[:space:]]*(export[[:space:]]+)?${key}="` beside this is
+# the second parser the function exists to remove, and the two disagree on
+# every spelling the pattern does not know -- `declare -x K=v`, `readonly K=v`,
+# the second assignment on one `export` -- which is how a file recording
+# exactly the flagged value earns "records no K".
+#
+# One evaluation for all of them, because the file is shell and a line may run
+# a command: a key whose value is a command substitution fetching a secret is
+# a network round-trip per evaluation, and the interview guard alone asks
+# about twenty-three keys. Answers stay cached until the file changes. A
+# caller reading through a command substitution primes the cache in a subshell
+# that then exits, so the callers that read several keys prime here first, in
+# their own shell, and their reads land warm.
+#
+# `unset` each key first, so a value coming back means the *file* assigned it.
+# Without that the caller's own exported ENABLE_DRIFT_DETECTOR would read back
+# as a recorded line, which is the one distinction the drift guard exists to
+# make. The rest of the environment is inherited on purpose: a file recording
+# `K=$OTHER` assigns whatever the real sourcing will assign, so the reader has
+# to see the same shell the install runs in.
+#
+# That `unset` is the one place this reader and the live ones part company, and
+# the class is `: ${K:=v}` and `K=${K:-v}`: the expansion fires here, where the
+# key was just unset, and does not fire in an install whose shell exports the
+# key already. The reader then reports `v` where this run read the export. It
+# is still the right answer to the question the guards ask -- a later run from
+# a shell without the export does get `v` -- but it is not what this run read,
+# and a guard comparing the two announces a divergence this shell does not
+# have. Kept rather than dropped: without the `unset` an exported key is
+# indistinguishable from a recorded line, which is the defect this guard exists
+# to catch, and answering both questions needs two evaluations and a caller
+# that knows which it wants. Pinned by
+# test_the_reader_and_the_install_diverge_on_a_default_assignment in
+# tests/test_install_script.py, and the recorded-spellings list next to
+# test_a_spelling_only_bash_sees_still_counts_as_recorded leaves `:=` out
+# rather than certifying an agreement that is not there.
+#
+# A subshell of this shell, then, and not a `bash -c` child, which inherits
+# only what is exported. install.defaults.env is sourced without `set -a`
+# (see the block above `main`), so every `DEFAULT_*` is one of this shell's
+# unexported variables and a child process cannot see any of them. A file
+# spelled `ENABLE_GVISOR=$DEFAULT_ENABLE_GVISOR` -- admitted, because the file
+# is shell -- then assigns `true` on the live path and empty in a child, and
+# the interview guard reports drift on every interactive run against a file
+# that agrees with the install.
+#
+# Executing the file is not a new exposure. The real shell sources it at
+# startup and every front door sources it again; a throwaway subshell that
+# reads keys back is strictly less than either.
+#
+# `%q` so a value carrying a newline still arrives as one line the caller can
+# eval, and `>/dev/null 2>&1` keeps a chatty file out of the caller's output.
+read_recorded_install_env_values() {
+  local file="${1:-}"
+  shift || true
+  [ -n "$file" ] && [ -f "$file" ] && [ "$#" -gt 0 ] || return 0
+
+  if [ "$RECORDED_INSTALL_ENV_FILE" != "$file" ]; then
+    local stale
+    for stale in $RECORDED_INSTALL_ENV_KEYS; do
+      unset "${RECORDED_VALUE_PREFIX}${stale}" "${RECORDED_SET_PREFIX}${stale}"
+    done
+    RECORDED_INSTALL_ENV_KEYS=""
+    RECORDED_INSTALL_ENV_FILE="$file"
+  fi
+
+  local key slot
+  local pending=()
+  for key in "$@"; do
+    slot="${RECORDED_SET_PREFIX}${key}"
+    [ -n "${!slot-}" ] || pending+=("$key")
+  done
+  [ "${#pending[@]}" -gt 0 ] || return 0
+
+  # The sourcing below runs under `set +u`, and the unset above is why. A file
+  # line that expands a requested key before assigning it -- K="$K,extra" --
+  # finds it unbound here and nowhere else: the live readers do not unset, so
+  # that line is answered by whatever the calling shell exports and the install
+  # carries on. Left under -u the assignment fails, the key stays unset, and the
+  # guard tells the operator the file records no K while the install is using
+  # the K it records. Unbound expands empty now, which is what the file assigns
+  # when nothing exports the key -- the question the unset was asked.
+  #
+  # The comment lives out here rather than beside the `set +u`: bash 3.2
+  # mis-scans some comment text inside a command substitution and swallows the
+  # rest of the file into it, with `bash -n` and shellcheck both clean.
+  eval "$(
+    {
+      # set -E propagates this script's ERR trap into the subshell, where a
+      # line of the file that exits non-zero would print an abort banner.
+      trap - ERR
+      # The keys as positional parameters, so the loop below survives a file
+      # that assigns to `key` or `pending` -- both of which are this
+      # function's locals and therefore visible here, unlike in a child.
+      set -- "${pending[@]}"
+      # `|| true`: unsetting a name the script made readonly fails, and the
+      # remaining keys still have answers owed to them.
+      for key in "$@"; do unset "$key" 2>/dev/null || true; done
+      source_as_the_install_does() {
+        set -a
+        set +u
+        # shellcheck disable=SC1090
+        . "$1" >/dev/null 2>&1 || true
+        set -u
+        set +a
+      }
+      source_as_the_install_does "$file"
+      for key in "$@"; do
+        if [ -n "${!key+x}" ]; then
+          printf "%s%s=1\n" "$RECORDED_SET_PREFIX" "$key"
+          printf "%s%s=%q\n" "$RECORDED_VALUE_PREFIX" "$key" "${!key}"
+        else
+          printf "%s%s=0\n" "$RECORDED_SET_PREFIX" "$key"
+          printf "%s%s=\n" "$RECORDED_VALUE_PREFIX" "$key"
+        fi
+      done
+    } 2>/dev/null || true
+  )"
+  RECORDED_INSTALL_ENV_KEYS="${RECORDED_INSTALL_ENV_KEYS}${RECORDED_INSTALL_ENV_KEYS:+ }${pending[*]}"
+}
+
 # The value install.env records for one key, empty when it records none.
-# Reads the file rather than the environment: install.env was sourced at
-# startup into these very names, and the interview has since overwritten them,
-# so the environment no longer remembers what the file said.
 #
 # Always returns 0. A `return 1` for "no such key" would be the natural
 # signature and is the wrong one here: this is called from a command
 # substitution, `set -E` propagates the ERR trap into that subshell, and the
 # trap fires on the non-zero return before the caller's `||` is ever consulted
-# -- printing an abort banner per absent key. Callers test presence separately.
-#
-# The value is unquoted the way sourcing the file would unquote it, because
-# both things that write install.env quote it. write_env_var here and
-# save_env_var in scripts/installer/installer_common.sh both serialise with
-# `printf '%s=%q\n'`, and %q renders the empty string as the two-character
-# literal '' and escapes anything the shell would treat specially -- so
-# `#gke-alerts` is written `\#gke-alerts`. Comparing a quoted recorded value
-# against an unquoted environment one reports every empty key as drifted, and
-# the line the banner prints for each (`KEY=`) changes nothing, so the next run
-# reports them again. That buries the
-# one case the warning exists for.
-#
-# A hand-authored file is the other half of the same problem and the reason
-# this cannot simply re-quote the current value and compare the quoted forms:
-# an operator writes `SLACK_HOME_CHANNEL="#gke-alerts"`, which %q would render
-# `\#gke-alerts`, and the two spellings of one value would not match.
-unquote_shell_value() {
-  local raw="${1:-}"
-  case "$raw" in
-    # Single quotes are literal all the way through, which is also how %q
-    # spells the empty string.
-    "'"*"'")
-      raw="${raw#\'}"
-      printf '%s' "${raw%\'}"
-      return 0
-      ;;
-    '"'*'"')
-      raw="${raw#\"}"
-      raw="${raw%\"}"
-      ;;
-  esac
-  # Outside single quotes a backslash escapes the next character. That is how
-  # %q writes '#', a space, and every other metacharacter.
-  printf '%s' "$raw" | sed 's/\\\(.\)/\1/g'
+# -- printing an abort banner per absent key. install_env_records_key is the
+# presence test, and it is safe because `if` suppresses the trap.
+recorded_install_env_value() {
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 0
+  read_recorded_install_env_values "$file" "$key"
+  local slot="${RECORDED_VALUE_PREFIX}${key}"
+  printf "%s" "${!slot-}"
 }
 
-recorded_install_env_value() {
-  local file="${1:-}" key="${2:-}" line=""
-  [ -n "$file" ] && [ -f "$file" ] || return 0
-  # install.env.example tells the operator `export K=V` is harmless, and every
-  # other reader of the file honours that: save_env_var, live_test_lease.py and
-  # project_config.py all skip an optional `export`. Matching it here keeps this
-  # reader in step -- missing the prefix skips the key silently, and in the
-  # direction of no warning at all.
-  # The `${line#*=}` below strips through the first `=`, so the longer prefix
-  # needs nothing further.
-  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -1 || true)"
-  [ -n "$line" ] || return 0
-  line="${line#*=}"
-  unquote_shell_value "$line"
+# Whether install.env assigns the key at all, told apart from assigning it
+# empty, by the same evaluation that reads the value.
+install_env_records_key() {
+  local file="${1:-}" key="${2:-}"
+  [ -n "$file" ] && [ -f "$file" ] && [ -n "$key" ] || return 1
+  read_recorded_install_env_values "$file" "$key"
+  local slot="${RECORDED_SET_PREFIX}${key}"
+  [ "${!slot-0}" = "1" ]
 }
 
 # Say so when an interactive answer changed something the file still records
@@ -1215,12 +1572,16 @@ warn_unrecorded_interview_answers() {
   #      and having the next run derive multiuser_memory from the unchanged file
   #      and tear the Hindsight API and its Postgres back down.
   local key recorded current drifted=""
-  for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
-    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
-    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
-    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
+  local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
+    SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
+    CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
+    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
+    USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+  # One evaluation of the file for the whole list, in this shell, so the reads
+  # below land on the cache instead of re-running whatever the file's lines run.
+  read_recorded_install_env_values "$file" "${interview_keys[@]}"
+  for key in "${interview_keys[@]}"; do
+    install_env_records_key "$file" "$key" || continue
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
       MEMORY) current="${PARAM_MEMORY:-}" ;;
@@ -1329,7 +1690,7 @@ note_stale_network_policy_acceptance() {
 warn_flag_beats_unrecorded_file_value() {
   local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}"
   [ -n "$value" ] || return 0
-  if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
+  if install_env_records_key "$file" "$key"; then
     local recorded
     recorded="$(recorded_install_env_value "$file" "$key")"
     if [ "$compare_as_bool" = "true" ]; then
@@ -1346,7 +1707,30 @@ warn_flag_beats_unrecorded_file_value() {
     print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
   fi
   print_info "$consequence"
-  print_info "Set ${key}=${value} in ${file}, or repeat ${flag} on ${repeat_on}."
+  # The bare form of a boolean flag means true (flag_bool_value), so "repeat
+  # --enable-drift-detector" told an operator who typed --enable-drift-detector=false
+  # to do the opposite of what they chose -- following it would re-provision
+  # the ingress the run they were warned about had just dropped, and the file
+  # still recording true would leave the guard silent about that. Render the
+  # value for a boolean whose chosen value is not true.
+  #
+  # Only for a boolean. A list flag's value is space-separated, so
+  # "--scope-projects=a b c" would not paste back as one argument, and the
+  # first remedy on this line already carries the value for it.
+  #
+  # `=false`, not the value as spelled. is_truthy reads `no`, `0`, `off` and
+  # `False` as off, and an exported ENABLE_GKE_BACKUP_PLAN=no arrives here
+  # verbatim -- but validate_bool_flag_value accepts only the literals `true`
+  # and `false`, so pasting the spelling back would print a remedy the
+  # installer rejects. The warning line above already carries what was given;
+  # this line has to be runnable.
+  local repeat_flag="$flag"
+  if [ "$compare_as_bool" = "true" ] && ! is_truthy "$value"; then
+    repeat_flag="${flag}=false"
+  fi
+  # %q, because the scope keys are the first list-valued values through here and
+  # a space-separated one printed bare would not paste back as one assignment.
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${repeat_flag} on ${repeat_on}."
 }
 
 bootstrap_install_env_file() {
@@ -1356,9 +1740,9 @@ bootstrap_install_env_file() {
     print_info "Left your install configuration as you wrote it: ${destination}"
     warn_unrecorded_interview_answers "$destination"
     note_unrecorded_network_policy_acceptance "$destination"
-    # The two flags that override a recorded value for one run. This function
-    # never rewrites an existing file, so only a first install can record either
-    # on the operator's behalf.
+    # The flags that override a recorded value for one run. This function
+    # never rewrites an existing file, so only a first install can record any of
+    # them on the operator's behalf.
     warn_flag_beats_unrecorded_file_value "$destination" NAMESPACE --agent-namespace \
       "${PARAM_AGENT_NAMESPACE:-}" \
       "A later run without it resolves the default namespace, renders tfvars for that one, looks for the recovered Secret there, and is refused by lifecycle.sh's guard_release_namespace." \
@@ -1369,6 +1753,157 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    # Four consequence strings, unlike every other call here, which take one.
+    # This key is the only one whose consequence varies, and it varies on two
+    # things at once.
+    #
+    # Direction. Turning it ON leaves the loss for a later run; turning it OFF
+    # over a file that records it on does the destroying now, and the later run
+    # re-reads the file and puts it back. The wrong one of those tells the
+    # operator the destruction is deferred at the moment it is about to happen.
+    #
+    # Whether anything is destroyed at all, which the TF_VAR_ block below
+    # explains.
+    #
+    # A string that covered every case would say nothing an operator could act
+    # on, and each of these is read by someone about to be surprised.
+    local drift_detector_chosen="${PARAM_ENABLE_DRIFT_DETECTOR:-}"
+    local drift_detector_recorded drift_detector_consequence drift_detector_turning_off=""
+    # Both drift keys in one evaluation of the file, in this shell, so the two
+    # reads below and the guard's own presence test share it.
+    read_recorded_install_env_values "$destination" ENABLE_DRIFT_DETECTOR TF_VAR_enable_drift_pubsub
+    drift_detector_recorded="$(recorded_install_env_value "$destination" ENABLE_DRIFT_DETECTOR 2>/dev/null || true)"
+    # What a later run that passes no flag reads the key back from. The file
+    # when it records one; otherwise, with the file silent, this shell's own
+    # export -- PARAM_ENABLE_DRIFT_DETECTOR is seeded from the environment
+    # before parse_args overwrites it, so that export is what the next run
+    # from this shell chooses and what an upgrade.sh from it regenerates on.
+    # SHELL_ENABLE_DRIFT_DETECTOR rather than ENABLE_DRIFT_DETECTOR because
+    # main() has already overwritten the latter with this run's choice; the
+    # comment beside the capture has the consequence of reading the wrong one.
+    local drift_detector_restorer="${destination}"
+    if [ -z "$drift_detector_recorded" ] && is_truthy "${SHELL_ENABLE_DRIFT_DETECTOR:-false}"; then
+      drift_detector_restorer="the ENABLE_DRIFT_DETECTOR=${SHELL_ENABLE_DRIFT_DETECTOR} this shell exports"
+    fi
+    if [ -n "$drift_detector_chosen" ] && ! is_truthy "$drift_detector_chosen"; then
+      if is_truthy "${drift_detector_recorded:-false}" || is_truthy "${SHELL_ENABLE_DRIFT_DETECTOR:-false}"; then
+        # Off over something that asks for it on: the file, or -- with the file
+        # silent -- the shell. The second is a reversal too, and the one this
+        # guard exists to catch: the =false applies to this run, and the next
+        # run from the same shell re-reads the export, writes both keys and
+        # provisions the ingress again, empty and billing, with nothing said.
+        drift_detector_turning_off="true"
+      else
+        # Off over a file that does not ask for it on, from a shell that does
+        # not either. This run writes neither key and so would every later run,
+        # so there is no reversal to announce -- and the helper's unrecorded
+        # branch would announce one.
+        drift_detector_chosen=""
+      fi
+    fi
+    # The other axis: whether dropping the two tfvars keys destroys the ingress
+    # at all. It does not on an install whose install.env carries a hand-written
+    # TF_VAR_enable_drift_pubsub=true line, which was the only front-door route
+    # to the ingress before this key existed. write_tfvars_from_state omits both
+    # drift keys rather than writing false precisely so that line keeps working,
+    # and a tfvars key beats TF_VAR_, so dropping them there stops the detector
+    # and leaves the sink, topic and subscription standing. Telling that
+    # operator their audit records are about to be deleted is how a warning gets
+    # discounted, and this is the population most likely to try the new key.
+    #
+    # Which source answers that depends on which apply the sentence is about,
+    # and the two branches below are about different ones.
+    #
+    # Turning off asks about the apply that is seconds away. Terraform reads
+    # TF_VAR_ out of the environment the front door hands it, and nothing on
+    # the way here unsets TF_VAR_* (load_install_env clears NAMESPACE and the
+    # five SCOPE_ keys, upgrade.sh clears three more, neither list reaches
+    # these), so a hand-written file line and a shell export both survive to
+    # `terraform apply` and either one keeps the trio standing through it.
+    # Reading only the file would tell the exporting operator this apply
+    # deletes their audit records when it does not, which is how a warning
+    # gets discounted.
+    #
+    # Turning on asks about a later run, and a later run is from whatever
+    # shell the operator is in by then, so only the file line counts. An
+    # operator who provisioned the ingress with
+    # `TF_VAR_enable_drift_pubsub=true ./install.sh` and recorded nothing has
+    # an upgrade.sh from a clean shell that regenerates tfvars with neither
+    # key, falls to the variable's false default and destroys the trio;
+    # promising them a sink that survives is the same discounting in the
+    # other direction. The export is still worth naming where it holds, which
+    # is why the turning-off branch carries the caveat rather than dropping
+    # the distinction. This function never rewrites an existing file, so a
+    # line read here is a line that is still there after.
+    local drift_ingress_recorded drift_ingress_caveat=""
+    drift_ingress_recorded="$(recorded_install_env_value "$destination" TF_VAR_enable_drift_pubsub 2>/dev/null || true)"
+    local drift_ingress_keeper_file="" drift_ingress_keeper_now=""
+    if is_truthy "${drift_ingress_recorded:-false}"; then
+      drift_ingress_keeper_file="the TF_VAR_enable_drift_pubsub line in ${destination}"
+      drift_ingress_keeper_now="$drift_ingress_keeper_file"
+    elif is_truthy "${TF_VAR_enable_drift_pubsub:-false}"; then
+      drift_ingress_keeper_now="TF_VAR_enable_drift_pubsub in this shell's environment"
+      # Only when the file does not record the detector on. With
+      # ENABLE_DRIFT_DETECTOR=true in the file, the run from a clean shell this
+      # caveat warns about re-reads that line and writes both drift tfvars keys,
+      # which provisions the ingress -- so the trio stands whether or not the
+      # export came along, and the caveat would contradict the sentence it is
+      # spliced into, which says in the next breath that a later run starts the
+      # detector again. A recorded `false`, or no line at all, leaves the shell
+      # as the only thing holding the trio up, and then it is the whole warning.
+      #
+      # Both exports, not the TF_VAR_ one alone. Reaching here means
+      # drift_detector_turning_off was set on a file that records no detector,
+      # which by the test above means SHELL_ENABLE_DRIFT_DETECTOR is on -- so
+      # every operator who sees this sentence is exporting both, and either one
+      # alone keeps the trio standing. TF_VAR_enable_drift_pubsub because
+      # Terraform reads it straight out of the environment; ENABLE_DRIFT_DETECTOR
+      # because write_tfvars_from_state writes `enable_drift_pubsub = true` from
+      # it, which test_tfvars_writes_both_drift_keys_when_the_detector_is_on in
+      # tests/test_installer_common.py pins. Naming one export promises
+      # destruction to a shell that kept the other, and contradicts the clause
+      # this is spliced in front of, which says a later run re-reads the export
+      # this shell holds and starts the detector again.
+      if ! is_truthy "${drift_detector_recorded:-false}"; then
+        drift_ingress_caveat=" ${destination} records neither key as on, so they stand on this shell's exports: keeping either ENABLE_DRIFT_DETECTOR or TF_VAR_enable_drift_pubsub keeps them, and the first run from a shell exporting neither destroys them along with the audit records retained there."
+      fi
+    fi
+    if [ -n "$drift_detector_turning_off" ]; then
+      if [ -n "$drift_ingress_keeper_now" ]; then
+        drift_detector_consequence="This run writes neither drift tfvars key, so it stops the detector now; ${drift_ingress_keeper_now} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads.${drift_ingress_caveat} A later run without the flag re-reads ${drift_detector_restorer} and starts the detector again."
+      else
+        drift_detector_consequence="This run writes neither drift tfvars key, so this apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there, with -auto-approve and no plan shown first; a later run without the flag re-reads ${drift_detector_restorer} and provisions them again, empty."
+      fi
+    elif [ -n "$drift_ingress_keeper_file" ]; then
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and stops the detector; ${drift_ingress_keeper_file} keeps the Log Router sink, the drift-audit topic and its subscription, which go on retaining records nothing reads."
+    else
+      drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it writes neither and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
+    fi
+    warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
+      "$drift_detector_chosen" \
+      "$drift_detector_consequence" \
+      true \
+      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file and from whatever the calling shell still exports, so the file is the only remedy that does not depend on which shell runs the upgrade"
+    # The scope keys: a flag applies its declaration for this run, and the
+    # next full upgrade regenerates from the file, so a project the file does
+    # not name is dropped again, its bindings revoked and its profiles retired.
+    local scope_key scope_flag scope_value
+    for scope_key in SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+      case "$scope_key" in
+        SCOPE_PROJECTS) scope_flag="--scope-projects"; scope_value="${PARAM_SCOPE_PROJECTS:-}" ;;
+        SCOPE_FOLDERS) scope_flag="--scope-folders"; scope_value="${PARAM_SCOPE_FOLDERS:-}" ;;
+        SCOPE_ORGANIZATIONS) scope_flag="--scope-organizations"; scope_value="${PARAM_SCOPE_ORGANIZATIONS:-}" ;;
+        SCOPE_SHARED_VPC_HOSTS) scope_flag="--scope-shared-vpc-hosts"; scope_value="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}" ;;
+        SCOPE_METRICS_SCOPES) scope_flag="--scope-metrics-scopes"; scope_value="${PARAM_SCOPE_METRICS_SCOPES:-}" ;;
+        SCOPE_EXCLUDE_PROJECTS) scope_flag="--scope-exclude-projects"; scope_value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
+        *) scope_flag="--scope-exclude-clusters"; scope_value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
+      esac
+      warn_flag_beats_unrecorded_file_value "$destination" "$scope_key" "$scope_flag" \
+        "$scope_value" \
+        "A later run without it regenerates the scope from the file: a project, folder, organisation, Shared VPC host or Metrics Scope the file does not name is dropped from the scope on the next full upgrade, its read roles revoked and its Cluster Agent profiles retired over the reconcile's next two clean runs." \
+        false \
+        "every later install.sh run"
+    done
     return 0
   fi
   if [ "$PARAM_DRY_RUN" = "true" ]; then
@@ -1420,6 +1955,17 @@ bootstrap_install_env_file() {
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_CUSTOM_ROLES "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   fi
+  # Recorded even when empty: the generator renders the scope block from these
+  # on every run, and a later upgrade.sh that finds no line renders the same
+  # empty block, so the presence of the keys is what tells an operator where
+  # a project is declared.
+  write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_FOLDERS "${SCOPE_FOLDERS:-}"
+  write_env_var "$tmp" SCOPE_ORGANIZATIONS "${SCOPE_ORGANIZATIONS:-}"
+  write_env_var "$tmp" SCOPE_SHARED_VPC_HOSTS "${SCOPE_SHARED_VPC_HOSTS:-}"
+  write_env_var "$tmp" SCOPE_METRICS_SCOPES "${SCOPE_METRICS_SCOPES:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
@@ -1432,6 +1978,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
   # Recorded only when this run accepted it -- the decision, not the flag: a
   # flag passed against a cluster that already enforces accepted nothing. The
   # key is a standing decision about this cluster, and every later generator
@@ -1551,6 +2098,14 @@ verify_local_source_ref() {
       return 0
     fi
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    # Only when the checkout's own install.sh carries the version, the line
+    # checkout_is_past_baked_release draws: the baked version belongs to the
+    # running script, and a release's piped installer standing in some other
+    # checkout that lacks the tag is not a line checkout to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     print_info "Pass --allow-unverified-source to provision anyway."
     return 1
   fi
@@ -1561,6 +2116,13 @@ verify_local_source_ref() {
       print_warning "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
     else
       print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+      # The tag is here and HEAD is not it: a line checkout asked for the release
+      # by name (--image-tag with the baked version), one the predicate could not
+      # walk (a shallow clone), or an unrelated commit. Same gate as above.
+      if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+        [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+        release_line_recognition_hint "$repo_dir"
+      fi
       print_info "Pass --allow-unverified-source to provision anyway."
       return 1
     fi
@@ -1721,9 +2283,6 @@ source_provisioning_helpers() {
     exit 1
   fi
   SCRIPT_DIR="${repo_dir}/scripts/installer"
-  # The legacy state file, still at its original address: an install made
-  # before the move has one there and nowhere else.
-  VARS_FILE="${repo_dir}/k8s-operator/scripts/vars.sh"
   # shellcheck source=/dev/null
   source "$helper_script"
   # gke_dns_endpoint_flag, for the credentials fetch before the health checks.
@@ -1770,6 +2329,10 @@ resolve_shared_defaults() {
   PARAM_KMS_KEY="${PARAM_KMS_KEY:-$DEFAULT_KMS_KEY}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  # No PARAM_ENABLE_DRIFT_DETECTOR. Empty has to survive this function and
+  # reach bootstrap_install_env_file's guard as "nobody chose"; its two
+  # readers, write_env_var below and the generator, each apply
+  # DEFAULT_ENABLE_DRIFT_DETECTOR themselves.
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -1866,6 +2429,27 @@ run_with_spinner() {
   return "$rc"
 }
 
+# lifecycle.sh writes two gitignored override files around each `terraform
+# import` -- a helm provider placeholder beside the composition and a scope
+# resolver pin inside that module's directory -- and removes them on an EXIT
+# trap and again at the start of every subcommand, because a lifecycle.sh
+# killed by a signal the trap cannot see leaves them behind. The dry run below
+# reads the same composition directly, through the checkout acquire_source_repo
+# reuses from run to run, and a plan that merged the scope pin would resolve
+# every declared selector to no members and preview the removal of the bindings
+# those members hold, under a banner calling it what a real run would do. So the
+# dry run clears them the way the engine does, through the engine's own
+# function, so the file names have one home. Runs in the composition directory
+# the caller has cd'd into; the subshell keeps the engine's `set -u`, its `cd`
+# and its definitions out of this script. lifecycle.sh is linted on its own.
+drop_stale_import_overrides() {
+  (
+    # shellcheck disable=SC1091
+    KUBE_AGENTS_SOURCE_ONLY=true source ./lifecycle.sh
+    drop_override
+  )
+}
+
 # The dry run's Terraform check. At file scope, rather than inside main(), so the
 # test suite can source install.sh and drive this exact function instead of its
 # own copy of the chain -- a copy asserts that the copy short-circuits, which is
@@ -1886,6 +2470,12 @@ wait_for_rollout() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
 
   local started=$SECONDS
   local log_file=""
@@ -1893,7 +2483,7 @@ wait_for_rollout() {
 
   local rc=0
   run_with_spinner "$deployment" "$log_file" \
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" "${ctx_flag[@]}" --timeout="${timeout_secs}s" || rc=$?
 
   # Published for the caller's failure message. How long the wait actually ran is
   # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
@@ -1926,9 +2516,15 @@ wait_for_deployment_object() {
   local deployment="$1"
   local namespace="$2"
   local timeout_secs="$3"
+  local context="${4:-}"
+
+  local ctx_flag=()
+  if [ -n "$context" ]; then
+    ctx_flag=(--context "$context")
+  fi
 
   local deadline=$((SECONDS + timeout_secs))
-  while ! kubectl get deployment "$deployment" -n "$namespace" >/dev/null 2>&1; do
+  while ! kubectl get deployment "$deployment" -n "$namespace" "${ctx_flag[@]}" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       return 1
     fi
@@ -2345,8 +2941,28 @@ print_generate_only_handoff() {
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""
   echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  # On an existing install only: first apply the chart's CRDs through the install's own context,"
+  echo -e "  # never the current one. Neither Helm nor lifecycle.sh upgrades them, and a field the served"
+  echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
+  echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
+  echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading APIs the"
+    echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
+    echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
+  fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
+  echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
+  echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES and the two exclusions)"
+  echo -e "  # is replaced by this apply, and the reconcile"
+  echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
+  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
+    echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
+    echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
+    echo -e "  # on the container, and a warning above, if any, says what this identity could not."
+  fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
@@ -3410,39 +4026,28 @@ run_menu_system() {
 
   local repo_dir
   repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
   local helper_script="${repo_dir}/scripts/installer/installer_common.sh"
 
   if [ ! -f "$helper_script" ]; then
     print_error "Cannot find installer helpers at $helper_script."
     exit 1
   fi
-  export VARS_FILE="$vars_file"
   # shellcheck disable=SC1090
   source "$helper_script"
 
-  if [ -f "$vars_file" ]; then
-    # shellcheck disable=SC1090
-    if ! source "$vars_file"; then
-      print_error "Configuration state is invalid and could not be loaded: $vars_file"
-      exit 1
-    fi
-  fi
-  # install.env was already loaded at startup, but sourcing vars.sh just now put
-  # the derived state back over the top of it. Re-apply the input so the
-  # hand-authored file is what the panel opens on, whichever order the two
-  # files disagree in.
+  # install.env is already loaded at startup; re-apply it here so the panel
+  # always opens on the operator's own input, whatever the sourced helpers
+  # left in the environment.
   load_install_env "$INSTALL_ENV_FILE" || true
   # That reload unsets NAMESPACE on its way in, for the reason
   # bootstrap_install_env does -- so --agent-namespace, which main() applied
   # before dispatching here, has to be applied again or the panel opens on the
   # default namespace and its Save & Apply writes tfvars for that one.
   apply_agent_namespace_override
-  # ...and the same for the memory setting, which the two files spell
-  # differently (install.env MEMORY, legacy vars.sh MEMORY_PROVIDER) so load
-  # order alone cannot make the input win. Save & Apply generates tfvars
-  # directly, without passing through the parameter block that resolves this
-  # pair on install.sh's own run.
+  # ...and the memory setting needs normalizing, because install.env spells it
+  # MEMORY while the provisioner reads MEMORY_PROVIDER. Save & Apply generates
+  # tfvars directly, without passing through the parameter block that resolves
+  # this pair on install.sh's own run.
   normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
@@ -3477,11 +4082,11 @@ run_menu_system() {
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
-  # already exists and its Save & Apply re-applies what it displays, so a
-  # vars.sh with no ENABLE_GVISOR has to read as the standard runtime — that is
-  # what such a cluster is actually running. Defaulting on here would show
-  # "gVisor Sandbox" for an unsandboxed install and then provision a node pool
-  # nobody asked for on the next apply.
+  # already exists and its Save & Apply re-applies what it displays, so an
+  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
+  # that is what such a cluster is actually running. Defaulting on here would
+  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
+  # pool nobody asked for on the next apply.
   local enable_gvisor="${ENABLE_GVISOR:-false}"
   # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
   # the panel has to read as what an unconfigured install is running. Flipping
@@ -3675,10 +4280,33 @@ run_menu_system() {
         #
         # No re-source: save_env_var exports as it writes, so the environment
         # write_tfvars_from_state reads is already current.
-        write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
+        #
+        # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER, because run_lifecycle_apply below
+        # is a full apply. This panel is the front door most likely to reach the
+        # generator with no memory answer at all -- normalize_memory_vars returns
+        # immediately when install.env carries no MEMORY line, and --menu is
+        # dispatched before the prerequisite check, so kubectl may not even be
+        # usable -- and an operator reaches it to change a model provider, not to
+        # decide the fate of a database.
+        KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
+          write_tfvars_from_state "$(tf_compose_dir "$repo_dir")/terraform.tfvars" "$image_tag"
         # A provider or minter switch is where a new fixed-name GSA is first
         # planned on an existing install, so the 409 check runs here too.
         check_service_account_ownership || exit 1
+        # The menu edits no scope key, so the keys are the recorded ones; this
+        # still refuses a re-apply over a scope the CR gained by hand since.
+        # The menu establishes no kubeconfig context of its own, so fetch one
+        # first, as main() does before its summary; the check refuses if the
+        # fetch did not land.
+        GKE_DNS_ENDPOINT_FLAG=""
+        gke_dns_endpoint_flag "$cluster_name" "$REGION" "$PROJECT_ID" || true
+        # shellcheck disable=SC2086
+        gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
+          --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+        refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+        check_scope_container_access || exit 1
+        enable_scope_selector_apis "$PROJECT_ID"
+        apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
@@ -3747,6 +4375,13 @@ main() {
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    # The menu reloads install.env and reads the scope keys from it alone; a
+    # flag here would be validated and then dropped without a word.
+    if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
+      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      exit 1
+    fi
     run_menu_system
     exit 0
   fi
@@ -3815,7 +4450,7 @@ main() {
   # tooling; gke-gcloud-auth-plugin allows kubectl to authenticate to GKE.
   # Everything is checked up front rather than discovered halfway through with
   # the cluster already created.
-  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin; do
+  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
@@ -4583,14 +5218,19 @@ main() {
   permission_set=$(printf '%s' "$permission_set" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   # require_supported_permission_set (installer_common.sh) is the one home for
   # the accepted vocabulary and for the explanation the removed admin bundle
-  # gets -- a PLATFORM_AGENT_PERMISSION_SET inherited from a vars.sh or a CI
+  # gets -- a PLATFORM_AGENT_PERMISSION_SET carried in install.env or a CI
   # environment variable written before the removal lands here.
   require_supported_permission_set "$permission_set" || exit 1
   local custom_roles="${PARAM_CUSTOM_ROLES:-}"
-  # This rule is also written in init_var_platform_agent_permission_set
-  # (scripts/installer/common.sh), which has no caller left in the repository
-  # -- the numbered provision scripts that used to invoke it went with #797. So
-  # this is the only place it runs, not a duplicate of somewhere it also runs.
+  local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
+  local scope_folders="${PARAM_SCOPE_FOLDERS:-}"
+  local scope_organizations="${PARAM_SCOPE_ORGANIZATIONS:-}"
+  local scope_shared_vpc_hosts="${PARAM_SCOPE_SHARED_VPC_HOSTS:-}"
+  local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
+  local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
+  local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
+  # This is the only place this rule runs: the installer library's copy went
+  # with the numbered provision scripts that called it (#797).
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
@@ -4744,6 +5384,7 @@ main() {
       hindsight) memory_choice="2" ;;
       off) memory_choice="3" ;;
     esac
+    local memory_seed_choice="$memory_choice"
     case "$memory_choice" in
       2) mem_tag_hind=" (Default)" ;;
       3) mem_tag_off=" (Default)" ;;
@@ -4763,6 +5404,32 @@ main() {
       2) memory_mode="hindsight" ;;
       3) memory_mode="off" ;;
     esac
+    # Not unconditional, which is what it used to be. When nothing stated a
+    # memory mode, resolve_shared_defaults has already put DEFAULT_MEMORY
+    # (`file`) into PARAM_MEMORY, so the seed above is 1 and the "(Default)" tag
+    # sits on the file store because of a project-wide default, not because this
+    # install chose it. prompt_menu returns that same 1 for a bare enter, so
+    # marking it explicit turns "the operator said nothing" into "the operator
+    # chose file" -- and that skips live_hindsight_state in the generator, which
+    # is the whole of what stands between a Hindsight install whose install.env
+    # predates the MEMORY key and an apply that deletes hindsight-postgresql and
+    # its database. That is the population the retirement of vars.sh created:
+    # before it, a pre-0.4.0 checkout seeded this prompt on option 2 from the
+    # MEMORY_PROVIDER that file carried, so enter kept Hindsight.
+    #
+    # Moving off the seeded option is a statement, and so is an install.env or
+    # --memory that set PARAM_MEMORY_EXPLICIT before the interview. What is left
+    # -- accepting the seed when nothing seeded it -- is deliberately read as
+    # "no answer" and handed to the probe. A typed "1" is indistinguishable from
+    # enter here (prompt_menu returns the number either way), so it is read the
+    # same: on a cluster running Hindsight the generator then preserves it and
+    # says so, and the pre-flight summary shows the store the apply will keep
+    # before anything is applied. Losing an argument with the operator that way
+    # costs one re-run with --memory=file; losing it the other way costs the
+    # database.
+    if [ "$PARAM_MEMORY_EXPLICIT" = "true" ] || [ "$memory_choice" != "$memory_seed_choice" ]; then
+      PARAM_MEMORY_EXPLICIT="true"
+    fi
   fi
 
   # bootstrap_install_env_file records PARAM_MEMORY, not this local, so the
@@ -4782,25 +5449,27 @@ main() {
   # alongside whichever provider is chosen — two competing stores in front of one
   # agent. Every provider here replaces it rather than supplementing it. Nothing
   # about memory keys off this flag, so an upgrade cannot read a false left in an
-  # old vars.sh as "this install wanted no memory".
+  # old install.env as "this install wanted no memory".
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
-  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
-  # in scripts/installer/common.sh.
+  # translates `none` back to Hermes' own spelling when it renders config.yaml.
   #
   # `multiuser_memory` is the default provider everywhere it is named with no
-  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # install to ask (the CRD default, install.defaults.env, and both profiles'
+  # config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
+  # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither
+  # install.env nor --memory), leave MEMORY_PROVIDER empty when calling
+  # write_tfvars_from_state so the generator can preserve a live Hindsight
+  # deployment on an existing cluster before falling back to multiuser_memory.
   local memory_enabled="false"
-  # memory_provider_from_mode (installer_common.sh) owns the mode → provider
-  # table; upgrade.sh and the Day-2 menu resolve the same pair through it, and a
-  # second copy here is how the three drift. It returns empty for a mode it does
-  # not recognise, which is what the fallback covers.
-  local memory_provider
-  memory_provider="$(memory_provider_from_mode "$memory_mode")"
-  [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  local memory_provider=""
+  if [ "$PARAM_MEMORY_EXPLICIT" = "true" ]; then
+    memory_provider="$(memory_provider_from_mode "$memory_mode")"
+    [ -n "$memory_provider" ] || memory_provider="$DEFAULT_MEMORY_PROVIDER"
+  fi
 
   print_step "10. Resolving Install Configuration"
   local registry_prefix="${PARAM_REGISTRY_PREFIX%/}"
@@ -4885,6 +5554,13 @@ main() {
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
+  export SCOPE_PROJECTS="$scope_projects"
+  export SCOPE_FOLDERS="$scope_folders"
+  export SCOPE_ORGANIZATIONS="$scope_organizations"
+  export SCOPE_SHARED_VPC_HOSTS="$scope_shared_vpc_hosts"
+  export SCOPE_METRICS_SCOPES="$scope_metrics_scopes"
+  export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
+  export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
   # One release of overlap: the agent runtime and the chart still speak
@@ -4902,6 +5578,13 @@ main() {
   export REGISTRY_PREFIX="$registry_prefix"
   export ENABLE_PUBSUB_PLATFORM="$PARAM_ENABLE_PUBSUB_PLATFORM"
   export ENABLE_STOCKOUT_INVESTIGATOR="$PARAM_ENABLE_STOCKOUT_INVESTIGATOR"
+  # Conditional, like ENABLE_GKE_BACKUP_PLAN above and for the same reason:
+  # resolve_shared_defaults leaves this PARAM empty when nothing chose, so an
+  # unconditional export would write an empty value over whatever install.env
+  # said. The generator's DEFAULT_ENABLE_DRIFT_DETECTOR decides when it is.
+  if [ -n "${PARAM_ENABLE_DRIFT_DETECTOR:-}" ]; then
+    export ENABLE_DRIFT_DETECTOR="$PARAM_ENABLE_DRIFT_DETECTOR"
+  fi
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an
@@ -4910,7 +5593,7 @@ main() {
     export THIRD_PARTY_REGISTRY_PREFIX="$third_party_registry_prefix"
   fi
   # No *_IMAGE variables. The operator reads OPERATOR_IMAGE and
-  # PLATFORM_AGENT_IMAGE from its own pod environment, where the chart sets them
+  # PLATFORM_AGENT_IMAGE from its own pod environment, where the chart sets both
   # from values.yaml. The images this install pulls are decided by
   # REGISTRY_PREFIX above and the image_tag the tfvars generator writes.
 
@@ -4919,8 +5602,31 @@ main() {
   # install.sh is the one front door allowed to mint an API_SERVER_KEY, and only
   # after the generator has tried the live Secret. upgrade.sh and uninstall.sh
   # leave this unset so an unfindable key stays an error for them.
+  #
+  # KUBE_AGENTS_REQUIRE_MEMORY_ANSWER: "could not tell whether the cluster runs
+  # Hindsight" has to stop this run rather than fall through to multiuser_memory
+  # and let an apply delete the database. Unconditional, including under
+  # --dry-run and --generate-only, because both of those write this same
+  # tfvars_file in the real composition directory and --generate-only exists
+  # precisely to hand it to `lifecycle.sh apply` -- so a guess here is applied
+  # either way, just later and by someone who did not see the run that made it.
+  # That is why this does not take the warn-under---dry-run shape the coordinate
+  # checks use: those refuse before writing anything.
+  #
+  # Only reachable when nothing stated a memory mode -- PARAM_MEMORY_EXPLICIT is
+  # false, which left MEMORY_PROVIDER empty above -- and never on a cluster that
+  # does not exist yet. uninstall.sh deliberately does not opt in.
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
+    KUBE_AGENTS_REQUIRE_MEMORY_ANSWER=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
+  if [ "$PARAM_MEMORY_EXPLICIT" != "true" ]; then
+    memory_provider="${MEMORY_PROVIDER:-$DEFAULT_MEMORY_PROVIDER}"
+    export MEMORY_PROVIDER="$memory_provider"
+    if [ "$memory_provider" = "kube_agents_memory" ]; then
+      memory_mode="hindsight"
+      PARAM_MEMORY="hindsight"
+    fi
+  fi
   # After the generator, because its Secret-recovery loop is the thing that can
   # still supply the tokens; before the apply, because a relay without them
   # CrashLoops.
@@ -4931,6 +5637,40 @@ main() {
   # service account the apply would 409 on is something to know before
   # answering "proceed", and it costs a describe per account. Read-only.
   check_service_account_ownership || exit 1
+  # For the same reason, and only for a run that will apply: the apply renders
+  # spec.scope from the keys over the live PlatformAgent, and a scope it
+  # carries that neither the release record nor the keys account for is
+  # refused here, before the operator confirms, the App key is imported or an
+  # adopted cluster is changed, rather than replaced. The context is fetched
+  # here because the generator fetches one only for an adoption; a fetch that
+  # does not land is the check's own refusal. A first install has no cluster
+  # yet and skips this.
+  if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
+      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  fi
+  # A declared folder or organisation is bound by the apply with this
+  # identity, in the container itself, and turns on the Asset API in the host
+  # project; both are checked before anything is applied, first install
+  # included, so a container this identity cannot bind or an organisation
+  # policy that forbids the API stops the run rather than failing it partway.
+  # The mode follows the route: a run that will apply is refused, a run that
+  # hands the apply to lifecycle.sh only warns, because that apply often runs
+  # later as a CI or platform identity and the credentials probed here are the
+  # ones at the keyboard. Here the route is known for --generate-only and -y;
+  # an interactive run learns it at the (Y/n/g) prompt below and is checked
+  # there, so the g answer is the same choice as the flag.
+  if [ "$PARAM_DRY_RUN" != "true" ]; then
+    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      check_scope_container_access || exit 1
+    fi
+  fi
 
   # Prompt for opt-ins on existing cluster mutations before the summary
   # checkpoint -- and before install.env is written, so an answer given here
@@ -4990,6 +5730,9 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
+      # Before terraform first reads the configuration; the plan further down
+      # runs in this same directory and nothing between the two writes them.
+      drop_stale_import_overrides
       local tf_log=""
       tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
       local rc=0
@@ -5015,7 +5758,7 @@ main() {
       fi
     )
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-      local np_status=0
+      local np_status=0 missing_apis=""
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
@@ -5038,6 +5781,14 @@ main() {
           print_info "To remediate manually beforehand, update each legacy node pool:"
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
+      elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \
+        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then
+        # The plan resolves a declared Shared VPC host or Metrics Scope by
+        # reading APIs a real run enables prior to apply; a dry run enables
+        # nothing, so its plan would be refused for a reason the real run
+        # does not have. A listing that failed runs the plan and lets it speak.
+        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan resolves the declared Shared VPC host or Metrics Scope through it (a real run enables it prior to apply)."
+        print_info "To preview anyway, enable it first: gcloud services enable ${missing_apis} --project=${project_id}"
       else
         # Reached with an unenforcing cluster only under --accept-no-network-policy,
         # whose tfvars carry the variable that passes the module's postcondition.
@@ -5082,9 +5833,14 @@ main() {
     prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
     case "$confirm_choice" in
       [Yy])
+        # The apply is chosen: the container preflight refuses here, before
+        # step 12 writes anything, as it does above the summary for -y.
+        check_scope_container_access || exit 1
         ;;
       [Gg])
+        # The handoff is chosen: the same check only warns, as for the flag.
         PARAM_GENERATE_ONLY="true"
+        check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
         print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
@@ -5112,6 +5868,10 @@ main() {
   # and the non-interactive flag path. Warns-only when GitHub is unreachable;
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
   check_github_org_is_organization "${GITOPS_ORG:-}"
+  # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
+  # reads APIs the apply below is what enables; on a first install they
+  # have to be on before the plan, or it is refused with the API disabled.
+  enable_scope_selector_apis "$project_id"
 
   # The three script behaviours a data source cannot express: CMEK, the
   # Workload Identity pool, and NetworkPolicy enforcement on a cluster that
@@ -5150,18 +5910,17 @@ main() {
   # Terraform, which never recorded it, plans a create. Whenever the cluster
   # is already there -- adopted, or created by this state on the attempt that
   # died -- and only for a release no revision of which ever served. The
-  # generator fetched credentials on the adoption path alone, so fetch them
-  # here for the other; the check itself refuses to look at any other context.
+  # context is the one fetched before the step-11 summary for the scope check
+  # (with the DNS-endpoint flag step 13 passes, since without it the fetch
+  # fails on a DNS-endpoint-only cluster and the context gate below does not
+  # match); the check itself refuses to look at any other context.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
-    # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
-    # a DNS-endpoint-only cluster, the context gate below does not match, and
-    # the check skips exactly the retry it exists for.
-    GKE_DNS_ENDPOINT_FLAG=""
-    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
-      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+    # A re-run is how INSTALL.md says to change configuration, and Helm never
+    # upgrades CRDs, so the schema is applied here as upgrade.sh applies it
+    # before its own apply; a field the served CRD lacked would otherwise be
+    # pruned from the CR, and stay pruned.
+    apply_crd_upgrades "$repo_dir"
   fi
 
   local provisioning_log
@@ -5190,13 +5949,22 @@ main() {
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "$cluster_name" --location "$region" \
     --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null
-  if ! kubectl get ns "$namespace" >/dev/null 2>&1; then
+  local expected_ctx
+  expected_ctx="$(gke_context_name)"
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ "$current_ctx" != "$expected_ctx" ]; then
+    print_error "kubectl current-context ('${current_ctx}') does not match expected cluster context '${expected_ctx}'."
+    print_info "Failed to switch kubectl context to '${expected_ctx}'. Refusing to run health checks on the wrong cluster."
+    exit 1
+  fi
+  if ! kubectl get ns "$namespace" --context "$expected_ctx" >/dev/null 2>&1; then
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
-    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then
+    if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS" "$expected_ctx"; then
       print_error "Expected deployment '$deployment' was not created within ${DEPLOYMENT_APPEAR_TIMEOUT_SECS}s."
       # platform-agent-gateway is the agent, and the sandbox is the one thing
       # that stops the operator writing it while leaving everything else
@@ -5204,7 +5972,7 @@ main() {
       # CR rather than in any of the logs an operator would reach for first.
       if [ "$deployment" = "$PLATFORM_AGENT_DEPLOYMENT" ] && [ "$enable_gvisor" = "true" ]; then
         print_info "The agent asks for the ${C_BOLD}gvisor${C_RESET} RuntimeClass; the operator will not create its Deployment until that RuntimeClass exists."
-        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
+        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n ${namespace} --context ${expected_ctx} -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
         print_info "Re-run with ${C_BOLD}--enable-gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
       fi
       exit 1
@@ -5213,7 +5981,7 @@ main() {
     # so a couple of minutes is normal. Running past the budget means "still
     # coming up", not "broken": say so and keep the summary below, which carries
     # the chat links and port-forward command.
-    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
+    if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS" "$expected_ctx"; then
       slow_rollouts+=("$deployment")
       print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi

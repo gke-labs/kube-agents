@@ -17,10 +17,9 @@ and RUFF_SELECT in the Makefile is the same rule set; the Makefile test below
 pins the two together.
 
 ruff comes from requirements-test.txt (`make test-python-deps`). Where it is
-not installed the test skips on a laptop, and skips on a CI job that never
-installs that file at all -- agent-startup-test.yml discovers this directory
-with PyYAML as its only dependency, on purpose, so the tests run anywhere the
-agent image does. It fails on a CI job that did install requirements-test.txt
+not installed the test skips on a laptop, and would skip on a CI job that
+never installs that file at all (none runs this directory without it today).
+It fails on a CI job that did install requirements-test.txt
 and still has no ruff, which is a runner that lost the dependency and must not
 report the gate green. `CI` is the variable GitHub Actions sets on every job;
 whether requirements-test.txt was installed is read from `coverage`, the

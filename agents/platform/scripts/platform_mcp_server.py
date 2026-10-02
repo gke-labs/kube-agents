@@ -19,9 +19,18 @@ from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
+from cluster_agent_profile import RESERVED_PROFILES, profile_name, read_cluster_identity
+from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS
 from gke_endpoint import dns_endpoint_args
+from profile_scaffold import is_scaffolded, profiles_base
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
+# The data root the Cluster Agent profiles live under, as `<root>/profiles/<name>`.
+# Read from PLATFORM_AGENT_HOME, which the operator sets from
+# spec.harness.hermes.agentHome; not HERMES_HOME, which in a platform worker is the
+# platform profile's own home and would show a roster with no Cluster Agents in it.
+DEFAULT_AGENT_HOME = "/opt/data"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
 # synchronously — it creates the session, runs a whole Chat Agent turn (its own
@@ -377,6 +386,103 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
         return f"ERROR: Failed to describe GKE cluster.\nExit Code: {e.returncode}\nStderr: {e.stderr}"
     except Exception as e:
         return f"ERROR: An unexpected error occurred: {e}"
+
+
+# =============================================================================
+# Cluster Agent roster
+# =============================================================================
+#
+# cluster_agent_profile.py is stubbed in the shell sandbox (it needs the profiles
+# tree on the agent pod's PVC), so the agent cannot resolve a kanban assignee from
+# its terminal. This server runs in the agent pod, where the tree is.
+
+def _profiles_dir() -> Path:
+    return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
+
+
+def _is_ready(home: Path) -> bool:
+    """A profile the dispatcher can hand a card to and its worker can serve.
+
+    is_scaffolded, not is_dir: a plugin mount point can leave a directory under
+    profiles/ that Hermes never registered, and a card assigned to it never runs.
+    The scaffold artifacts too: create_profile registers the profile and stamps its
+    identity before it fetches the credential and writes USER.md, so a scaffold that
+    stopped in between is registered, and its worker blocks at preflight.
+    """
+    return is_scaffolded(home) and all((home / f).is_file() for f in SCAFFOLD_ARTIFACTS)
+
+
+def _cluster_agent_roster() -> list[dict]:
+    base = _profiles_dir()
+    if not base.is_dir():
+        return []
+    roster = []
+    for home in sorted(base.iterdir()):
+        if home.name in RESERVED_PROFILES or not _is_ready(home):
+            continue
+        entry = {"name": home.name}
+        try:
+            entry.update(read_cluster_identity(home) or {})
+        except (OSError, UnicodeDecodeError, AttributeError) as e:
+            # One unreadable config costs that profile its identity, not the whole roster.
+            # AttributeError is a config.yaml that parses to a list or a scalar.
+            log(f"Warning: could not read the cluster identity of {home.name}: {e}")
+        roster.append(entry)
+    return roster
+
+
+@mcp.tool()
+def list_cluster_profiles() -> str:
+    """
+    List every Cluster Agent profile, with the cluster each one is pinned to.
+
+    Returns JSON: a list of {name, project, cluster, location}. `name` is the
+    kanban assignee for delegating work on that cluster. A profile scaffolded
+    without its identity stamp has only `name`.
+    """
+    try:
+        return json.dumps(_cluster_agent_roster(), indent=2)
+    except Exception as e:
+        return f"ERROR: Could not read the Cluster Agent roster: {e}"
+
+
+@mcp.tool()
+def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
+    """
+    Resolve the Cluster Agent profile for one GKE cluster: the kanban assignee.
+
+    Returns JSON with 'name' and 'exists'. Assign a card to 'name' only when
+    'exists' is true; a card assigned to a profile that does not exist is never
+    dispatched and sits in 'ready' forever. 'exists' is also false when the
+    profile's scaffold never finished (no USER.md, so its worker would block at
+    preflight), and when the profile under that name is pinned to a different
+    cluster: sanitizing can map two clusters to one name, and the profile's own
+    identity is what it works on.
+
+    Args:
+        project: The GCP project the cluster is in. Required: the name is
+            derived from it, and the agent's own project is the wrong answer for
+            a cluster anywhere else in the fleet.
+        cluster: The name of the GKE cluster.
+        location: The cluster's region or zone, as GKE reports it.
+    """
+    if not (project and cluster and location):
+        return "ERROR: project, cluster and location are all required."
+    name = profile_name(project, cluster, location)
+    home = _profiles_dir() / name
+    exists = _is_ready(home)
+    if exists:
+        try:
+            identity = read_cluster_identity(home)
+        except (OSError, UnicodeDecodeError, AttributeError) as e:
+            log(f"Warning: could not read the cluster identity of {name}: {e}")
+            identity = None
+        # A profile scaffolded without its identity stamp is taken at its name.
+        # Case-insensitive, as profile_name is: GKE identifiers are lowercase, and a
+        # capitalised spelling of the same cluster is not a different cluster.
+        wanted = {"project": project, "cluster": cluster, "location": location}
+        exists = identity is None or all(identity[k].lower() == v.lower() for k, v in wanted.items())
+    return json.dumps({"name": name, "exists": exists}, indent=2)
 
 
 def _kubeconfig_slug(value: str) -> str:

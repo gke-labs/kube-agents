@@ -52,6 +52,8 @@ from kube_agents_bench.baselines import (
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
+    CaseOutOfScope,
+    StoreUnreachable,
     VersionKey,
     Versions,
     append_record,
@@ -358,11 +360,17 @@ def test_a_leftover_pre_jsonl_file_is_refused(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_the_default_bar_is_nineteen_of_twenty():
+def test_the_default_bar_is_eighteen_of_twenty():
+    """0.90 over 20: the roster page's bar (>= 90 % of graded repetitions),
+    set 2026-09-29 from the store's movement (#1493). 18/20 and 19/21 clear
+    it; 17/20 and 18/21 do not."""
     bar = AdmissionBar()
     assert (bar.rate, bar.min_runs) == (DEFAULT_ADMISSION_RATE, DEFAULT_ADMISSION_MIN_RUNS)
-    assert BaselineRecord(key=KEY, runs=20, passes=19).admits(bar) is True
-    assert BaselineRecord(key=KEY, runs=20, passes=18).admits(bar) is False
+    assert (bar.rate, bar.min_runs) == (0.90, 20)
+    assert BaselineRecord(key=KEY, runs=20, passes=18).admits(bar) is True
+    assert BaselineRecord(key=KEY, runs=20, passes=17).admits(bar) is False
+    assert BaselineRecord(key=KEY, runs=21, passes=19).admits(bar) is True
+    assert BaselineRecord(key=KEY, runs=21, passes=18).admits(bar) is False
 
 
 def test_a_lucky_single_run_does_not_admit():
@@ -805,7 +813,7 @@ def test_the_record_verdict_is_the_same_five_states_in_either_mode(tmp_path):
     write_store(tmp_path, "planted-pdb", [record(runs=20, passes=20)])
     verdict = BaselineStore.load(tmp_path).record_verdict("planted-pdb", KEY, bar=AdmissionBar())
     assert verdict.state == "would-admit" and verdict.full_window
-    assert verdict.detail == "20/20 screening runs across 1 recorded run(s) (bar 95% over 20)"
+    assert verdict.detail == "20/20 screening runs across 1 recorded run(s) (bar 90% over 20)"
 
     for mode in ("roster", "record"):
         decision = BaselineStore.load(tmp_path).admission(
@@ -828,7 +836,7 @@ def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
     assert kept.reason == (
         "admitted by BOOTSTRAP_ADMITTED (transition bridge); the record would "
         "demote it: screened at 12/20 across 1 recorded run(s), below the bar "
-        "of 95% over 20 runs"
+        "of 90% over 20 runs"
     )
 
     out = store.admission("unlisted", KEY, bar=AdmissionBar(), bootstrap=listed, mode="roster")
@@ -836,7 +844,7 @@ def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
     assert out.record == "would-admit"
     assert out.reason == (
         "the record would admit it: 20/20 screening runs across 1 recorded "
-        "run(s) (bar 95% over 20) -- EVAL_ADMISSION_MODE=roster, so "
+        "run(s) (bar 90% over 20) -- EVAL_ADMISSION_MODE=roster, so "
         "BOOTSTRAP_ADMITTED decides and does not name this case"
     )
 
@@ -851,3 +859,79 @@ def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
     )
     assert bare.reason == "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
     assert bare.record == "none"
+
+
+# --------------------------------------------------------------------------
+# a scoped read
+# --------------------------------------------------------------------------
+
+
+def test_a_scoped_load_holds_only_the_cases_it_was_given(tmp_path):
+    write_store(tmp_path, "planted-pdb", [record()])
+    write_store(tmp_path, "other-case", [record()])
+
+    store = BaselineStore.load(tmp_path, only=["planted-pdb"])
+    assert store.record_for("planted-pdb", KEY).passes == 19
+    assert store.scope == frozenset({"planted-pdb"})
+
+    # ...and an unscoped load still answers for both.
+    whole = BaselineStore.load(tmp_path)
+    assert whole.scope is None
+    assert whole.record_for("other-case", KEY).passes == 19
+
+
+def test_a_case_outside_the_scope_raises_rather_than_reading_as_unscreened(tmp_path):
+    """The failure the scope exists to make loud.
+
+    Every lookup answers "nothing here, so never screened" for a case it holds
+    no records for. That is correct for a whole-store read and a silent
+    de-admission for a scoped one. Each public entry point is checked, because
+    a guard is only worth having if it cannot be walked around.
+    """
+    write_store(tmp_path, "planted-pdb", [record()])
+    store = BaselineStore.load(tmp_path, only=["planted-pdb"])
+
+    bar = AdmissionBar()
+    for call in (
+        lambda: store.record_for("other-case", KEY),
+        lambda: store.history_for("other-case"),
+        lambda: store.evidence_for("other-case", KEY),
+        lambda: store.record_verdict("other-case", KEY, bar=bar),
+        lambda: store.admission("other-case", KEY, bar=bar),
+        lambda: store.is_admitted("other-case", KEY, bar=bar),
+    ):
+        with pytest.raises(CaseOutOfScope, match="outside this store's read scope"):
+            call()
+
+
+def test_the_scope_guard_is_not_a_corrupt_store_and_not_an_outage():
+    """``gate._load_store`` catches ValueError and StoreUnreachable and carries
+    on -- fatally for the first, degraded for the second. A caller bug is
+    neither, or it would be absorbed into a verdict instead of raising."""
+    assert not issubclass(CaseOutOfScope, (ValueError, StoreUnreachable))
+    with pytest.raises(CaseOutOfScope):
+        BaselineStore({}, scope=["planted-pdb"]).history_for("other-case")
+
+
+def test_a_scoped_store_answers_the_same_as_a_whole_one_in_scope(tmp_path):
+    """Scoping changes what is read, never what the store says about a case.
+
+    Worth pinning because a scoped read that fetched nothing would be fast and
+    green, so speed cannot tell a working one from a broken one.
+    """
+    lines = [
+        record(runs=3, passes=3, recorded_at=f"2026-08-{day:02d}T00:00:00Z")
+        for day in range(1, 8)
+    ]
+    write_store(tmp_path, "planted-pdb", lines)
+    write_store(tmp_path, "other-case", [record()])
+
+    bar = AdmissionBar()
+    scoped = BaselineStore.load(tmp_path, only=["planted-pdb"])
+    whole = BaselineStore.load(tmp_path)
+    assert scoped.evidence_for("planted-pdb", KEY) == whole.evidence_for(
+        "planted-pdb", KEY
+    )
+    assert scoped.admission("planted-pdb", KEY, bar=bar) == whole.admission(
+        "planted-pdb", KEY, bar=bar
+    )

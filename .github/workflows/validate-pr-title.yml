@@ -7,6 +7,8 @@ on:
       - edited
       - synchronize
       - reopened
+  merge_group:
+    branches: [main]
 
 permissions:
   pull-requests: read
@@ -17,6 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate PR Title
+        # A merge-queue run carries no pull request, so there is no title to
+        # read. The job still has to report success under its name there, which
+        # is why the step is skipped rather than the trigger left out.
+        if: github.event_name == 'pull_request'
         uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

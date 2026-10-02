@@ -20,7 +20,7 @@ model:
   provider: custom
   model: model-default
   default: model-default
-  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
+  base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
 # MCP Servers configuration. Read-only diagnostics surface only.
@@ -97,3 +97,10 @@ plugins:
 # to publish a Python-toolchain line that is factually wrong on this image.
 agent:
   environment_probe: false
+
+# Per-file character cap on context files (SOUL.md, AGENTS.md) in the system
+# prompt; rationale lives in agents/platform/config.yaml, which pins the same
+# value. SOUL.md here sits just under Hermes's 20,000 fallback, so without the pin
+# the next edit to it would start cutting its middle. Cluster profiles already on
+# the volume get this key from the entrypoint's back-fill in the cluster loop.
+context_file_max_chars: 100000

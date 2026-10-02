@@ -1,6 +1,6 @@
 # The fleet fixture catalog
 
-The seeded fleet is three standing GKE clusters per eval project whose defects are
+The seeded fleet is four standing GKE clusters per eval project whose defects are
 planted on purpose. `bench/tf/fleet/README.md` is the operator's document: how the stack
 applies, how it reconciles, what each defect is made of, and which background findings a
 correct audit returns alongside the planted one. This one is the case author's: how a
@@ -15,8 +15,10 @@ have no cluster slot — and it may not rename a role: `scripts/validate_bench_c
 reads both and fails when they disagree about a slug or a slot. Object names in either are
 copied from `bench/tf/fleet/`, which remains the source of truth for all of them.
 
-Everything below was checked against the live fleet in `kube-agents-evals` and
-`kube-agents-evals-2`, and where the audit and the README disagreed the audit won. Two
+The original eight roles were checked against the live fleet in `kube-agents-evals` and
+`kube-agents-evals-2`, and where the audit and the README disagreed the audit won. The
+`readiness-*` and `zonal-skew-*` roles were verified on a development project instead, and
+describe the stack as written until the pool is re-applied with them. Two
 such disagreements are recorded in place: the version pin under
 [A finding nobody declared](#a-finding-nobody-declared), and the HPA replica count in the
 role table. Each is a correction the operator document still needs; recorded here so a
@@ -26,19 +28,21 @@ case author is not misled while it waits.
 
 A case names a fixture by its role slug. Never by cluster name, never by project id.
 
-Every eval project carries its own trio, so a case that hardcodes a cluster name runs in
+Every eval project carries its own fleet, so a case that hardcodes a cluster name runs in
 one project and errors in the next, and the failure looks like a broken agent rather than
 a broken case. Worse, the names are not even fixed within a project: they are
-`${var.cluster_prefix}-a`, `-b` and `-c`, and the prefix is a variable whose default is
+`${var.cluster_prefix}-a` through `-d`, and the prefix is a variable whose default is
 `seeded`.
 
 So the addressable units are the role and the slot. `rbac-overgrant` is a role. `a` is a
 slot. `seeded-a` is a rendering of slot `a` under this project's current prefix, and it
 belongs in the harness that resolves the slot to a kubeconfig, not in a case file.
 
-The selector that reaches the trio and nothing else is `resourceLabels.environment=seeded`
-— confirmed live in both applied projects, where it returns exactly `seeded-a`, `seeded-b`
-and `seeded-c`, all zonal in `us-central1-a`. The clusters also carry
+The selector that reaches the fleet and nothing else is `resourceLabels.environment=seeded`
+— confirmed live in both applied projects, where before slot `d` existed it returned exactly
+`seeded-a`, `seeded-b` and `seeded-c`, all zonal in `us-central1-a`. `seeded-d` carries the same
+label, so on a project that has it the selector returns all four; its control plane is in the same
+zone and its nodes span a second, `var.second_zone`. The clusters also carry
 `managed-by=kube-agents-seeded-fleet`, which is what keeps the orphan sweep (it matches
 `managed-by=kube-agents-bench`) away from them.
 
@@ -54,11 +58,10 @@ been, and it breaks loudly and correctly if the prefix ever changes. What must n
 happen is a check _targeting_ a cluster by name, which is the harness's job and the thing
 `fixtures:` exists to express.
 
-Resolving a slot to a cluster is runner work and does not exist yet — `hack/ci-eval-pr.sh`
-authenticates once, to `platform-agent-host`, and every cluster-state check in the corpus
-reads that ambient context. `bench/tasks/DRAFTS.md` tracks it as activation blocker A5.
-The contract here is what a case may write, and it holds whichever way the harness
-eventually resolves it.
+Resolving a slot to a cluster is runner work: `hack/fleet-kubeconfigs.sh` discovers the leased
+project's seeded clusters by label and writes one kubeconfig per role (the label paragraph under
+"The roles" below). The contract here is what a case may write, and it holds however the
+harness resolves it.
 
 ## Which projects have a fleet
 
@@ -90,24 +93,40 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Eight fixtures: seven across the three cluster slots and one project-scoped. Every in-cluster fixture is on slot `a`, across the
-four seeded namespaces `seeded-debug`, `seeded-reliability`, `seeded-security` and
-`seeded-capacity`, plus both defect node pools. Slots `b` and `c` carry GKE-level defects
-only and no workloads at all: `b` is the held-back control plane, `c` is the configuration
-outlier. Every cluster is labelled `environment=seeded`, which is what confines the drift
-cohort to these three and keeps `platform-agent-host` and transient `eval-pr*` clusters
-from voting on the baseline.
+Seventeen fixtures: sixteen across the four cluster slots and one project-scoped. Most in-cluster
+fixtures are on slot `a`, across the six seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation` and `seeded-intent`, plus both
+defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
+configuration outlier. Slot `b` is the held-back control plane, and also carries the
+upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
+`d` is the exception to "the defect is something planted in a cluster": there, the cluster's own
+shape is the fixture.
 
-| Role                 | Slot    | Day | What is planted                                                                       |
-| -------------------- | ------- | --- | ------------------------------------------------------------------------------------- |
-| `rbac-overgrant`     | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA |
-| `no-pdb-workload`    | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB           |
-| `crashloop-workload` | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop |
-| `hpa-saturated`      | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                 |
-| `idle-nodepool`      | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                   |
-| `orphan-disks`       | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                      |
-| `version-laggard`    | b       | 0   | Control plane one minor behind the REGULAR channel default                            |
-| `drift-outlier`      | c       | 1   | Master authorized networks absent, where a and b carry an open block                  |
+Every cluster in the stack is labelled `environment=seeded`, which confines the drift cohort to
+the fleet and keeps `platform-agent-host` and transient `eval-pr*` clusters from voting on the
+baseline. **Slot `d` carries it too, and has to**: `hack/fleet-kubeconfigs.sh` discovers slots by
+filtering on that label together with `managed-by`, so a cluster without it is never listed and
+its roles are never published.
+
+| Role                           | Slot    | Day | What is planted                                                                                                                                                                              |
+| ------------------------------ | ------- | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rbac-overgrant`               | a       | 0   | `clusterrolebinding/debug-binding`, cluster-admin to the `seeded-security` default SA                                                                                                        |
+| `no-pdb-workload`              | a       | 0   | `deployment/checkout-gateway` in `seeded-reliability`, two replicas, no PDB                                                                                                                  |
+| `declared-no-pdb-workload`     | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, declared on purpose in the GitOps repository's `knowledge/`                                                        |
+| `crashloop-workload`           | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                        |
+| `hpa-saturated`                | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                        |
+| `deprecated-api-caller`        | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                |
+| `idle-nodepool`                | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                          |
+| `orphan-disks`                 | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                             |
+| `version-laggard`              | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                   |
+| `drift-outlier`                | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                      |
+| `readiness-surge-blocked`      | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                           |
+| `readiness-pinned-workload`    | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                        |
+| `readiness-drain-blocked`      | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                 |
+| `readiness-failclosed-webhook` | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                                                                                     |
+| `zonal-skew-scheduling`        | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                      |
+| `zonal-skew-volume`            | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                     |
+| `zonal-skew-capacity`          | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -128,8 +147,9 @@ neither is going to be obvious from a slug.
 
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
-`seeded-role=idle-batch` on the idle pool's taint — so two of the eight roles are called
-one thing by the catalogue and another by the Terraform that plants them. They are
+`seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
+`seeded-role=no-surge` on the no-surge pool's — so three of the sixteen roles are called one
+thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
 runner resolves to a kubeconfig. Nothing breaks, but do not read one as the other, and do
@@ -141,6 +161,79 @@ word for the same subject, but a sentence with `idle-nodepool` in it is ambiguou
 which of the two it means, so say "the `idle-nodepool` role" or "the `idle-nodepool`
 check" and never the bare slug.
 
+### Slot `b`: the drain that cannot finish
+
+Upgrading a node means draining it, and most upgrade failures are really drain failures. What
+the fleet could already show was a workload that resists eviction — `obtainability-audit`'s
+PodDisruptionBudget checks, on slot `a`. What it could not show is a drain that goes ahead and
+takes a workload down with it, and one that cannot finish at all:
+
+| Role                           | What it plants                                                                                                                                                                                                                                                               |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade recreates its only node in place rather than adding a replacement first. Not a retirement, and not always wrong — the `gke-upgrades` skill prescribes it for reservation-bound pools                                          |
+| `readiness-pinned-workload`    | A single-replica Deployment whose `nodeSelector` names that pool alone, so it is down for the whole of each in-place node recreate rather than falling back to the default pool                                                                                              |
+| `readiness-drain-blocked`      | A PodDisruptionBudget with `maxUnavailable: 0` matching that workload, so `disruptionsAllowed` is 0 permanently and no drain that touches it can finish                                                                                                                      |
+| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` whose `clientConfig` names a Service that does not exist, with `failurePolicy: Fail` and the API's maximum 30-second `timeoutSeconds`. The unresolvable backend is the defect; Fail alone is set by healthy webhooks throughout the fleet |
+
+The first three are a chain, and that is the point. The surge setting alone is a configuration the
+`gke-upgrades` skill sometimes prescribes; joining it to the single replica pinned there is a
+guaranteed outage per node recreate; adding the budget that refuses the eviction is an upgrade that
+cannot finish at all. Three tiers from three objects, and a case can ask which one the agent
+reached. Only the budget is a Blocker — reporting the surge setting as one is the mistake this
+arrangement exists to catch.
+
+The webhook's planted property is its unresolvable backend, not its failure policy. `failurePolicy:
+Fail` on its own is set by cert-manager, GKE's managed Prometheus, and this repository's own
+operator webhook, so a check that fires on the policy alone reports every healthy cluster. What
+this fixture has that those do not is a `clientConfig` naming a Service that does not exist: fail
+closed onto a backend that can never answer is what turns a drain into a deadlock.
+
+The other dimension of the real finding — a rule matching cluster-wide — is deliberately not
+planted. A fail-closed cluster-wide webhook on a standing shared cluster would reject writes for
+every scenario that touches slot `b`, so a `namespaceSelector` and an `objectSelector` confine it.
+That dimension belongs in a unit test with a recorded manifest, where nothing can be broken by
+it.
+
+A second pool rather than a setting on the default one, because the default pool's version
+pinning is what makes `version-laggard` exact, and a scenario that reds because this fixture
+disturbed that pin would point at the wrong place. Both new pool settings — `version` and
+`auto_upgrade` — follow the default pool for the same reason it carries them.
+
+### Slot `d`: the shape is the fixture
+
+Zonal skew is the one anomaly that cannot be planted as an object. A cluster whose nodes are all
+in one zone has no zonal distribution, so `a`, `b` and `c` — each single-zone — cannot carry it.
+Slot `d` is multi-zonal: a zonal control plane with one pool per zone, an `e2-small` in the first
+and an `e2-standard-2` in the second. Two nodes is the cheapest shape on which "the pods are all in
+one zone" is a true statement about a real cluster, and the second is a size up because the
+capacity fixture needs one node that is always full and one that is always roomier, which no
+placement of GKE's own pods can be trusted to produce; every shared-core E2 size reports the same
+allocatable CPU, so the step up has to be to a dedicated-core size. Still two nodes' worth of
+standing cost rather than a regional control plane's.
+
+Carrying the label makes `d` a fourth voter in the drift cohort, so the arithmetic is worked
+rather than avoided. The planted facet is `authorized-networks`, base `critical`, and the ladder
+walks one step below an agreement ratio of 0.90 and another below 0.80. At three clusters the
+ratio is 2/3 and the finding survives two steps down as `minor`; at four, with `d` carrying the
+same open block `a` and `b` carry, it is 3/4 — still two steps, still `minor`. Leaving the block
+off `d` would make it 2/4, below the baseline threshold, so there would be no finding and
+`consistency-drift-outlier` would red. Anything added to the fleet later inherits that: a new
+cluster joins the cohort, and it has to be configured so the facets the drift scenarios assert
+on keep their majority.
+
+Slot `d`'s three roles exist to separate _noticing_ skew from _explaining_ it, which is the part an
+agent gets wrong:
+
+| Role                    | Cause it plants                                                                                     | What distinguishes it                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `zonal-skew-scheduling` | A `topologySpreadConstraint` set to `ScheduleAnyway` beside a node affinity only one zone satisfies | The constraint reads as protection and is a preference; the fix is a manifest edit                   |
+| `zonal-skew-volume`     | A StatefulSet whose zonal PersistentVolumeClaim binds it to one zone                                | The pod cannot move without its data; the fix is a migration, not an edit                            |
+| `zonal-skew-capacity`   | More replicas than the two nodes have CPU for, leaving Pending pods                                 | Distribution looks identical to the scheduling case, and only the Pending pods' events say otherwise |
+
+The last two rows are why there are three fixtures rather than one. A check that reports "skew"
+on all three has done the easy half; a check that calls the capacity case a misconfiguration
+sends someone to edit a manifest that is correct.
+
 ## Day 0, 1, 7, 30
 
 The fleet is not fully assertable on the day it is applied, and the delay is not
@@ -148,24 +241,32 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Five of the eight are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`crashloop-workload`, `hpa-saturated` and `version-laggard`, covering security, reliability,
-cluster debugging, remediation, capacity and upgrades between them. A corpus that leans on
-these can go green the day the fleet applies.
+Thirteen of the sixteen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
+`readiness-*` roles on slot `b` and the three `zonal-skew-*` roles on slot `d`, covering
+security, reliability, cluster debugging, remediation, capacity, upgrades, upgrade readiness,
+API deprecation and zonal skew between them. A corpus that leans on these can go green the day the fleet
+applies; the caller's first run is a Job the apply itself waits on, so its audit trail
+exists before the apply returns.
 
 `drift-outlier` waits a day. The drift SOP excludes a cluster whose `createTime` is under
 24 hours old from every cohort, so on apply day the `(standard, seeded)` cohort has zero
 members — and §2.4's floor, a cohort of fewer than three clusters produces no findings
-ever, would floor it out even if only one cluster were new.
+ever, would floor it out with any two of the four still new. Adding slot `d` to a project whose
+other three clusters are already a day old costs nothing: `d` sits out its first day and the
+other three vote as before.
 
-`idle-nodepool` waits seven, and no agent can satisfy that gate reliably, because the GKE
-node pool has no creation timestamp to read. The cost SOP's idle-nodepool check refuses
-pools created less than seven days ago, but `gcloud container node-pools describe` returns
-no `createTime` and neither does the REST resource; the only age signal is the boot-disk
-creation time of the pool's current nodes, which a rolling recreation resets while the
-pool object is untouched. So the gate is a judgement the agent makes from a proxy, and a
-node upgrade can silently close it. Treat `idle-nodepool` as the least dependable fixture in
-the catalog, and do not build a blocking objective on the age gate itself.
+`idle-nodepool` waits seven, and the GKE node pool has no creation timestamp to read:
+`gcloud container node-pools describe` returns no `createTime` and neither does the REST
+resource. The cost collector dates a pool from its `CREATE_NODE_POOL` operation in
+`gcloud container operations list`. A pool with no such operation arrived with the cluster
+in `CREATE_CLUSTER`, or before the operations the API still keeps, so it is dated from the
+cluster's `createTime` in `clusters list`. Only when the operations read fails does the
+oldest node's age stand in, and the collector then names each pool that stand-in exempted
+in the cluster's `limitations`, because a rolling node recreation resets node age while the
+pool object is untouched. On apply day the seeded pools are days old by either clock, so
+the gate holds; do not build a blocking objective on the age gate itself, since the
+operations the API keeps are finite and an old fixture pool falls back to its cluster's age.
 
 `orphan-disks` waits thirty, and that one is real: the unattached-disk collector filters
 server-side on the immutable `creationTimestamp<-P30D`. It is the longest gate in the
@@ -191,22 +292,23 @@ worth changing.
 
 The fleet's premise is that a correct audit returns the planted findings and the
 documented background ones, and nothing else — that is what lets a case assert an exact
-finding set rather than a substring. One fixture currently breaks it.
+finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
+rule now keeps it intact.
 
-A comment in `bench/tf/fleet/main.tf` argues that branch (a) of upgrade SOP check 3.1,
-"the control plane runs a version the channel does not offer", is "false by construction
-here because the pin is drawn from that very list". It is drawn from the location-wide
-`valid_master_versions` instead, so `seeded-b` sits on `1.34.10-gke.1106000`, a RAPID
-version absent from REGULAR's `validVersions`, and branch (a) fires at critical alongside
-the intended branch (b). An audit that reports it is right; a case that asserts the
-documented finding set is wrong. The fleet README's background-findings table, which
-promises the planted finding "plus the rows below — nothing else", does not list it
-either.
+The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
+rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
+`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
+(a) now fires only when a version is offered by no route at the location: not by the
+cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
+offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
+pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
+correctly.
 
-Until `main.tf` derives the pin from the REGULAR channel's `validVersions` rather than the
-location-wide list, treat the branch (a) critical on slot `b` as expected output. A case
-touching `version-laggard` asserts branch (b) specifically and must not assert that the
-critical count is one, or that branch (a) is absent.
+A case touching `version-laggard` may assert that branch (a) is absent, and
+`upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it
+catches.
 
 ## When a fixture goes away
 
@@ -220,11 +322,14 @@ hand is a disk deleted by hand.
 
 A cluster is replaced. That is the documented recovery for `version-laggard` when the
 maintenance exclusion lapses or the held minor reaches EOL, and it makes the replaced
-cluster new for 24 hours — which takes the drift cohort from three clusters to two and
-drops it under the floor. The drift audit then emits nothing for the whole fleet, so
-`consistency-drift-outlier` goes red on every open pull request for a day. It is a clean,
-self-clearing outage rather than a wrong answer, but it is a day of red: schedule a
-replacement when the drift case can be quiet, or announce the gap.
+cluster new for 24 hours, so it sits out the drift cohort for a day. Four clusters leave three,
+which is still at the floor: replacing `a`, `b` or `d` leaves `c` outvoted 2/3 and the finding
+stands. Replacing `c` removes the outlier itself — the other three agree, the drift audit finds
+nothing, and `consistency-drift-outlier` goes red on every open pull request for a day. On a
+project whose fleet predates slot `d`, replacing any cluster does the same, because three
+clusters leave two, under the floor. It is a clean, self-clearing outage rather than a wrong
+answer, but it is a day of red: schedule such a replacement when the drift case can be quiet,
+or announce the gap.
 
 Neither of these is a reason for a case to hedge. A case that tolerates its fixture being
 absent cannot tell "the agent missed it" from "it was not there", which is the same defect
@@ -245,17 +350,16 @@ nightly's, and to the CI health bot, so an apply lets `hack/fleet-kubeconfigs.sh
 impersonate the reader. A
 check on such a project cannot write what it grades.
 
-No pool project is in that state yet. Every one had its fleet applied before that
-default landed, so the impersonation fails, `hack/fleet-kubeconfigs.sh` warns per
-cluster, and the safeguards read under the runner's own credential like everything else.
-gke-labs/kube-agents#903 tracks the per-project re-apply that closes it.
+A project without it does not read the fleet at all: `hack/fleet-kubeconfigs.sh` writes nothing, exits 3, and
+`hack/ci-eval-pr.sh` stops the run at its fleet step rather than grading under the
+runner's own credential.
 
 What is not narrowed is the harness. `hack/ci-eval-pr.sh` runs as
 `prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and eleven other
 project roles in every pool project (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it inside the clusters. That
-is the credential the reader replaces, and until the re-apply it is the one every fleet
-check reads under.
+is the credential the reader replaces; the runner refuses to write a role kubeconfig that
+would carry it.
 
 The agent under test is a different identity, and it is already narrow.
 `kubeagents-platform-gsa@<project>` holds the eight read-only roles in
@@ -269,8 +373,8 @@ also need a GitOps-repo write path — the six audit scenarios and both remediat
 contained by pinning it to a throwaway repository per eval project.
 
 Asserting read-only from inside a case is a state check against the fixture — "the
-planted defect survived the run" — and not `tool_called`, which sees only the delegating
-turn's calls and would be blind to a worker's mutation. On the standing fleet that check
+planted defect survived the run" — and not `tool_called`, which even under `scope: workers`
+sees the call a worker made and not what it changed. On the standing fleet that check
 is `fleet_resource_property`, which resolves the cluster from the fixture role; plain
 `resource_property` reads the ambient kubeconfig and suits only a case whose deployer
 built its own cluster, as `gpu-stress-test-diagnosis` does.

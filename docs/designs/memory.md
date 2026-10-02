@@ -386,7 +386,7 @@ point the agent at a Hindsight service the install never deployed. Taking a
 default has to mean "keep what you have". An enterprise fleet that wants ranked
 recall is in a position to say so, and `--memory=hindsight` is how. Consequently
 `multiuser_memory` is the provider named wherever there is no install to ask — the
-CRD default, `common.sh`, and the Chat Agent's `config.yaml`. The specialist
+CRD default, `install.defaults.env`, and the Chat Agent's `config.yaml`. The specialist
 profile names no provider at all, because a file store has no gateway identity for
 a specialist to key on; see the overlay rule below.
 
@@ -468,8 +468,8 @@ It adds exactly two workloads to `kubeagents-system`.
   models are baked into the image, so the pod needs **no Hugging Face egress** —
   and both flags must stay set, or the libraries reach out on every cold start and
   hang where there is no route out of the cluster.
-- Extraction and consolidation call an LLM. That goes through the **same LiteLLM
-  gateway the agents use** (`HINDSIGHT_API_LLM_BASE_URL=http://litellm/v1`,
+- Extraction and consolidation call an LLM. That goes through the **same inference
+  gateway the agents use** (`HINDSIGHT_API_LLM_BASE_URL=http://inference-gateway/v1`,
   model `model-default`), so routing and cost attribution stay in one place. The
   API key is the literal string `none`, matching how the agents authenticate;
   it is a placeholder the client library insists on, not a credential.
@@ -493,12 +493,17 @@ It adds exactly two workloads to `kubeagents-system`.
   because LiteLLM honours it in a model entry's `litellm_params` rather than
   globally. Per-model it would work, at the price of editing a config every
   agent request passes through in order to accommodate one caller.
-- Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root under a `RuntimeDefault` seccomp
-  profile, no privilege escalation, all capabilities dropped; its root filesystem stays
-  writable, and what the API writes under `/` has not been enumerated. The CPU numbers
-  are sized for model inference rather than for
-  serving HTTP, though measurement says the headroom goes unused —
-  see [What a recall costs](#what-a-recall-costs).
+- Requests 250m CPU/1Gi, limits 4 CPU/4Gi. The request covers steady state, reported at
+  about 9m on a live install when the request came down from 2 CPU; the install and the
+  sampling window were not recorded, so read it as an order of magnitude. The limit is
+  the ceiling the reranker may burst to during recall, and raising it buys nothing — see
+  [What a recall costs](#what-a-recall-costs). CPU above the request is best-effort, so
+  on a node shared with other CPU-heavy tenants the request is the number to raise. An
+  Autopilot cluster without Pod bursting sets the limit equal to the request, which caps
+  recall at 250m until the request is raised.
+  Runs non-root under a `RuntimeDefault` seccomp profile, no privilege escalation, all
+  capabilities dropped; its root filesystem stays writable, and what the API writes
+  under `/` has not been enumerated.
 
 **2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
 
@@ -731,9 +736,14 @@ and startup migrations take a `pg_advisory_lock`, so replicas neither double-run
 consolidation nor race Alembic.
 
 [`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) still ships
-`replicas: 1`, and `kage-management` runs two by hand. Two replicas double an
-install's baseline CPU request to four cores and need two schedulable nodes, which a
-small cluster will not have. Read the 82% as the size of the effect rather than as a
+`replicas: 1`, and `kage-management` runs two by hand. Two replicas add a second
+250m request, which fits almost anywhere, but the gain above came from the pods
+sitting on different nodes: two replicas sharing one `e2-standard-4` share the two
+physical cores the single-pod result already saturates, and a small cluster has no
+second node to offer. Nothing in either manifest keeps the pair apart — neither carries
+pod anti-affinity or a topology spread constraint — so on a cluster that does have a
+second node the two replicas rely on the scheduler's default spreading, where a 2-CPU
+request used to force the split. Read the 82% as the size of the effect rather than as a
 figure to three digits: it is one run per configuration, and only the concurrency-4
 row is outside the noise the random load-balancing introduces.
 

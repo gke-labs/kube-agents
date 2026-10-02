@@ -1,0 +1,60 @@
+{{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentPodMonitoring" .) }}
+{{- /*
+Scraped by GKE Managed Prometheus, the same way the LiteLLM gateway and the
+Hindsight API are. Rendered where the cluster serves the PodMonitoring API
+unless platformAgent.podMonitoring says otherwise; the helper
+kube-agents.platformAgentPodMonitoring in _helpers.tpl is the rule. The
+operator renders the gateway pod, so the selector is the label it puts on
+that pod, and the endpoint is the port it declares on the agent-api-auth
+sidecar, where the k8s-event-watcher serves its k8s_event_watcher_* series
+(Concepts → Observability on the docs site). The port is given by number
+rather than by its name, event-metrics: that sidecar is a native sidecar, an
+init container with restartPolicy Always, and a numeric port scrapes the pod
+address whether or not the collector's discovery lists init-container ports.
+tests/test_chart_platform_agent_monitoring.py holds the number to the
+operator's declaration. The operator's gateway NetworkPolicy admits the
+collector on that port; nothing here has to. A template comment rather than
+YAML comments so none of this ships in the rendered manifest.
+*/ -}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-gateway-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-gateway
+  endpoints:
+    - port: 9095
+      path: /metrics
+      interval: 30s
+---
+{{- /*
+The credential broker's metrics-only listener (credentialProxyMetricsPort in the
+operator): brokered tool invocations by tool, subcommand and outcome, their
+latency, and the credentialed listener's request counts. Its own PodMonitoring
+because the broker is its own pod with its own labels; the same switch, because
+an install scrapes the agent's pods or none of them. The selector is the
+operator's broker selector and the port is the metrics-only one, never 8765:
+the credentialed listener admits no collector.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  endpoints:
+    - port: 8766
+      path: /metrics
+      interval: 30s
+{{- end }}

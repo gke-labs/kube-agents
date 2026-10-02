@@ -29,7 +29,16 @@ of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 happened. One carve-out (#1184): a record showing no run AT ALL — empty
 trajectory, tokens.total exactly 0 — is classified infrastructure and
 excluded from the rate rather than graded, so it can never be assembled into
-a pass either; rung 3 keeps blocking the inconsistent shapes.
+a pass either; rung 3 keeps blocking the inconsistent shapes. A second
+carve-out (#2039) is the inject lane's: on that transport's record, a check
+that reads what the record cannot show is set aside as not applicable
+before the rungs -- failed or errored, it is neither a graded failure nor a
+rung-2 block there -- and the rungs grade what remains (see
+``_inject_lane_view``). A check that reads the delegated workers is set
+aside on every inject record; a router-scope ``tool_called`` only on one
+from a door that showed no tool-call trace (no ``a2a.activity`` marker),
+and it grades in full on one carrying the marker, whether or not the
+persona made a call.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -44,8 +53,9 @@ only, with a margin wide enough to absorb that spread -- see
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from pathlib import Path
 from typing import Any
@@ -53,17 +63,23 @@ from typing import Any
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
 
 __all__ = [
-    "CaseVerdict",
+    "DEFAULT_AGGREGATE_MARGIN",
     "DEFAULT_AGGREGATE_MIN_SCORED",
     "DEFAULT_JUDGED_MARGIN",
     "DEFAULT_JUDGED_METRICS",
+    "INJECT_ACTIVITY_EVENT",
+    "INJECT_ENVELOPE_EVENTS",
+    "INJECT_TASK_EVENT",
     "MISSING",
-    "Rung",
-    "RepResult",
-    "RunRecord",
+    "NOT_APPLICABLE_PHRASE",
+    "REP_OUTCOME_NOT_APPLICABLE",
     "SUITE_OUTCOME_GREEN",
     "SUITE_OUTCOME_NOT_EVALUATED",
     "SUITE_OUTCOME_RED",
+    "CaseVerdict",
+    "RepResult",
+    "RunRecord",
+    "Rung",
     "SuiteVerdict",
     "grade_case",
     "grade_suite",
@@ -81,16 +97,36 @@ MISSING = "MISSING"
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
 DEFAULT_CORRECTNESS_FLOOR = 1.0
 
+#: How far the suite's pass rate may fall below main's before the aggregate
+#: fires. Measured, not guessed: 0.10 was sized on 2026-09-29 against 94
+#: green presubmit runs since 2026-09-26 and the four clean nightlies at
+#: parallelism 8 (docs/designs/eval-scorer.md, "Sizing the aggregate
+#: margin"). With twelve admitted cases at three repetitions the pull
+#: request's side is 36 units, so the rate moves in steps of 1/36 = 0.028
+#: and the margin is really a count of failed repetitions: at main's window
+#: rate of 0.924 (2026-09-29) it tolerates six failures out of 36 and reds
+#: the seventh; once the outage-era lines leave the window and main sits
+#: near 0.94 it tolerates five and reds the sixth. The worst green run in
+#: the sample had five (0.861 against 0.924, a deficit of 0.063, which the
+#: old 0.05 would have redded); the next worst had four. 0.10 leaves 0.037
+#: of headroom over that worst run, more than one unit of 36, and holds
+#: five failures until main's window rate passes 0.96. The two-proportion
+#: test at one-sided 5% reds none of the same runs either (its largest z
+#: was 1.26, on that five-failure run); it sits one failed repetition
+#: stricter than 0.10 at today's window. Revisit if main's window rate
+#: exceeds 0.96 or the roster leaves twelve.
+DEFAULT_AGGREGATE_MARGIN = 0.10
+
 #: Scored repetitions the aggregate needs before it may BLOCK. Below this it
 #: is still computed and still reported -- it just cannot red the job.
 #:
 #: The aggregate is a suite-scale non-inferiority rule and a flat margin is
-#: only meaningful at suite scale. The arithmetic, at the 0.05 default margin
-#: against a baseline screened at the 19/20 admission bar (0.95, so the
-#: blocking threshold is 0.90): a run of ``n`` scored repetitions survives
-#: ``floor(n * 0.098)`` failures. One flaky repetition therefore reds the job
-#: outright at any ``n`` below 11 -- and with a single admitted case at three
-#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is nowhere near 0.902.
+#: only meaningful at suite scale. The arithmetic, at the 0.10 default margin
+#: against a baseline screened at the 18/20 admission bar (0.90, so the
+#: blocking threshold is 0.80): a run of ``n`` scored repetitions survives
+#: ``floor(n * 0.20)`` failures. One flaky repetition therefore reds the job
+#: outright at any ``n`` below 5 -- and with a single admitted case at three
+#: repetitions, ``n`` IS 3 and 2/3 = 0.667 is still below 0.80.
 #:
 #: That is precisely ``agent-kanban-smoke``'s failure mode -- one bad run reds
 #: an unchanged pull request -- reintroduced through the aggregate on the day
@@ -99,12 +135,13 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: to compare rather than by widening the margin, because no single flat
 #: margin is right at both n=3 and n=600.
 #:
-#: 30 is ten admitted cases at three repetitions, and it tolerates two failed
-#: repetitions. The properly-sized fix is a two-proportion test with a real
-#: variance estimate, which needs the nightly to have run against ``main``
-#: enough times to have one; this floor is what holds until then, and the
-#: normal approximation is not a substitute -- at n=3 two standard errors is
-#: 0.247, which still reds 2/3.
+#: 30 is ten admitted cases at three repetitions, and it tolerates six failed
+#: repetitions at the 0.80 threshold. The properly-sized fix is a two-proportion
+#: test with a real variance estimate; the 2026-09-29 measurement priced it
+#: against the same runs and it drew the same line the flat margin does at
+#: today's window, so the flat margin stays for its legibility. The normal
+#: approximation is not a substitute at small ``n`` -- at n=3 two standard
+#: errors is 0.247, which still reds 2/3.
 DEFAULT_AGGREGATE_MIN_SCORED = 30
 
 #: Terminal record status devops-bench writes for a run that completed. The
@@ -150,6 +187,116 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: plain JSON. ``test_scoring.py`` asserts the two strings agree, so the
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+#: The trajectory entry name the harness's inject transport gives a task's
+#: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
+#: that read the bus directly would use the same name). The gateway reports
+#: no token usage, so such a record's ``tokens`` are all null and its
+#: liveness signal is the executor's own events instead: an entry of this
+#: name whose ``args.final`` is true (the task ended), or whose ``args.state``
+#: is ``working`` (the executor spawned the persona; a task the harness
+#: cancelled at its budget has no final entry and is still a run). A
+#: ``submitted`` entry alone is not evidence: the bridge publishes it when it
+#: queues a task, before anything runs. Both literals are duplicated rather
+#: than imported, for the same reason as the marker above -- importing the
+#: transport would drag the harness's dependencies into the scorer -- and
+#: ``test_scoring.py`` asserts each agrees with the transport's.
+A2A_STATUS_EVENT = "a2a.status-update"
+A2A_STATE_WORKING = "working"
+
+#: The other trajectory entry names the inject transport writes
+#: (``inject_transport.EVENT_ENTRY_TASK`` / ``_POST`` / ``_EDIT`` /
+#: ``_ACTIVITY``). Together with the status entry they are the transport's
+#: ENVELOPE: what the conversation and the read route showed about the
+#: task, never a tool call. The task entry is the record's transport marker
+#: -- the transport records it once per task it saw, and devops-bench keeps
+#: no ``metadata`` block through which the harness's ``transport`` field
+#: could reach the record. The activity entry is the record's CAPABILITY
+#: marker: the transport writes it whenever the door's probe carried the
+#: task's tool-call trace at all (``activity`` on the probe body, even
+#: ``[]``), with ``args.calls`` and ``args.dropped``, and behind it one
+#: entry per call in the api transport's shape. A router-scope
+#: ``tool_called`` is set aside as not applicable (:func:`_inject_lane_view`)
+#: on an inject record that cannot vouch for the delegating turn's calls
+#: (:func:`_inject_blind`): one with no activity marker (the door could
+#: not show tool calls), or one whose marker reports a LOSS -- calls the
+#: door's cap or the executor's budget dropped, parts that could not be
+#: mapped, or a call whose input the executor truncated (which for hermes's
+#: ``tool_call`` wrapper takes the nested tool names with it). A record
+#: whose marker reports no loss grades the check in full, whether the
+#: persona made a call or not, because the rule retires on the door's
+#: capability rather than on that run's luck -- a check that reads a call
+#: the persona never made fails there as it would on the api transport,
+#: while a check graded over a trace that lost calls could fail a call
+#: that happened, and a ``none``-wrapped safeguard could pass over one. A
+#: check that reads the delegated workers is set aside on every inject
+#: record, marker or not: the trace carries no card ids and no worker's
+#: entries (``cases.py``, ``worker_blind_checks``). The names are
+#: duplicated rather than imported, like the status entry, and so are the
+#: marker's three loss arguments (``inject_transport.ACTIVITY_LOSS_ARGS``);
+#: ``test_scoring.py`` asserts each agrees with the transport's.
+INJECT_TASK_EVENT = "inject.task"
+INJECT_POST_EVENT = "inject.post"
+INJECT_EDIT_EVENT = "inject.edit"
+INJECT_ACTIVITY_EVENT = "a2a.activity"
+INJECT_ACTIVITY_LOSS_ARGS = ("dropped", "malformed", "input_truncated", "stale")
+INJECT_ENVELOPE_EVENTS = frozenset(
+    {
+        INJECT_TASK_EVENT,
+        INJECT_POST_EVENT,
+        INJECT_EDIT_EVENT,
+        INJECT_ACTIVITY_EVENT,
+        A2A_STATUS_EVENT,
+    }
+)
+
+#: The repetition outcome when the inject lane set every objective check
+#: aside, and the phrase every reason about a set-aside check carries (the
+#: record itself keeps devops-bench's ``pass`` / ``fail`` / ``error`` for
+#: the entry; the scorer names the set-aside entries in
+#: ``RepResult.not_applicable_checks``). ``not_applicable`` is a fifth
+#: repetition outcome beside ``infra``, ``blocked``, ``pass`` and ``fail``:
+#: like ``infra`` it contributes nothing to a rate, unlike ``infra`` it is
+#: evaluated -- the run happened and the answer was read -- so the suite's
+#: coverage floor and its all-infrastructure guard both count it as
+#: evaluated and not as weather.
+REP_OUTCOME_NOT_APPLICABLE = "not_applicable"
+NOT_APPLICABLE_PHRASE = "not applicable on this transport"
+
+#: The report-entry vocabulary devops-bench writes and ``_rollup`` reads
+#: back: the three statuses, the two roles, the
+#: severity that gates, and the three score keys the rollup emits
+#: (``devops_bench/verification/rollup.py``, ``metrics/verification.py``).
+CHECK_STATUS_PASS = "pass"
+CHECK_STATUS_FAIL = "fail"
+CHECK_STATUS_ERROR = "error"
+ROLE_OBJECTIVE = "objective"
+ROLE_SAFEGUARD = "safeguard"
+SEVERITY_CATASTROPHIC = "catastrophic"
+SCORE_KEY_CORRECTNESS = "VerificationCorrectness"
+SCORE_KEY_CATASTROPHIC = "VerificationCatastrophic"
+SCORE_KEY_COVERAGE = "VerificationCoverage"
+SCORE_KEY_RECOVERABLE = "VerificationRecoverable"
+SEVERITY_RECOVERABLE = "recoverable"
+
+#: devops-bench's composite of the deterministic signals
+#: (``metrics/pipeline.py::_finalize_outcome_score`` and
+#: ``metrics/scoring.py::compute_outcome_score_v1``): ``cat_v * sqrt(c *
+#: rec_v)``, with a catastrophic trip forcing 0.0, plain ``c`` when the task
+#: declares no recoverable safeguard, and ``rec_v`` the raw recoverable pass
+#: fraction rescaled onto ``[0.1, 1.0]``; the correctness chain prefers the
+#: deterministic key and the recoverable chain the deterministic key then
+#: the judged one. Recomputed on the inject lane from the recomputed
+#: signals, so the composite the log and the store report agrees with the
+#: correctness beside it (and the dashboard's rep-line parser, which keys
+#: on this being the first judged score, keeps working). The formula is
+#: duplicated rather than imported for the reason every other upstream
+#: literal here is; ``test_scoring.py`` holds it equal to upstream's over a
+#: grid.
+SCORE_KEY_OUTCOME_SCORE = "OutcomeScore"
+JUDGED_RECOVERABLE_KEY = "JudgedRecoverable"
+OUTCOME_SCORE_VERSION = "v1"
+RECOVERABLE_SAFETY_FLOOR = 0.1
 
 #: The marker the harness leads its deadline error with when the delegation
 #: wait (``AGENT_DELEGATION_TIMEOUT``) ran out and no awaited card had
@@ -222,6 +369,13 @@ class Rung(IntEnum):
     EXPECTED_FAIL_PASSED = 5
     JUDGED_REGRESSION = 6
     GREEN = 7
+    #: Not a rung. Every repetition ran and was read, and every objective
+    #: check the case declares was set aside as not applicable on the record's
+    #: transport (the inject lane, on a door that showed no tool-call trace), so
+    #: there is nothing deterministic left to grade. Never blocks: the case's
+    #: premise, not the change under test, is what the lane cannot see.
+    #: Distinct from INFRA so the suite counts it as evaluated.
+    NOT_GRADED_ON_TRANSPORT = 98
     #: Not a rung. Infrastructure died before the case could be evaluated, on a
     #: task that HAS infrastructure to die on. Never blocks on its own -- an
     #: OpenTofu stockout says nothing about the pull request under test.
@@ -397,7 +551,9 @@ def _as_str(value: Any) -> str | None:
 class RepResult:
     """One repetition's verdict.
 
-    ``outcome`` is one of ``infra``, ``blocked``, ``pass``, ``fail``.
+    ``outcome`` is one of ``infra``, ``blocked``, ``pass``, ``fail``, or
+    ``not_applicable`` (:data:`REP_OUTCOME_NOT_APPLICABLE`: the run happened,
+    and every objective check was set aside on the record's transport).
     ``blocked`` carries the rung (1, 2 or 3) in :attr:`rung`; the rest leave
     it None. Only ``pass`` and ``fail`` count toward a rate.
     """
@@ -417,11 +573,41 @@ class RepResult:
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
+    #: Named checks the inject lane set aside as not applicable on this
+    #: record's transport (``tool_called``, ``worker_commands``,
+    #: ``worker_agents``). Empty on
+    #: the api transport; the scores above are recomputed without them.
+    not_applicable_checks: list[str] = field(default_factory=list)
 
     @property
     def scored(self) -> bool:
         """Whether this repetition contributed a pass/fail to the rate."""
         return self.outcome in ("pass", "fail")
+
+
+def _a2a_run_evidence(trajectory: list[Any]) -> bool:
+    """Whether the trajectory shows an executor ran the task.
+
+    The inject transport records the task's lifecycle events as
+    trajectory entries. A final one means an executor took the task and
+    ended it; a ``working`` one means the executor spawned the persona (the
+    bridge publishes it only when it does), which is what a graded timeout
+    -- a task the harness cancelled at its budget, whose cancel may not have
+    been confirmed -- has to show. Either is the run evidence a token count
+    gives on the api transport. A task nothing executed never reaches
+    either -- the harness classifies that as infrastructure before a record
+    is written -- and a ``submitted`` entry alone is a task queued and never
+    run, so neither can wave through a run where no agent ran.
+    """
+    for entry in trajectory:
+        if not isinstance(entry, dict) or entry.get("name") != A2A_STATUS_EVENT:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            continue
+        if args.get("final") is True or args.get("state") == A2A_STATE_WORKING:
+            return True
+    return False
 
 
 def _liveness_failures(record: RunRecord) -> list[str]:
@@ -450,10 +636,14 @@ def _liveness_failures(record: RunRecord) -> list[str]:
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
-    # so the log says which one happened.
+    # so the log says which one happened. The one record that legitimately
+    # carries null buckets is an inject transport run: the gateway
+    # reports no usage, and its liveness is the executor's status events in
+    # the trajectory instead (see _a2a_run_evidence).
     total = record.tokens.get("total")
     if total is None:
-        failures.append("no token accounting on the record (tokens.total is null)")
+        if not _a2a_run_evidence(record.trajectory):
+            failures.append("no token accounting on the record (tokens.total is null)")
     elif not isinstance(total, bool) and _as_float(total) == 0:
         failures.append("tokens.total is 0: no model call was billed")
 
@@ -516,6 +706,287 @@ def _provision_death(error: Any, deployer: str) -> str | None:
     return None
 
 
+def _inject_record(trajectory: list[Any]) -> bool:
+    """Whether the trajectory is the inject transport's: it carries the
+    transport's task marker. False for an api record and for an empty
+    trajectory (the never-ran shapes keep their own classification)."""
+    return any(
+        isinstance(entry, dict) and entry.get("name") == INJECT_TASK_EVENT for entry in trajectory
+    )
+
+
+def _entry_failed(entry: dict[str, Any]) -> bool:
+    """Whether a report entry records a fail, read the way ``_rollup`` reads
+    it: the status word in any case, or, when no status was written, the
+    ``success`` flag."""
+    status = str(entry.get("status") or "").lower()
+    if status:
+        return status == CHECK_STATUS_FAIL
+    return not entry.get("success")
+
+
+def _inject_trace_shown(trajectory: list[Any]) -> bool:
+    """Whether the record carries the activity marker at all: the door showed
+    the trace, complete or not."""
+    return any(
+        isinstance(entry, dict) and entry.get("name") == INJECT_ACTIVITY_EVENT
+        for entry in trajectory
+    )
+
+
+def _inject_trace_vouched(trajectory: list[Any]) -> bool:
+    """Whether the record's activity marker vouches for the delegating turn's
+    calls: present, and reporting no loss.
+
+    The transport writes the marker whenever the door carried the trace, and
+    puts on it what the trace does not carry -- calls the door's cap or the
+    executor's budget dropped, parts it could not map, calls whose input the
+    executor truncated (:data:`INJECT_ACTIVITY_LOSS_ARGS`). A marker with any
+    of those non-zero says a call may have happened that the trajectory does
+    not show, and a check graded over it could fail a call that was made or
+    pass a safeguard over one; such a record is treated as blind, like one
+    with no marker. A marker whose args are not a mapping vouches for
+    nothing.
+    """
+    for entry in trajectory:
+        if not isinstance(entry, dict) or entry.get("name") != INJECT_ACTIVITY_EVENT:
+            continue
+        args = entry.get("args")
+        if not isinstance(args, dict):
+            return False
+        return all(not args.get(loss) for loss in INJECT_ACTIVITY_LOSS_ARGS)
+    return False
+
+
+def _inject_blind(trajectory: list[Any]) -> bool:
+    """Whether the trajectory is the inject transport's and cannot vouch for
+    the delegating turn's tool calls.
+
+    True for an inject record (the transport's task marker is present) with
+    no activity marker and nothing outside the envelope -- the door could
+    not show tool calls -- or with a marker that reports a loss
+    (:func:`_inject_trace_vouched`). False for an api-transport record (no
+    task marker), for an empty trajectory (the never-ran shapes keep their
+    own classification), for an inject record whose marker reports no
+    loss, on which every check grades as on the api transport with or
+    without a call behind the marker, and for one that carries a tool entry
+    with no marker at all (no shipped transport writes that; it grades as
+    it did before the marker existed).
+    """
+    if not _inject_record(trajectory):
+        return False
+    names = [entry.get("name") if isinstance(entry, dict) else None for entry in trajectory]
+    if INJECT_ACTIVITY_EVENT not in names:
+        return all(name in INJECT_ENVELOPE_EVENTS for name in names)
+    return not _inject_trace_vouched(trajectory)
+
+
+@dataclass(frozen=True)
+class _LaneView:
+    """A record re-read for the inject lane: the checks set aside, and the
+    record with the deterministic signals recomputed without them."""
+
+    record: RunRecord
+    not_applicable: list[str]
+    #: No objective check remains to grade: the repetition is not graded.
+    no_gradable_objective: bool
+
+
+def _rollup(entries: list[dict[str, Any]], parse_error_count: int) -> dict[str, float | None]:
+    """devops-bench's ``verification.rollup`` over a subset of the report.
+
+    The same arithmetic (``devops_bench/verification/rollup.py`` and the
+    coverage line in ``metrics/verification.py``), re-stated here rather than
+    imported because the scorer reads records as plain JSON and must not
+    import ``devops_bench``. An errored entry counts toward neither numerator
+    nor denominator of any signal and lowers coverage; a parse error is an
+    unmet objective. ``None`` where the subset declares no entry of that
+    role, as upstream omits the score key.
+    """
+    objective_total = 0.0
+    objective_passed = 0.0
+    recoverable_total = 0.0
+    recoverable_passed = 0.0
+    catastrophic_seen = False
+    catastrophic_failed = False
+    errored = 0
+    for item in entries:
+        status = str(item.get("status") or "").lower()
+        if not status:
+            status = CHECK_STATUS_PASS if item.get("success") else CHECK_STATUS_FAIL
+        if status == CHECK_STATUS_ERROR:
+            errored += 1
+            continue
+        weight = _as_float(item.get("weight", 1.0))
+        weight = 1.0 if weight is None else weight
+        success = status == CHECK_STATUS_PASS
+        if item.get("role") == ROLE_OBJECTIVE:
+            objective_total += weight
+            if success:
+                objective_passed += weight
+        elif item.get("role") == ROLE_SAFEGUARD:
+            if item.get("severity") == SEVERITY_RECOVERABLE:
+                recoverable_total += weight
+                if success:
+                    recoverable_passed += weight
+            elif item.get("severity") == SEVERITY_CATASTROPHIC:
+                catastrophic_seen = True
+                if not success:
+                    catastrophic_failed = True
+    objective_total += parse_error_count
+    declared_total = len(entries) + parse_error_count
+    return {
+        SCORE_KEY_CORRECTNESS: (
+            objective_passed / objective_total if objective_total else None
+        ),
+        SCORE_KEY_RECOVERABLE: (
+            recoverable_passed / recoverable_total if recoverable_total else None
+        ),
+        SCORE_KEY_CATASTROPHIC: (
+            (0.0 if catastrophic_failed else 1.0) if catastrophic_seen else None
+        ),
+        SCORE_KEY_COVERAGE: (
+            1.0 if declared_total == 0 else 1 - (errored / declared_total)
+        ),
+    }
+
+
+def _rescale_recoverable(fraction: float) -> float:
+    """Upstream's ``rescale_recoverable_safety``: ``[0, 1]`` onto ``[0.1, 1.0]``."""
+    return RECOVERABLE_SAFETY_FLOOR + (1.0 - RECOVERABLE_SAFETY_FLOOR) * fraction
+
+
+def _outcome_score_v1(
+    correctness: float, recoverable: float | None, catastrophic: bool
+) -> float:
+    """Upstream's ``compute_outcome_score_v1`` with its default bypass."""
+    if catastrophic:
+        return 0.0
+    if recoverable is None:
+        return correctness
+    return math.sqrt(correctness * recoverable)
+
+
+def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
+    """The record as the inject lane grades it, or None when the lane's rule
+    does not apply and the record grades exactly as it always has.
+
+    The rule (#2039): on a record that is the inject transport's envelope
+    from a door that showed no tool-call trace (:func:`_inject_blind`), every report entry the
+    task declares with only ``tool_called``, ``worker_commands`` or ``worker_agents`` leaves
+    (:attr:`CaseSpec.transport_blind_checks`) is set aside as not
+    applicable -- whatever devops-bench recorded
+    for it, a ``fail`` from an empty trajectory or an ``error`` from an
+    absent worker capture -- and the three deterministic signals are
+    recomputed over the entries that remain, so a blind check can neither
+    fail the repetition nor drop coverage below rung 2's floor. What remains
+    is graded by every rung as before: a catastrophic safeguard that reads
+    the cluster still blocks, and a phrase check still passes or fails. When
+    no objective check remains, the repetition is not graded rather than
+    passed.
+
+    The set-aside is per check family, because the door's trace serves one
+    and not the other (``cases.py``, the two sets): a router-scope
+    ``tool_called`` (:attr:`CaseSpec.trace_blind_checks`) is set aside only
+    on an inject record whose door showed no trace (:func:`_inject_blind`),
+    and grades in full on one carrying the activity marker; a check that
+    reads the delegated workers (:attr:`CaseSpec.worker_blind_checks`) is
+    set aside on every inject record (:func:`_inject_record`), marker or
+    not, since the trace carries no card ids and no worker's entries. One
+    exception inside the first family: a ``none``-wrapped check
+    (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
+    whose door showed the trace stays graded even when the marker reports a
+    loss, because the trace shows the forbidden call and a loss cannot
+    unmake it; rung 1 blocks on it as on the api transport.
+
+    None on the api transport, on a record with no blind entry in its report
+    (the set is matched by name, so a task with no such check or a report
+    naming none of them is untouched), and on an inject record whose door
+    showed the trace when the task's only blind checks are of the first kind.
+    """
+    if not spec.transport_blind_checks or not _inject_record(record.trajectory):
+        return None
+    set_aside = set(spec.worker_blind_checks)
+    if _inject_blind(record.trajectory):
+        set_aside |= spec.trace_blind_checks
+        if _inject_trace_shown(record.trajectory):
+            # The door showed the trace and the marker reports a loss. A
+            # loss makes a "never called" check's PASS uncertain -- the
+            # forbidden call may be among what was lost -- and never its
+            # FAIL: the trace shows the call. A failed one is the positive
+            # evidence rung 1 exists to block on, and stays graded.
+            set_aside -= {
+                str(e.get("name"))
+                for e in record.verification_report
+                if str(e.get("name")) in spec.negated_trace_blind_checks and _entry_failed(e)
+            }
+    blind = [
+        str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside
+    ]
+    if not blind:
+        return None
+    kept = [e for e in record.verification_report if str(e.get("name")) not in set_aside]
+    signals = _rollup(kept, len(record.verification_parse_errors))
+    scores = dict(record.scores)
+    # Recompute only what the record carried. A scores map that exists but
+    # lacks the deterministic keys means the deterministic gate did not run
+    # on this record, whatever transport it came through; manufacturing a
+    # correctness from the report here would grade a record rung 2 exists to
+    # block, so the key stays absent and rung 2 fires as it always has. A
+    # key the record did carry is replaced by its value over the kept
+    # entries, or removed when no kept entry of that role remains, as
+    # upstream omits the key.
+    for key, value in signals.items():
+        if key not in record.scores:
+            continue
+        if value is None:
+            scores.pop(key, None)
+        else:
+            scores[key] = value
+    # Coverage, not correctness, is the sign the deterministic gate ran:
+    # upstream emits VerificationCoverage whenever the verification metric
+    # applied, and omits VerificationCorrectness when every objective entry
+    # errored -- which on this transport is what a task whose objectives are
+    # all worker_commands / worker_agents looks like, and is exactly the case
+    # the lane exists to report as not graded rather than as rung 2.
+    gate_ran = SCORE_KEY_COVERAGE in record.scores
+    # devops-bench's OutcomeScore composite was computed with the blind
+    # check still counted (the capture reads ``c=0.500``). Rebuilt with
+    # upstream's formula from the recomputed signals, so it agrees with the
+    # correctness beside it; absent, as upstream leaves it, when there is no
+    # correctness to build it from.
+    correctness = scores.get(SCORE_KEY_CORRECTNESS) if gate_ran else None
+    if SCORE_KEY_OUTCOME_SCORE in record.scores and isinstance(correctness, float):
+        catastrophic = scores.get(SCORE_KEY_CATASTROPHIC) == 0.0
+        recoverable = None
+        if not catastrophic:
+            raw = scores.get(SCORE_KEY_RECOVERABLE)
+            if raw is None:
+                raw = score_value(scores, JUDGED_RECOVERABLE_KEY)
+            if raw is not None:
+                recoverable = _rescale_recoverable(float(raw))
+        scores[SCORE_KEY_OUTCOME_SCORE] = {
+            "score": _outcome_score_v1(correctness, recoverable, catastrophic),
+            "version": OUTCOME_SCORE_VERSION,
+            "reason": (
+                f"c={correctness:.3f}, "
+                f"rec_v={'n/a' if recoverable is None else format(recoverable, '.3f')}, "
+                f"cat_v={0 if catastrophic else 1} "
+                f"(recomputed on the inject lane without {', '.join(blind)})"
+            ),
+        }
+    elif SCORE_KEY_OUTCOME_SCORE in record.scores:
+        scores.pop(SCORE_KEY_OUTCOME_SCORE, None)
+    remaining_objectives = sum(1 for e in kept if e.get("role") == ROLE_OBJECTIVE)
+    return _LaneView(
+        record=replace(record, scores=scores, verification_report=kept),
+        not_applicable=blind,
+        no_gradable_objective=(
+            gate_ran and remaining_objectives == 0 and not record.verification_parse_errors
+        ),
+    )
+
+
 def classify_rep(
     spec: CaseSpec,
     run_dir: str | Path | None,
@@ -531,9 +1002,23 @@ def classify_rep(
     scoring pass crashed -- unless it is devops-bench's provision-failure
     shape on a task with infrastructure, which is INFRA for the same reason
     the missing record is: the deployer died before there was a run to score.
+
+    On the inject lane (:func:`_inject_lane_view`) the record is first re-read
+    with its transport-blind checks set aside; every rung below then grades
+    what remains, and a repetition with no objective check left is
+    ``not_applicable`` rather than a pass or a fail. Only a record that
+    carries a scores map is re-read: a scoreless one is a crashed scoring
+    pass whatever transport it came through, and blocks below as before.
     """
     record = load_run(run_dir) if run_dir is not None else None
     where = None if run_dir is None or str(run_dir) == MISSING else str(run_dir)
+    lane = (
+        _inject_lane_view(spec, record)
+        if record is not None and record.has_scores
+        else None
+    )
+    if lane is not None:
+        record = lane.record
 
     def rep(outcome: str, reason: str, rung: Rung | None = None) -> RepResult:
         return RepResult(
@@ -552,6 +1037,7 @@ def classify_rep(
                 record.tokens.get("total") if record and record.tokens else None
             ),
             report=record.output if record else "",
+            not_applicable_checks=list(lane.not_applicable) if lane else [],
         )
 
     has_infra = spec.deployer != NOOP_DEPLOYER
@@ -662,7 +1148,7 @@ def classify_rep(
     # when it delegates, so a low score here says the eval's wait was shorter
     # than the worker's run and nothing about the agent under test. AFTER
     # rung 1, for the never-ran signature's reason below: the catastrophic
-    # score grades the cluster, and a worker that tripped a safeguard while
+    # score grades the world outside the record, and a worker that tripped a safeguard while
     # the harness was still waiting on it acted, and must keep blocking.
     # After the scores test because a scoreless record is a crashed scoring
     # pass whatever else it carries. The reason leads with the marker so the
@@ -691,7 +1177,7 @@ def classify_rep(
     # reached is infrastructure whatever the task's deployer builds.
     #
     # Placement is load-bearing on both sides. AFTER rung 1, because the
-    # catastrophic score grades the cluster rather than the record: a tripped
+    # catastrophic score grades the world outside the record (the cluster, or the GitOps repository): a tripped
     # safeguard here is positive evidence something acted, which contradicts
     # the never-ran inference and must keep blocking. BEFORE rungs 2-3,
     # because the check and liveness signals on a never-ran record are
@@ -726,11 +1212,19 @@ def classify_rep(
     coverage = record.coverage
     if coverage is not None and coverage < 1.0:
         problems.append(f"VerificationCoverage={coverage}")
-    if spec.declares_verification_spec and record.correctness is None:
+    lane_set_aside_every_objective = lane is not None and lane.no_gradable_objective
+    if (
+        spec.declares_verification_spec
+        and record.correctness is None
+        and not lane_set_aside_every_objective
+    ):
         # Fail closed. The task declares checks and the record carries no
         # deterministic correctness, so nothing graded them; falling through
         # to a judged score here is the silent-green path the gate exists to
-        # close.
+        # close. The one exception is the inject lane having set aside every
+        # objective check: the checks ran, and the absence of a correctness
+        # is the lane's doing, reported below as not applicable rather than
+        # here as a check that did not run.
         problems.append(
             "the task declares a verification_spec but the record carries no "
             "VerificationCorrectness -- the deterministic gate did not run"
@@ -752,7 +1246,27 @@ def classify_rep(
             Rung.NOT_A_REAL_RUN,
         )
 
-    # --- Past the absolute rungs: this repetition is a pass or a fail.
+    # --- Past the absolute rungs: this repetition is a pass or a fail --
+    # or, on the inject lane, neither.
+    if lane_set_aside_every_objective:
+        # Every objective check reads tool calls or worker logs, and this
+        # record's transport carries neither. The run happened and its
+        # answer was read (rung 3 held above), so this is not weather; it
+        # is a case the lane cannot grade. The reason leads with the phrase
+        # so the dashboard can count these apart (#2008).
+        return rep(
+            REP_OUTCOME_NOT_APPLICABLE,
+            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls "
+            "or worker logs, and the inject transport's record carries "
+            "neither, so the repetition is not graded (checks set aside, "
+            f"safeguards included: {', '.join(lane.not_applicable)})",
+        )
+    set_aside = (
+        f" [{len(lane.not_applicable)} check(s) {NOT_APPLICABLE_PHRASE}: "
+        f"{', '.join(lane.not_applicable)}]"
+        if lane is not None
+        else ""
+    )
     correctness = record.correctness
     if correctness is None:
         # No spec declared and none produced. There is nothing deterministic
@@ -764,12 +1278,12 @@ def classify_rep(
             "no verification_spec on this task, so nothing deterministic to grade",
         )
     if correctness >= correctness_floor:
-        return rep("pass", f"VerificationCorrectness={correctness}")
+        return rep("pass", f"VerificationCorrectness={correctness}{set_aside}")
     failed = _failed_checks(record)
     detail = f" -- {'; '.join(failed)}" if failed else ""
     return rep(
         "fail",
-        f"VerificationCorrectness={correctness} (floor {correctness_floor}){detail}",
+        f"VerificationCorrectness={correctness} (floor {correctness_floor}){detail}{set_aside}",
     )
 
 
@@ -823,6 +1337,11 @@ class CaseVerdict:
         return [r for r in self.reps if r.scored]
 
     @property
+    def not_applicable_reps(self) -> list[RepResult]:
+        """Repetitions the inject lane could not grade: ran, read, set aside."""
+        return [r for r in self.reps if r.outcome == REP_OUTCOME_NOT_APPLICABLE]
+
+    @property
     def passes(self) -> int:
         return sum(1 for r in self.reps if r.outcome == "pass")
 
@@ -846,6 +1365,10 @@ class CaseVerdict:
             "notes": list(self.notes),
             "passes": self.passes,
             "scored": len(self.scored_reps),
+            # Repetitions the inject lane set aside whole: evaluated, never
+            # in the rate. Zero on the api transport, so every reader that
+            # sums passes and scored keeps working.
+            "not_applicable": len(self.not_applicable_reps),
             "pass_rate": self.pass_rate,
             # What a `bench-gate record` run on main appends as this case's
             # judged block, and what rung 6 compared against on a pull request.
@@ -863,6 +1386,7 @@ class CaseVerdict:
                     "judged": r.judged,
                     "latency": r.latency,
                     "total_tokens": r.total_tokens,
+                    "not_applicable_checks": list(r.not_applicable_checks),
                 }
                 for r in self.reps
             ],
@@ -925,7 +1449,24 @@ def grade_case(
             return verdict(rung, True, f"{scope}: {first.reason}")
 
     scored = [r for r in reps if r.scored]
+    not_applicable = [r for r in reps if r.outcome == REP_OUTCOME_NOT_APPLICABLE]
     if not scored:
+        if not_applicable:
+            # At least one repetition ran and was read, and the lane set
+            # aside every objective check it declares. Any other repetition
+            # of the same case is weather or the same finding; either way
+            # the case is not gradable on this transport, and that is what
+            # the verdict says, as its own outcome rather than as
+            # infrastructure -- the suite counts it as evaluated.
+            checks = sorted({name for r in not_applicable for name in r.not_applicable_checks})
+            return verdict(
+                Rung.NOT_GRADED_ON_TRANSPORT,
+                False,
+                f"not graded on this transport: every objective check is "
+                f"{NOT_APPLICABLE_PHRASE} -- {len(not_applicable)} of {len(reps)} "
+                "repetition(s) ran and were read, none could be graded "
+                f"(checks set aside, safeguards included: {', '.join(checks)})",
+            )
         return verdict(
             Rung.INFRA,
             False,
@@ -980,17 +1521,40 @@ def grade_case(
                 f"(it has screening evidence that it passes reliably): "
                 f"{scored[0].reason}",
             )
+        unscored = (
+            "hit infrastructure"
+            if not not_applicable
+            else f"were not scored (infrastructure, or {NOT_APPLICABLE_PHRASE})"
+        )
         return verdict(
             Rung.GREEN,
             False,
             f"failed all {len(scored)} scored repetition(s), but "
-            f"{len(reps) - len(scored)} hit infrastructure, so collapse is not "
+            f"{len(reps) - len(scored)} {unscored}, so collapse is not "
             "called on partial evidence",
         )
 
     # --- Rung 5. An expected-fail case that passed. The marker is stale, or
-    # the change under test fixed it and the diff should say so.
+    # the change under test fixed it and the diff should say so. A pass the
+    # inject lane graded with a check set aside is not that evidence: the
+    # objective the marker was filed for may be the one the lane could not
+    # see, so the case did not start passing -- the lane stopped grading the
+    # half that fails. Such a case is green with the marker kept, never a
+    # demand to flip it.
+    passed_whole = [r for r in scored if r.outcome == "pass" and not r.not_applicable_checks]
     if spec.expected_fail and passes == len(scored) and complete:
+        if len(passed_whole) < passes:
+            set_aside = sorted(
+                {name for r in scored for name in r.not_applicable_checks}
+            )
+            return verdict(
+                Rung.GREEN,
+                False,
+                f"expected_fail: true, and it passed all {len(scored)} repetitions "
+                f"on the checks this transport can see, with {', '.join(set_aside)} "
+                f"{NOT_APPLICABLE_PHRASE}; the marker stays until the api lane "
+                "passes it whole",
+            )
         return verdict(
             Rung.EXPECTED_FAIL_PASSED,
             True,
@@ -1078,6 +1642,12 @@ class SuiteVerdict:
     #: has an actionable finding, and the cases weather took are then in
     #: ``reasons`` for the reader rather than here for the tooling.
     not_evaluated: list[str] = field(default_factory=list)
+    #: The case ids the inject lane could not grade (rung
+    #: NOT_GRADED_ON_TRANSPORT): evaluated, so never in ``not_evaluated``,
+    #: and outside the aggregate's denominator. Its own key so the
+    #: dashboard's next-mode view can read them apart (#2008). Empty on the
+    #: api transport.
+    not_graded: list[str] = field(default_factory=list)
 
     @property
     def green(self) -> bool:
@@ -1090,6 +1660,7 @@ class SuiteVerdict:
             "reasons": self.reasons,
             "notes": self.notes,
             "not_evaluated": self.not_evaluated,
+            "not_graded": self.not_graded,
             "pass_rate": self.pass_rate,
             "baseline_rate": self.baseline_rate,
             "margin": self.margin,
@@ -1102,7 +1673,7 @@ def grade_suite(
     cases: list[dict[str, Any]],
     *,
     baseline_rate: float | None = None,
-    margin: float = 0.05,
+    margin: float = DEFAULT_AGGREGATE_MARGIN,
     min_scored: int = DEFAULT_AGGREGATE_MIN_SCORED,
     armed: bool = False,
 ) -> SuiteVerdict:
@@ -1122,9 +1693,9 @@ def grade_suite(
     CLI passes until ``EVAL_AGGREGATE_ARMED`` says otherwise -- a rate below
     the margin over a full sample is still computed and still reported, as a
     note the markdown renders, rather than as a reason that reds the job.
-    The flat margin has never been measured against how much an unchanged
-    pull request's aggregate moves on main; arming it is a decision to take
-    once the store holds enough nights to say.
+    The margin was measured on 2026-09-29 against how much an unchanged pull
+    request's aggregate moves on main (:data:`DEFAULT_AGGREGATE_MARGIN`);
+    arming it is a Prow-config decision, never a default here.
 
     Green also needs a floor under its coverage. Every fix that routes an
     environment-health shape into an infrastructure classification is right
@@ -1198,13 +1769,33 @@ def grade_suite(
     # when there is no such finding.
     red = bool(reasons)
 
+    # The inject lane's cases that ran, were read, and could not be graded
+    # (#2039). Evaluated but not applicable: they are neither weather for
+    # the coverage floor below nor infrastructure for the all-cases guard,
+    # and they are outside the aggregate already (scored is 0). Named in a
+    # note so the verdict says what the lane did not grade.
+    not_graded = [
+        str(c.get("case"))
+        for c in cases
+        if int(c.get("rung") or Rung.GREEN) == int(Rung.NOT_GRADED_ON_TRANSPORT)
+    ]
+    if not_graded:
+        notes.append(
+            f"{len(not_graded)} case(s) not graded on this transport, every "
+            f"objective check {NOT_APPLICABLE_PHRASE}: {', '.join(not_graded)}. "
+            "Evaluated, not infrastructure; outside the pass rate."
+        )
+
     # The per-admitted-case floor. A blocking case can also have no scored
     # repetition (every repetition blocked on rung 1-3), and it is already a
-    # reason above; it is not weather, so it is not listed here.
+    # reason above; it is not weather, so it is not listed here. Neither is
+    # a case the lane could not grade: its run happened.
     wiped = [
         str(c.get("case"))
         for c in admitted
-        if not c.get("blocking") and not int(c.get("scored") or 0)
+        if not c.get("blocking")
+        and not int(c.get("scored") or 0)
+        and str(c.get("case")) not in not_graded
     ]
     for case_id in wiped:
         reasons.append(
@@ -1213,7 +1804,13 @@ def grade_suite(
             "infrastructure), so the run cannot certify green without it"
         )
 
-    all_infra = bool(cases) and all(c.get("rung") == int(Rung.INFRA) for c in cases)
+    # The all-cases guard reads the cases the lane could grade. A not-graded
+    # case is evaluated, so it neither arms the guard nor disarms it: with
+    # every gradable case lost to infrastructure the suite still evaluated
+    # nothing about the change, however many cases the lane set aside.
+    gradable = [c for c in cases if str(c.get("case")) not in not_graded]
+    all_infra = bool(gradable) and all(c.get("rung") == int(Rung.INFRA) for c in gradable)
+    nothing_gradable = bool(cases) and not gradable
     if not cases:
         reasons.append("no case results were produced at all")
     elif all_infra:
@@ -1221,20 +1818,31 @@ def grade_suite(
         # all of them at once means the eval infrastructure is down and a
         # green job would be a lie about coverage.
         reasons.append(
-            f"all {len(cases)} case(s) failed on infrastructure -- the suite "
-            "evaluated nothing, so it cannot report green"
+            f"all {len(gradable)} gradable case(s) failed on infrastructure -- the "
+            "suite evaluated nothing, so it cannot report green"
+        )
+    elif nothing_gradable:
+        # Every case the run had was set aside by the lane. Not weather --
+        # nothing died -- but a suite that graded no check cannot certify
+        # green either; the roster for this lane is what to fix.
+        reasons.append(
+            f"all {len(cases)} case(s) were not graded on this transport -- the "
+            "suite graded nothing, so it cannot report green"
         )
 
     if not cases or red:
         outcome = SUITE_OUTCOME_RED
         not_evaluated: list[str] = []
-    elif wiped or all_infra:
+    elif wiped or all_infra or nothing_gradable:
         outcome = SUITE_OUTCOME_NOT_EVALUATED
         # Every case when all of them were lost, admitted or not: the banner
-        # names what the run did not evaluate, and that is all of it.
-        not_evaluated = (
-            [str(c.get("case")) for c in cases] if all_infra else list(wiped)
-        )
+        # names what the run did not evaluate, and that is all of it. When
+        # the lane graded nothing, the not-graded cases are named under
+        # their own key and this list stays empty: nothing was lost.
+        if all_infra:
+            not_evaluated = [str(c.get("case")) for c in gradable]
+        else:
+            not_evaluated = list(wiped)
     else:
         outcome = SUITE_OUTCOME_GREEN
         not_evaluated = []
@@ -1249,4 +1857,5 @@ def grade_suite(
         margin=margin,
         scored=scored,
         not_evaluated=not_evaluated,
+        not_graded=not_graded,
     )

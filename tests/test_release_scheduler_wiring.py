@@ -1,7 +1,7 @@
 """The GA release cron lives on the scheduler, and the pipeline has no skip-green path.
 
 Following the decoupled trigger pattern established by rc-scheduler.yml and
-nightly-scheduler.yml, release-scheduler.yml holds the cron trigger
+staging-promotion-scheduler.yml, release-scheduler.yml holds the cron trigger
 ("17 5 * * 5") so that quiet ticks with nothing to release produce no
 pipeline run at all.
 

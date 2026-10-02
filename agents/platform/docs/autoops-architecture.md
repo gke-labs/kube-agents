@@ -150,8 +150,12 @@ incident rather than forty.
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
 
-> **Honest state:** the envelope is still k8s-shaped — `reason`, `namespace`, `kind_of_object`, `name`,
-> `message`. Generalizing it is part of the work of landing the second source, not a box already ticked.
+> **Honest state:** the event envelope is still k8s-shaped — `reason`, `namespace`, `kind_of_object`,
+> `name`, `message`. The second source did not generalize it; it landed alongside it. The drift
+> detector sends its own `kind: gitops-drift` envelope with its own fields, and the inject route
+> dispatches on `kind` rather than reconciling the two. So the pattern a third domain now follows is
+> "add a kind and a branch", which works and does not scale — a shared envelope is still owed, and is
+> now a refactor of two producers rather than a design decision about one.
 
 ---
 
@@ -320,8 +324,11 @@ Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 **So a new domain supplies two things: a skill and a judgment prompt.** The skill is _how to investigate_;
 the prompt is _what to decide and how to say it_.
 
-> **Honest state:** `_build_agent_query()` is hardcoded k8s-event-shaped, so today a second domain means
-> a second query builder. Making it pluggable is the same piece of work as generalizing the envelope.
+> **Honest state:** this is what the second domain actually cost. `_build_agent_query()` is hardcoded
+> k8s-event-shaped, so drift got a second query builder and a second card body rather than a plugged-in
+> prompt, dispatched on `kind` at the top of the function. Making it pluggable is still the same piece
+> of work as generalizing the envelope, and there are now two implementations to fold in rather than
+> one to parameterize.
 
 ---
 
@@ -370,13 +377,18 @@ than a live write, a new domain inherits reviewability and rollback for free.
 The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
-  rules and a flapping guard. The deployed watcher gates on seven reasons, which
+  rules and a flapping guard. The deployed watcher forwards eight reasons, which
   `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
   `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
-  `OOMKilled`. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
-  `FailedScheduling` and `Evicted` — applies only when `--reason` is left unset, so it does not
-  describe an install. `Decide` matches the wire reason exactly and before canonicalization, so a
-  reason absent from that list produces nothing at all: no session, no card, no report.
+  `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
+  `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
+  forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
+  count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
+  pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
+  opens one. The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.
+  `Decide` matches the wire reason exactly and before canonicalization, so a reason absent from
+  that list produces nothing at all: no session, no card, no report.
 - **Dedup** — a 24h rolling window collapses repeats and related reasons into one incident.
 - **Session + routing** — one session per incident, SQLite-backed, posted to the right chat thread and
   recorded with the platform that thread lives on, with the triage report stored for follow-up replies.
@@ -422,6 +434,19 @@ optional enrichment, never a prerequisite. It has a full design doc and a comple
 `managedFields` gives field-level ownership, the audit log gives the principal, and the two-signal join
 separates a human out-of-band change from CI and from controller churn (~99% noise reduction with two
 static filters).
+
+The adapter is now built end to end — ingestion, classification, the `managedFields` join across
+every cluster the Platform Agent has onboarded, and the inject itself — and the daemon routes the
+kind to its own chat alert and its own triage card. The agent images now carry the detector and the
+credential proxy's entrypoint starts it, so what an install still needs is
+`spec.harness.driftDetector.enabled` set on its `PlatformAgent` and the `drift-pubsub` Terraform
+module applied. Only the first is a start gate: without it the detector ships and does not run,
+while enabling it without the module gives a detector that runs and retries a pull that cannot
+succeed. Either way no drift is detected. Both are flags:
+`terraform/examples/full-install` instantiates the module when `enable_drift_pubsub` is set and
+writes the CR field when `enable_drift_detector` is, and it refuses an apply that asks for the
+second without the first. Through the installer front doors the pair is one `install.env` key,
+`ENABLE_DRIFT_DETECTOR`, which turns on both.
 
 **Obtainability governance — the same two contracts.** A completely different domain, engineered
 independently, arrived at the same shape. It also closes the quota and capacity gap that previously

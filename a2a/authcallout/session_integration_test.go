@@ -267,8 +267,9 @@ func TestTwoSessionsOnOneServiceAccountAreRefusedOnEachOthersSubjects(t *testing
 
 // A narrowed entry with no claim to narrow on must refuse. The alternative —
 // falling back to the entry's own grants — is a connection with the empty
-// grant set, which succeeds at connect and then hangs forever on its first
-// reply, and would read in production as "the bus is slow".
+// grant set, and that does not fail safe: the server reads an absent allow
+// list as "unrestricted", so it would succeed at connect and then be allowed
+// to publish anywhere, reading in production as nothing at all.
 func TestASessionTokenBoundToNoPodIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, sessionMap, sessionTokens())
 	if nc, err := nats.Connect(h.url, nats.Token(tokenNoPod), nats.CustomInboxPrefix("_INBOX."+podA)); err == nil {

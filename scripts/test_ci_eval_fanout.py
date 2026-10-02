@@ -1,7 +1,7 @@
 """The eval fan-out's scheduler is model-free shell, so it is testable here.
 
 `hack/ci-eval-pr.sh` launches one background unit per (task, repetition) and
-serializes the collisions with two mkdir mutexes. Three properties carry the
+serializes the collisions with three mkdir mutexes (task, stream, infra). Three properties carry the
 correctness of that scheme and each is exercised against the REAL text lifted
 out of the script, in the same style as test_ci_eval_trap.py:
 
@@ -15,11 +15,18 @@ out of the script, in the same style as test_ci_eval_trap.py:
 
 The run-directory recovery regex is pinned too: it is what replaced the
 directory-set diff that could not tell concurrent siblings apart.
+
+Since the per-case grading moved into the fan-out (#1491: a deadline-cut
+night must still record every case that finished), a fourth property joins
+them: the unit that brings a case's repetition count to EVAL_REPETITIONS --
+and only that unit -- grades and records the case, and a repetition that gave
+up on its lock leaves the case for the loop after the fan-out.
 """
 
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -29,9 +36,19 @@ SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 def lifted(name: str) -> str:
     """A top-level shell function as written, lifted from the script."""
     src = SCRIPT.read_text(encoding="utf-8")
-    match = re.search(rf"^{name}\(\) \{{.*?^\}}$|^{name}\(\) \{{[^\n]*\}}$", src, re.S | re.M)
+    match = re.search(rf"^{name}\(\) \{{.*?^\}}$|^{name}\(\) \{{[^\n]*\}}$", src, re.DOTALL | re.MULTILINE)
     if match is None:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"{name}() not found in {SCRIPT}")
+    return match.group(0)
+
+
+def lifted_constant(name: str) -> str:
+    """A `readonly NAME=...` line as written, lifted from the script: the
+    function under test reads it, and a stub would hide a rename."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(rf"^readonly {name}=.*$", src, re.MULTILINE)
+    if match is None:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"readonly {name} not found in {SCRIPT}")
     return match.group(0)
 
 
@@ -91,14 +108,18 @@ class LockTest(unittest.TestCase):
 class QueueOrderTest(unittest.TestCase):
     def queue(self, reps: int) -> list[tuple[int, int, int]]:
         src = SCRIPT.read_text(encoding="utf-8")
-        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.S | re.M)
+        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
         if match is None:  # pragma: no cover
             raise AssertionError(f"UNIT_QUEUE block not found in {SCRIPT}")
         body = "\n".join(
             [
                 lifted("unit_cost_hint"),
+                # The queue leaves out the cases that request a pull request
+                # (the inject lane's second phase); with the list unset every
+                # task is in this queue, as on the api lane.
+                lifted("unit_phase"),
                 f"EVAL_REPETITIONS={reps}",
-                # compliance carries a 700 hint, the probe 200: order within a
+                # compliance carries a 1000 hint, the probe 200: order within a
                 # repetition must be cost-descending.
                 'TASKS=("t/reliability-pdb-probe/task.yaml" "t/compliance-rbac-overgrant/task.yaml")',
                 'TASK_NAMES=(reliability-pdb-probe compliance-rbac-overgrant)',
@@ -177,21 +198,263 @@ class DelegationCeilingTest(unittest.TestCase):
         # A same-task repetition waits on the task lock for the holder's whole
         # unit. With a 3000s ceiling, a fixed 1800s wait would make it give
         # up while the holder was still legitimately running.
+        # And on a stream another case in the run also writes, the holder
+        # waits its turn on the stream lock first, so the wait is that figure
+        # times the cases on the stream (stream_case_count), plus the infra
+        # queue the stream's stack-bearing cases may hold it through
+        # (stream_stack_wait); a case alone on its stream, or writing none,
+        # keeps the single-unit figure -- plus one INFRA_LOCK_DEADLINE when it
+        # writes none and carries a stack, since its previous rep holds the
+        # task lock while queued on lock-infra. The in-flight grace a
+        # ledger-writing unit may spend before its run is in the per-case
+        # figure too, so a holder that spends it does not push its waiter past
+        # the deadline.
         unit = lifted("run_one_unit")
-        wait = (
-            'lock_acquire "${STATE_DIR}/lock-task-${name}" \\\n'
-            '    "$(($(unit_delegation_timeout "${name}") + 600))"'
+        deadline = 'lock_deadline="$(( $(stream_case_count "${audit_id}") * ($(unit_delegation_timeout "${name}") + 600 + EVAL_INFLIGHT_GRACE_SECONDS) + $(stream_stack_wait "${audit_id}") ))"'
+        ledgerless_stack = (
+            'if [ -z "${audit_id}" ] && [ -n "${has_stack}" ]; then\n'
+            "    lock_deadline=$(( lock_deadline + INFRA_LOCK_DEADLINE ))\n"
+            "  fi"
         )
-        self.assertIn(wait, unit)
+        self.assertIn(deadline, unit)
+        self.assertIn(ledgerless_stack, unit)
+        grace = re.search(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=\d+$", SCRIPT.read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(grace)
+        self.assertIn('lock_acquire "${STATE_DIR}/lock-task-${name}" "${lock_deadline}"', unit)
+        computed = deadline + "; " + ledgerless_stack + '; echo "${lock_deadline}"'
         body = "\n".join(
             [
                 lifted("unit_delegation_timeout"),
+                grace.group(0),
                 'export AGENT_DELEGATION_TIMEOUT="2700"',
-                'name=compliance-rbac-overgrant; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
-                'name=capacity-pinned-pool-probe; echo "$(($(unit_delegation_timeout "${name}") + 600))"',
+                "INFRA_LOCK_DEADLINE=900",
+                'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
+                'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=\n" + computed,
+                "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift has_stack=\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=900 name=compliance-rbac-overgrant audit_id=compliance-audit has_stack=1\n" + computed,
+                "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= has_stack=1\n" + computed,
             ]
         )
-        self.assertEqual(run_bash(body).stdout.split(), ["3600", "3300"])
+        self.assertEqual(run_bash(body).stdout.split(), ["3900", "3600", "7800", "4800", "4500"])
+
+
+class PerCaseGradingTest(unittest.TestCase):
+    """A case is graded by the unit that finishes its last repetition.
+
+    run_one_unit writes its state files while it still holds the task lock
+    and counts them there, so exactly one repetition sees the count reach
+    EVAL_REPETITIONS; finish_case then grades under one grading lock, prints
+    the block in one piece, and marks the case `.graded` only when the
+    grading produced its JSON. The loop after the fan-out grades what has no
+    sentinel and the record step passes the manifest that keeps a case from
+    being appended twice.
+    """
+
+    UNIT_STUBS = """
+_now_ms() { date +%s000; }
+lock_acquire() { mkdir "$1" 2>/dev/null; }
+lock_release() { rmdir "$1" 2>/dev/null || true; }
+mint_ledger_token() { return 0; }
+unit_delegation_timeout() { echo 1800; }
+ledger_audit_id_for_task() { echo ""; }
+stream_case_count() { echo 1; }
+stream_stack_wait() { echo 0; }
+_ts_lines() { cat; }
+uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
+finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }
+STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"; BENCH_DIR=/tmp
+EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1; EVAL_INFLIGHT_GRACE_SECONDS=300
+release_inflight_note() { :; }
+EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
+"""
+
+    def run_reps(self, extra: str = "") -> subprocess.CompletedProcess:
+        body = "\n".join([
+            # The one constant the unit reads from the script's top: the base
+            # of its per-unit inject port.
+            lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+            # The unit resolves the task file it hands the bench through
+            # this helper (the inject lane's copy, or the file under
+            # bench/tasks/); with no lane directory set it is the identity.
+            lifted("unit_task_path"),
+            lifted("run_one_unit"),
+            self.UNIT_STUBS,
+            extra,
+            'for rep in 1 2 3; do run_one_unit ./tasks/x/task.yaml case-x "${rep}" "" "" "${rep}"; done',
+            'ls "${STATE_DIR}" | sort | tr "\\n" " "; echo',
+        ])
+        return run_bash(body)
+
+    def test_only_the_repetition_that_completes_the_case_grades_it(self):
+        result = self.run_reps()
+        self.assertEqual(result.stdout.count("FINISH_CASE"), 1, result.stdout + result.stderr)
+        self.assertIn("FINISH_CASE case-x after rep 3", result.stdout)
+        self.assertIn("case-x.rep1.end case-x.rep1.start case-x.rep2.dir", result.stdout)
+        # Graded after its own `finished` line, so the log keeps its markers timely.
+        self.assertLess(result.stdout.index("finished case-x rep 3"), result.stdout.index("FINISH_CASE"))
+
+    def test_a_repetition_that_gave_up_on_its_lock_leaves_the_case_to_the_loop(self):
+        # Rep 2 never gets the task lock: no state file, so the count stops at
+        # two and the case is graded after the fan-out with rep 2 MISSING.
+        lost = 'lock_acquire() { case "$1" in *lock-task-*) [ "${rep}" != 2 ] && mkdir "$1" 2>/dev/null ;; *) mkdir "$1" 2>/dev/null ;; esac; }'
+        result = self.run_reps(lost)
+        self.assertNotIn("FINISH_CASE", result.stdout)
+        self.assertIn("case-x rep 2 gave up on its task lock", result.stderr)
+        self.assertNotIn("case-x.rep2.end", result.stdout)
+
+    def test_every_repetition_gets_its_own_tunnels(self):
+        """The harness owns one port-forward per process and its atexit
+        teardown drops a shared listener under every sibling, so each unit
+        exports its own local port for the agent API and, from the script's
+        named base, for the inject door. Run, not read: the ports the bench
+        stub sees are the ones the harness would bind."""
+        # The unit sends the bench's stdout to its own log file, so the stub
+        # records what it saw in a file of this test's.
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "ports"
+            ports = (
+                f'uv() {{ echo "PORTS rep=${{rep}} api=${{AGENT_LOCAL_PORT}} inject=${{AGENT_INJECT_LOCAL_PORT}}" >> "{record}"; '
+                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }'
+            )
+            result = self.run_reps(ports)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = record.read_text(encoding="utf-8") if record.exists() else ""
+        seen = re.findall(r"^PORTS rep=(\d) api=(\d+) inject=(\d+)$", recorded, re.MULTILINE)
+        self.assertEqual([rep for rep, _, _ in seen], ["1", "2", "3"], recorded)
+        base = int(lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE").split("=")[1])
+        for rep, api, inject in seen:
+            self.assertEqual(int(api), 28642 + int(rep))
+            self.assertEqual(int(inject), base + int(rep))
+        self.assertEqual(len({inject for _, _, inject in seen}), 3)
+        self.assertFalse({api for _, api, _ in seen} & {inject for _, _, inject in seen})
+
+    def stamps(self, audit_id: str, gitops_override: str = "") -> list[str]:
+        """EVAL_STREAM_STARTED_AT, EVAL_AUDIT_STREAM and EVAL_STREAM_REPO as each of case-y's
+        reps, then case-x's, sees them (`-` for unset).
+        `date` ticks per call here, so a stamp taken per unit would differ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "stamps"
+            extra = "\n".join([
+                'tick=1000; date() { if [ "$*" = "-u +%s" ]; then tick=$((tick + 1)); echo "${tick}"; '
+                'else command date "$@"; fi; }',
+                f'ledger_audit_id_for_task() {{ echo "{audit_id}"; }}',
+                'reset_audit_ledgers() { :; }',
+                'EVAL_LEDGER_REPO=gke-agentic/kube-agents-evals-4-infra',
+                f'EVAL_GITOPS_REPO="{gitops_override}"',
+                f'uv() {{ echo "STAMP ${{EVAL_CASE_ID}} ${{EVAL_STREAM_STARTED_AT:--}} ${{EVAL_AUDIT_STREAM:--}} ${{EVAL_STREAM_REPO:--}}" >> "{record}"; '
+                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }',
+                'for rep in 1 2 3; do run_one_unit ./tasks/y/task.yaml case-y "${rep}" "" "" "$((rep + 3))"; done',
+            ])
+            result = self.run_reps(extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = record.read_text(encoding="utf-8") if record.exists() else ""
+        return re.findall(r"^STAMP (\S+ \S+ \S+ \S+)$", recorded, re.MULTILINE)
+
+    def test_every_unit_on_a_stream_sees_when_the_stream_began(self):
+        """pull_request_opened's accepts_stream_pull_request measures from
+        EVAL_STREAM_STARTED_AT: the pull request case-y's rep 1 opened is the
+        one case-x's reps find open, so all six must see case-y's rep 1 start."""
+        self.assertEqual(
+            self.stamps("obtainability-audit"),
+            ["case-y 1001 obtainability-audit gke-agentic/kube-agents-evals-4-infra"] * 3
+            + ["case-x 1001 obtainability-audit gke-agentic/kube-agents-evals-4-infra"] * 3,
+        )
+
+    def test_a_developers_gitops_repo_is_the_streams_repository(self):
+        """The deploy told the agent to write to EVAL_GITOPS_REPO, so its pull
+        requests are there; `none` is the opt-out, not a repository."""
+        self.assertEqual(
+            {s.split()[3] for s in self.stamps("obtainability-audit", "me/infra")},
+            {"me/infra"},
+        )
+        self.assertEqual(
+            {s.split()[3] for s in self.stamps("obtainability-audit", "none")},
+            {"gke-agentic/kube-agents-evals-4-infra"},
+        )
+
+    def test_a_case_with_no_stream_gets_no_stream_window(self):
+        """Nothing ties a streamless case's earlier pull request to it, so the
+        verifier gets no stamp and measures from the run."""
+        self.assertEqual(self.stamps(""), ["case-y - - -"] * 3 + ["case-x - - -"] * 3)
+
+    def test_the_state_files_are_written_under_the_task_lock(self):
+        unit = lifted("run_one_unit")
+        written = unit.index('> "${STATE_DIR}/${name}.rep${rep}.end"')
+        counted = unit.index("finished_reps=$((finished_reps + 1))")
+        # The last release: the early ones are the give-up paths.
+        released = unit.rindex('lock_release "${STATE_DIR}/lock-task-${name}"')
+        self.assertLess(written, counted)
+        self.assertLess(counted, released)
+        self.assertLess(released, unit.index('finish_case "${task}" "${name}"'))
+
+    FINISH_STUBS = """
+lock_acquire() { echo "lock $(basename "$1")"; }
+lock_release() { echo "unlock $(basename "$1")"; }
+grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
+record_case() { echo "  recorded $1: 3/3 -> store"; }
+STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
+"""
+
+    def run_finish(self, grade_status: int) -> subprocess.CompletedProcess:
+        body = "\n".join([
+            lifted("finish_case"),
+            self.FINISH_STUBS,
+            f"GRADE_STATUS={grade_status}",
+            "finish_case ./tasks/x/task.yaml case-x",
+            '[ -f "${STATE_DIR}/case-x.graded" ] && echo GRADED || echo NOT_GRADED',
+        ])
+        return run_bash(body)
+
+    def test_a_graded_case_is_marked_recorded_and_printed_in_one_piece(self):
+        out = self.run_finish(0).stdout
+        self.assertIn("GRADED", out)
+        self.assertLess(out.index("lock lock-grade"), out.index("Task case-x Result:"))
+        self.assertLess(out.index("Task case-x Result:"), out.index("  recorded case-x"))
+        self.assertLess(out.index("  recorded case-x"), out.index("unlock lock-grade"))
+
+    def test_a_grading_that_failed_is_left_for_the_loop_after_the_fan_out(self):
+        out = self.run_finish(2).stdout
+        self.assertIn("NOT_GRADED", out)
+        self.assertIn("grading case-x inside the fan-out failed (status 2)", out)
+        self.assertNotIn("recorded case-x", out)
+        self.assertIn("unlock lock-grade", out, "the throttle is released either way")
+
+    def test_the_loop_after_the_fan_out_skips_what_the_fan_out_graded(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        loop = src[src.index("# ─── Per-case verdicts, in the order TASKS declares"):src.index('profile_begin "record + final gate"')]
+        self.assertIn('if [ -f "${STATE_DIR}/${TASK_NAME}.graded" ] && [ -f "${CASE_JSON}" ]; then', loop)
+        self.assertIn('grade_case "${TASK}" "${TASK_NAME}"', loop)
+        self.assertIn('CASE_RESULTS+=(--case-result "${CASE_JSON}")', loop)
+
+    def test_both_record_calls_share_the_manifest(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('--recorded-manifest "${EVAL_RECORDED_MANIFEST}"', lifted("record_case"))
+        tail = src[src.index('echo ">>> [$(date -u +\'%Y-%m-%dT%H:%M:%SZ\')] Recording baseline evidence from main <<<"'):]
+        self.assertIn('--recorded-manifest "${EVAL_RECORDED_MANIFEST}"', tail)
+        # The decision the in-lane record reads is taken before the fan-out.
+        self.assertLess(src.index('EVAL_IS_MAIN_RUN="true"'), src.index("run_one_unit() {"))
+        self.assertLess(src.index("EVAL_RECORDED_MANIFEST="), src.index("run_one_unit() {"))
+
+    def test_the_run_marks_its_suite_step_reached_before_writing_its_own_verdict(self):
+        """The one line that keeps the EXIT trap's cut-off table from
+        overwriting a finished run's verdict is `EVAL_SUITE_REACHED=1`, set
+        in the main body after the fan-out's `wait` and before the run's own
+        `bench-gate suite`; report_partial_verdict returns on it. Dropped,
+        moved below the suite call, or moved into the `(cd ...)` subshell,
+        every run that reached its verdict would have the trap rewrite
+        eval-verdict.md / .json with the PARTIAL banner, and the suite would
+        stay green. test_ci_eval_trap.py proves the function honours the
+        variable; this pins that the script sets it, where it must.
+        """
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(src.count("\nwait\n"), 1, "one fan-out wait in the main body")
+        self.assertEqual(src.count("\nEVAL_SUITE_REACHED=1\n"), 1, "set once, at top level")
+        own_suite = '(cd "${BENCH_DIR}" && uv run bench-gate suite \\\n  "${CASE_RESULTS[@]}"'
+        self.assertLess(src.index("\nwait\n"), src.index("\nEVAL_SUITE_REACHED=1\n"))
+        self.assertLess(src.index("\nEVAL_SUITE_REACHED=1\n"), src.index(own_suite))
+        self.assertIn('[ -z "${EVAL_SUITE_REACHED:-}" ] || return 0', lifted("report_partial_verdict"))
 
 
 class RunDirRecoveryTest(unittest.TestCase):

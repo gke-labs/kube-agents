@@ -43,7 +43,9 @@ future writer could get wrong.
 ``google-cloud-storage``. The bench package has no GCP dependency today and
 this is not worth acquiring one for; ``gcloud`` is already present wherever
 this runs. The price is process startup per case, which is why ``sources()``
-fans its per-case reads out across a bounded pool.
+fans its per-case reads out across a bounded pool, and why it takes an ``only``
+filter: the gate reads the store once per graded case and needs one case's
+evidence each time, so reading all of them is the same work repeated.
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,6 +102,20 @@ class EvidenceSource:
 
 def is_gcs(location: str | Path) -> bool:
     return str(location).startswith("gs://")
+
+
+def scope_of(only: Collection[str] | None) -> frozenset[str] | None:
+    """Normalise a case filter. ``None`` means every case.
+
+    A bare string is one case id, not a set of its letters -- the one way an
+    ``only`` argument goes wrong silently, since iterating it yields case ids
+    that match nothing and the read comes back empty rather than failing.
+    """
+    if only is None:
+        return None
+    if isinstance(only, str):
+        return frozenset({only})
+    return frozenset(only)
 
 
 def _sanitize(text: str) -> str:
@@ -184,8 +201,8 @@ class LocalBackend:
     def describe(self) -> str:
         return str(self.root)
 
-    def sources(self) -> list[EvidenceSource]:
-        """Every ``<case>.jsonl`` in the directory.
+    def sources(self, only: Collection[str] | None = None) -> list[EvidenceSource]:
+        """Every ``<case>.jsonl`` in the directory, or just the cases in ``only``.
 
         A missing directory is an empty store, not an error: that is the state
         a fresh checkout is in before anything has been screened.
@@ -195,7 +212,12 @@ class LocalBackend:
 
         # A leftover `<case>.json` is refused rather than ignored. Skipping it
         # would read as "this case has never been screened", which silently
-        # de-admits the case instead of saying the format changed.
+        # de-admits the case instead of saying the format changed. Checked
+        # across the whole directory whatever `only` says: it is a statement
+        # about the store's format, not about the cases this read wants. The
+        # per-line parse check is not held to that rule -- a name is free to
+        # look at and bytes are the cost `only` exists to avoid, so a corrupt
+        # record out of scope waits until something grades that case.
         for stray in sorted(self.root.glob("*.json")):
             if stray.name != "VERSIONS.json":
                 raise ValueError(
@@ -203,8 +225,11 @@ class LocalBackend:
                     f"{stray.stem}.jsonl, one record per line"
                 )
 
+        scope = scope_of(only)
         found: list[EvidenceSource] = []
         for path in sorted(self.root.glob("*.jsonl")):
+            if scope is not None and path.stem not in scope:
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except OSError as exc:
@@ -274,16 +299,28 @@ class GcsBackend:
             )
         return done.stdout
 
-    def _list(self) -> list[str]:
+    def _list(self, scope: frozenset[str] | None = None) -> list[str]:
         """Every object URL under the prefix, or [] if the prefix is empty.
 
         An empty prefix is an empty store. gcloud reports "matched no objects"
         as a non-zero exit, which must not be mistaken for the bucket being
         unreachable -- one is the ordinary state before anything is recorded,
-        the other disarms the gate.
+        the other disarms the gate. A scoped read hits that path routinely: a
+        case nobody has screened yet has no prefix of its own.
+
+        A single-case scope is pushed down into the `ls` so the server walks
+        one case's prefix instead of the whole store. A wider scope is filtered
+        by the caller: one listing of everything is one process, and a listing
+        per case would cost more than it saved. An empty scope skips the
+        listing outright, since every object it returned would be dropped.
         """
+        if scope is not None and not scope:
+            return []
+        prefix = self.location
+        if scope is not None and len(scope) == 1:
+            prefix = f"{self.location}/{_sanitize(next(iter(scope)))}"
         try:
-            out = self._run(["ls", f"{self.location}/**"])
+            out = self._run(["ls", f"{prefix}/**"])
         except StoreUnreachable as exc:
             if "matched no objects" in str(exc).lower():
                 return []
@@ -294,8 +331,8 @@ class GcsBackend:
             if line.strip().startswith("gs://") and line.strip().endswith(".jsonl")
         ]
 
-    def sources(self) -> list[EvidenceSource]:
-        """Every case's objects, grouped by case and ordered chronologically.
+    def sources(self, only: Collection[str] | None = None) -> list[EvidenceSource]:
+        """Every case's objects, or just ``only``'s, ordered chronologically.
 
         The case is the first segment under the prefix, whatever the depth
         below it, so this reads the key-partitioned layout and the flat one
@@ -306,14 +343,24 @@ class GcsBackend:
         within it. ``evidence_for()`` filters to a single key before it walks,
         so it never sees the interleaving between directories.
         """
+        scope = scope_of(only)
+
+        # Matched against the sanitised id, because that is what `append`
+        # names the directory: an id the two disagree on would otherwise list
+        # objects the filter then drops, reporting an empty store for a case
+        # that has evidence.
+        wanted = None if scope is None else {_sanitize(c) for c in scope}
+
         by_case: dict[str, dict[str, list[str]]] = {}
-        for url in self._list():
+        for url in self._list(scope):
             if not url.startswith(self.location + "/"):
                 continue
             relative = url[len(self.location) + 1 :]
             if "/" not in relative:  # an object sitting directly under the prefix
                 continue
             case_id = relative.split("/", 1)[0]
+            if wanted is not None and case_id not in wanted:
+                continue
             parent = url.rsplit("/", 1)[0]
             by_case.setdefault(case_id, {}).setdefault(parent, []).append(url)
 
@@ -333,8 +380,8 @@ class GcsBackend:
             return []
 
         # Concurrently, because the cost of a read is one `gcloud` process
-        # startup per case (~1.3s) against objects of a few hundred bytes, and
-        # the gate reads the whole store once per graded case. Order survives:
+        # startup per case (~1.3s) against objects of a few hundred bytes.
+        # `only` keeps the case count down; this keeps the rest. Order survives:
         # map yields in submission order, and truncated was filled above, off
         # the pool, so no worker touches it.
         def fetch(item: tuple[str, list[str]]) -> str:

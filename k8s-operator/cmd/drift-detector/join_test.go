@@ -473,10 +473,12 @@ func TestReconciledByIgnoresAStatusWriteAnsweringASpecChange(t *testing.T) {
 	// paging on. The controller's next loop writes .status on the same object,
 	// seconds later, under the manager name --gitops-managers configures.
 	//
-	// Reported as reconciled, that change is one T4 would suppress the inject
-	// for: DriftEvent.Reconciled means the person's edit has since been written
-	// over and there may be nothing left to revert, and here the edit stands
-	// untouched.
+	// Reported as reconciled, that change reaches the card carrying a claim
+	// that is false. Reconciled does not suppress the inject -- every surviving
+	// record is escalated -- it sets the "Possibly already reverted" line, which
+	// tells the reader the person's edit may have been written over and there
+	// may be nothing left to do. Here the edit stands untouched, so that line
+	// would send them looking for a revert that never happened.
 	const manager = "kustomize-controller"
 	suspendedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 	statusWrittenAt := suspendedAt.Add(4 * time.Second)

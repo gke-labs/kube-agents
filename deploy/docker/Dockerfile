@@ -87,8 +87,15 @@ ARG TARGETARCH
 WORKDIR /workspace
 COPY k8s-operator/ /workspace/k8s-operator/
 WORKDIR /workspace/k8s-operator
+# Two binaries, one stage and one RUN: both are peer processes that
+# start-services.sh launches inside the credential-proxy sidecar, both come out
+# of the k8s-operator module already copied above, and a second RUN would buy a
+# layer for nothing. The stage keeps the watcher's name because the file names
+# stages after what they produce and no single name covers two of them.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
+    go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/ && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/drift-detector ./cmd/drift-detector/
 
 # The a2a CLI — the topics reader/writer for the A2A bus (mode: next). Same
 # pattern as the event watcher above. The binary ships UNGATED at
@@ -162,9 +169,30 @@ RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/her
 # channel-directory resolution and fail. A bare thread name "spaces/<id>/threads/<id>" (no colon) is the
 # space before "/threads/" plus the whole name as the thread, the shape the adapter's thread ids take.
 # Exact-count guarded like the step above.
+#
+# Anchor the launchctl approval pattern -- a second edit in this layer, because the agent-base -> platform
+# chain sits within a few layers of the budget scripts/check_image_layers.py gates. v2026.9.14's
+# tools/approval_detection.py opens the "stop/restart hermes launchd service" rule with two unanchored
+# whole-input lookaheads, so re.search retries them at every position of a command that does not match,
+# once per normalised variant the detector generates for the command (one per word whose deobfuscation
+# differs: a handful for a plain command, hundreds for a findings heredoc). The time grows roughly with the
+# cube of the command's length and the scan holds the GIL, so the worker stalls whole: no heartbeat, no
+# tool result. Timed on v2026.9.14 at 3.5 s for 4.7 KB and 23 s for 8.9 KB, and in nightly build
+# 2103273400171499520 every terminal call of 16 KB or more hung or timed out at the tool executor's 420 s
+# guard (kube-agents #2013; upstream agent/tool_executor.py, _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S). A
+# JSON-bodied heredoc of the fleet-audit findings' shape reproduces it (5 s at 4.6 KB and 33 s at 8.7 KB
+# unanchored; 0.3 s, 1.0 s and 13.5 s at 32 KB anchored), which is how a fleet-audit worker that has
+# finished its checks hangs on the one call that writes them. Upstream anchored the rule with \A in
+# ea870b4d3e, shipped from v2026.9.21 (on v2026.9.24 a 32 KB command checks in 0.24 s); this carries the
+# one edit until the base moves, and the count guard fails the build the day the base already has it. The
+# last line is upstream's regression test for the fix: the anchored rule answers a 100 KB non-matching
+# input in microseconds and the unanchored one in tens of seconds, so a 5 s bound tells the two apart.
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_targets.py'); c = p.read_text(); t = '    parser = _PLATFORM_PARSERS.get(platform_name)\n'; r = '    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\") and \"/threads/\" in target_ref:\n            return target_ref.split(\"/threads/\", 1)[0].strip(), target_ref.strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True\n' + t; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
     grep -qF 'if platform_name == "google_chat":' /opt/hermes/tools/send_message_targets.py && \
-    grep -qF 'target_ref.split("/threads/", 1)[0]' /opt/hermes/tools/send_message_targets.py
+    grep -qF 'target_ref.split("/threads/", 1)[0]' /opt/hermes/tools/send_message_targets.py && \
+    /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/approval_detection.py'); c = p.read_text(); t = r\"(r'(?=[\s\S]*\blaunchctl\"; r = r\"(r'\A(?=[\s\S]*\blaunchctl\"; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
+    grep -qF "(r'\A(?=[\s\S]*\blaunchctl" /opt/hermes/tools/approval_detection.py && \
+    cd /opt/hermes && timeout 5 /opt/hermes/.venv/bin/python3 -c "from tools.approval_detection import DANGEROUS_PATTERNS_COMPILED as P; r = [rx for rx, d in P if d == 'stop/restart hermes launchd service (kills running agents)']; assert len(r) == 1 and r[0].search('x' * 100000) is None"
 
 # A dependency-free text utility, copied in on its own and ahead of both of its
 # callers. tools/cron_run_scope.py imports it a few layers below for a different
@@ -669,6 +697,16 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
 #
+# Slack agent view, behind KAGE_SLACK_UX (off by default; off leaves both files
+# behaving as upstream). With it on, --agent-view describes the app by its
+# --name, and the adapter answers a new thread or DM open with three suggested
+# prompts when platforms.slack.extra.suggested_prompts is unset. The default
+# stays assistant view: agent view is one-way in Slack. Runs after the
+# reactions-scope patch below because both edit slack_cli.py; the verifier
+# drives the real manifest command and prompt reader with the flag off and on.
+# Rides this COPY and RUN too.
+# See the module docstring in deploy/docker/patches/apply_slack_agent_view.py.
+#
 # Slack: ask for the reactions scope the adapter already spends. `hermes slack
 # manifest` is the only description of the Slack app an installer ever writes --
 # the operator pastes that JSON in and clicks Save -- and its bot_scopes list
@@ -700,13 +738,28 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # Rides this COPY and RUN for the same budget reason as the block above.
 # See the module docstring in
 # deploy/docker/patches/apply_slack_reactions_scope.py.
+#
+# Slack: with KAGE_SLACK_UX on, react to each ask by its kind (eyes, hammer and
+# wrench, clipboard, rotating light) and add a settle reaction beside it when
+# the work ends, never removing one -- the credential proxy refuses reactions.remove,
+# so upstream's eyes-for-a-tick swap leaves both. The two hooks gain a guard
+# that hands over to gateway/slack_ux_reactions.py; with the flag off they run
+# upstream's body untouched. slack_presenter.py is staged here only so the
+# verifier can import it; the image ships it under /opt/defaults/scripts. Also
+# rides this COPY and RUN. See deploy/docker/patches/slack_ux_reactions.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
      deploy/docker/patches/apply_slack_reactions_scope.py \
      deploy/docker/patches/verify_slack_reactions_scope.py \
+     deploy/docker/patches/apply_slack_ux_reactions.py \
+     deploy/docker/patches/verify_slack_ux_reactions.py \
+     deploy/docker/patches/slack_ux_reactions.py \
+     agents/platform/scripts/slack_presenter.py \
      deploy/docker/patches/patchlib.py \
+     deploy/docker/patches/apply_slack_agent_view.py \
+     deploy/docker/patches/verify_slack_agent_view.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
@@ -717,10 +770,18 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
     grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
+    install -m 0644 /tmp/message-surface/slack_ux_reactions.py /opt/hermes/gateway/slack_ux_reactions.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_reactions.py /opt/hermes && \
+    grep -qF "_kage_slack_ux.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
     cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
+    grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
+    grep -qF "_KAGE_SUGGESTED_PROMPTS = " /opt/hermes/plugins/platforms/slack/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_agent_view.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -1067,6 +1128,24 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # and the entrypoint's step 1.7; this is the belt for any database that stays
 # in WAL. Ordered before the two above only because it is independent of them.
 # See the module docstring in deploy/docker/patches/apply_state_db_synchronous_full.py.
+#
+# mcp_toolset_names rides the same COPY and RUN too, one statement in cli.py
+# that shares nothing with the three above: the CLI's pre-discovery toolset check
+# excludes configured MCP servers by their bare name while a profile lists
+# them by their registry alias (mcp-<server>), so every MCP toolset printed as
+# unknown on stdout ahead of the answer, which under `hermes chat -Q` is the
+# answer the Hermes bridge publishes (#2035). Upstream
+# NousResearch/hermes-agent#78102; this patch goes when a Hermes bump carries
+# the fix. See the module docstring in deploy/docker/patches/apply_mcp_toolset_names.py.
+#
+# quiet_rate_limit_exit rides it too, one condition in cli.py's one-shot exit
+# block: a kanban worker whose turn gave up on a rate limit exits 75 so the
+# dispatcher does not count it a failure, and a plain `hermes chat -Q` run (the
+# Hermes bridge's invocation) exited 1 for the same turn and was graded as the
+# persona's failure (#2036). The patch drops the kanban requirement; the
+# bridge names exit 75 `hermes-rate-limited`. Applied after kanban_guardrail_exit
+# because that patch inserts above this block and leaves the anchor alone. See
+# the module docstring in deploy/docker/patches/apply_quiet_rate_limit_exit.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      /opt/hermes/hermes_cli/
@@ -1076,11 +1155,17 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_rate_limit_retry_delay.py \
      deploy/docker/patches/apply_state_db_synchronous_full.py \
      deploy/docker/patches/verify_state_db_synchronous_full.py \
+     deploy/docker/patches/apply_mcp_toolset_names.py \
+     deploy/docker/patches/verify_mcp_toolset_names.py \
+     deploy/docker/patches/apply_quiet_rate_limit_exit.py \
+     deploy/docker/patches/verify_quiet_rate_limit_exit.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardrail_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_rate_limit_retry_delay.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_mcp_toolset_names.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_quiet_rate_limit_exit.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
@@ -1088,9 +1173,13 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
     grep -q "_kube_block_rate_limited_chat(turn.result)" /opt/hermes/hermes_cli/cli_chat_turn_mixin.py && \
     grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/turn_recovery.py && \
+    grep -q 'mcp_names |= {f"mcp-{_kube_mcp_name}" for _kube_mcp_name in mcp_names}' /opt/hermes/cli.py && \
+    grep -q 'kube-agents patch: quiet_rate_limit_exit' /opt/hermes/cli.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_mcp_toolset_names.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_quiet_rate_limit_exit.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
@@ -1120,11 +1209,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # 12:58: coordinator t_b9659077 was subscribed, the 4 cards it created as a
 # WORKER were not, and the synthesizer's answer sat undelivered for 91.3s
 # (gateway.log: zero Slack sends 12:59:02-13:02:15) until the user asked. The
-# manual remedy (agents/platform/scripts/kanban_notify_propagate.py) relies on
-# the worker
-# remembering to run it; it didn't. Same column set and INSERT OR IGNORE
-# idempotency as that script, so keeping it around as a back-fill tool
-# double-writes harmlessly. verify_kanban_auto_subscribe.py replays the
+# manual remedy, a propagate script the worker had to remember to run, did not
+# get run; it has since been deleted. verify_kanban_auto_subscribe.py replays the
 # incident through the real patched create handler on a real board.
 # Since v2026.9.14 upstream's create_task inherits the creator card's
 # subscriptions inside the creation transaction itself, so that verifier passes
@@ -1237,6 +1323,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # that chain past Docker's layer-depth ceiling ("max depth exceeded" on build
 # f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
 # same grep guards, same behavioural verifies — only the layer count differs.
+# skill_manage_image_owned rides here for the same reason: it gates
+# tools/skill_manager_tool.py::skill_manage, and the file tools' write guard in
+# agent/file_safety.py, so a skill the image ships cannot be rewritten from
+# inside the agent by either writer (gke-labs/kube-agents#1848). See the module
+# docstring in deploy/docker/patches/skill_manage_image_owned.py.
 COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/apply_kanban_wake_nudge.py \
      deploy/docker/patches/verify_kanban_wake_nudge.py \
@@ -1259,6 +1350,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
      deploy/docker/patches/verify_credential_redaction.py \
+     deploy/docker/patches/skill_manage_image_owned.py \
+     deploy/docker/patches/apply_skill_manage_image_owned.py \
+     deploy/docker/patches/verify_skill_manage_image_owned.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 # `install -m 0644`, not `cp`, for the first line. `cp` gives a newly created
@@ -1269,7 +1363,7 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
 # cannot read the result. Same failure agentplugins/lib/plugin_image.sh:798
 # stages against for the plugin image, same cause.
 #
-# The other five land in /opt/hermes/tools and /opt/hermes/gateway, which the
+# The other six land in /opt/hermes/tools and /opt/hermes/gateway, which the
 # `platform` stage normalizes; /opt/hermes/hermes_cli is the one patch
 # destination no loop walks, so it is stated here at the write site.
 RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
@@ -1309,6 +1403,13 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
     test "$(grep -c '_kube_agents_redact_tool_argument' /opt/hermes/agent/display.py)" = "2" && \
     test "$(grep -c '_kube_agents_install_transcript_redaction()' /opt/hermes/hermes_cli/main.py)" = "1" && \
+    cp /tmp/latency-patches/skill_manage_image_owned.py /opt/hermes/tools/skill_manage_image_owned.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_skill_manage_image_owned.py /opt/hermes && \
+    test "$(grep -c 'from tools.skill_manage_image_owned import image_owned_batch_refusal, image_owned_refusal' /opt/hermes/tools/skill_manager_tool.py)" = "1" && \
+    test "$(grep -c 'image_owned_batch_refusal(operations, name or None)' /opt/hermes/tools/skill_manager_tool.py)" = "1" && \
+    grep -q 'return tool_error(_image_owned, success=False)' /opt/hermes/tools/skill_manager_tool.py && \
+    test "$(grep -c 'from tools.skill_manage_image_owned import image_managed_tree' /opt/hermes/agent/file_safety.py)" = "2" && \
+    grep -q 'return "image_managed"' /opt/hermes/agent/file_safety.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
@@ -1317,6 +1418,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches
 
 
@@ -1483,8 +1585,17 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of taking the credential out of reach of the container the model's code used
 # to run in.
 
-# Copy event-watcher binary from builder stage
-COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
+# The event watcher and the drift detector, from the same builder stage and in one
+# layer: agent-base -> platform is the deepest chain against the ceiling in
+# scripts/check_image_layers.py, so a second COPY next to an identical one is a
+# layer spent for nothing.
+#
+# The detector ships in every image and starts in none of them unless
+# DRIFT_DETECTOR_ENABLED says so: the subscription it reads exists only where the
+# drift-pubsub Terraform module was applied, so shipping it started by default
+# would give an install without one a process retrying a failing pull for the life
+# of the pod, on a pod that stays Ready while it does.
+COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
 # The a2a CLI, ungated (see the a2a-builder stage for why that is safe).
 COPY --from=a2a-builder --chmod=0755 /workspace/bin/a2a /usr/local/bin/a2a
@@ -1590,11 +1701,19 @@ COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 #                              is already WAL, so without this the pin reaches only
 #                              databases created after it — see
 #                              tests/test_sqlite_journal_migrate.py.
+#   terminal_env_pin.py        copies the managed terminal settings into every profile's
+#                              .env and checks with Hermes that scheduled runs resolve the
+#                              ssh backend (entrypoint step 4b, fatal; cluster_agent_profile.py
+#                              for profiles scaffolded later; --build-check at the end of
+#                              this stage). The terminal scope a cron job runs under ignores
+#                              the managed config, so without it cron jobs use Hermes'
+#                              default local backend — see tests/test_terminal_env_pin.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
      deploy/shared/sandbox_mirror.py \
      deploy/shared/sqlite_journal_migrate.py \
+     deploy/shared/terminal_env_pin.py \
      /opt/defaults/scripts/
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
@@ -1623,6 +1742,10 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # reason in step 2a.
 COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
+# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
+COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
+
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
@@ -1649,10 +1772,17 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # that check allows, so a COPY/RUN pair of its own spends a third of what is
 # left. See the
 # module docstring for what a failure here means.
+#
+# check_skill_commands.py rides along the same way. It runs every shell block
+# in the SKILL.md files of the image's three skill trees through Hermes' Tirith
+# scan, which is why the Cluster Agent template is copied above this block
+# rather than below it.
+# It downloads the Tirith release it pins; see its module docstring.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
+     deploy/docker/check_skill_commands.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
@@ -1665,11 +1795,11 @@ assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % cap
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
+        agents/platform/skills=/opt/platform-template/skills \
+        agents/cluster/skills=/opt/cluster-template/skills \
+        a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
-
-# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
-# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
-COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
 # Plugins land in the shared plugin root regardless of which profile owns them —
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
@@ -1727,8 +1857,9 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 #     AGENTS.md, CAPABILITIES.md, governance/, cron/ and config.yaml sit beside
 #     skills/ and are force-synced into the platform profile on every boot by
 #     entrypoint step 2.6, and the cluster template's personas are re-copied into
-#     every cluster-* profile by its continuation. A rewritten SOUL.md is more
-#     load-bearing than any single SKILL.md.
+#     every cluster-* profile by its continuation, which also back-fills every
+#     key its config.yaml adds. A rewritten SOUL.md is more load-bearing than any
+#     single SKILL.md.
 #   - /opt/hermes/plugins (barriered by the stage's first RUN; listed for
 #     what it covers). It is the only path Hermes resolves plugins from, holding
 #     Python imported into the agent's own process — a strictly stronger capability
@@ -1902,7 +2033,8 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts; \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -m tools.skill_manage_image_owned --check-roots
 
 # Guard: nothing that carries a cluster credential may come back into this image.
 #
@@ -1916,6 +2048,21 @@ RUN set -eu; \
 # holds the Workload Identity — succeeding, silently, in the container #737
 # exists to take that capability away from. Nothing else in the build or the
 # test suite would report it.
+#
+# The same RUN asks the Hermes this image ships whether terminal_env_pin.py's .env
+# copy still sends a profile's scheduled runs to the ssh sandbox, including over a
+# backend the profile's config.yaml still sets. It is in this RUN rather
+# than its own because the chain is at the layer ceiling. It fails the build when
+# the copy stops working, and only warns when Hermes resolves ssh without the copy,
+# because the copy still agrees then and a failure would block the Hermes bump.
+#
+# It also asks that Hermes for the context-file cap each profile's shipped
+# config.yaml gives it, on the unknown-window path (no context_length), and fails
+# the build if that profile's SOUL.md is longer. Hermes keeps only the head and
+# tail of a file over the cap, so a persona that outgrows it, or a renamed or
+# ignored context_file_max_chars, would otherwise drop the middle of the prompt
+# with nothing but a log line. Each check runs in a scratch HERMES_HOME holding a
+# copy of the template's config.yaml, so Hermes writes nothing into the template.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
@@ -1926,6 +2073,21 @@ RUN set -eu; \
         echo "cluster tooling is back in the agent image: ${binary}" >&2; \
         exit 1; \
       fi; \
+    done; \
+    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check; \
+    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template; do \
+      config_dir="${profile%%:*}"; soul="${profile#*:}/SOUL.md"; \
+      scratch="$(mktemp -d)"; \
+      cp "${config_dir}/config.yaml" "${scratch}/config.yaml"; \
+      HERMES_HOME="${scratch}" /opt/hermes/.venv/bin/python3 -c "\
+import pathlib, sys; \
+from agent.prompt_builder import _get_context_file_max_chars; \
+soul, config = sys.argv[1], sys.argv[2]; \
+size = len(pathlib.Path(soul).read_text(encoding='utf-8').strip()); \
+cap = _get_context_file_max_chars(); \
+assert size <= cap, '%s is %d chars, over the %d-char context-file cap Hermes takes from %s, so the prompt would carry it truncated' % (soul, size, cap, config)" \
+        "${soul}" "${config_dir}/config.yaml"; \
+      rm -rf "${scratch}"; \
     done
 
 USER 10000:10000
@@ -2094,6 +2256,7 @@ COPY --chown=root:root --chmod=0755 \
      deploy/shared/otel_config.py \
      deploy/shared/sandbox_mirror.py \
      deploy/shared/sqlite_journal_migrate.py \
+     deploy/shared/terminal_env_pin.py \
      /opt/defaults/scripts/
 
 USER 10000:10000

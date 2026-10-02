@@ -13,7 +13,7 @@ Delegating is optional. Use this fan-out when you want per-cluster local validat
 
 ## The card graph (fan-out validation → decide on your own card)
 
-Resolve each cluster's profile name first (`cluster_agent_profile.py name --project … --cluster … --location …`), then:
+Resolve each cluster's profile name first with the `get_cluster_profile_name(project, cluster, location)` tool, and assign a card only to a profile it reports as existing (for a cluster with none, validate it yourself — `SOUL.md` §6 step 1), then:
 
 1. **Card A — can clusterA host it?** `kanban_create(assignee="<clusterA-profile>", title="Validate can-host <workload>", body="Can you host <ns/workload> (needs ~<cpu>/<mem>)? Check capacity, affinity/taints, quotas. Do NOT mutate.")`
 2. **Card B — is clusterB safe to evacuate?** `kanban_create(assignee="<clusterB-profile>", title="Validate safe-to-evacuate <workload>", body="Is it safe to evacuate <ns/workload>? Check PDBs, statefulness/local PVs, in-flight work. Do NOT mutate.")`

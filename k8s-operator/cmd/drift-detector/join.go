@@ -151,7 +151,7 @@ func (c joinCounts) String() string {
 }
 
 // DriftEvent is an audit record plus what the live object says about it. It is
-// the value T4 turns into a gitops-drift inject.
+// the value the inject flattens into a gitops-drift payload.
 type DriftEvent struct {
 	// Record is the audited change, unchanged from what T2 forwarded.
 	Record AuditRecord
@@ -182,8 +182,11 @@ type DriftEvent struct {
 	LookupError error
 }
 
-// driftEventHandler consumes an enriched record. T4 replaces logDriftEvent with
-// the inject.
+// driftEventHandler consumes an enriched record. logDriftEvent is one; with
+// --daemon-url set the handler is driftInjectHandler.Handle, which calls
+// logDriftEvent first and then injects. The inject is layered over the log line
+// rather than swapped for it, so the DRIFT lines an operator greps for are the
+// same whether or not escalation is on.
 type driftEventHandler func(context.Context, DriftEvent)
 
 // objectGetter is the slice of dynamic.Interface the join uses. Narrowing it
@@ -573,8 +576,8 @@ func (j *joiner) reconciledBy(owners []fieldOwner, changedAt time.Time) (bool, s
 		// is the wrong one: `flux suspend kustomization apps` patches
 		// spec.suspend, the controller's next status write lands a few seconds
 		// after the audited change, and the event goes out Reconciled while the
-		// person's change stands untouched. That is the reading T4 would act on
-		// to suppress the inject.
+		// person's change stands untouched. That is the reading the inject
+		// carries as reconciled=true.
 		//
 		// Skipping the entry rather than requiring it to match the audited
 		// change's own subresource, which looks sharper and is wrong for
@@ -648,8 +651,9 @@ func (j *joiner) Counts() joinCounts {
 	return j.counts
 }
 
-// logDriftEvent is T3's terminal handler, replacing T2's logActionable. T4
-// replaces this with the inject.
+// logDriftEvent is the terminal handler, replacing T2's logActionable. It stays
+// the terminal handler with the inject on: driftInjectHandler.Handle calls it
+// before sending, so a record whose inject fails is still on stdout.
 func logDriftEvent(_ context.Context, event DriftEvent) {
 	record := event.Record
 

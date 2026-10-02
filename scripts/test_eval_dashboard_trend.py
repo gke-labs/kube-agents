@@ -113,7 +113,7 @@ class NightOneTest(unittest.TestCase):
         self.assertEqual(d["records"], 4)
         self.assertEqual(d["metrics"], ["OutcomeValidity", "OutcomeScore", "ToolInvocation"], "rung 6's metric first, then by name")
         self.assertEqual(d["default_metric"], "OutcomeValidity")
-        self.assertEqual(d["bar"], {"rate": 0.95, "min_runs": 20})
+        self.assertEqual(d["bar"], {"rate": 0.9, "min_runs": 20})
         self.assertEqual(list(d["keys"]), [KEY_1])
         self.assertEqual(d["keys"][KEY_1], {"setup_id": "gemini-3-1-pro-preview-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1})
         self.assertEqual(sorted(d["cases"]), [n for n, _ in DOMAINS])
@@ -421,7 +421,7 @@ class TrendPageTest(unittest.TestCase):
         self.assertEqual(app.count('class="tcard"'), 4, "one card per domain")
         self.assertEqual(app.count('<svg class="tchart"'), 8, "two charts per card")
         self.assertIn('<a href="trend.html#domain=remediation">remediation</a><small>1 case pooled per night</small>', app)
-        self.assertIn("95% bar", app)
+        self.assertIn("90% bar", app)
         self.assertIn("key: judge_model", app, "the version-key marker is labelled with what changed")
         self.assertIn("Table view · 8 nights", app)
         self.assertIn('<th>Night</th><th>Cases</th><th>Pass rate</th><th>Trailing window</th><th>OutcomeValidity</th><th>Spread</th><th>Version key</th>', app)
@@ -491,10 +491,10 @@ class TrendPageTest(unittest.TestCase):
 
     def test_the_record_line_and_the_window_labels_say_admit_demote_and_cut_on_the_page(self):
         admit = dom_text(self.dense / "trend.html", fragment="#cases=agent-kanban-smoke")
-        self.assertIn("<b>Record today: the record would admit it.</b> 21/21 across 7 nights at the current key against a bar of 95% over 20", admit)
+        self.assertIn("<b>Record today: the record would admit it.</b> 21/21 across 7 nights at the current key against a bar of 90% over 20", admit)
         self.assertIn("100% of 21</text>", admit, "the window label of a full window carries no caveat")
         demote = dom_text(self.dense / "trend.html", fragment="#cases=rca-remediation-pr")
-        self.assertIn("<b>Record today: the record would demote it.</b> 7/21 across 7 nights at the current key against a bar of 95% over 20", demote)
+        self.assertIn("<b>Record today: the record would demote it.</b> 7/21 across 7 nights at the current key against a bar of 90% over 20", demote)
         # The sparse case: two records inside the read and three older ones the listing showed.
         cut = dom_text(self.dense / "trend.html", fragment="#cases=sparse-case")
         self.assertIn("<b>Record today: not knowable from this read.</b> 6/6 across 2 nights at the current key inside this read; the store may hold older records at this key that admission pools and this page did not read", cut)

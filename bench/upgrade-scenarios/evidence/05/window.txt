@@ -1,0 +1,30 @@
+
+## 2026-09-29T13:49:59Z [window/exclusion] G container clusters update upg-05 --zone us-central1-a --add-maintenance-exclusion-name hold-minor --add-maintenance-exclusion-start 2026-09-29T13:49:59Z --add-maintenance-exclusion-end 2026-10-02T13:49:59Z --add-maintenance-exclusion-scope no_minor_upgrades --quiet
+Updating upg-05...
+.........................done.
+Updated [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-a/clusters/upg-05].
+To inspect the contents of your cluster, go to: https://console.cloud.google.com/kubernetes/workload_/gcloud/us-central1-a/upg-05?project=<PROJECT_ID>
+## exit 0
+
+## 2026-09-29T13:51:06Z [window/policy] G container clusters describe upg-05 --zone us-central1-a --format=yaml(maintenancePolicy)
+maintenancePolicy:
+  resourceVersion: d6f5d953
+  window:
+    maintenanceExclusions:
+      hold-minor:
+        endTime: '2026-10-02T13:49:59Z'
+        maintenanceExclusionOptions:
+          scope: NO_MINOR_UPGRADES
+        startTime: '2026-09-29T13:49:59Z'
+    recurringWindow:
+      recurrence: FREQ=DAILY
+      window:
+        endTime: '2000-01-01T07:00:00Z'
+        startTime: '2000-01-01T03:00:00Z'
+## exit 0
+## 2026-09-29T13:51:08Z [window/note] manual master upgrade to 1.35.8-gke.1380000 outside the 03:00-07:00Z window and inside a NO_MINOR_UPGRADES exclusion
+
+## 2026-09-29T14:00:05Z [window/after] G container clusters describe upg-05 --zone us-central1-a --format=value(currentMasterVersion,maintenancePolicy.window.maintenanceExclusions)
+1.35.8-gke.1380000	hold-minor={'endTime': '2026-10-02T13:49:59Z', 'maintenanceExclusionOptions': {'scope': 'NO_MINOR_UPGRADES'}, 'startTime': '2026-09-29T13:49:59Z'}
+## exit 0
+## 2026-09-29T14:00:06Z [window/note] the window half cannot be forced: GKE decides when an automatic upgrade starts; observe-only

@@ -371,7 +371,7 @@ _FINAL_VERDICT = re.compile(
 #   🏷️ RELEASE CANDIDATE EVAL
 #   Candidate:   staging_2609092307_5b5ad10 (5b5ad10163cf10c73871b279518c7165c098bec9)
 #   Tier:        nightly
-#   Verdict:     GREEN (advisory: this lane gates nothing)
+#   Verdict:     GREEN (GREEN promotes this candidate to staging)
 #   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
 # The Artifacts line is absent when the driver ran outside Prow (no JOB_NAME
 # or BUILD_ID), so it is optional here. The whole banner is absent when the
@@ -416,8 +416,10 @@ _REP_RESULT_BY_VERDICT = {"pass": "pass", "infra": "infra"}
 # The final verdict line's word, as runs[].eval_verdict records it (the
 # release record's GREEN/RED vocabulary). The run gets None when the log has
 # no such line: the job ended before its verdict -- Prow's deadline (SIGTERM;
-# hack/ci-eval-pr.sh's EXIT trap prints no banner), a death before the
-# cases, or step 0's revalidation, which is a SUCCESS.
+# hack/ci-eval-pr.sh's EXIT trap prints `Eval ended before its verdict: N of
+# M cases graded ...`, which carries neither anchor word on purpose, so the
+# night reads as truncated with its graded cases counted), a death before
+# the cases, or step 0's revalidation, which is a SUCCESS.
 _EVAL_VERDICT_BY_WORD = {"Succeeded": "GREEN", "Failed": "RED"}
 
 
@@ -826,8 +828,11 @@ def build_release(build_id: str, read) -> dict | None:
         "commit": (banner["commit"] or run["head_sha"] or "")[:7] or None,
         "tier": banner["tier"],
         "verdict": banner["verdict"],
-        # Prow's own verdict on the job, which is not the eval's: the lane is
-        # advisory, so a RED candidate still reports SUCCESS. It is here for
+        # Prow's own verdict on the job, which is not the eval's. They agree on
+        # a red candidate now that the job no longer swallows the driver's exit
+        # code, and part on a lane that broke before measuring anything: a
+        # failed deploy exits non-zero with a NOT RUN banner, so the job is red
+        # while the verdict says nothing about the candidate. It is here for
         # the case where the banner is missing entirely, where it is the only
         # thing that says whether the job survived.
         "result": run["result"],
@@ -1101,10 +1106,10 @@ def annotate_pr_merged(runs: list[dict], gh: str, now: datetime | None = None) -
 # --------------------------------------------------------------------------
 
 
-def _gsutil_call(args: list[str], gsutil: str = "gsutil") -> tuple[str | None, str]:
+def _gsutil_call(args: list[str], gsutil: str = "gsutil", runner=subprocess.run) -> tuple[str | None, str]:
     """(stdout, stderr) of one gsutil call; stdout None when it failed."""
     try:
-        proc = subprocess.run(
+        proc = runner(
             [gsutil, *args],
             capture_output=True,
             text=True,

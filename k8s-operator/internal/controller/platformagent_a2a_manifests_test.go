@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -354,7 +355,7 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -369,6 +370,13 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	}
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+	// The provision Job waits on a serving callout replica, like the
+	// gateway (TestA2AProvisionJobWaitsForTheCallout); report one and pass
+	// again so the Job is there to assert on.
+	reportCalloutServing(t, ctx, cl, agent)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
 	}
 
 	sts := &appsv1.StatefulSet{}
@@ -394,8 +402,8 @@ func TestReconcileA2AGatedByMode(t *testing.T) {
 	if err := cl.List(ctx, jobs); err != nil || len(jobs.Items) == 0 {
 		t.Errorf("provision Job not rendered under next (err=%v, n=%d)", err, len(jobs.Items))
 	}
-	// The gateway waits on BusCredentialsReady (see the gate tests); under
-	// next with a serving callout it renders like the rest.
+	// The gateway waits on a serving callout replica (see the gate tests);
+	// under next with a serving callout it renders like the rest.
 	letTheGatewayThrough(t, ctx, cl, r, req, agent)
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-gateway", Namespace: "test-ns"}, dep); err != nil {
@@ -449,7 +457,7 @@ func TestUnrecognizedModePreservesRunningNextStack(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -969,6 +977,107 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 // without the others is the failure this PR's scoping exists to avoid: the
 // flag without the verbs is a gateway that refuses every delegation, and the
 // verbs without the flag are a standing pod-lifecycle grant with no caller.
+// The first-party next-stack images follow the operator image, else the
+// agent image the operator resolves for itself, so a chart install at X.Y.Z
+// pulls them at X.Y.Z, an install that mirrored the operator has mirrored
+// them, and a flip to next pulls nothing from a registry no operator input
+// can redirect.
+func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
+	resolvers := map[string]struct {
+		envVar  string
+		resolve func() string
+		name    string
+	}{
+		"gateway": {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
+		"worker":  {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
+		"callout": {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
+	}
+	for label, r := range resolvers {
+		t.Run(label, func(t *testing.T) {
+			t.Setenv(r.envVar, "")
+			t.Setenv(platformAgentImageEnvVar, "")
+			t.Setenv(operatorImageEnvVar, "")
+			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":"+DefaultPlatformAgentVersion; got != want {
+				t.Errorf("no env: %q, want the published repository at the fallback tag %q", got, want)
+			}
+			// The chart's install: PLATFORM_AGENT_IMAGE pinned to the release.
+			t.Setenv(platformAgentImageEnvVar, "ghcr.io/gke-labs/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("PLATFORM_AGENT_IMAGE set: %q, want the release tag %q", got, want)
+			}
+			// A mirrored chart install.
+			t.Setenv(platformAgentImageEnvVar, "mirror.corp.internal:5000/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("mirrored PLATFORM_AGENT_IMAGE: %q, want the mirror's prefix %q", got, want)
+			}
+			// OPERATOR_IMAGE outranks the agent image: the bus components'
+			// version contract is with the operator that renders their
+			// config, so an agent redeploy that moves PLATFORM_AGENT_IMAGE
+			// alone does not move them.
+			t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator:0.3.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("OPERATOR_IMAGE and PLATFORM_AGENT_IMAGE set: %q, want the operator's registry and tag %q", got, want)
+			}
+			// A kustomize install with neither set, where the operator
+			// discovers its own image at boot.
+			t.Setenv(platformAgentImageEnvVar, "")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("OPERATOR_IMAGE set: %q, want the operator's registry and tag %q", got, want)
+			}
+			// A digest-only operator reference names no tag, so it falls
+			// through to the agent image rather than sending these to
+			// :latest beside a release-tagged agent.
+			t.Setenv(operatorImageEnvVar, "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:1111111111111111111111111111111111111111111111111111111111111111")
+			if got, want := r.resolve(), "ghcr.io/gke-labs/kube-agents/"+r.name+":latest"; got != want {
+				t.Errorf("digest-pinned operator, no agent image: %q, want %q", got, want)
+			}
+			t.Setenv(platformAgentImageEnvVar, "mirror.corp.internal:5000/kube-agents/platform-agent:0.9.0")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.9.0"; got != want {
+				t.Errorf("digest-pinned operator beside a tagged agent: %q, want the agent's tag %q", got, want)
+			}
+			t.Setenv(operatorImageEnvVar, "mirror.corp.internal:5000/kube-agents/k8s-operator:0.3.0@sha256:1111111111111111111111111111111111111111111111111111111111111111")
+			if got, want := r.resolve(), "mirror.corp.internal:5000/kube-agents/"+r.name+":0.3.0"; got != want {
+				t.Errorf("tag-and-digest operator: %q, want the operator's tag %q", got, want)
+			}
+			t.Setenv(platformAgentImageEnvVar, "")
+			t.Setenv(r.envVar, "registry.example/pinned/"+r.name+":v9")
+			if got, want := r.resolve(), "registry.example/pinned/"+r.name+":v9"; got != want {
+				t.Errorf("override set: %q, want the override %q", got, want)
+			}
+		})
+	}
+}
+
+// Every image a next render pulls follows the mirror when only the agent
+// image names it (a chart install that set no OPERATOR_IMAGE): no
+// public-registry reference leaks on the air-gapped path, the rule
+// TestNoPublicRegistryWhenMirrored states for the agent Deployment.
+func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
+	const mirror = "mirror.corp.internal:5000/kube-agents"
+	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, operatorImageEnvVar} {
+		t.Setenv(v, "")
+	}
+	t.Setenv(platformAgentImageEnvVar, mirror+"/platform-agent:0.3.0")
+	agent := a2aTestAgent()
+	gw := buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0]
+	if gw.Image != mirror+"/a2a-gateway:0.3.0" {
+		t.Errorf("gateway image %q does not follow the agent image's mirror", gw.Image)
+	}
+	workerEnv := ""
+	for _, e := range gw.Env {
+		if e.Name == "A2A_WORKER_IMAGE" {
+			workerEnv = e.Value
+		}
+	}
+	if workerEnv != mirror+"/a2a-worker:0.3.0" {
+		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
+	}
+	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
+	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
+		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
+	}
+}
+
 func TestBuildA2AGatewaySpawnArming(t *testing.T) {
 	agent := a2aTestAgent()
 
@@ -1733,7 +1842,7 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				}
 				// The number it does name is the width a fresh render
 				// creates, not the raw budget. This agent takes the
-				// default maxSessions, so its budget (46) sits below
+				// default maxSessions, so its budget (62) sits below
 				// the floor its TASKS renders at (64), and the
 				// refusal is reached as readily by an operator
 				// upgrade whose stream is already at that floor. A
@@ -1781,12 +1890,16 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
-// early exit. The exit reads four sentinels and returns when all are absent,
+// early exit. The exit reads seven sentinels and returns when all are absent,
 // which is only sound while nothing it deletes can outlive them: the
-// StatefulSet is deleted last, the gateway Deployment first, and the callout
-// keys and config Secrets are the deletable objects the render creates first.
-// TestTheEarlyExitSeesEveryObjectTheRenderCreatesFirst holds that soundness
-// one object at a time; this one holds it across a pass that dies partway.
+// StatefulSet is deleted last, the gateway Deployment first, the callout
+// keys and config Secrets are the deletable objects the render creates first,
+// the two fences are what the guardrail path writes on a refusal, and the
+// inject fence is what a hand-deleted pair leaves of them.
+// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere holds that soundness
+// one object at a time; this one holds it across a pass that dies partway, and
+// TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall across one that
+// dies partway through the fences-only shape.
 //
 // The failure this pins is the one the optimisation invites — a pass that dies
 // partway leaves objects behind, and the NEXT pass steps over them because its
@@ -1817,11 +1930,16 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	// The gateway is the first object cleanupA2A deletes, so it is the object
 	// this test's early-exit argument turns on -- and reconcileA2A withholds
-	// its creation until BusCredentialsReady is True. Driving reconcileA2A
-	// directly never publishes that condition, so without this the gateway is
-	// never created and the "it is gone after cleanup" row below asserts the
+	// its creation until a callout replica reports serving. The fake client
+	// runs no Deployment controller, so without this the gateway is never
+	// created and the "it is gone after cleanup" row below asserts the
 	// absence of an object the render never made.
-	busCredentialsAreReady(agent)
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	// The teardown list carries the inject door's four objects, which render
+	// only under the operator's flag; set it, so the precondition below
+	// covers them rather than failing on objects the render was told not to
+	// make.
+	t.Setenv(a2aInjectBackendEnvVar, "true")
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
@@ -1880,11 +1998,11 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean measures the thing the
-// change was for. Counting is the only honest check here: the early exit is a
-// cost optimisation, and a correctness test passes just as well with the reads
-// still happening one object at a time.
-func TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean(t *testing.T) {
+// TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean measures the thing
+// the change was for. Counting is the only honest check here: the early exit
+// is a cost optimisation, and a correctness test passes just as well with the
+// reads still happening one object at a time.
+func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -1908,17 +2026,21 @@ func TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Four sentinel Gets and nothing else: no per-object walk, and in
+	// Seven sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
 	// The literal moved 3 -> 4 when the callout keys Secret joined the
-	// sentinels. Raising it is a real decision — every today install pays it
-	// on every reconcile, forever — so it is spelled out rather than derived.
-	// The inequality below is the part that must hold whatever the literal is:
-	// the exit is only worth having while it costs less than the walk.
-	if gets != 4 {
-		t.Errorf("Gets = %d, want 4 (the sentinels); the per-object walk is running on a no-op", gets)
+	// sentinels, 4 -> 6 when the two fences did (#2197), and 6 -> 7 when the
+	// inject door's fence did, for the hand-deleted pair that leaves it
+	// standing alone; the fences are Owns kinds, so those three reads come
+	// from the cache and only the two Secrets are uncached. Raising it is a
+	// real decision — every today install pays it on every reconcile,
+	// forever — so it is spelled out rather than derived. The inequality
+	// below is the part that must hold whatever the literal is: the exit is
+	// only worth having while it costs less than the walk.
+	if gets != 7 {
+		t.Errorf("Gets = %d, want 7 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -1931,11 +2053,13 @@ func TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean(t *testing.T) {
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
 // half of the optimisation the test above prices.
 //
-// cleanupA2A answers "is there anything to tear down?" from four objects. That
-// is sound only while every render that leaves residue leaves at least one of
-// the four, and the case that breaks it is not a full render -- it is a render
-// that died partway. Miss it and an A2A object stays alive on a today install,
-// which is the darkness property.
+// cleanupA2A answers "is there anything to tear down?" from seven objects: the
+// NATS StatefulSet, the gateway Deployment, the NATS, session and inject
+// fences, and the callout keys and NATS config Secrets. That is sound only
+// while every render that leaves residue leaves at least one of the seven, and
+// the case that breaks it is not a full render -- it is a render that died
+// partway. Miss it and an A2A object stays alive on a today install, which is
+// the darkness property.
 //
 // The reachable partial renders are the prefixes of reconcileA2A's own order,
 // so that is what this walks: fail the Nth object the render writes, for every
@@ -1943,6 +2067,14 @@ func TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean(t *testing.T) {
 // from the render rather than listed here, so an object inserted anywhere in
 // reconcileA2A -- including ahead of the current first sentinel, which is the
 // way this breaks -- gets a case for free and reds until the exit can see it.
+//
+// reconcileA2A is not the only render. reconcileAgentNetworkGuardrails applies
+// the fences on every refusal, before reconcileA2A is reached, so a next CR
+// refused on its first reconcile holds a prefix of reconcileA2ANetworkFences'
+// writes and nothing else -- the residue #2197 found, which this walk could not
+// see while it cut only reconcileA2A. The second half walks that path the same
+// way, including the complete render (the refusal's own shape), with the inject
+// door off and armed since the door's fence rides the same path.
 func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 	// The one documented survivor: the per-user creds Secret is created before
 	// anything the teardown deletes and is meant to outlive a flip.
@@ -2021,6 +2153,246 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 					"The early exit returned before the walk because none of its sentinels was present. "+
 					"Add the object to the sentinel list in cleanupA2A, or key the exit on something "+
 					"that does not have to be re-derived every time the render grows a step.", n, leftovers)
+			}
+		})
+	}
+
+	for _, door := range []bool{false, true} {
+		t.Run(fmt.Sprintf("guardrail_path_door_armed_%t", door), func(t *testing.T) {
+			if door {
+				t.Setenv(a2aInjectBackendEnvVar, "true")
+			}
+			fences := 0
+			unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &fences), Scheme: scheme}
+			if err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+				t.Fatalf("unobstructed guardrail render: %v", err)
+			}
+			if fences == 0 {
+				t.Fatal("the guardrail path wrote nothing; every case below would be vacuous")
+			}
+
+			// One past the end is the render that did NOT die: every fence
+			// applied and nothing else, which is what a refused first
+			// reconcile leaves.
+			for n := 1; n <= fences+1; n++ {
+				t.Run(fmt.Sprintf("guardrail_dies_on_write_%d_of_%d", n, fences), func(t *testing.T) {
+					writes := 0
+					cl := buildClient(next, n, &writes)
+					r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+					ctx := context.Background()
+
+					err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
+					if n <= fences && err == nil {
+						t.Fatal("want the injected error, got nil: the guardrail render did not die where this case says it did")
+					}
+					if n > fences && err != nil {
+						t.Fatalf("the complete guardrail render failed: %v", err)
+					}
+
+					today := next.DeepCopy()
+					today.Spec.Mode = nil
+					if err := r.cleanupA2A(ctx, today); err != nil {
+						t.Fatalf("cleanupA2A after a guardrail render: %v", err)
+					}
+
+					var leftovers []string
+					sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+						leftovers = append(leftovers, kind+"/"+name)
+					})
+					if len(leftovers) > 0 {
+						t.Errorf("a guardrail render that stopped after write %d leaves these on a today install: %v\n"+
+							"The early exit returned before the walk because none of its sentinels was present; "+
+							"the fences are the only A2A objects a refused CR has.", n, leftovers)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall is
+// TestCleanupA2AResumesAfterAMidPassError over the fences-only shape a refused
+// first reconcile leaves, and it is why the session fence is a sentinel beside
+// the NATS fence. On that shape there is no StatefulSet to outlive a failed
+// pass: the teardown deletes the inject fence, then the NATS fence, then the
+// session fence, so a pass that dies between the last two leaves the session
+// fence alone, and an exit keyed on the NATS fence would step over it. Fail
+// every delete in turn, let a clean pass run, and require the tree empty.
+func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+
+	count := func() int {
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(next.DeepCopy()).
+			WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+			t.Fatalf("guardrail render: %v", err)
+		}
+		return countA2ALabelled(context.Background(), t, cl)
+	}()
+	if count < 2 {
+		t.Fatalf("the guardrail render left %d objects; a one-object shape cannot die between deletes", count)
+	}
+
+	for k := 1; k <= count; k++ {
+		t.Run(fmt.Sprintf("cleanup_dies_on_delete_%d_of_%d", k, count), func(t *testing.T) {
+			deletes, failAt := 0, k
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(next.DeepCopy()).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: fakeServerSideApplyInterceptors().Patch,
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						deletes++
+						if deletes == failAt {
+							return fmt.Errorf("injected: the cleanup dies on delete %d", failAt)
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				}).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+			if err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
+				t.Fatalf("guardrail render: %v", err)
+			}
+
+			if err := r.cleanupA2A(ctx, today); err == nil {
+				t.Fatal("cleanup pass 1: want the injected error, got nil")
+			}
+			failAt = 0
+			if err := r.cleanupA2A(ctx, today); err != nil {
+				t.Fatalf("cleanup pass 2: %v", err)
+			}
+
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("a cleanup that died on delete %d leaves these after the resumed pass: %v\n"+
+					"The early exit stepped over them because the sentinel it keys on had already gone.", k, leftovers)
+			}
+		})
+	}
+}
+
+// TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall pins the
+// ownership rule the early exit applies to its sentinels, from both sides.
+//
+// The walk refuses to delete anything this CR does not own, and Reconcile
+// returns that refusal before status is written. So if a sentinel counted on
+// presence alone, a NetworkPolicy under a reserved name that this CR does not
+// own would send every reconcile of a today install into the refusal with no
+// phase and no conditions, requeued only by the error path's backoff -- a
+// wedge. The shape is concrete: a
+// next CR refused on its first reconcile, deleted, and re-created under the
+// same name in today mode holds its predecessor's fences under the old UID
+// until the garbage collector reaps them. A hand-written NetworkPolicy
+// squatting the name is the same shape without the collector coming.
+//
+// The sentinel rule is: an object counts only when this CR owns it. The rows
+// below plant each fence under a stale UID and under no owner at all and
+// require the reconcile to go through and leave the object alone; the control
+// plants the same object owned by the CR and requires the walk to remove it
+// (#2197), so a change that stopped the exit seeing owned residue reds here
+// rather than passing as "nothing wedged".
+func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.T) {
+	staleOwner := metav1.OwnerReference{
+		APIVersion:         agentv1alpha1.GroupVersion.String(),
+		Kind:               "PlatformAgent",
+		Name:               "test-agent",
+		UID:                types.UID("the-previous-agent-uid"),
+		Controller:         ptr.To(true),
+		BlockOwnerDeletion: ptr.To(true),
+	}
+	natsFence := func(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+		return buildA2ANATSNetworkPolicy(agent)
+	}
+	sessionFence := func(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+		return buildA2ASessionNetworkPolicy(agent, nil)
+	}
+	// The inject fence is a sentinel whatever the flag says, so its rows run
+	// with the door unarmed: the ownership rule has to hold on the operator
+	// that was redeployed without the flag and still has the fence.
+	injectFence := buildA2AGatewayNetworkPolicy
+	for _, tc := range []struct {
+		name  string
+		fence func(*agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy
+		owner *metav1.OwnerReference // nil plants the object with no owner at all
+		owned bool                   // true plants it under this CR, the control row
+	}{
+		{"NATS fence under a stale UID", natsFence, &staleOwner, false},
+		{"session fence under a stale UID", sessionFence, &staleOwner, false},
+		{"inject fence under a stale UID", injectFence, &staleOwner, false},
+		{"NATS fence with no owner at all", natsFence, nil, false},
+		{"session fence with no owner at all", sessionFence, nil, false},
+		{"inject fence with no owner at all", injectFence, nil, false},
+		{"control: NATS fence owned by this CR is torn down", natsFence, nil, true},
+		{"control: session fence owned by this CR is torn down", sessionFence, nil, true},
+		{"control: inject fence owned by this CR is torn down", injectFence, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			// A today CR: mode absent, and the finalizer already on so the
+			// first reconcile reaches the mode gate rather than returning
+			// after adding it.
+			agent := egressPolicyAgent()
+			planted := tc.fence(agent)
+			planted.OwnerReferences = nil
+			switch {
+			case tc.owned:
+				if err := ctrl.SetControllerReference(agent, planted, scheme); err != nil {
+					t.Fatal(err)
+				}
+			case tc.owner != nil:
+				planted.OwnerReferences = []metav1.OwnerReference{*tc.owner}
+			}
+			if owned := metav1.IsControlledBy(planted, agent); owned != tc.owned {
+				t.Fatalf("planted object controlled by the CR = %t, want %t; the row is not the shape it names", owned, tc.owned)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, planted).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d of a today CR beside %s: %v\n"+
+						"The early exit counted an object this CR does not own as its own residue, "+
+						"and the walk's ownership refusal wedged the reconcile before status.", i+1, planted.Name, err)
+				}
+			}
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+				t.Fatalf("re-read the agent: %v", err)
+			}
+			if stored.Status.Phase == "" {
+				t.Errorf("the reconcile returned nil but wrote no phase; it did not get past the mode gate")
+			}
+
+			after := &networkingv1.NetworkPolicy{}
+			err := cl.Get(ctx, client.ObjectKeyFromObject(planted), after)
+			if tc.owned {
+				if !errors.IsNotFound(err) {
+					t.Errorf("%s is owned by this CR and survived the today reconcile (err=%v): the exit no longer sees owned residue, which is #2197 again", planted.Name, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s is not this CR's and must be left to its owner or the garbage collector, got err=%v", planted.Name, err)
+			}
+			if !reflect.DeepEqual(after.OwnerReferences, planted.OwnerReferences) {
+				t.Errorf("%s was adopted or re-owned: ownerReferences = %+v, want %+v", planted.Name, after.OwnerReferences, planted.OwnerReferences)
 			}
 		})
 	}
@@ -2550,7 +2922,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, creds).
+		WithObjects(agent, creds, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -2566,7 +2938,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 2 failed: %v", err)
 	}
-	// The A2A gateway is withheld until BusCredentialsReady is True, and it is
+	// The A2A gateway is withheld until a callout replica serves, and it is
 	// one of the objects this test has to look at. Report the callout serving
 	// so the walk below has a gateway to walk.
 	letTheGatewayThrough(t, ctx, cl, r, req, agent)
@@ -2676,7 +3048,7 @@ func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	// reach. Two must be there or this proves nothing about them: the NATS
 	// StatefulSet, which carries the nats.conf digest on its pod template and
 	// is the exact regression above, and the A2A gateway Deployment, which the
-	// creation gate withholds until BusCredentialsReady is True -- so a test
+	// creation gate withholds until a callout replica serves -- so a test
 	// that does not open the gate walks a namespace with no gateway in it and
 	// reports green on coverage it never had.
 	for _, want := range []string{
@@ -2863,6 +3235,269 @@ func TestARefusalDoesNotSuspendTheA2AFences(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestARefusedFirstReconcileDropsTheA2AFencesOnTheFlipToToday is the other
+// half of the test above.
+//
+// TestARefusalDoesNotSuspendTheA2AFences holds that a refusal under mode next
+// keeps the fences maintained, and the rescue that makes it so is applying
+// them from reconcileAgentNetworkGuardrails, which every refusal returns
+// through before reconcileA2A is reached. That rescue produces a shape the
+// teardown had never seen: a next install refused on its FIRST reconcile has
+// the fences (two, three with the inject door armed) and no other A2A object.
+// cleanupA2A's early exit answered "anything to tear down?" from objects
+// reconcileA2A writes, so when the spec was fixed and the CR flipped to today
+// it saw none of them, returned, and the fences stayed on an install that is
+// supposed to look like it never heard of A2A.
+//
+// The control rows take the same flip without the refusal, so the stack
+// renders normally first. They pass with or without the fix, and they are what
+// shows the refused rows failing for the reason this test names rather than
+// because the flip itself is broken. The door rows arm the inject door, whose
+// fence rides the same guardrail path and the same teardown.
+func TestARefusedFirstReconcileDropsTheA2AFencesOnTheFlipToToday(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refused bool
+		door    bool
+	}{
+		{"refused on the first reconcile", true, false},
+		{"refused on the first reconcile, inject door armed", true, true},
+		{"control: rendered normally", false, false},
+		{"control: rendered normally, inject door armed", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.door {
+				t.Setenv(a2aInjectBackendEnvVar, "true")
+			}
+			scheme := setupScheme()
+			agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Mode = ptr.To(string(ModeNext))
+				if tc.refused {
+					a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+						ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+					}
+				}
+			})
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(ssaApplyInterceptor()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+			readyReason := func() string {
+				t.Helper()
+				stored := &agentv1alpha1.PlatformAgent{}
+				if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+					t.Fatalf("failed to re-read the agent: %v", err)
+				}
+				for _, condition := range stored.Status.Conditions {
+					if condition.Type == "Ready" {
+						return condition.Reason
+					}
+				}
+				return ""
+			}
+
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d under next: %v", i+1, err)
+				}
+			}
+			if refused := readyReason() == reasonEgressAllowlistRefused; refused != tc.refused {
+				t.Fatalf("refused = %t, want %t; this row is not exercising the shape it names", refused, tc.refused)
+			}
+
+			fences := []types.NamespacedName{
+				{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
+				{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+			}
+			if tc.door {
+				fences = append(fences, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace})
+			}
+			for _, fence := range fences {
+				if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
+					t.Fatalf("%s was not rendered under next, so the flip removing it would prove nothing: %v", fence.Name, err)
+				}
+			}
+			if tc.refused {
+				// The shape that matters: the fences are the ONLY A2A objects,
+				// because the refusal returned before reconcileA2A. Pinned on
+				// the objects the early exit used to key on, so a refusal
+				// that someday reaches the render fails here rather than
+				// quietly turning this row into another control.
+				for _, obj := range []client.Object{
+					&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}},
+					&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}},
+					&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}},
+					&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}},
+				} {
+					if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); !errors.IsNotFound(err) {
+						t.Fatalf("%T %s exists on a refused first reconcile (err=%v); the refusal reached the render, "+
+							"and this row no longer tests a fences-only install", obj, obj.GetName(), err)
+					}
+				}
+			}
+
+			// Fix the spec and flip to today in one edit, which is how an
+			// operator triaging an EgressAllowlistRefused on a next CR backs
+			// out of it.
+			fresh := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatalf("get agent: %v", err)
+			}
+			fresh.Spec.Mode = nil
+			fresh.Spec.Security.EgressAllowlist = nil
+			if err := cl.Update(ctx, fresh); err != nil {
+				t.Fatalf("flip to today: %v", err)
+			}
+			for i := 0; i < 3; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d after the flip: %v", i+1, err)
+				}
+			}
+			if reason := readyReason(); reason == reasonEgressAllowlistRefused {
+				t.Fatalf("the flipped CR is still refused (%s); cleanupA2A never ran and this proves nothing", reason)
+			}
+
+			for _, fence := range fences {
+				if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+					t.Errorf("%s survived the flip to today (err=%v): cleanupA2A's early exit saw none of its "+
+						"sentinels, because the refusal left the fences and nothing else", fence.Name, err)
+				}
+			}
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				if kind == "Secret" && name == "test-agent-a2a-nats-creds" {
+					return
+				}
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("these A2A-labelled objects survive the flip to today: %v", leftovers)
+			}
+		})
+	}
+}
+
+// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip is the shape the
+// test above's door rows do not reach, and it is why the inject fence is a
+// sentinel beside the NATS and session fences rather than riding on them.
+//
+// The argument for leaving it out was ordering: the inject fence is written
+// after both and deleted before both, so a render or a cleanup that dies
+// partway always leaves one of the two standing beside it. A hand does not
+// die partway. An operator triaging an EgressAllowlistRefused on an armed
+// next CR deletes the two fences they recognise -- the restore check in
+// TestARefusalDoesNotSuspendTheA2AFences is built on exactly that move -- and
+// flips the CR to today before the reconcile that delete enqueued has
+// re-applied them. The first today reconcile then reaches cleanupA2A with the
+// inject fence alone: owned, present, A2A-labelled, and seen by no sentinel.
+// The exit returns, nothing on the today path but the walk deletes it, and
+// every later reconcile takes the same exit, so it survives forever.
+//
+// Delete the pair through the client with no reconcile in between, flip, and
+// require the inject fence gone and the namespace clean.
+func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Mode = ptr.To(string(ModeNext))
+		a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+			ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+		}
+	})
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	readyReason := func() string {
+		t.Helper()
+		stored := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+			t.Fatalf("failed to re-read the agent: %v", err)
+		}
+		for _, condition := range stored.Status.Conditions {
+			if condition.Type == "Ready" {
+				return condition.Reason
+			}
+		}
+		return ""
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	if reason := readyReason(); reason != reasonEgressAllowlistRefused {
+		t.Fatalf("Ready reason = %q, want %s; this test is not exercising the refused shape", reason, reasonEgressAllowlistRefused)
+	}
+
+	pair := []types.NamespacedName{
+		{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
+		{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+	}
+	inject := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	for _, fence := range append(append([]types.NamespacedName{}, pair...), inject) {
+		if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
+			t.Fatalf("%s was not rendered on the refusal, so the hand has nothing to delete: %v", fence.Name, err)
+		}
+	}
+
+	// The hand. No Reconcile between this and the flip: that is the window
+	// the finding names, and running one here would re-apply the pair and
+	// turn this into the door row of the test above.
+	for _, fence := range pair {
+		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
+		}); err != nil {
+			t.Fatalf("delete %s by hand: %v", fence.Name, err)
+		}
+	}
+	if n := countA2ALabelled(ctx, t, cl); n != 1 {
+		t.Fatalf("%d A2A-labelled objects remain after the hand-delete, want 1 (the inject fence alone); "+
+			"this is not the shape the test names", n)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	fresh.Spec.Mode = nil
+	fresh.Spec.Security.EgressAllowlist = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatalf("flip to today: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d after the flip: %v", i+1, err)
+		}
+	}
+	if reason := readyReason(); reason == reasonEgressAllowlistRefused {
+		t.Fatalf("the flipped CR is still refused (%s); cleanupA2A never ran and this proves nothing", reason)
+	}
+
+	if err := cl.Get(ctx, inject, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+		t.Errorf("%s survived the flip to today (err=%v): with the pair deleted by hand it was the only "+
+			"A2A object standing, and cleanupA2A's early exit does not key on it", inject.Name, err)
+	}
+	var leftovers []string
+	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+		leftovers = append(leftovers, kind+"/"+name)
+	})
+	if len(leftovers) > 0 {
+		t.Errorf("these A2A-labelled objects survive the flip to today: %v", leftovers)
 	}
 }
 
@@ -4301,6 +4936,505 @@ func TestCheckA2AUserGrants(t *testing.T) {
 	}
 }
 
+// ---- the inject backend (#1704) ------------------------------------------
+//
+// The gateway's inject door is an HTTP door into handleInbound, for the eval
+// harness. Everything below is about the properties that keep it from being a
+// hole: it is rendered only when the operator itself was deployed with the
+// flag, every request to it carries a bearer token this operator mints, the
+// only identity it admits is an eval one, and while it is rendered the
+// gateway pod is fenced against every pod on the network.
+
+// a2aInjectAgentState reconciles a next-mode agent twice (finalizer pass,
+// then the real one), reports the auth callout serving and reconciles past
+// the gateway gate, and hands back the client, so each inject test states
+// only what it is asserting. The gate matters here: the door's env rides on
+// the gateway Deployment, and the flag-off removal is ordered after its
+// apply, so a test that never let the gateway through would assert against
+// a Deployment the render withheld.
+func a2aInjectAgentState(t *testing.T) (client.Client, *agentv1alpha1.PlatformAgent, *PlatformAgentReconciler, ctrl.Request) {
+	t.Helper()
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	return cl, agent, r, req
+}
+
+// a2aGatewayEnv reads the rendered gateway container's environment by name.
+func a2aGatewayEnv(t *testing.T, cl client.Client, agent *agentv1alpha1.PlatformAgent) map[string]corev1.EnvVar {
+	t.Helper()
+	dep := &appsv1.Deployment{}
+	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, dep); err != nil {
+		t.Fatalf("gateway Deployment: %v", err)
+	}
+	env := map[string]corev1.EnvVar{}
+	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+		env[e.Name] = e
+	}
+	return env
+}
+
+// TestA2AInjectBackendIsOffWithoutTheFlag is the property the whole design
+// rests on: an ordinary next install renders no inject door at all. Not a
+// closed one, not one behind a fence -- none, so there is nothing to
+// misconfigure and nothing to find.
+func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
+	// Pinned off rather than inherited, so a shell that exports the flag does
+	// not turn this test into its opposite.
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	agent := a2aTestAgent()
+
+	// The render, first: nothing in the pod spec even mentions it.
+	dep := buildA2AGatewayDeployment(agent)
+	container := dep.Spec.Template.Spec.Containers[0]
+	for _, e := range container.Env {
+		if e.Name == a2aInjectListenEnvVar {
+			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
+		}
+		if e.Name == "A2A_PRINCIPAL_MAP" {
+			t.Errorf("A2A_PRINCIPAL_MAP is repointed without the flag: %+v", e)
+		}
+	}
+	if len(container.Ports) != 0 {
+		t.Errorf("the gateway publishes %d container ports without the flag", len(container.Ports))
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if strings.Contains(v.Name, "inject") {
+			t.Errorf("an inject volume is mounted without the flag: %s", v.Name)
+		}
+	}
+
+	// And the cluster: no Service to reach, no map to be admitted by.
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+	name := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, name, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s exists without the flag (err=%v)", obj, name.Name, err)
+		}
+	}
+}
+
+// TestA2AInjectBackendRendersUnderTheFlag: with the operator deployed with
+// the flag, the gateway gets a listener, a map that admits exactly the eval
+// author, and a ClusterIP to reach it on.
+func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	ctx := context.Background()
+
+	env := a2aGatewayEnv(t, cl, agent)
+	// Loopback, not every interface: the port-forward the eval runner uses
+	// is served from inside the pod's network namespace, and a bind on every
+	// interface would hand the pod network a listener the fence alone
+	// withholds.
+	listen := env[a2aInjectListenEnvVar]
+	if listen.Value != fmt.Sprintf("%s:%d", a2aInjectListenHost, a2aInjectPort) {
+		t.Errorf("%s = %q, want the pod's loopback on the inject port", a2aInjectListenEnvVar, listen.Value)
+	}
+	if strings.HasPrefix(listen.Value, ":") {
+		t.Errorf("%s = %q binds every interface", a2aInjectListenEnvVar, listen.Value)
+	}
+	// The map the gateway reads has to be the one the operator rendered; the
+	// default path is the hand-made Discord map, which carries no eval
+	// author, and a gateway reading it drops every injected message at
+	// verification with nothing in the render looking wrong.
+	if got := env[a2aInjectPrincipalMapEnv].Value; got != a2aInjectPrincipalMapPath {
+		t.Errorf("%s = %q, want the operator's own map at %q",
+			a2aInjectPrincipalMapEnv, got, a2aInjectPrincipalMapPath)
+	}
+	// Beside the chat map rather than over it. The door may be armed next to
+	// a real backend now, and repointing the one variable would take that
+	// backend's identities away with it.
+	if got := env["A2A_PRINCIPAL_MAP"].Value; got == a2aInjectPrincipalMapPath {
+		t.Error("the door repointed A2A_PRINCIPAL_MAP, which is the chat backends' map")
+	}
+	// The token, from the Secret this operator mints, and NOT optional: a
+	// missing Secret must crash-loop the pod rather than leave the gateway
+	// to arm a door with no token -- which it would refuse to do anyway.
+	tokenRef := env[a2aInjectTokenEnvVar].ValueFrom
+	if tokenRef == nil || tokenRef.SecretKeyRef == nil {
+		t.Fatalf("%s is not read from a Secret: %+v", a2aInjectTokenEnvVar, env[a2aInjectTokenEnvVar])
+	}
+	if tokenRef.SecretKeyRef.Name != a2aInjectName(agent) || tokenRef.SecretKeyRef.Key != a2aInjectTokenKey {
+		t.Errorf("the token comes from %s/%s, want %s/%s", tokenRef.SecretKeyRef.Name,
+			tokenRef.SecretKeyRef.Key, a2aInjectName(agent), a2aInjectTokenKey)
+	}
+	if tokenRef.SecretKeyRef.Optional != nil && *tokenRef.SecretKeyRef.Optional {
+		t.Error("the token reference is optional, so a pod could start with an empty token")
+	}
+	if env[a2aInjectTokenEnvVar].Value != "" {
+		t.Error("the token is rendered as a literal env value rather than a Secret reference")
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	container := dep.Spec.Template.Spec.Containers[0]
+	var mounted bool
+	for _, m := range container.VolumeMounts {
+		if m.MountPath == a2aInjectPrincipalMapDir {
+			mounted = true
+			if !m.ReadOnly {
+				t.Error("the inject principal map is mounted writable")
+			}
+		}
+	}
+	if !mounted {
+		t.Errorf("no volume is mounted at %s, so the gateway would read an empty map", a2aInjectPrincipalMapDir)
+	}
+	// The other map stays mounted, at its own path: two ConfigMaps cannot
+	// share one, and the chat backends still read the default.
+	var stillHasDefault bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "principal-map" {
+			stillHasDefault = true
+		}
+	}
+	if !stillHasDefault {
+		t.Error("the flag removed the default principal-map volume; it is shared with the chat backends")
+	}
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, cm); err != nil {
+		t.Fatalf("inject principal map: %v", err)
+	}
+	// One line, "inject:<author> eval:<...>". Both halves are load-bearing:
+	// the gateway looks up the prefixed key in this map alone, and refuses
+	// any value outside the eval namespace -- which is what keeps a door
+	// taking its author from a request body unable to assert a principal a
+	// real backend's sender could hold.
+	fixture := cm.Data[a2aInjectPrincipalMapKey]
+	lines := strings.Fields(strings.TrimSpace(fixture))
+	if len(cm.Data) != 1 || len(lines) != 2 {
+		t.Fatalf("the map is %q under %d keys, want one prefixed entry", fixture, len(cm.Data))
+	}
+	if lines[0] != a2aInjectPrincipalPrefix+a2aInjectAuthor {
+		t.Errorf("the map's key is %q, want it qualified with %q", lines[0], a2aInjectPrincipalPrefix)
+	}
+	if !strings.HasPrefix(lines[1], "eval:") {
+		t.Errorf("the map admits %q, which is not an eval identity; a synthetic door must be "+
+			"structurally incapable of asserting a cloud principal", lines[1])
+	}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, secret); err != nil {
+		t.Fatalf("the door's bearer token Secret was not rendered: %v", err)
+	}
+	// Hex, two characters a byte: the length says the whole of the random
+	// material reached the Secret.
+	if len(secret.Data[a2aInjectTokenKey]) != 2*a2aInjectTokenNumBytes {
+		t.Errorf("the token is %d hex characters, want %d (%d random bytes); it is the door's whole access control",
+			len(secret.Data[a2aInjectTokenKey]), 2*a2aInjectTokenNumBytes, a2aInjectTokenNumBytes)
+	}
+
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}, svc); err != nil {
+		t.Fatalf("inject Service: %v", err)
+	}
+	// ClusterIP keeps the door inside the cluster: a LoadBalancer or a
+	// NodePort would publish a task-submission endpoint off-cluster with the
+	// bearer token as its only guard.
+	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("inject Service type = %q, want ClusterIP", svc.Spec.Type)
+	}
+	if svc.Spec.Selector["app"] != a2aGatewayName(agent) {
+		t.Errorf("inject Service selects %v, want the gateway pod", svc.Spec.Selector)
+	}
+	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != a2aInjectPort {
+		t.Errorf("inject Service ports = %+v, want just the inject port", svc.Spec.Ports)
+	}
+	// The listener and the Service must agree, or a port-forward reaches a
+	// closed port and reads as a broken gateway.
+	if !strings.HasSuffix(listen.Value, fmt.Sprintf(":%d", svc.Spec.Ports[0].Port)) {
+		t.Errorf("the gateway listens on %q and the Service publishes %d", listen.Value, svc.Spec.Ports[0].Port)
+	}
+}
+
+// TestA2AInjectFenceDeniesEveryPod: the fence is what keeps every other pod
+// off the door's port, so a leaked token alone reaches nothing; it has to
+// select the gateway pod and admit nobody. An ingress rule appearing here later is a
+// decision someone has to make deliberately.
+func TestA2AInjectFenceDeniesEveryPod(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+
+	np := &networkingv1.NetworkPolicy{}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, np); err != nil {
+		t.Fatalf("the gateway fence was not rendered with the inject backend: %v", err)
+	}
+	if np.Spec.PodSelector.MatchLabels["app"] != a2aGatewayName(agent) {
+		t.Errorf("the fence selects %v, want the gateway pod", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Errorf("policyTypes = %v, want Ingress alone -- Egress here would cut the gateway off the bus",
+			np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Ingress) != 0 {
+		t.Errorf("the fence admits %d ingress rules; the inject port must be reachable from no pod, "+
+			"only through the node path a port-forward uses", len(np.Spec.Ingress))
+	}
+}
+
+// TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff: unsetting the operator's
+// flag has to take the door with it. Left behind, a Service and a map would
+// sit on an install that is supposed to look like it never had one -- and the
+// next operator roll that re-reads the flag would find them already there.
+func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off: %v", err)
+	}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flag going off (err=%v)", obj, key.Name, err)
+		}
+	}
+	if env := a2aGatewayEnv(t, cl, agent); env[a2aInjectListenEnvVar].Value != "" {
+		t.Errorf("the gateway still listens on %q after the flag went off", env[a2aInjectListenEnvVar].Value)
+	}
+}
+
+// TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
+// four objects before deleting them, and the fourth is a Secret. The operator
+// ships secrets with get only, so a cached Get of one starts an informer
+// whose LIST is forbidden and blocks the single reconcile worker for good --
+// the fake client cannot show that hang (its cache is the store), so this
+// test fails the cached path outright and passes only if the Secret is read
+// through the reader the other A2A Secrets use.
+func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	// The "cache": the same store, refusing a Secret read once armed. Armed
+	// only for the flag-off reconcile, so the setup reconciles that mint the
+	// Secret through the reader are not what is under test.
+	var strict atomic.Bool
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
+				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d with the flag on: %v", i+1, err)
+		}
+	}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := base.Get(ctx, key, &corev1.Secret{}); err != nil {
+		t.Fatalf("the token Secret was not minted, so this test proves nothing: %v", err)
+	}
+
+	strict.Store(true)
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flag went off read a Secret through the cache: %v", err)
+	}
+	if err := base.Get(ctx, key, &corev1.Secret{}); !errors.IsNotFound(err) {
+		t.Fatalf("the token Secret survived the flag going off (err=%v)", err)
+	}
+}
+
+// TestA2AInjectBackendGoesAwayOnAFlipToToday: the darkness property. A today
+// install must carry no A2A object, and the inject backend's four are
+// exactly the kind that get forgotten -- they are rendered by a branch the
+// teardown path never consults.
+func TestA2AInjectBackendGoesAwayOnAFlipToToday(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, key, &corev1.Service{}); err != nil {
+		t.Fatalf("the Service was not rendered, so this test proves nothing: %v", err)
+	}
+
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Mode = nil
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the flip to today: %v", err)
+	}
+	for _, obj := range a2aInjectRenderedKinds() {
+		if err := cl.Get(ctx, key, obj); !errors.IsNotFound(err) {
+			t.Errorf("%T %s survived the flip to today (err=%v)", obj, key.Name, err)
+		}
+	}
+}
+
+// a2aInjectRenderedKinds is every kind the door renders, for the tests that
+// assert it is entirely gone. A list rather than three literals: the Secret
+// was the fourth, and the next one must not be missed the same way.
+func a2aInjectRenderedKinds() []client.Object {
+	return []client.Object{
+		&corev1.Service{},
+		&corev1.ConfigMap{},
+		&networkingv1.NetworkPolicy{},
+		&corev1.Secret{},
+	}
+}
+
+// TestA2AInjectTokenIsMintedOnceAndKept: the token is a live credential a
+// caller holds for the length of an eval run. Re-rolling it on a reconcile --
+// which happens every few seconds -- would 401 a run mid-flight, and the
+// failure would read as a broken gateway rather than as a rotated secret.
+func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+
+	first := &corev1.Secret{}
+	if err := cl.Get(ctx, key, first); err != nil {
+		t.Fatalf("the token Secret was not rendered: %v", err)
+	}
+	minted := string(first.Data[a2aInjectTokenKey])
+	if minted == "" {
+		t.Fatal("the token is empty, so the gateway would refuse to arm the door")
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i, err)
+		}
+	}
+	again := &corev1.Secret{}
+	if err := cl.Get(ctx, key, again); err != nil {
+		t.Fatal(err)
+	}
+	if string(again.Data[a2aInjectTokenKey]) != minted {
+		t.Error("the token changed across reconciles; every caller holding it is now refused")
+	}
+}
+
+// TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret: a Secret under the
+// rendered name that this agent did not create is not the door's key. The
+// token is the door's only access control, so adopting one would arm the door
+// with a credential its planter holds; and the flag-off removal refuses to
+// delete an unowned object, so a render built on it would wedge every later
+// reconcile. The reconcile fails before the Service is rendered, and the
+// planted Secret is left exactly as it was.
+func TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	planted := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace},
+		Data:       map[string][]byte{a2aInjectTokenKey: []byte("planted-token")},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, planted).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	var err error
+	for i := 0; i < 2 && err == nil; i++ {
+		_, err = r.Reconcile(ctx, req)
+	}
+	if err == nil || !strings.Contains(err.Error(), "unowned") {
+		t.Fatalf("Reconcile with a planted token Secret: err = %v, want a refusal naming the unowned Secret", err)
+	}
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	after := &corev1.Secret{}
+	if err := cl.Get(ctx, key, after); err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Data[a2aInjectTokenKey]) != "planted-token" || metav1.IsControlledBy(after, agent) {
+		t.Errorf("the planted Secret was changed or adopted: %+v", after.ObjectMeta.OwnerReferences)
+	}
+	if err := cl.Get(ctx, key, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("the inject Service was rendered on top of the refused token (err=%v)", err)
+	}
+}
+
+// TestA2AInjectTokenIsRepairedIfEmptied: an empty key renders an empty env,
+// and the gateway refuses to arm the door without a token -- so the pod would
+// crash-loop with nothing in the object set looking wrong. Emptied is the
+// shape a hand-edit or a half-written Secret takes.
+func TestA2AInjectTokenIsRepairedIfEmptied(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "true")
+	cl, agent, r, req := a2aInjectAgentState(t)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, key, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data[a2aInjectTokenKey] = []byte("")
+	if err := cl.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the token was emptied: %v", err)
+	}
+	repaired := &corev1.Secret{}
+	if err := cl.Get(ctx, key, repaired); err != nil {
+		t.Fatal(err)
+	}
+	if len(repaired.Data[a2aInjectTokenKey]) == 0 {
+		t.Error("an emptied token was left empty, so the door can never arm")
+	}
+}
+
+// TestA2AInjectTokenIsNotRenderedWithoutTheFlag: the darkness property
+// applied to the credential. A Secret is the one object here whose presence
+// on an install that never asked for the door would be more than residue.
+func TestA2AInjectTokenIsNotRenderedWithoutTheFlag(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	cl, agent, _, _ := a2aInjectAgentState(t)
+	key := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(context.Background(), key, &corev1.Secret{}); !errors.IsNotFound(err) {
+		t.Errorf("a bearer token Secret exists without the flag (err=%v)", err)
+	}
+}
+
 // The split A5 made is enforced by the pod spec, and spec.deployment is
 // user-authored: sidecars, init containers and their volumes are copied
 // verbatim into the render. So the one thing that keeps the projected bus token
@@ -4629,5 +5763,167 @@ func TestAnExtraVolumesEntryCannotShadowTheBusToken(t *testing.T) {
 	if podVolume(buildPodTemplateSpec(today, "", "", "", "", nil, renderOptions{}), a2aBusTokenVolume) == nil {
 		t.Error("a today install lost the CR's extraVolumes entry too; the strip is not gated on the " +
 			"surface, which is one more way to tell the next stack exists")
+	}
+}
+
+// ---- resources and ordering on the next-stack pods (#1700, #1702) ---------
+
+// TestA2ANextStackPodsCarryRequestsAndLimits: every container the operator
+// renders for the next stack (NATS, gateway, provision Job, callout) carries
+// CPU and memory requests and limits, so a namespace whose ResourceQuota
+// requires limits admits the stack, and Autopilot does not size the pods for
+// it. The session pods the gateway spawns are the gateway's (a2a/gateway).
+func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
+	agent := a2aTestAgent()
+	type container struct {
+		where string
+		c     corev1.Container
+	}
+	var containers []container
+	sts := buildA2ANATSStatefulSet(agent, "conf-hash")
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"nats StatefulSet", c})
+	}
+	dep := buildA2AGatewayDeployment(agent)
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"gateway Deployment", c})
+	}
+	job := buildA2AProvisionJob(agent)
+	for _, c := range job.Spec.Template.Spec.Containers {
+		containers = append(containers, container{"provision Job", c})
+	}
+	// The callout too: it is the provision Job's authentication path, and a
+	// quota that refused it would leave the Job's creation held for good.
+	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+		containers = append(containers, container{"callout Deployment", c})
+	}
+	if len(containers) < 4 {
+		t.Fatalf("expected at least four containers across the four renders, got %d", len(containers))
+	}
+	for _, entry := range containers {
+		for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			req, ok := entry.c.Resources.Requests[res]
+			if !ok || req.IsZero() {
+				t.Errorf("%s container %q: no %s request", entry.where, entry.c.Name, res)
+			}
+			lim, ok := entry.c.Resources.Limits[res]
+			if !ok || lim.IsZero() {
+				t.Errorf("%s container %q: no %s limit; a limits-requiring quota refuses the pod", entry.where, entry.c.Name, res)
+			}
+			if ok && req.Cmp(lim) > 0 {
+				t.Errorf("%s container %q: %s request %s exceeds limit %s", entry.where, entry.c.Name, res, req.String(), lim.String())
+			}
+		}
+	}
+	// The sizes are named constants, and NATS is the one that holds state.
+	nats := sts.Spec.Template.Spec.Containers[0].Resources
+	if got := nats.Limits[corev1.ResourceMemory]; got.String() != a2aNATSMemoryLimit {
+		t.Errorf("nats memory limit = %s, want %s", got.String(), a2aNATSMemoryLimit)
+	}
+	gw := dep.Spec.Template.Spec.Containers[0].Resources
+	if got := gw.Requests[corev1.ResourceCPU]; got.String() != a2aGatewayCPURequest {
+		t.Errorf("gateway cpu request = %s, want %s", got.String(), a2aGatewayCPURequest)
+	}
+}
+
+// TestA2AProvisionJobWaitsForTheCallout: the Job is not created until one
+// callout replica is ready, so the Job never spends its backoff on the callout
+// not being there yet. The rest of the stack renders while it waits (a gate that
+// withheld the callout too would deadlock), and the creation happens on the
+// first pass after the callout serves. Creation only: a Job that exists has
+// its status read whatever the callout does (TestA2AProvisionJobConditionsDriveStatus
+// seeds one with no callout serving).
+func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		state, err := r.reconcileA2A(ctx, agent)
+		if err != nil {
+			t.Fatalf("reconcileA2A %d: %v", i+1, err)
+		}
+		if !state.jobHeld || state.done {
+			t.Fatalf("pass %d: state = {jobHeld:%v done:%v}, want held and not done while no callout replica serves", i+1, state.jobHeld, state.done)
+		}
+	}
+	jobs := &batchv1.JobList{}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Fatalf("%d provision Jobs created while no callout replica serves; the Job would spend its backoff on authentication errors", len(jobs.Items))
+	}
+	// Everything the callout needs to become ready is there, or this is a
+	// deadlock rather than an ordering.
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		t.Errorf("NATS did not render while the Job waits: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the callout did not render while the Job waits: %v", err)
+	}
+
+	reportCalloutServing(t, ctx, cl, agent)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatalf("reconcileA2A after the callout came up: %v", err)
+	}
+	if state.jobHeld {
+		t.Error("the Job is still held with a callout replica serving")
+	}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 1 || jobs.Items[0].Name != buildA2AProvisionJob(agent).Name {
+		t.Fatalf("after the callout serves the namespace holds %d provision Jobs, want the one the render names", len(jobs.Items))
+	}
+	if inits := jobs.Items[0].Spec.Template.Spec.InitContainers; len(inits) != 0 {
+		t.Errorf("the Job carries init containers %+v; the ordering is the operator's, not the pod's", inits)
+	}
+}
+
+// TestTheProvisionJobRunsOnAnOldTemplateReplica: the Job's question of the
+// callout is weaker than the gateway's. Mid-roll, with one replica ready on
+// the previous template and none on the current one, the gateway is held
+// (it is minted against the map version this pass rendered) and the Job is
+// not (its principal is authenticated by any replica, all of which serve the
+// current map). A Job gated on the gateway's rule would be held through every
+// callout roll and for good on a wedged one.
+func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent)). // a backend, so the gateway reaches its callout gate rather than the backend one
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	// Two pods, one ready, none on the current template: a roll in progress
+	// or wedged at maxUnavailable 0.
+	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.jobHeld {
+		t.Error("the Job is held while a callout replica is ready; the old-template replica authenticates it")
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
+		t.Errorf("the Job was not created with a ready replica serving: %v", err)
+	}
+	if !state.gatewayHeld {
+		t.Error("the gateway was let through with no current-template replica; its gate is the stricter one on purpose")
 	}
 }

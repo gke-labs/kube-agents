@@ -78,7 +78,7 @@ jobs:
           COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
         run: ./scripts/release/record_rc_scheduler_skip.sh
 
-      # GITHUB_TOKEN rather than the PAT nightly-pipeline.yml's step 4 needs.
+      # GITHUB_TOKEN rather than the PAT staging-promotion-pipeline.yml's step 4 needs.
       # This step is the only thing that starts the RC pipeline, so whatever it
       # depends on is a single point of failure, and the default token needs no
       # secret to be present and cannot expire.

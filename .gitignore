@@ -36,6 +36,9 @@ coverage-go.xml
 # consumers should commit their own multi-platform lock in their own repo.
 .terraform/
 .terraform.lock.hcl
+# The seeded fleet's lock is committed: the scheduled reconcile applies it
+# unattended in every pool project, so provider versions are chosen by a person.
+!bench/tf/fleet/.terraform.lock.hcl
 
 # Terraform state and variable files hold credentials and infrastructure
 # details — never commit them. Committed examples keep the .example suffix.
@@ -46,8 +49,9 @@ coverage-go.xml
 terraform.tfvars.json
 
 # Terraform override files are environment-local by convention: lifecycle.sh
-# writes (and normally removes) providers_lifecycle_override.tf mid-import,
-# and a user's backend override belongs to their environment, not the example.
+# writes (and normally removes) providers_lifecycle_override.tf and the scope
+# resolver module's scope_resolver_lifecycle_override.tf mid-import, and a
+# user's backend override belongs to their environment, not the example.
 *_override.tf
 
 # Local build & release packaging output

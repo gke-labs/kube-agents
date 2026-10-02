@@ -226,22 +226,32 @@ def _event_id(prefix: str, *parts: object) -> str:
 
 
 def _logging_payload(row: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """The audit record in ``row`` and the Hermes line prefix it was written behind.
+
+    A record reaches Logging in one of two shapes. Wrapped: the JSON object at the
+    end of a Hermes log line, under ``jsonPayload.log`` or ``textPayload``. Lifted:
+    the object's keys as ``jsonPayload`` fields of their own, the raw line still
+    under ``log``, which is what the fluent-bit sidecar in the gateway pod writes.
+    The prefix carries Hermes' ``[session]`` tag, the only attribution a cron job's
+    tool call has, so it is read from the raw line in both shapes.
+    """
     direct = row.get("jsonPayload")
-    if isinstance(direct, dict) and direct.get("audit_event"):
-        return direct, ""
     candidate = ""
     if isinstance(direct, dict):
         candidate = _text(direct.get("log"))
     if not candidate:
         candidate = _text(row.get("textPayload"))
     match = _WRAPPED_AUDIT.match(candidate)
+    prefix = match.group("prefix") if match else ""
+    if isinstance(direct, dict) and direct.get("audit_event"):
+        return direct, prefix
     if not match:
         return {}, ""
     try:
         payload = json.loads(match.group("payload"))
     except json.JSONDecodeError:
-        return {}, match.group("prefix")
-    return (payload if isinstance(payload, dict) else {}), match.group("prefix")
+        return {}, prefix
+    return (payload if isinstance(payload, dict) else {}), prefix
 
 
 def _logging_trigger(
@@ -717,8 +727,12 @@ class CloudTelemetryProvider:
             f' timestamp>="{self._start:%Y-%m-%dT%H:%M:%SZ}"'
             f' AND timestamp<="{self._end:%Y-%m-%dT%H:%M:%SZ}"'
         )
+        # A lifted record still carries the wrapped text under `log`, so
+        # without the exclusion the first query returns every row the second
+        # does and each page budget is spent twice on the same records.
         return (
-            f'({base}) AND jsonPayload.log:"audit_event" AND{interval}',
+            f'({base}) AND jsonPayload.log:"audit_event"'
+            f" AND NOT jsonPayload.audit_event:* AND{interval}",
             f"({base}) AND jsonPayload.audit_event:* AND{interval}",
         )
 

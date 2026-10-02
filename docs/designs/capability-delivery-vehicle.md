@@ -96,7 +96,12 @@ reporting (R2): the schedule, a request in chat, and an event.
 **From chat**, three kinds of request:
 
 - **"Run it now"** for a shipped stream: the run happens in a fresh process through the identical
-  path the schedule uses, never re-enacted inside the chat session that took the request.
+  path the schedule uses, never re-enacted inside the chat session that took the request. Today
+  that path does not exist — `hermes cron run` is reachable only from the gateway pod, and the
+  sandbox-side worker answered "queued" instead
+  ([#1876](https://github.com/gke-labs/kube-agents/issues/1876)) — so the fleet-audit skill's
+  interim is a single named stream run in-session through `audit_report.py start … finish` with
+  its coverage gaps declared.
 - **"Run it against this scope"**: one cluster family, one region, one check, answered in the
   thread that asked.
 - **"Run it every Monday for family X"**: a schedule the operator defines in chat, which survives

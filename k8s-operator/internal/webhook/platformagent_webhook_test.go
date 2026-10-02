@@ -20,6 +20,7 @@ import (
 	"context"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -947,5 +948,139 @@ func TestEveryUserAuthoredMountSurfaceIsReserved(t *testing.T) {
 			t.Errorf("the reservation claims to cover spec.deployment.%s, which no longer exists on "+
 				"DeploymentSpec; the guard above is measuring a field that was renamed or removed", name)
 		}
+	}
+}
+
+// TestGitIntegrationAdmission covers the declarative surface added in
+// docs/designs/version-control-support.md §6: `spec.integration.forges` and
+// `spec.integration.repositories`, the deprecated
+// `spec.integration.github` alias, and validation dispatched to the declared
+// provider rather than GitHub's rules applied to every host.
+func TestGitIntegrationAdmission(t *testing.T) {
+	ctx := context.Background()
+	val := &PlatformAgentCustomValidator{}
+
+	agentWith := func(integration agentv1alpha1.IntegrationSpec) *agentv1alpha1.PlatformAgent {
+		return &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: integration},
+			},
+		}
+	}
+
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs"}}
+	cases := []struct {
+		name string
+		spec agentv1alpha1.IntegrationSpec
+		// path is the field the error must be reported against; empty means the
+		// declaration must be admitted.
+		path string
+	}{
+		{
+			name: "a forge with a gitops repository is admitted",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "https://github.com/gke-labs/kube-agents.git", Role: "gitops"}}},
+		},
+		{
+			name: "all three roles on explicit provider and host are admitted",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "github.com", Namespace: "gke-labs"}},
+				Repositories: []agentv1alpha1.RepositorySpec{
+					{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+					{Forge: "github", Repository: "apps", Role: "managed"},
+					{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+				}},
+		},
+		{
+			// The single-slash residue of #1085, at the layer that should have
+			// caught it: admission used to accept this as owner `gitlab.com`, and
+			// the operator then seeded https://github.com/gitlab.com/project.
+			name: "another forge's host in a single-slash shorthand is refused",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: "gitlab.com/project"}},
+			path: "spec.integration.github.gitRepo",
+		},
+		{
+			name: "a GitLab remote is refused rather than rewritten",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "git@gitlab.com:group/project.git", Role: "managed"}}},
+			path: "spec.integration.repositories[0].repository",
+		},
+		{
+			name: "the same refusal through the deprecated alias",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: "git@gitlab.com:group/project.git"}},
+			path: "spec.integration.github.gitRepo",
+		},
+		{
+			name: "a host the declared provider does not serve",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gh", Host: "gitlab.com"}}},
+			path: "spec.integration.forges[0].host",
+		},
+		{
+			// The CRD enum blocks this at the API server, but the operator's own
+			// check has to hold too: a CR applied before the enum narrowed, or one
+			// reaching the webhook by another path, must not reconcile.
+			name: "a provider with no registered rules",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
+			path: "spec.integration.forges[0].provider",
+		},
+		{
+			name: "a namespace outside GitHub's grammar",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gh", Namespace: "group.with_dots"}}},
+			path: "spec.integration.forges[0].namespace",
+		},
+		{
+			// The CRD's CEL rule refuses this too; the webhook is what names the
+			// entry.
+			name: "a repository on an undeclared forge",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "gitlab", Repository: "group/project", Role: "context"}}},
+			path: "spec.integration.repositories[0].forge",
+		},
+		{
+			name: "both spellings at once",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges: gh,
+				GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+			},
+			path: "spec.integration",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := val.ValidateCreate(ctx, agentWith(tc.spec))
+			if tc.path == "" {
+				if err != nil {
+					t.Errorf("expected the declaration to be admitted, got: %v", err)
+				}
+				return
+			}
+			assertFieldError(t, err, tc.path)
+		})
+	}
+}
+
+func TestGitIntegrationCredentialsRefOnGitHubWarns(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+				Forges: []agentv1alpha1.ForgeSpec{{
+					Name: "github", Namespace: "gke-labs",
+					CredentialsRef: &corev1.LocalObjectReference{Name: "forge-token"},
+				}},
+			}},
+		},
+	}
+	warnings, err := val.ValidateCreate(context.Background(), agent)
+	if err != nil {
+		t.Fatalf("expected a credentialsRef on a GitHub forge to be admitted, got: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.forges[0].credentialsRef") {
+		t.Errorf("warnings = %v, expected one naming spec.integration.forges[0].credentialsRef", warnings)
 	}
 }
