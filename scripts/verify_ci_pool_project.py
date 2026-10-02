@@ -2485,13 +2485,18 @@ def _note_declaration_problem(body: str, repo_slug: str, audit=None) -> Optional
     """
     if audit is None:
         audit = _load_audit_report()
+    # One parse over the union of the streams' declarable sets, so the two
+    # items are read in one pass and neither draws the other stream's note on
+    # stderr; each stream's item is then matched among the entries of its own
+    # check. The policy is still the audit's: a slug that leaves its stream's
+    # set leaves the union, and this check rejects the note the day the audit does.
+    union = frozenset().union(*(audit.audit_declarable_checks(stream) for stream, _ in GITOPS_INTENT_NOTE_DECLARATIONS))
+    all_entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=union)
     for stream, wanted_item in GITOPS_INTENT_NOTE_DECLARATIONS:
-        # The audit's own policy for which slugs a note may justify, not a local
-        # copy of it: if a slug ever leaves its stream's declarable set, this
-        # check rejects the note the day the audit does.
-        declarable = audit.audit_declarable_checks(stream)
-        entries = audit.parse_declarations(body, repo=repo_slug, path=GITOPS_INTENT_NOTE_PATH, declarable=declarable)
-        if not entries:
+        if wanted_item["check"] not in audit.audit_declarable_checks(stream):
+            return f"{wanted_item['check']} is no longer a check {stream} lets a declaration justify"
+        entries = [e for e in all_entries if str(e.get("check", "")) == wanted_item["check"]]
+        if not all_entries:
             # The reason is the parser's own (`explain_empty_declarations` walks
             # the ladder `parse_declarations` walks); None means the note had
             # items and the parser skipped every one, logging a WARNING each.

@@ -1819,6 +1819,10 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 self.assertFalse(result.passed, label)
                 self.assertIn("the audit reads no declaration from it", result.message)
                 self.assertIn(reasons[label], result.message, label)
+                if label == "empty cluster":
+                    # One item skipped, the other parsed: the diagnosis names
+                    # the missing item, never the whole-note fallback.
+                    self.assertNotIn("skipped every item", result.message)
                 self.assertIn("-f sha=deadbeef", result.message)
         # And what the audit accepts, this accepts: the `...` closer and the
         # spellings the join key folds to one.

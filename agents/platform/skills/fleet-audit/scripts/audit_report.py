@@ -848,6 +848,22 @@ DUAL_SHAPE_CHECK = "hpa-cannot-scale"
 # finding whatever a note declares. The withhold keeps taking both shapes: it
 # errs toward holding a finding back, the join would err toward silencing one.
 DUAL_SHAPE_POSTURE_SEVERITY = "major"
+# 2.6 `netpol-missing` names two shapes as well: the zero-policy and partial
+# postures name the namespace and may be declared; the allow-all shape names
+# the policy and is a fault. The object's kind tells them apart.
+NAMESPACE_SHAPE_CHECK = "netpol-missing"
+NAMESPACE_SHAPE_KIND = "Namespace"
+# 2.7 `default-sa-automount` is declared per workload and fixed per namespace
+# (one `default` ServiceAccount). A fix that merges for an undeclared sibling
+# would take the declared workload's token too, so a namespace holding a
+# declared workload gets manual recommendations instead of the shared file.
+SHARED_ACCOUNT_CHECK = "default-sa-automount"
+SHARED_ACCOUNT_SHIELD_NOTE = (
+    "_(A declared workload shares this namespace's `default` ServiceAccount: {declared}. "
+    "Turning automount off on the account would remove its token as well, so this stays manual: "
+    "set `automountServiceAccountToken: false` on the undeclared workloads' pod specs, or on the "
+    "account once the declared workload sets `true` on its own spec.)_"
+)
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
 # reads every repository the step must search, collects the declarations it
@@ -3374,6 +3390,15 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"of governance/{audit_sop(audit_id)} names the checks it may "
                     "move; write this one under `findings`"
                 )
+            if (
+                check == NAMESPACE_SHAPE_CHECK
+                and str(entry.get("object") or "").partition("/")[0] != NAMESPACE_SHAPE_KIND
+            ):
+                raise ValidationError(
+                    f"{where}.object: {str(entry.get('object') or '')!r} — a {check} declaration "
+                    f"justifies the namespace posture (`{NAMESPACE_SHAPE_KIND}/<ns>`); the allow-all "
+                    "shape names the policy and is a fault, so it stays under `findings`"
+                )
             _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
             _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
             cluster = str(entry["cluster"])
@@ -4767,10 +4792,15 @@ def parse_declarations(
             continue
         check = item["check"].strip()
         if check not in declarable:
-            log(
-                f"WARNING: {item_where}: {check!r} is not a check a declaration may "
-                "justify; skipped."
-            )
+            if any(check in spec.declarable for spec in AUDITS.values()):
+                # Another stream's posture: the note is read by every stream
+                # and each takes its own items, so this is not a malformed item.
+                log(f"NOTE: {item_where}: {check!r} is another stream's posture; not this one's to move.")
+            else:
+                log(
+                    f"WARNING: {item_where}: {check!r} is not a check a declaration may "
+                    "justify; skipped."
+                )
             continue
         raw_object = item["object"].strip()
         # Each side of the slash on its own: `Deployment / api` is a hand-typed
@@ -5118,6 +5148,20 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 "stands and the finding publishes."
             )
             match = None
+        if (
+            match is not None
+            and check == NAMESPACE_SHAPE_CHECK
+            and str(finding.get("object", "")).partition("/")[0] != NAMESPACE_SHAPE_KIND
+        ):
+            # The slug names a posture on the namespace and a fault on the
+            # policy, and a declaration justifies only the posture.
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
+                f"{finding.get('object', '')} is the allow-all fault (SOP §2.6), which no "
+                f"declaration excuses; the posture names `{NAMESPACE_SHAPE_KIND}/<ns>`. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
         if match is None or derive_finding_id(finding) in already:
             kept.append(finding)
             continue
@@ -5144,6 +5188,54 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
         data["findings"] = kept
         data["declared"] = declared
     return moved
+
+
+def shield_declared_account_siblings(data: dict) -> list[str]:
+    """Keep a declared 2.7 workload's token by making its siblings' fixes manual.
+
+    `default-sa-automount` is declared per workload and remediated per
+    namespace: the shared `default` ServiceAccount gets
+    `automountServiceAccountToken: false`, which removes the token from every
+    workload that does not set `true` on its own spec, the declared one
+    included. So where a namespace holds a declared workload, each remaining
+    finding in it keeps its evidence and recommendation and loses the shared
+    file: `kind: manual`, with a note naming the declared workload and the two
+    ways to fix the rest. Returns the ids changed, each logged.
+    """
+    shielded_by: dict[tuple[str, str], list[dict]] = {}
+    for entry in data.get("declared") or []:
+        if str(entry.get("check", "")) == SHARED_ACCOUNT_CHECK:
+            key = (str(entry.get("cluster", "")), str(entry.get("namespace") or ""))
+            shielded_by.setdefault(key, []).append(entry)
+    if not shielded_by:
+        return []
+    changed: list[str] = []
+    for finding in data.get("findings") or []:
+        if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
+            continue
+        declared = shielded_by.get((str(finding.get("cluster", "")), str(finding.get("namespace") or "")))
+        if not declared:
+            continue
+        remediation = finding.setdefault("remediation", {})
+        if str(remediation.get("kind", "")) == "manual":
+            continue
+        names = ", ".join(
+            f"`{e.get('object', '')}` declared at {e.get('declaration', {}).get('repo', '')}:"
+            f"{e.get('declaration', {}).get('path', '')}"
+            for e in declared
+        )
+        note = str(remediation.get("note", "")).strip()
+        remediation["kind"] = "manual"
+        remediation["path"] = ""
+        remediation["note"] = (f"{note} " if note else "") + SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names)
+        fid = str(finding.get("id", ""))
+        changed.append(fid)
+        log(
+            f"MANUAL: {fid} — {SHARED_ACCOUNT_CHECK} shares its namespace's `default` "
+            f"ServiceAccount with a declared workload ({names}); the shared-account fix would "
+            "remove that workload's token, so this finding is manual."
+        )
+    return changed
 
 
 class ContainmentError(ValidationError):
@@ -10433,6 +10525,7 @@ def join_harness_declarations(
     """
     fold_searched_record(data, record)
     moved = apply_declarations(data, read_declarations(audit_id, repo=repo))
+    shield_declared_account_siblings(data)
     return [str(finding.get("id", "")) for finding in moved]
 
 
