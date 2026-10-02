@@ -81,7 +81,11 @@ those cards roll and ``suspended`` while they wait on the user; a plan refused
 on its first post holds no status. A settle still edits a posted plan, best
 effort, so an edit refused once, for a rate limit say, does not leave its rows
 showing as running. Everything here is in process, like the progress-line map:
-a gateway restart forgets the plan, and the next note starts a new one.
+a gateway restart forgets the plan, and the next note starts a new one. A
+card that settles with no plan left closes the thread's session, or suspends
+it while the card waits on the user, so the Working… the old process set
+does not stick; it can also clear Working… for another card from before the
+restart that is still running, until that card's next note.
 """
 
 from __future__ import annotations
@@ -815,7 +819,7 @@ async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None
         return
     sent = _sessions.get(key)
     setter = getattr(adapter, "_set_thread_status", None)
-    if setter is None or (sent and sent[0] == _status.SESSION_PROCESSING):
+    if not (key[0] and key[1]) or setter is None or (sent and sent[0] == _status.SESSION_PROCESSING):
         return
     chat_id, thread_ts = key
     phrase = "" if wanted == _status.SESSION_CLOSED else wanted

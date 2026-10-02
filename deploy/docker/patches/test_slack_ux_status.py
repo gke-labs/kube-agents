@@ -748,6 +748,11 @@ class PlanTest(_RuntimeCase):
             _run(runtime.settle_row(adapter, _sub(), kind))
         self.assertEqual(adapter.calls, [])
 
+    def test_a_settle_with_no_thread_sends_no_status(self):
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(thread=""), "completed"))
+        self.assertEqual(adapter.calls, [])
+
     def test_a_settle_after_a_restart_leaves_a_running_turn_working(self):
         adapter = _Adapter()
         _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
