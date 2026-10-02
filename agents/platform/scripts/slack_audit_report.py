@@ -164,7 +164,7 @@ LEDGER_LABEL = "agent:audit"
 TOP_FINDINGS = 2
 #: A finding row: as long as the headline, shorter than a report row (``ROW_TEXT_MAX``).
 FINDING_ROW_MAX = HEADLINE_MAX
-#: The relayed line under the headline; the SOPs' lines run to about 200 characters.
+#: The fallback's bold line when the issue could not be read; the SOPs' lines run to about 200 characters.
 REPORT_LINE_MAX = 300
 #: The most of a report line read for the headline. Reducing nested links is
 #: quadratic, one pass per level, and a line holds what the model wrote; a finding
@@ -387,7 +387,7 @@ class AuditReport(NamedTuple):
     name: str
     count: int
     critical: int
-    #: The "<n> new" sentence, and the report's ledger line clipped for under the headline.
+    #: The "<n> new" sentence, and the report's whole ledger line, read for coverage and gaps.
     note: str
     line: str
     findings: list[tuple[str, str]]
@@ -396,10 +396,11 @@ class AuditReport(NamedTuple):
 def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     """The ledger issue's counts and findings, or None when it is not this run's report.
 
-    ``report`` is the relayed report: its ledger line goes under the headline,
-    and that line's "<n> new" count joins it. A closed issue, one without the
-    ledger label, and a zero-finding title do not parse: a clean run closes the
-    ledger over its old title, and the fallback posts the report's own line.
+    ``report`` is the relayed report: its whole ledger line is read for
+    coverage and gaps, and its "<n> new" count joins the headline. A closed
+    issue, one without the ledger label, and a zero-finding title do not
+    parse: a clean run closes the ledger over its old title, and the fallback
+    posts the report's own line.
     Nor does one whose title disagrees with the line's own finding total, or
     one whose line states no total and no non-zero count, or calls the run
     clean, held or carried: a zero-finding partial or held run leaves the old
@@ -429,7 +430,7 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     if count == 0:
         return None
     findings = _severity_findings(str(issue.get("body") or ""))
-    return AuditReport(name, count, critical, _new_phrase(line).strip(), _clip(line, REPORT_LINE_MAX), findings)
+    return AuditReport(name, count, critical, _new_phrase(line).strip(), line, findings)
 
 
 def _cluster_gap(part: str, coverage: re.Match | None) -> str:

@@ -2486,10 +2486,12 @@ def _slack_audit_headline(
     if not _is_fleet_audit_job(profile, job_id):
         return None
     ref = slack_audit_report.ledger_ref(message)
-    if ref is None or not _is_managed_github_repo(ref.repo):
+    if ref is None:
         return None
     if deadline - time.monotonic() < AUDIT_HEADLINE_MIN_LEFT_S:
         logger.warning(f"Audit headline skipped: too little time left to read {ref.url}")
+        return None
+    if not _is_managed_github_repo(ref.repo):
         return None
     issue = _fetch_ledger_issue(ref)
     headline = slack_audit_report.headline_from_issue(issue, ref, message) if issue else None

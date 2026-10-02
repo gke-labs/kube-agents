@@ -3386,14 +3386,14 @@ class TestSlackAuditHeadline(unittest.TestCase):
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value=composed if turn_ok else None), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
-             patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed), \
+             patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed) as is_managed, \
              patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
              patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
              patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
             response = self.client.post(
                 "/v1/cron-reports", json={"job_id": job_id, "report": "raw audit"}
             )
-        self.is_audit, self.fetch, self.posts = is_audit, fetch, poster.call_args_list
+        self.is_audit, self.is_managed, self.fetch, self.posts = is_audit, is_managed, fetch, poster.call_args_list
         return response, sender.call_args_list
 
     def _stored(self):
@@ -3712,6 +3712,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         left = session_kv_server.AUDIT_HEADLINE_MIN_LEFT_S - 1
         response, calls = self._post_at(session_kv_server.CRON_RELAY_POSTS_BUDGET_S - left, lambda *a, **k: self.BLOCKS_TS)
         self.assertEqual(response.json()["status"], "delivered")
+        self.is_managed.assert_not_called()
         self.fetch.assert_not_called()
         self.assertEqual(self.posts, [])
         self.assertEqual([c.args for c in calls], [("slack", self.COMPOSED, "", "")])

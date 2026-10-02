@@ -301,6 +301,11 @@ class HeadlineFromIssueTest(unittest.TestCase):
         self.assertEqual(lines[0], "**Security & RBAC Posture audit found 7 things to look at across 2 of 3 clusters.**")
         self.assertTrue(lines[1].startswith("seeded-c could not be scanned. "), lines[1])
 
+    def test_a_gap_past_the_display_clip_still_gets_its_line(self):
+        line = "Security audit: 7 findings across 3 clusters; " + "x" * sar.REPORT_LINE_MAX + "; seeded-c could not be scanned"
+        lines = sar.headline_from_issue(ISSUE, REF, f"{line} — {LEDGER}").splitlines()
+        self.assertTrue(lines[1].startswith("seeded-c could not be scanned. "), lines[1])
+
     def test_a_gap_comes_ahead_of_the_new_count(self):
         line = "Security audit: 2 new, 1 resolved across 3 clusters (1 unreachable)"
         second = sar.headline_from_issue(ISSUE, REF, f"{line} — {LEDGER}").splitlines()[1]
