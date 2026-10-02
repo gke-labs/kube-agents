@@ -3200,8 +3200,9 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 }
 
 // liveAgentSatisfies checks whether the uncached live object already satisfies pred.
-// If it does, live state is adopted into agent (including ResourceVersion and Status)
-// so subsequent deferred writes operate on the fresh version, and returns true.
+// If it does, live status and ResourceVersion are adopted into agent (so subsequent
+// deferred writers operate on the fresh version), and returns true. If the live object
+// is from a different generation, adoption is refused.
 func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent *agentv1alpha1.PlatformAgent, pred func(*agentv1alpha1.PlatformAgent) bool) bool {
 	if r.APIReader == nil {
 		return false
@@ -3210,8 +3211,9 @@ func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent 
 	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
 		return false
 	}
-	if pred(live) {
-		live.DeepCopyInto(agent)
+	if live.Generation == agent.Generation && pred(live) {
+		agent.Status = *live.Status.DeepCopy()
+		agent.ResourceVersion = live.ResourceVersion
 		return true
 	}
 	return false

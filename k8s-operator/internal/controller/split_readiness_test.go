@@ -731,6 +731,9 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 				return err
 			}
 			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				// The pre-write copy: behind the store on resourceVersion as well as
+				// status, so adopting only one of the two is a failure here.
+				pa.ResourceVersion = "1"
 				pa.Status.Conditions = nil
 			}
 			return nil
