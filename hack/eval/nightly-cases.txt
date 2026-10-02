@@ -513,10 +513,3 @@
 # extracts in the sandbox. Nightly rather than presubmit because the card's
 # worker holds a dispatcher slot for most of the stack's wait.
 ./tasks/bootstrap-inventory-ranking-delivery/task.yaml
-
-# The observability skill's trace latency analyzer, run to completion through
-# the credential broker's relay and graded on the report (a trace and its
-# slowest span) and on the worker's commands (no access token fetched or
-# pasted). Reads the install's own traces in the eval project; no fleet.
-# `validated: false` until its first observed runs.
-./tasks/observability-trace-latency-brokered/task.yaml

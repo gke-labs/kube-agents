@@ -1,4 +1,6 @@
-# Registered in hack/eval/nightly-cases.txt.
+# PARKED — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# (#2244), in no roster file under hack/eval/ until the pool host clusters
+# export traces; it runs locally against an install that does.
 #
 # Domain: none (KNOWN_NO_DOMAIN in scripts/validate_bench_cases.py) — this
 # case grades the agent's own observability skill, not a fleet domain.
@@ -65,7 +67,7 @@
 # cap, exits 1 naming the cap) and fails the report check, which is a fixture
 # gap, not a red.
 # Isolation class: read-only (nothing created or applied).
-# Tier: nightly (new case; presubmit admission is earned on record).
+# Tier: nightly once unparked (new case; presubmit admission is earned on record).
 id: observability-trace-latency-brokered
 name: Trace latency analysis completes through the broker, with no token in any command
 prompt: >-
