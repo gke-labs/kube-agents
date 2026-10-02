@@ -5,8 +5,8 @@ every function is pure but :func:`ack_link_click`, the coroutine a caller
 registers to acknowledge a link-button click, so any process that posts to
 Slack can use it, and it can move with Slack ingress when it leaves the
 gateway. Its callers include the gateway patches for reactions
-(``slack_ux_reactions``, which the kanban notifier also reaches) and button
-clicks (``slack_ux_clicks``).
+(``slack_ux_reactions``, which the kanban notifier also reaches), incident
+triage (``slack_ux_incident``) and button clicks (``slack_ux_clicks``).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 

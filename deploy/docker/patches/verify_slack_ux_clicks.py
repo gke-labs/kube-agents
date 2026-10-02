@@ -12,7 +12,8 @@ Two things are checked:
    ``_begin_interaction(ack, body, action, kind)`` returning the eight fields
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
-   ``_get_client`` and ``_handle_slack_message``; the adapter file still reads the
+   ``_get_client`` and ``_handle_slack_message``, plus ``_client_for`` for ``slack_ux_incident``;
+   the adapter file still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
    action handlers, and the flag guard calling
@@ -49,11 +50,12 @@ IMPORT_MODULE = "gateway"
 IMPORT_NAME = "slack_ux_clicks"
 
 ADAPTER_CLASS = "SlackAdapter"
-#: The adapter members ``slack_ux_clicks`` calls; the stubs supply them, so only
-#: this check ties them to upstream.
+#: The adapter members ``slack_ux_clicks`` calls, and ``_client_for``, which
+#: ``slack_ux_incident``'s alert edit calls; the stubs supply them, so only this
+#: check ties them to upstream.
 RUNTIME_MEMBERS = (
     "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
-    "_get_client", "_handle_slack_message",
+    "_get_client", "_handle_slack_message", "_client_for",
 )
 #: The members the runtime awaits; every other one it calls plainly.
 ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message")
@@ -70,6 +72,7 @@ CALL_SHAPES = {
     "_slack_allowed_channels": ((0, ()),),
     "_slack_disable_dms": ((0, ()),),
     "_get_client": ((1, ("team_id",)),),
+    "_client_for": ((2, ()),),
     "_handle_slack_message": ((1, ()),),
 }
 

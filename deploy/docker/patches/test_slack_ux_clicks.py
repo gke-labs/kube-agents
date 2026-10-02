@@ -85,6 +85,9 @@ class SlackAdapter:
     def _get_client(self, chat_id, team_id=None):
         return None
 
+    def _client_for(self, chat_id, metadata):
+        return None
+
     def _is_ignored_channel(self, channel_id):
         return False
 
@@ -197,6 +200,10 @@ class ApplierTest(unittest.TestCase):
             ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, *, team=None)",
              "_get_client no longer accepts"),
             ("*, team_scoped=True)", "*, team_scoped)", "_begin_interaction requires a keyword"),
+            ("def _client_for(", "def _workspace_client(", "_client_for"),
+            ("def _client_for(self, chat_id, metadata)", "def _client_for(self, chat_id)",
+             "_client_for no longer accepts"),
+            ("    def _client_for(", "    async def _client_for(", "_client_for is now async"),
             ("def _is_ignored_channel(", "def _ignored(", "_is_ignored_channel"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),

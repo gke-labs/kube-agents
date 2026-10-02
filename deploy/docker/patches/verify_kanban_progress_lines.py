@@ -2,9 +2,11 @@
 """Build gate for the rolling-progress-message patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` immediately after
-``apply_kanban_progress_lines.py``. The applier proves its anchors matched in
-``gateway/kanban_watchers_notifier.py``; a matched anchor is the weaker half of
-every concern here, because **every** failure mode of this patch is silent:
+``apply_kanban_progress_lines.py``, and again on the final tree once
+``apply_slack_ux_incident.py`` has wrapped the notifier's adapter. The applier
+proves its anchors matched in ``gateway/kanban_watchers_notifier.py``; a matched
+anchor is the weaker half of every concern here, because **every** failure mode
+of this patch is silent:
 
 * **The wiring.** A trailer import that did not execute, or a ``deliver`` that
   no longer resolves, does not fail at build time — it raises inside the
@@ -52,6 +54,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 
 FAILURES: list[str] = []
@@ -88,6 +91,13 @@ with open("gateway/kanban_watchers_notifier.py", encoding="utf-8") as _notifier_
     NOTIFIER_SOURCE = _notifier_src.read()
 
 GOOGLE_CHAT_ADAPTER = "plugins/platforms/google_chat/adapter.py"
+
+# The `_progress_deliver` arguments, before or after apply_slack_ux_incident.py
+# wraps `adapter`; the Dockerfile re-runs this verifier on the final tree.
+RUNNER_ARGS = re.compile(
+    r"self\.runner,\s*(?:adapter|_kage_slack_incident\.adapter_for\(adapter\b[^\n]*\)),"
+    r"\s*sub, ev\.kind, ev, msg, metadata,"
+)
 
 # The header the notifier passes: `f"{board_tag}{tag}"` with a board slug and a
 # @-mention, which is the shape every live delivery has.
@@ -157,7 +167,7 @@ check(
 )
 check(
     "the map is hung off the runner, not the per-delivery notification",
-    "self.runner, adapter, sub, ev.kind, ev, msg, metadata," in NOTIFIER_SOURCE,
+    RUNNER_ARGS.search(NOTIFIER_SOURCE),
     "_KanbanNotification is rebuilt for every delivery; a map on it forgets "
     "the message id between ticks and every note posts fresh",
 )
