@@ -866,10 +866,6 @@ SHARED_ACCOUNT_SHIELD_NOTE = (
 )
 # How many declared workloads the note names before counting the rest.
 SHARED_ACCOUNT_SHIELD_NAMES = 3
-# The document key `shield_declared_account_siblings` files the ids it demoted
-# under, for the same run's stale-close pass; set by the harness, never read
-# off the worker's text.
-SHIELDED_FINDINGS_KEY = "remediation_shielded"
 SHARED_ACCOUNT_STALE_REASON = (
     "Closing unmerged: a workload in this namespace is now declared to need the `default` "
     "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
@@ -5204,12 +5200,50 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     return moved
 
 
-def shielded_finding_ids(data: dict) -> set[str]:
-    """The ids `shield_declared_account_siblings` filed on the document this run."""
-    return {str(fid) for fid in data.get(SHIELDED_FINDINGS_KEY) or []}
+def _shield_sources(data: dict, declarations: list[dict]) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+    """Declared 2.7 workloads by `(cluster, namespace)`, folded as the finding id folds them.
+
+    Two sources, because each misses what the other has: the document's
+    `declared[]` holds what the worker reported and a declaration moved, and
+    `start`'s declarations hold what the owner declared whether or not the
+    worker reported that workload at all. A fleet-wide declaration (no
+    `cluster`) is keyed under the empty cluster and reaches every cluster.
+    Each value is `(object, repo, path)`, de-duplicated.
+    """
+    sources: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+
+    def add(cluster: str, namespace: str, obj: str, repo: str, path: str) -> None:
+        key = (_id_segment(cluster), _id_segment(namespace))
+        entry = (obj, repo, path)
+        bucket = sources.setdefault(key, [])
+        if entry not in bucket:
+            bucket.append(entry)
+
+    for entry in data.get("declared") or []:
+        if str(entry.get("check", "")) != SHARED_ACCOUNT_CHECK:
+            continue
+        declaration = entry.get("declaration") or {}
+        add(
+            str(entry.get("cluster", "")),
+            str(entry.get("namespace") or ""),
+            str(entry.get("object", "")),
+            str(declaration.get("repo", "")),
+            str(declaration.get("path", "")),
+        )
+    for entry in declarations:
+        if _id_segment(str(entry.get("check", ""))) != _id_segment(SHARED_ACCOUNT_CHECK):
+            continue
+        add(
+            str(entry.get(DECLARATION_CLUSTER_FIELD, "") or ""),
+            str(entry.get("namespace") or ""),
+            str(entry.get("object", "")),
+            str(entry.get("repo", "")),
+            str(entry.get("path", "")),
+        )
+    return sources
 
 
-def shield_declared_account_siblings(data: dict) -> list[str]:
+def shield_declared_account_siblings(data: dict, declarations: list[dict] | None = None) -> list[str]:
     """Keep a declared 2.7 workload's token by making its siblings' fixes manual.
 
     `default-sa-automount` is declared per workload and remediated per
@@ -5219,36 +5253,29 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
     included. So where a namespace holds a declared workload, each remaining
     finding in it keeps its evidence and recommendation and loses the shared
     file: `kind: manual`, with a note naming the declared workload and the two
-    ways to fix the rest. Returns the ids changed, each logged.
+    ways to fix the rest. The declared workloads come from `declared[]` and
+    from `start`'s declarations (`_shield_sources`), so a declared workload
+    the worker left out of the document still protects its namespace.
+    Returns the ids changed, each logged; the caller carries them to the
+    stale-close pass, and nothing in the document records them.
     """
-    # Keyed as the finding id folds its fields, so a sibling the model wrote
-    # as `Payments ` still meets a declaration written as `payments`.
-    def key_of(item: dict) -> tuple[str, str]:
-        return (_id_segment(str(item.get("cluster", ""))), _id_segment(str(item.get("namespace") or "")))
-
-    shielded_by: dict[tuple[str, str], list[dict]] = {}
-    for entry in data.get("declared") or []:
-        if str(entry.get("check", "")) == SHARED_ACCOUNT_CHECK:
-            shielded_by.setdefault(key_of(entry), []).append(entry)
+    shielded_by = _shield_sources(data, list(declarations or []))
     if not shielded_by:
         return []
     changed: list[str] = []
-    already = shielded_finding_ids(data)
     for finding in data.get("findings") or []:
         if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
             continue
-        declared = shielded_by.get(key_of(finding))
+        namespace = _id_segment(str(finding.get("namespace") or ""))
+        declared = list(shielded_by.get((_id_segment(str(finding.get("cluster", ""))), namespace), []))
+        for entry in shielded_by.get((_id_segment(""), namespace), []):
+            if entry not in declared:
+                declared.append(entry)
         if not declared:
             continue
         fid = str(finding.get("id", ""))
-        if fid in already:
-            continue
         remediation = finding.setdefault("remediation", {})
-        shown = [
-            f"`{e.get('object', '')}` declared at {e.get('declaration', {}).get('repo', '')}:"
-            f"{e.get('declaration', {}).get('path', '')}"
-            for e in declared[:SHARED_ACCOUNT_SHIELD_NAMES]
-        ]
+        shown = [f"`{obj}` declared at {repo}:{path}" for obj, repo, path in declared[:SHARED_ACCOUNT_SHIELD_NAMES]]
         rest = len(declared) - len(shown)
         names = ", ".join(shown) + (f" and {rest} more" if rest > 0 else "")
         note = str(remediation.get("note", "")).strip()
@@ -5268,8 +5295,6 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
             f"ServiceAccount with a declared workload ({names}); the shared-account fix would "
             "remove that workload's token, so this finding is manual."
         )
-    if changed:
-        data[SHIELDED_FINDINGS_KEY] = sorted(already | set(changed))
     return changed
 
 
@@ -10366,20 +10391,24 @@ def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
 
 def join_harness_declarations(
     data: dict, record: dict | None, audit_id: str, repo: str | None
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Fold `start`'s search into the document and apply its declarations.
 
     What `finish` — real and dry — and `remediate` share, in the one order
     that is right: the record's `searched` joins the document's
     `declared_intent_searched`, then every finding a filed declaration covers
-    moves to `declared[]`, each move logged. Returns the ids that moved so a
-    caller can refuse one by name. Run on a validated document, after
-    `load_findings`, so the ids are the derived ones.
+    moves to `declared[]`, each move logged, then a declared 2.7 workload's
+    siblings go manual. Returns the ids that moved, so a caller can refuse
+    one by name, and the ids the shield changed, for the stale-close pass;
+    neither list is written into the document, so neither can arrive in it.
+    Run on a validated document, after `load_findings`, so the ids are the
+    derived ones.
     """
     fold_searched_record(data, record)
-    moved = apply_declarations(data, read_declarations(audit_id, repo=repo))
-    shield_declared_account_siblings(data)
-    return [str(finding.get("id", "")) for finding in moved]
+    declarations = read_declarations(audit_id, repo=repo)
+    moved = apply_declarations(data, declarations)
+    shielded = shield_declared_account_siblings(data, declarations)
+    return [str(finding.get("id", "")) for finding in moved], shielded
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -11606,7 +11635,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # them would contradict it.
     repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
     record = read_run_record(audit_id, repo=repo_hint)
-    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint))
+    declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint)[0])
     withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
     covered = [fid for fid in args.finding if fid in declared_ids]
@@ -11935,7 +11964,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # order matters: a posture a declaration covers moves to `declared[]`,
     # where it cites the file it was read from, and only what is left is
     # measured against the search record.
-    join_harness_declarations(data, record, audit_id, repo_hint)
+    shielded_ids = set(join_harness_declarations(data, record, audit_id, repo_hint)[1])
     withheld = withhold_unsearched_postures(data, record)
     if withheld:
         log(
@@ -12261,7 +12290,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
                 repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
-                shielded_ids=shielded_finding_ids(data),
+                shielded_ids=shielded_ids,
             )
         )
         if existing_issue and answers_remediate:
@@ -12803,7 +12832,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 for group in remediation_groups(findings)
                 for finding in group
             },
-            shielded_ids=shielded_finding_ids(data),
+            shielded_ids=shielded_ids,
         )
 
     prs_opened = _open_promoted_prs(

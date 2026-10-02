@@ -82,6 +82,21 @@ fixtures:
       GitOps repository declares on purpose. A second such workload so the
       declaration silences none of the cases that grade checkout-gateway.
 
+  - role: declared-token-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/token-reader
+      - deployment/token-sidecar
+      - serviceaccount/default
+    namespace: seeded-token
+    defect: >-
+      Two one-replica Deployments on the namespace's default ServiceAccount
+      with the token mounted, behind a default-deny NetworkPolicy. The
+      knowledge/ note declares token-reader on purpose and not token-sidecar,
+      so the compliance audit must keep the sibling's fix off the shared
+      ServiceAccount the declared workload's token comes from.
+
   - role: stalled-controller
     slot: a
     available_from_day: 0

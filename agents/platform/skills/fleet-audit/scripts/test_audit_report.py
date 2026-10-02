@@ -5293,8 +5293,6 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertEqual(by_obj["Deployment/batch"]["remediation"]["kind"], "manifest")
         self.assertEqual(audit_report.remediation_groups(doc["findings"]), [[by_obj["Deployment/batch"]]])
         self.assertIn("MANUAL:", err.getvalue())
-        # Idempotent: a second pass changes nothing more.
-        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
 
     def test_a_sibling_already_manual_still_gains_the_shield_note(self):
         # 2.7's default is manual (few repositories declare the auto-created
@@ -5316,9 +5314,6 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertTrue(left["remediation"]["note"].startswith("_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off"))
         self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
-        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
-        self.assertEqual(audit_report.shielded_finding_ids(doc), {left["id"]})
-        self.assertEqual(doc[audit_report.SHIELDED_FINDINGS_KEY], [left["id"]])
 
     def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
         worker = self._sa_finding("worker", "Deployment/worker")
@@ -5338,7 +5333,35 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         worker["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/default-sa-automount.yaml", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/x`")}
         doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
         self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
-        self.assertEqual(audit_report.shielded_finding_ids(doc), set())
+
+    def test_a_declared_workload_the_worker_left_out_still_shields_its_namespace(self):
+        # The owner declared api; the worker never reported api at all, so
+        # nothing moved to declared[]. The harness's own declarations are the
+        # second source, and worker's shared-account fix still goes manual.
+        worker = self._sa_finding("worker", "Deployment/worker")
+        elsewhere = self._sa_finding("batch", "Deployment/batch", namespace="billing")
+        doc = audit_report.validate_findings(make_doc(findings=[worker, elsewhere], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit_report.apply_declarations(doc, [declaration]), [])
+            changed = audit_report.shield_declared_account_siblings(doc, [declaration])
+        by_obj = {f["object"]: f for f in doc["findings"]}
+        self.assertEqual(changed, [by_obj["Deployment/worker"]["id"]])
+        self.assertEqual(by_obj["Deployment/worker"]["remediation"]["kind"], "manual")
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", by_obj["Deployment/worker"]["remediation"]["note"])
+        self.assertEqual(by_obj["Deployment/batch"]["remediation"]["kind"], "manifest")
+        # A declaration scoped to another cluster reaches nothing here; a
+        # fleet-wide one reaches every cluster.
+        scoped = dict(declaration, **{audit_report.DECLARATION_CLUSTER_FIELD: "prod-eu-west"})
+        fresh = audit_report.validate_findings(make_doc(findings=[self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+        self.assertEqual(audit_report.shield_declared_account_siblings(fresh, [scoped]), [])
+        # One declared workload named once, whichever source it came from.
+        with contextlib.redirect_stderr(io.StringIO()):
+            both = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "Deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+            audit_report.apply_declarations(both, [declaration])
+            audit_report.shield_declared_account_siblings(both, [declaration])
+        (left,) = both["findings"]
+        self.assertEqual(left["remediation"]["note"].count("`Deployment/api` declared at"), 1)
 
     def test_the_shield_folds_cluster_and_namespace_as_the_id_does(self):
         api = self._sa_finding("api", "Deployment/api")
@@ -15392,6 +15415,33 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
         self.assertIn("The finding has not gone", comment)
         self.assertNotIn("If the finding comes back", comment)
+
+    def test_a_worker_cannot_mark_a_sibling_shielded_from_the_document(self):
+        # Same pull request, no declaration anywhere: a document that carries
+        # the ids under a key of the worker's choosing closes nothing, because
+        # the stale-close pass reads the shield's own result, not the document.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["pr list"] = json.dumps(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        doc = make_doc(findings=[api, worker], audit=AUDIT)
+        doc["remediation_shielded"] = [api_id, worker_id]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        # Whatever else this run says about the pull request (its branch is
+        # not the group's), the shield reason is not among it.
+        comment = " ".join(b for b in self.harness.bodies if b)
+        self.assertNotIn("declared to need the `default` ServiceAccount's token", comment)
+        self.assertNotIn("The finding has not gone", comment)
+        self.assertNotIn("MANUAL:", self.err)
 
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""
