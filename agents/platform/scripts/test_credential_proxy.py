@@ -4390,12 +4390,13 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         )
         calls = []
         started_event = threading.Event()
+        t2_queued_event = threading.Event()
 
         def execute_side_effect(argv, cwd=None):
             calls.append(list(argv))
             if "org-alpha/repo-a" in argv:
                 started_event.set()
-                time.sleep(0.05)
+                t2_queued_event.wait(timeout=2.0)
                 return credential_proxy.ExecutionResult(
                     exit_code=1,
                     stdout="",
@@ -4423,7 +4424,16 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             except Exception as e:
                 results[repo] = e
 
-        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+        real_monotonic = credential_proxy.time.monotonic
+
+        def monotonic_hook():
+            val = real_monotonic()
+            if threading.current_thread() == t2:
+                t2_queued_event.set()
+            return val
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=monotonic_hook):
             t1 = threading.Thread(target=worker, args=("org-alpha/repo-a",))
             t2 = threading.Thread(target=worker, args=("org-beta/repo-b",))
             t1.start()
@@ -4647,10 +4657,15 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 timed_out=False,
             )
         )
-        # First call reads at 100.0 (queued, check, record);
-        # second call reads at 131.0 (queued, check > 30s, record).
+        # Call 1 at 100.0: runs helper (reads: queued_at=100.0, check=100.0, record=100.0)
+        # Call 2 at 120.0: within 30s window (reads: queued_at=120.0, check=120.0; coalesces and returns)
+        # Call 3 at 140.0: 40s after Call 1, 20s after Call 2 (reads: queued_at=140.0, check=140.0, record=140.0)
+        # A fixed window runs the helper on Call 1 and Call 3 (len(calls) == 2).
+        # A sliding window (if cache write was hoisted above the coalesce return) would record 120.0 on Call 2,
+        # causing Call 3 (140.0 - 120.0 = 20s < 30s) to coalesce (len(calls) == 1).
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
-             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 131.0, 131.0, 131.0]):
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 120.0, 120.0, 140.0, 140.0, 140.0]):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
             executor.refresh_forge_credential("github", "gke-agentic/infra")
             executor.refresh_forge_credential("github", "gke-agentic/infra")
 
