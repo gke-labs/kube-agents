@@ -39,7 +39,10 @@ it edited and never edits one twice; only a failed write followed by a
 gateway restart leaves a thread open to a second edit. A report with no
 "What's wrong" sentence, an option named but not parsed, a fold
 ``block_kit`` cannot render or that would hold a block outside
-``FOLD_CHILD_TYPES``, or any failure to edit, also falls back to that reply.
+``FOLD_CHILD_TYPES``, or any failure to edit, also falls back to that reply,
+and a refused fold logs why. The fold stops at the report's first divider
+outside a code fence, so a closing ``---`` and a note after it do not refuse
+it; the message ``text`` still carries them.
 """
 
 from __future__ import annotations
@@ -98,6 +101,8 @@ FOLD_TEXT_MAX = 12000
 #: The plugin also renders ``table`` and ``divider``; a fold holding one keeps
 #: the threaded reply until a live run shows Slack accepts it there.
 FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
+#: A line the plugin renders as a ``divider`` (its ``_HR_RE``); the fold ends before the first.
+DIVIDER = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
 
 HEADING = re.compile(r"^ {0,3}#{1,6} +(.+?)[ #]*$")
 WHATS_WRONG = re.compile(r"what(?:['’]s| is) wrong", re.IGNORECASE)
@@ -248,12 +253,36 @@ def _load_block_kit() -> Any:
     return _block_kit
 
 
+def _before_divider(report: str) -> str:
+    """``report`` up to its first :data:`DIVIDER` line outside a code fence."""
+    lines, fence = report.split("\n"), None
+    for i, line in enumerate(lines):
+        was, fence = fence, _next_fence(line, fence)
+        if was is None and fence is None and DIVIDER.match(line):
+            return "\n".join(lines[:i]).rstrip()
+    return report
+
+
+def _refuse_fold(reason: str) -> None:
+    logger.info("slack_ux_incident: keeping the threaded reply, the fold is refused: %s", reason)
+
+
 def render_fold(report: str, mrkdwn_fn: Any = None) -> list[dict] | None:
-    """``report`` as the blocks the adapter's own send would render, or None if it cannot."""
+    """``report`` up to its first divider, as the blocks the adapter's own send would render.
+
+    None, with the reason logged, if it cannot be folded.
+    """
+    shown = _before_divider(report)
+    if shown != report and parse_triage(shown) != parse_triage(report):
+        # The buttons would offer what the fold no longer shows.
+        return _refuse_fold("a divider comes before the last option or link")
     block_kit = _load_block_kit()
-    blocks = block_kit.sanitize_blocks(block_kit.render_blocks(report, mrkdwn_fn=mrkdwn_fn))
-    if not blocks or any(block.get("type") not in FOLD_CHILD_TYPES for block in blocks):
-        return None
+    blocks = block_kit.sanitize_blocks(block_kit.render_blocks(shown, mrkdwn_fn=mrkdwn_fn))
+    if not blocks:
+        return _refuse_fold("the Slack plugin rendered no blocks")
+    outside = sorted({str(block.get("type")) for block in blocks} - FOLD_CHILD_TYPES)
+    if outside:
+        return _refuse_fold("block types outside FOLD_CHILD_TYPES: " + ", ".join(outside))
     return blocks
 
 

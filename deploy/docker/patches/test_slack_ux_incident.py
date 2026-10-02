@@ -122,9 +122,12 @@ def _texts(block):
 
 
 def _render_blocks(markdown, mrkdwn_fn=None):
-    """Stands in for block_kit.render_blocks: one section per paragraph."""
+    """Stands in for block_kit.render_blocks: one section per paragraph, a ``---`` paragraph a divider."""
     fmt = mrkdwn_fn or (lambda s: s)
-    return [{"type": "section", "text": {"type": "mrkdwn", "text": fmt(p)}} for p in markdown.split("\n\n") if p]
+    return [
+        {"type": "divider"} if p == "---" else {"type": "section", "text": {"type": "mrkdwn", "text": fmt(p)}}
+        for p in markdown.split("\n\n") if p
+    ]
 
 
 BLOCK_KIT = SimpleNamespace(render_blocks=_render_blocks, sanitize_blocks=lambda blocks: blocks)
@@ -314,8 +317,10 @@ class RuntimeTest(unittest.TestCase):
     def test_a_fold_the_plugin_cannot_render_keeps_the_reply(self):
         adapter = _Adapter()
         empty = SimpleNamespace(render_blocks=lambda md, mrkdwn_fn=None: None, sanitize_blocks=lambda b: b)
-        with mock.patch.object(runtime, "_load_block_kit", return_value=empty):
+        with mock.patch.object(runtime, "_load_block_kit", return_value=empty), self.assertLogs(runtime.logger) as logs:
             self.assertIs(self.wrap(adapter), adapter)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("the fold is refused: the Slack plugin rendered no blocks", logs.output[0])
 
     def test_a_fold_with_a_block_slack_has_not_kept_in_one_keeps_the_reply(self):
         adapter = _Adapter()
@@ -323,8 +328,39 @@ class RuntimeTest(unittest.TestCase):
             render_blocks=lambda md, mrkdwn_fn=None: [*_render_blocks(md, mrkdwn_fn), {"type": "table", "rows": []}],
             sanitize_blocks=lambda b: b,
         )
-        with mock.patch.object(runtime, "_load_block_kit", return_value=with_table):
+        with mock.patch.object(runtime, "_load_block_kit", return_value=with_table), self.assertLogs(runtime.logger) as logs:
             self.assertIs(self.wrap(adapter), adapter)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("the fold is refused: block types outside FOLD_CHILD_TYPES: table", logs.output[0])
+
+    def test_the_fold_stops_at_a_closing_divider(self):
+        adapter = _Adapter()
+        self.deliver(adapter, result=REPORT + "\n---\n")
+        fold = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual(fold["child_blocks"], _render_blocks(REPORT.strip()))
+
+    def test_a_note_after_the_divider_is_in_the_text_not_the_fold(self):
+        adapter = _Adapter()
+        note = "Nothing was changed on the cluster."
+        self.deliver(adapter, result=f"{REPORT}\n---\n\n{note}\n")
+        update = adapter.log[0][1]
+        self.assertEqual(update["blocks"][-1]["child_blocks"], _render_blocks(REPORT.strip()))
+        self.assertTrue(update["text"].endswith(note))
+
+    def test_a_divider_inside_a_code_fence_does_not_cut_the_fold(self):
+        adapter = _Adapter()
+        report = REPORT.replace("## What to do", "```yaml\n---\nkind: Secret\n```\n\n## What to do")
+        self.deliver(adapter, result=report)
+        fold = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual(fold["child_blocks"], _render_blocks(report.strip()))
+
+    def test_a_divider_before_the_options_keeps_the_reply_and_says_why(self):
+        adapter = _Adapter()
+        report = REPORT.replace("## What to do", "---\n\n## What to do")
+        with self.assertLogs(runtime.logger) as logs:
+            self.assertIs(self.wrap(adapter, result=report), adapter)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("the fold is refused: a divider comes before the last option or link", logs.output[0])
 
     def test_a_click_sends_apply_option_as_the_clicker(self):
         adapter = _Adapter()
