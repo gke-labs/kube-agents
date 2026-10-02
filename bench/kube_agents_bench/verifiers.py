@@ -156,7 +156,9 @@ def _normalize(text: str) -> str:
 # mark), a `<br>`, or a footnote marker (`[1]`, `[^note]`, `(1)`, a
 # superscript digit, a linked `[1](url)`); any other trailing symbol stays.
 # A footnote marker before a `;`, `,` or `.` inside the line is folded too,
-# since a declared frame's values are separated by `;`. A pattern anchored
+# since a declared frame's values are separated by `;`; so is a wrap the
+# agent kept from the prompt's template around a value (`<unavailable>`,
+# `"unaffected"`), and whitespace before a `:` or `;`. A pattern anchored
 # with ``^...$`` then spells a declared line once rather than once per
 # rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
 # edges. Other interior punctuation is untouched. Opt-in, because a case
@@ -205,8 +207,20 @@ _TRAIL_FOLD_PASSES = 3
 # a parenthetical inside the quotes: the lead fold has taken the opener, so
 # what is left is the name with its closer stuck to it before the colon or
 # slash that ends the name.
-_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]]+(?=[:/\s(])")
+_QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d'\u2018\u2019\]>]+(?=[:/\s(])")
 _MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
+# A value the agent kept inside the prompt's own delimiters (`<unavailable>`,
+# `"unaffected"`): a wrap that opens after whitespace and closes at the next
+# `;` or the end comes off; at the end the closer may already have gone with
+# the trail. Only a wrap on a whole value, so quotes inside a value stay.
+_VALUE_WRAP = re.compile(
+    r"(?<=\s)[\"'\u201c\u201d\u2018\u2019<]+([^;\n\"'\u201c\u201d\u2018\u2019<>]+?)"
+    r"(?:[\"'\u201c\u201d\u2018\u2019>]+(?=\s*(?:;|$))|(?=\s*$))",
+    re.M,
+)
+# Whitespace the agent put before a frame's separator (`seeded-a :`,
+# `zonal ;`): the separator is the frame's, so the space is decoration.
+_SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
 
 
 def _fold_trail_markers(line: str) -> str:
@@ -237,7 +251,11 @@ def _fold_line_decoration(line: str) -> str:
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
     unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
-    return _fold_trail(unquoted)
+    # The value wrap comes off before the trail fold (so a closing quote at
+    # the line's end is read as the wrap it is) and again after it (so a
+    # wrap followed by a stop is read once the stop is gone).
+    trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", unquoted))
+    return _SEPARATOR_SPACE.sub("", _VALUE_WRAP.sub(r"\1", trailed))
 
 
 def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:

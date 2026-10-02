@@ -406,6 +406,14 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
         # with a stop after it.
         "\n".join(_zonal_line(c).replace("running pods: unaffected", "running pods: [unaffected](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)") for c in _SLOTS),
         "\n".join(_zonal_line(c) + " [1](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)." for c in _SLOTS),
+        # The prompt's own delimiters kept around a value or the name, and
+        # whitespace before a separator.
+        "\n".join(_zonal_line(c).replace("is zonal;", "is <zonal>;").replace(": unavailable;", ": <unavailable>;").replace(": unaffected", ": <unaffected>") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(": unaffected", ': "unaffected"').replace("is zonal;", 'is "zonal";') for c in _SLOTS),
+        "\n".join(_zonal_line(f"<{c}>") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(f"{c}:", f"{c} :") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("zonal;", "zonal ;").replace("unavailable;", "unavailable ;") for c in _SLOTS),
+        "\n".join("**" + c + "** : " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS),
         # A citation on a value other than the last.
         "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1];") for c in _SLOTS),
         "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1](https://cloud.google.com/kubernetes-engine/docs);") for c in _SLOTS),
@@ -529,6 +537,17 @@ def test_zonal_case_patterns_name_exactly_the_catalogues_slots():
         assert class_letters(char_class) == set(_SLOT_LETTERS), char_class
 
 
+def test_a_cluster_that_merely_starts_with_a_slot_name_is_neither_a_slot_nor_a_wrong_value():
+    # A fifth, regional cluster named seeded-canary beside four right lines:
+    # not a slot line, so not forbidden; and a seeded-alpha line does not
+    # stand in for slot a.
+    extra = "seeded-canary: control plane is regional; API during its upgrade: available; running pods: unaffected"
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_grades(objective, _RIGHT_REPORT + "\n" + extra), objective
+    three = "\n".join(_zonal_line(c) for c in _SLOTS if c != "seeded-a")
+    assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", three + "\n" + _zonal_line("seeded-alpha"))
+
+
 def test_zonal_case_refuses_one_joint_line_for_all_slots():
     for joint in ("seeded-a/seeded-b/seeded-c/seeded-d", "seeded-a.seeded-b.seeded-c.seeded-d", "seeded-a-seeded-b-seeded-c-seeded-d"):
         assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", _zonal_line(joint))
@@ -550,6 +569,9 @@ def test_zonal_case_needs_a_line_for_each_of_the_four_slots():
         "seeded-a, seeded-b and seeded-c are zonal, so the API during each upgrade is unavailable and running pods are unaffected.",
         "platform-agent-host: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
         "zonal clusters: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-alpha: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-batch-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
     ],
 )
 def test_zonal_case_refuses_what_is_not_a_declared_seeded_line(text):

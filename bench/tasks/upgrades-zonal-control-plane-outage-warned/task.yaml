@@ -73,11 +73,12 @@ owner: maintainers
 # No planted defect is read: the case depends on the seeded clusters existing
 # and being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
 # `zone`), not a role. The four roles below are one per slot, and they are
-# how the first objective tells a cluster the agent missed from a cluster the
-# project does not have: the runner writes a credential per seeded cluster it
-# reaches (`clusters/<slot>.kubeconfig`) before it confirms any role, and a
-# slot without one makes that objective an `error` about the environment
-# (its `fixture_roles`), never a `fail` charged to the agent. Whether these
+# how the declared-line objectives tell a cluster the agent missed from a
+# cluster the project does not have: the runner writes a credential per
+# seeded cluster it reaches (`clusters/<slot>.kubeconfig`) before it confirms
+# any role and records each role's slot, and a slot without a credential
+# makes each of those objectives an `error` about the environment (their
+# `fixture_roles`), never a `fail` charged to the agent. Whether these
 # four defects are planted is not read: healing one does not quiet the case;
 # replacing or retiring the slot's cluster does, which is what a reader of
 # this list is checking.
@@ -102,7 +103,9 @@ verification_spec:
   # What the case does allow around the slot name is naming rather than
   # decoration: a qualified id (a project, a location, a kubeconfig context
   # or a resource path joined to the name by the characters a name may hold)
-  # or a parenthetical after it. The slot has to be one of a, b, c and d,
+  # or a parenthetical after it, and the slot letter has to end the slot's
+  # name (`seeded-b-us-central1-a` is slot b; `seeded-batch-a` and
+  # `seeded-canary` are not slots). The slot has to be one of a, b, c and d,
   # the four `bench/tf/fleet` declares, and the first objective needs a line
   # for each. The host cluster or "clusters in general" does not pass. Each value objective also forbids a declared
   # frame whose value slot holds anything but the right word, as the exact
@@ -116,9 +119,9 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       # One role per slot (the case's `fixtures:` says why), each resolved
-      # to its slot's own credential: a slot whose cluster the runner could
-      # not reach before the run is an `error` here, not a line the agent
-      # failed to write.
+      # to its slot's own credential, on this and the three value objectives:
+      # a slot whose cluster the runner could not reach before the run is an
+      # `error` here, not a line the agent failed to write.
       fixture_roles:
         - crashloop-workload
         - version-laggard
@@ -127,7 +130,7 @@ verification_spec:
       # One pattern, four lookaheads: a declared frame for each of the four
       # slots, in any order, anywhere in the report.
       any_of_patterns:
-        - '(?ms)\A(?=.*^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-a(?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-b(?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-c(?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-d(?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)'
+        - '(?ms)\A(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-a(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-b(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-c(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-d(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)'
 
   - name: the-declared-lines-say-the-control-plane-is-zonal
     role: objective
@@ -135,20 +138,20 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
-      # The same four slots as the first objective: on a project where the
-      # runner reached no seeded cluster, this is the environment's error too,
-      # not a value the agent got wrong.
+      # The same four slots: on a project missing one, or where the runner
+      # reached none, this is the environment's error, not a value the agent
+      # got wrong.
       fixture_roles:
         - crashloop-workload
         - version-laggard
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is zonal; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
+        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is zonal; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
       # A declared frame whose first value is anything but "zonal" is the
       # wrong read, whatever the other lines say.
       forbidden_patterns:
-        - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is (?!zonal;)[^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
+        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is (?!zonal;)[^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
 
   - name: the-declared-lines-say-the-api-goes-away
     role: objective
@@ -156,18 +159,18 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
-      # The same four slots as the first objective: on a project where the
-      # runner reached no seeded cluster, this is the environment's error too,
-      # not a value the agent got wrong.
+      # The same four slots: on a project missing one, or where the runner
+      # reached none, this is the environment's error, not a value the agent
+      # got wrong.
       fixture_roles:
         - crashloop-workload
         - version-laggard
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: unavailable; running pods: [^\n]+$'
+        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: unavailable; running pods: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: (?!unavailable;)[^;\n]+; running pods: [^\n]+$'
+        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: (?!unavailable;)[^;\n]+; running pods: [^\n]+$'
 
   # The distinction that makes the warning useful: the nodes and their pods
   # are not what goes away. A report that says "the cluster is down" without
@@ -178,18 +181,18 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
-      # The same four slots as the first objective: on a project where the
-      # runner reached no seeded cluster, this is the environment's error too,
-      # not a value the agent got wrong.
+      # The same four slots: on a project missing one, or where the runner
+      # reached none, this is the environment's error, not a value the agent
+      # got wrong.
       fixture_roles:
         - crashloop-workload
         - version-laggard
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: unaffected$'
+        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: unaffected$'
       forbidden_patterns:
-        - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: (?!unaffected$)[^\n]+$'
+        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: (?!unaffected$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective

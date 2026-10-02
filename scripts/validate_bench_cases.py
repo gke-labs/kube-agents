@@ -784,10 +784,17 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 )
 
         if fixtures is None and (used_types & CLUSTER_READING_TYPES or used_roles):
+            reading = sorted(used_types & CLUSTER_READING_TYPES)
+            # A report check naming roles opens no cluster; it asks whether
+            # the role's slot was reached. Say which the case does.
+            lead = (
+                "reads live cluster state (" + ", ".join(reading) + ")"
+                if reading
+                else "names seeded-fleet roles (" + ", ".join(sorted(used_roles)) + ")"
+            )
             problems.append(
-                "reads live cluster state ("
-                + ", ".join(sorted((used_types & CLUSTER_READING_TYPES) | {f"fixture role {r}" for r in used_roles}))
-                + ") and declares no 'fixtures:'. List the seeded-fleet roles "
+                lead
+                + " and declares no 'fixtures:'. List the seeded-fleet roles "
                 "it depends on, so the fleet owner replacing a cluster can "
                 "grep for the cases that go quiet, or declare 'fixtures: []' "
                 "for a case that plants its own state"
