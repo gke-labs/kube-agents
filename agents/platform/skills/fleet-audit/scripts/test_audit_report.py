@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
+from unittest import mock
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -255,6 +256,26 @@ def published_body(doc, **kwargs):
 # Fixtures
 # --------------------------------------------------------------------------- #
 
+
+DECLINE_REASON = "a pull request already carries this fix"
+
+
+def pytest_yaml():
+    """PyYAML, or a skip: the generated manifest is checked by parsing it."""
+    try:
+        import yaml  # noqa: PLC0415 -- optional in this suite
+    except ImportError:
+        raise unittest.SkipTest("PyYAML is not available")
+    return yaml
+
+
+def declined(doc):
+    """`--decline-fix` for every finding in `doc`, under the id `finish` derives."""
+    return tuple(
+        arg
+        for finding in doc["findings"]
+        for arg in ("--decline-fix", audit_report.derive_finding_id(dict(finding)), DECLINE_REASON)
+    )
 
 def make_finding(
     fid="no-network-policy",
@@ -3029,13 +3050,14 @@ class TestFinishWithFindings(HarnessTestCase):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         self.touch("clusters/stage-eu/psp.yaml")
         # Nothing here is auto-promotable — the manifest findings are below
-        # `critical` and the one critical is a `gcloud` remediation, which has
-        # no file to put in a pull request. That isolates the reporting path,
-        # which is what this test is about; auto-promotion has its own.
+        # `AUTO_PROMOTION_FLOOR` and the one critical is a `gcloud`
+        # remediation, which has no file to put in a pull request. That
+        # isolates the reporting path, which is what this test is about;
+        # auto-promotion has its own.
         doc = make_doc(
             findings=[
-                make_finding(fid="a", severity="major"),
-                make_finding(fid="b", severity="major"),  # duplicate path
+                make_finding(fid="a", severity="minor"),
+                make_finding(fid="b", severity="minor"),  # duplicate path
                 make_finding(
                     fid="c",
                     severity="minor",
@@ -3080,6 +3102,37 @@ class TestFinishWithFindings(HarnessTestCase):
         for verb in ("create", "edit", "close", "comment"):
             self.assertEqual(self.harness.gh_calls("pr", verb), [], verb)
 
+    def test_the_ledger_names_what_the_floor_passed_over(self):
+        """`finish` hands the sweep's `below_floor` to the renderer, so the
+        published body names the `minor` manifest fixes it did not open."""
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.run_finish(make_doc(findings=[make_finding(fid="a", severity="minor")]))
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn(
+            f"`{audit_report.AUTO_PROMOTION_FLOOR}` for `ccc-no-ondemand-floor`, `no-pdb`, "
+            "`unbound-sa-automount` where the collector graded it so",
+            body,
+        )
+        self.assertIn(f"`{derived_id(fid='a')}` —", body)
+
+    def test_the_dry_run_logs_what_the_floor_passed_over(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.run_finish(
+            make_doc(findings=[make_finding(fid="a", severity="minor")]), ["--dry-run"]
+        )
+        self.assertIn(
+            f"BELOW THE `{audit_report.UNVOUCHED_PROMOTION_FLOOR}` FLOOR, OR "
+            f"`{audit_report.AUTO_PROMOTION_FLOOR}` FOR `ccc-no-ondemand-floor`, `no-pdb`, "
+            "`unbound-sa-automount` (1): "
+            f"{derived_id(fid='a')}",
+            self.err,
+        )
+
     def test_opened_status_json(self):
         self.harness.replies = {
             "issue list": "[]",
@@ -3095,6 +3148,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "new": 1,
                 "resolved": 0,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": False,
                 "partial": False,
@@ -3156,6 +3210,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "new": 1,
                 "resolved": 1,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": False,
                 "partial": False,
@@ -3249,6 +3304,409 @@ class TestFinishWithFindings(HarnessTestCase):
             audit_report.degrade_missing_remediations(findings, self.workspace), []
         )
         self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
+
+
+class TestRevertedGcloudRemediations(HarnessTestCase):
+    """A `gcloud` fix Config Connector will undo is not a fix.
+
+    On 2026-09-05 the drift ledger carried two. `drift-peer-std-4`'s declaration
+    sets `loggingService: none` and the finding said to run
+    `--logging=SYSTEM,WORKLOAD`; `drift-peer-std-9`'s sets `releaseChannel`
+    against a `--release-channel=regular`. Both commands work when pasted and
+    are reverted by the next reconcile, so the finding returns every week having
+    been fixed every week. This is the backstop for the model getting it wrong.
+    """
+
+    CLUSTER = "Cluster/drift-peer-std-4"
+
+    def declare(self, relative, name, spec, kind="ContainerCluster", tree=None):
+        """Write a Config Connector declaration into a clone."""
+        target = (tree or self.workspace) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = [
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1",
+            f"kind: {kind}",
+            "metadata:",
+            f"  name: {name}",
+            "  namespace: kubeagents-system",
+            "spec:",
+        ] + [f"  {line}" for line in spec]
+        target.write_text("\n".join(body) + "\n", encoding="utf-8")
+        return target
+
+    def gcloud_finding(self, note, obj=CLUSTER, fid="drift", cluster=None):
+        # A cluster finding's cluster is the cluster itself; a node pool's
+        # defaults to `prod-us-east`.
+        if cluster is None:
+            prefix, _, name = obj.partition("/")
+            cluster = name if prefix == "Cluster" else "prod-us-east"
+        return make_finding(
+            fid=fid,
+            obj=obj,
+            cluster=cluster,
+            check="workload-identity-off",
+            remediation={"kind": "gcloud", "note": note},
+        )
+
+    def degrade(self, findings, roots=None):
+        return audit_report.degrade_reverted_gcloud_remediations(
+            findings, roots if roots is not None else [("", self.workspace)]
+        )
+
+    def test_a_declared_field_degrades_and_names_the_file(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+        remediation = findings[0]["remediation"]
+        self.assertEqual(remediation["kind"], "manual")
+        # The file is named above the command, and the command stays readable
+        # once the note renders as prose.
+        note = remediation["note"]
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", note)
+        self.assertIn("`loggingService`", note)
+        self.assertLess(note.index("gcp/drift-peer-std-4.yaml"), note.index("```bash"))
+        self.assertIn("```bash\ngcloud container clusters update x --logging=SYSTEM,WORKLOAD\n```", note)
+
+    def test_a_long_command_is_clipped_inside_its_fence(self):
+        """A `gcloud` note may run to `MAX_COMMAND_CHARS`; with the prose in
+        front it would pass `MAX_NOTE_CHARS`, and the renderer's clip would
+        cut the closing fence off."""
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        command = "gcloud container clusters update x --logging=SYSTEM,WORKLOAD " + "x" * 2100
+        findings = [self.gcloud_finding(command)]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+        note = findings[0]["remediation"]["note"]
+        self.assertLessEqual(len(note), audit_report.MAX_NOTE_CHARS)
+        self.assertTrue(note.endswith("…(truncated)\n```"), note[-40:])
+        self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note)
+
+    def test_a_declared_cluster_without_the_field_keeps_its_gcloud_fix(self):
+        # `adam-new-cluster` is declared, but its spec omits
+        # `masterAuthorizedNetworksConfig`. Config Connector holds only the
+        # fields its spec names, so the command sticks; degrading it would
+        # replace a working fix with prose.
+        self.declare(
+            "gcp/adam-new-cluster.yaml",
+            "adam-new-cluster",
+            ["location: us-central1", "releaseChannel:", "  channel: REGULAR"],
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container clusters update adam-new-cluster "
+                "--enable-master-authorized-networks --master-authorized-networks=10.0.0.0/8",
+                obj="Cluster/adam-new-cluster",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_undeclared_cluster_leaves_gcloud_alone(self):
+        self.declare("gcp/someone-else.yaml", "someone-else", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_name_in_a_label_is_not_a_declaration(self):
+        # `grep "name: <object>"` matches label lines; the index parses.
+        target = self.workspace / "clusters/x/workload.yaml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+            "  name: something-else\n  labels:\n"
+            "    app.kubernetes.io/name: drift-peer-std-4\n"
+            "    tracked-by: container.cnrm.cloud.google.com\n"
+            "spec:\n  loggingService: none\n",
+            encoding="utf-8",
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_prefix_sharing_cluster_is_not_a_declaration(self):
+        self.declare("gcp/drift-peer-std-40.yaml", "drift-peer-std-40", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_resource_id_wins_over_metadata_name(self):
+        self.declare(
+            "gcp/cr.yaml",
+            "some-kcc-object-name",
+            ["resourceID: drift-peer-std-4", "releaseChannel:", "  channel: RAPID"],
+        )
+        findings = [self.gcloud_finding("gcloud ... --release-channel=regular")]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_a_flag_prefix_does_not_match_a_longer_flag(self):
+        # `--logging-variant` writes a node-pool field this table does not claim.
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging-variant=MAX_THROUGHPUT")]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_the_negated_spelling_of_an_enable_flag_writes_the_same_field(self):
+        self.declare(
+            "gcp/pool.yaml",
+            "spot-pool",
+            ["clusterRef:", "  name: prod-us-east", "management:", "  autoUpgrade: true"],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update spot-pool --no-enable-autoupgrade",
+                obj="NodePool/spot-pool",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_another_clusters_node_pool_of_the_same_name_is_not_a_declaration(self):
+        """Every cluster has a `default-pool`. cluster-b's declaration says
+        nothing about cluster-a's pool, whose `gcloud` fix is the right one."""
+        self.declare(
+            "clusters/b/pool.yaml",
+            "default-pool",
+            ["clusterRef:", "  name: cluster-b", "management:", "  autoUpgrade: true"],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update default-pool --cluster=cluster-a --enable-autoupgrade",
+                obj="NodePool/default-pool",
+                cluster="acme/us-central1/cluster-a",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_external_cluster_ref_matches_on_its_last_segment(self):
+        self.declare(
+            "clusters/a/pool.yaml",
+            "default-pool",
+            [
+                "clusterRef:",
+                "  external: projects/acme/locations/us-central1/clusters/cluster-a",
+                "management:",
+                "  autoUpgrade: true",
+            ],
+            kind="ContainerNodePool",
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update default-pool --enable-autoupgrade",
+                obj="NodePool/default-pool",
+                cluster="acme/us-central1/cluster-a",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_a_node_pool_without_a_cluster_ref_is_not_indexed(self):
+        self.declare(
+            "gcp/pool.yaml", "spot-pool", ["management:", "  autoUpgrade: true"], kind="ContainerNodePool"
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud container node-pools update spot-pool --no-enable-autoupgrade",
+                obj="NodePool/spot-pool",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_same_named_cluster_in_another_location_is_not_a_declaration(self):
+        self.declare(
+            "gcp/drift-peer-std-4.yaml",
+            "drift-peer-std-4",
+            ["location: europe-west1", "loggingService: none"],
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud ... --logging=SYSTEM,WORKLOAD",
+                cluster="acme/us-central1/drift-peer-std-4",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+
+    def test_a_declaration_in_the_findings_location_degrades(self):
+        self.declare(
+            "gcp/drift-peer-std-4.yaml",
+            "drift-peer-std-4",
+            ["location: us-central1", "loggingService: none"],
+        )
+        findings = [
+            self.gcloud_finding(
+                "gcloud ... --logging=SYSTEM,WORKLOAD",
+                cluster="acme/us-central1/drift-peer-std-4",
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_a_manifest_remediation_is_untouched(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [
+            make_finding(
+                obj=self.CLUSTER,
+                remediation={"kind": "manifest", "path": "gcp/drift-peer-std-4.yaml", "note": "--logging=SYSTEM"},
+            )
+        ]
+        self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
+
+    def test_a_node_pool_matches_only_a_node_pool_declaration(self):
+        self.declare(
+            "gcp/pool.yaml",
+            "spot-pool",
+            ["clusterRef:", "  name: prod-us-east", "management:", "  autoUpgrade: false"],
+            kind="ContainerNodePool",
+        )
+        pool = self.gcloud_finding(
+            "gcloud container node-pools update spot-pool --enable-autoupgrade", obj="NodePool/spot-pool"
+        )
+        cluster = self.gcloud_finding(
+            "gcloud container clusters update spot-pool --enable-autoupgrade", obj="Cluster/spot-pool", fid="c"
+        )
+        self.assertEqual(self.degrade([pool, cluster]), [pool["id"]])
+        self.assertEqual(cluster["remediation"]["kind"], "gcloud")
+
+    def test_an_unparseable_yaml_file_does_not_stop_the_sweep(self):
+        bad = self.workspace / "gcp/broken.yaml"
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text(
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\n  bad: [indent\n",
+            encoding="utf-8",
+        )
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings), [findings[0]["id"]])
+
+    def test_without_pyyaml_the_check_is_off_and_the_fix_stands(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        with patch.dict(sys.modules, {"yaml": None}):
+            self.assertEqual(self.degrade(findings), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def test_an_unreadable_clone_is_no_declaration(self):
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings, [("", self.tmp_path / "nowhere")]), [])
+        self.assertEqual(findings[0]["remediation"]["kind"], "gcloud")
+
+    def context_checkout(self, slug="acme/platform-infra"):
+        """The leased checkout `start`'s declared-intent search leaves on disk."""
+        owner, _, name = slug.partition("/")
+        tree = self.gitops_root / f"{AUDIT}{audit_report.CLONE_LEASE_SUFFIX}" / f"{owner}__{name}"
+        (tree / ".git").mkdir(parents=True)
+        return tree
+
+    def test_a_context_repository_declaration_is_found_and_named(self):
+        tree = self.context_checkout()
+        self.declare("kcc/clusters.yaml", "drift-peer-std-4", ["loggingService: none"], tree=tree)
+        record = {"repo": "acme/fleet", "context_repos": ["acme/fleet", "acme/platform-infra"]}
+        roots = audit_report.kcc_declaration_roots(AUDIT, self.workspace, record)
+        self.assertEqual(roots, [("", self.workspace), ("acme/platform-infra", tree)])
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.assertEqual(self.degrade(findings, roots), [findings[0]["id"]])
+        self.assertIn(
+            "in the context repository `acme/platform-infra` at `kcc/clusters.yaml`",
+            findings[0]["remediation"]["note"],
+        )
+
+    def test_the_gitops_declaration_wins_a_name_both_repositories_carry(self):
+        tree = self.context_checkout()
+        self.declare("kcc/clusters.yaml", "drift-peer-std-4", ["loggingService: none"], tree=tree)
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        roots = audit_report.kcc_declaration_roots(
+            AUDIT, self.workspace, {"repo": "acme/fleet", "context_repos": ["acme/platform-infra"]}
+        )
+        findings = [self.gcloud_finding("gcloud ... --logging=SYSTEM,WORKLOAD")]
+        self.degrade(findings, roots)
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", findings[0]["remediation"]["note"])
+
+    def test_only_checkouts_are_roots(self):
+        # In content mode the GitOps path is a scratch directory of this run's
+        # own manifests, and a context repository `start` never checked out
+        # (or whose lease was reaped) is not on disk.
+        scratch = self.tmp_path / "scratch-tree"
+        scratch.mkdir()
+        record = {"repo": "acme/fleet", "context_repos": ["acme/never-cloned"]}
+        self.assertEqual(audit_report.kcc_declaration_roots(AUDIT, scratch, record), [])
+        self.assertEqual(audit_report.kcc_declaration_roots(AUDIT, None, None), [])
+
+    def test_finish_publishes_the_degraded_fix(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        doc = make_doc(findings=[self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertIn("Config Connector declaration holds", self.err)
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", body)
+
+    def broker_scan(self, files, rounds):
+        """`kcc_declarations_via_broker` against a broker answering `rounds` in turn.
+
+        Each round is the `skipped` list one `read_many` returns; every path
+        not skipped in that round comes back.
+        """
+        answers = iter(rounds)
+
+        class FakeWorkspace:
+            def grep(self, pattern, **_):
+                return {
+                    "matches": [{"path": path, "line": 1, "text": pattern} for path in files],
+                    "total": len(files),
+                    "truncated": False,
+                }
+
+            def read_many(self, paths):
+                skipped = next(answers)
+                held = {entry["path"] for entry in skipped}
+                return {p: files[p].encode() for p in paths if p not in held}, skipped
+
+        @contextlib.contextmanager
+        def opened(*_, **__):
+            yield FakeWorkspace()
+
+        with patch.object(credential_proxy_client.Workspace, "open", opened):
+            return audit_report.kcc_declarations_via_broker("acme/fleet")
+
+    KCC_TEXT = (
+        "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\n"
+        "metadata:\n  name: {name}\nspec:\n  loggingService: none\n"
+    )
+
+    def test_a_request_budget_skip_is_asked_for_again(self):
+        files = {
+            "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
+            "gcp/b.yaml": self.KCC_TEXT.format(name="b"),
+        }
+        scan = self.broker_scan(files, [[{"path": "gcp/b.yaml", "reason": "requestBudget"}], []])
+        self.assertFalse(scan.truncated)
+        self.assertEqual(
+            sorted(scan.declarations),
+            [("ContainerCluster", "a", "a", ""), ("ContainerCluster", "b", "b", "")],
+        )
+        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "")].path, "gcp/b.yaml")
+
+    def test_a_file_the_broker_withholds_marks_the_scan_truncated(self):
+        files = {
+            "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
+            "gcp/big.yaml": self.KCC_TEXT.format(name="big"),
+        }
+        scan = self.broker_scan(files, [[{"path": "gcp/big.yaml", "reason": "tooLarge"}]])
+        self.assertTrue(scan.truncated)
+        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "")])
+
+    def test_a_broker_that_never_relents_stops_and_marks_the_scan_truncated(self):
+        files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
+        stuck = [{"path": "gcp/a.yaml", "reason": "requestBudget"}]
+        scan = self.broker_scan(files, [stuck, stuck, stuck])
+        self.assertTrue(scan.truncated)
+        self.assertEqual(scan.declarations, {})
+
+    def test_the_dry_run_previews_the_degraded_fix(self):
+        self.declare("gcp/drift-peer-std-4.yaml", "drift-peer-std-4", ["loggingService: none"])
+        doc = make_doc(findings=[self.gcloud_finding("gcloud container clusters update x --logging=SYSTEM,WORKLOAD")])
+        self.assertEqual(self.run_finish(doc, argv_extra=("--dry-run",)), 0, self.err)
+        self.assertIn("DRY RUN: ", self.err)
+        self.assertIn("degrades to manual, naming the file", self.err)
+        self.assertIn("gcp/drift-peer-std-4.yaml", self.out)
 
 
 class TestPublishedBodies(HarnessTestCase):
@@ -3410,9 +3868,11 @@ class TestFinishClean(HarnessTestCase):
     def test_the_findings_branch_reports_the_declared_count_too(self):
         self.harness.replies = {"issue list": "[]"}
         self.record_run()
+        # Its finding's fix is unwritten; declining it lets this test reach
+        # what it is about (`TestUnwrittenSweepFixes`).
         doc = searched_doc(findings=[make_finding(check="no-pdb")])
         doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
-        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
+        self.assertEqual(self.run_finish(doc, declined(doc), audit=DECLARING_AUDIT), 0)
         self.assertEqual(self.stdout_json()["declared"], 2)
 
     def test_clean_run_closes_the_open_ledger_as_completed(self):
@@ -3449,6 +3909,7 @@ class TestFinishClean(HarnessTestCase):
                 "new": 0,
                 "resolved": 2,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": False,
                 "partial": False,
@@ -3483,6 +3944,7 @@ class TestFinishClean(HarnessTestCase):
                 "new": 0,
                 "resolved": 0,
                 "prs_opened": [],
+                "prs_still_open": [],
                 "prs_closed": [],
                 "silent_ok": True,
                 "partial": False,
@@ -4198,8 +4660,10 @@ class TestStart(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(clusters=[])), 2)
         self.assertIn("scope.clusters", self.err)
         self.assertTrue(note.is_file())
+        # Its finding's fix is unwritten; declining it lets this test reach
+        # what it is about (`TestUnwrittenSweepFixes`).
         self.harness.failures = {"issue create": 1}
-        self.assertEqual(self.run_finish(make_doc()), 1, self.err)
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 1, self.err)
         self.assertFalse(note.is_file())
 
     def test_a_guard_that_cannot_be_taken_refuses_rather_than_running_unguarded(self):
@@ -4261,10 +4725,12 @@ class TestStart(HarnessTestCase):
         audit_report.release_in_flight(AUDIT)
         self.assertFalse(note.is_file())
         # And `finish` is what releases it on the happy path.
+        # Its finding's fix is unwritten; declining it lets this test reach
+        # what it is about (`TestUnwrittenSweepFixes`).
         Path(audit_report.inflight_path_for(AUDIT)).write_text(
             json.dumps({"audit": AUDIT, "started_at": time.time()})
         )
-        rc = self.run_finish(make_doc())
+        rc = self.run_finish(make_doc(), declined(make_doc()))
         self.assertEqual(rc, 0, self.err)
         self.assertFalse(note.is_file())
 
@@ -8197,19 +8663,90 @@ class TestFindingState(BaseTestCase):
 
 
 class TestPromotion(BaseTestCase):
-    def test_only_critical_manifest_findings_auto_promote(self):
+    def test_only_manifest_findings_at_or_above_the_floor_auto_promote(self):
         findings = [
             manifest_finding("crit", "a.yaml", severity="critical"),
             manifest_finding("maj", "b.yaml", severity="major"),
+            manifest_finding("min", "c.yaml", severity="minor"),
             make_finding(
                 fid="crit-gcloud",
                 severity="critical",
                 remediation={"kind": "gcloud", "note": "g"},
             ),
         ]
-        plan = audit_report.promotion_candidates(findings, {})
-        self.assertEqual(plan.promote, ["crit"])
+        plan = audit_report.promotion_candidates(
+            findings, {}, vouched={"crit", "maj", "min", "crit-gcloud"}
+        )
+        self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_the_floor_is_major(self):
+        self.assertEqual(audit_report.AUTO_PROMOTION_FLOOR, "major")
+
+    def test_the_unvouched_floor_is_critical(self):
+        self.assertEqual(audit_report.UNVOUCHED_PROMOTION_FLOOR, "critical")
+
+    def test_a_major_finding_no_candidate_backs_stays_below_the_floor(self):
+        """The 2026-09-07 shape on a waiver run: a `major` idle-workload
+        finding whose fix is `spec.replicas: 0`. With no manifest there is no
+        candidate to carry `scale-to-zero`, so only the floor can hold it."""
+        findings = [manifest_finding("idle", "a.yaml", severity="major")]
+        plan = audit_report.promotion_candidates(
+            findings,
+            {},
+            uncorroborated=audit_report.uncorroborated_findings(findings, None),
+            triage_marked=set(audit_report.triage_markers(findings, None)),
+            vouched=audit_report.collector_vouched_findings(findings, None),
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.below_floor, ["idle"])
+
+    def test_an_unvouched_critical_finding_still_promotes(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("crit", "a.yaml", severity="critical")], {}, vouched=set()
+        )
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.below_floor, [])
+
+    def test_a_critical_finding_still_promotes_under_a_lower_floor(self):
+        """The floor is compared by rank. An equality test would pass every
+        case above while the floor was `critical` and stop promoting
+        `critical` the moment it was lowered."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("crit", "a.yaml", severity="critical")], {}
+        )
+        self.assertEqual(plan.promote, ["crit"])
+        self.assertEqual(plan.below_floor, [])
+
+    def test_a_minor_finding_lands_below_the_floor(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")], {}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_an_unknown_grade_lands_below_the_floor(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("odd", "a.yaml", severity="urgent")], {}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.below_floor, ["odd"])
+
+    def test_an_autopilot_bumped_major_is_held_for_triage_not_promoted(self):
+        """The cost collector's Autopilot bump raises a sizing finding to
+        `major`, which clears the floor. Its marker is in `NO_SWEEP_TRIAGE`, so
+        the grade orders the ledger without opening a pull request."""
+        self.assertIn("autopilot-bumped", audit_report.NO_SWEEP_TRIAGE)
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("bumped", "a.yaml", severity="major")],
+            {},
+            triage_marked={"bumped"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.needs_triage, ["bumped"])
+        self.assertEqual(plan.below_floor, [])
 
     def test_a_finding_with_an_existing_pr_is_not_promoted_again(self):
         # Every PR state, because "already has a PR" is not one condition. Only
@@ -8341,6 +8878,153 @@ def harness_comment(body, node_id="IC_9"):
         "createdAt": "2026-07-01T00:00:00Z",
         "viewerDidAuthor": True,
     }
+
+
+class TestBelowFloorDisclosure(BaseTestCase):
+    """What the severity floor passes over is named, not dropped.
+
+    `_render_withheld` names what each sweep filter held back on the stated
+    principle that a filter which silently drops work reads as "nothing more
+    to do". The floor refuses permanently -- unlike the cap it never clears on
+    the next run -- so a ledger that did not name its refusals would offer a
+    reader declarative fixes, no pull requests, and no sentence saying one
+    comment opens any of them.
+    """
+
+    def test_a_manifest_fix_under_the_floor_is_reported_not_dropped(self):
+        plan = audit_report.promotion_candidates(
+            [
+                manifest_finding("crit", "a.yaml", severity="critical"),
+                manifest_finding("maj", "b.yaml", severity="major"),
+                manifest_finding("min", "c.yaml", severity="minor"),
+            ],
+            {},
+            vouched={"crit", "maj", "min"},
+        )
+        self.assertEqual(plan.promote, ["crit", "maj"])
+        self.assertEqual(plan.withheld, [])
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_the_floor_report_excludes_what_the_earlier_filters_refused(self):
+        """Severity is tested last, so `below_floor` holds only its own refusals.
+
+        Tested first it would also collect the findings with no manifest to
+        open, the ones whose pull request is already live, and the ones a
+        collector held back for a reason of its own -- and the ledger would
+        invite `/remediate` on all of them.
+        """
+        findings = [
+            make_finding(
+                fid="min-gcloud",
+                severity="minor",
+                remediation={"kind": "gcloud", "note": "g"},
+            ),
+            make_finding(
+                fid="min-manual",
+                severity="minor",
+                remediation={"kind": "manual", "note": "m"},
+            ),
+            manifest_finding("min-open-pr", "d.yaml", severity="minor"),
+            manifest_finding("min-triaged", "f.yaml", severity="minor"),
+            manifest_finding("min-unbacked", "g.yaml", severity="minor"),
+            manifest_finding("min-real", "e.yaml", severity="minor"),
+        ]
+        plan = audit_report.promotion_candidates(
+            findings,
+            {"min-open-pr": {"state": "OPEN"}},
+            triage_marked={"min-triaged"},
+            uncorroborated={"min-unbacked"},
+        )
+        self.assertEqual(plan.below_floor, ["min-real"])
+        self.assertEqual(plan.needs_triage, ["min-triaged"])
+        self.assertEqual(plan.uncorroborated, ["min-unbacked"])
+
+    def test_a_harness_withdrawn_pr_does_not_hide_a_floor_refusal(self):
+        # `withdrawn` is treated as no pull request at all everywhere else, so
+        # a finding whose fix the harness closed as stale is still awaiting a
+        # `/remediate` and still has to be named as one.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {"min": stale_closed_pr()},
+        )
+        self.assertEqual(plan.below_floor, ["min"])
+
+    def test_a_requested_finding_is_promoted_rather_than_reported(self):
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {},
+            requested=["min"],
+        )
+        self.assertEqual(plan.promote, ["min"])
+        self.assertEqual(plan.below_floor, [])
+
+    def test_the_remediate_subcommand_reports_no_floor_refusals(self):
+        # `auto_promote=False` runs no sweep, so there is nothing for the floor
+        # to have refused. Reporting one would put an "Awaiting /remediate"
+        # section on the answer to a `/remediate` that just ran.
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("min", "a.yaml", severity="minor")],
+            {},
+            auto_promote=False,
+        )
+        self.assertEqual(plan.below_floor, [])
+
+    def floor_doc(self):
+        return make_doc(
+            findings=[
+                make_finding(),
+                make_finding(
+                    fid="wide-rbac",
+                    severity="minor",
+                    title="Wildcard RBAC verb",
+                    check="wildcard-rbac",
+                ),
+            ]
+        )
+
+    def test_the_ledger_names_the_floor_refusals_and_how_to_open_them(self):
+        body = render_body(self.floor_doc(), generated_at=NOW, below_floor=["wide-rbac"])
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn("`wide-rbac`", body)
+        self.assertIn("Wildcard RBAC verb", body)
+        self.assertIn(f"`{audit_report.AUTO_PROMOTION_FLOOR}`", body)
+        self.assertIn("/remediate <finding-id>", body)
+        # The distinction that makes the block worth separating from the cap's:
+        # a reader who thinks the sweep will get to it next run does not comment.
+        self.assertIn("does not clear on its own", body)
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+
+    def test_the_cap_and_the_floor_are_named_as_separate_reasons(self):
+        body = render_body(
+            self.floor_doc(),
+            generated_at=NOW,
+            withheld=["no-network-policy"],
+            below_floor=["wide-rbac"],
+        )
+        self.assertEqual(body.count("## Awaiting `/remediate`"), 1)
+        self.assertIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+        self.assertIn("does not clear on its own", body)
+
+    def test_a_long_floor_list_is_capped_and_the_body_still_publishes(self):
+        # Every minor manifest fix a stream files lands here, and the section
+        # is charged before the findings are; uncapped, 300 of them put the
+        # body over GitHub's limit and nothing was published.
+        ids = [f"minor-{n:03d}" for n in range(300)]
+        doc = make_doc(
+            findings=[
+                make_finding(fid=fid, severity="minor", title=f"Minor {fid}", check="wildcard-rbac")
+                for fid in ids
+            ]
+        )
+        body = render_body(doc, generated_at=NOW, below_floor=ids)
+        self.assertIn("300 finding(s) carry a manifest remediation graded below", body)
+        self.assertIn(f"`{ids[audit_report.MAX_WITHHELD_ROWS - 1]}` —", body)
+        self.assertNotIn(f"`{ids[audit_report.MAX_WITHHELD_ROWS]}` —", body)
+        self.assertIn(f"…and {300 - audit_report.MAX_WITHHELD_ROWS} more", body)
+
+    def test_nothing_refused_renders_no_section(self):
+        body = render_body(make_doc(), generated_at=NOW)
+        self.assertNotIn("Awaiting `/remediate`", body)
 
 
 class TestRemediateCommands(BaseTestCase):
@@ -8793,6 +9477,34 @@ def pr(number, branch, state="OPEN", merged_at=None, body="", url=None):
         "url": url or f"https://github.com/acme/fleet/pull/{number}",
         "body": body,
     }
+
+
+class TestStillOpenPrUrls(BaseTestCase):
+    def test_a_shared_pull_request_is_listed_once(self):
+        shared = pr(5, "b")
+        self.assertEqual(
+            audit_report.still_open_pr_urls({"a": shared, "b": shared}, []),
+            [shared["url"]],
+        )
+
+    def test_one_this_run_opened_is_not_listed_again(self):
+        fresh = pr(8, "b")
+        self.assertEqual(
+            audit_report.still_open_pr_urls({"a": fresh}, [fresh["url"]]), []
+        )
+
+    def test_only_open_ones_with_a_url_count(self):
+        self.assertEqual(
+            audit_report.still_open_pr_urls(
+                {
+                    "closed": pr(1, "x", state="CLOSED"),
+                    "none": None,
+                    "nourl": {"state": "OPEN", "url": ""},
+                },
+                [],
+            ),
+            [],
+        )
 
 
 class TestSelectPrByHead(BaseTestCase):
@@ -9504,6 +10216,35 @@ class TestAutoPromotionInFinish(HarnessTestCase):
         out = self.stdout_json()
         self.assertEqual(out["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertEqual(out["prs_still_open"], [])
+
+    def test_a_fix_already_open_is_reported_rather_than_reopened(self):
+        # The second run over the same finding: the sweep passes over it
+        # because its branch carries a live pull request, and `prs_opened` is
+        # empty. Without `prs_still_open` the report could not tell that from
+        # a run that proposed nothing.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        self.harness.replies["pr list"] = json.dumps([pr(5, branch)])
+        self.assertEqual(self.run_finish(doc), 0)
+        out = self.stdout_json()
+        self.assertEqual(out["prs_opened"], [])
+        self.assertEqual(out["prs_still_open"], ["https://github.com/acme/fleet/pull/5"])
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+
+    def test_a_closed_or_unrelated_pull_request_is_not_reported_open(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        self.harness.replies["pr list"] = json.dumps(
+            [
+                pr(5, branch, state="MERGED", merged_at="2026-07-01T00:00:00Z"),
+                pr(6, "platform-agent/fix-someone-else"),
+            ]
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.stdout_json()["prs_still_open"], [])
 
     def test_the_ledger_is_rewritten_once_the_pull_request_exists(self):
         # The body was rendered before the PR had a number, so it could not
@@ -11972,7 +12713,9 @@ class TestAcknowledgements(HarnessTestCase):
 class TestRemediationOutcomes(unittest.TestCase):
     def plan(self, **kw):
         return audit_report.PromotionPlan(
-            kw.get("promote", []), kw.get("withheld", []), kw.get("already_open", [])
+            promote=kw.get("promote", []),
+            withheld=kw.get("withheld", []),
+            already_open=kw.get("already_open", []),
         )
 
     def requests(self, targets):
@@ -13126,6 +13869,104 @@ class ContentModeTestCase(BaseTestCase):
         self.assertTrue(
             [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
         )
+
+    # -- the Config Connector backstop, read through the broker ------------ #
+
+    KCC_CLUSTER = "Cluster/drift-peer-std-4"
+    KCC_FIX = "gcloud container clusters update x --logging=SYSTEM,WORKLOAD"
+
+    def seed_kcc(self, relative, name, spec_line="loggingService: none"):
+        """Commit a Config Connector declaration to origin, through the seed clone."""
+        seed = self.tmp_path / "seed"
+        target = seed / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\n"
+            f"kind: ContainerCluster\nmetadata:\n  name: {name}\n"
+            f"spec:\n  {spec_line}\n",
+            encoding="utf-8",
+        )
+        for argv in (
+            ["add", relative],
+            ["commit", "--quiet", "-m", f"declare {name}"],
+            ["push", "--quiet", "origin", "main"],
+        ):
+            subprocess.run(["git", *argv], cwd=str(seed), check=True, capture_output=True)
+
+    def finish_kcc(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        finding = make_finding(
+            fid="drift",
+            obj=self.KCC_CLUSTER,
+            cluster=self.KCC_CLUSTER.partition("/")[2],
+            check="workload-identity-off",
+            remediation={"kind": "gcloud", "note": self.KCC_FIX},
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[finding])), 0, self.err)
+        return self.harness.bodies_for("issue", "create")[0]
+
+    def test_the_kcc_backstop_reads_the_repository_through_the_broker(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        body = self.finish_kcc()
+        # Named exactly as directory mode names it.
+        self.assertIn("in the GitOps repository at `gcp/drift-peer-std-4.yaml`", body)
+        self.assertIn("Config Connector declaration holds", self.err)
+        self.assertIn("grep", self.verbs)
+        # Read, not copied: nothing lands in the tree `finish` publishes, and
+        # no git ran here to read it.
+        self.assertFalse((self.workspace / "gcp").exists())
+        self.assertEqual([c for c in self.harness.calls if c[0] == "git"], [])
+
+    def test_a_run_with_no_candidate_fix_never_asks(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("grep", self.verbs)
+
+    def test_a_truncated_scan_degrades_what_it_found_and_says_so(self):
+        # Two declarations against a one-match ceiling: the broker answers
+        # with the first and `truncated`. The fix it found still degrades;
+        # the run says the index was incomplete rather than implying the rest
+        # of the repository declares nothing.
+        self.seed_kcc("gcp/a-drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.seed_kcc("gcp/b-other.yaml", "other")
+        cap = patch.dict(os.environ, {"CREDENTIAL_PROXY_MAX_MATCHES": "1"})
+        cap.start()
+        self.addCleanup(cap.stop)
+        self.start()
+        body = self.finish_kcc()
+        self.assertIn("`gcp/a-drift-peer-std-4.yaml`", body)
+        self.assertIn("truncated the Config Connector scan", self.err)
+
+    def test_a_broker_error_leaves_the_gcloud_fix_and_the_run_alone(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        live = credential_proxy_client._workspace_call
+
+        def failing_grep(endpoint, verb, payload):
+            if verb == "grep":
+                raise credential_proxy_client.WorkspaceRequestError(500, {"status": "error"})
+            return live(endpoint, verb, payload)
+
+        patcher = patch.object(credential_proxy_client, "_workspace_call", failing_grep)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        body = self.finish_kcc()
+        self.assertNotIn("Config Connector holds that field", body)
+        self.assertIn(self.KCC_FIX, body)
+        self.assertIn("could not read acme/fleet through the broker", self.err)
 
 
 # --------------------------------------------------------------------------- #
@@ -14301,21 +15142,33 @@ class TestUncorroboratedFindings(BaseTestCase):
         self.assertEqual(plan.uncorroborated, [])
 
     def test_a_finding_the_sweep_would_not_open_anyway_is_not_named(self):
-        """The two lists name only what the sweep would otherwise have opened:
-        a `major` finding, a `gcloud` fix, or one with a live pull request
-        drops out on the earlier tests and must not land in a block that
-        invites `/remediate` on it."""
+        """The two lists name only manifest fixes with no live pull request:
+        a `gcloud` fix, or one with a live pull request, drops out on the
+        earlier tests and must not land in a block that invites `/remediate`
+        on it."""
         plan = audit_report.promotion_candidates(
             [
-                manifest_finding("minor", "a.yaml", severity="major"),
                 make_finding(fid="cli", remediation={"kind": "gcloud", "note": "x"}),
                 manifest_finding("open", "c.yaml"),
             ],
             {"open": {"number": 9, "state": "OPEN", "labels": []}},
-            uncorroborated={"minor", "cli", "open"},
+            uncorroborated={"cli", "open"},
         )
         self.assertEqual(plan.promote, [])
         self.assertEqual(plan.uncorroborated, [])
+
+    def test_an_unbacked_finding_below_the_floor_is_named_as_unbacked(self):
+        """Severity is tested after corroboration, so a `minor` finding the
+        collector declined to flag lands in the block that says to read it
+        first, not in `below_floor`'s plain invitation to `/remediate`."""
+        plan = audit_report.promotion_candidates(
+            [manifest_finding("minor", "a.yaml", severity="minor")],
+            {},
+            uncorroborated={"minor"},
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.uncorroborated, ["minor"])
+        self.assertEqual(plan.below_floor, [])
 
     def test_without_a_sweep_nothing_is_named(self):
         plan = audit_report.promotion_candidates(
@@ -14371,6 +15224,486 @@ class TestUncorroboratedFindings(BaseTestCase):
                 )
 
 
+class TestUnwrittenSweepFixes(HarnessTestCase):
+    """`finish` refuses a fix the sweep would open and nobody wrote, until it is
+    written or declined."""
+
+    def manifest(self, check="no-pdb", severity="major", declaration="apps/a/deploy.yaml"):
+        candidate = {**_cand(check, "c1", "Deployment/a"), "severity": severity}
+        if declaration:
+            candidate["declaration"] = {"path": declaration, "directory": "apps/a"}
+        return {"clusters": [_ran("c1", check, candidates=[candidate])]}
+
+    def manual(self, severity="major", check="no-pdb"):
+        finding = _pub("a", check, "c1", "Deployment/a")
+        finding["severity"] = severity
+        finding["remediation"] = {"kind": "manual", "note": "Review and remediate."}
+        return finding
+
+    def unwritten(self, findings, manifest, promised=None, degraded=(), prs=None):
+        return audit_report.unwritten_sweep_fixes(
+            findings, manifest, promised or {}, list(degraded), AUDIT, prs or []
+        )
+
+    def pr_on(self, path, **fields):
+        """A remediation pull request on the branch the sweep names for `path`."""
+        as_written = {"id": "a", "remediation": {"kind": "manifest", "path": path}}
+        return {"headRefName": audit_report.group_branch_for(AUDIT, [as_written]), **fields}
+
+    SELECTOR = {"matchLabels": {"app": "a"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}]}
+
+    def generate(self, selector=SELECTOR, declines=None, prs=None, namespace_pdbs=()):
+        manifest = self.manifest()
+        manifest["clusters"][0]["candidates"][0].update(
+            {"pod_selector": selector, "namespace": "web", "namespace_pdbs": list(namespace_pdbs)}
+        )
+        finding = _pub("a", "no-pdb", "c1", "Deployment/a", namespace="web")
+        finding["remediation"] = {"kind": "manual", "note": "Review and remediate."}
+        findings = [finding]
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            planned, self.answered = audit_report.plan_generated_fixes(
+                findings, manifest, unwritten, declines or {}, prs or [], self.workspace, probe, AUDIT
+            )
+            probe.close()
+            audit_report.write_generated_fixes(findings, planned, self.workspace)
+        self.generate_err = err.getvalue()
+        return list(planned), finding
+
+    def test_finish_writes_the_pdb_the_sop_prescribes_beside_the_declaration(self):
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+        self.assertEqual(finding["remediation"]["path"], "apps/a/a-pdb.yaml")
+        self.assertIn("wrote this PodDisruptionBudget", finding["remediation"]["note"])
+        yaml = pytest_yaml()
+        document = yaml.safe_load((self.workspace / "apps/a/a-pdb.yaml").read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["apiVersion"], "policy/v1")
+        self.assertEqual(document["metadata"], {"name": "a-pdb", "namespace": "web"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertIsNone(audit_report.remediation_file_problem(finding, self.workspace))
+
+    def test_a_retry_adopts_its_own_earlier_write(self):
+        """A `finish` that failed after writing leaves the file; the next one
+        recognises its own bytes rather than refusing over them."""
+        self.generate()
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_finish_writes_nothing_it_cannot_derive_safely(self):
+        """No selector (the collector withholds it where other pods match), an
+        empty one, or a key `policy/v1` does not take."""
+        for name, selector in {
+            "absent": None,
+            "empty": {},
+            "empty terms": {"matchLabels": {}},
+            "unknown key": {"matchLabels": {"app": "a"}, "matchFields": []},
+        }.items():
+            with self.subTest(name):
+                written, finding = self.generate(selector=selector)
+                self.assertEqual(written, [])
+                self.assertEqual(finding["remediation"]["kind"], "manual")
+                self.assertFalse((self.workspace / "apps/a/a-pdb.yaml").exists())
+
+    def test_finish_writes_nothing_that_would_collide_or_not_render(self):
+        cases = {
+            "a file at the path": (lambda: self.touch("apps/a/a-pdb.yaml"), {}, "already exists"),
+            "a Kustomize root above": (lambda: self.touch("apps/kustomization.yaml"), {}, "Kustomize root"),
+            "the name in the namespace": (lambda: None, {"namespace_pdbs": ["a-pdb"]}, "already has"),
+            "the name in the repository": (
+                lambda: (self.workspace / "other.yaml").write_text("metadata:\n  name: a-pdb\n"),
+                {},
+                "already names",
+            ),
+        }
+        for name, (arrange, kwargs, said) in cases.items():
+            with self.subTest(name):
+                self.unclone()
+                self.workspace.mkdir(parents=True, exist_ok=True)
+                arrange()
+                written, finding = self.generate(**kwargs)
+                self.assertEqual(written, [])
+                self.assertEqual(finding["remediation"]["kind"], "manual")
+                self.assertIn(said, self.generate_err)
+
+    def test_a_declined_fix_or_one_another_pull_request_carries_is_not_written(self):
+        written, _ = self.generate(declines={"a": "a pull request already carries it"})
+        self.assertEqual(written, [])
+        for state, fields in {
+            "open on another path": {"state": "OPEN", "headRefName": "x"},
+            "merged": {"state": "MERGED", "headRefName": "x", "mergedAt": "2026-10-01T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "headRefName": "x", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            with self.subTest(state):
+                carrying = {**fields, "body": audit_report.delta_block(["a"])}
+                written, _ = self.generate(prs=[carrying])
+                self.assertEqual(written, [])
+                # Answered, so `finish` does not refuse over it either.
+                self.assertEqual(self.answered, {"a"})
+
+    def test_its_own_open_pull_request_is_planned_again_for_the_sweep_to_find(self):
+        """The next run's clone no longer holds the file; refusing there would
+        loop, and the sweep reports the live pull request as still open."""
+        own = audit_report.group_branch_for(
+            AUDIT, [{"id": "a", "remediation": {"kind": "manifest", "path": "apps/a/a-pdb.yaml"}}]
+        )
+        carrying = {"state": "OPEN", "headRefName": own, "body": audit_report.delta_block(["a"])}
+        written, finding = self.generate(prs=[carrying])
+        self.assertEqual(written, ["a"])
+        self.assertEqual(self.answered, set())
+
+    def test_in_content_mode_a_path_the_broker_lists_or_cannot_answer_is_not_written(self):
+        class Listing(list):
+            truncated = False
+
+        def broker(entries=(), error=None, truncated=False):
+            inner = mock.MagicMock()
+            listing = Listing(entries)
+            listing.truncated = truncated
+            inner.list.side_effect = error
+            inner.list.return_value = listing
+            inner.grep.return_value = {"total": 0}
+            session = mock.MagicMock()
+            session.__enter__.return_value = inner
+            module = mock.MagicMock()
+            module.Workspace.open.return_value = session
+            return module
+
+        self.patch_attr("content_mode", lambda: True)
+        for name, module, expected in (
+            ("listed", broker([{"path": "apps/a/a-pdb.yaml", "size": 1}]), []),
+            ("error", broker(error=RuntimeError("down")), []),
+            ("truncated", broker(truncated=True), []),
+            ("absent", broker([]), ["a"]),
+        ):
+            with self.subTest(name), mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+                target = self.workspace / "apps/a/a-pdb.yaml"
+                if target.exists():
+                    target.unlink()
+                self.assertEqual(self.generate()[0], expected)
+                self.assertEqual(module.Workspace.open.call_count, 1)
+
+    def test_two_clusters_each_get_their_own_budget_of_one_name(self):
+        """A PodDisruptionBudget's name is unique per namespace per cluster, and
+        another cluster's tree declaring it is no collision."""
+        manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[]), _ran("c2", "no-pdb", candidates=[])]}
+        findings = []
+        for index, cluster in enumerate(("c1", "c2")):
+            candidate = {**_cand("no-pdb", cluster, "Deployment/api", namespace="web"), "severity": "major"}
+            candidate.update(
+                {
+                    "declaration": {"path": f"clusters/{cluster}/web/deploy.yaml", "directory": f"clusters/{cluster}/web"},
+                    "pod_selector": self.SELECTOR,
+                }
+            )
+            manifest["clusters"][index]["candidates"].append(candidate)
+            finding = _pub(f"api-{cluster}", "no-pdb", cluster, "Deployment/api", namespace="web")
+            finding["severity"] = "major"
+            finding["remediation"] = {"kind": "manual", "note": ""}
+            findings.append(finding)
+        (self.workspace / "clusters/c2/web").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "clusters/c2/web/old.yaml").write_text("metadata:\n  name: api-pdb\n")
+        (self.workspace / "clusters/c3/web").mkdir(parents=True, exist_ok=True)
+        (self.workspace / "clusters/c3/web/pdb.yaml").write_text("metadata:\n  name: api-pdb\n")
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            planned, _ = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
+        # c1 is planned despite c3 declaring the name; c2's own tree has it.
+        self.assertEqual(sorted(planned), ["api-c1"])
+        self.assertIn("clusters/c2/ already names an object api-pdb", err.getvalue())
+
+    def test_the_name_search_matches_a_declared_name_and_nothing_else(self):
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        cases = {
+            "metadata:\n  name: a-pdb\n": True,
+            "metadata:\n  name: \"a-pdb\"  # budget\n": True,
+            "metadata:\r\n  name: a-pdb\r\n": True,
+            "metadata: {name: a-pdb, namespace: web}\n": True,
+            "metadata:\n  labels:\n    app.kubernetes.io/name: a-pdb\n": False,
+            "metadata:\n  name: a-pdb-canary\n": False,
+            "# name: a-pdb\n": False,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.unclone()
+                self.workspace.mkdir(parents=True)
+                (self.workspace / "x.yaml").write_text(text)
+                probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+                self.assertIs(probe.mentions("a-pdb"), expected)
+
+    def test_an_unreadable_file_answers_every_name_search(self):
+        (self.workspace / "x.yaml").write_text("metadata:\n  name: other\n")
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        original = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == "x.yaml":
+                raise OSError("unreadable")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertTrue(probe.mentions("a-pdb"))
+        self.assertTrue(probe.mentions("b-pdb"))
+
+    def test_the_broker_is_asked_for_a_cluster_tree_without_a_trailing_slash(self):
+        """`validate_path` refuses an empty segment, and a refused search
+        reads as a collision."""
+        inner = mock.MagicMock()
+        inner.grep.return_value = {"total": 0}
+        session = mock.MagicMock()
+        session.__enter__.return_value = inner
+        module = mock.MagicMock()
+        module.Workspace.open.return_value = session
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            self.assertFalse(probe.mentions("a-pdb", "clusters/c1/"))
+        self.assertEqual(inner.grep.call_args.kwargs["prefix"], "clusters/c1")
+
+    def test_the_config_connector_scan_reuses_the_probes_broker_session(self):
+        session = mock.MagicMock()
+        session.grep.return_value = {"matches": [], "total": 0, "truncated": False}
+        module = mock.MagicMock()
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            audit_report.kcc_declarations_via_broker("acme/fleet", session)
+        module.Workspace.open.assert_not_called()
+        session.grep.assert_called_once()
+
+    def test_two_fixes_never_take_one_file_or_one_name(self):
+        manifest = {"clusters": [_ran("c1", "no-pdb", candidates=[])]}
+        findings = []
+        for namespace in ("web", "staging"):
+            candidate = {**_cand("no-pdb", "c1", "Deployment/api", namespace=namespace), "severity": "major"}
+            candidate.update(
+                {"declaration": {"path": "apps/api/deploy.yaml", "directory": "apps/api"}, "pod_selector": self.SELECTOR}
+            )
+            manifest["clusters"][0]["candidates"].append(candidate)
+            finding = _pub(f"api-{namespace}", "no-pdb", "c1", "Deployment/api", namespace=namespace)
+            finding["severity"] = "major"
+            finding["remediation"] = {"kind": "manual", "note": ""}
+            findings.append(finding)
+        unwritten = self.unwritten(findings, manifest)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            planned, _ = audit_report.plan_generated_fixes(findings, manifest, unwritten, {}, [], self.workspace, probe)
+        self.assertEqual(len(unwritten), 2)
+        self.assertEqual(len(planned), 1)
+        self.assertIn("another fix this run writes already takes", err.getvalue())
+
+    def test_a_broker_that_cannot_be_asked_says_so(self):
+        module = mock.MagicMock()
+        module.Workspace.open.side_effect = RuntimeError("store full")
+        self.patch_attr("content_mode", lambda: True)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}):
+            written, _ = self.generate()
+        self.assertEqual(written, [])
+        self.assertIn("could not be checked (RuntimeError: store full)", self.generate_err)
+        self.assertNotIn("already exists", self.generate_err)
+
+    def test_a_run_refused_over_another_fix_writes_none_of_its_planned_ones(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        second = copy.deepcopy(doc["findings"][0])
+        second["object"] = "Namespace/ledger"
+        second["remediation"]["path"] = "clusters/prod-us-east/ledger-netpol.yaml"
+        doc["findings"].append(second)
+        first_id = declined(doc)[1]
+        first_path = doc["findings"][0]["remediation"]["path"]
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: ({first_id: (first_path, "# generated\n")}, set()))
+        self.assertEqual(self.run_finish(doc), 2)
+        self.assertIn("ledger-netpol.yaml", self.err)
+        self.assertFalse((self.workspace / first_path).exists())
+
+    def test_finish_publishes_a_planned_fix_instead_of_refusing_and_a_refused_run_writes_nothing(self):
+        """The wiring in `finish`: the planner's answer is what the refusal and
+        the write act on."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        fid = declined(doc)[1]
+        path = doc["findings"][0]["remediation"]["path"]
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: ({}, set()))
+        self.assertEqual(self.run_finish(doc), 2)
+        self.assertFalse((self.workspace / path).exists())
+        self.patch_attr("plan_generated_fixes", lambda *a, **k: ({fid: (path, "# generated\n")}, set()))
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual((self.workspace / path).read_text(), "# generated\n")
+        self.assertIn("GENERATED: " + fid, self.err)
+
+    def test_a_manual_fix_whose_declaration_the_collector_found_is_unwritten(self):
+        self.assertEqual(
+            self.unwritten([self.manual()], self.manifest()),
+            {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
+        )
+
+    def test_a_promised_file_the_degrade_caught_is_unwritten_at_the_path_promised(self):
+        self.assertEqual(
+            self.unwritten([self.manual()], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"]),
+            {"a": audit_report.UnwrittenFix("apps/a/pdb.yaml", declared=False)},
+        )
+
+    def test_a_manual_fix_with_no_declaration_is_the_workers_to_make(self):
+        self.assertEqual(self.unwritten([self.manual()], self.manifest(declaration="")), {})
+
+    def test_a_finding_the_sweep_would_not_open_is_not_refused(self):
+        # Under the floor, or off the major list.
+        cases = {
+            "minor": ([self.manual(severity="minor")], self.manifest(severity="minor")),
+            "unvouched major": (
+                [self.manual(check="cronjob-runs-overlap")],
+                self.manifest(check="cronjob-runs-overlap"),
+            ),
+        }
+        for name, (findings, manifest) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.unwritten(findings, manifest), {})
+
+    def test_a_declared_manual_fix_off_the_major_list_is_the_sops_to_make(self):
+        """`critical` reaches the sweep on any check, but a declared `manual`
+        fix there is usually the SOP's own answer -- a privileged container
+        stays `manual` until its owner confirms -- so only the checks cleared
+        for the `major` sweep are refused."""
+        self.assertEqual(
+            self.unwritten(
+                [self.manual(severity="critical", check="privileged-container")],
+                self.manifest(check="privileged-container", severity="critical"),
+            ),
+            {},
+        )
+
+    def test_a_declared_manual_fix_a_pull_request_carries_is_answered_on_any_cleared_check(self):
+        """A person closing the pull request is an answer too; refusing on
+        every later run would make the worker decline it forever."""
+        check = "unbound-sa-automount"
+        for name, fields in {
+            "open": {"state": "OPEN"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-10-01T00:00:00Z"},
+        }.items():
+            with self.subTest(name):
+                carrying = {**fields, "headRefName": "x", "body": audit_report.delta_block(["a"])}
+                self.assertEqual(
+                    self.unwritten([self.manual(check=check)], self.manifest(check=check), prs=[carrying]), {}
+                )
+        self.assertIn("a", self.unwritten([self.manual(check=check)], self.manifest(check=check)))
+
+    def test_prs_still_open_names_a_pull_request_that_answers_a_manual_finding(self):
+        finding = {"id": "a"}
+        carrying = {"state": "OPEN", "url": "https://x/pull/9", "body": audit_report.delta_block(["a"])}
+        closed = {"state": "CLOSED", "url": "https://x/pull/8", "body": audit_report.delta_block(["a"])}
+        other = {"state": "OPEN", "url": "https://x/pull/7", "body": audit_report.delta_block(["b"])}
+        prs = audit_report.carrying_prs([carrying, closed, other], [finding])
+        self.assertEqual(audit_report.still_open_pr_urls({}, [], prs), ["https://x/pull/9"])
+
+    def test_a_promised_fix_a_pull_request_already_answers_is_not_refused(self):
+        """Joined on the branch the promised path names, as the sweep joins it:
+        open, merged, or closed by a person all leave the finding out."""
+        answered = {
+            "open": {"state": "OPEN"},
+            "merged": {"state": "MERGED", "mergedAt": "2026-09-30T00:00:00Z"},
+            "closed by a person": {"state": "CLOSED", "closedAt": "2026-09-30T00:00:00Z"},
+        }
+        for name, fields in answered.items():
+            with self.subTest(name):
+                prs = [self.pr_on("apps/a/pdb.yaml", **fields)]
+                self.assertEqual(
+                    self.unwritten(
+                        [self.manual()], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"], prs
+                    ),
+                    {},
+                )
+
+    def test_a_pull_request_on_another_path_does_not_answer_a_promised_fix(self):
+        prs = [self.pr_on("apps/b/pdb.yaml", state="OPEN")]
+        self.assertIn(
+            "a",
+            self.unwritten([self.manual()], self.manifest(), {"a": "apps/a/pdb.yaml"}, ["a"], prs),
+        )
+
+    def test_the_refusal_never_tells_the_worker_to_write_over_the_declaration(self):
+        """A declared `manual` fix names the object's own file, so the message
+        has to say a new object goes beside it: a worker told only "write at
+        this path" writes the PodDisruptionBudget over the Deployment."""
+        message = audit_report.unwritten_refusal_message(
+            {
+                "a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True),
+                "b": audit_report.UnwrittenFix("apps/b/pdb.yaml", declared=False),
+            }
+        )
+        self.assertIn("a declared at apps/a/deploy.yaml", message)
+        self.assertIn("never over the file itself", message)
+        self.assertIn("b -> apps/b/pdb.yaml", message)
+        self.assertNotIn("a -> apps/a/deploy.yaml", message)
+        self.assertIn("--decline-fix", message)
+
+    def test_finish_refuses_until_the_fix_is_written_or_declined(self):
+        """Refused once, a worker re-ran `finish` unchanged and the fix reached
+        the ledger as `manual`; the refusal now holds until it is answered."""
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        # `make_doc`'s finding is critical and names a manifest nobody wrote.
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(self.run_finish(make_doc()), 2)
+                self.assertIn("their fix is not written", self.err)
+                self.assertIn("clusters/prod-us-east/payments-netpol.yaml", self.err)
+                self.assertFalse(self.harness.matching("issue", "create"))
+        self.assertEqual(self.run_finish(make_doc(), declined(make_doc())), 0, self.err)
+        self.assertTrue(self.harness.matching("issue", "create"))
+        self.assertIn(DECLINE_REASON, "".join(b or "" for b in self.harness.bodies))
+        self.assertIn("published with a manual remediation instead", self.err)
+
+    def test_finish_publishes_once_the_fix_is_written(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        self.assertEqual(self.run_finish(doc), 2)
+        self.touch(doc["findings"][0]["remediation"]["path"])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertNotIn("published with a manual remediation instead", self.err)
+
+    def test_a_decline_names_only_a_fix_the_refusal_would_list(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        self.assertEqual(self.run_finish(doc, ("--decline-fix", "not-a-finding", "why")), 2)
+        self.assertIn("--decline-fix names not-a-finding", self.err)
+        self.touch(doc["findings"][0]["remediation"]["path"])
+        self.assertEqual(self.run_finish(doc, declined(doc)), 2)
+        self.assertIn("--decline-fix names " + declined(doc)[1], self.err)
+        self.assertFalse(self.harness.matching("issue", "create"))
+
+    def test_a_blank_decline_reason_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.run_finish(make_doc(), declined(make_doc())[:2] + ("  ",))
+
+    def test_without_a_run_record_finish_does_not_refuse(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("their fix is not written", self.err)
+
+    def test_another_repositorys_run_record_is_no_record(self):
+        """A multi-repo loop: `start --repo A` must not make B's `finish` refuse."""
+        self.harness.replies = {"issue list": "[]"}
+        self.record_run(repo="acme/other", audit=AUDIT)
+        self.assertEqual(self.run_finish(make_doc(), ("--repo", "acme/fleet")), 0, self.err)
+        self.assertNotIn("their fix is not written", self.err)
+
+    def test_a_long_note_keeps_the_declined_reason_on_the_row(self):
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        doc["findings"][0]["remediation"]["note"] = "x" * audit_report.MAX_NOTE_CHARS
+        self.assertEqual(self.run_finish(doc, declined(doc)), 0, self.err)
+        self.assertIn(DECLINE_REASON, "".join(b or "" for b in self.harness.bodies))
+        self.assertIn("DECLINED: " + declined(doc)[1], self.err)
+
+
 class TestTriageMarkedFindings(BaseTestCase):
     """A finding the collector stands behind whose *fix* it cannot vouch for.
 
@@ -14392,49 +15725,151 @@ class TestTriageMarkedFindings(BaseTestCase):
 
     def test_a_marked_candidate_marks_its_finding(self):
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            set(audit_report.triage_markers(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], self.marked()
-            ),
+            )),
             {"f1"},
         )
 
     def test_an_unmarked_candidate_does_not(self):
         m = {"clusters": [_ran("c1", "idle-workload", candidates=[_cand("idle-workload", "c1", "Deployment/a")])]}
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], m
             ),
-            set(),
+            {},
         )
 
     def test_a_marker_this_gate_does_not_own_is_ignored(self):
         """Other markers are the model's triage cue, not the sweep's. Only what
         `NO_SWEEP_TRIAGE` names stops a pull request."""
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")],
-                self.marked(marker="guaranteed-qos"),
+                self.marked(marker="model-only-cue"),
             ),
-            set(),
+            {},
+        )
+
+    def test_the_disruptive_fix_markers_are_the_sweeps(self):
+        """Each of these fixes can break something the collector never read
+        once the floor reaches `major`, so each is a gate marker, not a cue."""
+        for marker in (
+            "scale-to-zero",
+            "guaranteed-qos",
+            "default-deny",
+            "namespace-token",
+            "service-selector",
+            "hard-spread",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, audit_report.NO_SWEEP_TRIAGE)
+                self.assertEqual(
+                    audit_report.triage_markers(
+                        [_pub("f1", "idle-workload", "c1", "Deployment/a")],
+                        self.marked(marker=marker),
+                    ),
+                    {"f1": marker},
+                )
+
+    def test_every_gate_marker_has_a_reason_to_print(self):
+        self.assertEqual(audit_report.NO_SWEEP_TRIAGE, frozenset(audit_report.TRIAGE_REASONS))
+        for marker, reason in audit_report.TRIAGE_REASONS.items():
+            with self.subTest(marker=marker):
+                self.assertTrue(reason.strip())
+
+    def test_triage_markers_names_the_marker_per_finding(self):
+        self.assertEqual(
+            audit_report.triage_markers(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")],
+                self.marked(marker="scale-to-zero"),
+            ),
+            {"f1": "scale-to-zero"},
         )
 
     def test_a_marked_candidate_on_another_object_does_not_reach_this_finding(self):
         m = self.marked()
         m["clusters"][0]["candidates"].append(_cand("idle-workload", "c1", "Deployment/b"))
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
                 [
                     _pub("a", "idle-workload", "c1", "Deployment/a"),
                     _pub("b", "idle-workload", "c1", "Deployment/b"),
                 ],
                 m,
             ),
-            {"a"},
+            {"a": "service-fronted"},
         )
 
     def test_no_manifest_marks_nothing(self):
         self.assertEqual(
-            audit_report.triage_marked_findings(
+            audit_report.triage_markers(
+                [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
+            ),
+            {},
+        )
+
+    def graded(self, check, severity, obj="Deployment/a", **ran):
+        return {
+            "clusters": [
+                _ran(
+                    "c1",
+                    check,
+                    candidates=[{**_cand(check, "c1", obj), "severity": severity}],
+                    **ran,
+                )
+            ]
+        }
+
+    def test_a_candidate_from_a_failed_read_does_not_vouch(self):
+        findings = [_pub("a", "no-pdb", "c1", "Deployment/a")]
+        for ran in ({"outcome": "gate-failed"}, {"rc": 1}):
+            with self.subTest(**ran):
+                self.assertEqual(
+                    audit_report.collector_vouched_findings(
+                        findings, self.graded("no-pdb", "major", **ran)
+                    ),
+                    set(),
+                )
+
+    def test_a_major_candidate_on_a_cleared_check_vouches_for_its_finding(self):
+        findings = [
+            _pub("a", "no-pdb", "c1", "Deployment/a"),
+            _pub("b", "no-pdb", "c1", "Deployment/b"),
+        ]
+        self.assertEqual(
+            audit_report.collector_vouched_findings(findings, self.graded("no-pdb", "major")),
+            {"a"},
+        )
+
+    def test_a_check_off_the_list_is_never_vouched(self):
+        # `cronjob-runs-overlap` is `major` and collector-flagged, and its fix
+        # is a concurrency policy the owner has to choose.
+        findings = [_pub("a", "cronjob-runs-overlap", "c1", "CronJob/a")]
+        self.assertEqual(
+            audit_report.collector_vouched_findings(
+                findings, self.graded("cronjob-runs-overlap", "major", "CronJob/a")
+            ),
+            set(),
+        )
+
+    def test_a_minor_candidate_does_not_vouch_for_a_major_regrade(self):
+        findings = [_pub("a", "no-pdb", "c1", "Deployment/a")]
+        self.assertEqual(
+            audit_report.collector_vouched_findings(findings, self.graded("no-pdb", "minor")),
+            set(),
+        )
+
+    def test_every_cleared_check_is_one_a_collector_emits(self):
+        import collect
+        import fleet_stockout
+        emitted = {spec.slug for spec in collect.OBTAINABILITY_CHECKS + collect.COMPLIANCE_CHECKS}
+        emitted |= set(fleet_stockout.SEVERITY)
+        self.assertLessEqual(audit_report.MAJOR_SWEEP_CHECKS, emitted)
+
+    def test_no_manifest_vouches_for_nothing(self):
+        self.assertEqual(
+            audit_report.collector_vouched_findings(
                 [_pub("f1", "idle-workload", "c1", "Deployment/a")], None
             ),
             set(),
@@ -14467,7 +15902,7 @@ class TestTriageMarkedFindings(BaseTestCase):
             _pub("edit", slug, "c2", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/burst.yaml"}},
         ]
         plan = audit_report.promotion_candidates(
-            findings, {}, triage_marked=audit_report.triage_marked_findings(findings, manifest)
+            findings, {}, triage_marked=audit_report.triage_markers(findings, manifest)
         )
         self.assertEqual(plan.promote, ["edit"])
         self.assertEqual(plan.needs_triage, ["create"])
@@ -14504,12 +15939,52 @@ class TestTriageMarkedFindings(BaseTestCase):
         )
         self.assertIn("`fronted` — A stand-down", body)
         self.assertIn("its fix is what needs a decision", body)
+        # No reasons passed: the row carries no marker clause.
+        self.assertIn("- `fronted` — A stand-down\n", body + "\n")
         # The two blocks say opposite things about the collector, so the
         # `unbacked` sentence must not be the one covering `fronted`.
         self.assertLess(
             body.index("Read these before asking"),
             body.index("its fix is what needs a decision"),
         )
+
+
+class TestTriageReasonsInTheLedger(BaseTestCase):
+    """The withheld block names why the sweep passed over each marked fix."""
+
+    def test_each_row_carries_its_markers_reason(self):
+        body = "\n".join(
+            audit_report._render_withheld(
+                [],
+                [_titled("netpol", "No NetworkPolicy"), _titled("idle", "Idle web")],
+                needs_triage=["netpol", "idle"],
+                triage_reasons={"netpol": "default-deny", "idle": "scale-to-zero"},
+            )
+        )
+        self.assertIn(
+            "- `netpol` — No NetworkPolicy (`default-deny`: the fix makes the "
+            "namespace deny ingress by default)",
+            body,
+        )
+        self.assertIn(
+            "- `idle` — Idle web (`scale-to-zero`: the fix scales the controller "
+            "to zero replicas)",
+            body,
+        )
+
+    def test_the_issue_body_passes_the_reasons_through(self):
+        data = {
+            "audit": "compliance-audit",
+            "scope": {"clusters": []},
+            "findings": [_titled("netpol", "No NetworkPolicy")],
+        }
+        rendered = audit_report.render_issue_body(
+            data,
+            generated_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            needs_triage=["netpol"],
+            triage_reasons={"netpol": "default-deny"},
+        )
+        self.assertIn("(`default-deny`: the fix makes the namespace deny ingress by default)", rendered.body)
 
 
 class TestScopedCoverage(unittest.TestCase):
@@ -15100,12 +16575,20 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(len(loud["unpublished_candidates"]), 1)
 
     def test_the_json_line_and_the_ledger_name_the_same_uncorroborated_findings(self):
-        """One set under one name: what the sweep would otherwise have opened.
-        A `major` finding the collector did not flag is uncorroborated too, but
-        the sweep would not have opened it, so neither surface names it."""
+        """One set under one name: manifest fixes, at any grade, the collector
+        did not stand behind. A `gcloud` finding the collector did not flag is
+        uncorroborated too, but there is no pull request to open for it, so
+        neither surface names it."""
         self.promotion_replies()
         doc = make_doc(
-            findings=[make_finding(), make_finding(fid="m", severity="major", title="Major one")]
+            findings=[
+                make_finding(),
+                make_finding(
+                    fid="m",
+                    title="Major one",
+                    remediation={"kind": "gcloud", "note": "gcloud x"},
+                ),
+            ]
         )
         rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
@@ -16882,6 +18365,26 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertNotIn("Read these before asking", body)
         self.assertEqual(self.stdout_json()["uncorroborated_findings"], [])
 
+    def test_a_default_deny_netpol_fix_is_withheld_with_its_reason(self):
+        """`netpol-missing` is the check the compliance collector marks
+        `default-deny`; the ledger row and the run log both say why."""
+        self.promotion_replies()
+        manifest = _full_manifest(candidates=[self.netpol_candidate(needs_triage="default-deny")])
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        body = self.harness.bodies_for("issue", "create")[0]
+        self.assertIn("(`default-deny`: the fix makes the namespace deny ingress by default)", body)
+        self.assertIn("marked the fix `default-deny`", self.err)
+
+    def test_the_dry_run_names_the_reason_for_a_marked_fix(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        manifest = _full_manifest(candidates=[self.netpol_candidate(needs_triage="default-deny")])
+        rc = self.run_finish(make_doc(), ["--dry-run", "--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"{derived_id()} (default-deny)", self.err)
+        self.assertIn("(`default-deny`: the fix makes the namespace deny ingress by default)", self.out)
+
     def test_the_dry_run_names_what_the_sweep_would_pass_over(self):
         self.touch("clusters/prod-us-east/payments-netpol.yaml")
         rc = self.run_finish(
@@ -17325,6 +18828,853 @@ class _FrozenDatetime(datetime):
 BASE_HELD_COMMENT = '### `compliance-audit` found nothing — but did not account for 1 previous finding, so the ledger stays open\n\nThe Security & RBAC Posture Audit run on 2026-08-01 09:30 UTC found **0 findings** across 1 audited cluster(s): `prod-us-east`.\n\n**This is not an all-clear.** This ledger reported each finding below, and this run\'s own `checks_run` says the check that found it ran again on that cluster — yet the document neither reports the finding again nor carries a `resolved_because` entry saying what that check showed. From here "fixed" and "not written down" are the same absence, so nothing has been reported as resolved, no remediation pull request has been closed, and the ledger stays open. It closes on the next run that reports each of these again, or says per finding why it is gone; `start` lists them under `carried`.\n\n- `cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding` — debug-binding grants cluster-admin — `ClusterRoleBinding/debug-binding` in `prod-us-east` / _cluster-scoped_; `cluster-admin-binding` ran there as `kubectl get clusterrolebindings -o json \\| jq \'.items[] \\| select(.roleRef.name=="cluster-admin")\' xxxxxxxxxxxxxxxxxxxx…`\n\n<details>\n<summary>How this run checked the fleet (1 checks)</summary>\n\nOne row per check that ran, with the command that ran it, as reported by the audit. The harness cannot confirm a command was issued — these are re-runnable so that it does not have to be taken on trust.\n\n| Cluster | Check | Command |\n| ------- | ----- | ------- |\n| `prod-us-east` | `cluster-admin-binding` | `kubectl get clusterrolebindings -o json \\| jq \'.items[]\'` |\n\n</details>'
 
 
+class TestGcloudEnumCasing(unittest.TestCase):
+    """A `kind: gcloud` note is a command a human pastes, so it has to parse.
+
+    The model reads the value off the API and passes it through, and the API's
+    spelling is often not gcloud's. Every expectation here is gcloud's own
+    output, harvested by feeding the flag a bogus value and reading back the
+    "Valid choices are [...]" it prints.
+    """
+
+    def normalise(self, note):
+        return audit_report.normalise_gcloud_enum_values(note)
+
+    def test_an_enum_flag_after_a_valueless_flag_is_corrected(self):
+        # The valueless flag's "value" used to swallow `--release-channel`, and
+        # the substitution resumed past it.
+        self.assertEqual(
+            self.normalise("gcloud container clusters update c --enable-autoupgrade --release-channel=REGULAR"),
+            "gcloud container clusters update c --enable-autoupgrade --release-channel=regular",
+        )
+
+    def test_the_live_defect_is_corrected(self):
+        # 2026-09-01 fleet-consistency-drift read `.releaseChannel.channel=RAPID`
+        # and shipped `--release-channel=REGULAR`, which gcloud rejects with
+        # *Invalid choice: 'REGULAR'. Did you mean 'regular'?*.
+        self.assertEqual(
+            self.normalise(
+                "gcloud container clusters update drift-peer-std-9 "
+                "--location us-east4-c --release-channel=REGULAR"
+            ),
+            "gcloud container clusters update drift-peer-std-9 "
+            "--location us-east4-c --release-channel=regular",
+        )
+
+    def test_the_space_separated_form_is_corrected_too(self):
+        self.assertEqual(
+            self.normalise("gcloud x --release-channel RAPID"),
+            "gcloud x --release-channel rapid",
+        )
+
+    def test_an_uppercase_choice_flag_is_not_lowercased(self):
+        # The reason this is a table and not a `.lower()`: gcloud spells
+        # --release-channel's choices lower and --logging-variant's upper.
+        self.assertEqual(
+            self.normalise("gcloud x --logging-variant=MAX_THROUGHPUT"),
+            "gcloud x --logging-variant=MAX_THROUGHPUT",
+        )
+
+    def test_an_uppercase_choice_flag_is_corrected_when_written_lower(self):
+        self.assertEqual(
+            self.normalise("gcloud x --logging-variant=max_throughput"),
+            "gcloud x --logging-variant=MAX_THROUGHPUT",
+        )
+
+    def test_a_component_list_flag_is_left_alone(self):
+        # --logging takes a list drawn from no fixed set, so it is absent from
+        # the table on purpose. `SYSTEM,WORKLOAD` is already the correct fix for
+        # an enableComponents of SYSTEM_COMPONENTS,WORKLOADS.
+        self.assertEqual(
+            self.normalise("gcloud x --logging=SYSTEM,WORKLOAD"),
+            "gcloud x --logging=SYSTEM,WORKLOAD",
+        )
+
+    def test_an_unrecognised_value_is_left_alone_not_guessed_at(self):
+        # A command that fails is inspected; a command quietly rewritten to
+        # something else runs and does the wrong thing.
+        self.assertEqual(
+            self.normalise("gcloud x --release-channel=TURBO"),
+            "gcloud x --release-channel=TURBO",
+        )
+
+    def test_a_flag_outside_the_table_is_left_alone(self):
+        self.assertEqual(
+            self.normalise("gcloud x --location US-EAST4-C"),
+            "gcloud x --location US-EAST4-C",
+        )
+
+    def test_several_flags_in_one_note(self):
+        self.assertEqual(
+            self.normalise("gcloud x --release-channel=STABLE --tier=ENTERPRISE"),
+            "gcloud x --release-channel=stable --tier=enterprise",
+        )
+
+    def test_validation_writes_the_correction_back_into_the_document(self):
+        # The published note is whatever survives validation, so a normaliser
+        # nothing calls fixes nothing.
+        finding = make_finding(
+            fid="a",
+            remediation={
+                "kind": "gcloud",
+                "note": "gcloud container clusters update c --release-channel=REGULAR",
+            },
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["remediation"]["note"],
+            "gcloud container clusters update c --release-channel=regular",
+        )
+
+    def test_prose_naming_the_api_value_is_not_touched(self):
+        # The rewrite fires on a flag and its value, so a sentence discussing
+        # the API's own spelling survives intact. This is what makes it safe to
+        # run over `recommendation.action`, which is prose with a command in it.
+        prose = "Nine of ten peers run REGULAR while this one is on RAPID."
+        self.assertEqual(self.normalise(prose), prose)
+
+    def test_a_manual_note_that_still_names_a_flag_is_corrected(self):
+        # `kind` says who applies the fix, not whether the text is pasteable.
+        # A manual note spelling out a command is a command a reader will run.
+        finding = make_finding(
+            fid="a",
+            remediation={
+                "kind": "manual",
+                "note": "Ask the owner to run: gcloud x --release-channel=REGULAR",
+            },
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["remediation"]["note"],
+            "Ask the owner to run: gcloud x --release-channel=regular",
+        )
+
+    def test_the_recommendation_action_is_corrected_too(self):
+        # The field the issue body renders above the fix block. Correcting the
+        # note alone published the broken command and the working one together.
+        finding = make_finding(
+            fid="a",
+            recommendation={
+                "action": "Run `gcloud x --release-channel=REGULAR` to align.",
+                "rationale": "r",
+                "risk": "k",
+            },
+            remediation={"kind": "gcloud", "note": "gcloud x --release-channel=REGULAR"},
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["recommendation"]["action"],
+            "Run `gcloud x --release-channel=regular` to align.",
+        )
+        self.assertEqual(
+            finding["remediation"]["note"], "gcloud x --release-channel=regular"
+        )
+
+
+class TestPublicControlPlaneRepair(unittest.TestCase):
+    """A `public-control-plane` fix has to clear `public-control-plane`.
+
+    The 2026-09-06 compliance run published 16 of these and all 16 said
+    `--enable-master-authorized-networks` and stopped, which GKE applies while
+    leaving `gcpPublicCidrsAccessEnabled: true` -- the state the check fires
+    on. A reader who pastes it does the work and watches the finding come back.
+    `kube-agents-host` was worse: both endpoints open, one command published,
+    so acting on it leaves the DNS endpoint answering from anywhere.
+
+    Every note here is that run's text, taken from the stored report.
+    """
+
+    NOTE = (
+        "# CIDR list must come from a human -- an incomplete list locks every "
+        "operator out of the API server.\n"
+        "gcloud container clusters update kube-agents-host --location us-east4 "
+        "--project adamparco-kage --enable-master-authorized-networks "
+        "--master-authorized-networks=<CIDR[,CIDR...]>"
+    )
+    DNS_EXCERPT = (
+        "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true; "
+        "controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic=true "
+        "(DNS endpoint, not gated by authorized networks)"
+    )
+    IP_EXCERPT = "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true"
+
+    def finding(self, note=None, excerpt=None, check=None, **overrides):
+        return make_finding(
+            fid="pcp",
+            check=audit_report.PUBLIC_CONTROL_PLANE_CHECK if check is None else check,
+            cluster="kube-agents-host",
+            obj="Cluster/kube-agents-host",
+            excerpt=self.IP_EXCERPT if excerpt is None else excerpt,
+            remediation={"kind": "gcloud", "note": self.NOTE if note is None else note},
+            **overrides,
+        )
+
+    def repaired(self, **kwargs):
+        finding = self.finding(**kwargs)
+        audit_report.repair_public_control_plane_commands(finding)
+        return finding
+
+    # -- append_gcloud_flag ------------------------------------------------
+
+    def test_the_live_defect_is_corrected(self):
+        note = self.repaired()["remediation"]["note"]
+        self.assertTrue(
+            note.endswith(
+                "--master-authorized-networks=<CIDR[,CIDR...]> "
+                "--no-enable-google-cloud-access"
+            ),
+            note,
+        )
+
+    def test_a_note_already_carrying_the_flag_gains_nothing(self):
+        already = self.NOTE + " --no-enable-google-cloud-access"
+        self.assertEqual(self.repaired(note=already)["remediation"]["note"], already)
+
+    def test_repairing_twice_is_repairing_once(self):
+        # `finish` runs the repair at two points on purpose, so a
+        # second pass appending a second copy would be the defect, not a
+        # cosmetic one: two `--no-enable-google-cloud-access` on one line is a
+        # command gcloud rejects.
+        finding = self.repaired()
+        once = copy.deepcopy(finding)
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertEqual(finding, once)
+
+    def test_a_longer_flag_sharing_the_prefix_does_not_read_as_the_anchor(self):
+        # `--enable-master-authorized-networks-on-private-endpoint` is a real
+        # gcloud flag and a different one. Without the token boundary this note
+        # would be "repaired" with a flag that contradicts it.
+        other = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks-on-private-endpoint"
+        )
+        self.assertEqual(self.repaired(note=other)["remediation"]["note"], other)
+
+    def test_a_wrapped_command_is_repaired_at_its_last_line(self):
+        wrapped = (
+            "gcloud container clusters update c \\\n"
+            "  --location=us-east4 --project=p \\\n"
+            "  --enable-master-authorized-networks \\\n"
+            "  --master-authorized-networks=<CIDR>"
+        )
+        self.assertEqual(
+            self.repaired(note=wrapped)["remediation"]["note"],
+            wrapped + " --no-enable-google-cloud-access",
+        )
+
+    def test_only_the_command_carrying_the_anchor_is_touched(self):
+        note = (
+            "gcloud container clusters describe c --location=us-east4 --project=p\n"
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+        )
+        out = self.repaired(note=note)["remediation"]["note"].split("\n")
+        self.assertNotIn("--no-enable-google-cloud-access", out[0])
+        self.assertTrue(out[1].endswith("--no-enable-google-cloud-access"), out[1])
+
+    def test_prose_that_never_names_the_anchor_is_left_alone(self):
+        prose = "Ask the platform owner which admin ranges are legitimate."
+        self.assertEqual(self.repaired(note=prose)["remediation"]["note"], prose)
+
+    # -- the DNS arm -------------------------------------------------------
+
+    def test_a_both_endpoints_open_finding_gains_the_second_command(self):
+        note = self.repaired(excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --no-enable-dns-access",
+            note,
+        )
+        # And it names the address a reader can check the finding against.
+        self.assertIn("gke-<hash>.us-east4.gke.goog", note)
+
+    def test_a_prompted_command_gains_the_second_command_too(self):
+        # `_is_gcloud_command` allows a `$ ` prompt, so the flag lands on it;
+        # the DNS half has to find the same command or it is silently dropped.
+        prompted = "$ " + self.NOTE.split("\n")[1]
+        note = self.repaired(note=prompted, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("--no-enable-dns-access", note)
+
+    def test_a_manual_note_gains_no_second_command(self):
+        # A `manual` note renders inline, not in a code block, so the comment
+        # line above the second command would publish as a heading.
+        finding = self.finding(excerpt=self.DNS_EXCERPT)
+        finding["remediation"]["kind"] = "manual"
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertNotIn("--no-enable-dns-access", finding["remediation"]["note"])
+
+    def test_the_ip_only_arm_gains_no_dns_command(self):
+        # The check fires on either endpoint. Closing the DNS one on a cluster
+        # that never opened it is a change the finding does not justify.
+        self.assertNotIn(
+            audit_report.DNS_ACCESS_FLAG, self.repaired()["remediation"]["note"]
+        )
+
+    def test_the_second_command_is_named_off_the_first(self):
+        # Built from the command the model already wrote rather than from the
+        # finding's fields, so the two invocations cannot name different
+        # clusters however the model spelled the first one.
+        note = self.repaired(
+            note=(
+                "gcloud container clusters update other-cluster --location europe-west1 "
+                "--project other-project --enable-master-authorized-networks "
+                "--master-authorized-networks=<CIDR>"
+            ),
+            excerpt=self.DNS_EXCERPT,
+        )["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update other-cluster --location=europe-west1 "
+            "--project=other-project --no-enable-dns-access",
+            note,
+        )
+
+    def test_the_anchored_command_is_the_one_the_second_is_named_off(self):
+        # A note that touches two clusters -- the finding's, and one named as an
+        # aside. Closing the DNS endpoint on the wrong one is a change nobody
+        # asked for on a cluster the finding is not about.
+        note = (
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --enable-master-authorized-networks "
+            "--master-authorized-networks=<CIDR>\n"
+            "# For reference, the peer that already has this:\n"
+            "gcloud container clusters update drift-peer-std-9 --location=us-east4-c "
+            "--project=adamparco-kage --enable-private-endpoint"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        added = [line for line in out.split("\n") if audit_report.DNS_ACCESS_FLAG in line]
+        self.assertEqual(
+            added,
+            [
+                "gcloud container clusters update kube-agents-host --location=us-east4 "
+                "--project=adamparco-kage --no-enable-dns-access"
+            ],
+        )
+
+    def test_an_unanchored_update_command_still_names_the_cluster(self):
+        # The DNS endpoint can be the only open path, in which case the model
+        # writes no authorized-networks command to anchor to. The note's own
+        # last word on which cluster it is about beats publishing nothing.
+        note = (
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --enable-private-endpoint"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --no-enable-dns-access",
+            out,
+        )
+
+    def test_an_unparseable_command_is_skipped_rather_than_ending_the_search(self):
+        # `shlex` raises on an unbalanced quote. The command below it is still
+        # the finding's, and giving up on the whole note loses the DNS half.
+        note = (
+            "gcloud container clusters update kube-agents-host --location=us-east4 "
+            "--project=adamparco-kage --enable-master-authorized-networks "
+            "--master-authorized-networks=<CIDR>\n"
+            "gcloud container clusters update c --location=us-east4 --project='unclosed"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "kube-agents-host --location=us-east4 --project=adamparco-kage "
+            "--no-enable-dns-access",
+            out,
+        )
+
+    def test_a_note_already_closing_the_dns_endpoint_gains_nothing(self):
+        note = self.NOTE + "\ngcloud container clusters update c --no-enable-dns-access"
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertEqual(out.count(audit_report.DNS_ACCESS_FLAG), 1)
+
+    def test_a_note_with_no_update_command_gets_no_invented_one(self):
+        # An incomplete repair a reader can see beats a command whose arguments
+        # this module guessed.
+        note = "Ask the owner to close the DNS endpoint via --enable-master-authorized-networks."
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
+
+    def test_an_update_command_missing_the_project_keeps_the_default_project(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertTrue(
+            out.endswith("gcloud container clusters update c --location=us-east4 --no-enable-dns-access"),
+            out,
+        )
+
+    def test_a_region_flag_reads_as_the_location(self):
+        note = (
+            "gcloud container clusters update c --region us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn(
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--no-enable-dns-access",
+            out,
+        )
+
+    def test_a_comment_on_the_anchored_command_does_not_lose_the_dns_command(self):
+        """The DNS arm reads the command as the IP arm does, without its comment."""
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>  # the owner's CIDRs"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("update c --location=us-east4 --project=p --no-enable-dns-access", out)
+
+    def test_a_location_named_only_in_a_comment_is_not_read(self):
+        note = (
+            "gcloud container clusters update c --project=p --enable-master-authorized-networks "
+            "--master-authorized-networks=<CIDR>  # or --zone=us-east4-a"
+        )
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertNotIn(audit_report.DNS_ACCESS_FLAG, out)
+
+    def test_prose_naming_the_dns_flag_does_not_count_as_closing_it(self):
+        note = self.NOTE + "\n# Run --no-enable-dns-access too if the DNS endpoint is open."
+        out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        self.assertIn("--project=adamparco-kage --no-enable-dns-access", out)
+
+    def test_a_long_note_keeps_the_dns_command_whole_when_rendered(self):
+        """`trim_command` clips from the end, so the second command goes
+        straight after the first, ahead of the prose that follows it."""
+        prose = "\n".join("# " + "x" * 120 for _ in range(16))
+        out = self.repaired(note=self.NOTE + "\n" + prose, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+        rendered = audit_report.trim_command(out)
+        self.assertIn("--project=adamparco-kage --no-enable-dns-access", rendered)
+
+    def test_the_flag_goes_before_a_trailing_comment(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR>  # list every CIDR"
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --master-authorized-networks=<CIDR> "
+            "--no-enable-google-cloud-access  # list every CIDR",
+        )
+
+    def test_a_flag_inside_the_comment_does_not_count(self):
+        note = (
+            "gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks  # then --no-enable-google-cloud-access"
+        )
+        self.assertTrue(
+            self.repaired(note=note)["remediation"]["note"].startswith(
+                "gcloud container clusters update c --location=us-east4 --project=p "
+                "--enable-master-authorized-networks --no-enable-google-cloud-access  #"
+            )
+        )
+
+    def test_the_flag_goes_inside_an_inline_backticked_command(self):
+        note = (
+            "Run `gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks` to restrict access."
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "Run `gcloud container clusters update c --location=us-east4 --project=p "
+            "--enable-master-authorized-networks --no-enable-google-cloud-access` to restrict access.",
+        )
+
+    def test_a_backticked_flag_in_prose_is_not_a_command(self):
+        note = (
+            "Enabling `--enable-master-authorized-networks` alone does not close it; "
+            "add `--no-enable-google-cloud-access` too."
+        )
+        self.assertEqual(self.repaired(note=note)["remediation"]["note"], note)
+
+    def test_a_bare_sentence_naming_the_flag_is_left_alone(self):
+        note = "Set --enable-master-authorized-networks on the cluster."
+        self.assertEqual(self.repaired(note=note)["remediation"]["note"], note)
+
+    def test_a_command_in_the_second_code_span_is_repaired(self):
+        note = (
+            "Pick the `<CIDR>` list, then run `gcloud container clusters update c "
+            "--location=us-east4 --project=p --enable-master-authorized-networks`."
+        )
+        self.assertEqual(
+            self.repaired(note=note)["remediation"]["note"],
+            "Pick the `<CIDR>` list, then run `gcloud container clusters update c "
+            "--location=us-east4 --project=p --enable-master-authorized-networks "
+            "--no-enable-google-cloud-access`.",
+        )
+
+    def test_both_flag_spellings_are_read(self):
+        for form in ("--location=us-east4 --project=p", "--location us-east4 --project p"):
+            with self.subTest(form=form):
+                note = (
+                    f"gcloud container clusters update c {form} "
+                    "--enable-master-authorized-networks --master-authorized-networks=<CIDR>"
+                )
+                out = self.repaired(note=note, excerpt=self.DNS_EXCERPT)["remediation"]["note"]
+                self.assertIn(
+                    "gcloud container clusters update c --location=us-east4 "
+                    "--project=p --no-enable-dns-access",
+                    out,
+                )
+
+    def test_the_dns_marker_is_the_string_the_collector_writes(self):
+        # The excerpt is the collector's own text by the time the repair runs
+        # (`adopt_collector_evidence` sees to that), so this constant is a
+        # contract between two files. Renaming the field on one side without
+        # the other silently stops the DNS arm firing, and nothing else here
+        # would notice: every test above would still pass.
+        import collect  # noqa: PLC0415 — the coupling is the point of this test
+
+        paths = collect._external_control_plane_paths(
+            {
+                "controlPlaneEndpointsConfig": {
+                    "ipEndpointsConfig": {"enablePublicEndpoint": True},
+                    "dnsEndpointConfig": {"allowExternalTraffic": True},
+                }
+            }
+        )
+        self.assertTrue(
+            any(audit_report.DNS_ENDPOINT_MARKER in path for path in paths), paths
+        )
+
+    # -- which fields, and which findings ----------------------------------
+
+    def test_the_recommendation_action_and_risk_are_repaired_too(self):
+        finding = self.repaired(
+            recommendation={
+                "action": "Run `gcloud container clusters update c --location=us-east4 "
+                "--project=p --enable-master-authorized-networks "
+                "--master-authorized-networks=<CIDR>`.",
+                "rationale": "r",
+                "risk": "Rerunning `gcloud container clusters update c --location=us-east4 "
+                "--project=p --enable-master-authorized-networks` replaces the list.",
+            }
+        )
+        for field in ("action", "risk"):
+            with self.subTest(field=field):
+                self.assertIn(
+                    "--no-enable-google-cloud-access", finding["recommendation"][field]
+                )
+
+    def test_the_second_command_goes_only_into_the_note(self):
+        # `recommendation.action` is prose about intent and the issue body
+        # renders it as a sentence; a bare second invocation pasted mid-sentence
+        # is not one. `/remediate` reads the note.
+        # The action spells the whole command out, which is what the live ones
+        # do -- so nothing but the field it is written into keeps the second
+        # invocation from landing here as well.
+        finding = self.repaired(
+            excerpt=self.DNS_EXCERPT,
+            recommendation={
+                "action": "Restrict the API server to known admin ranges:\n"
+                "gcloud container clusters update kube-agents-host "
+                "--location=us-east4 --project=adamparco-kage "
+                "--enable-master-authorized-networks "
+                "--master-authorized-networks=<CIDR>",
+                "rationale": "r",
+                "risk": "k",
+            },
+        )
+        self.assertIn(
+            "--no-enable-google-cloud-access", finding["recommendation"]["action"]
+        )
+        self.assertNotIn(
+            audit_report.DNS_ACCESS_FLAG, finding["recommendation"]["action"]
+        )
+        self.assertIn(audit_report.DNS_ACCESS_FLAG, finding["remediation"]["note"])
+
+    def test_another_check_is_not_touched(self):
+        # The anchor flag appears in other compliance findings' prose, and this
+        # repair is an argument about one check's predicate, not about the flag.
+        finding = self.finding(check="netpol-missing")
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertEqual(finding["remediation"]["note"], self.NOTE)
+
+    def test_the_older_stored_evidence_shape_does_not_crash_the_pass(self):
+        # `validate_findings` requires the object form, so this is what a
+        # document written before that requirement carries. Read as an
+        # attribute on a list it raised, which fails the whole pass rather than
+        # one finding.
+        finding = self.finding()
+        finding["evidence"] = [
+            {"command": "gcloud container clusters describe kube-agents-host",
+             "excerpt": self.DNS_EXCERPT},
+        ]
+        audit_report.repair_public_control_plane_commands(finding)
+        self.assertIn(audit_report.DNS_ACCESS_FLAG, finding["remediation"]["note"])
+
+    def test_the_sweep_names_the_ids_it_changed(self):
+        touched, clean = self.finding(), self.finding(check="netpol-missing")
+        touched["id"] = "pcp-1"
+        findings = [touched, clean]
+        self.assertEqual(audit_report.repair_remediation_commands(findings), ["pcp-1"])
+        self.assertEqual(audit_report.repair_remediation_commands(findings), [])
+
+    # -- the points it has to run at ---------------------------------------
+
+    def test_validation_writes_the_repair_back_into_the_document(self):
+        # A repair nothing calls repairs nothing; this is the path a finding new
+        # this run takes on the way in.
+        finding = self.finding()
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertIn(
+            "--no-enable-google-cloud-access", finding["remediation"]["note"]
+        )
+
+
+class TestPublicControlPlaneRepairInThePipeline(HarnessTestCase):
+    """The repair has to run again after the collector's excerpt lands.
+
+    The DNS arm keys on a string only `collect.py` writes, and
+    `adopt_collector_evidence` is what puts it on the finding. Until then
+    `evidence.excerpt` is the model's prose. So a finding passes
+    `validate_findings` -- the repair's other entry point -- before the string
+    the arm reads exists. Without a pass of its own after the adoption, a
+    both-endpoints-open cluster ships one command and the DNS endpoint stays
+    open.
+    """
+
+    CHECK = "public-control-plane"
+    CLUSTER = "prod-us-east"
+    OBJ = "Cluster/prod-us-east"
+    COMMAND = "gcloud container clusters describe prod-us-east --location us-east1"
+    COLLECTOR_EXCERPT = (
+        "controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint=true; "
+        "controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic=true "
+        "(DNS endpoint, not gated by authorized networks)"
+    )
+    NOTE = (
+        "gcloud container clusters update prod-us-east --location=us-east1 "
+        "--project=acme-prod --enable-master-authorized-networks "
+        "--master-authorized-networks=<CIDR>"
+    )
+
+    def doc(self):
+        # One cluster running one check, so the manifest below can account for
+        # every check `checks_run` names — `cross_check_manifest` rejects the
+        # document otherwise, and the roster is not what this test is about.
+        return make_doc(
+            clusters=[
+                {
+                    "name": self.CLUSTER,
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "checks_run": [{"check": self.CHECK, "command": self.COMMAND}],
+                }
+            ],
+            findings=[
+                make_finding(
+                    fid="pcp",
+                    check=self.CHECK,
+                    cluster=self.CLUSTER,
+                    # Cluster-scoped, as the live ones are — and the namespace
+                    # is part of the id the collector's candidate joins on.
+                    namespace="",
+                    obj=self.OBJ,
+                    command=self.COMMAND,
+                    # The model's own words, and they carry no marker: this is
+                    # the state the repair sees at validation time.
+                    excerpt="The control plane is reachable from the internet.",
+                    remediation={"kind": "gcloud", "note": self.NOTE},
+                )
+            ]
+        )
+
+    def manifest_file(self):
+        path = self.tmp_path / "collector-manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "clusters": [
+                        {
+                            "name": self.CLUSTER,
+                            "outcome": "collected",
+                            "commands": [
+                                {"check": self.CHECK, "command": self.COMMAND, "rc": 0}
+                            ],
+                            "candidates": [
+                                {
+                                    "check": self.CHECK,
+                                    "cluster": self.CLUSTER,
+                                    "namespace": "",
+                                    "object": self.OBJ,
+                                    "severity": "critical",
+                                    "excerpt": self.COLLECTOR_EXCERPT,
+                                    "impact": "Reachable from any address.",
+                                    "needs_triage": None,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_the_preview_shows_the_command_the_real_run_would_publish(self):
+        # A preview that omits the second command is a preview of a different
+        # document, which is the one thing a preview must not be.
+        self.patch_attr("run_cmd", Recorder())
+        rc = self.run_finish(
+            self.doc(),
+            argv_extra=("--dry-run", "--manifest-file", self.manifest_file()),
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("--no-enable-google-cloud-access", self.out)
+        self.assertIn(
+            "gcloud container clusters update prod-us-east --location=us-east1 "
+            "--project=acme-prod --no-enable-dns-access",
+            self.out,
+        )
+
+    def test_a_first_publication_carries_both_commands(self):
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        rc = self.run_finish(
+            self.doc(), argv_extra=("--manifest-file", self.manifest_file())
+        )
+        self.assertEqual(rc, 0, self.err)
+        envelope = json.loads(
+            (self.store_dir() / "latest.json").read_text(encoding="utf-8")
+        )
+        note = envelope["document"]["findings"][0]["remediation"]["note"]
+        self.assertIn("--no-enable-google-cloud-access", note)
+        self.assertIn(
+            "gcloud container clusters update prod-us-east --location=us-east1 "
+            "--project=acme-prod --no-enable-dns-access",
+            note,
+        )
+
+
+class TestGcloudFormatQuoting(unittest.TestCase):
+    """A gcloud format expression is parenthesised, so bash eats it unquoted.
+
+    `--format=value(x)` is not a command that prints the wrong field, it is a
+    syntax error before gcloud is reached. The fenced commands a collector
+    records arrive quoted; the ones the model writes into prose do not.
+    """
+
+    def quote(self, text):
+        return audit_report.quote_gcloud_format_projections(text)
+
+    def test_a_projection_with_a_transform_is_quoted_whole(self):
+        for projection in ("value(zone.basename())", "table(name,zone.basename())", "value(a.list().len())"):
+            with self.subTest(projection):
+                self.assertEqual(
+                    self.quote(f"gcloud container clusters describe c --format={projection}"),
+                    f"gcloud container clusters describe c --format='{projection}'",
+                )
+
+    def test_a_possessive_in_bare_prose_is_not_a_quote(self):
+        self.assertEqual(
+            self.quote("Confirm the cluster's channel: gcloud container clusters describe c --format=value(x)"),
+            "Confirm the cluster's channel: gcloud container clusters describe c --format='value(x)'",
+        )
+
+    def test_a_wrapper_continued_onto_the_next_line_is_untouched(self):
+        for note in (
+            "watch 'gcloud container clusters describe c \\\n  --format=value(status)'",
+            'S="$(gcloud container clusters describe c \\\n  --format=value(status))"',
+        ):
+            with self.subTest(note):
+                self.assertEqual(self.quote(note), note)
+
+    def test_an_apostrophe_in_the_prose_before_the_span_is_not_a_quote(self):
+        self.assertEqual(
+            self.quote(
+                "Confirm the cluster's channel with "
+                "`gcloud container clusters describe c --format=value(releaseChannel)`"
+            ),
+            "Confirm the cluster's channel with "
+            "`gcloud container clusters describe c --format='value(releaseChannel)'`",
+        )
+
+    def test_the_live_defect_is_corrected(self):
+        # 2026-09-04 compliance-audit shipped this in `recommendation.risk` on
+        # fifteen findings, each of which dies with *syntax error near
+        # unexpected token `('* the moment a reader pastes it.
+        self.assertEqual(
+            self.quote(
+                "gcloud container clusters describe adam-new-cluster "
+                "--format=value(controlPlaneEndpointsConfig.ipEndpointsConfig"
+                ".publicEndpoint)"
+            ),
+            "gcloud container clusters describe adam-new-cluster "
+            "--format='value(controlPlaneEndpointsConfig.ipEndpointsConfig"
+            ".publicEndpoint)'",
+        )
+
+    def test_the_space_separated_form_is_corrected_too(self):
+        self.assertEqual(
+            self.quote("gcloud x --format value(name,location)"),
+            "gcloud x --format 'value(name,location)'",
+        )
+
+    def test_an_already_single_quoted_expression_is_untouched(self):
+        # Double-quoting an already-quoted command is the same class of defect
+        # in the other direction, so the rewrite has to see the quote.
+        note = "gcloud x --format 'json(a,b)'"
+        self.assertEqual(self.quote(note), note)
+
+    def test_an_expression_inside_a_double_quoted_substitution_is_untouched(self):
+        # The shell reads no subshell inside double quotes, so quotes added
+        # there would reach gcloud as part of the expression.
+        note = 'ep="$(gcloud x describe c --format=value(endpoint))"'
+        self.assertEqual(self.quote(note), note)
+
+    def test_an_expression_inside_a_single_quoted_wrapper_is_untouched(self):
+        note = "watch 'gcloud x describe c --format=value(status)'"
+        self.assertEqual(self.quote(note), note)
+
+    def test_a_closed_double_quoted_string_earlier_on_the_line_does_not_stop_it(self):
+        self.assertEqual(
+            self.quote('echo "x"; gcloud x --format=value(name)'),
+            "echo \"x\"; gcloud x --format='value(name)'",
+        )
+
+    def test_an_already_double_quoted_expression_is_untouched(self):
+        note = 'gcloud x --format="json(a,b)"'
+        self.assertEqual(self.quote(note), note)
+
+    def test_prose_parentheses_are_not_quoted(self):
+        prose = "Authorized Networks (the weaker control) is preferred here."
+        self.assertEqual(self.quote(prose), prose)
+
+    def test_every_projection_gcloud_accepts_is_covered(self):
+        for projection in audit_report._GCLOUD_FORMAT_PROJECTIONS:
+            with self.subTest(projection=projection):
+                self.assertEqual(
+                    self.quote("gcloud x --format=%s(a)" % projection),
+                    "gcloud x --format='%s(a)'" % projection,
+                )
+
+    def test_the_risk_field_is_corrected_by_validation(self):
+        # `risk` is the third field carrying a pasteable command and the one
+        # left out when the enum normaliser was written; it is where the live
+        # defect shipped.
+        finding = make_finding(
+            fid="a",
+            recommendation={
+                "action": "a",
+                "rationale": "r",
+                "risk": "Confirm with `gcloud x --format=value(status)` first.",
+            },
+            remediation={"kind": "gcloud", "note": "gcloud x --format=value(status)"},
+        )
+        audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertEqual(
+            finding["recommendation"]["risk"],
+            "Confirm with `gcloud x --format='value(status)'` first.",
+        )
+        self.assertEqual(
+            finding["remediation"]["note"], "gcloud x --format='value(status)'"
+        )
+
+
 class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     """`finish` without `--manifest-file` is, byte for byte, what it was before
     the collector contract landed.
@@ -17357,7 +19707,12 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     output moved with it: the clean-over-a-gap run's stderr says the gaps mean
     it "cannot vouch for the ledger's state", where it said it "cannot speak
     for the fleet", because a lost store record also makes a clean run
-    partial, and the line now covers both causes. Nothing else moved.
+    partial, and the line now covers both causes. The `major` sweep opens a
+    `major` manifest only on `MAJOR_SWEEP_CHECKS`, and `two_findings`' `major`
+    finding is on none of them, so no transcript gains a pull request. And the JSON
+    line carries `prs_still_open`, the remediation pull requests already open
+    on findings the run still carries, empty in every scenario here. Nothing
+    else moved.
 
     Five scenarios, chosen to pass through every branch a manifest could
     touch: the findings path with a delta and an auto-promoted pull request,

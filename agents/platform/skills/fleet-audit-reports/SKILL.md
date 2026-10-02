@@ -20,7 +20,7 @@ repository — a stream publishes one ledger per managed repository:
 
 An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
-`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_closed`, `silent_ok`,
+`wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
 `document`, and sometimes `ledger_document`.
 

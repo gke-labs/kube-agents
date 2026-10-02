@@ -97,7 +97,7 @@ status surface and the collectors' own bookkeeping, and `finish` ignores them to
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                        |
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                            |
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                   |
-| `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is carried, not read by `finish`: the stream's SOP says whether the model copies it or re-judges it against fleet context. |
+| `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context. |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                     |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the `started_at` the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.       |
 | `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. Reserved for a run-over-run comparison and the timing view that a later change adds; `finish` does not read them today.                                                                                                                                                                                     |
@@ -182,6 +182,16 @@ A candidate with `impact_authoritative: true` also replaces the finding's `impac
 checks are the only ones a collector should mark: there the sentence reports which arm fired, which
 the model infers from an excerpt and gets wrong. Every other check's `impact` stays the model's,
 whose rewrite is usually the better sentence.
+
+A `no-pdb` candidate also carries `namespace_pdbs`, the names of the budgets already in its
+namespace, and `pod_selector`, the workload's `spec.selector`, but only where that selector reaches
+no other controller's pods in the dump. Where the model left a declared finding of that check
+`manual`, did not decline it, and the `major` sweep would open it, `finish` writes the
+PodDisruptionBudget the obtainability SOP prescribes from it, `maxUnavailable: 1` in a new file
+beside the declaration, rather than refusing. It writes nothing for an empty or unusable selector,
+a name the namespace or repository already uses, a path that holds a file, a declaration inside a
+Kustomize root, or a finding another pull request already carries; its own open pull request, on
+the branch the generated file names, gets the file written again for the sweep to find.
 
 ### 3.3 Resolution — `still_flagged_ids`, `collector_held_entries`
 
@@ -360,7 +370,7 @@ repositories (`Disk/<zone>:<name>` and the like, since each name is unique only 
 leave the ledger unheld on the bump run and are not in the warning's count. That residual is the cost of a
 bump, which is rare and operator-initiated.
 
-### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_marked_findings`
+### 3.4 The automatic sweep — `uncorroborated_findings`, `triage_markers`
 
 Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>` ignores both.
 
@@ -372,12 +382,21 @@ Sets that withhold auto-promotion and nothing else. An explicit `/remediate <id>
   named in the ledger's _Awaiting `/remediate`_ section under a paragraph that says to read it
   first, and reported on the JSON line.
 - **Needs triage:** a finding whose candidate carries a `needs_triage` value in `NO_SWEEP_TRIAGE`
-  (today, `service-fronted`). The collector stands behind the finding; the _fix_ has a consequence
+  (`service-fronted`, `new-computeclass`, `autopilot-bumped`, `scale-to-zero`, `guaranteed-qos`,
+  `default-deny`, `namespace-token`, `service-selector`, `hard-spread`). The collector stands behind the finding; the _fix_ has a consequence
   it could not measure. Named in its own paragraph, worded differently from the one above because
-  the two say opposite things about the collector.
+  the two say opposite things about the collector, each row followed by the marker and the
+  consequence it stands for (`TRIAGE_REASONS`).
 
-Both are computed after every other test the sweep already applies, so they name only what the sweep
-would otherwise have opened — in the ledger and on the JSON line alike, which carry the same list.
+The severity floor reads the manifest too. A finding is held to `AUTO_PROMOTION_FLOOR` (`major`)
+only when its check is in `MAJOR_SWEEP_CHECKS` and a candidate graded at least `major` stands behind
+it (`collector_vouched_findings`); every other finding is held to `UNVOUCHED_PROMOTION_FLOOR`
+(`critical`). This is the one place `finish` reads a candidate's `severity`.
+
+Both sets are computed after every other test the sweep already applies except the severity floor,
+which comes last. The ledger names all three; the JSON line carries only `uncorroborated_findings`. A finding below the
+floor that is also uncorroborated or triage-marked is therefore named here rather than as below the
+floor: the reason a human has to read before asking for it is the one worth printing.
 
 ### 3.5 Disclosure — `unpublished_candidates`, `wholly_unpublished_checks`
 

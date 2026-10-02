@@ -428,8 +428,9 @@ over two of those fields and stays correct through a re-rank by construction. A 
 column would be a second copy of the same fact, free to disagree with the vector the moment §4.6's
 re-rank moves L.
 
-The threshold is load-bearing in one place. `critical` is one of the three conditions on the
-auto-promotion sweep in `finish`, which is what opens a pull request without being asked. It is
+The threshold is load-bearing in one place. A `critical` grade always clears the severity floor of
+the auto-promotion sweep in `finish`, which is what opens a pull request without being asked (`major`
+clears it only on the few checks `MAJOR_SWEEP_CHECKS` names). It is
 **not** a condition on `remediate`, which passes `auto_promote=False` and "opens what was named and
 nothing else" — and `remediate` is the call §9 puts on this path. So on the queue's own path the
 threshold decides nothing about promotion; it decides what the surfaced message calls the finding,

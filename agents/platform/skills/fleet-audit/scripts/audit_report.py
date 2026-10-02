@@ -19,6 +19,7 @@ Two-command lifecycle, plus three on-demand commands:
     audit_report.py start     --audit <audit-id>
     audit_report.py finish    --audit <audit-id> --findings-file <path> [--dry-run]
                           [--manifest-file <path> | --no-collector-manifest <why>]
+                          [--decline-fix <id> <why> ...]
     audit_report.py remediate --audit <audit-id> --findings-file <path>
                           --finding <id> [--finding <id>...] [--dry-run]
     audit_report.py fetch     --audit <audit-id> --path <repo-path> [--path ...]
@@ -50,11 +51,15 @@ test_audit_report.py; the thin shell below them owns all subprocess execution.
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
+import copy
 import fcntl
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -63,7 +68,7 @@ import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # The shared scripts dir holds github_token_refresh and gitops_workspace (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
@@ -432,6 +437,206 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
 PROTECTED_BRANCHES = {"main", "master", "production"}
 PROTECTED_BRANCH_PREFIXES = ("run/",)
 
+# gcloud's accepted values for the enum flags a cluster remediation names, keyed
+# by flag. A model writing a `kind: gcloud` note reads the value off the API and
+# pastes it through, and the API's spelling is routinely not gcloud's: the
+# 2026-09-01 `fleet-consistency-drift` run read `.releaseChannel.channel=RAPID`
+# and shipped `--release-channel=REGULAR`, which dies on paste with *Invalid
+# choice: 'REGULAR'. Did you mean 'regular'?*. One bad flag discredits a true
+# finding, because a reader who pastes it concludes the finding is wrong rather
+# than the command.
+#
+# There is no rule to apply instead of a table. gcloud spells the first thirteen
+# of these lowercase and the six below them upper, so a blanket `.lower()` breaks
+# `--logging-variant=MAX_THROUGHPUT` and a blanket `.upper()` breaks all of the
+# first group. Each list here is gcloud's own, harvested by feeding the flag a
+# bogus value and reading back the "Valid choices are [...]" it prints; re-run
+# that probe rather than editing a list by hand. Flags taking a component *list*
+# rather than a single choice (`--logging`, `--monitoring`) are deliberately
+# absent: their values are not drawn from a fixed set and normalising them by
+# case would be guessing.
+GCLOUD_ENUM_FLAG_CHOICES: dict[str, tuple[str, ...]] = {
+    "--release-channel": ("extended", "rapid", "regular", "stable"),
+    "--binauthz-evaluation-mode": ("disabled", "project-singleton-policy-enforce"),
+    "--security-posture": ("disabled", "enterprise", "standard"),
+    "--workload-vulnerability-scanning": ("disabled", "enterprise", "standard"),
+    "--stack-type": ("ipv4", "ipv4-ipv6"),
+    "--in-transit-encryption": ("inter-node-transparent", "none"),
+    "--cluster-dns": ("clouddns", "default", "kubedns"),
+    "--cluster-dns-scope": ("cluster", "vpc"),
+    "--gateway-api": ("disabled", "standard"),
+    "--tier": ("enterprise", "standard"),
+    "--autoprovisioning-cgroup-mode": ("default", "v1", "v2"),
+    "--autopilot-general-profile": ("no-performance", "none"),
+    "--private-ipv6-google-access-type": (
+        "bidirectional",
+        "disabled",
+        "outbound-only",
+    ),
+    "--logging-variant": ("DEFAULT", "MAX_THROUGHPUT"),
+    "--dataplane-v2-observability-mode": (
+        "DISABLED",
+        "EXTERNAL_LB",
+        "INTERNAL_VPC_LB",
+    ),
+    "--control-plane-egress": ("NONE", "VIA_CONTROL_PLANE"),
+    "--node-creation-mode": ("CONTROL_PLANE", "KUBELET"),
+    "--membership-type": ("LIGHTWEIGHT",),
+    "--anonymous-authentication-config": ("ENABLED", "LIMITED"),
+}
+
+# `--flag=value` and `--flag value` are both valid gcloud, and the drift stream
+# emits both in the same report, so the rewrite has to see each.
+_GCLOUD_ENUM_FLAG_RE = re.compile(
+    # A value never starts with `-`: after a valueless flag (`--quiet`,
+    # `--enable-autoupgrade`) the next token is a flag, and consuming it as the
+    # value would hide the enum flag behind it from the rewrite.
+    r"(?P<flag>--[a-z0-9-]+)(?P<sep>[= ])(?P<value>(?!-)[A-Za-z0-9_-]+)"
+)
+
+# A flag is present when it stands as its own token: the boundary stops
+# `--enable-master-authorized-networks` from reading as present because
+# `--enable-master-authorized-networks-on-private-endpoint` is. The negated
+# spellings need no guard in the other direction -- `--no-enable-x` does not
+# contain `--enable-x`, the second hyphen breaks it.
+_GCLOUD_FLAG_BOUNDARY = r"(?![A-Za-z0-9-])"
+
+# The Config Connector spec field each gcloud flag writes. A fleet whose
+# clusters are declared as KCC `ContainerCluster`/`ContainerNodePool` resources
+# reconciles that spec continuously, so a `kind: gcloud` remediation against a
+# field the declaration carries is undone minutes after the operator pastes it,
+# and the finding returns next run having been "fixed" every week. On
+# 2026-09-05 the drift stream shipped two: `--logging` against a declared
+# `loggingService` and `--release-channel` against a declared `releaseChannel`.
+#
+# Only flags whose KCC field is unambiguous are listed. `--logging` and
+# `--monitoring` each name two fields because the CRD accepts the legacy scalar
+# and the component-config block, and a declaration carrying either owns the
+# setting. A flag absent from this table is not checked: guessing a field name
+# would degrade a correct `gcloud` fix, the more expensive of the two errors.
+# An `--enable-` flag also matches its `--no-enable-` spelling, which writes
+# the same field.
+KCC_SPEC_FIELD_FOR_GCLOUD_FLAG: dict[str, tuple[str, ...]] = {
+    "--release-channel": ("releaseChannel",),
+    "--logging": ("loggingService", "loggingConfig"),
+    "--monitoring": ("monitoringService", "monitoringConfig"),
+    "--enable-managed-prometheus": ("monitoringConfig",),
+    "--disable-managed-prometheus": ("monitoringConfig",),
+    "--binauthz-evaluation-mode": ("binaryAuthorization",),
+    "--enable-intra-node-visibility": ("enableIntranodeVisibility",),
+    "--enable-master-authorized-networks": ("masterAuthorizedNetworksConfig",),
+    "--master-authorized-networks": ("masterAuthorizedNetworksConfig",),
+    "--enable-network-policy": ("networkPolicy",),
+    "--enable-shielded-nodes": ("enableShieldedNodes",),
+    "--database-encryption-key": ("databaseEncryption",),
+    "--workload-pool": ("workloadIdentityConfig",),
+    "--enable-autoupgrade": ("management",),
+    "--enable-autorepair": ("management",),
+    "--maintenance-window-start": ("maintenancePolicy",),
+    "--maintenance-window-end": ("maintenancePolicy",),
+    "--maintenance-window-recurrence": ("maintenancePolicy",),
+}
+_GCLOUD_ENABLE_PREFIX = "--enable-"
+_GCLOUD_NEGATED_ENABLE_PREFIX = "--no-enable-"
+
+# The apiGroup suffix every Config Connector CRD shares, and the `object`
+# prefixes naming a control-plane resource KCC can declare. A finding on
+# anything else -- a Deployment, a Namespace -- is out of scope even where a
+# name collides.
+KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
+# The group both indexed kinds live in, and what the broker searches for. The
+# bare suffix also matches every `cnrm.cloud.google.com/project-id`
+# annotation, which fills the broker's match ceiling with files that declare
+# nothing this check reads.
+KCC_CONTAINER_API_GROUP = f"container.{KCC_API_GROUP_SUFFIX}"
+_KCC_OBJECT_KINDS: dict[str, tuple[str, ...]] = {
+    "Cluster": ("ContainerCluster",),
+    "NodePool": ("ContainerNodePool",),
+}
+_YAML_SUFFIXES = ("*.yaml", "*.yml")
+# The same two, as `str.endswith` wants them for a path the broker reports.
+_KCC_YAML_EXTENSIONS = (".yaml", ".yml")
+# What `degrade_reverted_gcloud_remediations` wraps the command in, counted
+# against `MAX_NOTE_CHARS`.
+_KCC_NOTE_FENCE_OVERHEAD = "\n\n```bash\n\n```"
+# `clip_text`'s marker, so a command clipped here reads like any other.
+_KCC_COMMAND_TRUNCATED = " …(truncated)"
+
+# `public-control-plane`'s remediation and the flags without which it does not
+# clear `public-control-plane`.
+#
+# `--enable-master-authorized-networks` narrows nothing on its own. GKE leaves
+# `gcpPublicCidrsAccessEnabled` on -- confirmed against a live cluster that had
+# never mentioned the field -- and the check fires on exactly that state, so a
+# reader who pastes the command watches the finding come back next week having
+# done the work. Compliance SOP 2.10 has said the flag "is not optional and is
+# not a no-op on a public cluster" since the arm was written, and the
+# 2026-09-06 report shipped 16 commands out of 16 without it. That is the same
+# lesson `normalise_gcloud_enum_values` learned about `--release-channel=REGULAR`:
+# the SOP describes the command, and only code produces it.
+#
+# The DNS endpoint is a second path with a second command, because authorized
+# networks do not gate it. A cluster with both open once published a note that
+# carried one command, so acting on that finding would have left the cluster
+# answering `gke-<hash>.<region>.gke.goog` from anywhere. They stay two
+# invocations rather than one: gcloud parses all four flags together, but SOP
+# 2.10 prescribes a command per path and the second one closes an endpoint for
+# every caller, which is a decision a reader should be able to decline by not
+# running that line.
+PUBLIC_CONTROL_PLANE_CHECK = "public-control-plane"
+# What `append_gcloud_flag` reads as a command: an inline code span, or text
+# starting with the gcloud binary, optionally behind a shell prompt.
+INLINE_CODE_SPAN = re.compile(r"`([^`\n]*)`")
+GCLOUD_COMMAND_PREFIX = "gcloud "
+SHELL_PROMPT = "$ "
+AUTHORIZED_NETWORKS_FLAG = "--enable-master-authorized-networks"
+GOOGLE_CLOUD_ACCESS_FLAG = "--no-enable-google-cloud-access"
+DNS_ACCESS_FLAG = "--no-enable-dns-access"
+GCLOUD_LOCATION_FLAG = "--location"
+GCLOUD_PROJECT_FLAG = "--project"
+GCLOUD_LOCATION_FLAGS = (GCLOUD_LOCATION_FLAG, "--region", "--zone")
+CLUSTERS_UPDATE_PREFIX = "gcloud container clusters update"
+# What `collect._external_control_plane_paths` writes into the excerpt when the
+# DNS endpoint answers external traffic, and the only way this module can tell
+# that arm fired: the excerpt is the collector's own string by the time the
+# repair runs, so the marker is a contract between the two files rather than a
+# guess at the model's prose. `test_audit_report` pins it against `collect.py`.
+DNS_ENDPOINT_MARKER = "dnsEndpointConfig.allowExternalTraffic=true"
+
+# A gcloud format expression is parenthesised, and bash reads a bare `(` as a
+# subshell: pasting `--format=value(status)` is a syntax error, not a command
+# that prints the wrong thing. The fenced commands a collector records are
+# already quoted; the ones the model writes into prose are the ones that are
+# not, and a reader copies those out of the Recommendation and Risk lines just
+# as readily. Match only an unquoted expression: the projection has to follow
+# the separator directly, so an already-correct `--format 'json(a,b)'` does not
+# match and is left alone rather than double-quoted.
+_GCLOUD_FORMAT_PROJECTIONS = ("value", "json", "table", "csv", "yaml", "flattened")
+# Transforms nest parentheses inside the projection -- `value(zone.basename())`,
+# `table(name,nodePools[].name.list())` -- so the group admits two levels of
+# nesting; a quote anywhere inside still refuses the match.
+_GCLOUD_PROJECTION_BODY = r"\((?:[^()'\"]|\((?:[^()'\"]|\([^()'\"]*\))*\))*\)"
+_GCLOUD_BARE_FORMAT_RE = re.compile(
+    r"(?P<flag>--format)(?P<sep>[= ])(?P<proj>(?:%s)%s)"
+    % ("|".join(_GCLOUD_FORMAT_PROJECTIONS), _GCLOUD_PROJECTION_BODY)
+)
+# An apostrophe between two word characters is English ("the cluster's
+# channel"), not a shell quote, so the quote-parity test discounts it.
+_WORD_APOSTROPHE_RE = re.compile(r"(?<=\w)'(?=\w)")
+
+# The `recommendation` fields that carry a command a reader pastes. `rationale`
+# is argument, never a command, so it is not rewritten.
+COMMAND_BEARING_RECOMMENDATION_FIELDS = ("action", "risk")
+
+# The `#` line `add_dns_access_command` writes above the command it adds, so a
+# reader who pastes the note sees what the second invocation costs before it
+# runs. `{location}` is the region the first command names.
+DNS_ACCESS_COMMENT = (
+    "# The DNS endpoint is a second path and authorized networks do not gate it. "
+    "This closes it for everyone, including anyone reaching the cluster over "
+    "gke-<hash>.{location}.gke.goog today."
+)
+
 # Both directories must live on the PVC. `gh` and `git` are not binaries in the
 # agent container: /opt/credential-proxy/bin/{gh,git} POST argv and cwd to a
 # sidecar that runs the real tool in *its* filesystem. Only /opt/data is shared
@@ -453,8 +658,12 @@ GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitop
 # under $HERMES_HOME is written in one place and looked for in another.
 # Overridable for the suite on the same reasoning as SCRATCH_DIR.
 REPORTS_DIR = os.environ.get("FLEET_AUDIT_REPORTS_DIR") or "/opt/data/fleet-audit/reports"
-# Two weeks of a daily stream, a quarter of a weekly one. At the ledger's own
-# body ceiling that bounds the store near 1 MB per stream.
+# Two weeks of a daily stream, a quarter of a weekly one. Each envelope holds
+# the ledger body, which its ceiling (MAX_BODY_CHARS) keeps near 1 MB across
+# the ring, and the run's findings document, stored whole and unclipped (with
+# the document the body rendered beside it when a held-open run carries one
+# forward). Nothing bounds the documents, so the store per stream and
+# repository is that 1 MB plus fourteen of them.
 REPORT_HISTORY = 14
 # The ring's filename: a UTC stamp that sorts lexically in time order, to the
 # microsecond so two runs finishing in one second do not replace each other.
@@ -799,6 +1008,13 @@ MAX_DECLARED_ROWS = 50
 # required: the repository and path a reviewer opens, and the lines that pin
 # the flagged property so the claim can be read off the row.
 DECLARATION_FIELDS = ("repo", "path", "excerpt")
+# Rows in each block of the ledger's "Awaiting /remediate" section. The
+# section is charged against the body before the findings are, and the
+# below-floor block grows with every minor manifest fix a stream files, so an
+# uncapped list squeezes findings out of the body and, past a few hundred,
+# makes it too large to publish at all. The count stays exact, and
+# `finish --dry-run` logs every id in both blocks.
+MAX_WITHHELD_ROWS = 20
 # The document's record of the declared-intent search (the obtainability SOP's
 # §4a): one `owner/name@sha` per repository the run searched. `finish` compares
 # the slugs against the run record `start` wrote, and a run that performed a
@@ -874,6 +1090,49 @@ RUN_RECORD_SOURCES_KEY = "sources"
 # finds last week's manifest at the same fixed path and publishes against it.
 # Comparing the manifest's `finished_at` with this is what makes that loud.
 RUN_RECORD_STARTED_KEY = "started_at"
+# The check whose fix `finish` writes itself when the worker left a declared,
+# cleared finding of it `manual`: a PodDisruptionBudget is fully determined by
+# the workload's selector (obtainability SOP §3.3), which the collector reads.
+GENERATED_FIX_CHECK = "no-pdb"
+# The new file `finish` writes beside the workload's declaration.
+GENERATED_PDB_SUFFIX = "-pdb"
+GENERATED_PDB_EXTENSION = ".yaml"
+# A DNS-1123 subdomain, what Kubernetes requires of a PDB's name and namespace.
+KUBERNETES_NAME_PATTERN = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
+# A clone's own directory, which no search of the repository's files enters.
+GIT_DIR_NAME = ".git"
+# What marks a directory as a Kustomize root, as the collector reads it: a
+# new file in one renders only if its `resources:` lists it.
+KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
+# A YAML `name:` key holding one name, as both Python's `re` (with `re.M`)
+# and the broker's `git grep -E` read it: at any indent, after a `-`, or
+# inside a flow mapping, the value bare or quoted.
+PDB_NAME_LINE = (
+    "(^[ \t-]*|[{,][ \t]*)name:[ \t]*['\"]?{name}['\"]?[ \t]*"
+    # Then a flow mapping's next key, a comment, or the end of the line --
+    # past a CRLF line's CR, which the broker will not take in a pattern.
+    "([,}#]|[^A-Za-z0-9.-]?$)"
+)
+# Where the name goes in PDB_NAME_LINE; replaced rather than formatted, since
+# the pattern's own braces are flow-mapping characters.
+PDB_NAME_SLOT = "{name}"
+# How many times one `finish` tries to open the broker for its repository
+# questions: the Config Connector scan, then planning.
+PROBE_OPEN_ATTEMPTS = 2
+# The GitOps layout's per-cluster tree, `clusters/<name>/`, as the collector
+# reads it: a PDB name collides only inside its own cluster's tree.
+CLUSTER_TREE_ROOT = "clusters"
+CLUSTER_TREE_DEPTH = 2
+# The selector keys `policy/v1` takes, and nothing else.
+LABEL_SELECTOR_KEYS = frozenset({"matchLabels", "matchExpressions"})
+# What the finding's ledger row says about a fix `finish` wrote.
+GENERATED_FIX_NOTE = (
+    "_(The audit wrote this PodDisruptionBudget from the workload's own selector, "
+    "as the collector read it.)_"
+)
+# What a finding's ledger row says when the worker declined the fix the sweep
+# would have opened (`finish --decline-fix`); the worker's reason follows.
+DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
 # The collector's own format (`fleet_drift.py`'s `TIMESTAMP_FORMAT`), so the
 # two stamps compare without either side guessing at the other's shape.
 RUN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -921,6 +1180,8 @@ SKIPPED_TREE_DIRS = frozenset({".git"})
 # (`tooLarge`, `requestBudget`) withholds a file the harness would have read,
 # and such a file under the searched paths is a note it may have missed.
 BROKER_SKIP_NOT_A_FILE_REASONS = frozenset({"symlink", "notAFile"})
+# The one `skipped` reason that means "ask again for the rest".
+BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
 # The copies come from the sibling skill's script, which works in both broker
 # modes and prints `sha` and `complete`; resolved from this file so the staged
 # and the source layouts both find it. Shallow, because the read is of one
@@ -956,6 +1217,49 @@ MAX_PR_PAGE = 1000
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
 AUTO_PROMOTION_CAP = 5
+
+# The least-severe grade the automatic sweep will open a pull request for
+# unasked. Inclusive: a finding *at* the floor promotes. Compare it by rank
+# through `SEVERITY_RANK`, never by equality -- an `==` test is
+# indistinguishable from this one only while the floor is the top severity,
+# and silently stops promoting `critical` the moment it is not.
+#
+# It was `critical`. The findings graded `critical` are mostly exposure
+# problems closed with `gcloud`, and the ones attracting a declarative fix are
+# graded lower, so the floor and the `manifest` test selected nearly disjoint
+# sets. Measured across the live streams on 2026-09-06: 3 `critical` manifest
+# remediations, all of them opened, and 26 more permanently withheld behind a
+# filter that never clears, 5 of them `major`.
+#
+# `major` rather than `minor` because the 21 that remain are `minor`, 15 of
+# them on one stream, which would sit at `AUTO_PROMOTION_CAP` for three
+# consecutive runs; a `minor` is defence in depth the ledger can go on
+# offering to `/remediate`. `major` holds only for a check in
+# `MAJOR_SWEEP_CHECKS` a collector candidate vouches for
+# (`collector_vouched_findings`); every other finding is held to
+# `UNVOUCHED_PROMOTION_FLOOR`. What the floor passes over is named on the ledger
+# (`_render_withheld`), because unlike the cap it does not clear on its own.
+AUTO_PROMOTION_FLOOR = "major"
+# The floor for a finding no collector candidate stands behind: one on a run
+# with no `--manifest-file`, or under a check the collector skipped, ran to a
+# non-zero `rc`, or ran against a target it did not collect. The
+# `NO_SWEEP_TRIAGE` markers are what keep a disruptive `major` fix out of the
+# sweep, and a marker only exists on a candidate, so without one the floor is
+# the only filter left. That was `critical` when the markers were written, and
+# it stays `critical` here.
+UNVOUCHED_PROMOTION_FLOOR = "critical"
+# The checks whose fix the sweep opens unasked at `AUTO_PROMOTION_FLOOR`; every
+# other check needs `UNVOUCHED_PROMOTION_FLOOR`. An allowlist because the SOPs
+# grade on how bad the finding is, not on whether its fix is safe to open with
+# nobody asking: a `major` memory limit, `Recreate` strategy, CronJob
+# concurrency policy, Binary Authorization or release-channel enrolment is a
+# change whose owner has to choose, and a denylist of markers missed each of
+# them in turn. Each entry here is additive and reads whole in one screen: a
+# PodDisruptionBudget (`no-pdb`), turning the token off for a ServiceAccount
+# nothing has granted (`unbound-sa-automount`), and an On-Demand fallback at
+# the bottom of a ComputeClass (`ccc-no-ondemand-floor`). A new check is held
+# to `critical` until someone argues it onto this list.
+MAJOR_SWEEP_CHECKS = frozenset({"no-pdb", "unbound-sa-automount", "ccc-no-ondemand-floor"})
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
@@ -1046,9 +1350,9 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # `needs_triage` markers whose findings the automatic sweep will not promote,
 # whatever their grade. A filter that is not about the finding's strength:
 # these are findings a collector fully corroborated whose *fix* has a failure
-# mode the collector cannot rule out.
+# mode the collector cannot rule out, or whose grade does not speak for the fix.
 #
-# Two markers. A cost collector sets `service-fronted` on an idle
+# Nine markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -1064,7 +1368,47 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # two files, where a finding carries one `remediation.path`, so the sweep's
 # pull request would land a class nothing selects. `/remediate` opens the same
 # one-file pull request, for a person who knows to add the selector to it.
-NO_SWEEP_TRIAGE = frozenset({"service-fronted", "new-computeclass"})
+#
+# The cost collector sets `autopilot-bumped` on a sizing finding (§3.1, §3.12)
+# whose `major` grade the Autopilot bump supplied rather than its magnitude.
+# The bump orders the ledger -- Autopilot bills on requests -- and was written
+# when the sweep promoted `critical` alone, on the explicit premise that it
+# could never open a pull request. Neither check is on `MAJOR_SWEEP_CHECKS`,
+# so the premise holds without the marker today; the marker names the reason
+# in the ledger, and keeps the premise if either check joins that list.
+#
+# The next three mark a fix that is disruptive by construction, whatever
+# the collector measured. Most of these checks are off `MAJOR_SWEEP_CHECKS`
+# anyway; the marker is what holds a `critical` one, and what tells the
+# ledger's reader why the fix waits. The cost
+# collector sets `scale-to-zero` on every other §3.13 stand-down (a
+# Service-selected one keeps the more specific `service-fronted`): the fix is
+# `spec.replicas: 0`, and an idle reading is not proof nothing needs the
+# workload. It sets `guaranteed-qos` on a §3.1 resize of a `Guaranteed` pod,
+# whose request is its limit, so a number sized from an idle week becomes an
+# enforcement ceiling; the SOP has that finding published as `manual`, and the
+# marker keeps a `manifest` the model wrote anyway out of the sweep. The
+# compliance collector sets `default-deny` on every §2.6 finding: each arm's
+# fix leaves the namespace denying ingress by default, which drops every
+# connection no allow rule names until the team writes those rules. The
+# other three are set by `collect.py` for the same reason, on §2.7,
+# §3.16 and §3.19; `collect.py`'s `TRIAGE_BY_SLUG` says what each fix risks.
+#
+# The text beside each marker is what the ledger prints after the finding's
+# title in the "fix needs a decision" block, so a reader sees why the sweep
+# passed over that one without opening it. Keep it a clause about the fix.
+TRIAGE_REASONS = {
+    "service-fronted": "stands down a controller a Service routes to",
+    "new-computeclass": "needs a new ComputeClass and a workload that selects it",
+    "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
+    "scale-to-zero": "scales the controller to zero replicas",
+    "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",
+    "default-deny": "makes the namespace deny ingress by default",
+    "namespace-token": "turns the API token off for every pod on the namespace's default ServiceAccount",
+    "service-selector": "rewrites or deletes a Service on a judgement about its backend",
+    "hard-spread": "adds a `DoNotSchedule` spread that leaves a replica Pending if the pool shrinks",
+}
+NO_SWEEP_TRIAGE = frozenset(TRIAGE_REASONS)
 
 # `authorAssociation` values that imply write access, and therefore the standing
 # to issue `/remediate`.
@@ -1995,6 +2339,7 @@ def report_envelope(
         UNCORROBORATED_FINDINGS_KEY: list(payload.get(UNCORROBORATED_FINDINGS_KEY) or []),
         # URL lists, not counts: a count cannot be clicked.
         "prs_opened": list(payload.get("prs_opened") or []),
+        "prs_still_open": list(payload.get("prs_still_open") or []),
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
         "ledger_held_open": ledger_held_open,
@@ -3221,6 +3566,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
+        # Write the corrected spelling back, for the same reason the manifest
+        # path above is normalised here: these strings are what get published,
+        # and every reader downstream sees whatever they say.
+        normalise_finding_commands(finding)
 
     # Previous findings this run confirmed gone, each with the reason. The
     # clean-close guard (`unaccounted_previous_findings`) refuses to retire a
@@ -3456,6 +3805,400 @@ def validate_findings(data: object, audit_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Pure helpers — derivation
 # --------------------------------------------------------------------------- #
+
+
+def normalise_gcloud_enum_values(note: str) -> str:
+    """Rewrite enum flag values in a command to the case gcloud takes.
+
+    Only a value that matches one of that flag's choices case-insensitively is
+    rewritten, and only to that choice. A flag absent from
+    `GCLOUD_ENUM_FLAG_CHOICES`, or a value that is not one of its choices under
+    any casing, is left exactly as written: the note is a command a human will
+    paste, and silently changing a value this function does not recognise turns
+    "the command fails and you look at it" into "the command runs and does
+    something else". Publishing a wrong-cased flag is a bad command; publishing
+    a rewritten one nobody checked is a bad change.
+    """
+    def rewrite(match: re.Match[str]) -> str:
+        choices = GCLOUD_ENUM_FLAG_CHOICES.get(match.group("flag"))
+        if not choices:
+            return match.group(0)
+        value = match.group("value")
+        for choice in choices:
+            if value != choice and value.lower() == choice.lower():
+                return f"{match.group('flag')}{match.group('sep')}{choice}"
+        return match.group(0)
+
+    return _GCLOUD_ENUM_FLAG_RE.sub(rewrite, note)
+
+
+def quote_gcloud_format_projections(text: str) -> str:
+    """Single-quote a bare `--format=value(...)` so pasting it is not a syntax error.
+
+    gcloud accepts the expression unquoted only because it never reaches gcloud
+    unquoted: the shell reads `(` first. A reader who copies the Recommendation
+    line gets `bash: syntax error near unexpected token '('` rather than the
+    field the finding told them to check, so the command is not merely
+    inelegant, it does not run.
+    """
+    def rewrite(match: re.Match[str]) -> str:
+        # Inside a double-quoted string -- `"$(gcloud ... --format=value(x))"`
+        # -- the shell does not read `(` as a subshell, and single quotes added
+        # there reach gcloud as part of the expression, which it rejects.
+        # Inside a single-quoted wrapper -- `bash -c '... --format=value(x)'`
+        # -- the `(` is already quoted, and a quote added there closes the
+        # wrapper instead.
+        # The logical line, not the physical one: a wrapper opened on a line
+        # that ends `\` is still open on the continuation.
+        lines = text[: match.start()].split("\n")
+        first = len(lines) - 1
+        while first > 0 and lines[first - 1].rstrip().endswith("\\"):
+            first -= 1
+        line = "\n".join(lines[first:])
+        # Inside an inline code span, only the span is shell: an apostrophe in
+        # the prose before it ("the cluster's channel") is not a quote.
+        if line.count("`") % 2:
+            line = line[line.rfind("`") + 1 :]
+        line = _WORD_APOSTROPHE_RE.sub("", line)
+        if (line.count('"') - line.count('\\"')) % 2 or line.count("'") % 2:
+            return match.group(0)
+        return f"{match.group('flag')}{match.group('sep')}'{match.group('proj')}'"
+
+    return _GCLOUD_BARE_FORMAT_RE.sub(rewrite, text)
+
+
+def _evidence_excerpt(finding: dict) -> str:
+    """Every excerpt on `finding`, whatever shape its evidence is in.
+
+    `validate_findings` requires one `{command, excerpt}` object, so that is
+    what a finding published today carries. The list form is the older stored
+    shape; reading it rather than assuming the object keeps a document written
+    before the requirement from crashing the pass over one finding.
+    """
+    evidence = finding.get("evidence")
+    if isinstance(evidence, dict):
+        return str(evidence.get("excerpt") or "")
+    if isinstance(evidence, list):
+        return "\n".join(
+            str(entry.get("excerpt") or "")
+            for entry in evidence
+            if isinstance(entry, dict)
+        )
+    return ""
+
+
+def _mentions_flag(text: str, flag: str) -> bool:
+    return re.search(re.escape(flag) + _GCLOUD_FLAG_BOUNDARY, text) is not None
+
+
+def _logical_command_spans(lines: list[str]) -> list[tuple[int, int, str]]:
+    """`(first, last, joined)` for each backslash-continued run of `lines`.
+
+    A `remediation.note` is prose and shell together and a command in it may be
+    wrapped, so "does this command carry the flag" is a question about the
+    logical line. `last` is where an appended flag belongs -- the end of the
+    final physical line, after the continuations.
+    """
+    spans, start = [], 0
+    while start < len(lines):
+        end = start
+        while end + 1 < len(lines) and lines[end].rstrip().endswith("\\"):
+            end += 1
+        joined = " ".join(
+            line.rstrip().removesuffix("\\").strip() for line in lines[start : end + 1]
+        )
+        spans.append((start, end, joined))
+        start = end + 1
+    return spans
+
+
+def append_gcloud_flag(text: str, anchor: str, flag: str) -> str:
+    """Put `flag` on every gcloud command in `text` that carries `anchor` and not it.
+
+    Appended rather than inserted at a fixed position, because gcloud does not
+    care and a reader diffing the note against last week's should see one token
+    arrive rather than the whole line reflow.
+
+    Only a command is touched, and a command is one of two shapes: a backticked
+    span whose text starts `gcloud `, wherever it falls on the line, or a whole
+    logical line that starts `gcloud ` -- a fenced block, where a caveat follows
+    as a `#` comment the flag must land ahead of. Prose that names a flag in
+    backticks, or a sentence that mentions one bare, is neither, and is left
+    as written.
+    """
+    lines = text.split("\n")
+
+    def inline(match: re.Match) -> str:
+        span = match.group(1)
+        if _is_gcloud_command(span) and _mentions_flag(span, anchor) and not _mentions_flag(
+            span, flag
+        ):
+            span = span.rstrip() + " " + flag
+        return f"`{span}`"
+
+    for first, last, _joined in _logical_command_spans(lines):
+        if any("`" in line for line in lines[first : last + 1]):
+            for index in range(first, last + 1):
+                lines[index] = INLINE_CODE_SPAN.sub(inline, lines[index])
+            continue
+        code = [_comment_free(line) for line in lines[first : last + 1]]
+        joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
+        if (
+            _is_gcloud_command(joined)
+            and _mentions_flag(joined, anchor)
+            and not _mentions_flag(joined, flag)
+        ):
+            end = len(code[-1].rstrip())
+            lines[last] = lines[last][:end] + " " + flag + lines[last][end:]
+    return "\n".join(lines)
+
+
+def _is_gcloud_command(text: str) -> bool:
+    """True where `text` is a gcloud invocation, a `$ ` prompt allowed."""
+    return text.strip().removeprefix(SHELL_PROMPT).startswith(GCLOUD_COMMAND_PREFIX)
+
+
+def _comment_free(line: str) -> str:
+    """`line` up to an unquoted `#` comment.
+
+    A flag appended past the comment lands where the shell never reads it, and
+    the presence test then finds it there and reports the command fixed.
+    """
+    quote = ""
+    for index, char in enumerate(line):
+        if quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1].isspace()):
+            return line[:index]
+    return line
+
+
+def _parse_update_target(command: str) -> tuple[str, str, str] | None:
+    """`(name, location, project)` off one `clusters update` invocation.
+
+    `None` where the name or location is absent: this builds a command out of
+    what is there and never invents an argument. `--region` and `--zone` read
+    as the location they are, and an absent `--project` comes back empty, so
+    the second command falls back on the same default project the first did. Both flag spellings are read
+    because the model writes both -- the 2026-09-06 run published
+    `--location us-east4` on one cluster and `--location=us-east4` on the next.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    rest, flags = argv[len(CLUSTERS_UPDATE_PREFIX.split()) :], {}
+    positional = ""
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token.startswith("--"):
+            key, sep, value = token.partition("=")
+            if not sep and index + 1 < len(rest) and not rest[index + 1].startswith("--"):
+                value, index = rest[index + 1], index + 1
+            flags[key] = value
+        elif not positional:
+            positional = token
+        index += 1
+    location = next((flags[f] for f in GCLOUD_LOCATION_FLAGS if flags.get(f)), "")
+    project = flags.get(GCLOUD_PROJECT_FLAG, "")
+    return (positional, location, project) if positional and location else None
+
+
+def _cluster_update_target(text: str, prefer: str = "") -> tuple[str, str, str] | None:
+    """`(name, location, project)` from a `clusters update` command in `text`."""
+    found = _cluster_update_command(text, prefer)
+    return found[0] if found else None
+
+
+def _command_mentions_flag(text: str, flag: str) -> bool:
+    """Whether a gcloud command in `text` carries `flag`, as `append_gcloud_flag` reads one.
+
+    A backticked span that is a command, or a whole logical line that is one
+    with its `#` comment removed: a sentence or a comment naming the flag does
+    not close anything.
+    """
+    lines = text.split("\n")
+    for first, last, _joined in _logical_command_spans(lines):
+        for span in INLINE_CODE_SPAN.findall("\n".join(lines[first : last + 1])):
+            if _is_gcloud_command(span) and _mentions_flag(span, flag):
+                return True
+        code = [_comment_free(line) for line in lines[first : last + 1]]
+        joined = " ".join(part.rstrip().removesuffix("\\").strip() for part in code)
+        if _is_gcloud_command(joined) and _mentions_flag(joined, flag):
+            return True
+    return False
+
+
+def _cluster_update_command(text: str, prefer: str = "") -> tuple[tuple[str, str, str], int] | None:
+    """`((name, location, project), last)` for a `clusters update` command in `text`.
+
+    `last` is the physical line the command ends on. Each line is read without
+    its `#` comment, as `append_gcloud_flag` reads it: an apostrophe or a
+    `--zone` in a comment is not part of the command.
+
+    Read off the command the model already wrote rather than passed in, so a
+    second command built from it names the same cluster by construction,
+    however the model spelled the first one.
+
+    The one carrying `prefer` when there is one, because that is the command
+    this repair is extending and the two invocations have to agree. Otherwise
+    the last, which is the note's final word on which cluster it is about.
+    """
+    fallback = None
+    code = [_comment_free(line) for line in text.split("\n")]
+    for _first, last, joined in reversed(_logical_command_spans(code)):
+        # The same `$ ` prompt `_is_gcloud_command` allows, or the flag repair
+        # extends a command this one cannot find.
+        joined = joined.strip().removeprefix(SHELL_PROMPT)
+        if not joined.startswith(CLUSTERS_UPDATE_PREFIX):
+            continue
+        target = _parse_update_target(joined)
+        if target is None:
+            continue
+        if prefer and _mentions_flag(joined, prefer):
+            return target, last
+        fallback = fallback or (target, last)
+    return fallback
+
+
+def add_dns_access_command(text: str) -> str:
+    """Give a both-endpoints-open finding the second command SOP 2.10 requires.
+
+    Only when the note already carries a `clusters update` to take the cluster's
+    identity from. A note the model wrote some other way is left alone: an
+    incomplete repair a reader can see beats a command this module guessed the
+    arguments for.
+    """
+    if not text or _command_mentions_flag(text, DNS_ACCESS_FLAG):
+        return text
+    found = _cluster_update_command(text, prefer=AUTHORIZED_NETWORKS_FLAG)
+    if found is None:
+        return text
+    (name, location, project), last = found
+    block = [
+        DNS_ACCESS_COMMENT.format(location=location),
+        f"{CLUSTERS_UPDATE_PREFIX} {name} {GCLOUD_LOCATION_FLAG}={location} "
+        + (f"{GCLOUD_PROJECT_FLAG}={project} " if project else "")
+        + DNS_ACCESS_FLAG,
+    ]
+    # Straight after the command it is named off, not at the end: a `gcloud`
+    # note renders through `trim_command`, which clips from the end, so prose
+    # after the first command is what goes before the second one does. Where
+    # even that cannot keep it whole, the note is left as the model wrote it
+    # rather than published with a command cut mid-flag.
+    lines = text.split("\n")
+    head = "\n".join(lines[: last + 1] + block)
+    if len(head) > MAX_COMMAND_CHARS:
+        log(
+            "WARNING: the DNS-endpoint command does not fit before the published "
+            f"note's {MAX_COMMAND_CHARS}-character limit; the note publishes without it"
+        )
+        return text
+    return "\n".join(lines[: last + 1] + block + lines[last + 1 :]).rstrip("\n")
+
+
+def repair_public_control_plane_commands(finding: dict) -> None:
+    """Make `public-control-plane`'s own remediation clear `public-control-plane`.
+
+    Two repairs, one per arm, and both are the difference between a command
+    that fixes the finding and one that reads as though it does. See
+    `PUBLIC_CONTROL_PLANE_CHECK` for what each was published without.
+
+    The flag goes into all three command-bearing fields, for the reason
+    `normalise_finding_commands` gives: the model writes the same command into
+    the note, the Recommendation line and the confirm-it-worked line, and a
+    note that closes the endpoint above a Recommendation line that does not
+    tells a reader the audit disagrees with itself. The second *command* goes
+    only into the note, which is what `/remediate` reads and what SOP 2.10's
+    Remediation section governs; `recommendation.action` is prose about intent
+    and a bare second invocation pasted into it is not.
+    """
+    if str(finding.get("check") or "") != PUBLIC_CONTROL_PLANE_CHECK:
+        return
+    dns_open = DNS_ENDPOINT_MARKER in _evidence_excerpt(finding)
+
+    def fix(text: str) -> str:
+        return append_gcloud_flag(text, AUTHORIZED_NETWORKS_FLAG, GOOGLE_CLOUD_ACCESS_FLAG)
+
+    recommendation = finding.get("recommendation")
+    if isinstance(recommendation, dict):
+        for field in COMMAND_BEARING_RECOMMENDATION_FIELDS:
+            if isinstance(recommendation.get(field), str):
+                recommendation[field] = fix(recommendation[field])
+    remediation = finding.get("remediation")
+    if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
+        note = fix(remediation["note"])
+        # Only a `gcloud` note renders in a code block; in a `manual` one the
+        # comment line above the second command would read as a heading.
+        if dns_open and remediation.get("kind") == "gcloud":
+            note = add_dns_access_command(note)
+        remediation["note"] = note
+
+
+def repair_remediation_commands(findings: list[dict]) -> list[str]:
+    """`repair_public_control_plane_commands` over `findings`; the ids changed.
+
+    A pass of its own in `finish` as well as inside `normalise_finding_commands`,
+    and it needs both. The DNS half reads `evidence.excerpt`, which is the
+    model's prose until `adopt_collector_evidence` replaces it with the
+    collector's, and validation runs before the adoption. Running twice costs
+    nothing: appending a flag that is already there is what the presence test
+    refuses to do.
+    """
+    changed = []
+    for finding in findings:
+        before = (
+            copy.deepcopy(finding.get("remediation")),
+            copy.deepcopy(finding.get("recommendation")),
+        )
+        repair_public_control_plane_commands(finding)
+        if (finding.get("remediation"), finding.get("recommendation")) != before:
+            changed.append(str(finding.get("id") or ""))
+    return changed
+
+
+def normalise_finding_commands(finding: dict) -> None:
+    """Make every gcloud command `finding` publishes one a reader can paste.
+
+    Three fields carry a command, and all three have to be corrected or none is
+    worth correcting. `remediation.note` is what `/remediate` reads;
+    `recommendation.action` is what the issue body renders *first*; and
+    `recommendation.risk` is where a check tells the reader how to confirm the
+    fix landed. The model writes the same command into all of them. Fixing the
+    note alone published `--release-channel=REGULAR` on the Recommendation line
+    with `--release-channel=regular` in the fix block seven lines below it,
+    which tells a reader the audit cannot spell its own command; leaving `risk`
+    out shipped fifteen copies of an unquoted `--format=value(...)` that dies in
+    bash before it reaches gcloud.
+
+    Every remediation kind is normalised, not only `gcloud`: `kind` says who
+    applies the fix, and a `manual` note that spells out a command is still a
+    command a reader will paste. Passing prose through is safe: the enum
+    rewrite only fires on a value directly following a flag in the table, so
+    "cohort peers run Regular" and "enrolled in the Rapid channel" are
+    untouched, and the format rewrite only fires on a parenthesised projection
+    directly following `--format`. `evidence` is deliberately excluded — it
+    records the command a collector actually ran, and correcting that would
+    misreport what happened rather than fix anything.
+    """
+    def fix(text: str) -> str:
+        return quote_gcloud_format_projections(normalise_gcloud_enum_values(text))
+
+    recommendation = finding.get("recommendation")
+    if isinstance(recommendation, dict):
+        for field in COMMAND_BEARING_RECOMMENDATION_FIELDS:
+            if isinstance(recommendation.get(field), str):
+                recommendation[field] = fix(recommendation[field])
+    remediation = finding.get("remediation")
+    if isinstance(remediation, dict) and isinstance(remediation.get("note"), str):
+        remediation["note"] = fix(remediation["note"])
+    # Last, so the flag it adds is one this function has already had its say
+    # about. Whether the command *runs* and whether it *works* are the same
+    # question to a reader pasting it.
+    repair_public_control_plane_commands(finding)
 
 
 def severity_counts(findings: list[dict]) -> dict[str, int]:
@@ -3989,8 +4732,8 @@ def _candidate_identity(entry: dict, candidate: dict) -> str:
     Two spellings of one identity are in play here, and each join below says
     which it uses. This is the *full* one, and it matches
     `derive_finding_id(finding)` on a document finding: `adopt_collector_evidence`,
-    `adopt_arm_impact`, `uncorroborated_findings` and `triage_marked_findings`
-    join full-to-full. The ledger spells a finding by `published_id`, clipped
+    `adopt_arm_impact`, `uncorroborated_findings`, `triage_markers` and
+    `collector_vouched_findings` join full-to-full. The ledger spells a finding by `published_id`, clipped
     at `MAX_FINDING_ID`, and anything compared against ledger ids or printed
     beside them — `collector_flagged_ids`, the held entries, the candidate
     rows on the JSON line — is clipped the same way, or a long-named object
@@ -4361,12 +5104,59 @@ def uncorroborated_findings(findings: list[dict], manifest: dict | None) -> set[
     }
 
 
-def triage_marked_findings(
+def _sweep_checks_text() -> str:
+    """`MAJOR_SWEEP_CHECKS` as the ledger and the log spell it."""
+    return ", ".join(f"`{check}`" for check in sorted(MAJOR_SWEEP_CHECKS))
+
+
+def collector_vouched_findings(
+    findings: list[dict],
+    manifest: dict | None,
+    checks: frozenset[str] = MAJOR_SWEEP_CHECKS,
+) -> set[str]:
+    """Findings the sweep may open at `AUTO_PROMOTION_FLOOR`.
+
+    Three conditions, all of them: the check is in `checks`, a collector
+    candidate in `manifest` stands behind the finding, and that candidate is
+    itself graded at or above the floor. The sweep holds every other finding to
+    `UNVOUCHED_PROMOTION_FLOOR`. The candidate has to vouch because a
+    `needs_triage` marker lives on it, so a finding without one is a finding
+    nothing could have marked; its grade has to vouch because otherwise the
+    model's re-grade of a `minor` candidate, not the collector, decides that a
+    pull request opens. Only a candidate whose check ran to `rc == 0` on a
+    `collected` target vouches, the line `uncorroborated_findings` draws: a
+    `gate-failed` target, or a command that failed, produced no reading the
+    sweep can stand behind. Empty on a run without a manifest.
+    """
+    floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
+    graded: dict[str, int] = {}
+    for entry, candidate in _candidates(manifest):
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            continue
+        ran = {
+            str(command.get("check") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0
+        }
+        if str(candidate.get("check") or "") not in ran:
+            continue
+        identity = _candidate_identity(entry, candidate)
+        rank = SEVERITY_RANK.get(str(candidate.get("severity") or ""), len(SEVERITIES))
+        graded[identity] = min(rank, graded.get(identity, len(SEVERITIES)))
+    return {
+        str(finding.get("id") or "")
+        for finding in findings
+        if str(finding.get("check") or "") in checks
+        and graded.get(derive_finding_id(finding), len(SEVERITIES)) <= floor_rank
+    }
+
+
+def triage_markers(
     findings: list[dict],
     manifest: dict | None,
     markers: frozenset[str] = NO_SWEEP_TRIAGE,
-) -> set[str]:
-    """Findings whose candidate carries a `needs_triage` marker in `markers`.
+) -> dict[str, str]:
+    """Finding id to the `needs_triage` marker in `markers` its candidate carries.
 
     The one thing that stops the sweep without being a doubt about the
     finding. `uncorroborated_findings` catches a finding the collector
@@ -4380,12 +5170,12 @@ def triage_marked_findings(
     Which also means this is silent on a stream that ran without a collector.
     """
     marked = {
-        _candidate_identity(entry, candidate)
+        _candidate_identity(entry, candidate): str(candidate.get("needs_triage") or "")
         for entry, candidate in _candidates(manifest)
         if str(candidate.get("needs_triage") or "") in markers
     }
     return {
-        str(finding.get("id") or "")
+        str(finding.get("id") or ""): marked[derive_finding_id(finding)]
         for finding in findings
         if derive_finding_id(finding) in marked
     }
@@ -6613,6 +7403,11 @@ class PromotionPlan(NamedTuple):
     # the object, and here it flagged it and stands behind it. See
     # `NO_SWEEP_TRIAGE`.
     needs_triage: list[str] = []
+    # Manifest findings the sweep passed over for severity alone, graded below
+    # `AUTO_PROMOTION_FLOOR`. Not `withheld`: the cap clears itself on the next
+    # run and this does not, so it is reported apart. Empty when `auto_promote`
+    # is off, because the `remediate` subcommand runs no sweep to be blocked by.
+    below_floor: list[str] = []
 
 
 def promotion_candidates(
@@ -6624,11 +7419,13 @@ def promotion_candidates(
     auto_promote: bool = True,
     uncorroborated: set[str] | None = None,
     triage_marked: set[str] | None = None,
+    vouched: set[str] | None = None,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
-    Auto-promotion is deliberately narrow — `critical`, `manifest`, and no
-    live pull request on its branch — and capped, so one bad night cannot bury
+    Auto-promotion is deliberately narrow — graded at or above
+    the floor (see `vouched`), `manifest`, and no live pull request on its
+    branch — and capped, so one bad night cannot bury
     the repository in generated pull requests. An explicit `/remediate` bypasses
     the cap: a human asked for that one by name.
 
@@ -6637,7 +7434,7 @@ def promotion_candidates(
     opening unattended; those ask whether a deterministic collector agreed the
     problem exists, and whether it vouched for the fix — the only grounds on
     which opening one unattended is defensible at all. `uncorroborated_findings`
-    and `triage_marked_findings` compute the sets and give the Deployments they
+    and `triage_markers` compute the sets and give the Deployments they
     were written for. Both gate the sweep and nothing else: an explicit
     `/remediate` is handled in the loop above and never consults them. Both are
     empty on a run without a collector manifest.
@@ -6662,6 +7459,17 @@ def promotion_candidates(
 
     The cap counts findings, and a group of findings sharing a path collapses to
     one pull request, so the number of PRs opened is at most `cap`.
+
+    `below_floor` is what the severity test alone refused — a manifest fix, on
+    a finding carrying no live pull request, that neither collector filter
+    stopped, graded under the floor that applied to it. It is returned so the ledger
+    can name it: unlike the cap, the floor never clears on its own.
+
+    `vouched` is the finding ids `collector_vouched_findings` clears for the
+    lower floor: a check in `MAJOR_SWEEP_CHECKS`, with a collector candidate
+    graded at least as high behind it. Only those are held to
+    `AUTO_PROMOTION_FLOOR`; every other finding is held to
+    `UNVOUCHED_PROMOTION_FLOOR`. Absent means none.
     """
     by_id = {str(f.get("id", "")): f for f in findings}
     requested_set = {fid for fid in (requested or []) if fid in by_id}
@@ -6700,23 +7508,26 @@ def promotion_candidates(
     auto: list[str] = []
     unbacked: list[str] = []
     triaged: list[str] = []
+    below_floor: list[str] = []
+    floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
+    unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
+    vouched_set = vouched or set()
     uncorroborated_set = uncorroborated or set()
     triage_set = triage_marked or set()
     for finding in sort_findings(findings) if auto_promote else []:
         fid = str(finding.get("id", ""))
         if fid in requested_set:
             continue
-        if finding.get("severity") != "critical":
-            continue
         if (finding.get("remediation") or {}).get("kind") != "manifest":
             continue
         pr = pr_by_finding.get(fid)
         if pr is not None and not pr_closed_by_harness(pr):
             continue
-        # Last, after every test the sweep already applied, so these two lists
-        # name only what the sweep would otherwise have opened: a `gcloud` fix
-        # or a finding with a live pull request must not land in a block that
-        # invites `/remediate` on it. Triage ahead of corroboration because the
+        # After the manifest and live-PR tests, so a `gcloud` fix or a finding
+        # with a live pull request never lands in a block that invites
+        # `/remediate` on it; ahead of severity, so these two lists hold every
+        # grade, a `minor` finding included, and say why it needs reading
+        # rather than only that it is below the floor. Triage ahead of corroboration because the
         # two cannot both be true of one finding — a marker only exists on a
         # candidate, and a candidate is exactly what an uncorroborated finding
         # lacks — and testing it first keeps that readable rather than relied on.
@@ -6726,10 +7537,30 @@ def promotion_candidates(
         if fid in uncorroborated_set:
             unbacked.append(fid)
             continue
+        # Severity last of all, so `below_floor` holds only the floor's own
+        # refusals. Tested earlier, a `gcloud` fix or a finding with a live
+        # pull request would land there too and the ledger would invite
+        # `/remediate` on work that is already open or has no manifest to
+        # open; and a triage-marked or uncorroborated finding would lose the
+        # block that says why it needs reading. By rank, so `critical` passes
+        # a `major` floor. An unknown grade ranks below every known one.
+        severity = str(finding.get("severity", ""))
+        rank = floor_rank if fid in vouched_set else unvouched_rank
+        if SEVERITY_RANK.get(severity, len(SEVERITIES)) > rank:
+            below_floor.append(fid)
+            continue
         auto.append(fid)
 
     promote.extend(auto[:cap])
-    return PromotionPlan(promote, auto[cap:], already_open, superseded, unbacked, triaged)
+    return PromotionPlan(
+        promote=promote,
+        withheld=auto[cap:],
+        already_open=already_open,
+        superseded=superseded,
+        uncorroborated=unbacked,
+        needs_triage=triaged,
+        below_floor=below_floor,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -7725,14 +8556,18 @@ def _render_withheld(
     findings: list[dict],
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
+    below_floor: list[str] | None = None,
+    triage_reasons: dict[str, str] | None = None,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
     A filter that silently drops work reads as "nothing more to do". Naming
     what it dropped, with the command to ask for one, is what keeps it honest.
 
-    Three filters, each in its own block, because the answer to them differs.
-    The cap clears itself on the next run. The other two come from the
+    Four filters, each in its own block, because the answer to them differs.
+    The cap clears itself on the next run; the severity floor
+    (`AUTO_PROMOTION_FLOOR`) never does, and a reader who assumes the sweep
+    will get to a finding eventually does not comment. The other two come from the
     collector manifest and are not invitations at all, and they are not the
     same refusal: a finding the collector ran the check for and declined to
     flag is one to read before asking for anything — see
@@ -7740,18 +8575,29 @@ def _render_withheld(
     finding it flagged and marked `needs_triage` is the opposite case: the
     observation is sound and the *fix* is what nobody has judged. See
     `NO_SWEEP_TRIAGE` for the markers, and the three findings that cost.
+    `triage_reasons` (finding id to marker, from `triage_markers`) gives each
+    row of that block the clause `TRIAGE_REASONS` holds for its marker.
     """
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])
-    if not withheld and not unbacked and not triaged:
+    floor = list(below_floor or [])
+    if not withheld and not unbacked and not triaged and not floor:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
 
-    def rows(ids: list[str]) -> list[str]:
-        return [
-            f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
-            for fid in ids
-        ]
+    reasons = triage_reasons or {}
+
+    def rows(ids: list[str], why: dict[str, str] | None = None) -> list[str]:
+        out = []
+        for fid in ids[:MAX_WITHHELD_ROWS]:
+            row = f"- `{fid}` — {_cell((by_id.get(fid) or {}).get('title', ''))}"
+            marker = (why or {}).get(fid, "")
+            if marker:
+                row += f" (`{marker}`: the fix {TRIAGE_REASONS.get(marker, 'needs a decision')})"
+            out.append(row)
+        if len(ids) > MAX_WITHHELD_ROWS:
+            out.append(f"- _…and {len(ids) - MAX_WITHHELD_ROWS} more_")
+        return out
 
     out = ["", "## Awaiting `/remediate`"]
     if withheld:
@@ -7789,7 +8635,21 @@ def _render_withheld(
             "for each one, is in the finding's own evidence and recommendation. "
             "`/remediate <finding-id>` opens them normally:",
             "",
-            *rows(triaged),
+            *rows(triaged, reasons),
+        ]
+    if floor:
+        out += [
+            "",
+            f"{len(floor)} finding(s) carry a manifest remediation graded below "
+            "what the automatic sweep requires: "
+            f"`{UNVOUCHED_PROMOTION_FLOOR}`, or `{AUTO_PROMOTION_FLOOR}` for "
+            f"{_sweep_checks_text()} where the collector graded it so. "
+            "Unlike the cap this does not clear on its own — the sweep will pass "
+            "over these again every run until someone asks. Comment "
+            "`/remediate <finding-id>` to open any of them — an explicit request "
+            "is not held to the floor:",
+            "",
+            *rows(floor),
         ]
     return out
 
@@ -7989,6 +8849,8 @@ def render_issue_body(
     gaps: list[str] | None = None,
     uncorroborated: list[str] | None = None,
     needs_triage: list[str] | None = None,
+    below_floor: list[str] | None = None,
+    triage_reasons: dict[str, str] | None = None,
     held: list[dict] | None = None,
     held_overflow: int = 0,
     held_preview: bool = False,
@@ -8037,6 +8899,8 @@ def render_issue_body(
         findings,
         uncorroborated=list(uncorroborated or []),
         needs_triage=list(needs_triage or []),
+        below_floor=list(below_floor or []),
+        triage_reasons=triage_reasons,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -8685,8 +9549,9 @@ def render_stale_close_comment(
             out.append("")
     out += [
         # Say what actually happens on return, not what would be nicest. Only a
-        # `critical` finding with a manifest fix is re-proposed without being
-        # asked, and only `AUTO_PROMOTION_CAP` of those per run — so promising
+        # manifest fix graded at or above `AUTO_PROMOTION_FLOOR`, that neither
+        # collector filter holds back, is re-proposed without being asked, and
+        # only `AUTO_PROMOTION_CAP` of those per run — so promising
         # every reader a fresh pull request writes a cheque the harness does not
         # cash, and the ones it silently fails are precisely the low-severity
         # findings nobody is watching for.
@@ -8694,10 +9559,13 @@ def render_stale_close_comment(
         f"`{STALE_CLOSED_LABEL}` — a close made *here*, by the harness, is never "
         "read as a rejection of the fix.",
         "",
-        "If the finding comes back: a `critical` finding with a manifest "
-        f"remediation is re-proposed automatically on this same branch (at most "
-        f"{AUTO_PROMOTION_CAP} per run). Anything else is listed on the ledger "
-        "as awaiting `/remediate <finding-id>`, which re-opens it on request.",
+        f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
+        f"or `{AUTO_PROMOTION_FLOOR}` for {_sweep_checks_text()} where the collector "
+        "graded it so, with a manifest "
+        "remediation is normally re-proposed automatically "
+        f"on this same branch (at most {AUTO_PROMOTION_CAP} per run). Anything "
+        "else is listed on the ledger as awaiting `/remediate <finding-id>`, "
+        "which re-opens it on request.",
         "",
         stale_closed_marker(pr_number),
     ]
@@ -9109,6 +9977,17 @@ def dry_run_repo_root(audit_id: str, repo: str | None = None) -> Path:
     because this is a laptop and not the pod), fall back rather than fail: a
     command that is safe to run anywhere has to run anywhere.
     """
+    return derived_workspace(audit_id, repo=repo) or repo_root_best_effort()
+
+
+def derived_workspace(audit_id: str, repo: str | None = None) -> Path | None:
+    """The stream's GitOps tree if it is on disk, found without any side effect.
+
+    `None` where `dry_run_repo_root` falls back. The fallback is right for
+    resolving remediation paths and wrong for anything that reads the tree as
+    the repository, since it is the working directory or whatever checkout
+    holds it.
+    """
     try:
         import gitops_workspace
 
@@ -9116,8 +9995,8 @@ def dry_run_repo_root(audit_id: str, repo: str | None = None) -> Path:
             resolve_repo(audit_id=audit_id, repo=repo), GITOPS_WORKSPACE, lease=audit_id
         )
     except Exception:
-        return repo_root_best_effort()
-    return target if target.is_dir() else repo_root_best_effort()
+        return None
+    return target if target.is_dir() else None
 
 
 def current_branch() -> str:
@@ -9445,6 +10324,44 @@ def reconcile_remediation_prs(
             if pr and pr.get("url"):
                 url_by_finding[fid] = str(pr["url"])
     return pr_by_finding, url_by_finding
+
+
+def carrying_prs(prs: list[dict], findings: list[dict]) -> list[dict]:
+    """The open remediation pull requests whose delta block names one of `findings`.
+
+    A finding left `manual` because such a pull request answers it has no
+    branch of its own, so `pr_by_finding` never maps it; this is how its pull
+    request still reaches `prs_still_open`.
+    """
+    ids = {str(f.get("id", "")) for f in findings}
+    return [
+        pr
+        for pr in prs
+        if str(pr.get("state", "") or "").upper() == "OPEN" and ids & set(parse_delta_block(pr.get("body")))
+    ]
+
+
+def still_open_pr_urls(
+    pr_by_finding: dict[str, dict | None], opened: list[str], carrying: Iterable[dict] = ()
+) -> list[str]:
+    """The open remediation pull requests on this run's findings it did not open.
+
+    The sweep passes over a finding whose branch already carries a live pull
+    request, and `prs_opened` lists only what this run created, so a run that
+    found the fix already waiting for review used to report no pull request at
+    all. A reader cannot tell that from "no fix was proposed". One URL per pull
+    request, since a group of findings shares one.
+    """
+    seen = set(opened)
+    urls: list[str] = []
+    for pr in [*(pr_by_finding[fid] or {} for fid in sorted(pr_by_finding)), *carrying]:
+        url = str(pr.get("url", "") or "")
+        if str(pr.get("state", "") or "").upper() != "OPEN" or not url:
+            continue
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def snapshot_paths(root: Path, paths: list[str]) -> dict[str, bytes]:
@@ -10146,6 +11063,342 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
     return [entry for entry in entries if isinstance(entry, dict)] if isinstance(entries, list) else []
 
 
+def unwritten_refusal_message(unwritten: dict[str, "UnwrittenFix"]) -> str:
+    """What the refusal tells the worker, one list per shape of the shortcut.
+
+    The declared list names the object's own file, and says in so many words
+    that a new object goes beside it: a worker told only "write the manifest at
+    this path" writes a PodDisruptionBudget over the Deployment it protects, and
+    the sweep opens that pull request unasked. It also names the way out for
+    a finding the SOP itself makes `manual`, or one a pull request already
+    carries: `--decline-fix` with the reason, since every `finish` refuses
+    until each listed fix is written or declined.
+    """
+    named = sorted((fid, fix.path) for fid, fix in unwritten.items() if not fix.declared)
+    declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
+    parts = [
+        f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
+        "their fix is not written."
+    ]
+    if named:
+        parts.append(
+            "Write the manifest each of these names, at that path: "
+            + "; ".join(f"{fid} -> {path}" for fid, path in named)
+            + "."
+        )
+    if declared:
+        parts.append(
+            "Each of these is `manual`, but the collector found where its object is "
+            "declared: "
+            + "; ".join(f"{fid} declared at {path}" for fid, path in declared)
+            + ". Write the fix your SOP prescribes as a `kind: manifest` remediation: "
+            "an edit to the object goes in that file; a new object, such as a "
+            "PodDisruptionBudget, goes in a new file in that file's directory, never "
+            "over the file itself."
+        )
+    parts.append(
+        "Then run `finish` again. Where the SOP itself makes a finding `manual`, or a "
+        "pull request already carries its fix, leave it `manual` and pass "
+        "`--decline-fix <id> \"<why>\"` to the next `finish`; the reason is published "
+        "on the finding's ledger row. `finish` refuses until each of these is "
+        "written or declined."
+    )
+    return " ".join(parts)
+
+
+def _pdb_manifest(candidate: dict, finding_id: str) -> tuple[str, str] | None:
+    """`(name, text)` of the PodDisruptionBudget §3.3 prescribes, or None.
+
+    `maxUnavailable: 1` and the workload's `spec.selector` verbatim, which the
+    collector carries as `pod_selector`. None where that cannot be written
+    safely: no selector, an empty one (which would select every pod in the
+    namespace), keys `policy/v1` does not take, or a name Kubernetes refuses.
+    """
+    selector = candidate.get("pod_selector")
+    if not isinstance(selector, dict) or not selector or set(selector) - LABEL_SELECTOR_KEYS:
+        return None
+    if not any(selector.get(key) for key in LABEL_SELECTOR_KEYS):
+        return None
+    workload = str(candidate.get("object") or "").partition("/")[2]
+    name = f"{workload}{GENERATED_PDB_SUFFIX}"
+    namespace = str(candidate.get("namespace") or "")
+    if not (KUBERNETES_NAME_PATTERN.match(name) and KUBERNETES_NAME_PATTERN.match(namespace)):
+        return None
+    # JSON is YAML, so the selector is written exactly as it was read.
+    text = (
+        f"# {candidate.get('cluster', '')}: {GENERATED_FIX_CHECK} on {candidate.get('object')} "
+        f"({finding_id})\n"
+        "apiVersion: policy/v1\n"
+        "kind: PodDisruptionBudget\n"
+        "metadata:\n"
+        f"  name: {name}\n"
+        f"  namespace: {namespace}\n"
+        "spec:\n"
+        "  maxUnavailable: 1\n"
+        f"  selector: {json.dumps(selector, sort_keys=True)}\n"
+    )
+    return name, text
+
+
+class _RepositoryProbe:
+    """What the repository already holds, for the fixes `finish` writes.
+
+    Directory mode reads the clone. Content mode asks the broker over one
+    session for the whole run, and an answer it cannot give -- an error, a
+    truncated listing -- is a yes, so `finish` never writes a file it could not
+    check.
+    """
+
+    def __init__(self, repo: str, root: Path) -> None:
+        self.repo, self.root = repo, root
+        self._session = None
+        self._workspace = None
+        # Why the broker could not be asked, once it could not.
+        self.unavailable = ""
+        self._attempts = 0
+        # The clone's YAML, read once for every `mentions` in directory mode,
+        # and whether any of it could not be read, which answers every search.
+        self._texts: list[tuple[str, str]] | None = None
+        self._unreadable = False
+
+    def broker(self):
+        # Asked twice at most: once for the Config Connector scan and once
+        # more at planning, so one refused open does not end generation.
+        if self._workspace is None and self._attempts < PROBE_OPEN_ATTEMPTS:
+            self._attempts += 1
+            self.unavailable = ""
+            try:
+                import credential_proxy_client  # noqa: PLC0415 -- the content-mode client
+
+                self._session = credential_proxy_client.Workspace.open(proxy_endpoint(), self.repo)
+                self._workspace = self._session.__enter__()
+            except Exception as exc:  # noqa: BLE001 -- no broker: every question is a yes
+                self.unavailable = f"{type(exc).__name__}: {exc}"
+                log(f"WARNING: could not open {self.repo} through the broker ({self.unavailable})")
+        return self._workspace
+
+    def has_path(self, path: str) -> bool:
+        if not content_mode():
+            return (self.root / path).exists()
+        workspace = self.broker()
+        if workspace is None:
+            return True
+        try:
+            listing = workspace.list(prefix=path)
+        except Exception:  # noqa: BLE001 -- an unanswered listing cannot rule the path out
+            return True
+        if getattr(listing, "truncated", False):
+            return True
+        return path in {entry.get("path") if isinstance(entry, dict) else entry for entry in listing}
+
+    def mentions(self, name: str, prefix: str = "") -> bool:
+        """Whether a tracked YAML file under `prefix` has a line whose `name:` is `name`.
+
+        Anchored to the line and the whole value, quoted or not, so a label
+        (`app.kubernetes.io/name:`), a comment or a longer name sharing the
+        prefix is not a collision. `prefix` is the declaration's cluster tree,
+        since a name is unique only within one cluster's namespace. A file that
+        could not be read answers yes."""
+        # The names reaching here are DNS-1123, so a dot is the one character
+        # either regex dialect would read as more than itself.
+        expression = PDB_NAME_LINE.replace(PDB_NAME_SLOT, name.replace(".", r"\."))
+        if not content_mode():
+            if self._texts is None:
+                self._texts = []
+                for candidate in self.root.rglob("*"):
+                    relative = candidate.relative_to(self.root)
+                    if candidate.suffix not in _KCC_YAML_EXTENSIONS or GIT_DIR_NAME in relative.parts:
+                        continue
+                    if candidate.is_file():
+                        try:
+                            self._texts.append((relative.as_posix(), candidate.read_text(encoding="utf-8", errors="replace")))
+                        except OSError:
+                            self._unreadable = True
+            pattern = re.compile(expression, re.M)
+            return self._unreadable or any(
+                pattern.search(body) for path, body in self._texts if path.startswith(prefix)
+            )
+        workspace = self.broker()
+        if workspace is None:
+            return True
+        try:
+            # The broker refuses a path with an empty segment, so no trailing slash.
+            found = workspace.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
+        except Exception:  # noqa: BLE001 -- an unanswered search cannot rule it out
+            return True
+        return not isinstance(found, dict) or int(found.get("total", 1)) > 0
+
+    def close(self) -> None:
+        session, self._session, self._workspace = self._session, None, None
+        if session is not None:
+            try:
+                session.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 -- closing a lease is best effort
+                pass
+
+
+def plan_generated_fixes(
+    findings: list[dict],
+    manifest: dict | None,
+    unwritten: dict[str, "UnwrittenFix"],
+    declines: dict[str, str],
+    prs: list[dict],
+    root: Path,
+    probe: "_RepositoryProbe",
+    audit_id: str = "",
+) -> tuple[dict[str, tuple[str, str]], set[str]]:
+    """`(planned, answered)`: finding id to `(path, text)` for each fix
+    `finish` can write itself, and the ids a pull request already answers.
+
+    A live pull request on the branch the generated file names is this
+    function's own from an earlier run, so the fix is planned again and the
+    sweep finds that pull request rather than a refusal. Any other pull request
+    the harness did not close -- open on another path, merged, or closed by a
+    person -- answers the finding: it is neither written nor refused.
+
+    Only `GENERATED_FIX_CHECK`, only an unwritten, declared finding the worker
+    did not decline, and only where the new file would render and collide with
+    nothing: not inside a Kustomize root (a file its `resources:` does not list
+    renders nothing), not under a name the namespace or the repository already
+    uses, not at a path that holds another file, and not for a finding a pull
+    request already carries. At fleet scale the worker converted a hundred
+    candidates with a script and this was the fix it kept leaving `manual`.
+    Nothing is written here, so a run that is refused for another fix leaves
+    nothing behind.
+    """
+    candidates = {_candidate_identity(entry, candidate): (entry, candidate) for entry, candidate in _candidates(manifest)}
+    carried: dict[str, list[dict]] = {}
+    for pr in prs:
+        if not pr_closed_by_harness(pr):
+            for fid in parse_delta_block(pr.get("body")):
+                carried.setdefault(fid, []).append(pr)
+    planned: dict[str, tuple[str, str]] = {}
+    answered: set[str] = set()
+    # Two workloads of one name planned into one directory, or into one
+    # namespace, would otherwise take the same file or the same object name.
+    taken_paths: set[str] = set()
+    taken_names: set[tuple[str, str, str]] = set()
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        fix = unwritten.get(fid)
+        if fix is None or not fix.declared or fid in declines:
+            continue
+        entry, candidate = candidates.get(derive_finding_id(finding)) or ({}, {})
+        if candidate.get("check") != GENERATED_FIX_CHECK:
+            continue
+        built = _pdb_manifest(candidate, fid)
+        if built is None:
+            continue
+        name, text = built
+        directory = PurePosixPath(fix.path).parent
+        path = str(directory / f"{name}{GENERATED_PDB_EXTENSION}")
+        if fid in carried:
+            own = group_branch_for(audit_id, [{"id": fid, "remediation": {"kind": "manifest", "path": path}}])
+            if not any(
+                str(pr.get("state") or "").upper() == "OPEN" and pr.get("headRefName") == own for pr in carried[fid]
+            ):
+                answered.add(fid)
+                continue
+        try:
+            target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
+        except ValidationError:
+            continue
+        # The same bytes are this run's own earlier write, kept by a `finish`
+        # that failed after it.
+        ours = target.is_file() and target.read_text(encoding="utf-8", errors="replace") == text
+        # A name is unique per namespace per cluster; the cluster comes from the
+        # entry where the candidate carries none, as in `_candidate_identity`.
+        cluster = str(candidate.get("cluster") or entry.get("name") or "")
+        namespace = str(candidate.get("namespace") or "")
+        tree = PurePosixPath(*PurePosixPath(fix.path).parts[:CLUSTER_TREE_DEPTH])
+        scope = f"{tree}/" if PurePosixPath(fix.path).parts[:1] == (CLUSTER_TREE_ROOT,) else ""
+        reason = None
+        if path in taken_paths or (cluster, namespace, name) in taken_names:
+            reason = f"another fix this run writes already takes {path} or the name {name}"
+        elif name in (candidate.get("namespace_pdbs") or []):
+            reason = f"the namespace already has a PodDisruptionBudget named {name}"
+        elif not ours and (target.exists() or probe.has_path(path)):
+            reason = f"{path} already exists"
+        elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
+            reason = f"{directory} is inside a Kustomize root, where a new file renders only if listed"
+        elif not ours and probe.mentions(name, scope):
+            reason = f"{scope or 'the repository'} already names an object {name}"
+        if reason and probe.unavailable:
+            reason = f"the repository could not be checked ({probe.unavailable})"
+        if reason:
+            log(f"WARNING: {fid}: `finish` does not write its PodDisruptionBudget: {reason}")
+            continue
+        planned[fid] = (path, text)
+        taken_paths.add(path)
+        taken_names.add((cluster, namespace, name))
+    return planned, answered
+
+
+def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, str]], root: Path) -> None:
+    """Write each planned fix and make it the finding's `manifest` remediation."""
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid not in planned:
+            continue
+        path, text = planned[fid]
+        target = resolve_inside_repo(root, path, f"{fid}.remediation.path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        remediation = finding.setdefault("remediation", {})
+        note = str(remediation.get("note", "")).strip()
+        remediation.update(
+            {"kind": "manifest", "path": path, "note": GENERATED_FIX_NOTE + (f" {note}" if note else "")}
+        )
+        log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
+
+
+def has_run_record(audit_id: str, repo: str | None = None) -> bool:
+    """Whether `start` left this stream a run record for `repo`.
+
+    The refusal is part of the run `start` opened: a `finish` with no record
+    publishes what is written, degrading the rest to `manual`, as it always has.
+    On a multi-repo loop another repository's record is no record, as in
+    `read_run_record`.
+    """
+    try:
+        data = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or data.get("audit") != audit_id:
+        return False
+    recorded = data.get("repo")
+    return not repo or (isinstance(recorded, str) and recorded.strip().lower() == repo.strip().lower())
+
+
+def decline_unwritten_fixes(
+    findings: list[dict], unwritten: dict[str, "UnwrittenFix"], declines: dict[str, str]
+) -> None:
+    """Note each declined fix on its finding, or refuse a decline nothing asked for.
+
+    A decline naming a fix `finish` would not refuse is a worker that misread
+    the refusal or wrote the fix and kept the flag; either way it is told,
+    rather than a reason published against a finding it does not describe.
+    """
+    stray = sorted(set(declines) - set(unwritten))
+    if stray:
+        raise ValidationError(
+            "--decline-fix names " + ", ".join(stray) + ", which `finish` would not "
+            "refuse: decline only a fix the refusal listed, and drop the flag once "
+            "its fix is written."
+        )
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid not in declines:
+            continue
+        remediation = finding.setdefault("remediation", {})
+        note = str(remediation.get("note", "")).strip()
+        # First, so the row's clip keeps it however long the note is.
+        remediation["note"] = DECLINED_FIX_NOTE.format(reason=declines[fid]) + (
+            f" {note}" if note else ""
+        )
+        log(f"DECLINED: {fid}'s automatic fix, published as manual: {declines[fid]}")
+
+
 def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     """The record `start` wrote for this stream, or None when there is none usable.
 
@@ -10292,6 +11545,456 @@ def degrade_missing_remediations(findings: list[dict], root: Path) -> list[str]:
             "re-run the audit.)_"
         )
         degraded.append(fid)
+    return degraded
+
+
+class UnwrittenFix(NamedTuple):
+    """A fix the sweep would open had it been written, and where to look.
+
+    `declared` says which of the two shapes it is. False: the worker named
+    `path` as its `manifest` file and never wrote it, so `path` is where the fix
+    goes. True: the worker wrote `manual` although the collector found the
+    object declared at `path` -- the object's own file, which an edit goes in
+    and a new object (a PodDisruptionBudget, say) goes beside, never over.
+    """
+
+    path: str
+    declared: bool
+
+
+def unwritten_sweep_fixes(
+    findings: list[dict],
+    manifest: dict | None,
+    promised: dict[str, str],
+    degraded: list[str],
+    audit_id: str,
+    prs: list[dict],
+) -> dict[str, UnwrittenFix]:
+    """Finding id to where its fix belongs, for each fix the sweep would
+    open if only it had been written.
+
+    Two shapes of the same shortcut. A `manifest` remediation whose file was
+    never written, which `degrade_missing_remediations` has already turned into
+    `manual` (`degraded`, with the path it named in `promised`). And a
+    `manual` remediation on a finding `collector_vouched_findings` clears for
+    the `major` sweep whose collector candidate carries a `declaration`: the
+    collector found the file and the worker did not use it. Only those, because
+    elsewhere `manual` is often the SOP's own answer -- a privileged container
+    or a cluster-admin binding is `critical`, declared, and `manual` until its
+    owner confirms -- and a refusal there argues the worker into a pull request
+    the SOP withheld.
+    At fleet scale a worker that meets a hundred candidates writes the same
+    boilerplate `manual` line for every one, and each is a finding the sweep
+    was built to fix that the ledger instead hands back to a person.
+
+    Only findings the sweep would open count, by the tests `promotion_candidates`
+    applies: graded at the floor that applies to them (`collector_vouched_findings`),
+    corroborated, and not marked for triage. The pull-request test is the one
+    that cannot be applied the same way, because the branch is named after the
+    fix's path and neither shape has one in its remediation any more. For a
+    degraded fix the path it promised names the branch, and any pull request
+    there that the harness did not close as stale -- open, merged, or closed by
+    a person -- leaves it out, as it would leave the sweep. A declared `manual`
+    fix has no path to join on, so it is joined on the pull request's delta
+    block instead, by the same rule; the generated check is left to
+    `plan_generated_fixes`, which tells its own pull request from another.
+    """
+    floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
+    unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
+    vouched = collector_vouched_findings(findings, manifest)
+    excluded = uncorroborated_findings(findings, manifest) | set(triage_markers(findings, manifest))
+    declared_at = {
+        _candidate_identity(entry, candidate): str(
+            (candidate.get("declaration") or {}).get("path") or ""
+        )
+        for entry, candidate in _candidates(manifest)
+        if isinstance(candidate.get("declaration"), dict)
+    }
+    degraded_set = set(degraded)
+    # A declared `manual` fix a pull request the harness did not close already
+    # carries -- open, merged, or closed by a person -- is answered; the
+    # generated check is left to `plan_generated_fixes`, which tells its own
+    # pull request from another.
+    carried = {fid for pr in prs if not pr_closed_by_harness(pr) for fid in parse_delta_block(pr.get("body"))}
+    unwritten: dict[str, UnwrittenFix] = {}
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        if fid in excluded:
+            continue
+        rank = SEVERITY_RANK.get(str(finding.get("severity") or ""), len(SEVERITIES))
+        if rank > (floor_rank if fid in vouched else unvouched_rank):
+            continue
+        if fid in degraded_set and promised.get(fid):
+            as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
+            pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
+            if pr is None or pr_closed_by_harness(pr):
+                unwritten[fid] = UnwrittenFix(promised[fid], declared=False)
+            continue
+        remediation = finding.get("remediation") or {}
+        declared = declared_at.get(derive_finding_id(finding), "")
+        if fid in carried and str(finding.get("check") or "") != GENERATED_FIX_CHECK:
+            continue
+        if fid in vouched and remediation.get("kind") == "manual" and declared:
+            unwritten[fid] = UnwrittenFix(declared, declared=True)
+    return unwritten
+
+
+class KccDeclaration(NamedTuple):
+    """Where a Config Connector resource is declared, and what its spec sets.
+
+    `repo` is empty for the GitOps repository and the slug for a context
+    repository; `fields` is the set of top-level `spec` keys, the only part of
+    the declaration Config Connector holds against out-of-band changes.
+    """
+
+    repo: str
+    path: str
+    fields: frozenset[str]
+
+
+# `(kind, name, cluster, location)`: `cluster` is the bare GKE name the resource
+# belongs to (its own name for a `ContainerCluster`, the `clusterRef` for a
+# `ContainerNodePool`) and `location` is `spec.location`, empty when the spec
+# omits it. A node pool's name alone is not an identity -- every cluster has a
+# `default-pool` -- and a match on it alone sends one cluster's correct fix to
+# another cluster's file.
+KccKey = tuple[str, str, str, str]
+
+
+def kcc_declarations(root: Path, repo: str = "") -> dict[KccKey, KccDeclaration]:
+    """Index the Config Connector resources a clone declares, by `KccKey`.
+
+    The key set of each `spec` is the point: Config Connector holds the fields
+    its spec *names* and leaves the rest to whoever set them, so a declaration
+    is evidence that a gcloud change will be reverted only when it carries the
+    field being changed.
+
+    Parsed rather than grepped. Every SOP in this skill warns that
+    `grep "name: <object>"` is kind-blind and unanchored -- it matches
+    `app.kubernetes.io/name:` label lines and names sharing a prefix -- and a
+    false hit here turns a correct `gcloud` fix into a `manual` one that sends
+    the operator to a file governing nothing.
+
+    `{}` when PyYAML is absent or the clone is unreadable. That is the safe
+    direction: the check stops and every `gcloud` fix publishes as written,
+    which is what shipped before it existed. Failing the run over a missing
+    parser would trade two wrong remediations for no report at all.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the check
+    except ImportError:
+        return {}
+    index: dict[KccKey, KccDeclaration] = {}
+    try:
+        paths = [path for pattern in _YAML_SUFFIXES for path in sorted(root.rglob(pattern))]
+    except OSError:
+        return {}
+    for path in paths:
+        # `.git` holds objects, not manifests, and rglob walks into it.
+        if ".git" in path.relative_to(root).parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        _index_kcc_text(index, yaml, text, repo, path.relative_to(root).as_posix())
+    return index
+
+
+def _kcc_cluster_ref(spec: dict) -> str:
+    """The bare cluster name a `ContainerNodePool`'s `clusterRef` points at.
+
+    `name` is the referenced `ContainerCluster`'s `metadata.name`, which is the
+    GKE name unless that resource sets `resourceID`; `external` is a GKE
+    resource path or a bare name, and its last segment is the name either way.
+    """
+    ref = spec.get("clusterRef")
+    if not isinstance(ref, dict):
+        return ""
+    return str(ref.get("name") or ref.get("external") or "").rstrip("/").rpartition("/")[2]
+
+
+def _index_kcc_text(
+    index: dict[KccKey, KccDeclaration], yaml: Any, text: str, repo: str, path: str
+) -> None:
+    """Add the Config Connector resources one manifest declares to `index`.
+
+    Shared by the clone walk and the broker read, so a file is named and
+    parsed the same way whichever mode found it. First declaration wins.
+    """
+    if KCC_API_GROUP_SUFFIX not in text:
+        return
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except (yaml.YAMLError, ValueError, RecursionError):
+        # A file this audit cannot parse is one it can make no claim
+        # about; skipping leaves the finding's `gcloud` kind alone.
+        return
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        api = str(doc.get("apiVersion") or "")
+        kind = str(doc.get("kind") or "")
+        meta = doc.get("metadata")
+        if KCC_API_GROUP_SUFFIX not in api or not kind or not isinstance(meta, dict):
+            continue
+        spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
+        # `resourceID` overrides `metadata.name` as the GCP resource's real
+        # name, and the fleet's clusters are matched by the name GKE reports.
+        name = str(spec.get("resourceID") or meta.get("name") or "")
+        cluster = _kcc_cluster_ref(spec) if kind in _KCC_OBJECT_KINDS["NodePool"] else name
+        if not name or not cluster:
+            continue
+        location = str(spec.get("location") or "")
+        index.setdefault(
+            (kind, name, cluster, location),
+            KccDeclaration(repo, path, frozenset(str(k) for k in spec)),
+        )
+
+
+class KccBrokerScan(NamedTuple):
+    """The declarations a content-mode read found, and whether it saw everything.
+
+    `truncated` is true when the broker's search stopped at its match ceiling
+    or withheld a matching file. The index is then a floor, not the answer: it
+    still degrades what it found, and a fix it did not catch says nothing about
+    whether the repository declares that object.
+    """
+
+    declarations: dict[KccKey, KccDeclaration]
+    truncated: bool
+
+
+def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
+    """Index the GitOps repository's Config Connector resources through the broker.
+
+    Content mode's counterpart of `kcc_declarations`: there is no clone at
+    `finish`, so the broker searches its own tree for the API group and only
+    the matching YAML files are read. They are parsed in memory, never written
+    anywhere -- in particular not into the remediation workspace, whose every
+    file `finish` publishes. Paths are the repository-relative names the broker
+    reports, the same names the clone walk produces.
+
+    Any broker failure returns an empty, untruncated scan, which disables the
+    check exactly as an unreadable clone does; the run never fails over it.
+    `session` is a broker workspace already open on `repo` (`_RepositoryProbe`),
+    so one `finish` clones the repository once.
+    """
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the check
+    except ImportError:
+        return KccBrokerScan({}, False)
+    index: dict[KccKey, KccDeclaration] = {}
+    try:
+        import credential_proxy_client
+
+        opened = (
+            contextlib.nullcontext(session)
+            if session is not None
+            else credential_proxy_client.Workspace.open(proxy_endpoint(), repo)
+        )
+        with opened as workspace:
+            result = workspace.grep(KCC_CONTAINER_API_GROUP)
+            truncated = bool(result.get("truncated"))
+            wanted = sorted(
+                {
+                    str(match.get("path") or "")
+                    for match in result.get("matches") or []
+                    if str(match.get("path") or "").endswith(_KCC_YAML_EXTENSIONS)
+                }
+            )
+            texts: dict[str, bytes] = {}
+            # `requestBudget` means ask again for the rest; stop when a round
+            # returns nothing, so a broker that never relents cannot spin this.
+            while wanted:
+                files, skipped = workspace.read_many(wanted)
+                texts.update(files)
+                retry = [
+                    str(entry.get("path") or "")
+                    for entry in skipped
+                    if entry.get("reason") == BROKER_SKIP_REQUEST_BUDGET
+                ]
+                if any(entry.get("reason") != BROKER_SKIP_REQUEST_BUDGET for entry in skipped):
+                    truncated = True
+                if retry and not files:
+                    truncated = True
+                    break
+                wanted = retry
+    except Exception as exc:  # noqa: BLE001 -- the backstop is optional; the run is not
+        log(
+            f"WARNING: the Config Connector scan could not read {repo} through "
+            f"the broker ({exc}); gcloud fixes publish as written"
+        )
+        return KccBrokerScan({}, False)
+    for path in sorted(texts):
+        _index_kcc_text(index, yaml, texts[path].decode("utf-8", errors="replace"), "", path)
+    return KccBrokerScan(index, truncated)
+
+
+def kcc_declaration_roots(
+    audit_id: str, root: Path | None, record: dict | None
+) -> list[tuple[str, Path]]:
+    """The clones `finish` already has on disk to look for KCC declarations in.
+
+    The GitOps repository's tree first, then the context repositories `start`
+    checked out for the declared-intent search, as `(repo, path)` with `repo`
+    empty for the GitOps one. Only git checkouts count: in content mode the
+    GitOps path is a scratch directory holding the manifests this run wrote, not
+    the repository (`finish` reads the repository through the broker instead,
+    `kcc_declarations_via_broker`), and the context copies were removed when
+    `start` finished with them. Nothing is cloned here -- a context checkout exists only for a
+    stream with a declared-intent step, on a directory-mode install, and until
+    its lease is reaped -- so an empty list is common and disables the check.
+    """
+    roots: list[tuple[str, Path]] = []
+    if root is not None and (root / ".git").exists():
+        roots.append(("", root))
+    gitops = str((record or {}).get("repo", "")).strip().lower()
+    try:
+        import gitops_workspace
+
+        lease = gitops_workspace.sanitize_lease(f"{audit_id}{CLONE_LEASE_SUFFIX}")
+        for slug in (record or {}).get("context_repos") or []:
+            text = str(slug).strip()
+            if not text or text.lower() == gitops:
+                continue
+            tree = gitops_workspace.workspace_path(text, GITOPS_WORKSPACE, lease=lease)
+            if (tree / ".git").exists():
+                roots.append((text, tree))
+    except Exception:  # noqa: BLE001 -- a context root is optional; the GitOps one stands
+        pass
+    return roots
+
+
+def _gcloud_flag_pattern(flag: str) -> str:
+    """The regex that finds `flag` as a whole token, `--no-enable-` included."""
+    if flag.startswith(_GCLOUD_ENABLE_PREFIX):
+        rest = re.escape(flag[len(_GCLOUD_ENABLE_PREFIX):])
+        head = f"(?:{re.escape(_GCLOUD_ENABLE_PREFIX)}|{re.escape(_GCLOUD_NEGATED_ENABLE_PREFIX)})"
+        return f"{head}{rest}{_GCLOUD_FLAG_BOUNDARY}"
+    return f"{re.escape(flag)}{_GCLOUD_FLAG_BOUNDARY}"
+
+
+def _kcc_candidate(finding: dict) -> bool:
+    """Whether `finding` is a `gcloud` fix on an object a KCC declaration could hold."""
+    remediation = finding.get("remediation") or {}
+    prefix = str(finding.get("object") or "").partition("/")[0]
+    return remediation.get("kind") == "gcloud" and prefix in _KCC_OBJECT_KINDS
+
+
+def reverted_gcloud_problem(
+    finding: dict, declarations: dict[KccKey, KccDeclaration]
+) -> tuple[KccDeclaration, str] | None:
+    """`None` if this `gcloud` fix survives its next reconcile; else the declaration and field.
+
+    Split from the rewrite for the reason `remediation_file_problem` is: a
+    caller can ask without rewriting the document.
+
+    A declaration matches on the finding's cluster as well as its object: the
+    bare name from the `<project>/<location>/<name>` the finding carries, and
+    its location where both sides state one. Project is not compared -- a KCC
+    resource names its project in an annotation or its namespace's, which this
+    parse does not resolve -- so same-named clusters in one location of two
+    projects still share a declaration.
+    """
+    remediation = finding.get("remediation") or {}
+    if remediation.get("kind") != "gcloud":
+        return None
+    prefix, _, name = str(finding.get("object") or "").partition("/")
+    kinds = _KCC_OBJECT_KINDS.get(prefix)
+    note = str(remediation.get("note") or "")
+    if not kinds or not name or not note:
+        return None
+    parts = str(finding.get("cluster") or "").split("/")
+    cluster = parts[-1]
+    location = parts[-2] if len(parts) > 2 else ""
+    for kind in kinds:
+        entry = declarations.get((kind, name, cluster, location)) if location else None
+        entry = entry or declarations.get((kind, name, cluster, ""))
+        if entry is None and not location:
+            # A finding naming its cluster bare cannot say which location's
+            # declaration it means; any one of them holds the field.
+            entry = next(
+                (
+                    value
+                    for key, value in declarations.items()
+                    if key[:3] == (kind, name, cluster)
+                ),
+                None,
+            )
+        if entry is None:
+            continue
+        for flag, fields in KCC_SPEC_FIELD_FOR_GCLOUD_FLAG.items():
+            if not re.search(_gcloud_flag_pattern(flag), note):
+                continue
+            held = [field for field in fields if field in entry.fields]
+            if held:
+                return entry, held[0]
+    return None
+
+
+def degrade_reverted_gcloud_remediations(
+    findings: list[dict],
+    roots: list[tuple[str, Path]],
+    prebuilt: dict[KccKey, KccDeclaration] | None = None,
+) -> list[str]:
+    """Rewrite `gcloud` fixes Config Connector would undo to `manual`, and report them.
+
+    `manual` rather than `manifest`: promoting would claim a file this run
+    never wrote, and `remediation.path` must name a real file when `finish`
+    stages it. The finding, its evidence and its recommendation survive; the
+    ledger stops printing a command whose effect is reverted minutes later and
+    names the file the change belongs in. The SOPs tell the model to write the
+    manifest up front; this is the backstop, in the shape of
+    `degrade_missing_remediations`, and it never fails a run.
+
+    Returns the ids that were degraded, for the caller to log.
+    """
+    # No `gcloud` fix on a cluster or node pool, no tree walk: the clones are
+    # read only to answer a question some finding asks.
+    if not any(_kcc_candidate(finding) for finding in findings) or not (roots or prebuilt):
+        return []
+    # The GitOps repository first, so its declaration wins a name both carry;
+    # in content mode that is the broker's index, handed in as `prebuilt`.
+    declarations: dict[KccKey, KccDeclaration] = dict(prebuilt or {})
+    for repo, tree in roots:
+        for key, entry in kcc_declarations(tree, repo).items():
+            declarations.setdefault(key, entry)
+    if not declarations:
+        return []
+    degraded: list[str] = []
+    for finding in findings:
+        problem = reverted_gcloud_problem(finding, declarations)
+        if problem is None:
+            continue
+        entry, field = problem
+        remediation = finding["remediation"]
+        note = str(remediation.get("note", "")).strip()
+        where = (
+            f"in the context repository `{entry.repo}` at `{entry.path}`"
+            if entry.repo
+            else f"in the GitOps repository at `{entry.path}`"
+        )
+        remediation["kind"] = "manual"
+        # A `gcloud` note renders inside a bash fence and a `manual` one as
+        # prose, so the command is fenced here to stay pasteable: it still
+        # states the end state, and an operator who has already changed the
+        # file may want it to close the gap before the next sync.
+        prose = (
+            f"This object is declared {where}, whose spec sets `{field}`. Config "
+            "Connector holds that field against out-of-band changes, so the "
+            "command below is reverted on the next reconcile and this finding "
+            "returns on the next run. Make the change in that file instead."
+        )
+        # The renderer clips a note at `MAX_NOTE_CHARS`, and a `gcloud` note
+        # may already be that long. Clipped there, the closing fence goes and
+        # the rest of the ledger renders as code, so the command is clipped
+        # here instead, inside the fence.
+        budget = MAX_NOTE_CHARS - len(prose) - len(_KCC_NOTE_FENCE_OVERHEAD)
+        if len(note) > budget:
+            note = note[: max(budget - len(_KCC_COMMAND_TRUNCATED), 0)].rstrip() + _KCC_COMMAND_TRUNCATED
+        remediation["note"] = f"{prose}\n\n```bash\n{note}\n```"
+        degraded.append(str(finding.get("id", "")))
     return degraded
 
 
@@ -11100,6 +12803,7 @@ def _handle_finish_dry_run(
     repo: str | None = None,
     manifest: dict | None = None,
     waiver: str = "",
+    record: dict | None = None,
 ) -> None:
     findings = list(data["findings"])
 
@@ -11116,6 +12820,17 @@ def _handle_finish_dry_run(
         log(
             f"WARNING: {fid}'s remediation path is not a readable file inside "
             f"{root}; it degrades to a manual remediation and opens no pull request."
+        )
+    # Only against the stream's own tree, never `dry_run_repo_root`'s fallback,
+    # which is whatever checkout holds the working directory. Directory mode
+    # only: the dry run never opens a broker session, and starting one here
+    # would make the preview the first thing in the run to need the broker.
+    # A content-mode dry run therefore previews no Config Connector degrade.
+    kcc_roots = kcc_declaration_roots(audit_id, derived_workspace(audit_id, repo=repo), record)
+    for fid in degrade_reverted_gcloud_remediations(findings, kcc_roots):
+        log(
+            f"DRY RUN: {fid}'s gcloud remediation changes a field a Config "
+            "Connector declaration holds; it degrades to manual, naming the file."
         )
     paths = manifest_paths(findings)
 
@@ -11206,11 +12921,13 @@ def _handle_finish_dry_run(
         return
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
+    triage_reasons = triage_markers(findings, manifest)
     plan = promotion_candidates(
         findings,
         {},
         uncorroborated=uncorroborated_findings(findings, manifest),
-        triage_marked=triage_marked_findings(findings, manifest),
+        triage_marked=set(triage_reasons),
+        vouched=collector_vouched_findings(findings, manifest),
     )
 
     # Groups over the whole finding set, filtered to those holding a promoted
@@ -11245,7 +12962,14 @@ def _handle_finish_dry_run(
     if plan.needs_triage:
         log(
             "THE COLLECTOR MARKED THESE FIXES AS NEEDING A READER'S JUDGEMENT "
-            f"({len(plan.needs_triage)}): {', '.join(plan.needs_triage)}"
+            f"({len(plan.needs_triage)}): "
+            + ", ".join(f"{fid} ({triage_reasons.get(fid, '?')})" for fid in plan.needs_triage)
+        )
+    if plan.below_floor:
+        log(
+            f"BELOW THE `{UNVOUCHED_PROMOTION_FLOOR}` FLOOR, OR `{AUTO_PROMOTION_FLOOR}` "
+            f"FOR {_sweep_checks_text()} "
+            f"({len(plan.below_floor)}): {', '.join(plan.below_floor)}"
         )
     rendered = render_issue_body(
         data,
@@ -11254,6 +12978,8 @@ def _handle_finish_dry_run(
         gaps=gaps,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
+        below_floor=plan.below_floor,
+        triage_reasons=triage_reasons,
         held=preview_held,
         held_preview=True,
         states=states,
@@ -11719,6 +13445,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"{fid}: impact taken from the collector, which knows which arm "
                 "of the check fired."
             )
+    # After the adoption, and ahead of the dry-run split so the preview and the
+    # real run publish the same command. `validate_findings` already ran this
+    # repair, but the DNS arm is read off `evidence.excerpt`, which was the
+    # model's prose until the adoption above put the collector's in its place.
+    for fid in repair_remediation_commands(data["findings"]):
+        log(
+            f"{fid}: its remediation was missing a flag without which the "
+            "command does not clear the finding it is published under."
+        )
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
@@ -11777,7 +13512,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     if args.dry_run:
         _handle_finish_dry_run(
-            audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver
+            audit_id, data, now, repo=opt_repo, manifest=manifest, waiver=waiver, record=record
         )
         return
 
@@ -11787,11 +13522,46 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     ensure_labels(repo, audit_id)
 
     # A fix the audit promised but did not write degrades that one finding to
-    # `manual`; it never suppresses the report.
-    for fid in degrade_missing_remediations(findings, root):
+    # `manual`; it never suppresses the report. What each promised is kept for
+    # `unwritten_sweep_fixes`, since the degrade blanks the path.
+    promised = {
+        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
+        for f in findings
+        if (f.get("remediation") or {}).get("kind") == "manifest"
+    }
+    degraded = degrade_missing_remediations(findings, root)
+    for fid in degraded:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
+        )
+    # Every stream, not only drift: any `gcloud` fix against a declared field
+    # is reverted the same way. Directory mode reads the clone; content mode
+    # has none and asks the broker, and only when a finding could match, so
+    # a run with no such fix costs no round trip.
+    kcc_prebuilt: dict[KccKey, KccDeclaration] = {}
+    # One broker session for the run's repository questions; closed after the
+    # generated fixes are planned below.
+    probe = _RepositoryProbe(repo, root)
+    # Closed after planning below, and at exit if anything between raises, so
+    # a failed `finish` does not hold a broker slot until the idle reclaim.
+    atexit.register(probe.close)
+    if content_mode() and any(_kcc_candidate(finding) for finding in findings):
+        scan = kcc_declarations_via_broker(repo, probe.broker())
+        kcc_prebuilt = scan.declarations
+        if scan.truncated:
+            log(
+                "WARNING: the broker truncated the Config Connector scan of "
+                f"{repo}; gcloud fixes against declarations it did not return "
+                "publish as written, so their absence here proves nothing."
+            )
+    for fid in degrade_reverted_gcloud_remediations(
+        findings, kcc_declaration_roots(audit_id, root, record), prebuilt=kcc_prebuilt
+    ):
+        log(
+            f"WARNING: {fid}'s gcloud remediation changes a field a Config "
+            "Connector declaration holds, so it would be reverted on the next "
+            "reconcile; it is published as manual, naming the file to change."
         )
 
     # "Absent from this document" only means "fixed" if the audit actually
@@ -12024,6 +13794,34 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
     remediation_prs = list_remediation_prs(repo, audit_id)
+    # The last point before anything is published. A fix the sweep would open
+    # and the worker did not write is refused until it is written or declined
+    # by name with a reason: refused once, a worker re-ran `finish` unchanged
+    # and the fix reached the ledger as `manual`. A declined fix publishes as
+    # `manual` with the reason on its row.
+    declines = dict(getattr(args, "decline_fix", None) or [])
+    unwritten = (
+        unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
+        if findings
+        else {}
+    )
+    # A fix `finish` can derive is written rather than refused, but only once
+    # the run is past the refusal, so a refused run leaves no file behind.
+    try:
+        planned, answered = plan_generated_fixes(
+            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id
+        )
+    finally:
+        probe.close()
+    decline_unwritten_fixes(findings, unwritten, declines)
+    remaining = {
+        fid: fix
+        for fid, fix in unwritten.items()
+        if fid not in declines and fid not in planned and fid not in answered
+    }
+    if remaining and has_run_record(audit_id, repo):
+        raise ValidationError(unwritten_refusal_message(remaining))
+    write_generated_fixes(findings, planned, root)
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens -- and just after the clean close, not here. A close leaves the
@@ -12330,6 +14128,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "new": 0,
             "resolved": clean_resolved,
             "prs_opened": [],
+            "prs_still_open": [],
             "prs_closed": prs_closed,
             # Same rule as the findings branch below — see the long note
             # there. A clean run is the *usual* silent one, but not
@@ -12460,13 +14259,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         collector_held=held_ids,
         collector_flagged=candidate_only,
     )
+    triage_reasons = triage_markers(findings, manifest)
     plan = promotion_candidates(
         findings,
         pr_by_finding,
         requests.targets,
         requested_at=requests.requested_at,
         uncorroborated=uncorroborated_findings(findings, manifest),
-        triage_marked=triage_marked_findings(findings, manifest),
+        triage_marked=set(triage_reasons),
+        vouched=collector_vouched_findings(findings, manifest),
     )
     for fid in plan.uncorroborated:
         log(
@@ -12477,7 +14278,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     for fid in plan.needs_triage:
         log(
             f"{fid}: the collector flagged this and stands behind it, and marked "
-            "the fix as needing a judgement it could not make, so the sweep will "
+            f"the fix `{triage_reasons.get(fid, '?')}` as needing a judgement it could not make, so the sweep will "
             f"not open a pull request on it. Comment `/remediate {fid}` once you "
             "have decided."
         )
@@ -12503,6 +14304,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         withheld=plan.withheld,
         uncorroborated=plan.uncorroborated,
         needs_triage=plan.needs_triage,
+        below_floor=plan.below_floor,
+        triage_reasons=triage_reasons,
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
@@ -12670,6 +14473,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 withheld=plan.withheld,
                 uncorroborated=plan.uncorroborated,
                 needs_triage=plan.needs_triage,
+                below_floor=plan.below_floor,
+                triage_reasons=triage_reasons,
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
@@ -12731,6 +14536,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         "new": reported_new,
         "resolved": reported_resolved,
         "prs_opened": prs_opened,
+        # Already open before this run, on findings it still carries. Listed
+        # so the report can name the fix that is waiting for review; it moves
+        # nothing, so it plays no part in `silent_ok`.
+        # A pull request this run closed as stale is not still open, though
+        # the listing taken before the close says so.
+        "prs_still_open": [
+            url
+            for url in still_open_pr_urls(pr_by_finding, prs_opened, carrying_prs(remediation_prs, findings))
+            if url not in prs_closed
+        ],
         "prs_closed": prs_closed,
         # The `[SILENT]` verdict, computed rather than re-derived.
         #
@@ -12846,6 +14661,13 @@ def _add_read_branch_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _nonblank(value: str) -> str:
+    """An argument that says something: a blank finding id or reason is refused."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must not be blank")
+    return value.strip()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Deterministic audit-reporting harness for the fleet-audit skill."
@@ -12880,6 +14702,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Validate and render to stdout; perform zero git/gh side effects.",
+    )
+    finish_parser.add_argument(
+        "--decline-fix",
+        nargs=2,
+        action="append",
+        type=_nonblank,
+        metavar=("FINDING_ID", "REASON"),
+        help=(
+            "Leave a fix the refusal listed `manual`, for REASON: the SOP makes it "
+            "manual, or a pull request already carries it. REASON is published on "
+            "the finding's ledger row. Repeat for more than one."
+        ),
     )
     # One or the other, never both: a waiver says the collector produced no
     # manifest, and a manifest beside it would make that sentence false.
