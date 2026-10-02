@@ -28,6 +28,7 @@ asserts it builds the arrays this module reads.
 """
 
 import pathlib
+import re
 import subprocess
 import sys
 import unittest
@@ -339,6 +340,11 @@ INJECT_LANE_EXCLUDED = [
     "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
     "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
 ]
+# The directives a case's prompt opens with to replay a wake into the chat
+# front door (bench/kube_agents_bench/card_wake.py); the harness errors such
+# a run on any transport but api.
+FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
+PROMPT_FIRST_LINE_RE = re.compile(r"^prompt: \|-?\n[ \t]+(\S[^\n]*)", re.MULTILINE)
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
@@ -396,6 +402,17 @@ class InjectLaneExclusionsTest(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertTrue(reason, f"{case}: no reason in the comment block above it")
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
+
+    def test_every_registered_wake_replay_is_excluded(self):
+        # A replay errors on the inject lane, so an unlisted one reds there
+        # every repetition; the docs' rule is enforced here.
+        excluded = eval_rosters.inject_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            text = (REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text()
+            first = PROMPT_FIRST_LINE_RE.search(text)
+            if first and first.group(1).strip() in FRONT_DOOR_WAKE_DIRECTIVES:
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_an_exclusion_is_not_a_demotion(self):
         # The api lane's roster is untouched by an entry here: an excluded

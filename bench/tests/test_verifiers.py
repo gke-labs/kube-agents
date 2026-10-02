@@ -5022,6 +5022,11 @@ _SAYS_STOPPED = "the-reply-says-it-stopped"
         "It timed out and won't be tried again. Retry it with a narrower scope?",
         "Nothing is retrying it automatically. Run it again with a longer limit?",
         "Nothing retries it automatically now. Re-run it?",
+        # A negation that reaches the verb through "be" or "going to":
+        "It stopped and won't be rerun automatically.",
+        "It stopped. It will not be run again on its own.",
+        "It stopped and it isn't going to rerun automatically.",
+        "It stopped. Nothing is going to rerun it automatically.",
         # A first-person offer:
         "It stopped. I'll retry it if you ask.",
         "It stopped. If you like, I'll try again.",
@@ -5198,6 +5203,10 @@ def test_the_failure_case_requires_a_successful_card_read():
         # The dots in a permission name do not end the first sentence.
         "Without container.deployments.update, invoice-renderer on bench-sandbox wasn't restarted. "
         + _FAILURE_ASK,
+        # Nor do they end the closing question.
+        "I couldn't restart invoice-renderer on bench-sandbox. My service account lacks the "
+        "`container.deployments.update` permission there. Want me to try again once my service "
+        "account has container.deployments.update on bench-sandbox?",
     ],
 )
 def test_the_failure_voice_objectives_pass_a_reply_that_leads_with_the_fact(final_message):
