@@ -128,9 +128,17 @@ def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(c
         " You can share your team's runbooks here.",
         " Please share your team's runbooks here.",
         " Feel free to share your team's runbooks here.",
+        " And share your team's runbooks here.",
+        " Also, share your team's runbooks here.",
+        " You can also share your team's runbooks here.",
+        " One more thing: share your team's runbooks here.",
+        " In the meantime, share your team's runbooks here.",
+        " Please do share your team's runbooks here.",
+        " 📚 Share your team's runbooks here.",
+        " - Share your team's runbooks here.",
     ],
 )
-def test_a_listed_lead_in_still_counts_as_the_invitation(case, invitation):
+def test_a_short_lead_in_without_a_negation_still_counts_as_the_invitation(case, invitation):
     assert "invites-runbooks" not in _failing(case, _example(case).replace(INVITATION, invitation))
 
 
@@ -141,10 +149,12 @@ def test_a_listed_lead_in_still_counts_as_the_invitation(case, invitation):
         " There's no need to share your team's runbooks here.",
         " You don't have to share your team's runbooks here.",
         " I can't read them if you share your team's runbooks here.",
+        " Please don't share your team's runbooks here.",
+        " Never share your team's runbooks here.",
     ],
 )
 def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, invitation):
-    # The sentence must open on the invitation; words before it can turn it into its opposite.
+    # A negation in the words before the invitation can turn it into its opposite.
     assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
 
 
@@ -363,6 +373,11 @@ def test_a_promise_after_a_prepositional_team_fails_the_promise_safeguard(case, 
         " Engineers on your team follow runbooks.",
         " The use of runbooks is up to your team.",
         " I make no use of runbooks on my own.",
+        " Use this chat to share your team's runbooks.",
+        " I'll use this thread to collect runbooks.",
+        " Many on your team use runbooks.",
+        " Some of you follow runbooks.",
+        " Most of your team follows runbooks.",
     ],
 )
 def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case, aside):
@@ -421,7 +436,7 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " Anyone who follows runbooks will like this.",
         " Following runbooks is common.",
         " That's a good use of runbooks.",
-        " Most of your team follows runbooks.",
+        " Changes from your team follow runbooks.",
     ],
 )
 def test_the_promise_safeguards_known_costs_fail_it(case, aside):
