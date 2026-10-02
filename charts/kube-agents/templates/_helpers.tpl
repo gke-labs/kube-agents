@@ -143,8 +143,7 @@ them here would not suit every caller.
 {{- end }}
 
 {{/*
-A complete third-party image reference, reproducing third_party_image() from
-scripts/installer/common.sh: mirrored installs pull <prefix>/<name>:<tag>
+A complete third-party image reference: mirrored installs pull <prefix>/<name>:<tag>
 with any @sha256 digest dropped — `make mirror-images` pushes by tag, and the
 copy's digest differs from the upstream one, so keeping it would break every
 mirrored pull — while unmirrored installs pull the inventory's full pin,

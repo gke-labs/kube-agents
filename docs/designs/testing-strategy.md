@@ -87,7 +87,7 @@ Second, many cases per journey. One case per domain proves the domain is covered
 
 #### The seeded fleet
 
-Three standing GKE clusters per eval project, carrying defects we planted (`bench/tf/fleet`). Three and not two, because the drift audit compares each cluster against the fleet majority, and two clusters have no majority.
+Four standing GKE clusters per eval project, carrying defects we planted (`bench/tf/fleet`). At least three, because the drift audit compares each cluster against the fleet majority, and two clusters have no majority; the fourth is multi-zonal, because a single-zone cluster cannot carry a zonal skew.
 
 | Planted defect                          | Case it feeds | Usable from |
 | --------------------------------------- | ------------- | ----------- |
@@ -100,11 +100,13 @@ Three standing GKE clusters per eval project, carrying defects we planted (`benc
 | Idle node pool                          | Cost          | day 7       |
 | Unattached disks                        | Cost          | day 30      |
 
+The table is the original fleet. The upgrade-readiness drain fixtures on the second cluster and the zonal-skew fixtures on the fourth, with the rest of the roles, are in [`bench-fleet-catalog.md`](bench-fleet-catalog.md), which is canonical for the list.
+
 Four properties matter:
 
 - **Every defect is one an SOP demonstrably flags.** Planting a defect no SOP looks for is the mistake to catch in review. Because we planted them, the checks that matter can be exact rather than judged.
 - **The fleet is standing and read-only, not disposable.** The agent has no write path to a cluster: it reports, and proposes fixes as pull requests. So the fleet is applied once per project and shared by every pull request that leases it. No case may mutate it. The harness enforces the read side: `bench/tf/fleet` provisions `seeded-fleet-reader`, `hack/fleet-kubeconfigs.sh` writes every role kubeconfig as that account or writes nothing, and a run stops rather than read the fleet on `prowjob-default-sa`, which holds `container.admin` on every eval project ([`bench-fleet-catalog.md`](bench-fleet-catalog.md), "Read-only"). What is still convention is that no case mutates the fleet through any other path. Drift is the same story: `bench/tf/fleet/README.md` names a scheduled re-apply as the design: `hack/fleet_reconcile.py`, under a Boskos hold per project, applying only creates and in-place updates ([`ci-pool-projects.md`](../ci-pool-projects.md) §6.2). Remediation cases run here for the same reason: a proposed fix is a pull request, checkable without anything on the cluster changing.
-- **Fixtures are named by role, never by cluster.** Each eval project gets its own trio from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
+- **Fixtures are named by role, never by cluster.** Each eval project gets its own set from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
 - **The clock cannot be cheated.** `creationTimestamp` is server-set, and the cost SOP filters server-side, so the "usable from" column is a real wait. A fixture that has not aged in yet is dormant, not failing. The fleet README carries the dates.
 
 A presubmit run gets six hours of wall-clock and the nightly gets eight (§4.4). Compute is deliberately not the constraint.
