@@ -4267,9 +4267,12 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Clicks: a click on a choice runs as the clicker's turn under the
 	//     adapter's own authorization, echoed in the same thread.
 	//   - Incident alerts: an incident alert's triage options post as an edit
-	//     of the alert, with a button per option and the report folded; and the
+	//     of the alert, with a button per option and the report folded; the
 	//     Session KV database is read, read-only, to tell an alert's thread
-	//     from any other.
+	//     from any other; and before an option click counts, the alert's
+	//     thread is read once (conversations.replies, the existing token and
+	//     scopes) to see whether an authorized user typed apply since
+	//     the options appeared, which drops the click.
 	//   - Reactions: which reaction goes on an ask and when it settles.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},

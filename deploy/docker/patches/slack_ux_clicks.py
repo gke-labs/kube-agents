@@ -49,14 +49,34 @@ echoed text can come back longer than the send path budgeted for. A section or
 context text past ``SECTION_TEXT_MAX`` is clipped and the message is cut to
 ``MESSAGE_BLOCKS_MAX`` blocks, keeping the answered note last.
 
-Fail-soft throughout: a rewrite or echo that fails is logged and the turn
-still runs, because the click was the user's answer.
+An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
+answered by typing: someone replies ``apply Option B`` in the thread, the agent
+applies it, and the buttons are still there. So before such a click counts,
+the thread is read once, and if a person the adapter's interactive
+authorization passes has replied with one of the call to action's bare forms
+(``apply``, ``apply Option B``, ``apply B``, any of them ending in a please or
+a thanks; a colon after one is not one) since the buttons appeared, the buttons
+are replaced with "answered in the thread" and the click is dropped. Any option
+typed counts, not only the one clicked: a typed ``apply A`` drops a click on B,
+since the agent is already applying A and a second apply would run on top of
+it. The buttons appear when the alert is edited into its triage, so that
+edit's time, which the click's payload carries, is the start. The match is a
+heuristic: the agent reads a typed reply as free text, so this guesses what it
+will apply. A read that fails runs the click as if nothing had been typed;
+an authorization check that raises on a reply that typed an apply counts the
+reply, since the agent may already be applying it. Other choice buttons are
+not checked.
+
+A click that runs is fail-soft: a rewrite or echo that fails is logged and the
+turn still runs, because the click was the user's answer. A click dropped for a
+typed apply runs no turn, whether or not its rewrite lands.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import OrderedDict
 from typing import Any
 
@@ -98,6 +118,33 @@ FALLBACK_TS = "kage-click-{ts}-{action}-{user}"
 
 #: Bound on the answered-message map, oldest evicted first.
 ANSWERED_MAX = 512
+
+#: An incident alert's option buttons: ``slack_ux_incident.ACTION_PREFIX`` and the
+#: presenter's choice segment, copied because that module is not imported here.
+INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
+
+#: What can come before a typed apply and is not part of it: mentions (Slack's
+#: ``<@U…>`` or a plain ``@name``), a blockquote (``&gt;`` as Slack sends it), emoji
+#: codes, punctuation, and a yes or a please.
+TYPED_LEAD = re.compile(
+    r"^(?:\s+|<@[UWB][A-Z0-9]+>|@\S+|&gt;|:[\w+-]+:|[^\w\s]|(?:yes|ok|okay|sure|please)\b)*",
+    re.IGNORECASE,
+)
+
+#: The call to action's own forms, ``apply``, ``apply Option B`` or ``apply B``, ending
+#: the reply, or ending in a courtesy (``please``, ``thanks``, ``thank you``, ``ty``), or
+#: followed by ``:`` as a button's text is, which :func:`_typed_apply` does not count.
+TYPED_APPLY = re.compile(
+    r"apply(?:\s+(?:option\s+)?([A-Z])\b)?"
+    r"(?::|[,.!]*(?:\s*(?:please|thanks|thank\s+you|ty)[.!]*)?\s*$)",
+    re.IGNORECASE,
+)
+
+#: The line that replaces an alert's buttons when someone typed the apply first.
+ANSWERED_IN_THREAD = "✓ answered in the thread"
+
+#: Slack's most replies one ``conversations.replies`` page returns.
+REPLIES_READ_MAX = 1000
 
 #: Slack truncates a message's ``text`` past this many characters.
 SLACK_TEXT_MAX = 40000
@@ -239,6 +286,58 @@ def _thread_ts(body: dict, message: dict, msg_ts: str) -> str:
     return str(message.get("thread_ts") or container.get("thread_ts") or msg_ts)
 
 
+def _after(ts: Any, msg_ts: str) -> bool:
+    try:
+        return float(ts) > float(msg_ts)
+    except (TypeError, ValueError):
+        return False
+
+
+def _buttons_shown(message: dict, msg_ts: str) -> str:
+    """When the clicked message got its buttons: its last edit, or its post if it was never edited."""
+    edited = message.get("edited")
+    edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
+    return edited_ts if _after(edited_ts, msg_ts) else msg_ts
+
+
+def _typed_apply(text: str) -> bool:
+    """Whether ``text`` is one of the call to action's bare forms. A guess at what the agent applies."""
+    typed = TYPED_APPLY.match(text, TYPED_LEAD.match(text).end())
+    return bool(typed) and not typed.group(0).endswith(":")
+
+
+async def _applied_by_typing(adapter: Any, client: Any, channel_id: str, team_id: str, thread_ts: str, since: str) -> bool:
+    """Whether an authorized user typed an apply in the thread after ``since``.
+    One read. A failed read answers no, so the click runs as it would without the check; an
+    authorization check that fails on a reply that typed an apply answers yes, since the gateway
+    may already be applying it and running the click as well would apply two."""
+    try:
+        response = await client.conversations_replies(
+            channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
+        )
+        for reply in response.get("messages") or []:
+            if not (
+                isinstance(reply, dict)
+                and reply.get("user")
+                and not reply.get("bot_id")
+                and not reply.get("subtype")
+                and _after(reply.get("ts"), since)
+                and _typed_apply(str(reply.get("text") or ""))
+            ):
+                continue
+            try:
+                if adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id):
+                    return True
+            except Exception as exc:  # noqa: BLE001 — a typed apply is already in the thread
+                logger.warning(
+                    "slack_ux_clicks: could not check the thread of %s; counting the typed apply: %s", thread_ts, exc,
+                )
+                return True
+    except Exception as exc:  # noqa: BLE001 — the click still answers
+        logger.warning("slack_ux_clicks: could not check the thread of %s; running the click: %s", thread_ts, exc)
+    return False
+
+
 def _is_group_dm(body: dict) -> bool:
     """Whether the click came from a group DM, which the gateway asks its gate about as a DM."""
     return str((body.get("channel") or {}).get("name") or "").startswith(GROUP_DM_NAME_PREFIX)
@@ -271,9 +370,27 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         return
     thread_ts = _thread_ts(body, message, msg_ts)
     client = adapter._get_client(channel_id, team_id=team_id)
+    typed = action_id.startswith(INCIDENT_CHOICE_PREFIX) and await _applied_by_typing(
+        adapter, client, channel_id, team_id, thread_ts, _buttons_shown(message, msg_ts),
+    )
+    # Checked again: another click on this message may have landed during the read.
+    if key in _answered:
+        logger.info("slack_ux_clicks: dropping a second %s click on %s, already answered", kind, msg_ts)
+        return
     _answered[key] = None
     while len(_answered) > ANSWERED_MAX:
         _answered.popitem(last=False)
+
+    if typed:
+        logger.info("slack_ux_clicks: dropping a %s click on %s, already applied in the thread", kind, msg_ts)
+        try:
+            await client.chat_update(
+                channel=channel_id, ts=msg_ts, text=_answered_text(ANSWERED_IN_THREAD, message),
+                blocks=answered_blocks(message.get("blocks"), _answered_by, ANSWERED_IN_THREAD),
+            )
+        except Exception as exc:  # noqa: BLE001 — the click is dropped either way
+            logger.warning("slack_ux_clicks: could not mark %s answered in the thread: %s", msg_ts, exc)
+        return
 
     shown = _presenter._escape(label)
     note = ANSWERED.format(user=user_id, label=shown)

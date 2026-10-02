@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 import apply_slack_ux_clicks as applier
 import slack_presenter as presenter
 import slack_ux_clicks as runtime
+import slack_ux_incident as incident
 import verify_slack_ux_clicks as verifier
 
 UPSTREAM = '''\
@@ -90,6 +91,9 @@ class SlackAdapter:
 
     def _is_ignored_channel(self, channel_id):
         return False
+
+    def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
+        return True
 
     async def _handle_slack_message(self, event, payload=None):
         return bool(event.get("_hermes_force_process"))
@@ -205,6 +209,8 @@ class ApplierTest(unittest.TestCase):
              "_client_for no longer accepts"),
             ("    def _client_for(", "    async def _client_for(", "_client_for is now async"),
             ("def _is_ignored_channel(", "def _ignored(", "_is_ignored_channel"),
+            ("def _is_interactive_user_authorized(", "def _is_user_authorized(", "_is_interactive_user_authorized"),
+            ("user_name=None, team_id=\"\")", "user_name=None)", "_is_interactive_user_authorized no longer accepts"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),
             ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
@@ -288,9 +294,17 @@ class ActionIdTest(unittest.TestCase):
 
 
 class _Client:
-    def __init__(self, log, fail=()):
+    def __init__(self, log, fail=(), replies=()):
         self.log = log
         self.fail = fail
+        self.replies = replies
+
+    async def conversations_replies(self, **kwargs):
+        if "conversations_replies" in self.fail:
+            raise RuntimeError("read refused")
+        self.log.append(("conversations_replies", kwargs))
+        await asyncio.sleep(0)  # a real read yields, so a second click can land during it
+        return {"ok": True, "messages": list(self.replies)}
 
     async def chat_update(self, **kwargs):
         if "chat_update" in self.fail:
@@ -304,9 +318,16 @@ class _Client:
 
 
 class _Adapter:
-    def __init__(self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=()):
+    def __init__(
+        self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
+        broken=(),
+    ):
+        self.broken = set(broken)
         self.authorized = authorized
+        self.unlisted = set(unlisted)
+        self.asked = []
         self.ignored = set(ignored)
+        self.replies = replies
         self.log = []
         self.acks = 0
         self.fail = fail
@@ -334,7 +355,13 @@ class _Adapter:
         )
 
     def _get_client(self, chat_id, team_id=None):
-        return _Client(self.log, self.fail)
+        return _Client(self.log, self.fail, self.replies)
+
+    def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
+        self.asked.append((user_id, channel_id, team_id))
+        if "authorized" in self.broken and user_id != USER:
+            raise RuntimeError("allowlist unreadable")
+        return user_id not in self.unlisted
 
     async def _handle_slack_message(self, event, payload=None):
         self.log.append(("message", event))
@@ -359,6 +386,11 @@ def _message(thread=THREAD):
     if thread:
         message["thread_ts"] = thread
     return message
+
+
+def _alert_choice(index, value):
+    """A click on an incident alert's option, on the alert itself: the thread's parent."""
+    return _choice(index, value, prefix=incident.ACTION_PREFIX, thread=None)
 
 
 def _choice(index=1, value="Leave it", shown=None, prefix="kage", **message_kwargs):
@@ -566,6 +598,111 @@ class RuntimeTest(unittest.TestCase):
         _run(presenter.ack_link_click(ack, {}, {"action_id": "kage.link.0"}))
         self.assertEqual(acks, [True])
 
+    def _incident(self, adapter, value="Apply Option B", edited=None):
+        body, action = _alert_choice(1, value)
+        if edited:
+            body["message"]["edited"] = {"user": "B1", "ts": edited}
+        self._answer(adapter, body, action)
+
+    def test_the_incident_prefix_is_the_one_the_alert_buttons_carry(self):
+        self.assertEqual(
+            runtime.INCIDENT_CHOICE_PREFIX, f"{incident.ACTION_PREFIX}.{presenter.CHOICE_ACTION}."
+        )
+
+    def test_a_typed_apply_strikes_the_buttons_and_drops_the_click(self):
+        typed = {"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}
+        adapter = _Adapter(replies=[{"type": "message", "bot_id": "B1", "text": "alert", "ts": MESSAGE_TS}, typed])
+        self._incident(adapter)
+        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update"])
+        read, update = (entry[1] for entry in adapter.log)
+        self.assertEqual((read["channel"], read["ts"], read["oldest"]), (CHANNEL, MESSAGE_TS, MESSAGE_TS))
+        self.assertEqual(adapter.asked, [("U2", CHANNEL, TEAM)])
+        self.assertFalse([b for b in update["blocks"] if b["type"] == "actions" and len(b["elements"]) > 1])
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], runtime.ANSWERED_IN_THREAD)
+        # A second click on the struck message does not read or run either.
+        self._incident(adapter, "Apply Option A")
+        self.assertEqual(len(adapter.log), 2)
+
+    def test_a_typed_apply_of_another_option_drops_the_click_too(self):
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply A", "ts": "223.000"}])
+        self._incident(adapter, "Apply Option B")
+        self._drops(adapter)
+        update = adapter.log[1][1]
+        self.assertEqual(update["blocks"][-1]["elements"][0]["text"], runtime.ANSWERED_IN_THREAD)
+
+    def test_what_is_not_a_human_typing_apply_after_the_alert_does_not_drop_the_click(self):
+        cases = {
+            "a bot": {"type": "message", "user": "U9", "bot_id": "B1", "text": "apply Option B", "ts": "223.000"},
+            "a subtype": {"type": "message", "subtype": "bot_message", "user": "U2", "text": "apply B", "ts": "223.000"},
+            "before the alert": {"type": "message", "user": "U2", "text": "apply Option A", "ts": "221.000"},
+            "the alert itself": {"type": "message", "user": "U2", "text": "apply", "ts": MESSAGE_TS},
+            "apply mid-sentence": {"type": "message", "user": "U2", "text": "should we apply B?", "ts": "223.000"},
+            "a longer word": {"type": "message", "user": "U2", "text": "applying B now", "ts": "223.000"},
+        }
+        for name, reply in cases.items():
+            with self.subTest(name):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[reply])
+                self._incident(adapter)
+                self.assertEqual(
+                    [entry[0] for entry in adapter.log],
+                    ["conversations_replies", "chat_update", "chat_postMessage", "message"],
+                )
+
+    def _runs(self, adapter):
+        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update", "chat_postMessage", "message"])
+
+    def _drops(self, adapter):
+        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update"])
+
+    def test_a_typed_apply_from_someone_the_adapter_ignores_does_not_drop_the_click(self):
+        adapter = _Adapter(
+            replies=[{"type": "message", "user": "U3", "text": "apply Option B", "ts": "223.000"}], unlisted={"U3"},
+        )
+        self._incident(adapter)
+        self._runs(adapter)
+        self.assertEqual(adapter.asked, [("U3", CHANNEL, TEAM)])
+
+    def test_a_reply_typed_before_the_options_appeared_does_not_drop_the_click(self):
+        # The alert is posted at 222 and edited into its options at 230.
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "225.000"}])
+        self._incident(adapter, edited="230.000")
+        self._runs(adapter)
+        self.assertEqual(adapter.log[0][1]["oldest"], "230.000")
+
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "231.000"}])
+        self._incident(adapter, edited="230.000")
+        self._drops(adapter)
+
+    def test_a_colon_after_the_apply_does_not_drop_the_click(self):
+        adapter = _Adapter(replies=[
+            {"type": "message", "user": "U2", "text": "apply option b: Restore the secret", "ts": "223.000"},
+        ])
+        body, action = _alert_choice(1, "Apply Option B")
+        self._answer(adapter, body, action)
+        self._runs(adapter)
+
+    def test_a_failed_thread_read_runs_the_click_as_before(self):
+        adapter = _Adapter(fail=("conversations_replies",))
+        with self.assertLogs(runtime.logger, level="WARNING") as logs:
+            self._incident(adapter)
+        self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
+        self.assertTrue(any("could not check the thread" in line for line in logs.output))
+
+    def test_a_check_that_raises_after_a_typed_apply_matched_counts_the_reply(self):
+        # Running the click as well would apply both the typed option and the clicked one.
+        for broken in ("authorized",):
+            with self.subTest(broken=broken):
+                importlib.reload(runtime)
+                adapter = _Adapter(
+                    replies=[{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}], broken={broken},
+                )
+                with self.assertLogs(runtime.logger, level="WARNING") as logs:
+                    self._incident(adapter)
+                self._drops(adapter)
+                self.assertTrue(any("could not check the thread" in line for line in logs.output))
+
     def test_the_answered_alert_keeps_its_report_for_the_clicks_own_turn(self):
         report = "*Pod OOMKilled*\nOption A: raise the limit\nOption B: roll back checkout-gateway"
         adapter = _Adapter()
@@ -613,6 +750,21 @@ class RuntimeTest(unittest.TestCase):
         del body["message"]["text"]
         self._answer(adapter, body, action)
         self.assertEqual(adapter.log[0][1]["text"], "✓ <@U1>: Leave it")
+
+    def test_two_clicks_during_the_thread_read_run_one_turn(self):
+        adapter = _Adapter()
+
+        async def both():
+            await asyncio.gather(
+                runtime.answer(adapter, self._ack(adapter), *_alert_choice(1, "Apply Option B"),
+                               runtime.CHOICE_KIND),
+                runtime.answer(adapter, self._ack(adapter), *_alert_choice(0, "Apply Option A"),
+                               runtime.CHOICE_KIND),
+            )
+
+        _run(both())
+        turns = [entry[1]["text"] for entry in adapter.log if entry[0] == "message"]
+        self.assertEqual(turns, ["Apply Option B"])
 
     def test_flag_off_is_disabled(self):
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
