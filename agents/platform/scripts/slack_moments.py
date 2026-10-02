@@ -88,7 +88,7 @@ JOIN = frozenset({"and", "then"})
 OUR_LEAD = frozenset({"i", "we", "i've", "we've", "i’ve", "we’ve"})
 #: An outcome a label may name before "opened": "Done: opened", "Tests passed, opened".
 OUTCOME_WORD = frozenset({
-    "done", "update", "next", "result", "ready", "green", "complete", "completed", "finished",
+    "done", "update", "next", "result", "ready", "green", "complete", "completed", "finished", "passed",
 })
 #: A label naming the PR with no subject: "PR opened: <url>".
 PR_LABEL = (["pr"], ["pull", "request"])
@@ -99,17 +99,17 @@ OTHER_SUBJECT = frozenset({"he", "she", "they", "who", "which"})
 #: The worker's own earlier steps. A list rather than "-ed", which would take
 #: "Ahmed then opened" and "Fred reviewed and opened" as ours.
 OUR_VERB = frozenset({
-    "added", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built",
+    "added", "addressed", "adjusted", "analysed", "analyzed", "applied", "audited", "began", "bumped", "built",
     "changed", "checked", "cleaned", "closed", "committed", "compared", "confirmed", "corrected",
     "created", "debugged", "decreased", "deployed", "diagnosed", "did", "disabled", "documented",
-    "drafted", "edited", "enabled", "fetched", "filed", "fixed", "found", "generated", "got",
-    "identified", "implemented", "increased", "inspected", "installed", "investigated", "kept",
+    "drafted", "edited", "enabled", "fetched", "filed", "fixed", "following", "found", "generated", "got",
+    "identified", "implemented", "increased", "inspected", "installed", "investigated", "investigating", "kept",
     "looked", "lowered", "made", "merged", "migrated", "modified", "moved", "opened", "patched",
-    "pinned", "prepared", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
-    "rebuilt", "reduced", "refactored", "regenerated", "removed", "renamed", "replaced",
-    "reproduced", "reran", "restarted", "restored", "reverted", "reviewed", "rewrote", "rolled",
-    "scaled", "sent", "set", "split", "submitted", "superseded", "tested", "took", "traced",
-    "tuned", "updated", "upgraded", "validated", "verified", "wrote",
+    "pinned", "prepared", "proposed", "pulled", "pushed", "put", "raised", "ran", "re-ran", "read", "rebased",
+    "rebuilt", "reduced", "refactored", "regenerated", "released", "removed", "renamed", "replaced",
+    "reproduced", "reran", "resolved", "restarted", "restored", "reverted", "reviewed", "rewrote", "rolled",
+    "scaled", "sent", "set", "shipped", "split", "submitted", "superseded", "tested", "took", "traced",
+    "tuned", "updated", "updating", "upgraded", "validated", "verified", "working", "wrote",
 })
 #: The worker's line under the headline, clipped: a note can be one long
 #: paragraph, and a Slack context element holds at most 3,000 characters.
@@ -202,7 +202,7 @@ def _a_name(clause: str) -> bool:
     step or outcome of ours ("Done", "Checked it", "Tests passed", "Following up")."""
     words = _trimmed([w.lower() for w in CLAUSE_WORD.findall(clause)])
     return bool(words) and not any(
-        w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD or w.endswith(("ed", "ing")) for w in words
+        w in OUR_LEAD or w in OUR_VERB or w in OUTCOME_WORD for w in words
     )
 
 
@@ -260,12 +260,32 @@ def _escape(text: str) -> str:
     return text
 
 
-def _with_subline(blocks: list[dict], subline: str) -> list[dict]:
+def _link(match: re.Match) -> str:
+    label, url = match.group(1), match.group(2)
+    if not _presenter._safe_link_url(url):
+        return _escape(match.group(0))
+    return f"<{_presenter._link_url(url)}|{_escape(label)}>"
+
+
+def _subline_mrkdwn(subline: str) -> str:
+    """``subline`` escaped, with each Markdown link outside a code span as a mrkdwn link."""
+    held, spans = _presenter._hold_code(subline.replace("\x00", ""))
+    parts, last = [], 0
+    for match in _presenter.MD_LINK.finditer(held):
+        parts += [_escape(held[last : match.start()]), _link(match)]
+        last = match.end()
+    text = "".join(parts) + _escape(held[last:])
+    return _presenter.CODE_PLACEHOLDER.sub(lambda m: _escape(spans[int(m.group(1))][0]), text)
+
+
+def _with_subline(blocks: list[dict], subline: str, links: bool = False) -> list[dict]:
     """``blocks`` with ``subline`` as a context line under the headline, escaped so
-    the worker's words cannot mention anyone."""
+    the worker's words cannot mention anyone; with ``links``, a Markdown link stays
+    a link. An opened PR's line keeps its links as text, for :data:`PR_URL`'s reason."""
     if not subline:
         return blocks
-    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": _escape(subline)}]}
+    text = _subline_mrkdwn(subline) if links else _escape(subline)
+    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
     return [*blocks[:1], context, *blocks[1:]]
 
 
@@ -369,7 +389,8 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
         start, options = len(lines), []
     first = lines[0].strip()
     # A clipped headline keeps its whole line below it too.
-    below = 0 if len(first) > _presenter.HEADLINE_MAX else 1
+    # Measured as shown: a link's url is not on screen.
+    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX else 1
     return first, [*before, *lines[below:start]], options
 
 
@@ -400,6 +421,7 @@ def needs_you(reason: str, buttons: bool = True) -> tuple[list[dict], str] | Non
     blocks = _with_subline(
         _presenter.blocks_answer(headline, choices=options, action_id_prefix=NEEDS_YOU_ACTION_PREFIX),
         detail,
+        links=True,
     )
     blocks.append({
         "type": "context",

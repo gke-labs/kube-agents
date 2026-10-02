@@ -436,13 +436,13 @@ async def _drive(module) -> None:
             raise _fail(f"register() wired {len(adapter._app.listeners)} listeners, expected 2")
         await module.answer(adapter, _ack, *_click(), module.CHOICE_KIND)
         kinds = [entry[0] for entry in adapter.log]
-        if kinds != ["chat_update", "chat_postMessage", "message"]:
+        if kinds != ["chat_update", "message"]:
             raise _fail(f"an authorized choice click made {kinds!r}")
-        update, echo, turn = (entry[1] for entry in adapter.log)
+        update, turn = (entry[1] for entry in adapter.log)
         if any(b.get("type") == "actions" for b in update["blocks"]):
             raise _fail("the answered choice buttons are still on the message")
-        if echo["thread_ts"] != THREAD or f"<@{USER}>" not in echo["text"]:
-            raise _fail(f"the echo was {echo!r}")
+        if f"<@{USER}>" not in update["text"]:
+            raise _fail(f"the answered message does not name the clicker: {update!r}")
         expected = {"user": USER, "text": LABEL, "channel": CHANNEL, "thread_ts": THREAD, "ts": ACTION_TS}
         if {k: turn.get(k) for k in expected} != expected:
             raise _fail(f"the turn was {turn!r}")
@@ -461,7 +461,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     asyncio.run(_drive(_load_runtime(root)))
     print(
         "slack_ux_clicks verify: registration guarded after the plugin handlers; "
-        "an authorized choice click is echoed and runs as the clicker's turn, an unauthorized one does nothing"
+        "an authorized choice click is marked answered and runs as the clicker's turn, an unauthorized one does nothing"
     )
 
 

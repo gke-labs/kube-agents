@@ -197,8 +197,7 @@ async def needs_you(adapter: Any, sub: dict, payload: Any, event_id: int = 0) ->
         return False
     if asked(sub, event_id):
         return True
-    # A card blocks again only after it was unblocked, so an earlier question is answered.
-    await settle_question(adapter, sub)
+    # The caller settled any earlier question first (kanban_progress_lines.deliver).
     key = _sub_key(sub)
     earlier = _questions.get(key)
     if earlier is not None:
