@@ -291,7 +291,8 @@ takes the token up to the next space, so `bus-publish-failed at working` reads a
 `bus-publish-failed`, and a message without the prefix is an unknown reason. The executors' own
 reasons, the bridge's `bridge-shutdown`, `bridge-queue-overflow`, `bus-publish-failed`,
 `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited` (a turn that gave
-up on the provider's rate limit or billing, Hermes's exit 75 or the API server's 429) and
+up on the provider's rate limit or billing, Hermes's exit 75 or the API server's
+`X-Hermes-Failure-Reason` header, or the API server's concurrent-run cap answering 429) and
 `hermes-api-unreachable` (the bridge never got a response from the pod's API server) and the
 worker adapter's `worker-evicted`
 and `bus-subscribe-failed` (`spawn-failed` is both), are infrastructure, the class the api

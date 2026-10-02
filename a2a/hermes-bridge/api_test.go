@@ -2,6 +2,7 @@ package hermesbridge
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -221,6 +222,54 @@ func TestAPI_TurnsInOneSessionAreSerialized(t *testing.T) {
 	}
 }
 
+// A task whose deadline passes while it waits behind its session's previous
+// turn says so: no request was sent, which is not the persona running long.
+func TestAPI_DeadlineWhileWaitingIsNamed(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		writeCompletion(w, c.sessionID, "unexpected")
+	})
+	b := startAPIBridge(t, url, stub, func(cfg *Config) { cfg.TaskDeadline = 2 * time.Second })
+	// The session's turn is held for longer than the task's deadline, as a
+	// sibling's long turn would hold it.
+	release := b.turns.acquire(context.Background(), "a2a-ctx-wait")
+	if release == nil {
+		t.Fatal("could not take the session's turn")
+	}
+	t.Cleanup(release)
+	c := gatewayClient(t, url)
+	submitIn(t, c, "task-waiter", "ctx-wait", "second")
+	task := waitTerminal(t, c, "task-waiter")
+	if task.State != lib.StateFailed {
+		t.Fatalf("state = %s, want failed", task.State)
+	}
+	want := "reason: deadline-exceeded - waited 2s for the session's previous turn; no request was sent"
+	if reason := terminalReason(t, task); reason != want {
+		t.Fatalf("reason = %q, want %q", reason, want)
+	}
+	if n := len(stub.seen()); n != 0 {
+		t.Fatalf("requests = %d, want 0: the waiter never reached the server", n)
+	}
+}
+
+// A turn the server marks incomplete but not failed (truncated, partial)
+// completes with its text, as `hermes chat -Q` exits zero on it.
+func TestAPI_PartialTurnCompletes(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+		w.Header().Set("X-Hermes-Completed", "false")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"half an answer"},"finish_reason":"length"}],`+
+			`"hermes":{"completed":false,"partial":true,"failed":false,"error":"output truncated","error_code":"output_truncated"}}`)
+	})
+	startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+	submitIn(t, c, "task-partial", "ctx-partial", "go")
+	task := waitTerminal(t, c, "task-partial")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+}
+
 // A cancel ends the request: the server sees its client go away, and the
 // task's terminal is canceled.
 func TestAPI_CancelEndsTheRequest(t *testing.T) {
@@ -260,10 +309,30 @@ func TestAPI_FailuresAreNamed(t *testing.T) {
 		handle func(w http.ResponseWriter, r *http.Request, c apiCall)
 		want   string
 	}{
-		{"rate limited", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+		{"run cap", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
 			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = io.WriteString(w, `{"error":{"message":"quota"}}`)
+			_, _ = io.WriteString(w, `{"error":{"message":"Too many concurrent runs (max 10)"}}`)
 		}, "reason: hermes-rate-limited - HTTP 429; session: a2a-ctx-fail; body tail: "},
+		{"turn failed with text", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.Header().Set("X-Hermes-Completed", "false")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"The provider rate-limited me."},"finish_reason":"error"}],`+
+				`"hermes":{"completed":false,"partial":false,"failed":true,"error":"HTTP 429 from provider","error_code":"agent_error"}}`)
+		}, "reason: hermes-api-failed - HTTP 200, turn failed; session: a2a-ctx-fail; error: HTTP 429 from provider"},
+		{"turn gave up on the provider's rate limit", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.Header().Set("X-Hermes-Failure-Reason", "rate_limit")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"Rate limited."},"finish_reason":"error"}],`+
+				`"hermes":{"completed":false,"partial":false,"failed":true,"error":"HTTP 429","error_code":"agent_error"}}`)
+		}, "reason: hermes-rate-limited - HTTP 200, turn failed; session: a2a-ctx-fail; error: HTTP 429"},
+		{"billing failure with no text", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.Header().Set("X-Hermes-Failure-Reason", "billing")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"message":"credits exhausted","code":"agent_incomplete"}}`)
+		}, "reason: hermes-rate-limited - HTTP 502; session: a2a-ctx-fail; body tail: "},
+		{"other reason with no text", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.Header().Set("X-Hermes-Failure-Reason", "tool_error")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"message":"boom","code":"agent_incomplete"}}`)
+		}, "reason: hermes-api-failed - HTTP 502; session: a2a-ctx-fail; body tail: "},
 		{"server error", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, "boom")
@@ -277,7 +346,7 @@ func TestAPI_FailuresAreNamed(t *testing.T) {
 			_, url := startServer(t)
 			startAPIBridge(t, url, newAPIStub(t, tc.handle), nil)
 			c := gatewayClient(t, url)
-			taskID := "task-fail-" + strings.ReplaceAll(tc.name, " ", "-")
+			taskID := "task-fail-" + strings.NewReplacer(" ", "-", "'", "").Replace(tc.name)
 			submitIn(t, c, taskID, "ctx-fail", "doomed")
 			task := waitTerminal(t, c, taskID)
 			if task.State != lib.StateFailed {

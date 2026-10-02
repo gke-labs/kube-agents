@@ -58,8 +58,10 @@ const (
 	// from the chat platforms' and the CLI's.
 	apiSessionIDPrefix = "a2a-"
 	// apiHashedSessionPrefix follows apiSessionIDPrefix when the contextId
-	// is not usable verbatim (apiSessionID), so a hashed id cannot collide
-	// with a verbatim one.
+	// is not usable verbatim (apiSessionID). It marks the id as hashed for a
+	// reader; it does not partition the namespace, since a contextId of
+	// "h-" plus 32 hex is itself verbatim-safe. Nothing rests on it: a
+	// sender who can name a session's contextId can already send into it.
 	apiHashedSessionPrefix = "h-"
 	// apiContextIDMaxLen is the longest contextId used verbatim. The
 	// gateway's are "ctx-" plus 32 hex; the server caps the header too.
@@ -77,11 +79,20 @@ const (
 	// the turn again. The task id is the key, so a bridge restart that
 	// redelivers a task does not run it twice in the session.
 	apiIdempotencyHeader = "Idempotency-Key"
-	// apiRateLimitedStatus is the status the server answers when the
-	// provider rate-limited or billed out the turn; it maps to the same
-	// reason token as the CLI's EX_TEMPFAIL exit, so the eval harness
-	// classes it as infrastructure either way.
+	// apiRateLimitedStatus is the status the server answers when it is
+	// already running its cap of concurrent turns
+	// (gateway.api_server.max_concurrent_runs), before the turn starts. It
+	// maps to the reason token of the CLI's EX_TEMPFAIL exit, so the eval
+	// harness classes it as infrastructure. A provider's own rate limit is
+	// not this: the turn runs and fails, and is read from
+	// apiFailureReasonHeader.
 	apiRateLimitedStatus = http.StatusTooManyRequests
+	// apiFailureReasonHeader names the failure_reason Hermes classified a
+	// failed turn under; the image's api_failure_reason_header patch adds it
+	// to both the 200 and the 502 answer. apiRateLimitedReasons are the
+	// reasons the CLI exits 75 on, so a turn that gave up on the provider is
+	// hermes-rate-limited on either executor.
+	apiFailureReasonHeader = "X-Hermes-Failure-Reason"
 	// apiBodyTailBytes bounds the error body quoted in a failed terminal.
 	apiBodyTailBytes = 2048
 	// apiResponseCap bounds a successful response body read: an answer is
@@ -96,6 +107,14 @@ const (
 	DefaultAPIConnectRetry  = 2 * time.Minute
 	apiConnectRetryInterval = time.Second
 )
+
+// errWaitingForTurn is the error a task whose context ended while it waited
+// for its session's previous turn carries into finalizeAPIError.
+var errWaitingForTurn = errors.New("waiting for the session's previous turn")
+
+// apiRateLimitedReasons is the set apiFailureReasonHeader is checked against:
+// the reasons apply_quiet_rate_limit_exit.py exits 75 on.
+var apiRateLimitedReasons = map[string]bool{"rate_limit": true, "billing": true}
 
 // apiSafeContextID is what a contextId may hold to be used verbatim in a
 // session id: the server interpolates the id into a filename and refuses a
@@ -181,16 +200,28 @@ type apiChatMessage struct {
 }
 
 // apiChatResponse is the subset of the chat-completions response the bridge
-// reads: the first choice's text. The server also answers an OpenAI error
-// envelope on a hard failure, with a non-2xx status; that path reads the
-// body as text.
+// reads: the first choice's text, and the server's own verdict on the turn.
+// A turn that failed with no text comes back as an OpenAI error envelope
+// with a non-2xx status, read as text; one that failed with text (a
+// provider error, a rate limit the retries did not outlast, the failure
+// summary Hermes writes for either) comes back 200 with Hermes.Failed set.
 type apiChatResponse struct {
 	Choices []struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Hermes *struct {
+		Failed bool   `json:"failed"`
+		Error  string `json:"error"`
+	} `json:"hermes"`
+}
+
+// apiTurnFailed reports whether the server marked the turn failed, the case
+// in which `hermes chat -Q` exits non-zero; a partial or truncated turn that
+// did not fail completes, as it does on the subprocess path.
+func apiTurnFailed(out *apiChatResponse) bool {
+	return out.Hermes != nil && out.Hermes.Failed
 }
 
 // runTaskAPI is runTask for ExecutorAPI. The lifecycle is the subprocess
@@ -255,7 +286,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 
 	release := b.turns.acquire(reqCtx, sessionID)
 	if release == nil {
-		b.finalizeAPIError(run, reqCtx, fmt.Errorf("waiting for the session's previous turn: %w", reqCtx.Err()))
+		b.finalizeAPIError(run, reqCtx, errWaitingForTurn)
 		return
 	}
 	defer release()
@@ -282,7 +313,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		reason := "hermes-api-failed"
-		if resp.StatusCode == apiRateLimitedStatus {
+		if resp.StatusCode == apiRateLimitedStatus || apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
 			reason = "hermes-rate-limited"
 		}
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s; body tail: %s",
@@ -295,8 +326,14 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 			resp.StatusCode, sessionID, tail(string(raw), apiBodyTailBytes)), nil)
 		return
 	}
-	if got := resp.Header.Get(apiSessionIDHeader); got != "" && got != sessionID {
-		b.cfg.Logger.Warn("hermes answered under another session id", "task", taskID, "sent", sessionID, "got", got)
+	if apiTurnFailed(&out) {
+		reason := "hermes-api-failed"
+		if apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
+			reason = "hermes-rate-limited"
+		}
+		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s; error: %s",
+			reason, resp.StatusCode, sessionID, tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+		return
 	}
 	// A canceled task that finished anyway won the race: completed wins,
 	// per the payload spec's cancel mapping, as on the subprocess path.
@@ -333,6 +370,9 @@ func (b *Bridge) finalizeAPIError(run *taskRun, reqCtx context.Context, err erro
 		b.finalize(run, lib.StateCanceled, "reason: canceled-by-request", nil)
 	case b.closing.Load():
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
+	case reqCtx.Err() == context.DeadlineExceeded && errors.Is(err, errWaitingForTurn):
+		b.finalize(run, lib.StateFailed,
+			fmt.Sprintf("reason: deadline-exceeded - waited %s for the session's previous turn; no request was sent", b.cfg.TaskDeadline), nil)
 	case reqCtx.Err() == context.DeadlineExceeded:
 		b.finalize(run, lib.StateFailed,
 			fmt.Sprintf("reason: deadline-exceeded - request ended after %s", b.cfg.TaskDeadline), nil)

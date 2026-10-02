@@ -225,10 +225,15 @@ trace. With `BRIDGE_EXECUTOR` unset and no key, the bridge logs a warning and ru
 executor, so a sidecar declared before `api` existed keeps working; `BRIDGE_EXECUTOR=api` with
 no key is refused at start.
 
-Two things the `api` executor does not do. A kanban card the persona creates completes after
-the turn has answered, and the API server has no channel to push that completion back, so it
-never reaches the A2A thread; the `cli` executor loses it the same way. And a running turn
-cannot be steered: a follow-up to a running task gets the refusal described below.
+What the `api` executor does not do. A kanban card the persona creates completes after the turn
+has answered, and the API server has no channel to push that completion back, so it never reaches
+the A2A thread; the `cli` executor loses it the same way. A running turn cannot be steered: a
+follow-up to a running task gets the refusal described below. A turn the bridge stops waiting
+for, on cancel or the deadline, may keep running in the server, and the next task on the same
+session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
+Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
+session it continues it under a new session id, which the hook reports and the trace's key does
+not match, so the trace stops for that conversation while the answers keep arriving.
 
 **`cli`: a subprocess per task.** `hermes -p <BRIDGE_PROFILE> chat -Q -q <prompt>`, a fresh
 session for every task, with no memory of the thread's earlier tasks. The rest of this page
@@ -317,17 +322,19 @@ Under the `api` executor `working` is published before the request goes out, and
 shutdown and the deadline end the HTTP request where the `cli` executor kills a process group,
 with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
 the request ends the bridge's wait; whether the server abandons the turn it was running is the
-server's. The failures name themselves in the status message:
+server's. Turns on one session run one at a time; a task still waiting for the previous turn
+when its deadline passes ends `reason: deadline-exceeded - waited <d> for the session's previous
+turn; no request was sent`. The failures name themselves in the status message:
 
-| Reason                   | When                                                                              | Eval harness class |
-| ------------------------ | --------------------------------------------------------------------------------- | ------------------ |
-| `hermes-rate-limited`    | the server answered 429, the provider's rate limit or billing                     | infrastructure     |
-| `hermes-api-unreachable` | no response: still refused after the two-minute retry, or the connection failed   | infrastructure     |
-| `hermes-api-failed`      | any other non-2xx answer; the message carries the status, session and a body tail | persona            |
-| `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice               | persona            |
-| `hermes-api-read-failed` | the response body broke off mid-read                                              | persona            |
-| `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice | graded (unlisted)  |
-| `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise  | graded (unlisted)  |
+| Reason                   | When                                                                                                                                    | Eval harness class |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `hermes-rate-limited`    | the server answered 429 (its concurrent-run cap), or `X-Hermes-Failure-Reason` names the provider's rate limit or billing               | infrastructure     |
+| `hermes-api-unreachable` | no response: still refused after the two-minute retry, or the connection failed                                                         | infrastructure     |
+| `hermes-api-failed`      | any other non-2xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail | persona            |
+| `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice                                                                     | persona            |
+| `hermes-api-read-failed` | the response body broke off mid-read                                                                                                    | persona            |
+| `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                       | graded (unlisted)  |
+| `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                        | graded (unlisted)  |
 
 ## Sizing against the eval harness
 

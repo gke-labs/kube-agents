@@ -330,8 +330,9 @@ REASON_WORKER_EVICTED = "worker-evicted"
 REASON_BUS_SUBSCRIBE_FAILED = "bus-subscribe-failed"
 # The hermes turn gave up on the model provider's rate limit or billing (its
 # retries exhausted the 429 window; exit 75, EX_TEMPFAIL, the code Hermes
-# reserves for both). A quota storm is the install's, not the persona's: the
-# turn never got an answer to grade.
+# reserves for both, or the API server's X-Hermes-Failure-Reason header), or
+# the API server refused the turn at its concurrent-run cap. A quota storm is
+# the install's, not the persona's: the turn never got an answer to grade.
 REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
 # The bridge's api executor got no response from the pod's Hermes API server:
 # the connection was still refused after the bridge's startup retry window,
