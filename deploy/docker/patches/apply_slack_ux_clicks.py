@@ -13,11 +13,12 @@ handlers::
 
 and the module import is appended to the end of the file, where it resolves at
 import time, before the adapter connects. With the flag off nothing is
-registered, so the adapter's listeners are exactly upstream's. After the
-plugin handlers, because Bolt dispatches to the first matching listener: a
-plugin that claims one of these action ids keeps it. What the handlers do,
-and why, is in the module docstring of
-``deploy/docker/patches/slack_ux_clicks.py``.
+registered, so the adapter's listeners are exactly upstream's. Bolt
+dispatches to the first matching listener, so a plugin that claims one of
+these action ids through ``ctx.register_slack_action_handler`` keeps it, since
+those are wired before these; a ``ctx.register_platform_handler`` factory is
+wired after them and loses it. What the handlers do, and why, is in the
+module docstring of ``deploy/docker/patches/slack_ux_clicks.py``.
 
 The anchor is the call that wires the plugin action handlers: one line,
 unique in the file, and inside the method that must run before Socket Mode
