@@ -4312,6 +4312,11 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 	// forever (the same skip-and-continue discipline deleteA2AProvisionJobs
 	// uses for unowned Jobs).
 	if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
+		logf.FromContext(ctx).Info("skipping unowned A2A callout ClusterRoleBinding",
+			"binding", crb.Name,
+			"instance", crb.Labels[labelInstance],
+			"expectedInstance", instanceLabel(agent.Namespace, agent.Name),
+		)
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))

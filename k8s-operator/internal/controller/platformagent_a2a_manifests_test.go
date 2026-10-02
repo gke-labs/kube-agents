@@ -2387,6 +2387,54 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	}
 }
 
+// TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding pins the invariant
+// that on CR deletion (handleDeletion), an unowned or squatted callout
+// ClusterRoleBinding is logged and skipped rather than wedging finalizer removal,
+// allowing PlatformAgent deletion to complete while leaving the foreign
+// binding untouched.
+func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Finalizers = []string{platformAgentFinalizer}
+	now := metav1.Now()
+	agent.DeletionTimestamp = &now
+
+	crbName := a2aCalloutClusterRoleBindingName(agent)
+	crb := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: crbName,
+			Labels: map[string]string{
+				labelInstance: "foreign-agent",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent.DeepCopy(), crb.DeepCopy()).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	currentAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, currentAgent); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+	if _, err := r.handleDeletion(ctx, currentAgent); err != nil {
+		t.Fatalf("handleDeletion failed: %v", err)
+	}
+
+	// The foreign ClusterRoleBinding must still exist untouched.
+	gotCRB := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, gotCRB); err != nil {
+		t.Errorf("foreign ClusterRoleBinding was deleted or errored: %v", err)
+	}
+	if gotCRB.Labels[labelInstance] != "foreign-agent" {
+		t.Errorf("foreign ClusterRoleBinding label modified: %v", gotCRB.Labels[labelInstance])
+	}
+}
+
 // TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
