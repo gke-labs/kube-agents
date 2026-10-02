@@ -300,8 +300,10 @@ class DefaultOnKeysAreRefusableTest(unittest.TestCase):
         # The same shape as the drift key and genuinely unaddressed: the default
         # enables the Vertex API on the serving project and grants the gateway's
         # role there, so an omission acts on a project rather than skipping it,
-        # and a long-lived environment has no variable that declines. Left as it
-        # was found -- flipping one default is not licence to widen the audit.
+        # and a long-lived environment has no variable that declines. Narrower
+        # in that nothing happens unless model_provider is vertex_ai. Left as it
+        # was found -- flipping one default is not licence to widen the audit --
+        # and tracked as issue #2269, which is what removes this entry.
         "VERTEX_MANAGE_SERVING_PROJECT",
     }
 
