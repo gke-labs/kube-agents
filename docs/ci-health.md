@@ -809,12 +809,17 @@ scan's finding lines), as is the bot's own issue when its title fell back to a
 count, matched on the finding ids its hidden marker carries. A finding a leased
 run passes with is said the other way round: the verifier lists those in
 `LEASE_SILENT_FINDINGS` (today `gke/host-otel-scope`, a host cluster that serves
-the lease and exports no traces), `health.py` copies the firing ones into the
-incident's `passes_leases`, and the advice, the Chat sentence, the digest line
-and the issue body then say that no run reds from it and a 403 on one of those
-projects is the change's to read; when such a finding fires beside one that
-does red a run, the 403 sentence names the latter and its projects and the
-exception follows it. When only such findings fire, the message's header reads
+the lease and exports no traces), `health.py` splits the firing findings once,
+into the incident's `passes_leases` and `reds_runs` with the projects one of
+the latter is on under `reds_runs_projects` (the `pool_state` block carries the
+same three over every drifted project), and the advice, the Chat sentence, the
+digest line and the issue body read that split rather than making their own:
+they say that no run reds from such a finding and a 403 on one of those
+projects is the change's to read; when it fires beside a finding that does red
+a run, the 403 sentence names the latter, the advice names and the three others
+count only the projects it is on, and the exception follows it. An incident
+held from before the split was carried has no classification, and reads as
+every finding redding a run. When only such findings fire, the message's header reads
 `pool drifted, runs unaffected` in place of `flaky`: the other DEGRADED headers
 mean "retest" by that word, and this one has nothing to retest for.
 

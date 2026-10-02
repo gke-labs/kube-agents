@@ -2516,6 +2516,8 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual(result["cause"], f"pool drift: {SILENT_FINDING} on 3 pool project(s)")
         self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
         self.assertEqual(result["pool_state"]["passes_leases"], [SILENT_FINDING])
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([], []))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([], []))
         self.assertEqual(
             result["advice"],
             f"No run reds from {SILENT_FINDING} on {project(1)}, {project(2)}, {project(3)}: an install there passes its lease with that gap,"
@@ -2533,6 +2535,13 @@ class PoolDrift(unittest.TestCase):
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "pool_drift"))
         self.assertEqual(result["incident"]["roles"], [SILENT_FINDING, FINDING])
         self.assertEqual(result["incident"]["passes_leases"], [SILENT_FINDING])
+        # The split is carried once, here, for every renderer: the findings
+        # a leased run reds on and the projects one of them is on, in the
+        # incident (the firing ones) and the pool_state block (every drifted
+        # project this scan).
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual((result["pool_state"]["reds_runs"], result["pool_state"]["reds_runs_projects"]), ([FINDING], [project(1), project(2), project(3)]))
+        self.assertEqual(health.pool_drift_split(result["incident"]), ([FINDING], [SILENT_FINDING], [project(1), project(2), project(3)]))
         advice = result["advice"]
         self.assertEqual(
             advice,
@@ -2546,6 +2555,19 @@ class PoolDrift(unittest.TestCase):
     def test_a_pool_finding_that_reds_runs_lists_nothing_under_passes_leases(self):
         result = self.judge(pool_scan(drifted={project(1): [FINDING]}, previous={project(1): [FINDING]}))
         self.assertEqual((result["incident"]["passes_leases"], result["pool_state"]["passes_leases"]), ([], []))
+        self.assertEqual((result["incident"]["reds_runs"], result["incident"]["reds_runs_projects"]), ([FINDING], [project(1)]))
+
+    def test_an_incident_from_before_the_split_was_carried_reads_every_finding_as_one_a_run_reds_on(self):
+        # A held incident is the previous tick's document; one written before
+        # the split was carried has no classification, and the advice for it
+        # is the one from before the split, on every project.
+        incident = {"roles": [FINDING], "projects": [project(1), project(2)], "drift": {}}
+        self.assertEqual(health.pool_drift_split(incident), ([FINDING], [], [project(1), project(2)]))
+        self.assertEqual(
+            health.advice_for("DEGRADED", "pool_drift", [], None, {}, incident=incident),
+            f"A 403 or a missing-resource red from a run that leased {project(1)}, {project(2)} is the pool project's shape, not your change"
+            f" ({FINDING}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding.",
+        )
 
     def test_ranked_below_fixture_drift_and_every_run_based_condition(self):
         both = self.judge(pool_scan(drifted={project(i): [FINDING] for i in (1, 2, 3)}), fleet=scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}))

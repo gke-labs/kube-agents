@@ -58,8 +58,15 @@ owns what the issue says.
 
 from __future__ import annotations
 
+import pathlib
 import re
 import sys
+
+try:
+    from .health import pool_drift_split
+except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from health import pool_drift_split
 
 LABEL = "presubmit-gate"
 JOB_NAME = "pull-kube-agents-smoke-test"
@@ -216,18 +223,25 @@ Incident brief: {brief}
 Filed automatically by the smoke health bot; whoever holds the pool should run the repairs in the projects named; the bot will not close it.
 """
 # POOL_DRIFT_BODY's consequence for a pull request, by whether a leased run
-# reds on the findings; health.py's incident lists the ones it does not under
-# `passes_leases` (the verifier's LEASE_SILENT_FINDINGS).
+# reds on the findings; health.py's incident carries the split (pool_drift_split:
+# `reds_runs`, `passes_leases` from the verifier's LEASE_SILENT_FINDINGS, and
+# `reds_runs_projects`). When both kinds fire, the 403 sentence counts only
+# the projects a finding a run reds on is on; the per-project blocks below it
+# say which those are.
 POOL_DRIFT_REDS_RUNS = (
     "so a run that leases one of these projects fails on the missing grant, API, key or cluster -- a 403 or a missing"
     " resource in the agent's transcript -- and that red is the pool's, not the pull request's. A retest is worth it only after the repair below."
+)
+POOL_DRIFT_REDS_RUNS_BESIDE = (
+    "so a run that leases a project below with {findings} ({count} of the {total}) fails on the missing grant, API, key or cluster -- a 403 or a missing"
+    " resource in the agent's transcript -- and that red is the pool's, not the pull request's; {silent} on its own reds no run, so a red on one of the"
+    " others is the pull request's to read. A retest is worth it only after the repair below."
 )
 POOL_DRIFT_PASSES_LEASES = (
     "and a run that leases one of these projects passes with the gap: {findings} reds no run (the install serves and grades;"
     " only what the finding names is missing), so a 403 or a missing-resource red there is the pull request's to read, not the"
     " pool's, and nothing on a pull request waits for the repair below."
 )
-POOL_DRIFT_PASSES_LEASES_TAIL = " {findings} on its own reds no run; a red is the pool's only on a project with one of the other findings."
 RECOVERY_COMMENT = "Healthy again after {lasted}; bot will not close it."
 NO_EVIDENCE = "- (none recorded)"
 UNKNOWN_NODE = "(node name not recorded)"
@@ -414,12 +428,15 @@ def _pool_evidence(lines, findings):
 def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
-    silent = [finding for finding in findings if finding in set(incident.get("passes_leases") or [])]
-    loud = [finding for finding in findings if finding not in silent]
-    if findings and not loud:
+    loud, silent, loud_projects = pool_drift_split(incident)
+    if silent and not loud:
         consequence = POOL_DRIFT_PASSES_LEASES.format(findings=", ".join(silent))
+    elif silent:
+        consequence = POOL_DRIFT_REDS_RUNS_BESIDE.format(
+            findings=", ".join(loud), count=len(loud_projects), total=len(incident.get("projects") or []), silent=", ".join(silent)
+        )
     else:
-        consequence = POOL_DRIFT_REDS_RUNS + (POOL_DRIFT_PASSES_LEASES_TAIL.format(findings=", ".join(silent)) if silent else "")
+        consequence = POOL_DRIFT_REDS_RUNS
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
     evidence = [f"- {line}" for line in _pool_evidence(health.get("evidence") or [], findings)]
