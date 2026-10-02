@@ -4255,12 +4255,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	//
-	// KAGE_SLACK_UX switches the Slack adapter between two code paths already
-	// in the image: which reaction goes on an ask and when it settles. It is
-	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
-	// value is off, the image default. It names no path, URL, credential or
-	// image, and no value of it reaches anything but the reactions the gateway
-	// adds to messages it already receives.
+	// KAGE_SLACK_UX switches between code paths already in the image, all of
+	// them about Slack. It is compared against `FLAG_ON_VALUES` in
+	// `slack_presenter.py`; any other value is off, the image default. It names
+	// no path, URL, credential or image, and no value of it adds a destination,
+	// a write or a credential. Each effect it switches, one per change that
+	// ships it:
+	//
+	//   - Clicks: a click on a choice runs as the clicker's turn under the
+	//     adapter's own authorization, echoed in the same thread.
+	//   - Reactions: which reaction goes on an ask and when it settles.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's

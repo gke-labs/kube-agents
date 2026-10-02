@@ -4,9 +4,9 @@ Nothing here imports the Hermes gateway, the Slack SDK or the network, and
 every function is pure but :func:`ack_link_click`, the coroutine a caller
 registers to acknowledge a link-button click, so any process that posts to
 Slack can use it, and it can move with Slack ingress when it leaves the
-gateway. Today its one caller is the
-gateway's reactions patch (``slack_ux_reactions``), which the kanban notifier
-also reaches.
+gateway. Its callers include the gateway patches for reactions
+(``slack_ux_reactions``, which the kanban notifier also reaches) and button
+clicks (``slack_ux_clicks``).
 Every caller reaches it through ``PYTHONPATH=/opt/defaults/scripts``, which the
 operator sets on the agent container.
 
@@ -131,7 +131,8 @@ ELLIPSIS = "…"
 #: Action ids: ``<prefix>.link.<n>`` and ``<prefix>.choice.<n>``, which callers build
 #: from these. Link buttons open their url client-side and Slack still sends a
 #: block_actions request, which :func:`ack_link_click` acknowledges once a caller
-#: registers it for :data:`LINK_ACTION_ID_PATTERN`.
+#: registers it for :data:`LINK_ACTION_ID_PATTERN`; a choice click is answered as
+#: the clicker's reply (the gateway's ``slack_ux_clicks``).
 LINK_ACTION = "link"
 CHOICE_ACTION = "choice"
 LINK_ACTION_ID_PATTERN = re.compile(r"\.link\.\d+$")
