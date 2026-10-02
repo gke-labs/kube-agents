@@ -124,8 +124,9 @@ _READ_UNREADABLE = 3
 _READ_INCOMPLETE = 4
 
 # How much of a failed read's stderr `SandboxReadFailed` carries, from the end.
-# The login shell runs first and the model owns its startup file, so the stream
-# has no natural bound, and the failing command's own message comes last.
+# The login shell runs first, and on older sandbox images the model owns its
+# startup file, so the stream has no natural bound, and the failing command's
+# own message comes last.
 _READ_STDERR_CHARS = 200
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
