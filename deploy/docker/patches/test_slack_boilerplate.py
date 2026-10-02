@@ -723,6 +723,16 @@ class ApplierTest(unittest.TestCase):
             verifier.main(self.root.dir)
         self.assertIn("no longer looks up gateway.restart.restarting", str(caught.exception))
 
+    def test_verifier_refuses_a_spliced_call_reading_a_renamed_local(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        path.write_text(path.read_text().replace(
+            "def _deliver_result(job, content, targets", "def _deliver_result(job, body, targets"
+        ).replace("delivery_content = content", "delivery_content = body"))
+        with self.assertRaises(SystemExit) as caught:
+            verifier.main(self.root.dir)
+        self.assertIn("content (line", str(caught.exception))
+
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
         path = self.root.dir / applier.DELIVERY

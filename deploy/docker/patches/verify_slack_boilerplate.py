@@ -5,7 +5,7 @@ Run by ``deploy/docker/Dockerfile`` against the patched ``/opt/hermes`` tree,
 after ``apply_slack_boilerplate.py``, with ``slack_presenter.py`` staged beside
 this script.
 
-Four things are checked:
+Five things are checked:
 
 1. The call sites. Both cron send lanes take ``target_text``, bound from
    ``cron_delivery_text`` over the unwrapped ``content`` and the wrapped
@@ -39,7 +39,14 @@ Four things are checked:
    the exception holds. The words a drain reply or the interrupted-cron-job notice
    interpolates are read out of upstream too (``_status_action_gerund()`` and
    the notice's ``action`` binding), and each must be one the runtime rewords.
-4. The runtime module, loaded by path: on Slack with the flag on,
+4. The names a spliced call reads. Every ``_kage_slack_boilerplate.*``
+   call's arguments are evaluated before the helper reads the flag, so each
+   name they read must be bound where the call sits: a parameter or assignment
+   of an enclosing function, a module-level name, or a builtin. An upstream
+   rename of a local the anchors never mention (``content``, ``turn_ctx``,
+   ``event``, ``ctx``) would otherwise compile and raise ``NameError`` on every
+   call, flag off.
+5. The runtime module, loaded by path: on Slack with the flag on,
    ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
    off, and for any platform other than Slack, every helper returns its input
    and ``drop_notice`` is false.
@@ -48,6 +55,7 @@ Four things are checked:
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib.util
 import itertools
 import os
@@ -131,6 +139,8 @@ ERROR_HELPER = f"{ALIAS}.error_reply"
 ERROR_SHAPES = (f"{AUTH_ERROR}\nTraceback line two", AUTH_ERROR + "x" * 600)
 
 SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
+#: Every file the applier splices a helper call into.
+BOUND_READ_FILES = (DELIVERY, RUN_TURN, RUN_NOTIFICATIONS, RUN_BUSY, RUN_TURN_RUNNER, SLACK_ADAPTER)
 SLACK_CLASS = "SlackAdapter"
 #: Each hooked method, and what the statement just before the hook contains.
 SLACK_METHODS = {"send": "self._dm_target(", "edit_message": "return blocked"}
@@ -214,6 +224,63 @@ def _binds_alias(tree: ast.AST) -> bool:
         and any(a.name == "slack_boilerplate" and a.asname == ALIAS for a in stmt.names)
         for stmt in ast.walk(tree)
     )
+
+
+def _scope_names(body: list[ast.stmt], args: ast.arguments | None = None) -> set[str]:
+    """The names ``body`` binds in its own scope, without descending into nested functions or classes."""
+    names = set()
+    if args is not None:
+        names |= {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+        names |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
+    stack = list(body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.alias):
+            names.add((node.asname or node.name).split(".")[0])
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _unbound_reads(tree: ast.Module) -> tuple[int, list[str]]:
+    """How many spliced calls ``tree`` holds, and each name one reads that nothing binds where it sits."""
+    module = _scope_names(tree.body) | set(dir(builtins))
+    found, unbound = 0, []
+
+    def visit(node: ast.AST, bound: set[str]) -> None:
+        nonlocal found
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            body = node.body if isinstance(node.body, list) else [node.body]
+            bound = bound | _scope_names(body, node.args)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and _is_helper(node, node.func.attr):
+            found += 1
+            for arg in [*node.args, *(k.value for k in node.keywords)]:
+                local = _scope_names([arg])
+                for name in ast.walk(arg):
+                    if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load) and name.id not in bound | local:
+                        unbound.append(f"{name.id} (line {node.lineno}, {ast.unparse(node.func)})")
+        for child in ast.iter_child_nodes(node):
+            visit(child, bound)
+
+    visit(tree, module)
+    return found, unbound
+
+
+def check_bound_reads(root: Path) -> None:
+    for relative in BOUND_READ_FILES:
+        found, unbound = _unbound_reads(_tree(root, relative))
+        if not found:
+            raise _fail(f"{relative} carries no {ALIAS} call")
+        if unbound:
+            raise _fail(f"{relative} passes a {ALIAS} call a name nothing binds there: {', '.join(unbound)}")
 
 
 def check_delivery(root: Path) -> None:
@@ -588,6 +655,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     notices = check_notices(root)
     replies = check_system(root) + check_locale(root)
     check_error_sites(root)
+    check_bound_reads(root)
     runtime = _load_runtime(root)
     check_action_words(runtime, root)
     drive(runtime, notices, replies)
