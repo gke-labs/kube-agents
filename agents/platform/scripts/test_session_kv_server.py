@@ -4246,8 +4246,13 @@ class TestStallInject(unittest.TestCase):
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_a_record_missing_what_it_names_is_refused_before_anything_is_posted(self, trigger):
-        for overrides in ({"namespace": ""}, {"cluster": None}, {"objects": []}, {"objects": "Deployment/x"},
-                          {"objects": [{"heuristic": "stale-condition"}]}):
+        wrong_types = (["checkout"], 0, 7, False, {}, {"name": "checkout"})
+        cases = [{"namespace": ""}, {"cluster": None}, {"objects": []}, {"objects": "Deployment/x"},
+                 {"objects": [{"heuristic": "stale-condition"}]}]
+        cases += [{"namespace": value} for value in wrong_types]
+        cases += [{"cluster": value} for value in wrong_types]
+        cases += [{"objects": [{"object": value, "heuristic": "stale-condition", "stalled_for": "11m"}]} for value in wrong_types]
+        for overrides in cases:
             with self.subTest(overrides=overrides):
                 self.assertEqual(self._inject(**overrides).status_code, 400)
         trigger.assert_not_called()
@@ -4287,6 +4292,23 @@ class TestStallInject(unittest.TestCase):
                 self.assertEqual(response.json()["status"], "injected")
         card = session_kv_server._stall_task_body(self._payload(objects=[{"object": "Deployment/x", "heuristic": [], "stalled_for": "11m"}]))
         self.assertIn("- Deployment/x: unknown (11m)", card)
+
+    def test_an_overlong_duration_or_assignee_falls_back(self):
+        # The patterns bound the alphabet, not the length; the defang's cut does.
+        card = session_kv_server._stall_task_body(self._payload(objects=[
+            {"object": "Deployment/x", "heuristic": "stale-condition", "stalled_for": "9" * 1000 + "m"},
+        ]))
+        self.assertIn("- Deployment/x: stale-condition (unknown)", card)
+        self.assertNotIn("9" * 300, card)
+        query = session_kv_server._build_agent_query(self._payload(assignee="cluster-" + "a" * 1000))
+        self.assertIn("the `cluster-*` agent scoped to **prod-us-east1**", query)
+        self.assertNotIn("a" * 300, query)
+
+    def test_a_non_ascii_digit_duration_falls_back(self):
+        card = session_kv_server._stall_task_body(self._payload(objects=[
+            {"object": "Deployment/x", "heuristic": "stale-condition", "stalled_for": "\u0663m"},
+        ]))
+        self.assertIn("- Deployment/x: stale-condition (unknown)", card)
 
     def test_a_trailing_newline_does_not_pass_the_closed_set_checks(self):
         card = session_kv_server._stall_task_body(self._payload(objects=[

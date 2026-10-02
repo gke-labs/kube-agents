@@ -80,8 +80,9 @@ Every number comes from one table: `intercepted_events` in `session_kv.db`
 (`/var/lib/kube-agents/session/session_kv.db`), written by the `session_kv_server.py` REST bridge on
 port 8699. It holds one row per event the watcher forwarded, with `notified` recording whether that
 event was announced in chat. It has other writers — the drift detector's `gitops-drift` injects
-land in the same table under `reason = 'OutOfBandChange'`, and the stall watch's `controller-stall`
-alerts under `reason = 'ControllerStall'` — and the generator excludes those rows before it counts
+land in the same table under `reason = 'OutOfBandChange'`, and `controller-stall` injects (see
+[stall-watch-inject.md](stall-watch-inject.md)) under `reason = 'ControllerStall'` — and the
+generator excludes those rows before it counts
 anything, so every number below is still the watcher's alone. That exclusion is
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
 drift record is not an event the watcher forwarded. [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md) is
