@@ -106,7 +106,6 @@ ADDED_AFTER_THE_SPLIT = [
     "upgrades-master-behind-offered-elsewhere",  # the patch collector's §3.1 route check, with patch_readiness.py
     "obtainability-planted-orphan-service",  # the obtainability collector's §3.16 check, with collect.py
     "obtainability-declared-intent-no-finding",  # #1341 criterion 4, activated with its declared-no-pdb-workload fixture (#1409)
-    "cluster-agent-unlocated-crashloop-debug",  # #953 unlocated cluster discovery, PR #1670
 ]
 # Appended at the tail of the nightly file.
 ADDED_AT_THE_TAIL = [

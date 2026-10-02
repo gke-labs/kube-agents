@@ -2419,12 +2419,10 @@ unit_cost_hint() {
     # last cost tier and was what the deadline truncated first.
     vcs-issue-resolver-triage) echo 1400 ;;
     vcs-review-feedback-read-back) echo 700 ;;
-    # Nightly-only since #1840 (with cluster-agent-unlocated-crashloop-debug sharing
-    # the 720s hint as a sibling fleet discovery workload). Median of four clean
-    # dev-install repetitions for delegation-profile-lookup (710/710/735/1325s,
-    # 2026-09-23): the platform worker enumerates the Cluster Agent profiles
-    # in the fleet before the payments-api one reports.
-    cluster-agent-delegation-profile-lookup | cluster-agent-unlocated-crashloop-debug) echo 720 ;;
+    # Nightly-only since #1840. Median of four clean dev-install repetitions
+    # (710/710/735/1325s, 2026-09-23): the platform worker fans out to every
+    # Cluster Agent profile in the fleet before the payments-api one reports.
+    cluster-agent-delegation-profile-lookup) echo 720 ;;
     # Two prepare/submit rounds and a close. Measured on `dev-1918-69fd3893`:
     # 587-1512s a repetition, 937s the middle one.
     vcs-spent-branch-reuse) echo 1000 ;;

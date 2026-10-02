@@ -151,12 +151,6 @@
 # three units, measured 209-1317s a repetition on its green presubmit run, so
 # this file's share is forty-five cases (135 units) of a fifty-nine-case,
 # 177-unit matrix (with the presubmit file's fourteen).
-#
-# 2026-10-01 adds cluster-agent-unlocated-crashloop-debug (#1670): one case,
-# three units, ~36 serial minutes at its 720s hint. It makes this file's share
-# forty-six cases (138 units) of a sixty-case, 180-unit matrix (+3 units).
-# At parallelism 8 the 2026-09-22 paragraph leaves the worst measured night
-# inside the deadline, and ~4.5 more minutes of fan-out does not change that.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -330,19 +324,6 @@
 # (build 2104979469071552512, 3/3, 209-1317s), both on this case's bench
 # pull request. deployer: noop, read-only over the seeded fleet.
 ./tasks/obtainability-declared-intent-no-finding/task.yaml
-
-# Blocker: never run (`validated: false`). Issue #953: unlocated cluster
-# crashloop debugging (omits "Find the cluster it is running on", requiring the
-# Platform Agent to discover the target cluster via fleet enumeration before
-# delegating to the cluster agent). Requires role crashloop-workload on seeded
-# cluster A of the 3-cluster standing dirty fleet (bench/tf/fleet/README.md).
-# Authored in PR #1670; its eval loop was not run locally because the contributor
-# environment is single-cluster (kyber-test) without the multi-cluster OpenTofu
-# fleet stack applied. Unvalidated live on dev cluster; awaiting maintainer
-# determination on PR #1670 review (@scromp / OWNERS approvers). Lands in the
-# nightly roster under ADDED_AFTER_THE_SPLIT to build its empirical baseline in
-# Boskos-leased pool projects.
-./tasks/cluster-agent-unlocated-crashloop-debug/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was

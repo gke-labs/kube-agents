@@ -28,19 +28,9 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 **Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Resolve the cluster's profile name** (the kanban `assignee`):
-
-   - **If the request names a specific cluster**, resolve its profile name with the `get_cluster_profile_name(project, cluster, location)` tool. It returns `name` and `exists`; both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
-     - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
-     - If it does not exist, the cluster has no usable Cluster Agent: none yet (the hourly reconcile job below creates one for every cluster in scope), a scaffold that never finished, or a profile under that name pinned to a different cluster. Investigate it yourself and say in your `result` that it had no Cluster Agent.
-
-   - **If the request does NOT name a cluster** (names only a namespace or workload):
-     **Do not ask the user which cluster before searching.** You have fleet-wide read visibility and per-cluster Cluster Agents; the user does not. Resolve the cluster before asking:
-     1. **Enumerate the fleet:** call the `list_cluster_profiles()` platform MCP tool. It runs in the agent pod and returns ready profiles with their `name`, `project`, `cluster`, and `location` (if a profile config is unreadable or lacks an identity stamp, it returns `name` only; treat such an entry as uninspectable via MCP, noting the unlocated cluster in your findings if ambiguity remains); do not run `cluster_agent_profile.py list`, which is a stub in your shell.
-     2. **Check existence across the fleet:** check whether the target namespace or workload exists on each cluster using read-only MCP tools (e.g. `get_k8s_resource(parent="projects/<project>/locations/<location>/clusters/<cluster>", resourceType="deployment", namespace="<namespace>", name="<workload>")`, `get_k8s_resource(parent="...", resourceType="namespace", name="<namespace>")`, or `describe_k8s_resource(...)`). Do not create throwaway kanban probe cards for existence checks: worker cards inherit chat subscriptions and post completion messages into the user's thread, and blocked probes ask the user for input on cards they never filed. Resolve the target cluster via read-only MCP inspection first.
-     3. **Evaluate the findings:**
-        - **Exactly one cluster matches:** proceed to step 2 to delegate the debugging investigation to that cluster's profile. In your report, state clearly which cluster was resolved and how (e.g. _"Resolved `payments-api` in namespace `seeded-debug` to cluster `seeded-a` after fleet discovery"_). Never resolve silently.
-        - **Zero clusters match, multiple clusters match, or inspection leaves ambiguity:** _then_ ask the user for clarification, stating explicitly which clusters were checked and what was found on each. Ask only after looking.
+1. **Resolve the cluster's profile name** (the kanban `assignee`) with the `get_cluster_profile_name(project, cluster, location)` tool. It returns `name` and `exists`; `list_cluster_profiles()` returns every profile with its project, cluster and location, for when you still have to find the cluster. Both run in the agent pod — do not look the name up with `cluster_agent_profile.py name`, which is a stub in your shell, and do not block on it.
+   - Assign only to a profile that `exists`. A card for a name that is not a profile is never dispatched.
+   - If it does not exist, the cluster has no usable Cluster Agent: none yet (the hourly reconcile job below creates one for every cluster in scope), a scaffold that never finished, or a profile under that name pinned to a different cluster. Investigate it yourself and say in your `result` that it had no Cluster Agent.
 
 2. **Create the card** with the request in the body:
 
