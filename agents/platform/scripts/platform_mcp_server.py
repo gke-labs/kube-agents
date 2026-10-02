@@ -404,16 +404,13 @@ def _profiles_dir() -> Path:
     return profiles_base(Path(os.environ.get("PLATFORM_AGENT_HOME") or DEFAULT_AGENT_HOME))
 
 
-_is_ready = is_ready_profile
-
-
 def _cluster_agent_roster() -> list[dict]:
     base = _profiles_dir()
     if not base.is_dir():
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        if home.name in RESERVED_PROFILES or not _is_ready(home):
+        if home.name in RESERVED_PROFILES or not is_ready_profile(home):
             continue
         entry = {"name": home.name}
         try:
@@ -465,7 +462,7 @@ def get_cluster_profile_name(project: str, cluster: str, location: str) -> str:
         return "ERROR: project, cluster and location are all required."
     name = profile_name(project, cluster, location)
     home = _profiles_dir() / name
-    exists = _is_ready(home)
+    exists = is_ready_profile(home)
     if exists:
         try:
             identity = read_cluster_identity(home)
