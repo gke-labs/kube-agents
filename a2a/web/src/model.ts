@@ -257,9 +257,10 @@ export interface PendingTurn {
   at: number;
   stale: boolean;
   /**
-   * A gateway notice reached this conversation after the turn was sent. The
-   * notice may have been this turn's answer (a full queue, a refusal), so a
-   * resend of the same words matches ahead of it.
+   * A gateway notice reached this conversation after the turn was sent.  It
+   * only words the stale note: the turn may have been answered by a notice
+   * (a full queue, a refusal) rather than dropped.  It does not rank the turn
+   * (pendingMatch says why).
    */
   noticed: boolean;
 }
@@ -300,7 +301,11 @@ export type BusEvent =
   | { type: "streamStat"; name: string; stat: StreamStat | null; error?: string; at: number }
   | { type: "streamAttach"; stream: string; error: string | null; at: number }
   | { type: "consoleSent"; messageId: string; text: string; conversation: string; at: number }
-  | { type: "sendFailed"; messageId: string; error: string }
+  /**
+   * unconfirmed: the publish may have landed (the flush timed out), so the
+   * turn stays pending and still attaches if its submission arrives.
+   */
+  | { type: "sendFailed"; messageId: string; error: string; unconfirmed?: boolean }
   | { type: "notice"; frame: ConsoleOutFrame; conversation: string; at: number }
   | { type: "local"; text: string; at: number }
   | { type: "clear" };
@@ -343,8 +348,13 @@ function isTerminal(state: TaskState): boolean {
   return TERMINAL_STATES.includes(state);
 }
 
-function tsMs(env: Envelope): number {
-  return Date.parse(env.ts) || 0;
+/**
+ * The envelope's ts in epoch ms, or undefined when it does not parse.  An
+ * unparseable ts must not read as 1970: queue and run times subtract these.
+ */
+function tsMs(env: Envelope): number | undefined {
+  const ms = Date.parse(env.ts);
+  return Number.isNaN(ms) ? undefined : ms;
 }
 
 function withAgent(
@@ -377,7 +387,7 @@ function touchAgent(state: UiState, env: Envelope, live: boolean, at: number): M
     statusLine: prev?.statusLine,
     perTask: prev?.perTask,
     status: prev?.status === "closed" ? "closed" : "active",
-    lastActivity: Math.max(prev?.lastActivity ?? 0, live ? at : tsMs(env)),
+    lastActivity: Math.max(prev?.lastActivity ?? 0, live ? at : (tsMs(env) ?? 0)),
   });
   return agents;
 }
@@ -407,7 +417,7 @@ function upsertTask(
   next.set(env.taskId, {
     ...base,
     ...patch,
-    lastEventAt: Math.max(base.lastEventAt, tsMs(env)),
+    lastEventAt: Math.max(base.lastEventAt, tsMs(env) ?? 0),
   });
   return next;
 }
@@ -489,9 +499,11 @@ function reduceMessage(
   // identical texts attach in order. Two things outrank age. A turn sent
   // with exactly this text beats one that only strips to it (a delegate
   // candidate must not take a plain retry's task). And a turn that has gone
-  // stale, or that a gateway notice followed, ranks below one that has not:
-  // either may be a turn the gateway dropped or answered with a notice, and
-  // the same words sent again must attach to the resend, not to it.
+  // stale ranks below one that has not: it may be a turn the gateway
+  // dropped, and the same words sent again must attach to the resend. A
+  // notice does not demote a turn, because the gateway posts its "submitted"
+  // placeholder as a notice before it publishes the submission, so every
+  // ordinary turn is noticed before its own submission lands.
   const match =
     authority.conversation !== undefined
       ? pendingMatch(state.pending, authority.conversation, text, live, tsMs(env))
@@ -518,20 +530,26 @@ function reduceMessage(
     conversations.set(authority.conversation, {
       conversation: authority.conversation,
       backend: authority.backend ?? prev?.backend ?? "unknown",
-      lastSeen: Math.max(prev?.lastSeen ?? 0, tsMs(env)),
+      lastSeen: Math.max(prev?.lastSeen ?? 0, tsMs(env) ?? 0),
       turns: (prev?.turns ?? 0) + 1,
     });
     next.conversations = conversations;
   }
 }
 
-function pendingMatch(pending: PendingTurn[], conversation: string, text: string, live: boolean, ts: number): number {
+function pendingMatch(
+  pending: PendingTurn[],
+  conversation: string,
+  text: string,
+  live: boolean,
+  ts: number | undefined,
+): number {
   let best = -1;
   let bestRank = Infinity;
   for (let i = 0; i < pending.length; i++) {
     const p = pending[i];
-    if (p.conversation !== conversation || !p.texts.includes(text) || !(live || p.at < ts)) continue;
-    const rank = (p.stale || p.noticed ? 2 : 0) + (p.text === text ? 0 : 1);
+    if (p.conversation !== conversation || !p.texts.includes(text) || !(live || (ts !== undefined && p.at < ts))) continue;
+    const rank = (p.stale ? 2 : 0) + (p.text === text ? 0 : 1);
     if (rank < bestRank) {
       best = i;
       bestRank = rank;
@@ -553,7 +571,10 @@ function reduceStatusUpdate(
   const fromExecutor = env.from.session !== GATEWAY_SESSION;
   const ts = tsMs(env);
   const terminal = final || isTerminal(taskState);
-  const firstTerminal = terminal && prev?.endedAt === undefined;
+  // A terminal with an unparseable ts leaves endedAt unset, so "already
+  // ended" also reads the state the task is in.
+  const ended = prev !== undefined && (prev.endedAt !== undefined || prev.final || isTerminal(prev.state));
+  const firstTerminal = terminal && !ended;
   const note = partsText(payload.status?.message?.parts);
   const sawSubmitted = prev?.sawSubmitted === true || (fromExecutor && taskState === "submitted");
   next.tasks = upsertTask(state.tasks, env, subject, {
@@ -568,8 +589,10 @@ function reduceStatusUpdate(
   // Both executors publish `submitted` before anything else. A task that
   // ended without one skipped a step the spec requires. Counted once, on the
   // event that first makes it terminal, and only for tasks whose submission
-  // this page saw (a task first seen mid-flight proves nothing).
-  if (firstTerminal && prev?.askAt !== undefined && !sawSubmitted) {
+  // this page saw (a task first seen mid-flight proves nothing). A terminal
+  // the gateway published as supervisor (a spawn that never started, a
+  // cancel) is not the executor skipping a step.
+  if (firstTerminal && fromExecutor && prev?.askAt !== undefined && !sawSubmitted) {
     next.anomalies = { ...next.anomalies, missingSubmitted: next.anomalies.missingSubmitted + 1 };
   }
 
@@ -762,7 +785,7 @@ function reduceEnvelope(
         agentType: prev?.agentType ?? "profile",
         profile: key,
         status: prev?.status === "closed" ? "active" : (prev?.status ?? "idle"),
-        lastActivity: Math.max(prev?.lastActivity ?? 0, tsMs(env)),
+        lastActivity: Math.max(prev?.lastActivity ?? 0, tsMs(env) ?? 0),
         statusLine: prev?.statusLine,
         perTask: prev?.perTask,
       });
@@ -794,14 +817,15 @@ function reduceEnvelope(
       // seen per subject. A replay arriving after a live update never wins.
       const key = topicKey(subject, topic);
       const prevTopic = touched.topics.get(key);
-      if (prevTopic === undefined || tsMs(env) >= prevTopic.at) {
+      const topicAt = tsMs(env);
+      if (prevTopic === undefined || (topicAt !== undefined && topicAt >= prevTopic.at)) {
         const topics = new Map(touched.topics);
         topics.set(key, {
           key,
           topic,
           owner: subject.plane === "topics" ? subject.owner : undefined,
           summary,
-          at: tsMs(env),
+          at: topicAt ?? 0,
           publisher: env.from.session,
         });
         next.topics = topics;
@@ -925,10 +949,10 @@ export function reduce(state: UiState, event: BusEvent): UiState {
     }
 
     case "sendFailed": {
-      const failed = { kind: "local" as const, note: `not sent: ${event.error}` };
+      const failed = { kind: "local" as const, note: `${event.unconfirmed ? "unconfirmed" : "not sent"}: ${event.error}` };
       return {
         ...state,
-        pending: state.pending.filter((p) => p.messageId !== event.messageId),
+        pending: event.unconfirmed ? state.pending : state.pending.filter((p) => p.messageId !== event.messageId),
         chat: withEntry(withEntry(state.chat, `pending:${event.messageId}`, failed), `sent:${event.messageId}`, failed),
       };
     }

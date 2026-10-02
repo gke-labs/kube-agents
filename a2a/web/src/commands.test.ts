@@ -37,6 +37,15 @@ describe("classifyInput", () => {
     }
   });
 
+  it("splits the command word on the same whitespace the trim strips", () => {
+    // NEL is Go whitespace and not JS \s; a BOM is the reverse.
+    expect(classifyInput("/replay\u0085platform-bridge")).toEqual({
+      kind: "command",
+      command: { name: "replay", session: "platform-bridge" },
+    });
+    expect(classifyInput("/new\ufeff")).toEqual({ kind: "send", text: "/new\ufeff" });
+  });
+
   it("reads the page's own command words case-insensitively", () => {
     expect(classifyInput("/Clear")).toEqual({ kind: "command", command: { name: "clear" } });
     expect(classifyInput("/HELP")).toEqual({ kind: "command", command: { name: "help" } });

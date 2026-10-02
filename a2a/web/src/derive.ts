@@ -196,7 +196,8 @@ export interface Liveness {
  * current. A report older than `LIVENESS_STALE_MS` is the same problem for
  * any session: the poller dispatches nothing while the link is down, so an
  * old "live - pulling" would otherwise freeze on the page for the whole
- * outage.
+ * outage.  An error report ages out the same way, since the last poll before
+ * a link drops is the one most likely to have timed out.
  */
 export function livenessOf(
   report: LivenessReport | undefined,
@@ -210,11 +211,11 @@ export function livenessOf(
   if (report === undefined) {
     return { kind: "unknown", text: "no consumer known", title: "no consumer known for this session" };
   }
-  if (report.error !== undefined) {
-    return { kind: "error", text: `could not check consumer ${report.durable}: ${report.error}` };
-  }
   if (now - report.checkedAt > LIVENESS_STALE_MS) {
     return { kind: "stale", text: `last checked ${fmtAgo(report.checkedAt, now)}` };
+  }
+  if (report.error !== undefined) {
+    return { kind: "error", text: `could not check consumer ${report.durable}: ${report.error}` };
   }
   if (!report.found) {
     // A worker's -in consumer exists only while it runs a task (5s inactive

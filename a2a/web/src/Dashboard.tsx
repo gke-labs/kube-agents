@@ -157,7 +157,7 @@ export default function Dashboard({
                 <div key={c.conversation} className="conv-row">
                   <span>{c.conversation}</span>
                   <span>{`${c.turns} turns`}</span>
-                  <span>{fmtAgo(c.lastSeen, state.now)}</span>
+                  <span>{c.lastSeen ? fmtAgo(c.lastSeen, state.now) : ""}</span>
                 </div>
               ))}
             </div>
@@ -173,7 +173,7 @@ export default function Dashboard({
             <div key={t.key} className="topic-row">
               <span>{t.key}</span>
               <span>{t.summary}</span>
-              <span>{`${fmtAgo(t.at, state.now)} by ${t.publisher}`}</span>
+              <span>{t.at ? `${fmtAgo(t.at, state.now)} by ${t.publisher}` : `by ${t.publisher}`}</span>
             </div>
           ))
         )}

@@ -599,6 +599,33 @@ describe("dashboard task fields", () => {
     expect(queueMs(state.tasks.get("task-1")!)).toBeUndefined();
   });
 
+  it("reads an unparseable ts as unknown, not as 1970", () => {
+    let state = onSubject(
+      initialState,
+      "a2a.tasks.platform.task-1.in",
+      env({
+        kind: "message",
+        taskId: "task-1",
+        contextId: "ctx-1",
+        ts: "not a time",
+        payload: { role: "user", parts: [{ kind: "text", text: "are we ready to upgrade?" }] },
+      }),
+    );
+    state = status(state, "submitted", "2026-08-31T12:00:04Z");
+    expect(state.tasks.get("task-1")!.askAt).toBeUndefined();
+    expect(queueMs(state.tasks.get("task-1")!)).toBeUndefined();
+    state = status(state, "completed", "not a time", { final: true });
+    expect(state.tasks.get("task-1")!.endedAt).toBeUndefined();
+    expect(durationMs(state.tasks.get("task-1")!)).toBeUndefined();
+  });
+
+  it("counts a task once even when its terminal had an unparseable ts", () => {
+    let state = submission();
+    state = status(state, "completed", "not a time", { final: true });
+    state = status(state, "completed", "2026-08-31T12:00:10Z", { final: true });
+    expect(state.anomalies.missingSubmitted).toBe(1);
+  });
+
   it("leaves queue time and duration undefined until the bus has said enough", () => {
     const task = submission().tasks.get("task-1")!;
     expect(queueMs(task)).toBeUndefined();
@@ -616,6 +643,16 @@ describe("anomaly counters", () => {
     state = status(state, "completed", "2026-08-31T12:00:10Z", { final: true });
     expect(state.anomalies.missingSubmitted).toBe(1);
     expect(state.anomalies.postFinal).toBe(1);
+  });
+
+  it("does not count a task the gateway ended as supervisor", () => {
+    let state = submission();
+    state = status(state, "failed", "2026-08-31T12:00:09Z", {
+      final: true,
+      text: "the session never started",
+      from: { session: GATEWAY_SESSION, agentType: "a2a-gateway" },
+    });
+    expect(state.anomalies.missingSubmitted).toBe(0);
   });
 
   it("does not count a task whose executor said submitted", () => {
@@ -836,6 +873,17 @@ describe("pending console turns", () => {
     state = consoleTurn(state, "task-1", "hi");
     expect(state.chat).toHaveLength(2);
   });
+
+  it("calls a timed-out flush unconfirmed, and still attaches the turn if it arrived", () => {
+    let state = sent(initialState, "m-1", "hi");
+    state = reduce(state, { type: "sendFailed", messageId: "m-1", error: "the link dropped", unconfirmed: true });
+    expect(state.chat[0]).toMatchObject({ kind: "local", text: "hi", note: "unconfirmed: the link dropped" });
+    expect(state.chat[0].note).not.toMatch(/not sent/);
+    state = consoleTurn(state, "task-1", "hi");
+    expect(state.chat).toHaveLength(1);
+    expect(state.chat[0]).toMatchObject({ kind: "user", taskId: "task-1" });
+    expect(state.pending).toEqual([]);
+  });
 });
 
 describe("console turns the gateway never makes a task of", () => {
@@ -946,6 +994,13 @@ describe("choosing among matching pending turns", () => {
     });
     state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
     state = reduce(state, { type: "consoleSent", messageId: "m-again", text: "yes", conversation: "console:abc", at: SENT_AT + 60_000 });
+    // The gateway's placeholder for m-again lands before its submission.
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "c-x-2", text: "⏳ submitted…", edit: false },
+      conversation: "console:abc",
+      at: SENT_AT + 60_010,
+    });
     state = consoleTurn(state, "task-9", "yes");
     state = reduce(state, { type: "tick", now: SENT_AT + 60_000 + PENDING_STALE_MS + 1 });
     const byId = new Map(state.chat.map((c) => [c.id, c]));
@@ -956,20 +1011,19 @@ describe("choosing among matching pending turns", () => {
     expect(state.pending.map((p) => p.messageId)).toEqual(["m-drop"]);
   });
 
-  it("attaches a resend within 30s of a queue-full notice to the resend", () => {
-    let state = reduce(up, { type: "consoleSent", messageId: "m-drop", text: "yes", conversation: "console:abc", at: SENT_AT });
+  it("does not let a turn's own placeholder hand its submission to a resend", () => {
+    let state = reduce(up, { type: "consoleSent", messageId: "m-1", text: "yes", conversation: "console:abc", at: SENT_AT });
     state = reduce(state, {
       type: "notice",
-      frame: { messageId: "c-x-1", text: "⚠️ 8 messages are already waiting in this conversation, so new ones are dropped until it catches up", edit: false },
+      frame: { messageId: "c-x-1", text: "⏳ submitted…", edit: false },
       conversation: "console:abc",
       at: SENT_AT + 10,
     });
-    state = reduce(state, { type: "consoleSent", messageId: "m-again", text: "yes", conversation: "console:abc", at: SENT_AT + 5_000 });
-    state = consoleTurn(state, "task-9", "yes");
+    state = reduce(state, { type: "consoleSent", messageId: "m-2", text: "yes", conversation: "console:abc", at: SENT_AT + 20 });
+    state = consoleTurn(state, "task-1", "yes");
     const byId = new Map(state.chat.map((c) => [c.id, c]));
-    expect(byId.get("pending:m-again")).toMatchObject({ kind: "user", taskId: "task-9" });
-    expect(byId.get("pending:m-drop")).toMatchObject({ kind: "pending" });
-    expect(state.pending.map((p) => p.messageId)).toEqual(["m-drop"]);
+    expect(byId.get("pending:m-1")).toMatchObject({ kind: "user", taskId: "task-1" });
+    expect(byId.get("pending:m-2")).toMatchObject({ kind: "pending" });
   });
 
   it("leaves turns in other conversations, and turns sent after the notice, unmarked", () => {
