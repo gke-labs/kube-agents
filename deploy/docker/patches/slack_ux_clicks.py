@@ -48,9 +48,9 @@ applies it, and the buttons are still there. So before such a click counts,
 the thread is read once, and if a person the adapter would answer (its own
 interactive authorization, the check the clicker passed, and its channel gate
 with the mention rule the click skips) has replied with one of the call to
-action's forms (``apply``, ``apply Option B``, ``apply B``, or a button's whole
-text, ``apply Option B: <that option's text>``; a colon before anything else
-is not one) since the buttons appeared, the buttons are replaced with
+action's forms (``apply``, ``apply Option B``, ``apply B``, any of them ending
+in a please or a thanks, or a button's whole text, ``apply Option B: <that
+option's text>``; a colon before anything else is not one) since the buttons appeared, the buttons are replaced with
 "answered in the thread" and the click is dropped. Any option typed counts, not only the one
 clicked: a typed ``apply A`` drops a click on B, and the clicker sees only
 "answered in the thread", since the agent is already applying A and a second
@@ -128,9 +128,14 @@ TYPED_LEAD = re.compile(
 )
 
 #: The call to action's own forms, ``apply``, ``apply Option B`` or ``apply B``, ending
-#: the reply or followed by ``:`` as a button's text is. A colon counts only before that
-#: option's own text: :func:`_typed_apply`.
-TYPED_APPLY = re.compile(r"apply(?:\s+(?:option\s+)?([A-Z])\b)?(?::|[.!]*\s*$)", re.IGNORECASE)
+#: the reply, or ending in a courtesy (``please``, ``thanks``, ``thank you``, ``ty``), or
+#: followed by ``:`` as a button's text is. A colon counts only before that option's own
+#: text: :func:`_typed_apply`.
+TYPED_APPLY = re.compile(
+    r"apply(?:\s+(?:option\s+)?([A-Z])\b)?"
+    r"(?::|[,.!]*(?:\s*(?:please|thanks|thank\s+you|ty)[.!]*)?\s*$)",
+    re.IGNORECASE,
+)
 
 #: An incident option button's value, its whole label, ``slack_ux_incident.OPTION_LABEL``
 #: or ``SINGLE_LABEL``: its capital letter, if it has one, and the option's own text.

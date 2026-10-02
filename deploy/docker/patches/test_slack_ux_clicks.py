@@ -806,6 +806,22 @@ class RuntimeTest(unittest.TestCase):
         self._answer(adapter, body, action)
         self._runs(adapter)
 
+    def test_a_courtesy_after_the_option_still_counts_and_nothing_else_does(self):
+        drops = (
+            "apply B please", "apply Option B, thanks", "Apply B thank you!", "apply, please", "apply B ty",
+            "apply B. Thanks.",
+        )
+        runs = (
+            "Apply B now", "apply B please?", "apply B :+1:", "apply B please wait", "apply B thanks but not yet",
+            "apply B: please",
+        )
+        for text, check in [*((t, self._drops) for t in drops), *((t, self._runs) for t in runs)]:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                check(adapter)
+
     def test_a_typed_apply_also_sent_to_the_channel_drops_the_click(self):
         adapter = _Adapter(replies=[
             {"type": "message", "subtype": "thread_broadcast", "user": "U2", "text": "apply B", "ts": "223.000"},
