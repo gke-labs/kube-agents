@@ -4245,6 +4245,52 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         # Only one helper execution occurred because the second caller coalesced.
         self.assertEqual(len(calls), 1)
 
+    def test_serializes_concurrent_refreshes_and_fails_queued_waiter_without_rerunning(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        started_event = threading.Event()
+
+        def slow_failing_execute(argv, cwd=None):
+            calls.append(list(argv))
+            started_event.set()
+            time.sleep(0.05)
+            return credential_proxy.ExecutionResult(
+                exit_code=1,
+                stdout="",
+                stderr="Minty unavailable",
+                duration_ms=50,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = slow_failing_execute
+        results = []
+
+        def worker():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as e:
+                results.append(e)
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            started_event.wait(timeout=1.0)
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+
+        # Both callers must fail with the helper error
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0], RuntimeError)
+        self.assertIsInstance(results[1], RuntimeError)
+        # Helper must only execute once: waiter queued during the failure raises without re-running
+        self.assertEqual(len(calls), 1)
+
     def test_coalesces_subsequent_refresh_within_coalesce_window(self):
         executor = credential_proxy.CommandExecutor.__new__(
             credential_proxy.CommandExecutor
@@ -4454,10 +4500,10 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 timed_out=False,
             )
         )
-        # First call reads now at 100.0 (check) and 100.0 (record);
-        # second call reads now at 131.0 (check > 30s) and 131.0 (record).
+        # First call reads at 100.0 (queued, check, record);
+        # second call reads at 131.0 (queued, check > 30s, record).
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
-             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 131.0, 131.0]):
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 131.0, 131.0, 131.0]):
             executor.refresh_forge_credential("github", "gke-agentic/infra")
             executor.refresh_forge_credential("github", "gke-agentic/infra")
 

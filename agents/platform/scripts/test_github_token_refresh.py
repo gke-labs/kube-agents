@@ -263,6 +263,40 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual(["repo1", "repo2"], body["repositories"])
         self.assertEqual("platform-agent-scope", body["scope"])
 
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    @patch("gitops_workspace.get_managed_github_repos")
+    def test_scoped_repositories_printed_to_stdout_on_success(
+        self, get_managed_github_repos, urlopen, run
+    ):
+        get_managed_github_repos.return_value = [
+            "owner/repo1",
+            "owner/repo2",
+            "other-org/repo3",
+        ]
+
+        def fake_run(cmd, **kwargs):
+            if "print-identity-token" in cmd:
+                return MagicMock(stdout="fake-oidc-token\n")
+            return MagicMock(returncode=0, stdout="")
+
+        run.side_effect = fake_run
+
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = b"fake-installation-token"
+        response.__enter__.return_value = response
+        urlopen.return_value = response
+
+        out = io.StringIO()
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            with patch("sys.stdout", out):
+                token = refresh_git_credentials("owner/repo1")
+
+        self.assertEqual("fake-installation-token", token)
+        self.assertEqual("owner/repo1\nowner/repo2\n", out.getvalue())
+        self.assertNotIn("other-org/repo3", out.getvalue())
+
     @patch("github_token_refresh.log")
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
@@ -681,9 +715,12 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             urlopen.return_value = ok_response
 
             with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(RuntimeError) as cm:
-                    refresh_git_credentials("owner/repository")
+                out = io.StringIO()
+                with patch("sys.stdout", out):
+                    with self.assertRaises(RuntimeError) as cm:
+                        refresh_git_credentials("owner/repository")
 
+        self.assertEqual("", out.getvalue())
         self.assertIn(
             "error: could not lock config file /home/.gitconfig: File exists",
             str(cm.exception),
