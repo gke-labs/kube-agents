@@ -193,7 +193,10 @@ verification_spec:
           "not up-to-date",
           "below the channel",
           "out of sync",
-          "moved ahead",
+          # Bound to a leading space, as " 0 restarts" is elsewhere: bare
+          # "moved ahead" sits inside "removed ahead of". Every recorded use
+          # is "has moved ahead".
+          " moved ahead",
           "trailing the channel's default",
           "trails its",
           # 2026-10-01: "is trailing its release channel default" (#2133's
@@ -227,7 +230,11 @@ verification_spec:
       # ("currently / fully up to date", "fully current").
       forbidden_phrases:
         - "is current for its release channel"
-        - "is current with the"
+        # 2026-10-02: "with the regular", not "with the": the one recorded
+        # wrong answer says "is current with the regular release channel",
+        # and "is current with the RAPID channel" is the correct half of a
+        # reply that places the planted patch in RAPID.
+        - "is current with the regular"
         - "is current relative"
         - "is currently up to date"
         - "is currently up-to-date"

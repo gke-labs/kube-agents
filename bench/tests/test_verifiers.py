@@ -742,6 +742,20 @@ def test_a_wrong_answer_one_word_off_the_forbidden_list_still_fails(name, old, n
     assert _upgrades_verdict(report) == "fail"
 
 
+def test_the_moved_ahead_phrase_is_bound_to_a_space():
+    """"moved ahead" sits inside "removed ahead of", which a correct reply
+    can say about the planted patch or the exclusion with no lag word near
+    it; the entry carries a leading space, which `_normalize` keeps, so the
+    recorded "has moved ahead" still matches and "removed ahead" does not.
+    """
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert "moved ahead" not in shipped
+    assert " moved ahead" in shipped
+    assert _upgrades_verdict("The exclusion will be removed ahead of 2026-12-02.") == "fail"
+    assert "removed ahead" in verifiers._normalize("the patch was removed ahead of the rotation")
+    assert " moved ahead" not in verifiers._normalize("the patch was removed ahead of the rotation")
+
+
 def test_the_channel_absence_phrase_keeps_its_preposition():
     """"aged out" alone sits inside "managed outage" -- the "of" is the anchor.
 
@@ -995,6 +1009,9 @@ def test_each_forbidden_verdict_fails_a_report_on_its_own(phrase):
         "the default is 1.35.8.",
         "seeded-b's version mismatches the default version for REGULAR; "
         "it is one minor behind.",
+        "seeded-b's 1.34.11-gke.1209000 is current with the RAPID channel but "
+        "is not a valid version for REGULAR; it is one minor behind.",
+        "The REGULAR channel's default has moved ahead to 1.35.8-gke.1225000.",
     ],
     ids=[
         "not-fully-current",
@@ -1002,6 +1019,8 @@ def test_each_forbidden_verdict_fails_a_report_on_its_own(phrase):
         "advice-is-not-a-verdict",
         "not-up-to-date-hyphenated",
         "mismatches",
+        "current-with-rapid",
+        "has-moved-ahead",
     ],
 )
 def test_a_negated_verdict_or_plain_advice_stays_green(report):
