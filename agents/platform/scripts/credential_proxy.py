@@ -310,6 +310,13 @@ METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # vocabularies below, so a caller cannot grow the series set by varying what
 # it sends -- the bound the collector's cardinality depends on.
 TOOL_INVOCATIONS_METRIC = "kubeagents_tool_invocations_total"
+# The gauge the operator's usage poller reads to tell a broker that restarted
+# from one whose counter fell for another reason. Captured once, at import,
+# which for the broker is process start, and never re-read: the poller reads
+# a value that moved as a restart, so it has to be constant for the life of
+# the process by construction (docs/designs/usage-counters-producer.md).
+PROCESS_START_TIME_METRIC = "process_start_time_seconds"
+PROCESS_START_TIME_SECONDS = time.time()
 TOOL_DURATION_METRIC = "kubeagents_tool_execution_duration_seconds"
 PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
@@ -5549,16 +5556,21 @@ class ProxyMetrics:
                 f'{PROXY_REQUESTS_METRIC}{{endpoint="{_escape_label_value(endpoint)}",'
                 f'status_code="{_escape_label_value(status_code)}"}} {count}'
             )
+        lines += [
+            f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
+            f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
+            f"{PROCESS_START_TIME_METRIC} {PROCESS_START_TIME_SECONDS!r}",
+        ]
         return "\n".join(lines) + "\n"
 
 
 class MetricsHandler(BaseHTTPRequestHandler):
     """The metrics-only listener: GET /metrics, and nothing else.
 
-    Unauthenticated, like /healthz on the credentialed listener, because the
-    scraper is the managed-Prometheus collector, which holds no caller token;
-    the operator's NetworkPolicy on this pod is what bounds who reaches the
-    port. It serves the registry the credentialed handler writes and holds no
+    Unauthenticated, like /healthz on the credentialed listener, because its
+    readers, the managed-Prometheus collector and the operator's usage
+    poller, hold no caller token; the operator's NetworkPolicy on this pod is
+    what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
     route, credential or policy of its own, which is why it may bind a TCP
     port the credential runtime otherwise refuses to (see serve). Bounded
     because it shares the process with that handler: MetricsServer admits

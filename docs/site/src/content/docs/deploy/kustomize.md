@@ -11,7 +11,7 @@ The operator lays down every concrete Kubernetes object for the Platform Agent �
 
 The operator renders one `NetworkPolicy` over the agent Pod, `<agent-name>-gateway-netpol`, covering:
 
-- **Ingress** — the Hermes API (`8642`), the credential proxy (`8643`) and, when `harness.hermes.dashboardEnabled` is set, the dashboard (`9119`), from Pods in the agent's own namespace; and the event watcher's metrics port (`9095`) from the `gke-gmp-system` namespace, where GKE Managed Prometheus's collectors run.
+- **Ingress** — the Hermes API (`8642`), the credential proxy (`8643`) and, when `harness.hermes.dashboardEnabled` is set, the dashboard (`9119`), from Pods in the agent's own namespace; and the event watcher's metrics port (`9095`) from the `gke-gmp-system` namespace, where GKE Managed Prometheus's collectors run, and from the operator's own pods, which read the watcher's counter into `status.usage`.
 - **DNS and metadata egress** — CoreDNS and NodeLocal DNSCache, the cluster's DNS ClusterIP, and the GCP metadata server (`169.254.169.254/32` and `169.254.169.252/32`). The metadata address is also a DNS peer, on port `53` alone, because it is the resolver on a [Cloud DNS for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns) cluster.
 - **In-cluster egress** — LiteLLM, vLLM, the GitHub token minter, Hindsight and the managed OTel collector.
 - **Control-plane egress** — the Kubernetes API server, at the endpoints the operator discovers.

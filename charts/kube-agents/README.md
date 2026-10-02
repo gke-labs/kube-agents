@@ -399,7 +399,9 @@ event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar'
 port 9095, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation and request metrics from its metrics-only port 8766. The
 operator's policies on both pods admit the collector's namespace, `gke-gmp-system`,
-on those ports either way; the value only decides whether a scrape is configured.
+and the operator's own pods on those ports either way; the value only decides whether a
+scrape is configured, and the operator's own read of the two counters into `status.usage`
+does not depend on it.
 It is a tri-state: `null`,
 the default, renders them when the cluster serves the `PodMonitoring` API and
 nothing elsewhere, so an install off GKE, or on a GKE cluster with Managed

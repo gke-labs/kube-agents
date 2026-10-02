@@ -57,6 +57,14 @@ spec:
           env:
             - name: ENABLE_WEBHOOKS
               value: "true"
+            # The namespace this pod runs in. The operator admits its own
+            # pods, in this namespace, to the gateway and broker metrics ports
+            # so that it can read the counters behind status.usage; unset, it
+            # renders no such rule and the counters stay where they are.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack

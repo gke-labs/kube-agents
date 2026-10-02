@@ -689,32 +689,45 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 The operator writes observed state to the `status` subresource:
 
-| Field                                  | Type     | Purpose                                                                                                                                         |
-| -------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                                                                       |
-| `observedGeneration`                   | int64    | The `metadata.generation` the status was last computed from. Behind `metadata.generation` from a spec edit until the reconcile that follows it. |
-| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                                                                        |
-| `lastReconcileTime`                    | time     | Timestamp of the last status write. A reconcile that changes nothing in the status leaves it where it was.                                      |
-| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                                                                      |
-| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                                                              |
-| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                                                                 |
-| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                                                                     |
-| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                                                                   |
-| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                                                                      |
-| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.                                                |
-| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled.                                             |
-| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                                                                         |
-| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.                                                           |
-| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                                                                        |
-| `networkPolicy.metadataDaemonPort`     | int32    | The post-NAT daemon port in rule 3, resolved from live DaemonSet or default (`988`).                                                            |
-| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, `Default`, or `Suppressed`.                                             |
-| `usage.activeInterfaces`               | []string | The interfaces the spec enables, sorted; see below.                                                                                             |
-| `usage.sessionsTotal`                  | int64    | Declared; nothing writes it yet.                                                                                                                |
-| `usage.eventsIngestedTotal`            | int64    | Declared; nothing writes it yet.                                                                                                                |
-| `usage.toolExecutionsTotal`            | int64    | Declared; nothing writes it yet.                                                                                                                |
-| `usage.remediationsProposedTotal`      | int64    | Declared; nothing writes it yet.                                                                                                                |
-| `usage.remediationsAppliedTotal`       | int64    | Declared; nothing writes it yet.                                                                                                                |
-| `usage.lastActiveTime`                 | time     | Declared; nothing writes it yet.                                                                                                                |
+| Field                                  | Type     | Purpose                                                                                                                                                                                                                                                                                   |
+| -------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                                                                                                                                                                                                                 |
+| `observedGeneration`                   | int64    | The `metadata.generation` the status was last computed from. Behind `metadata.generation` from a spec edit until the reconcile that follows it.                                                                                                                                           |
+| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                                                                                                                                                                                                                  |
+| `lastReconcileTime`                    | time     | Timestamp of the last status write. A reconcile that changes nothing in the status leaves it where it was.                                                                                                                                                                                |
+| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                                                                                                                                                                                                                |
+| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                                                                                                                                                                                                        |
+| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                                                                                                                                                                                                           |
+| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                                                                                                                                                                                                               |
+| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                                                                                                                                                                                                             |
+| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                                                                                                                                                                                                                |
+| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.                                                                                                                                                                                          |
+| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled.                                                                                                                                                                                       |
+| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                                                                                                                                                                                                                   |
+| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.                                                                                                                                                                                                     |
+| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                                                                                                                                                                                                                  |
+| `networkPolicy.metadataDaemonPort`     | int32    | The post-NAT daemon port in rule 3, resolved from live DaemonSet or default (`988`).                                                                                                                                                                                                      |
+| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, `Default`, or `Suppressed`.                                                                                                                                                                                       |
+| `usage.activeInterfaces`               | []string | The interfaces the spec enables, sorted; see below.                                                                                                                                                                                                                                       |
+| `usage.sessionsTotal`                  | int64    | Declared; nothing writes it yet (no series counts chat sessions).                                                                                                                                                                                                                         |
+| `usage.eventsIngestedTotal`            | int64    | Events the event watcher accepted for triage, cumulative; read from the watcher's `k8s_event_watcher_events_injected_total` every five minutes. Observed-only events are not counted.                                                                                                     |
+| `usage.toolExecutionsTotal`            | int64    | Commands the credential broker ran, successful or not, plus requests it rejected or failed on before running (its `success` and `error` outcomes), cumulative; policy refusals, `busy` and `abandoned` are not counted. Read from `kubeagents_tool_invocations_total` every five minutes. |
+| `usage.remediationsProposedTotal`      | int64    | Declared; nothing writes it yet (no series counts proposals).                                                                                                                                                                                                                             |
+| `usage.remediationsAppliedTotal`       | int64    | Declared; nothing writes it yet (approvals are log records, not a metric).                                                                                                                                                                                                                |
+| `usage.lastActiveTime`                 | time     | The last poll in which one of the two counters above moved; a chat turn that runs no brokered command does not move it.                                                                                                                                                                   |
+
+`usage.toolExecutionsTotal`, `usage.eventsIngestedTotal` and `usage.lastActiveTime` are produced by
+the operator, on the leader and off the reconcile path: every five minutes it reads the credential
+broker's and the event watcher's metrics listeners over the pod network, folds the two series into
+totals it keeps with their per-pod baseline in the `<name>-usage-counters` ConfigMap, so the counters
+stay monotonic across pod, process and operator restarts, and patches the status only when it is
+behind. They under-count rather than over-count: a listener that cannot be read keeps its baseline
+and its backlog is added when it is read again, but a backlog past the per-poll ceiling, an honest
+burst past it, or what a process counted after its last read and before it restarted, is lost once.
+A `lastActiveTime` that stops advancing while commands plainly run is the symptom of a listener the
+operator cannot reach; the CR's events name the pod. The counters the table above marks as unwritten stay absent until a
+series exists for each
+([what lands them](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md#what-stays-unwritten-and-what-lands-it)).
 
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
@@ -725,8 +738,12 @@ write; the operator notices from the write's echo, stops treating the missing fi
 five minutes at a time, and lands it once this release's CRD is applied: within five minutes on a
 quiet install, at once when the Ready status update next writes for any other reason. The other
 status writers carry the field through as they read it, so a pass that ends `Degraded` lands
-nothing new. The counters and `usage.lastActiveTime` are declared in the schema and absent from
-every status until something writes them.
+nothing new. `usage.sessionsTotal`, `usage.remediationsProposedTotal` and
+`usage.remediationsAppliedTotal` are declared in the schema and absent from every status until a
+series exists for each. The two counters the operator does write, and `usage.lastActiveTime`, land
+through the poller above, which consults the same five-minute record: under a served CRD that
+predates `status.usage` they accumulate in the `<name>-usage-counters` ConfigMap and land with the
+first patch after this release's CRD is applied.
 
 These condition types appear in `conditions`; only `Ready` is always present:
 

@@ -11070,14 +11070,22 @@ spec:
                       x-kubernetes-list-type: set
                     eventsIngestedTotal:
                       description: |-
-                        EventsIngestedTotal is the cumulative count of cluster events ingested and evaluated.
-                        Nothing writes it yet.
+                        EventsIngestedTotal is the cumulative count of cluster events the event
+                        watcher accepted for triage: past its reason filter and its dedup
+                        window, and not turned away by the agent. Read from the watcher's
+                        k8s_event_watcher_events_injected_total every five minutes, kept
+                        monotonic across pod, process and operator restarts, and across gateway
+                        replicas counted once rather than once per replica; it under-counts
+                        rather than over-counts when a listener cannot be read. Events the
+                        watcher merely observed are not counted.
                       format: int64
                       type: integer
                     lastActiveTime:
                       description: |-
-                        LastActiveTime is the timestamp of the most recent interaction or event triage.
-                        Nothing writes it yet.
+                        LastActiveTime is the time of the last poll in which a counter above
+                        moved: a brokered command ran, or an event was accepted for triage.
+                        Until SessionsTotal has a source, a chat turn that runs no brokered
+                        command does not move it. Advances at most once per five minutes.
                       format: date-time
                       type: string
                     remediationsAppliedTotal:
@@ -11100,8 +11108,12 @@ spec:
                       type: integer
                     toolExecutionsTotal:
                       description: |-
-                        ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool invocations.
-                        Nothing writes it yet.
+                        ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool
+                        invocations the credential broker ran, successful or not, plus requests
+                        it rejected or failed on before running: its success and error outcomes.
+                        Read from the broker's kubeagents_tool_invocations_total every five
+                        minutes and kept monotonic the same way; commands refused by policy,
+                        busy and abandoned are not counted.
                       format: int64
                       type: integer
                   type: object

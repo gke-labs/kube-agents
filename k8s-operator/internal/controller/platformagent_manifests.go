@@ -124,6 +124,18 @@ const (
 	eventWatcherMetricsPortName       = "event-metrics"
 	eventWatcherMetricsPortEnv        = "EVENT_WATCHER_METRICS_PORT"
 
+	// OperatorNamespaceEnv is the variable both install paths set on the
+	// manager container from the Downward API (the chart's operator
+	// Deployment and config/manager/manager.yaml); main.go reads it into
+	// PlatformAgentReconciler.OperatorNamespace. operatorPodNameLabel and
+	// operatorPodNameValue are the label both paths put on the operator's
+	// pods, the chart through operatorSelectorLabels; together with the
+	// namespace they are the peer the gateway and broker policies admit on
+	// the metrics ports, for the usage counters poller.
+	OperatorNamespaceEnv = "POD_NAMESPACE"
+	operatorPodNameLabel = "app.kubernetes.io/name"
+	operatorPodNameValue = "kube-agents-operator"
+
 	// sandboxUID is the canonical unprivileged 'hermes' runtime user created in
 	// the upstream NousResearch/hermes-agent Dockerfile (line 92). Everything the
 	// agent image ships is owned by it, so the sandbox cannot run as anything else.
@@ -5771,6 +5783,39 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 	return append(peers, peersNotAlreadyPresent(peers, dnsIPPeers)...)
 }
 
+// operatorMetricsIngressRule admits the operator's pods, in operatorNamespace,
+// on port: the usage counters poller's scrape of a metrics listener. The same
+// shape as the collector's rule beside it, narrowed to a pod selector so that
+// the listener reaches the collector and the operator, both readers of
+// counters, and nothing else in either namespace. False when the namespace is
+// unknown, off the cluster, where nothing could reach a pod IP in any case.
+func operatorMetricsIngressRule(operatorNamespace string, port int32) (networkingv1.NetworkPolicyIngressRule, bool) {
+	if operatorNamespace == "" {
+		return networkingv1.NetworkPolicyIngressRule{}, false
+	}
+	return networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelMetadataName: operatorNamespace}},
+			PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{operatorPodNameLabel: operatorPodNameValue}},
+		}},
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(port)},
+	}, true
+}
+
+// credentialProxyNetworkPolicyWithOperatorPeer is the broker's policy as
+// buildCredentialProxyNetworkPolicy renders it, plus the operator-peer rule on
+// the metrics port for the poller that reads the broker's counters into
+// status.usage (usage_counters_poller.go). The rule is appended here rather
+// than in the builder so the builder keeps its one argument, which its tests
+// and other callers use.
+func credentialProxyNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	np := buildCredentialProxyNetworkPolicy(agent)
+	if rule, ok := operatorMetricsIngressRule(operatorNamespace, credentialProxyMetricsPort); ok {
+		np.Spec.Ingress = append(np.Spec.Ingress, rule)
+	}
+	return np
+}
+
 func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string, otlpDisabled bool) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
@@ -5841,6 +5886,11 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		},
 		Ports: []networkingv1.NetworkPolicyPort{tcpPort(eventWatcherMetricsPort)},
 	})
+	// The operator's own pods on the same port, for the poller that reads the
+	// watcher's counters into status.usage (usage_counters_poller.go).
+	if rule, ok := operatorMetricsIngressRule(profile.OperatorNamespace, eventWatcherMetricsPort); ok {
+		ingressRules = append(ingressRules, rule)
+	}
 
 	dnsPeers := clusterDNSPeers(dnsIPs)
 

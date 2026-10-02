@@ -101,8 +101,9 @@ listener in the pod is the runtime's metrics-only one on 8766, unauthenticated l
 vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
 time with a ten-second deadline on each, and is the one port the broker's
 NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
-collector runs, and to no other peer
-([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
+collector runs, and to the operator's own pods, selected by namespace and pod label, which
+read the counters into the `PlatformAgent`'s `status.usage`; both are readers of counters, and
+no other peer reaches it by selector; the site's security reference states the one residual above one replica ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount and the sandbox's and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a
 multi-tenancy control rather than an agent-containment one.

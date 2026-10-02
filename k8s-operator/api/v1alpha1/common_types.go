@@ -1795,24 +1795,36 @@ type AgentStatus struct {
 // ever written here, so the whole struct is safe to read with the same access
 // as the rest of the status.
 //
-// Today the operator writes ActiveInterfaces, from the spec, on every Ready status
-// update. The counters and LastActiveTime are declared so that the schema names
-// them, but nothing writes them yet — the agent's own ServiceAccount holds no
-// write verb on this status, and the operator has no producer for them — so each
-// is absent (omitempty) on every install until one exists.
+// The operator writes ActiveInterfaces, from the spec, on every Ready status
+// update, and ToolExecutionsTotal, EventsIngestedTotal and LastActiveTime from
+// the broker's and the event watcher's metrics listeners, which it reads every
+// five minutes on the leader; the agent's own ServiceAccount holds no write
+// verb on this status. The other counters are declared so that the schema
+// names them, but nothing writes them yet, and each is absent (omitempty)
+// until a series exists for it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative number of interactive sessions handled.
 	// Nothing writes it yet.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
-	// EventsIngestedTotal is the cumulative count of cluster events ingested and evaluated.
-	// Nothing writes it yet.
+	// EventsIngestedTotal is the cumulative count of cluster events the event
+	// watcher accepted for triage: past its reason filter and its dedup
+	// window, and not turned away by the agent. Read from the watcher's
+	// k8s_event_watcher_events_injected_total every five minutes, kept
+	// monotonic across pod, process and operator restarts, and across gateway
+	// replicas counted once rather than once per replica; it under-counts
+	// rather than over-counts when a listener cannot be read. Events the
+	// watcher merely observed are not counted.
 	// +optional
 	EventsIngestedTotal int64 `json:"eventsIngestedTotal,omitempty"`
 
-	// ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool invocations.
-	// Nothing writes it yet.
+	// ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool
+	// invocations the credential broker ran, successful or not, plus requests
+	// it rejected or failed on before running: its success and error outcomes.
+	// Read from the broker's kubeagents_tool_invocations_total every five
+	// minutes and kept monotonic the same way; commands refused by policy,
+	// busy and abandoned are not counted.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
@@ -1837,8 +1849,10 @@ type AgentUsageStatus struct {
 	// +optional
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
-	// LastActiveTime is the timestamp of the most recent interaction or event triage.
-	// Nothing writes it yet.
+	// LastActiveTime is the time of the last poll in which a counter above
+	// moved: a brokered command ran, or an event was accepted for triage.
+	// Until SessionsTotal has a source, a chat turn that runs no brokered
+	// command does not move it. Advances at most once per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }
