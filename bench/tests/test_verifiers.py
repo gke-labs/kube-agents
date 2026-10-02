@@ -705,6 +705,43 @@ def test_a_phrase_that_rescues_a_wrong_answer_stays_out_of_the_list(phrase):
         assert verifiers._normalize(phrase) in verifiers._normalize(report), name
 
 
+@pytest.mark.parametrize("name", _WRONG_ANSWERS.keys())
+def test_no_shipped_phrase_occurs_in_either_recorded_wrong_answer(name):
+    """The property the test above only samples: both recorded wrong answers
+    fail on any_of alone, with no help from the forbidden list.
+
+    Membership of the two cut phrases is not enough. "older than the", shipped
+    2026-09-29 as the article-carrying form of a cut phrase, was not in that
+    list and still sat inside "older than the channel's default version", so
+    one of the two cleared any_of and only the forbidden list kept it red --
+    and a wrong verdict one word off the nine forbidden shapes passed (the
+    test below). The 2026-10-01 entries spell the default out instead.
+    """
+    text = verifiers._normalize(_WRONG_ANSWERS[name])
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert [p for p in shipped if verifiers._normalize(p) in text] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        ("exclusion-means-up-to-date", "is currently **up to date**", "is **up to date**"),
+        ("lag-is-expected", "older than its", "older than the"),
+    ],
+)
+def test_a_wrong_answer_one_word_off_the_forbidden_list_still_fails(name, old, new):
+    """The two variants the 2026-10-01 review walked: drop "currently" from
+    the first recorded wrong answer and it no longer carries any forbidden
+    phrase; swap "its" for "the" in the second and it hedges with the same
+    "older than the" the first one uses. Both passed while "older than the"
+    was an any_of entry. They fail now because nothing in any_of matches
+    them, which is the property the test above pins.
+    """
+    report = _WRONG_ANSWERS[name].replace(old, new)
+    assert report != _WRONG_ANSWERS[name], old
+    assert _upgrades_verdict(report) == "fail"
+
+
 def test_the_channel_absence_phrase_keeps_its_preposition():
     """"aged out" alone sits inside "managed outage" -- the "of" is the anchor.
 
@@ -726,8 +763,9 @@ def test_the_channel_absence_phrase_keeps_its_preposition():
 
 # kube-agents-evals-25 rep 1, build 2104637844441010176 (#2050). The largest
 # miss of the 15-phrase list: "older than the default", 17 of the 39 correct
-# answers it failed. Bare "older than" stays out (the test above); the
-# article is what admits this and keeps the two hedged wrong answers out.
+# answers it failed. Bare "older than" and "older than the" both stay out
+# (the tests above): "older than the current default" is what admits this,
+# and neither recorded wrong answer contains it or "older than the default".
 _LAG_OLDER_THAN_THE_DEFAULT = """🔀 Delegated to the **platform** agent
 
 I've started this as task `t_727d75f2`. The answer will post into this thread as soon as it's ready.
@@ -860,6 +898,32 @@ _WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES = {
     "fully-current": _WRONG_FULLY_CURRENT,
 }
 
+# Build 2105820178175496192 (#2088) rep 3, 2026-10-01: the first presubmits
+# on a front door carrying #2169 (c16fc9ef), whose acknowledgement names the
+# target in the user's words instead of the fixed "Delegated to the platform
+# agent" receipt every fixture above opens with. That line is the first line
+# of the final message, so the forbidden lists read it too. Over the first
+# day on such a front door (46 presubmit runs, 138 acks in 21 wordings, this
+# one 12 times) no ack carried a forbidden entry or matched the pattern.
+_LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET = """checking the seeded-b cluster control plane version.
+
+The task `t_03d57096` checking the seeded-b cluster control plane version has finished. 
+
+Here is the result:
+
+The `seeded-b` cluster is on the **REGULAR** release channel, but its control plane is running version `1.34.11-gke.1209000`, which is **not a valid version** for that channel in `us-central1-a`.
+
+## Version Mismatch
+
+- **Current Control Plane:** `1.34.11-gke.1209000`
+- **Current Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1225000`
+
+The control plane version `1.34.11-gke.1209000` is currently valid only in the **RAPID** channel. The highest valid `1.34.x` version on the REGULAR channel is `1.34.11-gke.1056000`.
+
+This means the cluster was likely downgraded to the REGULAR channel after being created or upgraded while on the RAPID channel, leaving it stranded on a version the REGULAR channel doesn't currently support.
+"""
+
 
 @pytest.mark.parametrize(
     "report",
@@ -869,6 +933,19 @@ _WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES = {
 def test_the_widened_list_accepts_the_reports_it_was_widened_for(report):
     """Both read the versions and state the lag; the 15-phrase list failed both."""
     assert _upgrades_verdict(report) == "pass"
+
+
+def test_a_reply_that_opens_with_the_named_target_ack_passes():
+    """The ack is inside the match since #2169, so it is pinned as recorded:
+    the shipped lists pass the whole reply, and the ack line on its own
+    carries no forbidden phrase and matches no forbidden pattern.
+    """
+    assert _upgrades_verdict(_LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET) == "pass"
+    ack = _LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET.splitlines()[0]
+    assert ack == "checking the seeded-b cluster control plane version."
+    check = _upgrades_probe_check()
+    assert [p for p in check["forbidden_phrases"] if verifiers._normalize(p) in verifiers._normalize(ack)] == []
+    assert [p for p in check["forbidden_patterns"] if re.search(p, verifiers._normalize_lines(ack))] == []
 
 
 @pytest.mark.parametrize(
@@ -889,6 +966,22 @@ def test_the_forbidden_list_fails_a_report_that_calls_the_lagging_cluster_curren
     assert _upgrades_verdict(report) == "fail"
 
 
+@pytest.mark.parametrize("phrase", _upgrades_probe_check()["forbidden_phrases"])
+def test_each_forbidden_verdict_fails_a_report_on_its_own(phrase):
+    """One hand-written sentence per shipped entry, failing on that entry and
+    nothing else: the sentence clears any_of on "one minor" and "behind", so
+    the reason has to name the forbidden phrase. The recorded wrong verdicts
+    above pin three of the nine; this pins each, so a dropped or misspelt
+    entry fails here under its own name.
+    """
+    transcript.set(f"seeded-b {phrase}; it is one minor behind.", [])
+    v = parse_node(_upgrades_probe_check())
+    assert isinstance(v, ReportContainsVerifier)
+    result = v.verify(5.0)
+    assert result.status == "fail"
+    assert "forbidden phrases present" in result.reason and phrase in result.reason
+
+
 @pytest.mark.parametrize(
     "report",
     [
@@ -898,15 +991,27 @@ def test_the_forbidden_list_fails_a_report_that_calls_the_lagging_cluster_curren
         "There is no pending upgrade operation, yet the control plane is one "
         "minor behind the REGULAR default. No action is required while the "
         "NO_MINOR_UPGRADES exclusion holds it.",
+        "seeded-b's control plane is not up-to-date with its REGULAR channel; "
+        "the default is 1.35.8.",
+        "seeded-b's version mismatches the default version for REGULAR; "
+        "it is one minor behind.",
     ],
-    ids=["not-fully-current", "no-longer-matches", "advice-is-not-a-verdict"],
+    ids=[
+        "not-fully-current",
+        "no-longer-matches",
+        "advice-is-not-a-verdict",
+        "not-up-to-date-hyphenated",
+        "mismatches",
+    ],
 )
 def test_a_negated_verdict_or_plain_advice_stays_green(report):
     """Hand-written, not recorded: the correct sentences the forbidden list
     must not red, one per edit that shaped it. Each entry keeps its "is", the
-    "matches" shapes are a pattern that excludes "no longer / not / never",
-    and "no pending upgrade" / "no action is required" are not on the list
-    because a correct answer that reads the planted exclusion says both.
+    "matches" shapes are a pattern that excludes "no longer / not / never"
+    and starts on a word boundary (so "mismatches" is not "matches"), "no
+    pending upgrade" / "no action is required" are not on the list because a
+    correct answer that reads the planted exclusion says both, and the
+    hyphenated "not up-to-date" is an any_of entry beside the spaced one.
     """
     assert _upgrades_verdict(report) == "pass"
 

@@ -113,9 +113,7 @@ verification_spec:
       # the forbidden list (nine phrases and one pattern) closes the verdict
       # gap the paragraph above left to the judge, on the shapes those 17
       # wrong answers used, and touches none of the 223 correct passes.
-      # "older than the" is the qualified form the wrong answers hedge with;
-      # the two that use it are caught by the forbidden list. Priced with the
-      # verifier's own _normalize:
+      # Priced with the verifier's own _normalize:
       #
       # | 279 reps        | pass      | wrong verdicts passing | correct answers failing |
       # |-----------------|-----------|------------------------|-------------------------|
@@ -125,6 +123,25 @@ verification_spec:
       # The 11 still failing are 7 replies that list versions with no
       # comparison sentence and 4 one-off wordings; neither is worth a bare
       # phrase.
+      #
+      # 2026-10-01 (review of #2145): no any_of phrase may occur in either
+      # recorded wrong answer, and the test file asserts it over the whole
+      # list. "older than the" broke that: it sits inside the recorded
+      # "older than the channel's default version", so that wrong answer
+      # cleared any_of and only the forbidden list kept it red, and a wrong
+      # verdict one word off the nine forbidden shapes passed. Spelled as
+      # "older than the default" / "older than the current default" the
+      # same 279 price out the same (251 / 0 / 11) and both wrong answers
+      # fail on any_of alone again. Also from the first day of presubmits on
+      # a front door carrying #2169 (the ack names the target, see the
+      # forbidden list below): "trailing its", "not an offered version"
+      # and the hyphenated "not up-to-date" are correct answers' words.
+      # Over that day's 141 replies (47 runs, 2026-10-01 14:03Z to 10-02
+      # 01:05Z) the old 15 pass 108 and these lists 122; of the 19 still
+      # failing, 4 are wrong verdicts (one of them on the forbidden list),
+      # 3 are empty or table-only replies, and 12 are correct answers in
+      # words not here yet ("not listed as / in", "not available in",
+      # "trails the default", "older than the REGULAR ... default").
       any_of_phrases: [
           "behind",
           "lagging",
@@ -139,6 +156,9 @@ verification_spec:
           "no longer offered",
           "aged out of",
           "not a valid version",
+          # 2026-10-01: "currently not an offered version on the Regular
+          # channel" (#2133's presubmit on 40cfec3c, rep 1).
+          "not an offered version",
           # The lag as the question negated, and the largest miss: "not on the
           # current default" carries nine of the 21 rescues.
           "not on the current default",
@@ -150,8 +170,10 @@ verification_spec:
           "older version than",
           # 2026-09-29: the comparison as the agent writes it -- "older than
           # the default", "an older version", "older control plane version".
-          # "older than the" keeps the article so bare "older than" stays out.
-          "older than the",
+          # 2026-10-01: with "default" spelled out, because "older than the"
+          # alone is inside the recorded "older than the channel's default".
+          "older than the default",
+          "older than the current default",
           "older control plane version",
           "older version",
           # 2026-09-29: the lag as absence, in the words that appeared once
@@ -168,11 +190,15 @@ verification_spec:
           # drop it, so "trailing the channel default" never matched
           # "trailing the channel's default".
           "not up to date",
+          "not up-to-date",
           "below the channel",
           "out of sync",
           "moved ahead",
           "trailing the channel's default",
           "trails its",
+          # 2026-10-01: "is trailing its release channel default" (#2133's
+          # presubmit on 40cfec3c, rep 2).
+          "trailing its",
           "does not match the channel's default",
           "not running the version currently recommended",
           "not running the current version",
@@ -187,6 +213,18 @@ verification_spec:
       # the fixture), and neither caught a wrong verdict on its own. A report
       # that words the gap AND one of these fails, which is what
       # expected_output asks.
+      #
+      # The match runs over the whole final message, whose first line is
+      # the front door's acknowledgement; since #2169 (2026-10-01) that line
+      # names the target in the user's words instead of a fixed receipt.
+      # Measured over the first day on such a front door (2026-10-01 14:03Z
+      # to 10-02 01:05Z, 46 presubmit runs, 138 acks in 21 wordings, from
+      # "checking seeded-b." to "checking the control plane version of the
+      # seeded-b cluster."): none contained a forbidden entry, matched the
+      # pattern, or so much as used the word "current". Every entry here
+      # needs a continuation the question does not have ("for its release
+      # channel", "with the", "relative") or an adjective it does not use
+      # ("currently / fully up to date", "fully current").
       forbidden_phrases:
         - "is current for its release channel"
         - "is current with the"
@@ -202,9 +240,10 @@ verification_spec:
       # the default version") are the correct answer, so they live here as
       # one pattern with the negations excluded rather than as phrases. Runs
       # per normalised line (lowercased, emphasis stripped), so it is spelled
-      # in lowercase.
+      # in lowercase. The \b in front keeps "mismatches the default version"
+      # out of it (2026-10-01).
       forbidden_patterns:
-        - "(?<!no longer )(?<!not )(?<!never )matches (the default version|its configured release channel)"
+        - "(?<!no longer )(?<!not )(?<!never )\\bmatches (the default version|its configured release channel)"
   - name: no-invented-cves
     role: objective
     mode: assert
