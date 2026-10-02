@@ -69,17 +69,28 @@ DEFAULT_BUDGET_MS = 3000
 FAST_TIMERS_SUFFIX = "-fast"
 FAST_TIMERS_SHIM = ("<script>(() => { const native = window.setInterval;"
                     f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
-# bare_anchor_page writes this shim into a copy's <head>, so the page's own
-# script, which runs after it, reads #<anchor> from location.hash as it
-# would from a reader's bare-anchor link; the URL Chrome is launched on
-# carries no fragment. A fragment-only URL resolves against the document's,
-# so a query string on the launch URL stays. replaceState fires no
-# hashchange, so the boot renderAll(true) is the one render that scrolls.
+# bare_anchor_page names its copies with this stem suffix and writes this
+# shim into their <head>, so the page's own script, which runs after it,
+# reads #<anchor> from location.hash as it would from a reader's bare-anchor
+# link; the URL Chrome is launched on carries no fragment. A fragment-only
+# URL resolves against the document's, so a query string on the launch URL
+# stays. replaceState fires no hashchange, so the boot renderAll(true) is
+# the one render that scrolls. What the shim removes is the fragment on the
+# launch URL, the half of the old shape Chrome reads before the page exists;
+# the document URL carries the anchor once the shim has run, so Blink's
+# end-of-parse fragment step still sees it. Which half stalls is unknown,
+# and the flake tracker is the judge of this shape as it was of the last.
+BARE_ANCHOR_SUFFIX = "-anchor-"
 BARE_ANCHOR_SHIM = '<script>history.replaceState(null, "", "#{anchor}");</script>'
-# The Brief's bare view anchors (#gate, #agent), each the id of a section.
-# dom_html refuses one on every budget: a URL fragment naming an element on
-# the page is the one shape every recorded stall of headless Chrome on CI
-# shares (#2202, #2227, #2278), and no fix that kept it has held.
+# The first line of the page's own inline script, which follows the shims
+# and #app in the document; dom_text's slice ends there.
+PAGE_SCRIPT_MARKER = "<script>\n/* The Brief"
+# The Brief's bare view anchors (#gate, #agent), each the id of a section
+# and the fragment a reader's old links carry. dom_html refuses one on the
+# launch URL on every budget: that shape is the one constant across every
+# recorded stall of headless Chrome on CI (#2202, #2227, #2278), and no fix
+# that kept it has held. The guard knows these two ids, not every id on the
+# page; no other call in the suite names an element in a fragment.
 def brief_view_anchors(pages_js: str) -> frozenset:
     """PAGE.views' values from pages.js's text, a flat object of quoted
     strings. Any other shape raises, so a reshaped literal fails the import
@@ -201,14 +212,14 @@ def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms:
     an XHR with a login redirect puts the pages in. ``budget_ms`` is the
     virtual time the page is given; timers fire inside it, so a budget past
     PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
-    on every budget: no fragment naming an element on the page reaches
-    Chrome's command line. A test that needs the bare-anchor path sets the
-    hash from inside the page with bare_anchor_page."""
+    on every budget: the Brief's view anchors reach Chrome's launch URL
+    from no call. A test that needs the bare-anchor path sets the hash
+    from inside the page with bare_anchor_page."""
     anchor = fragment.lstrip("#")
     if anchor in BRIEF_VIEW_ANCHORS:
         raise ValueError(
-            f"{fragment}: a fragment naming an element on the page is the shape in every stall of headless Chrome "
-            f"on CI (#2227, #2278) and reaches it on no budget; use #view={anchor}, or bare_anchor_page(page, {anchor!r})"
+            f"{fragment}: a bare view anchor on Chrome's launch URL is the shape in every stall of headless Chrome "
+            f"on CI (#2227, #2278) and is refused on every budget; use #view={anchor}, or bare_anchor_page(page, {anchor!r})"
         )
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
@@ -242,8 +253,8 @@ def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
     headless Chrome's virtual clock on CI until the wall-clock timeout. The
     sped-up clock alone did not remove the stall: #gate under
     TWO_POLLS_BUDGET_MS stalled the same way, and then #gate on the default
-    budget, the first poll outside it, stalled too. So no call carries a
-    fragment that names an element, whatever the budget: dom_html refuses
+    budget, the first poll outside it, stalled too. So no call puts a bare
+    view anchor on the launch URL, whatever the budget: dom_html refuses
     one, and bare_anchor_page sets the hash from inside the page instead."""
     copy = page.with_name(page.stem + FAST_TIMERS_SUFFIX + page.suffix)
     copy.write_text(page.read_text().replace("<head>", "<head>" + FAST_TIMERS_SHIM, 1))
@@ -255,12 +266,13 @@ def bare_anchor_page(page: pathlib.Path, anchor: str) -> pathlib.Path:
     (a PAGE.views value: "gate", "agent") on its own URL with
     history.replaceState before the page's script runs, so linkState reads
     it as it reads a reader's `#gate` link while the URL handed to Chrome
-    carries no fragment (BARE_ANCHOR_SHIM says why). A fragment that is not
-    a view anchor is passed to dom_html as a fragment instead."""
+    carries no fragment (BARE_ANCHOR_SHIM says what that does and does not
+    remove). A fragment that is not a view anchor is passed to dom_html as
+    a fragment instead."""
     anchor = anchor.lstrip("#")
     if anchor not in BRIEF_VIEW_ANCHORS:
         raise ValueError(f"#{anchor} is not a bare view anchor ({', '.join(sorted(BRIEF_VIEW_ANCHORS))}); pass it to dom_html as a fragment")
-    copy = page.with_name(page.stem + "-anchor-" + anchor + page.suffix)
+    copy = page.with_name(page.stem + BARE_ANCHOR_SUFFIX + anchor + page.suffix)
     copy.write_text(page.read_text().replace("<head>", "<head>" + BARE_ANCHOR_SHIM.format(anchor=anchor), 1))
     return copy
 
@@ -271,7 +283,7 @@ def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
     start = html.find('<div id="app">')
     # Slice up to the page's own inline script (its first comment line), not
     # the first <script> tag: an injected tag inside #app must stay visible.
-    end = html.find("<script>\n/* The Brief", start)
+    end = html.find(PAGE_SCRIPT_MARKER, start)
     return html[start:end]
 
 
@@ -704,7 +716,7 @@ class DomHtmlGuardTest(unittest.TestCase):
                 shim = BARE_ANCHOR_SHIM.format(anchor=anchor)
                 self.assertEqual(text.count(shim), 1)
                 self.assertLess(text.index(shim), text.index("</head>"))
-                self.assertLess(text.index(shim), text.index("<script>\n/* The Brief"))
+                self.assertLess(text.index(shim), text.index(PAGE_SCRIPT_MARKER))
                 self.assertEqual(bare_anchor_page(self.index, f"#{anchor}").read_text(), text, "a leading # is the same anchor")
         for anchor in ("view=gate", CASES_ROW_ANCHOR, "case-gate", ""):
             with self.subTest(anchor=anchor):
