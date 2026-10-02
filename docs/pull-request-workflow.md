@@ -350,8 +350,9 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
-kube-agents-bot finding you decline, the reason. Then resolve. A pull request carrying both `lgtm`
-and `approved` with a thread still open also carries the `do-not-merge` label,
+`kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve,
+except the description thread, which waits for the body edit described below. A pull request
+carrying both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
@@ -377,7 +378,7 @@ query($pr: Int!) {
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
-# Per thread, once the reply naming the fix is posted:
+# Per thread, once the reply is posted:
 gh api graphql -f query='
 mutation($thread: ID!) {
   resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
