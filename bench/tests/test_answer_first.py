@@ -78,7 +78,33 @@ def test_lead_terms_are_matched_like_report_phrases():
     # "memory" finds MemoryPressure once emphasis and case are folded.
     assert _run("**No node has `MemoryPressure`.** All three are fine.", lead_terms=["memory"]).success
     outcome = _run("**All good.** No node has memory pressure.", lead_terms=["memory"])
-    assert "does not mention ['memory']" in outcome.reason
+    assert "no bold lead mentions ['memory']" in outcome.reason
+
+
+def test_lead_terms_may_be_answered_across_two_cards():
+    outcome = _run(
+        "**No pod outside kube-system is failing.** All run.",
+        "**No node is under memory pressure.** All three report False.",
+        lead_terms=["pod", "memory"],
+    )
+    assert outcome.success, outcome.reason
+
+
+def test_a_bold_fragment_is_not_a_lead():
+    for result in (
+        "**No** node is under memory pressure. All three report False.",
+        "**No node is under memory pressure** and all pods run.",
+    ):
+        assert "not a whole sentence" in _run(result).reason, result
+
+
+def test_a_lead_on_its_own_line_needs_no_full_stop():
+    assert _run("**No node is under memory pressure**\n\nAll three report False.").success
+
+
+def test_abbreviations_end_no_sentence():
+    outcome = _run("**Every node reports pressure False, e.g. node-a.** Checked at 10 a.m. vs. yesterday.")
+    assert outcome.success, outcome.reason
 
 
 def test_the_caps_count_characters_and_sentences():

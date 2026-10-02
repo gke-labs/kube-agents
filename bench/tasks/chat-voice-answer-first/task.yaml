@@ -19,9 +19,10 @@
 # platform-agent-host is the agent's own host cluster on every install the
 # presubmit and a dev project run (hack/ci-env.sh HOST_CLUSTER_NAME).
 #
-# The summary line the notifier used to post above the result is the other
-# copy of the verdict a user saw. It never reaches final_message, so this case
-# cannot see it; deploy/docker/patches/test_kanban_notifier.py holds that half.
+# The worker's summary line is the other copy of the verdict a user could
+# see; the notifier drops it when a result is delivered. It never reaches
+# final_message, so this case cannot see it;
+# deploy/docker/patches/test_kanban_notifier.py holds that half.
 #
 # Planted defect required: none. Isolation class: read-only.
 id: chat-voice-answer-first
