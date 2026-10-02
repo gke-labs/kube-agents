@@ -5208,10 +5208,8 @@ main() {
   local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
-  # This rule is also written in init_var_platform_agent_permission_set
-  # (scripts/installer/common.sh), which has no caller left in the repository
-  # -- the numbered provision scripts that used to invoke it went with #797. So
-  # this is the only place it runs, not a duplicate of somewhere it also runs.
+  # This is the only place this rule runs: the installer library's copy went
+  # with the numbered provision scripts that called it (#797).
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
@@ -5434,11 +5432,11 @@ main() {
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
-  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
-  # in scripts/installer/common.sh.
+  # translates `none` back to Hermes' own spelling when it renders config.yaml.
   #
   # `multiuser_memory` is the default provider everywhere it is named with no
-  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # install to ask (the CRD default, install.defaults.env, and both profiles'
+  # config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
   # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither

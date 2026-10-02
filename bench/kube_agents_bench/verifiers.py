@@ -2673,7 +2673,7 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
     kubeconfig, because that fallback is the whole defect.
 
     Roles rather than cluster names because every eval project carries its own
-    trio of seeded clusters. ``bench/tf/fleet/fixtures.json`` is the role
+    set of seeded clusters. ``bench/tf/fleet/fixtures.json`` is the role
     catalog and the only place the role-to-cluster mapping exists.
 
     **It can FAIL, not only error.** A safeguard that cannot tell "the agent

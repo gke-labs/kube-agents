@@ -10,8 +10,8 @@ be narrowed to one.
 
 The install used to offer that as one word, `PLATFORM_AGENT_PERMISSION_SET=gke-admin`.
 These tests are what keeps it gone, across the whole of the one install engine:
-the shell front doors that collect the answer (`install.sh`, `installer_common.sh`,
-`common.sh`) and the Terraform composition that turns it into IAM bindings
+the shell front doors that collect the answer (`install.sh`, `installer_common.sh`)
+and the Terraform composition that turns it into IAM bindings
 (`terraform/examples/full-install`). The shell half runs the real bash rather
 than grepping for a string, so re-adding the bundle under a different arm name
 is caught by the accepted-value test even if the role list is spelled
@@ -29,10 +29,8 @@ Run:
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -91,36 +89,6 @@ REJECTED_VALUES = [
 ACCEPTED_VALUES = ["read-only", "custom"]
 
 
-def _run_bash(script: str, env_overrides: dict[str, str]) -> subprocess.CompletedProcess:
-    """Run `script` with common.sh already sourced, in a throwaway state dir.
-
-    CI=1 makes `init_var` take defaults instead of blocking on a prompt, and
-    VARS_FILE points at a temp file so nothing touches the developer's real
-    (git-ignored) scripts/installer/vars.sh. TERM=dumb keeps common.sh's
-    EXIT trap (`tput cnorm`) from writing cursor escapes into the stdout the
-    assertions are read from.
-    """
-    with tempfile.TemporaryDirectory() as state_dir:
-        env = dict(os.environ)
-        env.pop("PLATFORM_AGENT_PERMISSION_SET", None)
-        env.pop("PLATFORM_AGENT_CUSTOM_ROLES", None)
-        env.update(
-            {
-                "CI": "1",
-                "TERM": "dumb",
-                "SCRIPT_DIR": str(SCRIPTS),
-                "VARS_FILE": str(Path(state_dir) / "vars.sh"),
-            }
-        )
-        env.update(env_overrides)
-        return subprocess.run(
-            ["bash", "-c", f'source "$SCRIPT_DIR/common.sh"\n{script}'],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-
-
 def _terraform_list_locals(source: str) -> dict[str, list[str]]:
     """Every `name = [ "…", "…" ]` list assignment in a Terraform file.
 
@@ -142,69 +110,6 @@ def _terraform_list_locals(source: str) -> dict[str, list[str]]:
             entries.extend(re.findall(r'"([^"]*)"', stripped))
         lists[name] = entries
     return lists
-
-
-class PermissionSetValidatorTest(unittest.TestCase):
-    """`init_var_platform_agent_permission_set` is the provisioning entry point."""
-
-    def _validate(self, value: str) -> subprocess.CompletedProcess:
-        return _run_bash(
-            "init_var_platform_agent_permission_set",
-            {"PLATFORM_AGENT_PERMISSION_SET": value},
-        )
-
-    def test_gke_admin_is_rejected(self):
-        result = self._validate("gke-admin")
-        self.assertNotEqual(
-            0,
-            result.returncode,
-            "PLATFORM_AGENT_PERMISSION_SET=gke-admin must fail provisioning; it grants "
-            "roles/container.admin, which authorizes the agent through IAM regardless "
-            "of its Kubernetes RBAC.\n" + result.stdout + result.stderr,
-        )
-
-    def test_gke_admin_says_why_rather_than_just_invalid(self):
-        """A cached vars.sh from before the removal has to be diagnosable."""
-        combined = self._validate("gke-admin")
-        self.assertIn("has been removed", combined.stdout + combined.stderr)
-
-    def test_only_read_only_and_custom_are_accepted(self):
-        for value in REJECTED_VALUES:
-            with self.subTest(value=value):
-                self.assertNotEqual(
-                    0,
-                    self._validate(value).returncode,
-                    f"{value!r} must not be an accepted permission set",
-                )
-
-    def test_read_only_is_accepted(self):
-        self.assertEqual(0, self._validate("read-only").returncode)
-
-    def test_custom_is_accepted_when_roles_are_named(self):
-        result = _run_bash(
-            "init_var_platform_agent_permission_set",
-            {
-                "PLATFORM_AGENT_PERMISSION_SET": "custom",
-                "PLATFORM_AGENT_CUSTOM_ROLES": "roles/container.viewer",
-            },
-        )
-        self.assertEqual(
-            0,
-            result.returncode,
-            "`custom` is the documented path for a deployment that needs broader "
-            "roles; removing it would leave no supported alternative.\n"
-            + result.stdout
-            + result.stderr,
-        )
-
-    def test_the_prompt_does_not_offer_a_set_the_validator_rejects(self):
-        """The prompt string is the operator-facing list; it has to match."""
-        prompt = re.search(
-            r'init_var "PLATFORM_AGENT_PERMISSION_SET" [^\n]*"([^"]*)"',
-            COMMON_SH.read_text(encoding="utf-8"),
-        )
-        self.assertIsNotNone(prompt, "the permission-set prompt moved or was renamed")
-        self.assertNotIn("gke-admin", prompt.group(1))
 
 
 class SharedValidatorTest(unittest.TestCase):

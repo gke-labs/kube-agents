@@ -701,8 +701,8 @@ is the wrong one: ambient never points at the cluster carrying the seeded namesp
 naming `-n seeded-debug` resolves against a cluster that has no such namespace. Use
 `fleet_resource_property` for those.
 
-**Name the role, never the cluster.** Every eval project carries its own trio of seeded clusters
-(`seeded-a`, `-b`, `-c`), and the pool of eval projects is meant to grow, so a check naming a
+**Name the role, never the cluster.** Every eval project carries its own set of seeded clusters
+(`seeded-a` to `-d`), and the pool of eval projects is meant to grow, so a check naming a
 cluster or a project is a check that cannot run in the next one. A check names the role a fixture
 plays instead — `crashloop-workload`, `hpa-saturated`, `idle-nodepool`, `drift-outlier` — and the
 runner resolves it inside whichever project the run leased:
@@ -723,8 +723,8 @@ runner resolves it inside whichever project the run leased:
 ```
 
 **Where the mapping lives.** `bench/tf/fleet/fixtures.json`, beside the Terraform that plants the
-fixtures, is the only place a role is tied to a cluster — and it ties the role to a _slot_ (`a`,
-`b`, `c`), not to a name. At run time `hack/fleet-kubeconfigs.sh` is the only thing that reads it:
+fixtures, is the only place a role is tied to a cluster — and it ties the role to a _slot_ (`a` to
+`d`), not to a name. At run time `hack/fleet-kubeconfigs.sh` is the only thing that reads it:
 it discovers the leased project's seeded clusters by their labels
 (`environment=seeded`, `managed-by=kube-agents-seeded-fleet`, both applied by
 `bench/tf/fleet/main.tf` and by nothing else in an eval project), matches each to its slot, and
@@ -741,10 +741,11 @@ drift.
 `node?cloud.google.com/gke-nodepool=idle-batch-pool` — and before the agent runs the runner reads
 every one of them on the slot's cluster, skipping the role unless all are present and writing the
 ones it saw to `<role>.confirmed`. A labelled cluster is not the same thing as a planted fixture —
-an apply that created the clusters and stopped before the Kubernetes provider ran leaves a trio that
-answers every API call and holds none of the objects — and this manifest is what lets an object that
+an apply that created the clusters and stopped before the Kubernetes provider ran leaves clusters that
+answer every API call and hold none of the objects — and this manifest is what lets an object that
 disappears _later_ be read as a destroyed fixture rather than an environment that was never ready.
-Probing the object rather than only its namespace matters because the cluster-scoped roles (`rbac-overgrant`, `idle-nodepool`, `version-laggard`, `drift-outlier`) have no namespace to probe: a namespace-only gate published them unconditionally,
+Probing the object rather than only its namespace matters because several roles are
+cluster-scoped and have no namespace to probe: a namespace-only gate published them unconditionally,
 and `compliance-rbac-overgrant` then reported a catastrophic `fail` against an agent that had
 touched nothing. Every subject a check asserts on must therefore appear in its role's `probes`, in
 both directions, which `bench/tests/test_fleet_verifier.py` enforces. Two clusters in one project

@@ -1353,6 +1353,28 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
+	// The Slack UX flag is read by the gateway's Slack adapter and kanban
+	// notifier, both in this container. Off the allowlist, the documented
+	// `spec.deployment.env` override renders on the CR and never reaches them,
+	// so the feature cannot be turned on at all.
+	custom := []corev1.EnvVar{
+		{Name: "KAGE_SLACK_UX", Value: "1"},
+		{
+			Name: "KAGE_SLACK_UX",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "1" || got[0].ValueFrom != nil {
+		t.Errorf("expected only the literal KAGE_SLACK_UX=1 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
 	// reads both from the environment on every tick and there is no config
