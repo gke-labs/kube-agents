@@ -610,6 +610,9 @@ def refresh_git_credentials(
     except Exception as e:
         raise RuntimeError(f"Failed to configure GitHub auth in gh CLI: {e}") from e
 
+    for r in repositories_to_scope:
+        print(f"{org_name}/{r}".lower())
+
     return token
 
 

@@ -3878,7 +3878,7 @@ class CommandExecutor:
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
-        self._last_forge_refresh: dict[str, tuple[str, float]] = {}
+        self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         self.executables = {
             name: shutil.which(name, path=trusted_path)
@@ -4438,7 +4438,7 @@ class CommandExecutor:
         return self._forge_refresh_lock
 
     @property
-    def _refresh_cache(self) -> dict[str, tuple[str, float]]:
+    def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
         if getattr(self, "_last_forge_refresh", None) is None:
             self._last_forge_refresh = {}
         return self._last_forge_refresh
@@ -4460,23 +4460,29 @@ class CommandExecutor:
         if not repository_is_managed(repository):
             raise PermissionError(f"{repository} is not a repository this install manages")
         clean_repo = repository.strip().lower()
-        org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
         with self._refresh_lock:
             now = time.monotonic()
             current = self._refresh_cache.get(provider)
             if current is not None:
-                cached_org, last_refresh = current
-                if cached_org == org and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
+                last_refresh, cached_scoped = current
+                if clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
                     return
             try:
-                self._run_forge_helper(provider, helper, [repository], "credential refresh")
+                result = self._run_forge_helper(provider, helper, [repository], "credential refresh")
             except Exception:
                 # The helper may have replaced the slot before it failed; a
                 # stale entry would coalesce the next caller onto a token that
                 # is not theirs.
                 self._refresh_cache.pop(provider, None)
                 raise
-            self._refresh_cache[provider] = (org, time.monotonic())
+            scoped = frozenset(
+                line.strip().lower()
+                for line in (result.stdout or "").splitlines()
+                if line.strip()
+            )
+            if not scoped:
+                scoped = frozenset([clean_repo])
+            self._refresh_cache[provider] = (time.monotonic(), scoped)
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:

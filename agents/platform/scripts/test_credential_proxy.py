@@ -4268,7 +4268,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
-    def test_distinct_repositories_in_same_org_coalesce(self):
+    def test_distinct_repositories_in_same_org_coalesce_when_in_minted_scope(self):
         executor = credential_proxy.CommandExecutor.__new__(
             credential_proxy.CommandExecutor
         )
@@ -4277,7 +4277,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             calls.append(list(argv))
             or credential_proxy.ExecutionResult(
                 exit_code=0,
-                stdout="",
+                stdout="gke-agentic/repo-a\ngke-agentic/repo-b\n",
                 stderr="",
                 duration_ms=5,
                 truncated=False,
@@ -4286,10 +4286,74 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         )
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
             executor.refresh_forge_credential("github", "gke-agentic/repo-a")
-            # Same organization shares the pod-wide token slot, so second repo coalesces
+            # When helper scoped both repos into the token, second repo coalesces
             executor.refresh_forge_credential("github", "gke-agentic/repo-b")
 
         self.assertEqual(len(calls), 1)
+
+    def test_sibling_repository_not_in_minted_scope_runs_and_does_not_coalesce(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv, cwd=None: (
+            calls.append(list(argv))
+            or credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/repo-a\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+        )
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            # Helper scoped only repo-a (e.g. expansion failed or repo-b not yet registered),
+            # so repo-b does NOT coalesce and executes helper
+            executor.refresh_forge_credential("github", "gke-agentic/repo-b")
+
+        self.assertEqual(len(calls), 2)
+
+    def test_managed_repos_expansion_growth_two_call_sequence(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def grow_scope(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=0,
+                    stdout="gke-agentic/repo-a\n",
+                    stderr="",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/repo-a\ngke-agentic/repo-b\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = grow_scope
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            # 1. repo-a refreshed at t=0 when token only scoped repo-a
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            self.assertEqual(len(calls), 1)
+
+            # 2. repo-b arrives; not in cached scope, so it runs helper
+            executor.refresh_forge_credential("github", "gke-agentic/repo-b")
+            self.assertEqual(len(calls), 2)
+
+            # 3. repo-a arrives within coalesce window; now in expanded scope, coalesces
+            executor.refresh_forge_credential("github", "gke-agentic/repo-a")
+            self.assertEqual(len(calls), 2)
 
     def test_distinct_organizations_both_run_and_invalidate_coalesce(self):
         executor = credential_proxy.CommandExecutor.__new__(
