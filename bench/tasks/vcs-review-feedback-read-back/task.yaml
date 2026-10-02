@@ -86,9 +86,9 @@
 # out from the forge that it landed.
 #
 # WHAT IT LEAVES BEHIND: one open pull request per run on the GitOps
-# repository, permanently -- the same unbounded accumulation
-# rca-remediation-pr accepts, and for the same reason: nothing closes a pull
-# request opened through submit-suggestion. Every run writes the same path on
+# repository, until the job's reset (hack/ci_reset_agent_pulls.py, #2260)
+# closes it before the next repetition of a case that requests one, or the
+# next lease -- submit-suggestion itself closes nothing. Every run writes the same path on
 # its own branch, which never merges, so the runs do not collide. The case
 # asserts on its own run's output rather than on repository state, so the pile
 # does not make it flake.

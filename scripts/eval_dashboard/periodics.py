@@ -167,7 +167,7 @@ class Periodic:
 
 
 SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
-SWEEP_EFFECT = "pull requests a run left behind stay open until the next lease's reset closes them, and a run killed hard leaves its last one for good."
+SWEEP_EFFECT = "pull requests a run left behind stay open until the project's next lease, whose reset closes them."
 RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (
     Periodic(

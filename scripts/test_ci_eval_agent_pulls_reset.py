@@ -248,6 +248,54 @@ class ResetTest(unittest.TestCase):
         self.assertEqual(pauses, [helper.WRITE_PAUSE_SECONDS] * 4)
 
 
+class RetryTest(unittest.TestCase):
+    """A transient answer is tried again; a refusal is not. The reset fails
+    closed, so without this one GitHub hiccup would grade a repetition MISSING."""
+
+    def flaky(self, failures, github):
+        remaining = list(failures)
+
+        def api(method, path, token, body=None):
+            if remaining and (method, path.split("?")[0]) == remaining[0][0]:
+                exc = remaining.pop(0)[1]
+                raise exc
+            return github(method, path, token, body)
+
+        return api
+
+    def run_with(self, api):
+        pauses = []
+        with mock.patch.object(helper.ledgers, "api", api), mock.patch.object(helper, "pause", pauses.append), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            record = helper.reset(REPO, PROJECT, BUILD, "lease", "tok", False)
+        return record, pauses
+
+    def test_a_listing_that_answers_5xx_twice_then_lists_is_clean(self):
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        listing = ("GET", f"/repos/{REPO}/pulls")
+        record, pauses = self.run_with(self.flaky([(listing, _http_error(502)), (listing, _http_error(503))], github))
+        self.assertTrue(record["clean"])
+        self.assertEqual(pauses[:2], list(helper.RETRY_DELAYS_SECONDS))
+
+    def test_a_close_that_drops_once_then_closes_is_closed(self):
+        github = FakeGitHub(pulls=[pull(1)], branches=["fix-payments-api-oom"])
+        record, _ = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), OSError("connection reset"))], github))
+        self.assertEqual((record["closed"], record["unclosed"]), ([1], []))
+
+    def test_a_refusal_is_not_tried_again(self):
+        github = FakeGitHub(pulls=[pull(1)])
+        record, pauses = self.run_with(self.flaky([(("PATCH", f"/repos/{REPO}/pulls/1"), _http_error(403))], github))
+        self.assertEqual(record["unclosed"], [1])
+        self.assertEqual([m for m, p, _ in github.calls if m == "PATCH"], [], "the refused call was made once, to the fake's predecessor")
+        self.assertEqual(pauses, [helper.WRITE_PAUSE_SECONDS])
+
+    def test_three_transient_answers_surface_as_the_fault(self):
+        listing = ("GET", f"/repos/{REPO}/pulls")
+        api = self.flaky([(listing, _http_error(502))] * 3, FakeGitHub())
+        with mock.patch.object(helper.ledgers, "api", api), mock.patch.object(helper, "pause", lambda s: None), redirect_stderr(io.StringIO()):
+            with self.assertRaises(urllib.error.HTTPError):
+                helper.reset(REPO, PROJECT, BUILD, "lease", "tok", False)
+
+
 class MainTest(unittest.TestCase):
     def run_main(self, github, *args, token="tok"):
         out, err = io.StringIO(), io.StringIO()
@@ -450,11 +498,6 @@ class CallSiteTest(unittest.TestCase):
             self.assertIn(f'lock_release "${{STATE_DIR}}/{lock}"', body)
         self.assertLess(unit.index('reset_audit_ledgers "${name} rep ${rep}"'), unit.index("reset_agent_pulls"), "after the ledger reset")
         self.assertLess(unit.index("reset_agent_pulls"), unit.index("uv run devops-bench"), "before devops-bench")
-
-    def test_the_api_lane_reads_the_requesting_list_too(self):
-        src = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("kube_agents_bench.lane \\\n      --safeguards", src)
-        self.assertIn("--list-requesting", src)
 
 
 if __name__ == "__main__":

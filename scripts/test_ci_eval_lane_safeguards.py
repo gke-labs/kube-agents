@@ -375,7 +375,7 @@ class WiringTest(unittest.TestCase):
         self.assertIn("python -m kube_agents_bench.github_writes", report)
         self.assertIn('--since "${EVAL_RUN_STARTED_AT}"', report)
         self.assertIn('mint_ledger_token "leftovers"', report)
-        # Named, not implied: the job closes nothing.
+        # Named, not implied: the listing closes nothing.
         self.assertIn("closes none of them", report)
         call = src.index("\nreport_github_leftovers\n")
         # After both phases of the fan-out have been waited for.

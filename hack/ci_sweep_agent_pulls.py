@@ -211,9 +211,11 @@ class RateLimited(Exception):
 
 
 class WriteBudget:
-    """The run's remaining writes. A close or a delete takes one; when none is
-    left the rest waits for the next run, counted in `left` as the writes it
-    will need (a pull request left unclosed is two: its close and its delete)."""
+    """The run's remaining writes. A close or a delete takes one, an audit's
+    label and close take two together or not at all; when a take cannot be
+    paid for, what it was for waits for the next run, counted in `left` as the
+    writes it will need (a pull request left unclosed is its close and its
+    delete, and its label when it is the audit's)."""
 
     def __init__(self, writes=None):
         self.budget = WRITE_BUDGET_PER_RUN if writes is None else writes
@@ -226,9 +228,13 @@ class WriteBudget:
         budget could not then pay for would leave a pull request open and
         labelled, so the two are one take."""
         if self.remaining < count:
-            if self.exhausted_at is None:
+            if self.remaining <= 0 and self.exhausted_at is None:
                 self.exhausted_at = repo
                 print("  write budget for this run (%d) used up at %s; the rest waits for the next run" % (self.budget, repo), file=sys.stderr)
+            elif self.remaining > 0:
+                # One write left and a pair asked for: the pair waits, the
+                # write stays for a single close or delete behind it.
+                print("  %d write(s) left in this run's budget, %d asked for at %s; that one waits for the next run" % (self.remaining, count, repo), file=sys.stderr)
             self.left += writes_left_if_not
             return False
         self.remaining -= count

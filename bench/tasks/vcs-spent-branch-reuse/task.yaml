@@ -49,8 +49,10 @@
 # cleared some other way than the verbs.
 #
 # WHAT IT LEAVES BEHIND: two pull requests per run on the GitOps repository,
-# one closed and one open, under a branch name no other run uses -- the
-# accumulation rca-remediation-pr and vcs-review-feedback-read-back accept.
+# one closed and one open, under a branch name no other run uses, until the
+# job's reset (hack/ci_reset_agent_pulls.py, #2260) closes the open one and
+# deletes both branches before the next repetition of a case that requests a
+# pull request, as rca-remediation-pr's header describes.
 #
 # No `domain:`, for the reason vcs-review-feedback-read-back gives: it grades
 # the version-control path of the remediation journey, not a fix.

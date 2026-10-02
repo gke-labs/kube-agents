@@ -458,8 +458,8 @@
 # writers -- it files a pull request through submit-suggestion on every
 # repetition -- and, since #1780 (merged 2026-09-21), graded by
 # pull_request_opened, which rejects a pull request last written before the
-# run started; nothing sweeps the *-infra repositories between runs (#1755
-# item 2), and on #1780's own head it went 0/3 on a leftover. 434/681
+# run started; on #1780's own head it went 0/3 on a leftover, the shape
+# #2260's reset before every repetition removes (#1755 item 2). 434/681
 # (63.7%) in the window. Priced at 700s. Re-admission bar: #1189's.
 ./tasks/rca-remediation-pr/task.yaml
 

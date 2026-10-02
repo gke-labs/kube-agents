@@ -129,8 +129,8 @@ with a filed issue naming the exit condition:
   collapse. Its own record was 12/13 clean before the storms; 434 of 681 graded presubmit
   repetitions 2026-09-15 to 09-22. Since [#1780](https://github.com/gke-labs/kube-agents/pull/1780)
   (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request last
-  written before the run started, and nothing sweeps the `*-infra` repositories between runs
-  ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
+  written before the run started; since #2260 the job empties the `*-infra` repository before
+  every repetition ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist; pdb-remediation-pr
   is back in the presubmit held out (seat opened 2026-09-28, below), which changes nothing here until

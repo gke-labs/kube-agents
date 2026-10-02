@@ -1919,8 +1919,9 @@ fi
 # refuses to start the lane without one: a lane whose safeguard cannot name
 # its repository would grade every repetition as an errored check. Applied on
 # the inject lane only; on the api lane the copy is never made and the file
-# is never read, so that lane's matrix and task files stay byte for byte what
-# they were. bench/kube_agents_bench/lane.py refuses a lane entry whose name
+# is read for `requesting:` alone (the second phase, below), so that lane's
+# matrix and task files stay byte for byte what they were.
+# bench/kube_agents_bench/lane.py refuses a lane entry whose name
 # a case already declares -- devops-bench would refuse the duplicate as a
 # parse error on every repetition of that case, after the lease -- and
 # scripts/test_eval_rosters.py pins the file's shape and the set of cases
@@ -2894,8 +2895,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # is, for pull_request_opened's accepts_stream_pull_request
   # (bench/kube_agents_bench/verifiers.py). A fleet audit opens its remediation
   # pull request once and later runs on the stream find it open and leave it,
-  # whichever case they are, and nothing here may close it between units
-  # (docs/ci-pool-projects.md 5.3). Written once, by the first unit to get
+  # whichever case they are; only a unit of a case that requests a pull
+  # request resets the repository first (reset_agent_pulls above, 5.5), so a
+  # stream whose cases request none keeps it between units. Written once, by the first unit to get
   # here, under the stream lock that serializes them; a pull request older
   # than it is not this job's, and one the stamp admits must sit on the
   # audit's remediation branch in this job's GitOps repository

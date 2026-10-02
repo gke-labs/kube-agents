@@ -67,11 +67,37 @@ REF_GONE_CODES = (404, 422)
 # A second between writes, GitHub's published burst limit for an App. A lease
 # with a dozen leftovers costs under a minute; the sweep paces the same way.
 WRITE_PAUSE_SECONDS = 1.0
+# A transient answer -- a 5xx, a 429, a connection that dropped or timed out
+# -- is tried again, twice, 2 s then 8 s apart, as the ledger mint is: this
+# fails closed, so one such answer would otherwise grade a repetition MISSING
+# on a GitHub hiccup. A 4xx other than 429 is the request's fault and is not.
+RETRY_DELAYS_SECONDS = (2, 8)
+RETRYABLE_STATUS_FLOOR = 500
+TOO_MANY_REQUESTS = 429
 RECORD_SCHEMA_VERSION = 1
 ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 pause = time.sleep
 ResetError = ledgers.ResetError
+
+
+def transient(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= RETRYABLE_STATUS_FLOOR or exc.code == TOO_MANY_REQUESTS
+    return isinstance(exc, OSError)
+
+
+def call(method: str, path: str, token: str, body: dict | None = None):
+    """One GitHub call, tried again after a transient answer."""
+    for attempt, delay in enumerate((*RETRY_DELAYS_SECONDS, None)):
+        try:
+            return ledgers.api(method, path, token, body)
+        except (urllib.error.HTTPError, OSError) as exc:
+            if delay is None or not transient(exc):
+                raise
+            print(f"  {method} {path} answered {exc}; trying again in {delay}s", file=sys.stderr)
+            pause(delay)
+    raise AssertionError("unreachable")
 
 
 def is_agent_pull_request(pull: dict, repo: str) -> bool:
@@ -96,7 +122,7 @@ def open_pulls(repo: str, token: str) -> list[dict]:
     found: list[dict] = []
     for page in range(1, ledgers.MAX_PAGES + 1):
         query = urllib.parse.urlencode({"state": "open", "per_page": str(ledgers.PER_PAGE), "page": str(page)})
-        batch = ledgers.api("GET", f"/repos/{repo}/pulls?{query}", token)
+        batch = call("GET", f"/repos/{repo}/pulls?{query}", token)
         if not isinstance(batch, list) or not all(isinstance(pull, dict) for pull in batch):
             raise ResetError(f"GitHub answered the pull-request listing for {repo} with a body that is not a list")
         if not batch:
@@ -109,7 +135,7 @@ def open_pulls(repo: str, token: str) -> list[dict]:
 
 
 def default_branch(repo: str, token: str) -> str:
-    payload = ledgers.api("GET", f"/repos/{repo}", token)
+    payload = call("GET", f"/repos/{repo}", token)
     name = str((payload or {}).get("default_branch") or "") if isinstance(payload, dict) else ""
     if not name:
         raise ResetError(f"GitHub answered the repository lookup for {repo} without a default branch")
@@ -121,7 +147,7 @@ def branches(repo: str, token: str) -> list[str]:
     names: list[str] = []
     for page in range(1, ledgers.MAX_PAGES + 1):
         query = urllib.parse.urlencode({"per_page": str(ledgers.PER_PAGE), "page": str(page)})
-        batch = ledgers.api("GET", f"/repos/{repo}/branches?{query}", token)
+        batch = call("GET", f"/repos/{repo}/branches?{query}", token)
         if not isinstance(batch, list) or not all(isinstance(branch, dict) for branch in batch):
             raise ResetError(f"GitHub answered the branch listing for {repo} with a body that is not a list")
         names.extend(str(branch.get("name") or "") for branch in batch)
@@ -133,7 +159,7 @@ def branches(repo: str, token: str) -> list[str]:
 def write(method: str, path: str, token: str, body: dict | None = None):
     """One GitHub write, then the pause that keeps the next one under the limit."""
     try:
-        return ledgers.api(method, path, token, body)
+        return call(method, path, token, body)
     finally:
         pause(WRITE_PAUSE_SECONDS)
 
