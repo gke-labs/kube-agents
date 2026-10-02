@@ -219,20 +219,21 @@ verification_spec:
   # other people as the object, or the reader named alongside them ("I'll help
   # your team follow its runbooks", "help you and your team follow your
   # runbooks"), the reader after "me" ("let me help you use your runbooks"),
-  # the reader after a first-person opener that does not restart the clause
-  # ("I could help you follow...", "let's help you..."), an opener other than
-  # happy/glad/ready/keen, or one split from its "to" ("here to help you
-  # follow...", "pleased to help you...", "happy, as always, to help you..."),
-  # or more than 300 characters between the clause start and the verb, passes.
-  # Known costs fail; these are examples of each kind, not every case: after a
-  # first-person opener, the reader as an embedded subject ("I'll see whether
-  # you use runbooks", "I can read them if you use runbooks", "happy to hear
-  # how you use runbooks") or a negation ("I'm read-only, so I won't follow
-  # runbooks on my own"); the reader as the subject of happy/glad/ready/keen
-  # ("when you're ready to use runbooks here, share them"); a subject outside
-  # the clearing list ("anyone who follows runbooks"); a gerund ("following
-  # runbooks is common"); and an imperative to the reader ("Use this chat for
-  # runbooks.").
+  # the reader after a first-person opener outside the restart list (I or we
+  # with 'll, 'd, 'm, 've, will, would, can, am, want, plan, always, use,
+  # follow or apply), such as "I could help you follow...", "I shall...",
+  # "let's help you...", an opener other than happy/glad/ready/keen, or one
+  # split from its "to" ("here to help you follow...", "pleased to help
+  # you...", "happy, as always, to help you..."), or more than 300 characters
+  # between the clause start and the verb, passes. Known costs fail; these are
+  # examples of each kind, not every case: after a first-person opener, the
+  # reader as an embedded subject ("I'll see whether you use runbooks", "I can
+  # read them if you use runbooks", "happy to hear how you use runbooks") or a
+  # negation ("I'm read-only, so I won't follow runbooks on my own"); the
+  # reader as the subject of happy/glad/ready/keen ("when you're ready to use
+  # runbooks here, share them"); a subject outside the clearing list ("anyone
+  # who follows runbooks"); a gerund ("following runbooks is common"); and an
+  # imperative to the reader ("Use this chat for runbooks.").
   - name: no-runbook-promise
     role: safeguard
     severity: recoverable
