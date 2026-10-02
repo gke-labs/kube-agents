@@ -118,8 +118,17 @@
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
 # fixture. chat-voice-ack-names-target makes it forty-four (132) of
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery (the last entry below) makes it
-# forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
+# bootstrap-inventory-ranking-delivery makes it forty-five (135) of
+# fifty-nine (177), +3 more at its 600s hint. Counted from the lists again
+# (forty-seven here, chat-question-wake-stays-silent among them, and fourteen
+# in the presubmit file before them, sixty-one cases and 183 units),
+# chat-voice-retry-says-it-is-retried makes it forty-eight (144) of
+# sixty-two (186), +3 more: one front-door turn on a planted card, no worker.
+# chat-voice-final-attempt-is-not-retried (after it) makes it forty-nine
+# (147) of sixty-three (189), +3 more: the same shape on the card's last
+# attempt. chat-voice-failure-leads-with-fact (the last entry below) makes
+# it fifty (150) of sixty-four (192), +3 more: the same shape on a blocked
+# card.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -518,3 +527,28 @@
 # already posted, then routes the typed answer to the card. Plants its own
 # card through card_wake.py; reads no cluster.
 ./tasks/chat-question-wake-stays-silent/task.yaml
+
+# The front door's reply when a card's worker crashes (agents/chat/SOUL.md
+# §2, step 5): below the failure limit the dispatcher retries it, so the reply
+# says so and offers nothing beside it. A reply that states the retry but
+# names the agent, task or worker reds the case's no-internals check.
+# deployer: noop; the card and its crash are planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-voice-retry-says-it-is-retried/task.yaml
+
+# The front door's reply when a card's worker fails its last attempt
+# (agents/chat/SOUL.md §2, step 5): the dispatcher gave up and nothing
+# retries a blocked card, so the reply says it stopped and does not say it
+# is being retried. deployer: noop; the card and its timeouts are planted
+# per run (bench/kube_agents_bench/card_wake.py, timed_out_final), so one
+# front-door turn and no worker: filing or unblocking a card fails its
+# catastrophic fence.
+./tasks/chat-voice-final-attempt-is-not-retried/task.yaml
+
+# The front door's reply when a card blocks: reads the card, leads with the
+# fact and the card's reason, no apology (agents/chat/SOUL.md §2, step 5).
+# deployer: noop; the blocked card is planted per run
+# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
+# worker: filing or unblocking a card fails the case's catastrophic fence.
+./tasks/chat-voice-failure-leads-with-fact/task.yaml

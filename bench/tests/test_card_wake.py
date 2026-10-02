@@ -2,12 +2,13 @@
 
 The in-pod scripts run here under the test interpreter, the way
 ``test_board.py`` runs its sibling, against a stand-in hermes tree: a
-``kanban_db`` that keeps its board in a JSON file, a dispatcher that records
-a card giving up, and a notifier whose wake passes through
-``slack_ux_moments.wake_text`` when that module is there. Where the tree has
-``deploy/docker/patches/slack_ux_moments.py``, the tests that need it copy
-the real one in, with the real ``agents/platform/scripts`` beside it; where it
-does not, they skip. The harness-side parsers are tested with canned replies.
+``kanban_db`` that keeps its board in a JSON file, a dispatcher whose failure
+breaker counts and trips as the real one does, and a notifier whose wake
+passes through ``slack_ux_moments.wake_text`` when that module is there.
+Where the tree has ``deploy/docker/patches/slack_ux_moments.py``, the tests
+that need it copy the real one in, with the real ``agents/platform/scripts``
+beside it; where it does not, they skip. The harness-side parsers are tested
+with canned replies.
 """
 
 from __future__ import annotations
@@ -21,12 +22,18 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from devops_bench.agents import AgentResult
 from kube_agents_bench import card_wake
 
 REPO = Path(__file__).resolve().parents[2]
 MOMENTS = REPO / "deploy" / "docker" / "patches" / "slack_ux_moments.py"
 SCRIPTS = REPO / "agents" / "platform" / "scripts"
+WORKER_CASES = {
+    "chat-voice-retry-says-it-is-retried": card_wake.OUTCOME_CRASHED,
+    "chat-voice-final-attempt-is-not-retried": card_wake.OUTCOME_TIMED_OUT_FINAL,
+}
+FAILURE_CASE = REPO / "bench" / "tasks" / "chat-voice-failure-leads-with-fact" / "task.yaml"
 
 PROMPT = """[bench:slack-question-wake]
 title: Check checkout-gateway's restarts
@@ -47,7 +54,7 @@ needs_moments = pytest.mark.skipif(
 )
 
 _FAKE_KANBAN_DB = '''
-import json, os
+import contextlib, json, os
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -86,7 +93,7 @@ def create_task(conn, *, title, body=None, created_by=None, idempotency_key=None
     task_id = "t_%08d" % (len(state["tasks"]) + 1)
     state["tasks"][task_id] = {"title": title, "body": body, "created_by": created_by,
                                "status": "ready", "assignee": None, "key": idempotency_key,
-                               "comments": []}
+                               "comments": [], "failures": 0}
     _save(state)
     return task_id
 
@@ -101,9 +108,25 @@ def list_comments(conn, task_id):
     return [SimpleNamespace(**c) for c in _load()["tasks"][task_id]["comments"]]
 
 
+@contextlib.contextmanager
+def write_txn(conn):
+    yield conn
+
+
+def _append_event(conn, task_id, kind, payload=None):
+    state = _load()
+    state["events"].append({"id": len(state["events"]) + 1, "task_id": task_id, "kind": kind,
+                            "payload": payload})
+    _save(state)
+
+
 def assign_task(conn, task_id, profile):
     state = _load()
-    state["tasks"][task_id]["assignee"] = profile
+    task = state["tasks"][task_id]
+    if task["assignee"] != profile:
+        # As the real one: a new assignee starts a fresh failure streak.
+        task["failures"], task["last_failure_error"] = 0, None
+    task["assignee"] = profile
     state["events"].append({"id": len(state["events"]) + 1, "task_id": task_id, "kind": "assigned",
                             "payload": {"assignee": profile}})
     _save(state)
@@ -115,6 +138,19 @@ def block_task(conn, task_id, *, reason=None, kind=None):
     state["tasks"][task_id]["status"] = "blocked"
     state["events"].append({"id": len(state["events"]) + 1, "task_id": task_id, "kind": "blocked",
                             "payload": {"reason": reason, "kind": kind}})
+    _save(state)
+    return True
+
+
+def unblock_task(conn, task_id):
+    # As the real one: back to ready with a fresh failure count; the assignee is untouched.
+    state = _load()
+    task = state["tasks"][task_id]
+    if task["status"] != "blocked":
+        return False
+    task["status"], task["failures"], task["last_failure_error"] = "ready", 0, None
+    state["events"].append({"id": len(state["events"]) + 1, "task_id": task_id,
+                            "kind": "unblocked", "payload": None})
     _save(state)
     return True
 
@@ -144,15 +180,27 @@ def archive_task(conn, task_id):
 '''
 
 _FAKE_DISPATCH = '''
+import os
+
 from hermes_cli.kanban_db import _load, _save
 
+DEFAULT_FAILURE_LIMIT = int(os.environ.get("FAKE_FAILURE_LIMIT", "2"))
 
-def _record_task_failure(conn, task_id, error, *, outcome, force_trip=False):
+
+def _record_task_failure(conn, task_id, error, *, outcome, force_trip=False,
+                         event_payload_extra=None):
     state = _load()
-    state["tasks"][task_id]["status"] = "blocked"
+    task = state["tasks"][task_id]
+    task["failures"] += 1
+    task["last_failure_error"] = error
+    if not (force_trip or task["failures"] >= DEFAULT_FAILURE_LIMIT):
+        _save(state)
+        return False
+    task["status"] = "blocked"
+    payload = {"error": error, "trigger_outcome": outcome, "force_trip": force_trip,
+               **(event_payload_extra or {})}
     state["events"].append({"id": len(state["events"]) + 1, "task_id": task_id, "kind": "gave_up",
-                            "payload": {"error": error, "trigger_outcome": outcome,
-                                        "force_trip": force_trip}})
+                            "payload": payload})
     _save(state)
     return True
 '''
@@ -172,7 +220,13 @@ except ImportError:
     _kage_moments_wake_text = None
 
 
-_STATUS = {"blocked": "blocked; needs attention", "gave_up": "gave up (retries exhausted)"}
+# The pinned locale's wake statuses, joined in upstream's _WAKE_KINDS order.
+_STATUS = {
+    "gave_up": "gave up (retries exhausted)",
+    "crashed": "crashed (worker exited); dispatcher will retry",
+    "timed_out": "timed out; dispatcher will retry",
+    "blocked": "blocked; needs attention",
+}
 
 
 class _KanbanNotification:
@@ -188,7 +242,8 @@ class _KanbanNotification:
         if os.environ.get("FAKE_WAKE_FAILS"):
             raise RuntimeError("notifier exploded")
         self.wake_kinds = {ev.kind for ev in self.d["events"]}
-        self.synth = "[kanban] Task %s %s." % (self.sub["task_id"], _STATUS[self.d["events"][-1].kind])
+        status = ", ".join(_STATUS[k] for k in _STATUS if k in self.wake_kinds)
+        self.synth = "[kanban] Task %s %s." % (self.sub["task_id"], status)
         if self.d["task"].assignee:
             self.synth += "\\nAssignee: @%s" % self.d["task"].assignee
         if not self.is_push_adapter:
@@ -207,6 +262,8 @@ def hermes_root(tmp_path: Path) -> Path:
     (root / "hermes_cli" / "__init__.py").write_text("")
     (root / "hermes_cli" / "kanban_db.py").write_text(_FAKE_KANBAN_DB)
     (root / "hermes_cli" / "kanban_db_dispatch.py").write_text(_FAKE_DISPATCH)
+    # The split module opens the board, as on the image.
+    (root / "hermes_cli" / "kanban_db_connect.py").write_text("from hermes_cli.kanban_db import connect\n")
     (root / "gateway" / "__init__.py").write_text("")
     (root / "gateway" / "kanban_watchers_notifier.py").write_text(_FAKE_NOTIFIER)
     return root
@@ -466,9 +523,139 @@ def test_a_failure_prompt_missing_a_field_is_an_authoring_error(field: str) -> N
         card_wake.parse(prompt)
 
 
+@pytest.mark.parametrize(("case", "outcome"), WORKER_CASES.items())
+def test_the_worker_failure_case_prompts_are_worker_replays(case: str, outcome: str) -> None:
+    task = REPO / "bench" / "tasks" / case / "task.yaml"
+    replay = card_wake.parse(yaml.safe_load(task.read_text())["prompt"])
+
+    assert isinstance(replay, card_wake.Failure)
+    assert replay.outcome == outcome
+    assert "invoice-renderer" in replay.title
+
+
+def test_the_failure_case_prompt_is_a_blocked_replay() -> None:
+    replay = card_wake.parse(yaml.safe_load(FAILURE_CASE.read_text())["prompt"])
+
+    assert isinstance(replay, card_wake.Failure)
+    assert replay.outcome == card_wake.OUTCOME_BLOCKED
+    assert "invoice-renderer" in replay.title
+    assert replay.reason.startswith("Permission denied.")
+
+
+def test_the_failure_case_says_why_only_from_the_reason() -> None:
+    case = yaml.safe_load(FAILURE_CASE.read_text())
+    replay = card_wake.parse(case["prompt"])
+    (says_why,) = [e for e in case["verification_spec"] if e["name"] == "the-reply-says-why"]
+    phrases = says_why["check"]["any_of_phrases"]
+
+    # The wake carries the title, so a phrase it also holds is answerable unread.
+    assert all(p in replay.reason for p in phrases)
+    assert not any(p in f"{replay.title} {replay.body}" for p in phrases)
+
+
 def test_a_failure_prompt_with_an_unknown_outcome_is_an_authoring_error() -> None:
-    with pytest.raises(ValueError, match="'crashed' is not one of blocked, gave_up"):
-        card_wake.parse(FAILURE_PROMPT.replace("outcome: blocked", "outcome: crashed"))
+    with pytest.raises(ValueError, match="'completed' is not one of blocked, gave_up, crashed"):
+        card_wake.parse(FAILURE_PROMPT.replace("outcome: blocked", "outcome: completed"))
+
+
+@pytest.mark.parametrize("outcome", card_wake.WORKER_OUTCOMES)
+def test_a_failure_prompt_reads_a_worker_outcome(outcome: str) -> None:
+    replay = card_wake.parse(FAILURE_PROMPT.replace("outcome: blocked", f"outcome: {outcome}"))
+
+    assert isinstance(replay, card_wake.Failure)
+    assert replay.outcome == outcome
+    assert card_wake.plant_command(replay, KEY).endswith(f" {outcome} {card_wake.WORKER_ASSIGNEE} {KEY}")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status"),
+    [
+        ("crashed", "crashed (worker exited); dispatcher will retry"),
+        ("timed_out", "timed out; dispatcher will retry"),
+    ],
+)
+def test_a_retried_worker_failure_wakes_alone_and_leaves_the_card_ready(
+    hermes_root: Path, tmp_path: Path, outcome: str, status: str
+) -> None:
+    prompt = FAILURE_PROMPT.replace("outcome: blocked", f"outcome: {outcome}")
+    shell = _shell_for(hermes_root, tmp_path, prompt)
+
+    planted = _plant(shell, prompt)
+
+    assert planted.wake == (
+        f"[kanban] Task {planted.card} {status}.\n"
+        f"Assignee: @{card_wake.WORKER_ASSIGNEE}\nVia: api_server"
+    )
+    board = _board(tmp_path)
+    card = board["tasks"][planted.card]
+    assert card["status"] == "ready"
+    # Assigned before it failed, so the count and the error kanban_show reads survive.
+    assert (card["failures"], card["last_failure_error"]) == (1, FAILURE_REASON)
+    assert [e["kind"] for e in board["events"]] == ["assigned", outcome]
+    assert board["events"][1]["payload"]["retry_status"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "trigger", "status"),
+    [
+        ("crashed_final", "crashed", "crashed (worker exited); dispatcher will retry"),
+        ("timed_out_final", "timed_out", "timed out; dispatcher will retry"),
+    ],
+)
+def test_a_final_worker_failure_wakes_with_its_gave_up(
+    hermes_root: Path, tmp_path: Path, outcome: str, trigger: str, status: str
+) -> None:
+    prompt = FAILURE_PROMPT.replace("outcome: blocked", f"outcome: {outcome}")
+    shell = _shell_for(hermes_root, tmp_path, prompt)
+
+    planted = _plant(shell, prompt)
+
+    # One wake, both kinds: the breaker's gave_up and the attempt's own
+    # "dispatcher will retry".
+    assert planted.wake.startswith(
+        f"[kanban] Task {planted.card} gave up (retries exhausted), {status}.\n"
+    )
+    board = _board(tmp_path)
+    card = board["tasks"][planted.card]
+    assert (card["status"], card["failures"]) == ("blocked", 2)
+    assert [e["kind"] for e in board["events"]] == ["assigned", trigger, trigger, "gave_up"]
+    gave_up = board["events"][-1]["payload"]
+    assert (gave_up["error"], gave_up["trigger_outcome"], gave_up["force_trip"]) == (
+        FAILURE_REASON,
+        trigger,
+        False,
+    )
+
+
+def test_a_final_worker_failure_follows_the_images_failure_limit(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    prompt = FAILURE_PROMPT.replace("outcome: blocked", "outcome: timed_out_final")
+    shell = _shell_for(hermes_root, tmp_path, prompt, FAKE_FAILURE_LIMIT="3")
+
+    planted = _plant(shell, prompt)
+
+    assert planted.wake.startswith(
+        f"[kanban] Task {planted.card} gave up (retries exhausted), timed out; dispatcher will retry.\n"
+    )
+    board = _board(tmp_path)
+    assert board["tasks"][planted.card]["failures"] == 3
+    assert [e["kind"] for e in board["events"]] == ["assigned"] + ["timed_out"] * 3 + ["gave_up"]
+
+
+def test_a_worker_failure_the_breaker_disagrees_with_is_a_mismatch_and_archives_the_card(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    prompt = FAILURE_PROMPT.replace("outcome: blocked", "outcome: crashed")
+    shell = _shell_for(hermes_root, tmp_path, prompt, FAKE_FAILURE_LIMIT="1")
+
+    # A mismatch, not ReplayUnavailable: the harness records it as errored, so
+    # the case reds rather than being excluded as infrastructure.
+    with pytest.raises(card_wake.ReplayMismatch, match="tripped its failure breaker"):
+        _plant(shell, prompt)
+
+    [card] = _board(tmp_path)["tasks"].values()
+    assert card["status"] == "archived"
 
 
 def test_a_blocked_failure_wakes_through_the_api_server_with_only_the_wake_assigned(
@@ -493,6 +680,30 @@ def test_a_blocked_failure_wakes_through_the_api_server_with_only_the_wake_assig
     assert board["events"][0]["payload"] == {"reason": FAILURE_REASON, "kind": None}
 
 
+def test_an_unblock_in_the_wake_turn_leaves_the_blocked_card_ready_for_no_worker(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    shell = _shell_for(hermes_root, tmp_path, FAILURE_PROMPT)
+    planted = _plant(shell, FAILURE_PROMPT)
+
+    # What a kanban_unblock from the woken turn does to the board's card.
+    _run(
+        "import sys; sys.path.insert(0, sys.argv[1]);"
+        " from hermes_cli import kanban_db as kb;"
+        " assert kb.unblock_task(kb.connect(), sys.argv[2])",
+        [str(hermes_root), planted.card],
+        tmp_path,
+    )
+
+    board = _board(tmp_path)
+    card = board["tasks"][planted.card]
+    # Ready with no assignee: the dispatcher files that under skipped_unassigned
+    # and spawns nothing, so no real worker picks the replayed card up.
+    assert card["status"] == "ready"
+    assert card["assignee"] is None
+    assert [e["kind"] for e in board["events"]] == ["blocked", "unblocked"]
+
+
 def test_a_gave_up_failure_trips_the_breaker_with_the_reason_as_its_error(
     hermes_root: Path, tmp_path: Path
 ) -> None:
@@ -501,8 +712,13 @@ def test_a_gave_up_failure_trips_the_breaker_with_the_reason_as_its_error(
 
     planted = _plant(shell, prompt)
 
-    assert planted.wake.startswith(f"[kanban] Task {planted.card} gave up (retries exhausted).\n")
+    assert planted.wake == (
+        f"[kanban] Task {planted.card} gave up (retries exhausted).\n"
+        f"Assignee: @{card_wake.WAKE_ASSIGNEE}\nVia: api_server"
+    )
     board = _board(tmp_path)
+    # Never assigned: an unblock or a reset failure count hands no worker the card.
+    assert board["tasks"][planted.card]["assignee"] is None
     assert [e["kind"] for e in board["events"]] == ["gave_up"]
     assert board["events"][0]["payload"] == {
         "error": FAILURE_REASON,

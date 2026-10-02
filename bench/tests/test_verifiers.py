@@ -3956,3 +3956,1529 @@ def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
     spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
     entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
     assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]
+
+
+_RETRY_CASE = TASKS / "chat-voice-retry-says-it-is-retried" / "task.yaml"
+_CRASHED = "The worker checking invoice-renderer on bench-sandbox crashed."
+_NO_INTERNALS = "the-reply-names-no-internals"
+
+
+def _report_misses(case: Path, final_message: str) -> list[str]:
+    """``case``'s report_contains objectives that fail on ``final_message``.
+
+    The no-internals check has its own test, so the retry wording rows
+    can keep their worker, card and agent names.
+    """
+    spec = yaml.safe_load(case.read_text())
+    transcript.set(final_message, [], final_message=final_message)
+    return [
+        entry["name"]
+        for entry in spec["verification_spec"]
+        if entry["check"]["type"] == "report_contains"
+        and entry["name"] != _NO_INTERNALS
+        and not ReportContainsVerifier(**entry["check"]).verify(timeout_sec=1).success
+    ]
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        "The worker checking invoice-renderer's restarts on bench-sandbox crashed; it's being "
+        "retried, so nothing to do yet.",
+        "The restart check on bench-sandbox hit a worker crash and the dispatcher is trying again.",
+        "**invoice-renderer** check: the worker exited, and another attempt is on its way.",
+        # A failure in the reason is not the final announcement.
+        "The worker crashed and the logs could not be read; it's being retried.",
+        "I couldn't get an answer yet: the worker crashed, and the dispatcher will retry it.",
+        # Neither denies the retry.
+        "The worker crashed and is being retried, so please do not retry it yourself.",
+        "It hasn't given up: the worker crashed and the dispatcher is retrying it.",
+        # A delivered result is the specialist's voice, not the front door's.
+        "The worker crashed and is being retried.\n\n"
+        "Result of delegated task t_cc52a43d:\nI couldn't read the logs.",
+        # A live green that redded before "queued it up to try again" and "when
+        # the retry finishes" were on the list (rv on main-64cb68bb, green1).
+        "The task checking why `invoice-renderer` is restarting crashed unexpectedly (it was "
+        "forcefully terminated, likely due to running out of memory), but the system has already "
+        "queued it up to try again automatically. I'll let you know when the retry finishes.",
+        # A live green that redded before "queued it up for a retry" was on the
+        # list (rv on main-64cb68bb at 9b36715b, green3).
+        "The cluster agent checking the `invoice-renderer` restarts crashed unexpectedly during its "
+        "run. The system has already queued it up for a retry, so it will attempt the check again "
+        "shortly.",
+        f"{_CRASHED} The dispatcher queued it for retry.",
+        f"{_CRASHED} The dispatcher queued it to retry.",
+        f"{_CRASHED} I'll report back once the retry completes.",
+        f"{_CRASHED} It's queued for retry. I'll let you know if any errors come up.",
+        f"{_CRASHED} It's queued for retry, but nobody cancelled it.",
+        f"{_CRASHED} It's being retried, and the crashed run was cancelled.",
+        f"{_CRASHED} I think it was OOM and it's queued for retry.",
+        f"{_CRASHED} It'll be retried automatically and I'll report back with findings (if any).",
+        f"{_CRASHED} It's been queued to retry; I'll post the new findings, if any.",
+        f"{_CRASHED} The dispatcher is retrying it and I'll pass along any errors, if any.",
+        f"{_CRASHED} The retry is queued, but the memory limit stopped it last time, so it may OOM again.",
+        f"{_CRASHED} It was retried once, but the OOM killer stopped it again; the dispatcher is retrying it once more.",
+        f"{_CRASHED} The dispatcher will retry it; then I'll check whether the OOM stopped it again.",
+        f"{_CRASHED} It's being retried, but the kernel aborted it the first time for memory.",
+        f"{_CRASHED} It's queued for retry, but nobody has cancelled it.",
+        f"{_CRASHED} It's queued for retry, but no one ever cancelled it.",
+        f"{_CRASHED} It's queued for retry, but nobody ever stopped it.",
+        f"{_CRASHED} It's being retried, but the kernel aborted it the first time for memory.",
+        f"{_CRASHED} It's being retried, but the OOM killer stopped it again last time.",
+        f"{_CRASHED} It's being retried, and I'll report back on new errors from each attempt, if any.",
+        f"{_CRASHED} The retry is queued; I'll share the results of the retry, if any.",
+        # A hedge on the cause, run into the retry without a comma:
+        f"{_CRASHED} Not sure why it crashed it's being retried.",
+        f"{_CRASHED} Possibly due to memory pressure it will be retried automatically.",
+        f"{_CRASHED} Maybe due to load the dispatcher will retry it.",
+        f"{_CRASHED} I'm not sure what killed it but it's being retried.",
+        f"{_CRASHED} It's queued for retry, but no one has cancelled it.",
+        # main's own replies (rv reds on main-37c6b216): the queue is the retry.
+        "The task checking the `invoice-renderer` restarts crashed (exit code 137) during its run, "
+        "but it has already been queued to automatically retry.",
+        "The `cluster-bench-project-bench-sandbox-us-central1` agent crashed (exit code 137) while "
+        "checking the `invoice-renderer` pods. The system has automatically returned it to the queue "
+        "to retry, so no action is needed right now.",
+        # main's replies at dceb7ed3, the three runs the pull request cites.
+        "The task crashed with exit code 137 while running. It has already been automatically "
+        "placed back in the queue to be retried.",
+        "The `cluster-bench-sandbox` agent crashed unexpectedly while trying to check the "
+        "invoice-renderer pods (it was killed by the system, likely due to running out of memory). "
+        "The task is back in the queue and will be retried automatically.",
+        "The check on the invoice-renderer restarts in bench-sandbox crashed mid-run. The system has "
+        "already placed it back in the queue to try again. I'll let you know when the retried run "
+        "finishes.",
+        # Natural wording the fact list has to carry.
+        "The worker crashed. It will automatically retry.",
+        "The worker crashed; it's scheduled to retry.",
+        "The worker crashed and the dispatcher queued another attempt.",
+        "The worker crashed, so the card went back to the queue.",
+        "The worker crashed. The dispatcher will rerun it shortly.",
+        "The worker crashed. It'll run again on its own.",
+        # Talk about the retry that offers nothing.
+        "The worker crashed and is being retried. I'll check back once the retry finishes.",
+        "The worker crashed and is being retried. Want me to let you know when the retry finishes?",
+        "The worker crashed and is being retried. Anything else you need?",
+        "This is not a final failure: the worker crashed and it will be retried.",
+        "The dispatcher is going to retry it on its own, so no action is needed.",
+        "A retry is already underway; nothing for you to do.",
+        "The last attempt crashed with exit 137; the dispatcher is retrying it.",
+        "The worker crashed, but it will be retried automatically, so nothing has failed for good yet.",
+        "The worker crashed and is being retried, so I won't re-run it myself.",
+        "The worker crashed. The dispatcher will retry it, so I won't requeue it.",
+        "The worker crashed and will be retried, and you won't have to rerun it.",
+        "The worker crashed. The dispatcher will give it another try.",
+        # A question about the retry already running, not one that asks for another.
+        *(
+            f"{_CRASHED} It's being retried. {question}"
+            for question in (
+                "Want me to check the node's memory while the retry runs?",
+                "Should I keep an eye on the next attempt?",
+                "Do you want a heads-up when it's retried?",
+                "Any other context I should pass along for the retry?",
+                "Want the stack trace from the failed attempt?",
+                "Want me to check the log file it was writing?",
+            )
+        ),
+        "The worker crashed. The dispatcher will try again automatically — anything else you'd like "
+        "me to look at while we wait?",
+        # A negation that does not deny the retry.
+        "The worker crashed but it isn't out of retries; it's being retried now.",
+        "The worker crashed. The dispatcher is retrying it, so no one will run it twice.",
+        "The worker crashed. It's queued and hasn't been retried yet.",
+        "The worker crashed. It's back in the queue but hasn't run again yet.",
+        "The worker crashed and is being retried; you didn't need to requeue it.",
+        "The worker crashed. I won't retry it myself — the dispatcher is already retrying it.",
+        # "Up to you" about something other than the retry, and an issue that is not a second run.
+        "The worker crashed and will be retried. Once the retry finishes, what to do next is up to you.",
+        "It's being retried automatically. After the next attempt, any fix is your call.",
+        "The worker crashed and is being retried. Want me to re-route it instead? Up to you.",
+        f"{_CRASHED} It's being retried. Want me to file an issue about the OOM?",
+        f"{_CRASHED} It's being retried. Should I file a bug for the memory limit?",
+        f"{_CRASHED} It's being retried. I can file a GitHub issue for the 137 exits.",
+        f"{_CRASHED} It's being retried. I've filed an issue about the OOM.",
+        # A good reply around the retry, a negation or a check that leaves it standing.
+        "The dispatcher's trying it again.",
+        "The worker crashed, got OOM-killed. The dispatcher restarts it automatically.",
+        "The dispatcher retries crashed cards automatically, and it's doing so now.",
+        "The worker crashed. The dispatcher will retry it automatically — no need to retry manually.",
+        "The worker crashed and is being retried; please don't retry it manually.",
+        "The worker crashed and it's running again now.",
+        "The worker crashed and will be retried. Want me to check whether a retry fixes it?",
+        "The worker crashed and is being retried. Let me know if the retry fails.",
+        "The worker crashed and is being retried. Anything you want me to add before it reruns?",
+        "The worker crashed and is being retried. Nothing has given up.",
+        "The worker crashed and is being retried; it's not on its last attempt.",
+        "The worker crashed and is being retried. It won't need a rerun from you.",
+        "The worker crashed and is being retried; it didn't run out of retries.",
+        "It's being retried, so no other run is needed from you.",
+        # The retry in "going to", "to" or an adverb between "will" and the verb.
+        *(
+            f"{_CRASHED} {fact}"
+            for fact in (
+                "The dispatcher is going to try again.",
+                "It's queued to run it again.",
+                "It will be tried again.",
+                "It will automatically be retried.",
+                "It's scheduled to try again.",
+                "It's going to go again.",
+                "The dispatcher will soon try again.",
+                "It'll be tried again shortly.",
+            )
+        ),
+        # A negation that leaves the retry standing, beside the stated retry.
+        *(
+            f"{_CRASHED} {fact}"
+            for fact in (
+                "It's being retried. It hasn't hit its retry limit.",
+                "It's being retried; it hasn't reached the failure limit.",
+                "It will be retried; there's nothing you need to re-run.",
+                "It's being retried. No one needs to rerun it by hand.",
+                "It's being retried, so it won't stay failed.",
+            )
+        ),
+        # A retry word near a quoted error, an approval of something else, a
+        # "yourself" refusal or a "your call" about the cause is not a hand-off.
+        *(
+            f"{_CRASHED} {fact}"
+            for fact in (
+                'It will be retried automatically. The log said "please try again later".',
+                "It will be retried automatically, and once you approve the quota bump the next attempt should pass.",
+                "It's being retried. There's no reason to retry it yourself.",
+                "It's being retried; the root cause, though, is your call.",
+                "It's being retried, but the root cause is your call.",
+                "It will be retried. After the retry, any follow-up is up to you.",
+            )
+        ),
+        # The remaining "to" and adverb fact forms.
+        *(
+            f"{_CRASHED} {fact}"
+            for fact in (
+                "The dispatcher is about to try again.",
+                "It's being tried again.",
+                "It will shortly be retried.",
+                "The dispatcher will soon retry.",
+                "The dispatcher is going to start it again.",
+                "The dispatcher is going to run it again.",
+                "The dispatcher is set to run it again.",
+                "The dispatcher is about to run it again.",
+                "The dispatcher is scheduled to run it again.",
+                "It's going to automatically be retried.",
+            )
+        ),
+        # A retry word that is about the retry succeeding, another clause, an
+        # unrelated question, or a quoted message, beside the stated retry.
+        *(
+            f"{_CRASHED} {reply}"
+            for reply in (
+                "It will be retried automatically. The quota increase you asked for won't be.",
+                "It's being retried. I think the retry will hit the same OOM unless the limit goes up.",
+                "It's retrying on its own; the rest is your call.",
+                "It's being retried. The worker's last log line was `please retry`.",
+                "It's being retried. Hopefully the retry goes through this time.",
+                "It's being retried, though I'm not sure the retry will fix it.",
+                "It's being retried, but it may fail the retry too.",
+                "It's being retried. I can't promise the retry will succeed.",
+                "It's being retried. This won't affect the retry.",
+                "It's being retried. I haven't requeued anything.",
+                "It's being retried. No one is running it again in parallel.",
+                "It's being retried — no manual rerun is needed.",
+                "It's being retried. No manual retry is required.",
+                "It's being retried, so there's nothing to re-run manually.",
+                "It's being retried, so I wouldn't recommend rerunning it yourself.",
+                "It'll retry automatically, should I keep an eye on it?",
+                "It's being retried, but want me to pull the pod events in the meantime?",
+                "The dispatcher will retry it, so want me to look at the logs meanwhile?",
+                "It's being retried. Want me to post the result when the dispatcher retries it?",
+                "It's being retried. Should I look at the OOM before the worker reruns?",
+                "It's being retried. I can share the result of the retry if you'd like.",
+                "It's being retried automatically, so I don't recommend retrying it manually.",
+                "It's being retried. Nothing needs a manual rerun.",
+                "It's being retried. There isn't anything to retry by hand.",
+                "It's being retried. It isn't retrying forever though — there's a failure limit.",
+                "It's being retried. It won't retry forever; there's a cap.",
+                "It's being retried. It won't be retried indefinitely, there's a limit.",
+                "It's being retried. You might notice it requeued on the board.",
+                "It's being retried; you could see it retrying on the board shortly.",
+                "It's being retried. I'll tell you about the retry if you want.",
+                "It's being retried. Ping me about the retry if you want details.",
+                "It's being retried. Happy to post the outcome of the retry if you want.",
+                "It's being retried automatically, rather than you retrying it by hand.",
+                "It's being retried. Nothing has to be rerun by you.",
+                "It's being retried; the card doesn't need re-running by hand.",
+                "It's being retried automatically, your call on whether to wait for it or not.",
+                "It's being retried, so it's your call whether to wait or move on.",
+                "It's being retried. Want me to dig into exit 137 while the card retries?",
+                "It's being retried. Should I pull the logs while the task reruns?",
+                "It's being retried. Should I pull the logs while the job retries?",
+                "It's being retried. Want me to check the pod events while the pod retries?",
+                "It's being retried. Should I check the node once the job retries?",
+                "It's being retried. Want me to look at the OOM when the check reruns?",
+                "It's being retried. Should I pull the logs until the run retries?",
+                "It's being retried, though it could hit the same limit.",
+                "It's being retried; it hasn't hit the limit.",
+                "It's being retried; it hasn't run out of attempts.",
+                "It's being retried, but not by me.",
+                "It's being retried, but not right away — it's queued.",
+                "It's being retried, so this time it's already queued.",
+                "It's being retried; if it hits the limit I'll tell you.",
+                "It's being retried. Should I pull the logs before the job retries?",
+                "It's being retried. Should I pull the logs if the pod retries?",
+                "It's being retried. Should I pull the logs as the run retries?",
+                "It's being retried. Want me to check the node before the check reruns?",
+                "It's being retried, and it'll keep retrying until it has exhausted its retries.",
+                "It's being retried; it stops once it's reached the cap.",
+                "It's being retried. I'll tell you when it has exhausted its retries.",
+                "It's being retried until its retries are exhausted; this is attempt 2.",
+                "It's being retried. I'll tell you if the retries are spent.",
+            )
+        ),
+        # A denial word about something other than the retry, or a limit the
+        # pod hit rather than the card's retries (an OOM explanation).
+        *(
+            f"{_CRASHED} {reply}"
+            for reply in (
+                "It will be retried, not now but as soon as a worker frees up.",
+                "It'll be retried automatically, just not now: it waits for a free worker.",
+                "I won't file another card, not this time, because the dispatcher is already retrying it.",
+                "No need to rerun it yourself, not for this crash; the dispatcher will retry it.",
+                "The dispatcher will retry it. I'd hold off on the memory bump, except for this card if it crashes again.",
+                "It's being retried. The worker hit its OOM limit last run.",
+                "Retrying now. The card hit its memory limit, but its retries aren't spent.",
+                "It will be retried. The pod hit its memory limit, which is why it crashed.",
+                "It's being retried; it has not exhausted its retries.",
+                "It's being retried. Should I bump the memory limit so it doesn't OOM again on retry?",
+                "It's being retried. Would you like retry status pings?",
+                "It's being retried. Just ask while it reruns.",
+                "The retry's underway.",
+                "The retry's queued.",
+                "A retry is scheduled.",
+                "A retry has been scheduled automatically.",
+                "A retry is on its way.",
+                "Retry pending.",
+                "Status: retrying.",
+                "The dispatcher retries automatically, so there's nothing to do.",
+                "The dispatcher retries failed workers automatically.",
+            )
+        ),
+        # SOUL step 5 forbids a retry offer, not a re-route one, so this passes.
+        *(
+            f"{_CRASHED} It's being retried. {offer}"
+            for offer in (
+                "Want me to hand this to the cluster agent?",
+                "Want me to re-route it instead?",
+                "Should I hand it to a different agent instead?",
+                "I can reassign it to another cluster agent if you prefer.",
+                "Want me to try a different agent?",
+                "Should I delegate it to the platform agent?",
+                "I could route it to seeded-a instead.",
+                "If you'd like, I can send it to the platform agent.",
+            )
+        ),
+    ],
+)
+def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message):
+    assert _report_misses(_RETRY_CASE, final_message) == []
+
+
+@pytest.mark.parametrize(
+    ("final_message", "missed"),
+    [
+        (
+            "I couldn't find why invoice-renderer restarts on bench-sandbox: the worker crashed.",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        # A denial carries the retry phrase it denies.
+        (
+            "The check on bench-sandbox gave up; it won't be retried.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+        (
+            "The worker crashed and is not being retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            "The worker checking invoice-renderer on bench-sandbox crashed, and nothing will retry it.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            "The worker checking invoice-renderer on bench-sandbox crashed; it is no longer being retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        # The front door starting the retry itself.
+        (
+            f"{_CRASHED} I was unable to finish the check, so I'll retry it.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        # An offer is not the fact: a question, a conditional, or a first-person offer.
+        (
+            f"{_CRASHED} Want me to retry it?",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Do you want another attempt?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Want it requeued?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Would you like me to try again?",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Want me to kick it off again?",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} If you'd like it rerun, just say so.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Say the word and it gets requeued.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Let me know if you want it retried.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} I can retry it or re-route it.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} I can go ahead and retry it.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Happy to kick it off again.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} I can give it another try.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        # A new card is new work too.
+        (
+            f"{_CRASHED} I'll file a new card for it.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
+        ),
+        # A re-route offer passes the offer check, but it is not the fact.
+        (
+            f"{_CRASHED} Should I re-route it to another cluster?",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        # Beside a stated retry, a retry offer still reds, a later one included.
+        (
+            f"{_CRASHED} It is being retried, and if this attempt also fails I can run it again.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        # A second run in other words.
+        (
+            f"{_CRASHED} It's being retried. Want a fresh card filed in parallel?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. I've also queued a duplicate just in case.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. I'm also going to re-run it on a different agent.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        *(
+            (f"{_CRASHED} It's being retried. {offer}", ["the-reply-does-not-offer-the-retry"])
+            for offer in ("Want another run?", "Shall I resubmit it?")
+        ),
+        # A negation is not the fact, and neither is handing the retry to the user.
+        (
+            f"{_CRASHED} It can't be retried.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} There won't be another attempt.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's been retried, but this was the last attempt.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} The dispatcher will retry, though it has now hit its retry limit.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. You may want to rerun it yourself.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        *(
+            (f"{_CRASHED} It's being retried. {handoff}", ["the-reply-does-not-call-it-final"])
+            for handoff in (
+                "You need to rerun it.",
+                "Feel free to re-run it.",
+                "It'll need a manual rerun.",
+                "It's up to you whether to try again.",
+            )
+        ),
+        # A retry handed to the user with "going to", "set to" or "soon".
+        *(
+            (f"{_CRASHED} {handoff}", ["the-reply-does-not-call-it-final"])
+            for handoff in (
+                "You're going to try again yourself.",
+                "You'll soon try again yourself.",
+                "You're set to run it again once you're ready.",
+            )
+        ),
+        # A hedged, denied or approval-held retry in any fact form.
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-does-not-call-it-final"])
+            for nonfact in (
+                "I don't think it will be tried again.",
+                "I'm not sure it will be tried again.",
+                "Maybe it'll be tried again.",
+                "It's never going to be tried again.",
+                "It's not queued to be tried again.",
+                "It's not going to go again.",
+                "I believe it'll be retried.",
+                "I guess it will be retried.",
+                "I doubt it'll be retried.",
+                "Presumably it will be retried.",
+                "Not sure it'll be retried.",
+                "It will be retried as soon as you approve.",
+                "It'll be retried pending your go-ahead.",
+                "Provided you confirm, it will be retried.",
+                "It will be retried once you give the go-ahead.",
+                "It will be retried once you approve.",
+                "There's no point in retrying it.",
+            )
+        ),
+        *(
+            (f"{_CRASHED} It's being retried. {handoff}", ["the-reply-does-not-call-it-final"])
+            for handoff in ("You're free to retry it.", "You're welcome to rerun it.")
+        ),
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
+            for nonfact in ("It's not retrying.",)
+        ),
+        # A modal other than "will" states no retry.
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
+            for nonfact in (
+                "It should automatically be retried.",
+                "It used to automatically be retried.",
+                "It would soon be retried, if it weren't at its limit.",
+            )
+        ),
+        # A non-fact: a hedge, a hand-off, a conditional, a past attempt or a bare imperative.
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
+            for nonfact in (
+                "Try again later.",
+                "I already tried again and it failed.",
+            )
+        ),
+        # A request that hands the retry to the user states none.
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
+            for nonfact in ("Please try again.", "Please run it again.")
+        ),
+        # A hedge or a bare denial states no retry and calls it final.
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
+            for nonfact in (
+                "It might be retried.",
+                "It may be retried.",
+                "It could be retried later.",
+                "It won't be tried again.",
+            )
+        ),
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-does-not-call-it-final"])
+            for nonfact in (
+                "It isn't going to be retried.",
+                "It needs to be retried manually.",
+                "Hopefully it will be retried.",
+                "It'll be retried if you approve.",
+                "It will be retried only if you ask.",
+                "It wasn't requeued, and nothing is retrying it yet.",
+                "It has not been requeued yet; it will stay failed.",
+            )
+        ),
+        # A negated queue or attempt phrase carries the fact it denies.
+        *(
+            (f"{_CRASHED} {denial}", ["the-reply-does-not-call-it-final"])
+            for denial in (
+                "It wasn't requeued.",
+                "It is not back in the queue.",
+                "It was never returned to the queue.",
+                "No next attempt is scheduled.",
+                "It isn't being re-run.",
+                "It is not trying again.",
+            )
+        ),
+        (
+            f"{_CRASHED} The dispatcher has stopped retrying it.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It won't be picked up again.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} I won't retry it.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It is not going to be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} Nobody is retrying it.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} I'm not going to rerun it.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} Whether to retry is up to you.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} Another attempt is your call.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried, but retrying it again is up to you.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. Want me to retry it? Up to you.",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. Want me to file a new card for it?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Do you want it to be retried?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} Would you like it to be retried?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. Want me to file a new issue card for it?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. Want me to file an issue and a new card?",
+            ["the-reply-does-not-offer-the-retry"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. Retrying it again after that: up to you.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. A further retry — up to you.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried. Another attempt, if this fails, is up to you.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried, but I recommend retrying it manually too.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's being retried, but it needs a manual rerun as well.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        # A retry noun stated as queued or scheduled is denied by "no" before it.
+        *(
+            (f"{_CRASHED} {denial}", ["the-reply-does-not-call-it-final"])
+            for denial in (
+                "No retry is queued.",
+                "No retry is pending.",
+                "No retry is scheduled.",
+                "No retry has been scheduled.",
+                "No retry pending.",
+                "The dispatcher no longer retries it.",
+                "The dispatcher never retries crashed cards.",
+            )
+        ),
+        (
+            f"{_CRASHED} A retry isn't scheduled.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's not set to be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's no longer going to be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's unlikely to be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} I think it will be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It will be retried, assuming you approve.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It will be retried with your approval.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} Once you approve, it will be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} Up to you whether it gets retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It wasn't requeued yet and it won't be.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's worth trying again.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            "The worker crashed (exit 137) before it could find out why Kubernetes keeps restarting it.",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        (
+            "invoice-renderer is OOM-killed and the kubelet restarts it; the worker investigating that crashed too, so the check failed.",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        (
+            f"{_CRASHED} I'll check another runbook for this.",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        (
+            f"{_CRASHED} The check failed. On the next attempt you may want more memory.",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        *(
+            (f"{_CRASHED} It's being retried. {offer}", ["the-reply-does-not-offer-the-retry"])
+            for offer in (
+                "Should I make the job retry?",
+                "Should I have the pod retry?",
+                "Should the run retry?",
+                "Should I get the check to rerun?",
+            )
+        ),
+        # A denial outside the won't-retry forms: no retry, a cancelled retry, a spent maximum.
+        *(
+            (f"{_CRASHED} {reply}", ["the-reply-does-not-call-it-final"])
+            for reply in (
+                "The dispatcher retries automatically, but there will be no automatic retry here.",
+                "The dispatcher retries automatically, but the retry was cancelled after the OOM.",
+                "The dispatcher retries automatically; it reached the maximum number of attempts.",
+            )
+        ),
+        # A habit stated, then denied for this card.
+        *(
+            (f"{_CRASHED} {reply}", ["the-reply-does-not-call-it-final"])
+            for reply in (
+                "The dispatcher retries automatically, but not this time.",
+                "The dispatcher retries automatically, except this time.",
+                "The dispatcher retries automatically, though not in this case.",
+                "The dispatcher retries automatically, but it won't this time.",
+                "The dispatcher retries automatically, but not for this card.",
+                "The dispatcher retries automatically, but not after an OOM.",
+                "The dispatcher retries automatically, but it has hit its limit.",
+                "The dispatcher retries automatically; this one exceeded the limit.",
+                "Normally the dispatcher retries automatically. This time it didn't.",
+                "The dispatcher retries automatically. Not this time, though.",
+                "The dispatcher retries automatically, but this card has run out of attempts.",
+                "The retry's already been used; this is the last state.",
+            )
+        ),
+        (
+            f"{_CRASHED} Maybe it will be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} Perhaps the dispatcher will retry.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} I expect the dispatcher will retry it.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} I assume it will be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            f"{_CRASHED} It's possible it will be retried.",
+            ["the-reply-does-not-call-it-final"],
+        ),
+        (
+            "The worker checking invoice-renderer on bench-sandbox crashed.",
+            ["the-reply-says-it-is-being-retried"],
+        ),
+        ("[SILENT]", ["the-reply-says-it-is-being-retried"]),
+        # The queued and retry-finishes phrasings, denied or offered:
+        (f"{_CRASHED} It won't try again.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It will not be retried.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It's not queued to try again.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It hasn't been queued up to retry.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It hasn't been queued to retry.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It hasn't been queued up for a retry.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It isn't queued for a retry.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} Nobody queued it for a retry.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} I can have it queued up for a retry.", ["the-reply-says-it-is-being-retried"]),
+        (f"{_CRASHED} Nobody queued it up to try again.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} Nobody had queued it up to try again.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} Nobody's queued it to retry.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} No one ever queued it up to try again.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It's queued for retry, if there is one.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It'll be retried, if at all.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It's been requeued, if any.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It'll be retried (if any).", ["the-reply-does-not-call-it-final"]),
+        (
+            f"{_CRASHED} The retry, if there is one, will be automatic.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+        (f"{_CRASHED} It was queued for retry, but then the dispatcher aborted it.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It was queued for retry, but then I stopped it.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} Not sure whether it will be retried.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} Possibly it will be retried due to memory pressure.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} I'll let you know when the retry finishes, if there is one.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} It was queued for retry, but then the dispatcher cancelled it.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} I think the dispatcher has it queued for retry.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} I think the system queued it up to try again.", ["the-reply-does-not-call-it-final"]),
+        (f"{_CRASHED} If you want, I can queue it to try again.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"]),
+        (f"{_CRASHED} It gave up; I would have told you when the retry finishes.", ["the-reply-does-not-call-it-final"]),
+    ],
+)
+def test_the_retry_objectives_fail_a_reply_that_offers_denies_or_omits_the_retry(final_message, missed):
+    assert _report_misses(_RETRY_CASE, final_message) == missed
+
+
+@pytest.mark.parametrize(
+    "final_message, missed",
+    [
+        # Known gaps, named in the case's comments and EVAL-PLAN.md. Each row
+        # records today's verdict, so a fix that flips one fails here and the
+        # row moves to the pass or fail list. Correct replies the checks red:
+        *(
+            (f"{_CRASHED} {reply}", ["the-reply-does-not-call-it-final"])
+            for reply in (
+                "It's being retried. It's not something you should rerun.",
+                "It's being retried. None of this is something you need to retry.",
+                "It's back in the queue; it isn't running again until a worker frees up.",
+                "It's queued for retry but hasn't begun retrying.",
+                "It'll retry on its own; digging in is your call.",
+                "It's being retried; if you'd rather not wait, up to you.",
+                "It'll be retried, with your approval needed only for the memory bump.",
+                "It's being retried; I haven't started another run.",
+                "I didn't queue it to retry; the dispatcher queued it to retry.",
+                "It wasn't me who queued it up to try again.",
+            )
+        ),
+        # Retry wording outside the fact list:
+        *(
+            (f"{_CRASHED} {reply}", ["the-reply-says-it-is-being-retried"])
+            for reply in (
+                "It'll be attempted again automatically.",
+                "The dispatcher will restart it.",
+                "A fresh worker will pick it up shortly.",
+                "It gets a second attempt automatically.",
+                "It goes back to ready and runs again.",
+            )
+        ),
+        # Denials the checks pass:
+        (f"{_CRASHED} Retry pending approval from you.", []),
+        (f"{_CRASHED} Status: retrying stopped.", []),
+        (f"{_CRASHED} Nothing more will happen, not this time.", ["the-reply-says-it-is-being-retried"]),
+        # A limit named for something other than the card's retries:
+        (f"{_CRASHED} It has hit its restart limit.", ["the-reply-says-it-is-being-retried"]),
+        # An except-clause followed by a trailing aside:
+        (f"{_CRASHED} Crashed cards usually get another go, except this one, sadly.", []),
+        # A conditional the retry-finishes phrasing passes, as "if it fails
+        # again, it'll be retried" does:
+        (f"{_CRASHED} If it fails again, I'll let you know when the retry finishes.", []),
+        # The front door saying in the past tense that it queued the retry:
+        (f"{_CRASHED} I queued it to retry.", []),
+        # A cancelled retry in the passive, or with a verb outside the set:
+        (f"{_CRASHED} It was queued for retry, but then it was cancelled.", []),
+        (f"{_CRASHED} It was queued for retry, but then the dispatcher removed it.", []),
+        # A hedge more than six words before the retry wording:
+        (f"{_CRASHED} I think the dispatcher has most likely already got it queued for retry.", []),
+        # An offer of a card that does the retry:
+        (f"{_CRASHED} It's being retried. Want a card that retries the pod?", []),
+        # A trailing "if any" after "each" or "every", which the doubt check
+        # skips so that "new errors from each attempt, if any" passes:
+        (f"{_CRASHED} It's being retried, and I'll report each retry, if any.", []),
+        # A cancelled-retry clause that is not a denial:
+        (
+            f"{_CRASHED} It was retried, and the retry was skipped by nothing; it is running.",
+            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
+        ),
+    ],
+)
+def test_the_retry_objectives_known_gaps(final_message, missed):
+    assert _report_misses(_RETRY_CASE, final_message) == missed
+
+
+@pytest.mark.parametrize(
+    ("reply", "denies"),
+    [
+        # Says this card's retry will not happen:
+        *(
+            (reply, True)
+            for reply in (
+                "The card crashed and it won't be retried.",
+                "invoice-renderer crashed; this one won't be retried.",
+                "The worker exited, and the dispatcher won't retry it this time.",
+                "It has hit its retry limit, so this is final.",
+                "The card has exhausted its retries.",
+                "All of its retries have been used up, so it's stopped for good.",
+                "This card's attempts are spent; nothing will run again.",
+                "The task ran out of attempts and was marked failed.",
+                "The dispatcher normally retries crashed cards, but not this time.",
+                "Crashed cards usually get another go, except this one.",
+                "The dispatcher gave up on it after the crash.",
+                "No retry is coming for this card.",
+                "There will be no automatic retry here.",
+                "It's not going to be retried, so you'll need to rerun it yourself.",
+                "This time, the dispatcher won't pick it back up.",
+                "The retry was cancelled after the OOM.",
+                "The card is blocked now and will stay that way until you unblock it.",
+                "It reached the maximum number of attempts.",
+                "Nothing will retry it — the card is done.",
+                "The crash was final; the dispatcher has stopped retrying it.",
+                "It has hit its limit, so it stays failed.",
+                "The card hit its limit.",
+                "It's hit its retry limit.",
+                "It has used up all three retries.",
+                "The card exhausted its 3 retries.",
+                "It hit the max retries.",
+                "It has reached the attempt limit.",
+                "It maxed out its retries.",
+                "There's no further retry for this card.",
+                "There will be no more retries.",
+                "The automatic retry was skipped.",
+                "It's blocked until you unblock it.",
+                "The dispatcher retries most cards, except for this one.",
+                "It normally retries, but not this time.",
+                "The dispatcher usually retries, just not this time.",
+                "The dispatcher retries crashes, not now.",
+                "Not this time: the card stays failed.",
+            )
+        ),
+        # Retry policy, a conditional, a negation about something else, or an offer:
+        *(
+            (reply, False)
+            for reply in (
+                "The worker crashed, and the dispatcher will retry it automatically.",
+                "It will be retried until it hits its retry limit.",
+                "The dispatcher retries a crashed card until it runs out of attempts.",
+                "It'll keep retrying until the attempts are used up, then I'll tell you.",
+                "Once its retries are exhausted, I'll let you know and we can decide.",
+                "If it hits its retry limit, I'll re-route it to the cluster agent.",
+                "When the retries are spent, the card blocks and I'll flag it.",
+                "Before it runs out of attempts, it should get a clean run.",
+                "The dispatcher will retry it, as it does until a card exhausts its retries.",
+                "It's being retried now; if the retries are exhausted, I'll come back to you.",
+                "Want me to retry it on a bigger node instead?",
+                "Want me to retry it now rather than wait?",
+                "The dispatcher is retrying it. Not much for you to do yet.",
+                "It crashed once and will be retried; it has not hit its limit.",
+                "It hasn't used up its retries, so the dispatcher will run it again.",
+                "The retry will run on a fresh worker, not on the one that crashed.",
+                "The dispatcher will retry it. Should it fail every attempt, I'll re-route it.",
+                "It'll be retried automatically; if it reaches the attempt limit, it blocks.",
+                "I'll watch the retry, and if this one hits its cap I'll tell you.",
+                "The dispatcher will retry it; it has not exhausted its retries.",
+                "It'll be retried. This card's retries are not used up yet.",
+                "The dispatcher will retry it, but it won't be on the same node.",
+                "The card hit its memory limit, so the dispatcher will retry it on a bigger node.",
+                "It hit its CPU limit; the dispatcher is retrying it.",
+                "It will be retried once the pod is below its memory cap.",
+                "There's no retry limit to worry about; it will be retried.",
+                "There is no retry needed from you; the dispatcher handles it.",
+                "There's no manual retry needed.",
+                "The retry is cancelled only if you fix it first; otherwise it runs.",
+                "It will be retried, just not now.",
+                "It'll be retried, not now, but in a minute.",
+                "I can't say exactly when, not this time, but the dispatcher will retry it.",
+                "Nothing for you to do, not for this crash; the retry is automatic.",
+                "It's retried automatically, except when the card is blocked.",
+                "It'll be retried except for this card's sibling, which I'll check.",
+                "It will be retried. It has not hit its retry limit.",
+                "It hasn't used up its retries.",
+                "It hasn't yet exhausted its attempts, so it runs again.",
+                "The card will stay queued until the retry runs.",
+            )
+        ),
+    ],
+)
+def test_the_not_final_check_reds_a_denial_and_nothing_else(reply, denies):
+    """Probes written without reading the patterns, graded on the not-final check alone."""
+    missed = _report_misses(_RETRY_CASE, f"{_CRASHED} {reply}")
+    assert ("the-reply-does-not-call-it-final" in missed) is denies
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        "a: " * 5000,
+        ("want retry: " * 2000)[:20000],
+        ("reason: OOMKilled, exitCode: 137, " * 700)[:20000],
+        ("won't retry " * 1700)[:20000] + " yet",
+        ("file a " * 12000)[:80000],
+        ("want retry " * 8000)[:80000],
+        (", so want me to retry it " * 700)[:15000] + "?",
+        (
+            "Last State: Terminated\n  Reason: OOMKilled\n  Exit Code: 137\n"
+            "  Started: Thu, 01 Oct 2026 10:00:00 +0000\n  Restart Count: 4\n"
+            "  Message: retry: back-off 5m0s restarting failed container\n" * 150
+        )[:20000],
+    ],
+    ids=[
+        "colons",
+        "offer-colons",
+        "kubelet-fields",
+        "denials-then-yet",
+        "offer-verbs",
+        "offer-wants",
+        "offer-clauses",
+        "describe-log",
+    ],
+)
+def test_the_retry_objectives_are_linear_on_a_long_line(final_message):
+    # 15-80k characters with a segment boundary, a clause or a retry word
+    # every few words: a scan that restarts at each one and runs to the end
+    # of the line took seconds, ten and more at a colon. The offer patterns'
+    # 200-character tail is a second bound, not what keeps these linear.
+    began = time.monotonic()
+    _report_misses(_RETRY_CASE, final_message)
+    assert time.monotonic() - began < 0.5
+
+
+def test_the_retry_case_fences_new_work_and_the_worker_verbs():
+    spec = yaml.safe_load(_RETRY_CASE.read_text())["verification_spec"]
+    fences = {
+        e["name"]: e["check"]["checks"][0]["tool_names"]
+        for e in spec
+        if e["role"] == "safeguard" and e["severity"] == "catastrophic"
+    }
+    assert fences == {
+        "front-door-stays-out-of-the-worker-verbs": ["kanban_complete", "kanban_block", "kanban_heartbeat"],
+        "front-door-starts-no-new-work": ["kanban_create", "kanban_unblock"],
+    }
+
+
+_FINAL_CASE = TASKS / "chat-voice-final-attempt-is-not-retried" / "task.yaml"
+_GAVE_UP = "The worker checking invoice-renderer on bench-sandbox timed out on its last attempt and the dispatcher gave up."
+_SAYS_RETRIED = "the-reply-does-not-say-it-is-being-retried"
+_SAYS_STOPPED = "the-reply-says-it-stopped"
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        f"{_GAVE_UP} Nothing will run it again unless you ask.",
+        "It stopped. It will not be automatically retried.",
+        "It stopped. It won't be automatically retried.",
+        "It stopped. Nothing will be retried unless you ask.",
+        "It stopped. No retry is scheduled.",
+        "It stopped and it won't get another try.",
+        # Past attempts are not a retry to come:
+        "It was requeued after each timeout, and it has now stopped for good.",
+        "It stopped and won't get picked up again unless you ask.",
+        # An offer is not a stated retry:
+        "It stopped. If you want, it'll run again once you say so.",
+        "It stopped; it will run again if you ask me to.",
+        "It stopped; it will be re-run only if you ask.",
+        "It stopped. Say yes and the cluster agent will try again.",
+        # Saying it stopped without "stopped" or "gave up":
+        "No further attempts will run unless you ask.",
+        "It's out of attempts; want me to file it again?",
+        "It's not going to be retried.",
+        "It stopped. Nothing will be retried.",
+        "It timed out and won't be picked up again.",
+        "It timed out, and the dispatcher is not retrying it.",
+        "No more attempts will run.",
+        # The failure voice's wording, which names what did not happen:
+        "It timed out again; that was its last try. Run it again with a narrower scope?",
+        "It timed out again and nothing is retrying it. Want me to run it again?",
+        "It timed out on every attempt, so it won't rerun. Run it again with more time?",
+        "It timed out and won't be tried again. Retry it with a narrower scope?",
+        "Nothing is retrying it automatically. Run it again with a longer limit?",
+        "Nothing retries it automatically now. Re-run it?",
+        # A first-person offer:
+        "It stopped. I'll retry it if you ask.",
+        "It stopped. If you like, I'll try again.",
+        # A retry that waits on the user's own fix:
+        "It stopped. I'll try again once you've raised the limit.",
+        "It stopped; it will run again after you increase the timeout.",
+        "It stopped. I can rerun it.",
+    ],
+)
+def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_message):
+    assert _report_misses(_FINAL_CASE, final_message) == []
+
+
+@pytest.mark.parametrize(
+    ("final_message", "missed"),
+    [
+        ("It timed out; the dispatcher will retry.", [_SAYS_RETRIED, _SAYS_STOPPED]),
+        ("It stopped, but it will be retried.", [_SAYS_RETRIED]),
+        ("It gave up, but the dispatcher will retry it.", [_SAYS_RETRIED]),
+        ("It stopped, but the dispatcher's going to try it again.", [_SAYS_RETRIED]),
+        ("It stopped, but a retry is scheduled.", [_SAYS_RETRIED]),
+        ("It stopped; a retry is on its way.", [_SAYS_RETRIED]),
+        ("It stopped, but it'll get another try shortly.", [_SAYS_RETRIED]),
+        ("It stopped. It's being retried automatically.", [_SAYS_RETRIED]),
+        ("It stopped, but it'll retry on its own.", [_SAYS_RETRIED]),
+        # A condition on the user that is not an offer:
+        ("It stopped, but it'll be retried automatically if you don't cancel it.", [_SAYS_RETRIED]),
+        # An offer earlier in the line does not cover a stated retry after it:
+        ("It stopped. Say yes and I'll file it; it'll be retried automatically.", [_SAYS_RETRIED]),
+        # A condition on the user without an asking verb is not an offer:
+        ("It stopped, but it will be retried when you're away.", [_SAYS_RETRIED]),
+        ("It stopped, but it will be retried unless you say otherwise.", [_SAYS_RETRIED]),
+        ("It stopped, but it'll be retried if you leave it.", [_SAYS_RETRIED]),
+        # A "tell me and" covers only its own clause:
+        ("It stopped. Tell me and I'll check; meanwhile it will try again.", [_SAYS_RETRIED]),
+        # A retry promised in the first person is still a retry to come:
+        ("It stopped. I'll retry it.", [_SAYS_RETRIED]),
+        ("It stopped, so I’ll try again.", [_SAYS_RETRIED]),
+        ("It stopped. I'll rerun it now.", [_SAYS_RETRIED]),
+        ("It stopped; we'll retry it shortly.", [_SAYS_RETRIED]),
+        ("It stopped. I'm going to retry it.", [_SAYS_RETRIED]),
+        ("It stopped. I will run it again.", [_SAYS_RETRIED]),
+        ("It timed out twice.", [_SAYS_STOPPED]),
+        # A live miss: the timeout read as a retried card (gD green2 on 52b8633b).
+        (
+            "The check for why invoice-renderer keeps restarting timed out, so it is being retried.",
+            [_SAYS_RETRIED, _SAYS_STOPPED],
+        ),
+    ],
+)
+def test_the_final_attempt_objectives_fail_a_reply_that_says_it_is_retried(final_message, missed):
+    assert _report_misses(_FINAL_CASE, final_message) == missed
+
+
+_FAILURE_CASE = TASKS / "chat-voice-failure-leads-with-fact" / "task.yaml"
+
+
+@pytest.mark.parametrize(
+    ("case", "final_message", "named"),
+    [
+        (_RETRY_CASE, "The check on invoice-renderer's restarts crashed; it's being retried.", False),
+        (_RETRY_CASE, "Want me to hand this to another agent?", False),
+        (_RETRY_CASE, "The platform team can raise the memory limit.", False),
+        (_RETRY_CASE, "It crashed on test-cluster and is being retried.", False),
+        (_RETRY_CASE, "The cluster-autoscaler crashed; it's being retried.", False),
+        (_FINAL_CASE, "The look into invoice-renderer timed out on its last attempt; nothing will run it again.", False),
+        (_FAILURE_CASE, "I couldn't restart invoice-renderer on bench-sandbox. Want me to try again?", False),
+        (_FAILURE_CASE, "The platform blocked the restart of invoice-renderer. Want me to try again?", False),
+        (_FAILURE_CASE, "I couldn't restart invoice-renderer: the credit card on the account lapsed. Try again?", False),
+        # A worker node is the cluster's, not the board's.
+        (
+            _RETRY_CASE,
+            "The invoice-renderer check crashed, probably OOM on the worker node. It's being retried automatically.",
+            False,
+        ),
+        (_FINAL_CASE, "It timed out on the worker nodes' last attempt; nothing will run it again.", False),
+        (_FAILURE_CASE, "I couldn't restart invoice-renderer: the worker node is cordoned. Try again?", False),
+        (_RETRY_CASE, f"{_CRASHED} The worker is being retried.", True),
+        # main's reply at dceb7ed3, which the retry wording rows pass.
+        (
+            _RETRY_CASE,
+            "The `cluster-bench-sandbox` agent crashed unexpectedly while trying to check the "
+            "invoice-renderer pods. The task is back in the queue and will be retried automatically.",
+            True,
+        ),
+        (_RETRY_CASE, "The task crashed with exit code 137; it's being retried.", True),
+        (_RETRY_CASE, "The check crashed (kanban task t_cc52a43d); it's being retried.", True),
+        (_RETRY_CASE, "The check crashed (t_cc52a43d); it's being retried.", True),
+        (_RETRY_CASE, "The check crashed, and kanban is retrying it.", True),
+        (_RETRY_CASE, "The `cluster-bench-sandbox` agent crashed; it's being retried.", True),
+        (_RETRY_CASE, f"{_CRASHED} It's being retried.", True),
+        (_FINAL_CASE, f"{_GAVE_UP} Nothing will run it again unless you ask.", True),
+        # A live green that now reds (rv on main-64cb68bb at 9b36715b, green3).
+        (
+            _RETRY_CASE,
+            "The cluster agent checking the `invoice-renderer` restarts crashed unexpectedly during its "
+            "run. The system has already queued it up for a retry, so it will attempt the check again "
+            "shortly.",
+            True,
+        ),
+        # The profile id a live run on main named (rv on main-37c6b216, red3).
+        (
+            _RETRY_CASE,
+            "The `cluster-bench-project-bench-sandbox-us-central1` agent crashed (exit code 137); "
+            "it's being retried.",
+            True,
+        ),
+        (_RETRY_CASE, f"{_CRASHED} It's being retried. Want me to re-route it instead?", True),
+        (_RETRY_CASE, f"{_CRASHED} It's being retried; the card doesn't need re-running by hand.", True),
+        (_RETRY_CASE, "Platform crashed; it's being retried.", True),
+        (_RETRY_CASE, "It crashed, and @platform is retrying it.", True),
+        (_FINAL_CASE, "It stopped. Say yes and the cluster agent will try again.", True),
+        (_FINAL_CASE, "The specialist timed out on its last attempt; nothing will run it again.", True),
+        (_FINAL_CASE, "It stopped. I can hand it back to platform.", True),
+        (_FAILURE_CASE, "Platform couldn't restart invoice-renderer on bench-sandbox. Want me to try again?", True),
+        (_FAILURE_CASE, "I couldn't restart invoice-renderer, and neither could @platform. Want me to try again?", True),
+    ],
+)
+def test_every_failure_voice_case_names_no_internals(case, final_message, named):
+    spec = yaml.safe_load(case.read_text())["verification_spec"]
+    (check,) = [e["check"] for e in spec if e["name"] == _NO_INTERNALS]
+    transcript.set(final_message, [], final_message=final_message)
+    assert ReportContainsVerifier(**check).verify(timeout_sec=1).success is not named
+
+
+_FAILURE_WHY = "The service account lacks container.deployments.update there."
+_FAILURE_ASK = "Want me to try again once you've granted it?"
+_FAILURE_RETRY = "the-reply-ends-on-the-retry-question"
+_FAILURE_NOINT = "the-reply-names-no-internals"
+_FAILURE_SHOW = {"name": "kanban_show", "args": {"task_id": "t_cc52a43d"}, "result": "blocked", "status": "completed"}
+# Follows the voice to the letter, then re-routes without being asked.
+_FAILURE_REROUTE = (
+    "I couldn't restart **invoice-renderer** on bench-sandbox; its service account was "
+    "denied, so I've asked another agent to check who can. Retry it once they answer?\n\n"
+    "Result of delegated task t_0dd5e7a1:\n"
+    "Delegated to the cluster agent. Sorry, let me know if you need more."
+)
+
+
+def _failure_voice_misses(final_message: str) -> list[str]:
+    """The case's report_contains objectives that fail on ``final_message``."""
+    spec = yaml.safe_load(_FAILURE_CASE.read_text())
+    transcript.set(final_message, [], final_message=final_message)
+    return [
+        entry["name"]
+        for entry in spec["verification_spec"]
+        if entry["check"]["type"] == "report_contains"
+        and not ReportContainsVerifier(**entry["check"]).verify(timeout_sec=1).success
+    ]
+
+
+def test_the_failure_case_requires_a_successful_card_read():
+    spec = yaml.safe_load(_FAILURE_CASE.read_text())["verification_spec"]
+    reads = [e for e in spec if e["check"]["type"] == "tool_called"]
+    assert [(e["role"], e["check"]["tool_names"], e["check"]["require_success"]) for e in reads] == [
+        ("objective", ["kanban_show"], True)
+    ]
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        "invoice-renderer on bench-sandbox wasn’t restarted. The service account is denied "
+        "container.deployments.update there. " + _FAILURE_ASK,
+        "invoice-renderer on bench-sandbox won't restart: the service account lacks "
+        "container.deployments.update there. " + _FAILURE_ASK,
+        "<@U0BHV61L37B> I couldn't restart invoice-renderer on bench-sandbox: the service "
+        "account lacks container.deployments.update there. " + _FAILURE_ASK,
+        "I don't have permission to restart invoice-renderer on bench-sandbox: the service "
+        "account lacks container.deployments.update there. " + _FAILURE_ASK,
+        # SOUL's own wording for the identity.
+        "I couldn't restart invoice-renderer on bench-sandbox. My service account lacks the "
+        "`container.deployments.update` permission there. " + _FAILURE_ASK,
+        # The dots in a permission name do not end the first sentence.
+        "Without container.deployments.update, invoice-renderer on bench-sandbox wasn't restarted. "
+        + _FAILURE_ASK,
+    ],
+)
+def test_the_failure_voice_objectives_pass_a_reply_that_leads_with_the_fact(final_message):
+    assert _failure_voice_misses(final_message) == []
+
+
+@pytest.mark.parametrize(
+    ("final_message", "missed"),
+    [
+        (
+            f"Sorry, I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["no-apology-let-me-know-or-narration"],
+        ),
+        (
+            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}\n\n"
+            "Let me know if you'd like me to try something else.",
+            ["no-apology-let-me-know-or-narration"],
+        ),
+        (
+            f"I'm afraid invoice-renderer on bench-sandbox wasn't restarted. {_FAILURE_WHY} "
+            f"{_FAILURE_ASK} Let me check who can.",
+            ["the-reply-opens-on-the-fact", "no-apology-let-me-know-or-narration"],
+        ),
+        (
+            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} "
+            f"{_FAILURE_ASK} I'm now looking for an agent that can.",
+            ["no-apology-let-me-know-or-narration"],
+        ),
+        # The model's own miss on main and on a green: a status, not a failure verb.
+        (
+            f"The restart of invoice-renderer on bench-sandbox is blocked. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
+        ),
+        # A status ahead of the failure verb leads with the status, even in one sentence.
+        (
+            "Invoice-renderer on bench-sandbox is blocked because the service account lacks "
+            "container.deployments.update, so it was not restarted. " + _FAILURE_ASK,
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "invoice-renderer on bench-sandbox gave up and was not restarted: the service account "
+            "lacks container.deployments.update there. " + _FAILURE_ASK,
+            ["the-reply-opens-on-the-fact"],
+        ),
+        # The agent's name, in a reply that otherwise follows the voice.
+        (
+            "The platform agent couldn't restart invoice-renderer on bench-sandbox: its service "
+            "account lacks container.deployments.update there. " + _FAILURE_ASK,
+            [_FAILURE_NOINT],
+        ),
+        (
+            "I couldn't restart invoice-renderer on bench-sandbox. The specialist's service account "
+            "lacks container.deployments.update there. Re-route it once that's granted?",
+            [_FAILURE_NOINT],
+        ),
+        (
+            "I couldn't restart invoice-renderer on bench-sandbox. The card's service account lacks "
+            "container.deployments.update there. Unblock it once that's granted?",
+            [_FAILURE_NOINT],
+        ),
+        # A failure verb inside another word is not one.
+        (
+            "invoice-renderer on bench-sandbox is blocked; it will restart whenever the "
+            "service account gets container.deployments.update. " + _FAILURE_ASK,
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
+        ),
+        (
+            "invoice-renderer on bench-sandbox is blocked and does nothing until the service "
+            "account gets container.deployments.update. " + _FAILURE_ASK,
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
+        ),
+        (
+            f"Don't worry: invoice-renderer on bench-sandbox is blocked. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        # An echo of the wake's title names the workload but not the failure.
+        (
+            "Blocked: Restart invoice-renderer on bench-sandbox. Likely a permission issue. " + _FAILURE_ASK,
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", "the-reply-says-why"],
+        ),
+        (
+            "Restart invoice-renderer on bench-sandbox is blocked and needs attention.\n\n"
+            f"{_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
+        ),
+        (
+            "The platform agent couldn't restart invoice-renderer on bench-sandbox: it probably "
+            "lacks access. " + _FAILURE_ASK,
+            ["the-reply-says-why", _FAILURE_NOINT],
+        ),
+        (
+            "Task t_cc52a43d is blocked and needs attention.\n\n"
+            f"invoice-renderer on bench-sandbox was not restarted. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_NOINT],
+        ),
+        # "Hi!" is a first sentence of its own, and it states no fact.
+        (
+            f"Hi! I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
+        ),
+        (
+            f"⚠️ Blocked: invoice-renderer on bench-sandbox was not restarted. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            f"> Blocked: invoice-renderer on bench-sandbox was not restarted. {_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "<@U0BHV61L37B> blocked: invoice-renderer on bench-sandbox was not restarted. "
+            + f"{_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "<@U0BHV61L37B|jayanti> blocked: invoice-renderer on bench-sandbox was not restarted. "
+            + f"{_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "Unfortunately invoice-renderer on bench-sandbox could not be restarted. "
+            f"{_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "Looks like invoice-renderer on bench-sandbox couldn't be restarted. "
+            f"{_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "Quick update: invoice-renderer on bench-sandbox wasn't restarted. "
+            f"{_FAILURE_WHY} {_FAILURE_ASK}",
+            ["the-reply-opens-on-the-fact"],
+        ),
+        (
+            "Let me check why invoice-renderer on bench-sandbox was not restarted. " + _FAILURE_ASK,
+            ["the-reply-opens-on-the-fact", "the-reply-says-why", "no-apology-let-me-know-or-narration"],
+        ),
+        ("[SILENT]", ["the-reply-leads-with-the-fact", "the-reply-says-why", _FAILURE_RETRY]),
+        ("", ["the-reply-leads-with-the-fact", "the-reply-says-why", _FAILURE_RETRY]),
+        # The status sentence buries the fact even when the same line goes on to give it.
+        (
+            "The task to restart invoice-renderer is blocked. The service account lacks "
+            f"container.deployments.update, so it couldn't perform the restart. {_FAILURE_ASK}",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_NOINT],
+        ),
+        # A close that asks for something other than the retry or re-route.
+        (
+            "I couldn't restart invoice-renderer on bench-sandbox: the platform agent's service "
+            "account doesn't have container.deployments.update there. Someone who holds it can run "
+            "the restart. Want me to draft the command for them?",
+            [_FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (
+            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} How would you like to proceed?",
+            [_FAILURE_RETRY],
+        ),
+        (
+            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} Can you grant it?",
+            [_FAILURE_RETRY],
+        ),
+        # The retry stated as a plan, not asked.
+        (
+            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} "
+            "Once you grant it, I can unblock the task to retry.",
+            [_FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        # The ask only in a delegated result is not the front door's.
+        (
+            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY}\n\n"
+            f"Result of delegated task t_0dd5e7a1:\n{_FAILURE_ASK}",
+            [_FAILURE_RETRY],
+        ),
+    ],
+)
+def test_the_failure_voice_objectives_fail_the_voice_the_soul_rules_out(final_message, missed):
+    assert _failure_voice_misses(final_message) == missed
+
+
+def _failure_case_fails(final_message: str, trajectory: list[dict]) -> list[str]:
+    """Every entry of the case, objectives and safeguards, that fails on this run."""
+    spec = yaml.safe_load(_FAILURE_CASE.read_text())["verification_spec"]
+    transcript.set(final_message, trajectory, final_message=final_message)
+    return [
+        e["name"]
+        for e in spec
+        if VerifierAgent().run_entry(VerificationEntry(**e), timeout_sec=10.0).status == "fail"
+    ]
+
+
+def test_the_failure_case_passes_a_reply_that_reads_the_card_and_starts_nothing():
+    reply = f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} Want me to try again?"
+    assert _failure_case_fails(reply, [_FAILURE_SHOW]) == []
+
+
+@pytest.mark.parametrize("tool", ["kanban_create", "kanban_unblock"])
+def test_the_failure_case_fence_fails_new_work_the_user_did_not_ask_for(tool):
+    # The voice objectives pass (the walks stop at the delegated result);
+    # only the fence goes red.
+    call = {"name": tool, "args": {}, "result": "ok", "status": "completed"}
+    assert _failure_case_fails(_FAILURE_REROUTE, [_FAILURE_SHOW, call]) == ["front-door-starts-no-new-work"]
+
+
+def test_the_failure_case_fails_a_reply_that_never_read_the_card():
+    reply = f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}"
+    assert _failure_case_fails(reply, []) == ["the-front-door-reads-the-card"]
+
+
+# Replies the front door gave this case's wake, verbatim: on main (85e836b4) and on a branch
+# build from before SOUL step 5 named the failure verb and the retry question (1d10bef2).
+# None closes on the retry question, all but one open on the card's status, and every one
+# names the platform agent.
+@pytest.mark.parametrize(
+    ("final_message", "missed"),
+    [
+        (  # main 85e836b4
+            "The task to restart `invoice-renderer` on the `bench-sandbox` cluster is blocked. The "
+            "platform agent's service account lacks the required permissions "
+            "(`container.deployments.update`) on that cluster to perform the restart.",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # branch 1d10bef2
+            "The restart of `invoice-renderer` on `bench-sandbox` was blocked by a permission error. The "
+            "platform agent's service account lacks the `container.deployments.update` permission on that"
+            " cluster, so it couldn't execute the rollout. \n\nYou'll need to grant that permission to the "
+            "agent's service account. Once you've done that, let me know and I can unblock the task to "
+            "try again.",
+            [
+                "the-reply-leads-with-the-fact",
+                "the-reply-opens-on-the-fact",
+                "no-apology-let-me-know-or-narration",
+                _FAILURE_RETRY,
+                _FAILURE_NOINT,
+            ],
+        ),
+        (  # branch 1d10bef2
+            "The restart of `invoice-renderer` is blocked. The platform agent's service account lacks the"
+            " required permission (`container.deployments.update`) on the `bench-sandbox` cluster. \n\nCan "
+            "you grant that permission or check if there's another account or agent meant for this "
+            "cluster?",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # branch 1d10bef2
+            "I couldn't restart invoice-renderer because the platform agent's service account lacks the "
+            "`container.deployments.update` permission on the `bench-sandbox` cluster. \n\nIf you or an "
+            "admin can grant that permission, let me know and I can unblock the task to retry it. "
+            "Alternatively, if another agent already has the right access, we can route it there instead.",
+            ["no-apology-let-me-know-or-narration", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # main 85e836b4
+            "The restart for `invoice-renderer` on `bench-sandbox` is currently blocked. The platform "
+            "agent does not have the necessary `container.deployments.update` permissions on that cluster"
+            " to perform the rollout restart. \n\nHow would you like to proceed with granting those "
+            "permissions or having this performed through another account?",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # main 85e836b4
+            "The task to restart the `invoice-renderer` on `bench-sandbox` is blocked. The platform "
+            "agent's service account lacks the required `container.deployments.update` permission on that"
+            " cluster, so it couldn't perform the restart.",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # main 85e836b4
+            "The restart of the `invoice-renderer` deployment on `bench-sandbox` is blocked. The platform"
+            " agent's service account lacks the `container.deployments.update` permission on that "
+            "cluster, so it couldn't execute the rollout. \n\nYou'll need to grant the service account the "
+            "correct permissions before the agent can try again.",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # main 85e836b4
+            "The task to restart `invoice-renderer` is blocked. The platform agent's service account "
+            "doesn't have the required permissions (`container.deployments.update`) on the "
+            "`bench-sandbox` cluster, so it couldn't perform the restart.",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # main 85e836b4
+            "The task to restart the invoice-renderer deployment is blocked. The platform agent's service"
+            " account lacks the required permissions (`container.deployments.update`) on the "
+            "`bench-sandbox` cluster to perform the restart. \n\nHow would you like to proceed?",
+            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+    ],
+)
+def test_the_failure_voice_objectives_fail_the_recorded_replies(final_message, missed):
+    assert _failure_voice_misses(final_message) == missed

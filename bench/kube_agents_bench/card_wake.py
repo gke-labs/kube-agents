@@ -1,4 +1,4 @@
-"""Replay the wake a blocked or failed card sends the front door.
+"""Replay the wake a blocked, failed or retried card sends the front door.
 
 The front door's reply to a card's wake is a turn the harness's own asks never
 reach. Two replays produce one. A prompt whose first line is
@@ -42,6 +42,29 @@ the API server's is. The harness sends that wake as the run's only turn. The
 wake names the card but not the reason, so the front door reads the card
 (``kanban_show``) as it would in a real thread.
 
+**A worker that crashed or timed out.** The dispatcher retries a ``crashed``
+or ``timed_out`` card until its failure breaker trips
+(``hermes_cli/kanban_db_dispatch.py``, ``_record_task_failure``:
+``DEFAULT_FAILURE_LIMIT`` consecutive failures, or the card's own
+``max_retries``). Below the limit the card goes back to ``ready`` and the
+event wakes the front door alone (``outcome: crashed`` or ``timed_out``). On
+the attempt that trips it, the dispatcher appends ``gave_up`` straight after
+the ``crashed`` or ``timed_out`` event and parks the card in ``blocked``, so
+one wake carries both (``outcome: crashed_final`` or ``timed_out_final``) and
+its status names both: gave up, and that the dispatcher will retry. The plant
+records each attempt as the dispatcher does, the event and then
+``_record_task_failure``, which counts it and trips on its own: one attempt
+for a retry, and as many as the image's ``DEFAULT_FAILURE_LIMIT`` for a final
+one. The card is assigned to
+:data:`WORKER_ASSIGNEE` before it fails, a profile no install has, so a
+retrying card left ``ready`` never starts a worker.
+
+A final attempt's wake can arrive in two halves, which neither replay
+reproduces: the dispatcher appends the ``crashed`` or ``timed_out`` event and
+the breaker's ``gave_up`` in separate transactions, so the notifier can claim
+the first alone and wake with "dispatcher will retry", then wake again with
+``gave_up``. The plant always delivers both in one wake.
+
 What neither replay reproduces: the turns arrive on the run's own
 ``/v1/responses`` conversation rather than the session that filed the card, so
 the front door has not seen the ask that led to it; for a question, the flag is
@@ -49,10 +72,11 @@ set in the script's process whatever the install's setting and no message
 reaches Slack. The wake under test is the notifier's, built by the image's own
 code.
 
-Either replay's card stays unassigned on the board, so unblocking it hands
-no worker anything; the notifier is given a copy naming
+A question, blocked or gave_up card stays unassigned on the board, so
+unblocking it hands no worker anything; the notifier is given a copy naming
 :data:`WAKE_ASSIGNEE`, as a delegated card would carry, so the wake does not
-read ``@None``.
+read ``@None``. A crashed or timed-out card is assigned to
+:data:`WORKER_ASSIGNEE`, and its wake names that.
 
 Every replay's card carries a key minted for the run
 (:data:`REPLAY_KEY_PREFIX`, the card's ``idempotency_key``). :func:`archive`
@@ -66,7 +90,16 @@ Unlike :mod:`kube_agents_bench.board`, a failed plant is not best effort: a
 run that never saw the wake grades nothing. :func:`plant` raises
 :class:`ReplayUnavailable`, which the harness records as infrastructure, when
 the script never ran to completion, and :class:`ReplayBroken`, which it
-records as an error, when the script ran in the image and failed there.
+records as an error, when the script ran in the image and failed there. A
+breaker that disagrees with the outcome (a retry that trips it, a final
+attempt that does not) is an error too: the image's dispatcher no longer
+retries the way the case asserts, so :func:`plant` raises
+:class:`ReplayMismatch` and the harness records an errored run rather than an
+infrastructure one, which the gate excludes. An errored run has no trajectory
+and a null token count, so a single repetition of it stops at one of the
+gate's absolute rungs (a check that did not run, or "not evidence of a real
+agent run"): an absolute red, admitted case or not. The printed reason names
+the rung, not the mismatch; the run's error names the mismatch.
 """
 
 from __future__ import annotations
@@ -89,6 +122,7 @@ __all__ = [
     "Planted",
     "Replay",
     "ReplayBroken",
+    "ReplayMismatch",
     "ReplayUnavailable",
     "Settled",
     "archive",
@@ -117,7 +151,19 @@ SETTLED_ENTRY = "card_wake_settled"
 OUTCOME_QUESTION = "question"
 OUTCOME_BLOCKED = "blocked"
 OUTCOME_GAVE_UP = "gave_up"
-FAILURE_OUTCOMES = (OUTCOME_BLOCKED, OUTCOME_GAVE_UP)
+# A worker's crash or timeout the dispatcher will retry, and the same on the
+# attempt that trips its failure breaker.
+OUTCOME_CRASHED = "crashed"
+OUTCOME_TIMED_OUT = "timed_out"
+OUTCOME_CRASHED_FINAL = "crashed_final"
+OUTCOME_TIMED_OUT_FINAL = "timed_out_final"
+WORKER_OUTCOMES = (
+    OUTCOME_CRASHED,
+    OUTCOME_TIMED_OUT,
+    OUTCOME_CRASHED_FINAL,
+    OUTCOME_TIMED_OUT_FINAL,
+)
+FAILURE_OUTCOMES = (OUTCOME_BLOCKED, OUTCOME_GAVE_UP, *WORKER_OUTCOMES)
 
 # Line the in-pod scripts print before their JSON. A reply without it means
 # the script never ran to completion.
@@ -139,6 +185,10 @@ FLAG_ON = "1"
 # thread a question is posted in. Slack never sees the thread.
 CARD_CREATOR = "devops-bench"
 WAKE_ASSIGNEE = "platform"
+# Who a crashed or timed-out card says was working it: shaped like a
+# scaffolded cluster agent's profile (cluster_agent_profile.py, profile_name)
+# but never scaffolded, so the dispatcher never takes a card assigned to it.
+WORKER_ASSIGNEE = "cluster-bench-project-bench-sandbox-us-central1"
 STUB_CHANNEL = "C0BENCHWAKE"
 STUB_THREAD = "1700000000.000100"
 
@@ -146,14 +196,24 @@ STUB_THREAD = "1700000000.000100"
 # hermes root, the scripts directory, the flag, its on value, the creator,
 # the stub channel, the stub thread, the card title, its body, the block
 # reason or failure error, the outcome, the wake's assignee and the run's key.
-# The card is archived again if anything after filing it fails.
+# The card is archived again if anything after filing it fails. The worker
+# pid, elapsed time and runtime limit in a crash or timeout's payload are
+# made up; only the front door reads them.
 _PLANT_SCRIPT = r"""
 import asyncio, dataclasses, json, os, sys
 
 (SENTINEL, HERMES_ROOT, SCRIPTS, FLAG, ON, CREATOR,
  CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY) = sys.argv[1:15]
 STUB_TS = "1700000000.000200"
-out = {"card": None, "wake": None, "posted": 0, "error": None}
+STUB_PID = 4242
+STUB_ELAPSED, STUB_LIMIT = 1830, 1800
+# A final attempt's wake: its own crashed or timed_out event, then gave_up.
+FINAL_BATCH = 2
+out = {"card": None, "wake": None, "posted": 0, "error": None, "mismatch": None}
+
+
+class BreakerMismatch(RuntimeError):
+    pass
 
 
 class _Client:
@@ -199,9 +259,41 @@ try:
     except ImportError:
         moments = None
     conn = connect()
+    gave_up = OUTCOME == "gave_up"
     card = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR, idempotency_key=KEY)
     out["card"] = card
-    if OUTCOME == "gave_up":
+    batch = 1
+    if OUTCOME in ("crashed", "timed_out", "crashed_final", "timed_out_final"):
+        from hermes_cli import kanban_db_dispatch as dispatch
+        trigger, final = OUTCOME.replace("_final", ""), OUTCOME.endswith("_final")
+        # Assigned before it fails, as a real card is: the profile does not
+        # exist, so no dispatcher ever takes it.
+        if not kb.assign_task(conn, card, ASSIGNEE):
+            raise RuntimeError("card %s would not take assignee %s" % (card, ASSIGNEE))
+        # The payloads detect_crashed_workers and enforce_max_runtime write.
+        if trigger == "crashed":
+            payload = {"pid": STUB_PID, "claimer": None, "retry_status": "ready"}
+            extra = {"pid": STUB_PID, "claimer": None}
+        else:
+            payload = {"pid": STUB_PID, "elapsed_seconds": STUB_ELAPSED, "limit_seconds": STUB_LIMIT,
+                       "sigkill": False, "retry_status": "ready"}
+            extra = {"pid": STUB_PID, "sigkill": False, "retry_status": "ready"}
+        # Each attempt as the dispatcher records it: the event, then the
+        # breaker's count, which appends gave_up when it trips. A final
+        # attempt is the one that reaches the image's own limit.
+        for _attempt in range(dispatch.DEFAULT_FAILURE_LIMIT if final else 1):
+            with kb.write_txn(conn):
+                kb._append_event(conn, card, trigger, payload)
+            tripped = dispatch._record_task_failure(conn, card, REASON, outcome=trigger,
+                                                    event_payload_extra=extra)
+        if tripped != final:
+            raise BreakerMismatch("card %s %s its failure breaker"
+                                  % (card, "tripped" if tripped else "did not trip"))
+        kind = "gave_up" if final else trigger
+        # The notifier claims every event since its cursor, so a final
+        # attempt's crash or timeout reaches the wake with the gave_up after it.
+        batch = FINAL_BATCH if final else 1
+    elif gave_up:
         from hermes_cli import kanban_db_dispatch as dispatch
         # force_trip records gave_up and parks the card on its first failure,
         # where the dispatcher would after exhausting its retries.
@@ -213,8 +305,8 @@ try:
         if not kb.block_task(conn, card, reason=REASON, kind=block_kind):
             raise RuntimeError("card %s would not block" % card)
         kind = "blocked"
-    events = [e for e in kb.list_events(conn, card) if e.kind == kind][-1:]
-    if not events:
+    events = [e for e in kb.list_events(conn, card) if e.kind != "assigned"][-batch:]
+    if not events or events[-1].kind != kind:
         raise RuntimeError("card %s has no %s event" % (card, kind))
     if OUTCOME == "question":
         sub = {"task_id": card, "platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD,
@@ -228,8 +320,10 @@ try:
         sub = {"task_id": card, "platform": "api_server", "chat_id": CHANNEL, "thread_id": "",
                "delivery_mode": "notify+wake"}
         adapter = _ApiServerAdapter()
-    # The board's card stays unassigned, so an unblock hands no worker
-    # anything; the notifier's copy names the assignee a delegated card carries.
+    # A blocked, question or gave_up card stays unassigned on the board, so an
+    # unblock hands no worker anything; a crashed or timed-out one carries a
+    # profile no dispatcher takes. The notifier's copy names the assignee a
+    # delegated card carries.
     task = dataclasses.replace(kb.get_task(conn, card), assignee=ASSIGNEE)
     wake = notifier._KanbanNotification(
         None, {"sub": sub, "task": task, "board": kb.DEFAULT_BOARD, "events": events},
@@ -243,7 +337,7 @@ try:
         raise RuntimeError("the notifier built no wake for card %s" % card)
     out.update(wake=wake.synth, posted=len(adapter.posts))
 except Exception as exc:
-    out["error"] = "%s: %s" % (type(exc).__name__, exc)
+    out["mismatch" if isinstance(exc, BreakerMismatch) else "error"] = "%s: %s" % (type(exc).__name__, exc)
     if conn is not None and out["card"]:
         try:
             kb.archive_task(conn, out["card"])
@@ -315,6 +409,10 @@ class ReplayUnavailable(RuntimeError):
 
 class ReplayBroken(RuntimeError):
     """The plant script ran in the image and failed there: the image's fault, not the cluster's."""
+
+
+class ReplayMismatch(RuntimeError):
+    """The image's failure breaker disagrees with the replay's outcome."""
 
 
 @dataclass(frozen=True)
@@ -425,8 +523,9 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
     """The ``sh -c`` line that files, parks and wakes the replay's card in the pod."""
     if isinstance(replay, Failure):
         body, outcome = replay.body, replay.outcome
+        assignee = WORKER_ASSIGNEE if outcome in WORKER_OUTCOMES else WAKE_ASSIGNEE
     else:
-        body, outcome = replay.reason, OUTCOME_QUESTION
+        body, outcome, assignee = replay.reason, OUTCOME_QUESTION, WAKE_ASSIGNEE
     return _command(
         _PLANT_SCRIPT,
         [
@@ -442,7 +541,7 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
             body,
             replay.reason,
             outcome,
-            WAKE_ASSIGNEE,
+            assignee,
             key,
         ],
     )
@@ -468,6 +567,8 @@ def _reply(text: str, what: str) -> dict:
         raise ReplayBroken(f"{what}: reply is not JSON ({exc})") from exc
     if not isinstance(payload, dict):
         raise ReplayBroken(f"{what}: reply is not an object")
+    if payload.get("mismatch"):
+        raise ReplayMismatch(f"{what}: {payload['mismatch']}")
     if payload.get("error"):
         raise ReplayBroken(f"{what}: {payload['error']}")
     return payload
@@ -481,11 +582,12 @@ def plant(
     ``shell`` is :func:`harness._agent_shell`; ``key`` defaults to
     :func:`new_key`. Raises :class:`ReplayUnavailable` when the script did not
     run to completion, after sweeping any card it filed before the
-    ``kubectl exec`` gave out, and :class:`ReplayBroken` when its reply is not
-    JSON, it reported an error, or it named no card or wake. The script
-    archives a card it filed before reporting an error. An image with the
-    moments module that posts nothing is one such error: it would build the
-    plain wake and pass for a red run.
+    ``kubectl exec`` gave out, :class:`ReplayBroken` when its reply is not
+    JSON, it reported an error, or it named no card or wake, and
+    :class:`ReplayMismatch` when the image's failure breaker disagreed with
+    the outcome. The script archives a card it filed before reporting an
+    error. An image with the moments module that posts nothing is one such
+    error: it would build the plain wake and pass for a red run.
     """
     key = key or new_key()
     what = "failure wake" if isinstance(replay, Failure) else "question wake"

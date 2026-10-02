@@ -147,6 +147,9 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-ack-names-target",  # the front door's delegation ack
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
+    "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
+    "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
+    "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -331,7 +334,20 @@ class SplitLostNothingTest(unittest.TestCase):
 # are pinned.
 INJECT_LANE_EXCLUDED = [
     "agent-kanban-smoke",  # #2039: grades kanban_create by the front door; the inject door addresses platform directly
+    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; the inject door addresses platform directly
+    "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
+    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same door
+    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same door
 ]
+# Each exclusion's api-lane tier, pinned beside it: an entry is not a
+# demotion, so a case that leaves its tier's file while still excluded reds.
+INJECT_LANE_EXCLUDED_TIER = {
+    "agent-kanban-smoke": "presubmit",
+    "chat-voice-retry-says-it-is-retried": "nightly",
+    "chat-voice-final-attempt-is-not-retried": "nightly",
+    "chat-voice-failure-leads-with-fact": "nightly",
+    "chat-question-wake-stays-silent": "nightly",
+}
 
 
 class InjectLaneExclusionsTest(unittest.TestCase):
@@ -382,12 +398,17 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
 
     def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's roster is untouched by an entry here: the excluded
-        # case still runs on every pull request and can still red one.
-        for case in INJECT_LANE_EXCLUDED:
-            with self.subTest(case=case):
-                self.assertIn(case, eval_rosters.presubmit_cases())
-                self.assertIn(case, eval_rosters.blocking_roster())
+        # The api lane's roster is untouched by an entry here: an excluded
+        # presubmit case still runs on every pull request and can still red
+        # one, and an excluded nightly case still runs every night.
+        self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
+        for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
+            with self.subTest(case=case, tier=tier):
+                if tier == "presubmit":
+                    self.assertIn(case, eval_rosters.presubmit_cases())
+                    self.assertIn(case, eval_rosters.blocking_roster())
+                else:
+                    self.assertIn(case, eval_rosters.nightly_cases())
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
