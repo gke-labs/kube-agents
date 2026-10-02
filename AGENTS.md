@@ -455,10 +455,10 @@ your working copy — a finding that looks wrong because the file it cites does 
 often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment
 call, a reviewer asking for something you chose not to do, a rebuttal nobody has answered yet —
 reply and leave it to them. Resolving says the conversation is finished; it is not a way to end a
-disagreement. The exception is a `kube-agents-bot` finding you decline, bar the description one: the
-bot never replies or resolves, so once your reply and **Self-Review** give the reason, resolve it.
-Reply first, always: a resolved thread collapses, so the reply, naming the fix commit or why not, is
-the only record a reviewer may ever see.
+disagreement. The exception, with a user in the loop, is a `kube-agents-bot` finding you decline,
+bar the description one: the bot never replies or resolves, so once your reply and **Self-Review**
+give the reason, resolve it. Reply first, always: a resolved thread collapses, so the reply is the
+only record a reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 

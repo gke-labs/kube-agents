@@ -350,9 +350,10 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
-`kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve,
-except the description thread, which waits for the body edit described below. A pull request
-carrying both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
+`kube-agents-bot` finding you decline with a user in the loop, the reason, which **Self-Review**
+gives too. Then resolve, except the description thread, which waits for the body edit described
+below. A pull request carrying both `lgtm` and `approved` with a thread still open also carries the
+`do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
