@@ -132,6 +132,7 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual([b["type"] for b in post["blocks"]], ["section"])
         [attachment] = post["attachments"]
         self.assertEqual(attachment["color"], "#2EB67D")
+        self.assertEqual(attachment["fallback"], post["text"])
         self.assertEqual([b["type"] for b in attachment["blocks"]], ["context", "actions"])
         self.assertEqual([e.get("style") for e in _buttons(attachment["blocks"])], ["primary", None])
 
@@ -332,7 +333,7 @@ class SettleQuestionTest(unittest.TestCase):
         _run(runtime.settle_question(adapter, SUB))
         update = adapter.updates[0]
         self.assertEqual(update["blocks"], post["blocks"])
-        self.assertEqual(update["attachments"], [{"color": "#ECB22E", "blocks": post["attachments"][0]["blocks"][:1]}])
+        self.assertEqual(update["attachments"], [{"color": "#ECB22E", "fallback": update["text"], "blocks": post["attachments"][0]["blocks"][:1]}])
 
     def test_a_settle_that_leaves_only_the_headline_clears_the_attachment(self):
         # chat.update keeps an attachment it is not sent, buttons and all.

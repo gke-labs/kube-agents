@@ -21,7 +21,8 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   question that is not a yes/no ask to go on ("Shall I proceed?", whose list is
   the plan); otherwise, and with no thread for a click to answer in, the
   question is text only and a typed reply is the answer. Beside it is a yellow
-  side bar (:data:`NEEDS_YOU_SIDE_BAR`), which stays once it is settled.
+  side bar (:data:`NEEDS_YOU_SIDE_BAR`), which stays once it is settled while
+  anything is left below the headline.
 
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
 into the headline and the attachment that carries the bar when it is posted.

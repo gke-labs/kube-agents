@@ -555,11 +555,14 @@ def blocks_answer(
     return blocks
 
 
-def with_side_bar(blocks: Sequence[dict], color: str) -> dict:
+def with_side_bar(blocks: Sequence[dict], color: str, text: str) -> dict:
     """``blocks`` as the ``blocks`` and ``attachments`` of a ``chat.postMessage`` or
     ``chat.update``: all but the first :data:`SIDE_BAR_FROM` go in one attachment
     with ``color`` as its side bar.
 
+    ``text`` is the message's own, given as the attachment's ``fallback``:
+    without one Slack stores "[no preview available]", which a thread read back
+    shows, and the adapter drops a fallback the message's text already holds.
     ``attachments`` is always present, empty when nothing is left for the bar,
     since ``chat.update`` keeps a message's attachments unless it is sent some.
     """
@@ -567,33 +570,39 @@ def with_side_bar(blocks: Sequence[dict], color: str) -> dict:
     above, barred = blocks[:SIDE_BAR_FROM], blocks[SIDE_BAR_FROM:]
     if not above or not barred:
         return {"blocks": blocks, "attachments": []}
-    return {"blocks": above, "attachments": [{"color": color, "blocks": barred}]}
+    return {"blocks": above, "attachments": [{"color": color, "fallback": text, "blocks": barred}]}
 
 
-def message_blocks(message: Any) -> list[dict]:
-    """The blocks ``message`` shows: its own, then each attachment's, in order.
-
-    A click's payload echoes a message :func:`with_side_bar` laid out with its
-    blocks split between the two.
-    """
-    if not isinstance(message, dict):
-        return []
-    blocks = [b for b in message.get("blocks") or () if isinstance(b, dict)]
-    for attachment in message.get("attachments") or ():
-        if isinstance(attachment, dict):
-            blocks.extend(b for b in attachment.get("blocks") or () if isinstance(b, dict))
-    return blocks
-
-
-def side_bar_color(message: Any) -> str | None:
-    """The side-bar colour of the first attachment of ``message`` holding blocks, else None."""
+def _side_bar(message: Any) -> dict | None:
+    """The first attachment of ``message`` with a colour and blocks: a side bar, not an unfurl."""
     attachments = message.get("attachments") or () if isinstance(message, dict) else ()
     for attachment in attachments:
         if isinstance(attachment, dict) and attachment.get("blocks") and attachment.get("color"):
-            color = str(attachment["color"])
-            # Slack echoes a hex colour without its "#".
-            return color if color.startswith(HEX_MARK) else HEX_MARK + color
+            return attachment
     return None
+
+
+def message_blocks(message: Any) -> list[dict]:
+    """The blocks ``message`` shows itself: its own, then its side bar's.
+
+    A click's payload echoes a message :func:`with_side_bar` laid out with its
+    blocks split between the two. Any other attachment, such as a link's
+    unfurl, is not the message's own.
+    """
+    if not isinstance(message, dict):
+        return []
+    bar = _side_bar(message) or {}
+    return [b for b in (*(message.get("blocks") or ()), *(bar.get("blocks") or ())) if isinstance(b, dict)]
+
+
+def side_bar_color(message: Any) -> str | None:
+    """The colour of the side bar of ``message``, else None."""
+    bar = _side_bar(message)
+    if bar is None:
+        return None
+    color = str(bar["color"])
+    # Slack echoes a hex colour without its "#".
+    return color if color.startswith(HEX_MARK) else HEX_MARK + color
 
 
 def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[str] = ()) -> str:

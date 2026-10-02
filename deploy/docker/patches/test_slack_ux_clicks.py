@@ -550,6 +550,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(update["blocks"], [headline])
         [attachment] = update["attachments"]
         self.assertEqual(attachment["color"], "#ECB22E")
+        self.assertEqual(attachment["fallback"], update["text"])
         actions = [b for b in attachment["blocks"] if b["type"] == "actions"]
         self.assertEqual([[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]])
         self.assertEqual(attachment["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")

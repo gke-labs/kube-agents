@@ -349,11 +349,11 @@ def _answered_text(note: str, message: dict, question: bool = False) -> str:
     return _presenter._clip(f"{note}\n\n{original}", SLACK_TEXT_MAX) if original else note
 
 
-def _rewrite(message: dict, answered: Any, note: str) -> dict:
-    """The ``blocks``, and ``attachments`` for a message with a side bar, that answer ``message``."""
+def _rewrite(message: dict, answered: Any, note: str, text: str) -> dict:
+    """The ``text`` and ``blocks``, and ``attachments`` for a message with a side bar, that answer ``message``."""
     blocks = answered_blocks(_presenter.message_blocks(message), answered, note)
     color = _presenter.side_bar_color(message)
-    return _presenter.with_side_bar(blocks, color) if color else {"blocks": blocks}
+    return {"text": text, **(_presenter.with_side_bar(blocks, color, text) if color else {"blocks": blocks})}
 
 
 def _shown_text(action: dict) -> str:
@@ -649,8 +649,8 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         logger.info("slack_ux_clicks: dropping a %s click on %s, already applied in the thread", kind, msg_ts)
         try:
             await client.chat_update(
-                channel=channel_id, ts=msg_ts, text=_answered_text(ANSWERED_IN_THREAD, message),
-                **_rewrite(message, _answered_by, ANSWERED_IN_THREAD),
+                channel=channel_id, ts=msg_ts,
+                **_rewrite(message, _answered_by, ANSWERED_IN_THREAD, _answered_text(ANSWERED_IN_THREAD, message)),
             )
         except Exception as exc:  # noqa: BLE001 — the click is dropped either way
             logger.warning("slack_ux_clicks: could not mark %s answered in the thread: %s", msg_ts, exc)
@@ -663,8 +663,9 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     try:
         await client.chat_update(
             channel=channel_id, ts=msg_ts,
-            text=_answered_text(note, message, not action_id.startswith(INCIDENT_CHOICE_PREFIX)),
-            **_rewrite(message, _answered_by, note),
+            **_rewrite(message, _answered_by, note, _answered_text(
+                note, message, not action_id.startswith(INCIDENT_CHOICE_PREFIX),
+            )),
         )
         if key in _answered:
             _rewritten[key] = None

@@ -499,17 +499,18 @@ BAR_REST = [{"type": "context", "elements": []}, {"type": "actions", "elements":
 class SideBarTest(unittest.TestCase):
     def test_all_but_the_headline_go_beside_the_bar(self):
         self.assertEqual(
-            sp.with_side_bar([BAR_HEAD, *BAR_REST], sp.SIDE_BAR_GREEN),
-            {"blocks": [BAR_HEAD], "attachments": [{"color": "#2EB67D", "blocks": BAR_REST}]},
+            sp.with_side_bar([BAR_HEAD, *BAR_REST], sp.SIDE_BAR_GREEN, "h"),
+            {"blocks": [BAR_HEAD], "attachments": [{"color": "#2EB67D", "fallback": "h", "blocks": BAR_REST}]},
         )
 
     def test_nothing_to_bar_sends_an_empty_attachment_list(self):
         # chat.update keeps a message's attachments unless it is sent some.
-        self.assertEqual(sp.with_side_bar([BAR_HEAD], sp.SIDE_BAR_YELLOW), {"blocks": [BAR_HEAD], "attachments": []})
-        self.assertEqual(sp.with_side_bar([], sp.SIDE_BAR_YELLOW), {"blocks": [], "attachments": []})
+        self.assertEqual(sp.with_side_bar([BAR_HEAD], sp.SIDE_BAR_YELLOW, "h"), {"blocks": [BAR_HEAD], "attachments": []})
+        self.assertEqual(sp.with_side_bar([], sp.SIDE_BAR_YELLOW, ""), {"blocks": [], "attachments": []})
 
-    def test_message_blocks_reads_its_own_then_each_attachments(self):
-        message = {"blocks": [BAR_HEAD], "attachments": [{"color": "ECB22E", "blocks": BAR_REST}, "junk"]}
+    def test_message_blocks_reads_its_own_then_its_side_bars(self):
+        unfurl = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "preview"}}]}
+        message = {"blocks": [BAR_HEAD], "attachments": ["junk", unfurl, {"color": "ECB22E", "blocks": BAR_REST}]}
         self.assertEqual(sp.message_blocks(message), [BAR_HEAD, *BAR_REST])
         self.assertEqual(sp.message_blocks({"blocks": [BAR_HEAD]}), [BAR_HEAD])
         self.assertEqual(sp.message_blocks(None), [])

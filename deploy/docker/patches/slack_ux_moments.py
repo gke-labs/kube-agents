@@ -51,7 +51,7 @@ leaves the buttons of any it forgot.
 Each moment carries a side bar, green for a PR and yellow for a question: a
 legacy attachment holding every block below the headline. A settle sends the
 attachment again, since ``chat.update`` would otherwise keep the old one, buttons
-and all.
+and all; a question settled down to its headline alone loses the bar.
 
 Fail-soft: a moment that cannot be posted is logged, and the caller falls back
 to what it did before.
@@ -154,7 +154,7 @@ async def _post(adapter: Any, sub: dict, blocks: list[dict], text: str, color: s
             channel=chat_id,
             thread_ts=sub.get("thread_id") or None,
             text=text,
-            **_presenter.with_side_bar(blocks, color),
+            **_presenter.with_side_bar(blocks, color, text),
         )
     except Exception as exc:  # noqa: BLE001 — the caller falls back
         logger.warning("slack_ux_moments: posting in %s failed: %s", chat_id, exc)
@@ -266,7 +266,7 @@ async def _settled(adapter: Any, sub: dict, entry: tuple) -> bool:
         client = adapter._get_client(channel, team_id=sub.get("team_id") or None)
         await client.chat_update(
             channel=channel, ts=ts, text=text,
-            **_presenter.with_side_bar(_moments.needs_you_settled(blocks), _moments.NEEDS_YOU_SIDE_BAR),
+            **_presenter.with_side_bar(_moments.needs_you_settled(blocks), _moments.NEEDS_YOU_SIDE_BAR, text),
         )
     except Exception as exc:  # noqa: BLE001 — cosmetic; the next event retries
         logger.warning("slack_ux_moments: settling the question %s failed: %s", ts, exc)
