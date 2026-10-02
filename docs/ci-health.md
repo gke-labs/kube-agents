@@ -683,7 +683,9 @@ the fleet owner, labelled `presubmit-gate`: `Seeded fleet drift:
 crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM
 ET`, with the roles, per project the assertion and what was observed, the
 window, the evidence, and the reconcile — re-apply `bench/tf/fleet` in each
-project named (`bench/tf/fleet/README.md`, "State and reconcile") — and the
+project named (`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
+drift where an in-cluster heal started the container, hand-delete the pod in `seeded-stall`
+and replace the Deployment if the condition persists) — and the
 line "Filed automatically by the smoke health bot; the fleet owner should
 re-apply the stack in the projects named; the bot will not close it." An open
 `presubmit-gate` issue that already names every drifted role is adopted
@@ -712,11 +714,14 @@ first shows up as a 403 in an agent transcript on whichever pull request leased
 the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
-`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,token_minter_kms --report`
+`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,gitops_default_branch,token_minter_kms --report`
 against every pool project, seven at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the GitHub-reading checks
+`gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
+
+The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
+Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
 (`github_repo_and_app`, `gitops_declaration`, `ledger_read_credential`; each needs a credential the bot must not hold), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
@@ -765,7 +770,11 @@ document: the same finding on the same project in two consecutive scans, or on
 a scan that could read the incident's checks on its projects no longer shows the
 findings, and a scan that is missing, stale, blind or could not read one of them
 holds it with a note. A scan older than 3 hours is ignored; one that could check
-no project is `pool_state.unknown`, said once by the poster and never a drift. An
+no project is `pool_state.unknown`, said once by the poster and never a drift. A
+project counts as checked when one of its GCP reads happened; the default-branch
+read alone does not count, since it runs with the job's own GitHub credential
+whatever gcloud answered, so a pool whose publisher roles are gone still scans as
+`pool_state.unknown` once the secret exists. An
 extra role is drift like a missing one.
 
 **What it posts.** One Chat message naming the findings and how many projects,

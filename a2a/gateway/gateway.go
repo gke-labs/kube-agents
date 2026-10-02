@@ -148,8 +148,11 @@ type Gateway struct {
 	relays map[string]*relayState
 
 	// backend names the gateway's configured chat backend, which is what a
-	// message that names none is attributed to. A message from the inject
-	// side door names its own (backendFor).
+	// message that names none is attributed to. Since the mux and the side
+	// door there are ingresses that name their own - the console adapter
+	// stamps console on every frame it delivers, the inject door stamps
+	// inject - so this is the answer for the configured backend's own
+	// messages rather than for all of them (backendFor).
 	backend string
 	// injectAudience is injectPM's inject: section with the prefix removed
 	// and only eval: values kept -- the shape BuildAuthority and hashRoster
@@ -235,13 +238,17 @@ func New(o Options) (*Gateway, error) {
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
 	// map — an empty map is only a lockout on the backends that use one
-	// (Discord's test table and Slack's user_id join alike), and a gateway
+	// (Discord's test table and Slack's user_id join alike). The console
+	// does not use one either: its grant is the mechanism, since only the
+	// console credential may publish on the console subject. And a gateway
 	// whose only ingress is the side door uses the door's map below instead
 	// of this one. Slack is the case that matters operationally: nothing
 	// renders its map yet (#2099), so a Slack gateway whose map path is
 	// missing would otherwise pass boot silently and drop every sender.
+	// Naming the backend matters, because the other ingresses beside it
+	// keep working.
 	if (backend == discordBackend || backend == slackBackend) && pm.Len() == 0 {
-		log.Warn("principal map is empty; every inbound message will be dropped at verification",
+		log.Warn(fmt.Sprintf("principal map is empty; every %s message will be dropped at verification", backend),
 			"path", o.Config.PrincipalMapPath)
 	}
 	// The side door's map, which is a different file and not a section of
@@ -379,9 +386,28 @@ func (g *Gateway) Run(ctx context.Context) error {
 		go g.sweepLoop(ctx)
 	}
 
-	// The adapter's delivery goroutines only enqueue; per-conversation order
-	// is the queue's job, not the backend's.
-	return g.adapter.Run(ctx, func(msg InboundMessage) { g.inbox.enqueue(msg.Conversation, msg) })
+	// The adapter's delivery goroutines only enqueue (or refuse a console
+	// turn whose queue is full); per-conversation order is the queue's job,
+	// not the backend's.
+	return g.adapter.Run(ctx, g.enqueueInbound)
+}
+
+// enqueueInbound queues a turn for its conversation. Console turns are
+// bounded per conversation (consoleQueueCap), because the console is the
+// one ingress whose rate the sender sets.
+func (g *Gateway) enqueueInbound(msg InboundMessage) {
+	if msg.Backend != consoleBackend {
+		g.inbox.enqueue(msg.Conversation, msg)
+		return
+	}
+	accepted, first := g.inbox.enqueueBounded(msg.Conversation, msg, consoleQueueCap)
+	if accepted || !first {
+		return
+	}
+	// Once per fill: a tab publishing in a loop would otherwise get a log
+	// line and a post for every frame it loses.
+	g.log.Warn("console frame dropped", "reason", "queue full", "conversation", msg.Conversation, "messageId", msg.MessageID, "queued", consoleQueueCap)
+	g.post(msg.Conversation, fmt.Sprintf(consoleQueueFullNotice, consoleQueueCap))
 }
 
 type sessionLockEntry struct {
@@ -515,18 +541,22 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 	// backend-asserted id — their own identity, in their own conversation,
 	// which is what the admin needs to add and is not an oracle over
 	// anything the sender does not already see.
+	// The backend is the message's, not the process's: one gateway now has
+	// several ingresses at once - a chat backend, the console, and the
+	// inject door - and each of the latter two stamps its own on what it
+	// delivers, so which mechanism has to check this sender is a property
+	// of the message.
 	backend = g.backendFor(msg)
 	principal = g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",
 			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
-		// Keyed by backend and case-folded author: one gateway has two
-		// ingresses (a chat backend and the inject door), and the same id
-		// on the two is not the same sender, so a notice on one must not
-		// silence the other. Case-folded because an asserted address that
-		// varies in case is one person. Bounded the way the adapters bound
-		// their own maps: wholesale eviction at the cap, which at worst
-		// repeats a notice.
+		// Keyed by backend and case-folded author: one gateway has several
+		// ingresses, and the same id on two of them is not the same sender,
+		// so a notice on one must not silence the other. Case-folded because
+		// an asserted address that varies in case is one person. Bounded the
+		// way the adapters bound their own maps: wholesale eviction at the
+		// cap, which at worst repeats a notice.
 		key := droppedNoticeKey(backend, msg.AuthorID)
 		g.mu.Lock()
 		if len(g.droppedNotices) >= droppedNoticesCap {
@@ -587,9 +617,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	if !slices.Contains(rosterIDs, msg.AuthorID) {
 		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
-	authority := BuildAuthority(g.ps, g.principalMapFor(backend), principal, backend, msg.AuthorID,
+	resolveRoster := g.rosterResolver(backend)
+	authority := BuildAuthority(g.ps, resolveRoster, principal, backend, msg.AuthorID,
 		verifiedByFor(backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
-	rec.Roster = hashRoster(g.ps, g.principalMapFor(backend), rosterIDs)
+	rec.Roster = hashRoster(g.ps, resolveRoster, rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already
 	// terminal on the stream (the relay's ack raced a transient failure, or
@@ -764,10 +795,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 }
 
 // backendFor names the ingress one message arrived through. A message that
-// names none is the configured backend's, which is every chat backend's
-// case; the inject door stamps its own, because it can be armed beside a
-// real backend and the authority block must say which door a task came in
-// through rather than which backend the process was configured with.
+// names none is the configured backend's, which is the Discord and Google
+// Chat adapters' case; the inject door and the console adapter stamp their
+// own, because either can be armed beside a real backend and the authority
+// block must say which door a task came in through rather than which backend
+// the process was configured with.
 func (g *Gateway) backendFor(msg InboundMessage) string {
 	if msg.Backend != "" {
 		return msg.Backend
@@ -778,7 +810,10 @@ func (g *Gateway) backendFor(msg InboundMessage) string {
 // principalMapFor is the map that backend's identities live in. The side
 // door's is its own and is never a fallback to the chat map, nor the chat
 // map's a fallback to it: an id that resolves in the wrong map would be an
-// identity asserted by a door that is not allowed to assert it.
+// identity asserted by a door that is not allowed to assert it. The console
+// is not an arm here because it has no map to name - its grant is the
+// mechanism (resolvePrincipal), and rosterResolver sends it down that path
+// before it ever reaches this one.
 func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 	if backend == injectBackend && g.injectAudience != nil {
 		return g.injectAudience
@@ -1651,14 +1686,34 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 	})
 }
 
-func hashRoster(ps *Pseudonymizer, pm *PrincipalMap, ids []string) []string {
+// rosterResolver picks the principal resolution to apply to one backend's
+// roster ids, and two things decide it.
+//
+// Roster ids arrive in AuthorID vocabulary, so the console's fixed author
+// has to resolve the way its requester does: resolvePrincipal maps "console"
+// to "nats:console", while a principal map knows nothing about it and would
+// leave H("console") in a snapshot whose requester.principal is
+// H("nats:console") - the requester missing from its own audience.
+//
+// Every other backend resolves in its OWN map rather than in whichever one
+// the gateway happens to hold, which is principalMapFor: the roster has to
+// be read under the same map the requester's principal was read under, and
+// one backend's map is never a fallback for another's.
+func (g *Gateway) rosterResolver(backend string) func(string) string {
+	if backend == consoleBackend {
+		return func(id string) string { return g.resolvePrincipal(consoleBackend, id) }
+	}
+	return g.principalMapFor(backend).Resolve
+}
+
+func hashRoster(ps *Pseudonymizer, resolve func(string) string, ids []string) []string {
 	out := make([]string, 0, min(len(ids), rosterCap))
 	for _, id := range ids {
 		if len(out) >= rosterCap {
 			break
 		}
 		entry := id
-		if p := pm.Resolve(id); p != "" {
+		if p := resolve(id); p != "" {
 			entry = p
 		}
 		out = append(out, ps.Hash(entry))

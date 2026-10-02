@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
 
 ## Purpose
 
@@ -617,7 +617,8 @@ those sections are the design of record for each.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
-operations, normalized. If the Discord adapter leaks Discord-isms through that interface,
+operations, normalized. The console adapter is the third implementation and the smallest;
+see its own section. If the Discord adapter leaks Discord-isms through that interface,
 that's a bug in the interface, and better to learn it on the throwaway backend.
 
 ### The inject backend (added 9/17)
@@ -1093,7 +1094,7 @@ any combination but exactly one: a Slack pair, a Discord token, and a gchat rela
 are mutually exclusive, and none of the three is also a refusal. A second backend is a
 second Deployment with its own durable, when we want one. The inject side door is not
 in that count - it may sit beside any one of the three, for the reason the inject
-section gives.
+section gives - and neither is the console adapter, which has no durable to split.
 
 `verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
 the socket and asserted the `user_id`, our table joined it to a principal. Rendering
@@ -1101,6 +1102,74 @@ into mrkdwn is a narrow deterministic translation of the two forms the relay emi
 (bold, links); the legacy Hermes converter stays where it is. Everything posted is
 escaped first (`&`, `<`, `>`) - relayed text is executor-authored, ie model output,
 and an unescaped `<!channel>` in a result would ping the room.
+
+## The console adapter (added 9/23)
+
+The web console's chat door. Not a chat product's ingress: the browser is a bus client
+already (the `web` read surface), so the door is on the bus too, and the identity story is
+the one every other writer here has.
+
+**Transport.** Core NATS, no stream. The browser publishes a frame -
+`{"messageId","text","kind"}`, `kind` defaulting to `text` - to `chat.console.<token>.in`;
+the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
+`chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
+protocol, and the payload spec's agreement rules do not apply to it. The answers never
+travel here. They stream through TASKS, which the console page renders directly, so a lost
+`.out` frame across a reconnect costs a notice and never an answer. An `.in` frame published
+while no gateway subscription is live (the gateway restarting, or the NATS config not yet
+rolled) is dropped by core NATS without trace; the browser sees only a pending entry that
+never attaches. A receipt frame on `.out` is the natural follow-up for the page.
+
+**Conversation.** `console:<token>`, one dot-free DNS-1123 label per browser tab, kind `dm`.
+The gateway treats it like any DM: one session per conversation, spawned on the first turn,
+reaped at the idle TTL.
+
+**Identity.** The `console` NATS user is the only principal granted publish on
+`chat.console.*.in` (spec-nats-deployment.md, the console surface). So a frame there is from
+`console`, and the adapter reports that as the author; the gateway resolves it to the fixed
+principal `nats:console`, `verifiedBy: nats-grant`, with no mapping table - the mechanism is
+the connect-time grant, which is the same subject-derived identity `identity` was retired in
+favour of. That resolution is bound to the console conversation: the string `console`
+arriving on a Discord conversation is an unmapped id and drops. One shared principal is the
+posture until the account split gives each person a credential, at which point the entry
+becomes one inbound subject per principal and nothing else here changes.
+
+**Backend per message.** One gateway process runs its configured chat backend and the console
+together, through a mux that dispatches `post`/`edit`/`roster` on the conversation prefix.
+The console adapter stamps its own backend on every message it delivers, the way the inject
+door does, so `authority.requester.backend`, the drop notice and verification name the console
+rather than the configured backend. Where there is no message to ask (the relay holding a
+session record), the `console:` prefix answers the same question. `openDirect` takes a bare
+user id and goes to the configured backend. With no real backend, as on an inject-only eval
+install, the console is the only chat backend and runs without a mux.
+
+The inject door, when armed, sits beside the mux rather than inside it, for the reason in "A
+side door, not a fourth backend" above: the gateway finds the door's probe and observers by
+type assertion on the top of the adapter stack, and the mux has no probe and no key for an
+`inject:` conversation. The mux does pass the task observer calls and the session lookup on to
+the backend that owns the conversation, since the Slack adapter learns its session threads
+from them. The console runs whenever the gateway runs, so an inject-only gateway also exits when the console
+adapter does.
+
+**The console outlives the chat backend.** The console is the way in when chat is broken, so
+the two do not share a fate. When the console adapter stops, the gateway exits and restarts.
+When the chat backend stops (a bad or revoked Discord or Slack token, a Socket Mode give-up),
+the mux logs `chat backend stopped` at error with the backend in a `backend` field, and runs
+that backend again after a delay that doubles from one second to a one-minute cap, while the
+console keeps serving. A run that lasted at least the cap starts the doubling over. A backend
+that returns without an error while the gateway is still running has stopped all the same and is
+handled the same way. Google Chat never takes this path, since its adapter retries pulls itself.
+A dead chat backend therefore shows as that log line on a Running pod, not as a restart.
+
+**Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
+naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a
+frame whose `kind` is anything but `text`. At most 8 turns wait behind one console
+conversation: a chat platform paces its own senders, but the console credential can publish as
+fast as it likes, so past the cap a frame is dropped. The first drop in each fill logs and posts
+one notice, and the rest are silent until the conversation has room again. A NATS render that predates the console identity,
+or a NATS pod not yet rolled onto the new one, refuses the adapter's subscription
+asynchronously; the adapter logs that with the remedy rather than boot-failing,
+because the chat backend beside it is still good.
 
 ## What stage 2 builds from this doc
 

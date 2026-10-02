@@ -124,10 +124,18 @@ else:
 '''
 
 
-def _pod(*, restarts: int, last_reason: str | None, phase: str = "Running") -> dict:
-    status = {"restartCount": restarts, "lastState": {}}
+def _pod(
+    *,
+    restarts: int,
+    last_reason: str | None,
+    phase: str = "Running",
+    waiting_reason: str | None = None,
+) -> dict:
+    status: dict = {"restartCount": restarts, "lastState": {}}
     if last_reason:
         status["lastState"] = {"terminated": {"reason": last_reason, "exitCode": 137}}
+    if waiting_reason:
+        status["state"] = {"waiting": {"reason": waiting_reason}}
     return {"status": {"phase": phase, "containerStatuses": [status]}}
 
 
@@ -215,6 +223,20 @@ def _healthy_world() -> dict:
                 "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}],
             },
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [_node()]},
+            "deployment/inventory-api": {
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Progressing",
+                            "status": "False",
+                            "reason": "ProgressDeadlineExceeded",
+                        }
+                    ]
+                }
+            },
+            "pod?app=inventory-api": _pods(
+                _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="CreateContainerConfigError")
+            ),
             "cronjob/legacy-endpoints-writer": _writer_cronjob(),
             "endpoints/legacy-endpoints-lane": {"subsets": [{"addresses": [{"ip": "192.0.2.10"}], "ports": [{"port": 9}]}]},
             "job?app=legacy-endpoints-writer": {"items": [_writer_job()]},
@@ -459,7 +481,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 16 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 17 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -489,7 +511,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "16 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "17 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -510,7 +532,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "15 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "16 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -536,7 +558,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "16 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "17 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -560,7 +582,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "16 role(s) in their designed state" in done.stderr, done.stderr
+        assert "17 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -580,7 +602,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "16 role(s) in their designed state" in done.stderr, done.stderr
+        assert "17 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -656,7 +678,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "13 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
+        assert "14 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -701,8 +723,74 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "16 role(s) in their designed state" in done.stderr
+        assert "17 role(s) in their designed state" in done.stderr
 
+    def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
+        world = _healthy_world()
+        world["kubectl"]["deployment/inventory-api"] = {
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Progressing",
+                        "status": "True",
+                        "reason": "NewReplicaSetAvailable",
+                    }
+                ]
+            }
+        }
+        done = self.run_script(world)
+        assert done.returncode == 0, done.stderr
+        assert "1 drifted" in done.stderr
+        files = self.drift_files()
+        assert set(files) == {"stalled-controller"}
+        body = files["stalled-controller"]
+        assert "ProgressDeadlineExceeded" in body
+
+    def test_stalled_controller_fixture_detects_drift_when_healed_by_configmap(self):
+        world = _healthy_world()
+        world["kubectl"]["configmap/inventory-flags"] = {"data": {"foo": "bar"}}
+        done = self.run_script(world)
+        assert done.returncode == 0, done.stderr
+        assert "1 drifted" in done.stderr
+        files = self.drift_files()
+        assert set(files) == {"stalled-controller"}
+        body = files["stalled-controller"]
+        assert "configmap/inventory-flags absent: observed" in body
+
+    def test_stalled_controller_fixture_detects_drift_when_available_replicas_set(self):
+        world = _healthy_world()
+        world["kubectl"]["deployment/inventory-api"] = {
+            "status": {
+                "availableReplicas": 1,
+                "conditions": [
+                    {
+                        "type": "Progressing",
+                        "status": "False",
+                        "reason": "ProgressDeadlineExceeded",
+                    }
+                ],
+            }
+        }
+        done = self.run_script(world)
+        assert done.returncode == 0, done.stderr
+        assert "1 drifted" in done.stderr
+        files = self.drift_files()
+        assert set(files) == {"stalled-controller"}
+        body = files["stalled-controller"]
+        assert "status.availableReplicas absent: observed 1" in body
+
+    def test_stalled_controller_fixture_detects_drift_when_pod_waiting_reason_mismatches(self):
+        world = _healthy_world()
+        world["kubectl"]["pod?app=inventory-api"] = _pods(
+            _pod(restarts=0, last_reason=None, phase="Pending", waiting_reason="ImagePullBackOff")
+        )
+        done = self.run_script(world)
+        assert done.returncode == 0, done.stderr
+        assert "1 drifted" in done.stderr
+        files = self.drift_files()
+        assert set(files) == {"stalled-controller"}
+        body = files["stalled-controller"]
+        assert "CreateContainerConfigError" in body
 
 
 class ReportTest(_Harness):
@@ -737,6 +825,7 @@ class ReportTest(_Harness):
                 "readiness-failclosed-webhook": "converged",
                 "readiness-pinned-workload": "converged",
                 "readiness-surge-blocked": "converged",
+                "stalled-controller": "converged",
                 "version-laggard": "converged",
                 "zonal-skew-capacity": "converged",
                 "zonal-skew-scheduling": "converged",
@@ -747,7 +836,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 13, "drifted": 1, "unchecked": 1})
+        self.assertEqual(doc["summary"], {"converged": 14, "drifted": 1, "unchecked": 1})
         self.assertIn("1 drifted, 1 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):

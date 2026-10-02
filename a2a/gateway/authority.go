@@ -45,7 +45,7 @@ type Authority struct {
 // principal mapping are recorded as mapped principals instead (gateway
 // design: "mapped principals where the mapping exists, backend subjects
 // where it doesn't").
-func BuildAuthority(ps *Pseudonymizer, pm *PrincipalMap, principal, backend, subjectID, verifiedBy, conversation, kind string, rosterIDs []string, rosterComplete bool) json.RawMessage {
+func BuildAuthority(ps *Pseudonymizer, resolve func(string) string, principal, backend, subjectID, verifiedBy, conversation, kind string, rosterIDs []string, rosterComplete bool) json.RawMessage {
 	roster := make([]string, 0, len(rosterIDs))
 	complete := rosterComplete
 	for _, id := range rosterIDs {
@@ -54,7 +54,7 @@ func BuildAuthority(ps *Pseudonymizer, pm *PrincipalMap, principal, backend, sub
 			break
 		}
 		entry := id
-		if p := pm.Resolve(id); p != "" {
+		if p := resolve(id); p != "" {
 			entry = p
 		}
 		roster = append(roster, ps.Hash(entry))
