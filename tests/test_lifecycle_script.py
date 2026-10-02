@@ -1004,6 +1004,61 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stderr, "")
 
+    def test_guard_drift_adoption_prints_an_import_per_foreign_resource(self):
+        """The other way to reach this refusal is a single install whose state
+        went missing, where deleting the trio is the lossy answer and importing
+        it is the right one. Only the resources actually found get a line: an
+        import for something that is not there fails, and a reader who copies
+        all three cannot tell which."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub='if [[ "$*" == *"logging sinks"* ]]; then exit 0; fi; exit 1',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "terraform import 'module.drift_pubsub[0].google_logging_project_sink.drift_audit' "
+            "projects/test-project/sinks/platform-agent-drift-audit-sink",
+            proc.stderr,
+        )
+        self.assertNotIn("google_pubsub_topic.drift_audit'", proc.stderr)
+        self.assertNotIn("google_pubsub_subscription.drift_audit'", proc.stderr)
+
+    def test_guard_drift_adoption_import_ids_match_each_resource_type(self):
+        """projects/<project>/<collection>/<name>, and the collection differs
+        per resource. A single wrong one is a command that errors at the end of
+        a refusal, where nobody will read it as the guard's fault."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("projects/test-project/topics/platform-agent-drift-audit", proc.stderr)
+        self.assertIn("projects/test-project/subscriptions/platform-agent-drift-audit-sub", proc.stderr)
+        self.assertIn("projects/test-project/sinks/platform-agent-drift-audit-sink", proc.stderr)
+
+    def test_guard_drift_adoption_refuses_when_the_console_cannot_answer(self):
+        """A terraform console that cannot evaluate enable_drift_pubsub must
+        stop the run, not read as "not enabled" and wave the apply through.
+        tfvar's own `exit 1` only kills a command substitution's subshell,
+        which is why the guard assigns the value before comparing it."""
+        proc = self._run_guard(
+            "guard_drift_adoption",
+            state_list="",
+            tfvar_create_cluster='"false"',
+            tfvar_enable_drift_pubsub="true",
+            gcloud_stub="exit 0",
+            console_fail_var="enable_drift_pubsub",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
+
+
 
 class DeleteAgentCrEndpointTest(unittest.TestCase):
     """delete_agent_cr has to reach the cluster over the endpoint that answers.

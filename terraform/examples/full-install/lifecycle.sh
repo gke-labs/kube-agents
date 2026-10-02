@@ -217,6 +217,11 @@ readonly DRIFT_ADOPTION_TARGETS=(
   "$DRIFT_SUBSCRIPTION_ADDRESS|drift_pubsub_subscription|pubsub subscriptions|Pub/Sub subscription"
   "$DRIFT_SINK_ADDRESS|drift_pubsub_sink|logging sinks|Log Router sink"
 )
+# The `terraform import` id for each of them, printed in the guard's recovery
+# advice. All three take projects/<project>/<collection>/<name>, and the
+# collection is the last word of the gcloud group above -- topics,
+# subscriptions, sinks -- so the array needs no fourth spelling of it.
+readonly DRIFT_IMPORT_ID_FORMAT='projects/%s/%s/%s'
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -875,6 +880,12 @@ guard_pubsub_subscription() {
 # project's audit records and each install reports roughly half its drift,
 # staying Ready throughout. A 409 is loud; both of those are silent.
 #
+# The refusal still prints a `terraform import` line per resource, because the
+# other way to arrive here is a single install whose state went missing -- a
+# repointed bucket, a `state rm`, a local state that was never kept. What this
+# script will not do is run that import unasked; an operator who has checked
+# that nothing else reads the trio has the knowledge the script does not.
+#
 # A describe that fails for any reason other than absence -- no permission to
 # read Pub/Sub or Logging, say -- counts as absent here and lets the apply
 # report it, which is no worse than the 409 this replaced.
@@ -904,7 +915,7 @@ guard_drift_adoption() {
     # Unquoted on purpose: $group is two words of the gcloud command.
     # shellcheck disable=SC2086
     if gcloud $group describe "$name" --project "$project" >/dev/null 2>&1; then
-      foreign+=("$group|$noun|$name")
+      foreign+=("$addr|$group|$noun|$name")
     fi
   done
   if [[ "${#foreign[@]}" -eq 0 ]]; then
@@ -913,19 +924,25 @@ guard_drift_adoption() {
 
   local line
   for line in ${foreign[@]+"${foreign[@]}"}; do
-    IFS='|' read -r group noun name <<<"$line"
+    IFS='|' read -r addr group noun name <<<"$line"
     warn "$noun '$name' already exists in project '$project' and is not managed by this install's Terraform state."
   done
-  warn "Applying would stop on a 409 creating them. Importing them instead is not the way out: an import cannot tell a trio an earlier install left behind from one another live install owns."
+  warn "Applying would stop on a 409 creating them. Importing them FOR you is not the way out: an import this script runs cannot tell a trio an earlier install left behind from one another live install owns."
   warn "Taking over another install's trio splits the project's audit records between the two detectors and deletes all three on this install's teardown, neither of which is reported on that side."
   warn "If another kube-agents install in this project owns them, give this install its own three names. Through the front doors they are passthrough lines in install.env, which every front door sources with 'set -a':"
   warn "  TF_VAR_drift_pubsub_topic=\"<a-different-name>\""
   warn "  TF_VAR_drift_pubsub_subscription=\"<a-different-name>\""
   warn "  TF_VAR_drift_pubsub_sink=\"<a-different-name>\""
   warn "A hand-driven apply sets the three in terraform.tfvars instead."
-  warn "If they are left over from an install removed without uninstall.sh, delete them first:"
+  warn "If they are THIS install's own and the state is what went missing -- a repointed KUBE_AGENTS_STATE_BUCKET, a 'terraform state rm', a lost local state -- import them back rather than deleting them. You are the one asserting the ownership the script cannot establish, so confirm no other install reads them first:"
   for line in ${foreign[@]+"${foreign[@]}"}; do
-    IFS='|' read -r group noun name <<<"$line"
+    IFS='|' read -r addr group noun name <<<"$line"
+    # shellcheck disable=SC2059
+    warn "  terraform import '$addr' $(printf "$DRIFT_IMPORT_ID_FORMAT" "$project" "${group##* }" "$name")"
+  done
+  warn "If they are left over from an install removed without uninstall.sh and nothing reads them, delete them instead:"
+  for line in ${foreign[@]+"${foreign[@]}"}; do
+    IFS='|' read -r addr group noun name <<<"$line"
     warn "  gcloud $group delete $name --project $project"
   done
   warn "Or leave the detector off for this install: ENABLE_DRIFT_DETECTOR=false in install.env."

@@ -209,6 +209,25 @@ class LifecyclePlanTest(unittest.TestCase):
         self.assertLess(apply_branch.index("guard_drift_adoption"),
                         apply_branch.index("terraform apply"))
 
+    def test_the_drift_guard_is_in_no_branch_but_apply(self):
+        """`plan` reports without changing anything and `destroy` creates
+        nothing, so neither can reach the 409 the guard pre-empts, and a guard
+        that refused either would stop a read-only report and a teardown over
+        a collision they do not cause. Read from the dispatch, because a
+        misplaced guard exits 1 wherever it sits and looks right doing it."""
+        dispatch = self.text[self.text.index('case "${1:-}" in'):]
+        # re.split keeps the captured branch names, so the result is
+        # [preamble, name, body, name, body, ...].
+        branches = re.split(r"^  (\w[\w-]*)\)$", dispatch, flags=re.MULTILINE)
+        guarded = {
+            branches[i]: "guard_drift_adoption" in branches[i + 1]
+            for i in range(1, len(branches) - 1, 2)
+        }
+        for branch in ("apply", "plan", "destroy"):
+            with self.subTest(branch=branch):
+                self.assertIn(branch, guarded, guarded)
+        self.assertEqual([name for name, called in guarded.items() if called], ["apply"])
+
     def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
         """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""
         destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,
