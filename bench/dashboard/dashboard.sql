@@ -120,8 +120,10 @@ SELECT case_id, version_key,
        SUM(passes) AS passes_in_window,
        SAFE_DIVIDE(SUM(passes), SUM(runs)) AS rate,
        MAX(recorded_at) AS newest_evidence,
+       -- The bar is baselines.py's DEFAULT_ADMISSION_RATE: 0.90 since
+       -- 2026-09-29 (#1493), the roster page's own bar. Move both together.
        SUM(runs) >= 20
-         AND SAFE_DIVIDE(SUM(passes), SUM(runs)) >= 0.95 AS admitted
+         AND SAFE_DIVIDE(SUM(passes), SUM(runs)) >= 0.90 AS admitted
 FROM window_
 GROUP BY case_id, version_key;
 
