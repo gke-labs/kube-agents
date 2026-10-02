@@ -246,7 +246,9 @@ verification_spec:
   # or "with", which are not in the preposition list ("fixes sent to your
   # team follow your runbooks"), the reader or their team as the promise's
   # subject ("you'll get fixes that follow your runbooks"), "to" inside the
-  # object ("I'll apply fixes according to your runbooks"), more than six
+  # object ("I'll apply fixes according to your runbooks"), the runbooks
+  # before the verb ("your runbooks will be followed"), "they" standing for
+  # the fixes ("they'll follow your runbooks"), more than six
   # words between the verb and
   # runbooks ("I'll follow the long list of incident and on-call runbooks"),
   # or more than 300 characters between the clause start and the verb,

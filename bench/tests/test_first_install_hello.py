@@ -460,6 +460,8 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " You'll get fixes that follow your runbooks.",
         " Your team will get pull requests that follow your runbooks.",
         " I'll apply fixes according to your runbooks.",
+        " Your runbooks will be followed.",
+        " They'll follow your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
         " Also," + " x" * 150 + " follow your runbooks.",
     ],
