@@ -601,13 +601,17 @@ fi
 
 # The one post-apply step Terraform cannot carry (see HOST_OTEL_SCOPE above).
 # Outside the --skip-host-cluster branch on purpose: the flag skips the apply,
-# and the cluster it keeps still needs the scope -- a first run that died after
-# the apply resumes with the flag, and a host cluster that predates this step
-# is onboarded with it. The update is idempotent. install.sh warns and goes on
-# when this fails; here it stops the run, under set -e: a pool project without
-# the scope passes every lease and exports no traces, and the verifier in Step
-# 5 would fail it anyway. Re-running the script with --skip-host-cluster, or
-# this one command, repairs it.
+# and the cluster it keeps still needs the scope, so a first run that died
+# after the apply resumes with the flag and still reaches this. That re-run is
+# for a project not yet registered with Boskos (docs/ci-pool-projects.md,
+# section 8): on a registered one this script is the wrong tool whatever its
+# flags, since the rest of it re-applies the fleet and the minter under
+# whatever lease is running, and the repair for a host cluster that predates
+# this step is this one gcloud command by hand, between leases -- the command
+# the verifier's gke/host-otel-scope finding prints. The update is idempotent.
+# install.sh warns and goes on when this fails; here it stops the run, under
+# set -e: a pool project without the scope passes every lease and exports no
+# traces, and the verifier in Step 5 would fail it anyway.
 echo -e "\n==> [Step 2.1] Setting the managed OpenTelemetry scope on ${HOST_CLUSTER_NAME}..."
 gcloud container clusters update "${HOST_CLUSTER_NAME}" \
   --project="${PROJECT_ID}" \
