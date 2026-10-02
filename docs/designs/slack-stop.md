@@ -51,10 +51,22 @@ credentialed command runs to completion or the broker's 300 s deadline. A proces
 worker reaches only the local `ssh` client too. Killing the shared ControlMaster would kill every
 other worker's commands.
 
-This settles where Stop must act. **Every write leaves through the broker**: the sandbox holds no
-credentials, so an uncredentialed command left running there cannot reach a cluster or the forge.
-The broker is therefore both where Stop cancels in-flight writes and where it checks what was
-written.
+The sandbox holds no credentials, so an uncredentialed command left running there cannot reach a
+cluster or the forge. That leaves two doors a write can leave by:
+
+- **The broker**, for every credentialed command and every vcs broker call.
+- **The `gke` MCP server**, which the broker never sees. Every profile, the Platform and Cluster
+  workers' included, lists Google's hosted server (`container.googleapis.com/mcp`) through a stdio
+  proxy that runs as a child of the Hermes process in the agent pod and mints a token from the pod's
+  ambient Workload Identity on each call (`deploy/docker/Dockerfile`, the `mcp-remote` comment;
+  `credential_proxy.py` says of it "Nothing here scopes it and nothing here can"). The server offers
+  mutating tools (`update_cluster`, `update_node_pool`, `apply_k8s_manifest`, `patch_k8s_resource`,
+  `delete_k8s_resource`, among others), no profile filters them with Hermes's `tools:` include or
+  exclude, and the server's default trust needs no approval. Only IAM refuses the write: the
+  default `project_roles` are viewer roles, but a `custom` permission set, or in-cluster RBAC bound
+  to the agent's identity, lets a worker change a cluster through this door.
+
+Stop therefore acts at both: the broker for commands, and a Hermes tool hook for MCP calls.
 
 ## How the stop reaches the gateway
 
@@ -113,7 +125,10 @@ interrupt_reason=STOP_REASON, invalidation_reason=…)`, with a reason of Stop's
 3. **Fence them at the broker.** Add every found card's caller label to the broker's stopped set:
    the broker refuses new requests carrying a stopped label and kills the process group of every
    in-flight command that carries one, through the same path as its kill-on-disconnect. This is the
-   cancel that reaches a command the worker kill cannot.
+   cancel that reaches a command the worker kill cannot. Write the same ids to the stopped list the
+   `pre_tool_call` hook reads (below), so an MCP call a worker starts between the fence and its kill
+   is refused. An MCP call already sent cannot be recalled: Google runs it, and a cluster or node-pool
+   update continues as a long-running operation after the worker dies.
 4. **Archive them, leaves first.** `kb.archive_task` in reverse topological order over `task_links`.
    `archive_task` runs `recompute_ready`, which promotes a child once all its parents are archived,
    so archiving a parent first can hand the dispatcher (5 s tick) a child to start. Every non-final
@@ -141,9 +156,11 @@ running. Kanban cards never cross the A2A bus.
 
 ## How "nothing changed" is checked
 
-Because every write leaves through the broker, the broker records them. The build adds a bounded
-in-memory ledger to `credential_proxy.py`, keyed by caller label and served on an authenticated
-local route, of every request that can change something outside the pod:
+Each door keeps its own record.
+
+**The broker ledger.** The build adds a bounded in-memory ledger to `credential_proxy.py`, keyed by
+caller label and served on an authenticated local route, of every request that can change something
+outside the pod:
 
 - every vcs broker call in `WRITE_VERBS` (`vcs_broker.py`): publishing a branch, opening, updating,
   commenting on, closing or acknowledging a proposal, creating, commenting on, updating or closing
@@ -164,12 +181,29 @@ its request landed) and `busy` then retried are unknowns.
 The `tool_execution_audit` log lines are not a read source: they go to Cloud Logging, and a 5 s read
 against ingestion lag would return "empty" for "not yet ingested".
 
+**The MCP record.** A `pre_tool_call` and `post_tool_call` plugin, loaded in every profile that lists
+`mcp-gke` (chat, platform, cluster), handles each `gke` MCP call. Workers run in the agent pod, so
+the gateway and the hook share a filesystem. The hook:
+
+- refuses the call (`{"action": "block"}`) when the card (`HERMES_KANBAN_TASK`) or session is on the
+  stopped list;
+- otherwise appends `started` to a per-card record under the profile's home before the call, and
+  the outcome after it.
+
+A call whose tool name starts `get_`, `list_`, `describe_` or `query_` is a read. Any other is
+counted. Its outcome classifies it the way the broker ledger's does: success is a write, an IAM or
+RBAC refusal is not, and `started` with no outcome, as when the worker was killed mid-call, is an
+unknown. The tool list is Google's and can grow, which is why it reads by prefix rather than
+enumerating writes.
+
 `stop_thread` says "Nothing changed" only when all of these hold:
 
 1. read-only enforcement was on (a new broker route reporting `read_only_enforced()`);
 2. the fence drained: no stopped label has a command in flight;
 3. every stopped card terminated (step 4);
-4. the ledger holds no write and no unknown for any stopped label.
+4. the broker ledger holds no write and no unknown for any stopped label;
+5. the MCP record holds no write and no unknown for any stopped card, or for the stopped turn's
+   session.
 
 Anything else produces one of the other replies. A write is reported with its link; a reported pull
 request is read from the forge once to learn whether it is open or merged, and if that read fails
@@ -183,6 +217,9 @@ Limits the reply carries rather than hides:
 - **The caller label is self-reported.** The shim reads it from the worker's environment
   (`HERMES_KANBAN_TASK`, else `HERMES_SESSION_ID`), and the worker's shell could change it. A worker
   that did so would escape both the fence and the check.
+- **A token minted outside both doors is invisible.** The metadata server is reachable from the agent
+  container, so code there can mint the Workload Identity token and call Google directly. Hermes's
+  own tools do not; the IAM grant is the limit on anything that does.
 - **What already landed stays landed:** a pull request a person or Tide merged, or a GitOps sync
   that applied one, is reported, not undone.
 
@@ -204,6 +241,7 @@ line each under a single "Stopped." The reply is one message in the thread.
 | A pull request was updated                                       | Stopped. Before stopping, I updated my pull request for seeded-a: #412.                                                         |
 | A branch was pushed, no pull request                             | Stopped. Before stopping, I pushed a branch for seeded-a, `<branch>`, with no pull request.                                     |
 | Any other write (an issue, a comment, a label, a deleted branch) | Stopped. Before stopping, I <closed issue #88 / commented on #412 / …> for seeded-a.                                            |
+| A cluster write through the GKE tools                            | Stopped. Before stopping, I asked GKE to update node pool pool-1 on seeded-a. Google may still be applying it.                  |
 | Some writes found, some sources unchecked                        | (the write lines, then) I couldn't check everything else, so look at seeded-a before you rely on it.                            |
 | Could not check                                                  | Stopped. I couldn't check whether anything changed in seeded-a, so look for a pull request from me before you assume it didn't. |
 | Read-only enforcement is off                                     | Stopped. Cluster writes are switched on for me, so I can't vouch for seeded-a. Check it before you rely on it.                  |
@@ -242,12 +280,27 @@ neither a red nor a green:
   `delegated_task_ids(result.trajectory)` is non-empty, the harness sends `/stop` on the same
   conversation, records `stop_at` and a `harness_stop_sent` trajectory entry, folds the stop reply
   into `final_message`, then reads the board for `observe_seconds` without sending another turn: a
-  status poll is a user message and would resume the work. Whether the API server runs `/stop` as a
-  command or hands it to the model is open; if the latter, the build intercepts it on that door too.
-- **`github_writes` on the api lane, with `since`.** The check needs `BENCH_GITOPS_REPO`, which only
-  the inject lane exports, and a `since: stop` option, offset by a `grace_seconds` that covers the
-  kill window, so a write the stop could not prevent and the reply reports is not charged as a
-  failure.
+  status poll is a user message and would resume the work.
+- **`/stop` on the API server.** Hermes's `/v1/responses` handler has no slash dispatch: it takes the
+  last input message as the user message and runs the model on it
+  (`gateway/platforms/api_server_openai_routes.py`, `_handle_responses`), so `/stop` there is an
+  ordinary prompt. It also holds no per-conversation lock, so a second request mid-turn runs a
+  second agent beside the first. The only HTTP stop is `POST /v1/runs/{run_id}/stop`, for
+  `/v1/runs` runs. The build therefore patches `_handle_responses`: an input that is exactly `/stop`
+  resolves the conversation's session, calls `stop_thread`, and returns its reply as the response
+  without starting a run. On this door card lookup also takes cards whose inherited
+  `tasks.session_id` is the conversation's session, in case api-server sessions file cards without
+  a subscription row. The harness sends the stop after the opening turn has returned, so there is
+  no concurrent turn.
+- **`github_writes` grows `since` and `grace_seconds`.** The verifier is the repo's
+  (`bench/kube_agents_bench/verifiers.py`); today it accepts `owner`, `branch_prefix`, `author`,
+  `requested_pull_requests` and `max_clock_skew_sec`, and its window always starts at the run's
+  `started_at`. Verifiers forbid unknown keys (`extra="forbid"` in devops-bench's `BaseVerifier`),
+  so the case written against the old verifier fails to parse and the gate reds it as "verification
+  spec did not parse" rather than evaluating. `since: stop` starts the window at the transcript's
+  `stop_at`, and `grace_seconds` moves it past the kill window, so a write the stop could not
+  prevent, which the reply reports, is not charged as a failure. The check also needs
+  `BENCH_GITOPS_REPO`, which only the inject lane exports today.
 - **A serial slot.** On the api lane this case would run beside `pdb-remediation-pr`, which opens a
   pull request in the same repository by design, and `github_writes` would count it. The case runs
   in a serial phase, the inject lane's existing split, or one added to the api lane.
@@ -317,8 +370,18 @@ verification_spec:
           grace_seconds: 30
 ```
 
+The structure loads as written: devops-bench's `all`, `any` and `none` each take `type`, an optional
+`name` and a non-empty `checks:` list, and parse every child back through the same node parser, so
+`any` → `all` → `none` → `github_writes` nests (`devops_bench/verification/spec.py` at the pinned
+commit). Under `mode: assert` the subtree runs once; `none` fails if a child passes and errors if a
+child errors. `tool_called` accepts `require_success`; `report_contains` accepts
+`required_phrases`, `forbidden_phrases` and `any_of_phrases`.
+
 `report_contains` lowercases both sides, so no reply other than the verified one may contain
 "nothing changed in"; the read-only-off row is worded around it for that reason.
+
+The case asserts no MCP write: on the pool projects the agent's IAM refuses one, and existing cases
+do not enumerate the `gke` server's tool names, which are Google's to change.
 
 **Red on main**, against a `main` install with the branch's harness (neither the hook nor `since`
 exists on `main`): the stop arrives after the Planning Agent's turn has ended, Hermes replies that
@@ -339,12 +402,10 @@ case cannot land marked ahead of the fix. It lands with the build: red shown on 
   press Stop once, and log the event's keys at the relay; then restore the manifest. It posts to
   Slack and edits the app, so it needs the owner's go-ahead. The event shape here is from Slack's
   reference.
-- Whether the API server runs `/stop` as a command (see the stop hook).
 - That sshd sends no signal to a no-pty command when its channel closes, and that Envoy closes the
   broker's upstream connection when the shim's closes. Both are standard behaviour, unverified in
   these images; the broker fence does not depend on either.
-- Whether the GKE MCP server's credentials go through the broker or straight to IAM. If straight,
-  it is a write path the ledger does not see, and the check must refuse to say "Nothing changed"
-  while it is enabled.
-- Whether devops-bench's compound checks accept `none` nested in `all` nested in `any` under an
-  objective.
+- Whether api-server sessions give their cards a `kanban_notify_subs` row; the `tasks.session_id`
+  lookup covers them either way.
+- Whether any live install runs a `custom` permission set with container write roles. The MCP
+  record reports such a write either way; this decides only how often the GKE row is seen.
