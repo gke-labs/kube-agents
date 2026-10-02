@@ -279,6 +279,7 @@ func main() {
 		Client:                   mgr.GetClient(),
 		APIReader:                mgr.GetAPIReader(),
 		RBAC:                     rbacChecker,
+		Recorder:                 mgr.GetEventRecorderFor(controller.PlatformAgentControllerName),
 		Scheme:                   mgr.GetScheme(),
 		APIServerIP:              apiHost,
 		APIServerCIDROverride:    apiServerCIDR,

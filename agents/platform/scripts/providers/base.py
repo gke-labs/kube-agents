@@ -62,7 +62,7 @@ __all__ = [
     "listing",
 ]
 
-# The verbs a forge may serve, plus the four the broker serves for every forge.
+# The verbs a forge may serve, plus the ones the broker serves for every forge.
 # Spelled with hyphens because that is how they appear in a route and in the
 # `verbs` list a caller reads back from `capabilities`.
 #
@@ -89,7 +89,12 @@ COLLABORATION_VERBS: tuple[str, ...] = (
     "label-ensure",
 )
 
-BROKER_VERBS: tuple[str, ...] = ("capabilities", "clone", "publish", "identity")
+# `branch-view` and `branch-delete` are the broker's rather than a forge's for the
+# reason `publish` is: which refs a remote holds, and removing one, is git
+# against a URL on every forge.
+BROKER_VERBS: tuple[str, ...] = (
+    "capabilities", "clone", "publish", "identity", "branch-view", "branch-delete",
+)
 
 
 class ForgeUnsupported(WorkspaceError):
@@ -203,7 +208,14 @@ class Forge:
             "forge": self.name,
             "repo": repo,
             "proposalNoun": self.proposal_noun,
-            "verbs": sorted({*BROKER_VERBS, *self.verbs}),
+            # `branch-delete` is served for every forge but decided by
+            # `proposal-list`: without it whether a branch is spent cannot be
+            # read, and the broker refuses the delete. Advertising it would
+            # send a caller to a refusal it could have seen here.
+            "verbs": sorted(
+                {*BROKER_VERBS, *self.verbs}
+                - (set() if "proposal-list" in self.verbs else {"branch-delete"})
+            ),
             "acknowledge": self.acknowledges,
             "missing": [],
         }

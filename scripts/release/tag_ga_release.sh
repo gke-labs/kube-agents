@@ -25,36 +25,29 @@ RC_CANDIDATE_COMMIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --verify "${RC_CANDID
 
 RELEASE_COMMIT="$(create_stamped_release_commit "${RELEASE_VERSION}" "${RC_CANDIDATE_COMMIT_SHA}" "${REPO_ROOT}")"
 
-# The banner comes from tag_commit.sh, below, rather than being printed here:
-# the stamped release commit is resolved first, so the banner can name the commit
-# the tag actually lands on. This script keeps what is genuinely its own — the
-# pure-SemVer gate, the swapped-argument handling, and the stamping — and hands
-# the tag itself to the shared tagger. A mistaken GA tag is the one rung of the
-# ladder that cannot be fixed by deleting a tag, so it does not get a private
-# copy of the tagging logic either.
-# Where the release branch is, read before anything is pushed. ensure_release_branch
-# below refuses a branch already at another commit; finding that only after the
-# GA tag went out would leave the one artefact a failed run cannot take back.
-release_branch_placement "${RELEASE_VERSION}" "${RELEASE_COMMIT}" >/dev/null
+RELEASE_LINE_BRANCH="$(release_branch_for_line "$(release_line_for_version "${RELEASE_VERSION}")")"
 
-GA_TAG_DETAILS=(--detail "Release Version:     ${RELEASE_VERSION}")
-GA_TAG_DETAILS+=(--detail "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}")
+# The banner is printed here rather than by tag_commit.sh: the GA rung pushes
+# two refs, the tag and its release line, and it pushes them atomically through
+# ensure_ga_release_refs so that neither can exist on the remote without the
+# other, and it reads where the line is before anything is pushed: a line at
+# any commit but the release commit, its candidate, or beyond it stops the run
+# with nothing pushed. The line's first release creates `release/X.Y` because
+# the line is absent; a later patch fast-forwards it because it is at the
+# candidate; a merge that lands on the line meanwhile rejects the whole push,
+# and the re-run stamps from the new head. This script keeps what is genuinely its own — the pure-SemVer gate, the
+# swapped-argument handling, the stamping — and the shared helpers keep the
+# idempotency contract every rung of the ladder has.
+echo "======================================================================"
+echo "🏷️ CREATING AND PUSHING GA RELEASE GIT TAG"
+echo "Tag:          ${RELEASE_VERSION}"
+echo "Commit SHA:   ${RELEASE_COMMIT}"
+echo "Release Version:     ${RELEASE_VERSION}"
+echo "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}"
 if [ "${RELEASE_COMMIT}" != "${RC_CANDIDATE_COMMIT_SHA}" ]; then
-  GA_TAG_DETAILS+=(--detail "Release Commit:      ${RELEASE_COMMIT:0:7}")
+  echo "Release Commit:      ${RELEASE_COMMIT:0:7}"
 fi
-GA_TAG_DETAILS+=(--detail "Release Branch:      $(release_branch_for_version "${RELEASE_VERSION}")")
+echo "Release Line:        ${RELEASE_LINE_BRANCH}"
+echo "======================================================================"
 
-"${SCRIPT_DIR}/tag_commit.sh" \
-  --title "CREATING AND PUSHING GA RELEASE GIT TAG" \
-  "${GA_TAG_DETAILS[@]}" \
-  "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "Release ${RELEASE_VERSION}"
-
-# The branch is pushed after the tag, and the order is load-bearing. The tag is
-# what a re-run keys on: create_stamped_release_commit reuses the tagged commit
-# and verify_release_eligibility.sh reads the tag, so a run that fails here
-# re-runs the way one that fails at image promotion does, and pushes the branch
-# it did not get to. The other way round is not re-runnable: with the branch
-# pushed and no tag, the re-run stamps a fresh commit and refuses the branch it
-# pushed itself. Without the branch the stamped commit is reachable from the tag
-# alone, which GitHub shows as belonging to no branch on the repository.
-ensure_release_branch "${RELEASE_VERSION}" "${RELEASE_COMMIT}"
+ensure_ga_release_refs "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "${RC_CANDIDATE_COMMIT_SHA}"

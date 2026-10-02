@@ -49,6 +49,7 @@ def run_trap(exit_code: int) -> subprocess.CompletedProcess:
             "collect_bench_results() { echo 'called collect_bench_results'; }",
             "report_partial_verdict() { echo 'called report_partial_verdict'; }",
             "collect_gateway_log() { echo 'called collect_gateway_log'; }",
+            "collect_agent_pod_diagnostics() { echo 'called collect_agent_pod_diagnostics'; }",
             "profile_report() { echo \"called profile_report $1\"; }",
             "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
             trap_body(),
@@ -85,6 +86,15 @@ class ExitTrapTest(unittest.TestCase):
         self.assertIn("called collect_gateway_log", out)
         self.assertLess(out.index("called collect_gateway_log"), out.index("called dumper"))
         self.assertIn("called collect_gateway_log", run_trap(7).stdout)
+
+    def test_the_agent_pod_diagnostics_follow_the_gateway_log_on_every_exit(self):
+        """A pod replaced mid-run starts a fresh gateway log; the previous
+        containers, restarts and events are what say why, green or red."""
+        for code in (0, 7):
+            out = run_trap(code).stdout
+            self.assertIn("called collect_agent_pod_diagnostics", out)
+            self.assertLess(out.index("called collect_gateway_log"), out.index("called collect_agent_pod_diagnostics"))
+            self.assertLess(out.index("called collect_agent_pod_diagnostics"), out.index("called profile_report"))
 
 
 class EvalLifetimeHeartbeatTest(unittest.TestCase):
@@ -168,6 +178,7 @@ class EvalLifetimeHeartbeatTest(unittest.TestCase):
                 "collect_bench_results() { :; }",
                 "report_partial_verdict() { :; }",
                 "collect_gateway_log() { :; }",
+                "collect_agent_pod_diagnostics() { :; }",
                 "profile_report() { :; }",
                 "dump_prow_artifacts_on_failure() { echo 'called dumper'; }",
                 unguarded,

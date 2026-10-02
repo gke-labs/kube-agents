@@ -2,7 +2,7 @@
 # ==============================================================================
 # Release-candidate eval (the postsubmit job's entrypoint)
 # ==============================================================================
-# Resolve the newest release candidate, check it out, deploy its published
+# Resolve the newest release candidate on main, check it out, deploy its published
 # images, and evaluate them. GATING: the verdict this writes is what decides
 # whether the candidate reaches the staging cluster. Step 5 of
 # staging-promotion-pipeline.yml polls this run's artifacts and pushes the
@@ -83,8 +83,8 @@ set -euo pipefail
 # held-out seats, `nightly` appends eval/nightly-cases.txt. Counted from those
 # files rather than stated here, because both move: on 2026-09-29 they are 14
 # (twelve on the roster and two held-out seats, the compliance canary, #2013,
-# and pdb-remediation-pr, #2016) and 37, so 51 cases, and at three
-# repetitions 42 units against 153.
+# and pdb-remediation-pr, #2016) and 38, so 52 cases, and at three
+# repetitions 42 units against 156.
 #
 # It is the smaller one because of the clock, not because the other cases are
 # unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this

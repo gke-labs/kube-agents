@@ -45,7 +45,7 @@ cycle.
    resolved, per the bar in the root `AGENTS.md`. After fixing findings,
    trigger a fresh review yourself: comment `/review` for a narrow re-check of
    the diff, or `/review all` for a wider re-check when the changes are
-   substantial. A clean pass is what puts the change in front of a human
+   substantial. A green pass is what puts the change in front of a human
    reviewer, so trigger it yourself rather than waiting. If `lgtm` is present,
    you are done only when the full merge gate holds - `lgtm` _and_ `approved`
    present and the required checks passing (and `ok-to-test` applied when Prow
@@ -140,9 +140,10 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 1. Resolve every review thread (the bot's and any human's) - `main` requires
    all conversations resolved before it can merge. Resolve a thread only once
    genuinely resolved, per the root `AGENTS.md`.
-2. Trigger a clean bot pass yourself - comment `/review` (or `/review all`
-   for a wider re-check). A clean pass is what puts the change in front of a
-   human reviewer; `/request-review` assigns one immediately when a review
+2. Trigger a green bot pass yourself - comment `/review` (or `/review all`
+   for a wider re-check). A green pass is what puts the change in front of a
+   human reviewer: clean on the first review, or nothing above Medium and no
+   open description thread on a later one, per the root `AGENTS.md`; `/request-review` assigns one immediately when a review
    never arrives or you have answered a finding you disagree with. It reacts
    👀 to the comment when it requested someone and 😕 when it declined; the
    workflow run's annotations say why.

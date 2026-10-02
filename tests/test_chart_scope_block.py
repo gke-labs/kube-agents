@@ -36,6 +36,8 @@ POPULATED = {
     "projects": ["payments-prod", "payments-staging"],
     "folders": ["123456789012"],
     "organizations": [],
+    "sharedVpcHosts": ["shared-net-host"],
+    "metricsScopes": ["observability-hub"],
     "exclude": {
         "projects": ["*-sandbox"],
         "clusters": [
@@ -43,10 +45,14 @@ POPULATED = {
         ],
     },
 }
-EMPTY = {"projects": [], "folders": [], "organizations": [], "exclude": {"projects": [], "clusters": []}}
-# What a record written before the chart knew the container lists renders: the
-# two keys stay out of the manifest, so a retag's patch leaves the CR's lists alone.
+EMPTY = {"projects": [], "folders": [], "organizations": [], "sharedVpcHosts": [], "metricsScopes": [],
+         "exclude": {"projects": [], "clusters": []}}
+# What a record written before the chart knew the container and selector lists
+# renders: the four keys stay out of the manifest, so a retag's patch leaves
+# the CR's lists alone.
 EMPTY_WITHOUT_CONTAINERS = {"projects": [], "exclude": {"projects": [], "clusters": []}}
+# The keys the chart renders only when the value carries them.
+KEYED_LISTS = ("folders", "organizations", "sharedVpcHosts", "metricsScopes")
 
 
 class ScopeBlockShapeTest(unittest.TestCase):
@@ -66,13 +72,13 @@ class ScopeBlockShapeTest(unittest.TestCase):
         self.assertNotIn("compactFields", body)
         self.assertNotIn("{{- with", body)
 
-    def test_the_container_lists_render_only_when_the_value_carries_the_key(self):
+    def test_the_container_and_selector_lists_render_only_when_the_value_carries_the_key(self):
         # A release record from before the chart knew the keys must re-render
         # without them: Helm patches the CR from the difference between
         # manifests, and `folders: []` over a hand-declared folder retires its
         # members on the next reconcile. `hasKey`, not `with`: an empty list the
         # value carries still renders.
-        for key in ("folders", "organizations"):
+        for key in KEYED_LISTS:
             with self.subTest(key=key):
                 self.assertIn(f'{{{{- if hasKey $scope "{key}" }}}}\n    {key}: {{{{ $scope.{key} | default list | toJson }}}}\n    {{{{- end }}}}',
                               self.template)
@@ -81,6 +87,8 @@ class ScopeBlockShapeTest(unittest.TestCase):
         for key in ("projects: {{ $scope.projects | default list | toJson }}",
                     "folders: {{ $scope.folders | default list | toJson }}",
                     "organizations: {{ $scope.organizations | default list | toJson }}",
+                    "sharedVpcHosts: {{ $scope.sharedVpcHosts | default list | toJson }}",
+                    "metricsScopes: {{ $scope.metricsScopes | default list | toJson }}",
                     "projects: {{ $scopeExclude.projects | default list | toJson }}",
                     "clusters: {{ $scopeExclude.clusters | default list | toJson }}"):
             with self.subTest(line=key):
@@ -129,13 +137,24 @@ class ScopeBlockRenderTest(unittest.TestCase):
 
     def test_a_record_without_the_container_keys_renders_no_container_list(self):
         # The pre-2078 release record: a scope map with projects and exclude
-        # only. The manifest must not carry the two keys, so the retag's patch
-        # cannot clear a folder the CR holds.
+        # only. The manifest must not carry the four keys, so the retag's patch
+        # cannot clear a folder or a host the CR holds.
         older = {"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}
         rendered = self._scope_of(self._render("-f", self._values_file(older)))
         self.assertEqual(rendered, older)
-        self.assertNotIn("folders", rendered)
-        self.assertNotIn("organizations", rendered)
+        for key in KEYED_LISTS:
+            self.assertNotIn(key, rendered)
+
+    def test_a_record_without_the_selector_keys_renders_no_selector_list(self):
+        # The release record between the container and the selector keys: the
+        # two container lists render, the two selector lists stay out, so a
+        # retag cannot patch `sharedVpcHosts: []` over a host declared by hand.
+        between = {"projects": [], "folders": ["123456789012"], "organizations": [],
+                   "exclude": {"projects": [], "clusters": []}}
+        rendered = self._scope_of(self._render("-f", self._values_file(between)))
+        self.assertEqual(rendered, between)
+        self.assertNotIn("sharedVpcHosts", rendered)
+        self.assertNotIn("metricsScopes", rendered)
 
     def test_a_populated_value_reaches_the_block_verbatim(self):
         self.assertEqual(self._scope_of(self._render("-f", self._values_file(POPULATED))), POPULATED)
@@ -147,12 +166,16 @@ class ScopeBlockRenderTest(unittest.TestCase):
         self.assertEqual(self._scope_of(proc), "ABSENT")
 
     def test_an_unknown_key_under_scope_is_refused_by_the_schema(self):
-        # The two phase 3 selectors are not rendered by the chart yet, so a
-        # value for them is a mistake the schema names rather than drops.
-        proc = self._render("--set", "platformAgent.scope.sharedVpcHosts={shared-net-host}")
+        # A key the CRD does not have is a mistake the schema names rather
+        # than drops.
+        proc = self._render("--set", "platformAgent.scope.regions={us-central1}")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("scope", proc.stderr)
 
     def test_a_folder_without_the_other_lists_renders_it_and_the_project_lists(self):
         rendered = self._scope_of(self._render("-f", self._values_file({"folders": ["123456789012"]})))
         self.assertEqual(rendered, {**EMPTY_WITHOUT_CONTAINERS, "folders": ["123456789012"]})
+
+    def test_a_selector_without_the_other_lists_renders_it_and_the_project_lists(self):
+        rendered = self._scope_of(self._render("-f", self._values_file({"sharedVpcHosts": ["shared-net-host"]})))
+        self.assertEqual(rendered, {**EMPTY_WITHOUT_CONTAINERS, "sharedVpcHosts": ["shared-net-host"]})

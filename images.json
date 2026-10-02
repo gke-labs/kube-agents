@@ -62,6 +62,41 @@
       "description": "Autonomous diagnostic and remediation skill for GKE compute stockouts."
     },
     {
+      "name": "a2a-gateway",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-gateway",
+      "tagPolicy": "release",
+      "override": "A2A_GATEWAY_IMAGE",
+      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way.",
+      "description": "The chat gateway of the A2A next stack: adapters, the bus relay and the session spawner (a2a/Dockerfile.gateway)."
+    },
+    {
+      "name": "a2a-worker",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
+      "tagPolicy": "release",
+      "override": "A2A_WORKER_IMAGE",
+      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE.",
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker)."
+    },
+    {
+      "name": "a2a-authcallout",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
+      "tagPolicy": "release",
+      "override": "A2A_CALLOUT_IMAGE",
+      "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
+    },
+    {
+      "name": "hermes-bridge",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
+      "tagPolicy": "release",
+      "pulledBy": "The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's.",
+      "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
+    },
+    {
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",

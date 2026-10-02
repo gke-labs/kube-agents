@@ -10,15 +10,20 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import MOCK_DEFAULT_REGISTRY_PREFIX, get_isolated_test_env
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_COLLIDING_RELEASE_TAG,
     MOCK_EMERGENCY_OVERRIDE_REASON,
     MOCK_NONEXISTENT_REF,
     MOCK_HANDMADE_STAGING_TAG,
     MOCK_LATEST_STAGING_TAG,
+    MOCK_LINE_PATCH_RELEASE_TAG,
+    MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
+    commit_required_release_images,
+    create_mock_docker_binary,
     create_mock_gh_binary,
 )
 
@@ -387,6 +392,31 @@ exit {docker_exit}
         finally:
             temp_dir.cleanup()
 
+    def test_a_candidate_from_before_the_list_grew_is_eligible_on_its_own_images(self):
+        """The script runs from a checkout of main whose list may be longer than
+        the candidate's. The images it requires are the ones the candidate's own
+        common.sh lists -- what its publish run built -- not this checkout's
+        (#2211). The docker mock holds exactly the candidate's images."""
+        temp_dir, repo_dir, git, _, bin_dir = self._create_mock_repo()
+        try:
+            candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+            git("tag", "-a", MOCK_LATEST_STAGING_TAG, candidate, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
+            create_mock_docker_binary(
+                bin_dir,
+                existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+            )
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, candidate],
+                env={"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX},
+                bin_dir=bin_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("ELIGIBLE: Found staging promotion tag", proc.stdout)
+            self.assertIn(f"lists at {candidate[:7]}", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
     def test_blocked_when_no_staging_promotion_tag(self):
         temp_dir, repo_dir, _, commit_sha, bin_dir = self._create_mock_repo()
         try:
@@ -665,6 +695,124 @@ exit {docker_exit}
         finally:
             temp_dir.cleanup()
 
+
+    # ─── release lines ───────────────────────────────────────────────────────
+    # A line's gate is the RC pipeline's rc_<ts>_<sha>_validated on its candidate: the
+    # head, or what a stamped head or a named version was cut from.
+
+    def _line_repo(self):
+        temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
+        self.addCleanup(temp_dir.cleanup)
+        git("switch", "-c", f"release/{MOCK_TARGET_RELEASE_LINE}")
+        (pathlib.Path(repo_dir) / "backport.txt").write_text("fix")
+        git("add", "backport.txt")
+        git("commit", "-m", "fix: backport")
+        head = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+        return repo_dir, git, bin_dir, commit_sha, head
+
+    def test_a_line_is_eligible_on_its_validated_head(self):
+        repo_dir, git, bin_dir, _, head = self._line_repo()
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
+        proc = self._run_verify_script(
+            repo_dir, env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("candidate is the line's own", proc.stdout)
+        self.assertIn("Found RC validation tag(s)", proc.stdout)
+        self.assertIn(f"rc_2609290000_{head[:7]}_validated", proc.stdout)
+
+    def test_a_line_cut_before_the_list_grew_is_eligible_on_its_own_images(self):
+        """The case that does not heal itself: a release line opened from a commit
+        before the list grew carries the shorter list for its life, and main's
+        checkout, running this script, must hold it to that list (#2211)."""
+        repo_dir, git, bin_dir, _, _ = self._line_repo()
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
+        head = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES, "fix: a backport on the old list")
+        git("switch", "main")
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{head}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+        )
+        proc = self._run_verify_script(
+            repo_dir,
+            env={
+                "RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG,
+                "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE,
+                "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+            },
+            bin_dir=bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("candidate is the line's own", proc.stdout)
+        self.assertIn(f"lists at {head[:7]}", proc.stderr)
+
+    def test_a_line_is_blocked_by_a_staging_tag_or_a_hand_typed_marker_alone(self):
+        """The line's gate is the RC pipeline's own name for the commit, not the rc_*_validated
+        glob and not the bare shape with another sha field composed into it."""
+        for tag in ("staging_2609290000_1234567", "rc_hotfix_validated", "rc_x_validated", "rc_2609290000_0000000_validated"):
+            with self.subTest(tag=tag):
+                repo_dir, git, bin_dir, _, head = self._line_repo()
+                git("tag", "-a", tag, "-m", "not the line's gate", head)
+                proc = self._run_verify_script(
+                    repo_dir, env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("has NOT passed the RC validation", proc.stderr)
+                self.assertIn("rc-release-pipeline.yml", proc.stderr)
+                self.assertIn("rc_tag empty", proc.stderr)
+                if tag.startswith("rc_"):
+                    # A hand-named marker is named, with why it does not count: the operator
+                    # who dispatched with rc_tag filled in otherwise reads "not validated"
+                    # on a commit they watched the pipeline validate.
+                    self.assertIn(f"It carries {tag} ", proc.stderr)
+                    self.assertIn("hand-named rc_tag", proc.stderr)
+                else:
+                    self.assertNotIn("It carries", proc.stderr)
+
+    def test_a_line_release_resumes_from_its_stamp_parent_after_the_line_moved(self):
+        """RELEASE_VERSION names a tag on the line: the candidate is what it was cut from, and Scenario A resumes."""
+        repo_dir, git, bin_dir, _, head = self._line_repo()
+        # The original release's gate, as the RC pipeline left it on the head it released.
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text(MOCK_LINE_PATCH_RELEASE_TAG)
+        git("add", "stamp.txt")
+        git("commit", "-m", f"chore(release): stamp release version {MOCK_LINE_PATCH_RELEASE_TAG}")
+        git("tag", "-a", MOCK_LINE_PATCH_RELEASE_TAG, "-m", f"release {MOCK_LINE_PATCH_RELEASE_TAG}")
+        (pathlib.Path(repo_dir) / "l2.txt").write_text("fix")
+        git("add", "l2.txt")
+        git("commit", "-m", "fix: landed after the push")
+        git("switch", "main")
+        create_mock_gh_binary(bin_dir, existing_releases=[])
+        gh_out = pathlib.Path(repo_dir) / "gh_out.txt"
+        gh_out.write_text("")
+        proc = self._run_verify_script(
+            repo_dir,
+            env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "GH_TOKEN": "mock-token", "GITHUB_OUTPUT": str(gh_out)},
+            bin_dir=bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"candidate is the line's own {head[:7]}", proc.stdout)
+        self.assertIn("resuming=true", gh_out.read_text())
+
+    def test_a_line_refuses_a_version_off_the_line_and_a_candidate_that_is_not_its_head(self):
+        repo_dir, git, bin_dir, base_commit, head = self._line_repo()
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
+        off = self._run_verify_script(
+            repo_dir, env={"RELEASE_VERSION": "0.3.1", "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
+        )
+        self.assertNotEqual(off.returncode, 0)
+        self.assertIn(f"is not on release line {MOCK_TARGET_RELEASE_LINE}", off.stderr)
+        other = self._run_verify_script(
+            repo_dir,
+            env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "RC_CANDIDATE_COMMIT": base_commit},
+            bin_dir=bin_dir,
+        )
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("resolves to its own head", other.stderr)
+        self.assertIn("the line moved since it was last read", other.stderr)
 
 if __name__ == "__main__":
     unittest.main()

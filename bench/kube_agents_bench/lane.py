@@ -179,7 +179,9 @@ def load_lane_requesting(path: str | Path) -> dict[str, int]:
     For a case whose prompt the persona answers with a pull request before
     its checks say so: it runs in the second phase and is allowed that many,
     where its own spec would count zero. An entry is a placeholder for the
-    case's own check and goes when that check lands.
+    case's own check and goes when that check lands. Or for a case that opens
+    more pull requests by design than its checks grade: the count is the
+    total, and the entry stays.
     """
     file = Path(path)
     if not file.is_file():

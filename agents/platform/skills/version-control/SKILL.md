@@ -15,7 +15,8 @@ The remote verbs are exactly these:
 
 `capabilities`, `identity`, `clone`, `publish`,
 `proposal create|list|view|comment|update|close|commits|acknowledge`,
-`issue create|list|view|comment|update|close`, `label ensure`.
+`issue create|list|view|comment|update|close`, `label ensure`,
+`remote-branch view|delete`.
 
 `update` edits a title or body and adds or removes labels; `close` closes;
 `commits` lists the revisions on a proposal's source branch; `acknowledge`
@@ -25,20 +26,24 @@ author sees it was read — `capabilities` says whether this forge supports it.
 carrying any of them — that is how a queue is read for unclaimed work.
 `label ensure` creates a label or updates it if it exists. `identity` says
 who this install is on the forge and, with `--login`, whether that login may
-write to the repository.
+write to the repository. `remote-branch view` says whether the shared
+repository still holds a branch and at which revision; `remote-branch delete`
+removes one only when it is spent — under `platform-agent/`, no open proposal
+on it, and its tip exactly what a merged or closed proposal this install opened
+from this repository carried — and only
+at the `--revision` you just read.
 
 **Local operations — everything else.** `clone` unpacks a real working copy
 onto this filesystem and prints its `path`. Inside it, use the local git, which
-is `/opt/vcs/libexec/git`. Call it by that path, or through a variable you
-export once — `export G=/opt/vcs/libexec/git`, then `$G log`, `$G show`,
-`$G blame`, `$G grep`, `$G diff`, `$G status`, `$G branch`, `$G commit`,
-`$G ls-files --stage` — and every read works as you expect. Do **not** define a
-shell alias for it: each command you run here arrives in a fresh
-non-interactive shell, which never expands aliases, so an aliased `git`
-followed by `git log` silently runs the other program. An exported variable
-survives from one command to the next; an alias does not. Read files in the
-working copy with `cat`, `rg`, or anything else. You do not need `vcs.py` for
-any of this and it is faster without it.
+is `/opt/vcs/libexec/git`. Call it by that full path every time —
+`/opt/vcs/libexec/git log`, `show`, `blame`, `grep`, `diff`, `status`, `branch`,
+`commit`, `ls-files --stage` — and every read works as you expect. Do **not**
+put it in a shell variable or an alias. The command scanner refuses a command
+whose program is a variable (`$G log`), and in an unattended run that refusal is
+final. Each command you run here arrives in a fresh non-interactive shell, which
+never expands aliases, so an aliased `git` followed by `git log` silently runs
+the other program. Read files in the working copy with `cat`, `rg`, or anything
+else. You do not need `vcs.py` for any of this and it is faster without it.
 
 The full path matters: plain `git` on this machine is a different program that
 runs elsewhere and holds a credential. The one named above holds none and
@@ -104,14 +109,13 @@ python3 $V clone https://github.com/acme/infra
 
 # Local, in that working copy. No network, no credential, no vcs.py.
 # The path is the point: bare `git` is a different, credentialed program,
-# and an alias would not survive to your next command here.
-export G=/opt/vcs/libexec/git
-$G log      -n 20 -- inventory/clusters.yaml
-$G show     HEAD~3:inventory/clusters.yaml
-$G blame    scripts/rotate-keys.sh
-$G ls-files --stage
-$G grep     'nodeCount:'
-$G status
+# and neither an alias nor a variable in its place would run here.
+/opt/vcs/libexec/git log      -n 20 -- inventory/clusters.yaml
+/opt/vcs/libexec/git show     HEAD~3:inventory/clusters.yaml
+/opt/vcs/libexec/git blame    scripts/rotate-keys.sh
+/opt/vcs/libexec/git ls-files --stage
+/opt/vcs/libexec/git grep     'nodeCount:'
+/opt/vcs/libexec/git status
 ```
 
 The same reads through `vcs.py`, if you want JSON instead:
@@ -200,7 +204,25 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   on — clone again and reapply the change. An ordinary push to the target by
   somebody else is _not_ refused: your proposal simply opens with a base behind
   the tip, which is a rebase on the forge and not a problem here. Do not try to
-  force any of them.
+  force any of them. `BRANCH_DIVERGED` on a `platform-agent/` name whose last
+  proposal was closed or squash-merged is a spent branch in the way:
+  `remote-branch view` reads its revision and `remote-branch delete` clears it.
+  That delete refuses with `BRANCH_NOT_OURS` (not under `platform-agent/`, or
+  the closed proposal is not this install's, or it has carried a full page of
+  proposals, too many to read, or an open proposal targets it), `OPEN_PROPOSAL`, `NOT_SPENT` (it holds revisions
+  no proposal carried); treat each as somebody's work — pick another name or
+  report it. `DELETE_REFUSED` means the remote itself refuses
+  the delete (a branch rule, a hook, or a credential without the right); it
+  answers every attempt alike, so pick another name or report it too. Never open and close a proposal on a branch to make
+  it deletable: the delete reads that proposal as proof the branch is yours. `BRANCH_MOVED` means it moved since you read it:
+  view it again, and delete only if it is still spent.
+  `PROTECTED_BRANCH` is never yours to clear. `FORGE_CALL_FAILED` and
+  `GIT_FAILED` mean the delete did not complete, and it may have landed before
+  the failure: read the branch again, and retry once if it is still there.
+  `FORGE_RATE_LIMITED` and `FORGE_UNAVAILABLE` from the delete are the forge
+  turning it away for now: wait, then do the same. A forge without `proposal-list`
+  does not list `remote-branch delete` in `capabilities` and refuses it
+  `FORGE_UNSUPPORTED`.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
   `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer
@@ -252,6 +274,8 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
 | `issue close`          | Close it; `--reason completed\|not-planned`                                                                                                  |
 | `label ensure`         | Make the label exist, or update its `--color`/`--description` if it already does                                                             |
 | `identity`             | Who this install is on this forge; `--login` asks whether that account may write here, `--bot` if `view --comments` said it is an automation |
+| `remote-branch view`   | Whether the shared repository holds this branch, and its `revision` if it does                                                               |
+| `remote-branch delete` | Delete a spent `platform-agent/` branch at `--revision`; refused while a proposal on it is open or when it holds revisions none carried      |
 
 Every listing verb takes `-n/--limit` and answers with `count` and `truncated`.
 `truncated` is the forge's word for "there was more", judged on what it sent

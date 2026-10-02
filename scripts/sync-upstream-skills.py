@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud)."""
+"""Syncs GKE agent skills from the upstream google/skills repository (skills/cloud).
+
+The platform image build runs the shell blocks of every synced SKILL.md through
+deploy/docker/check_skill_commands.py, so a sync that brings in a command Tirith
+refuses, or changes any line of a block listed in its KNOWN_FINDINGS, comments
+included, fails that build until the list is updated. So does a shell block whose Markdown does not parse as one; that
+fix goes in SKILL_SUBSTITUTIONS below.
+"""
 
 import os
 import shutil
@@ -27,6 +34,35 @@ SKILL_AGENT_OVERRIDES = {
 SKILL_MD_FILENAME = "SKILL.md"
 UTF_8_ENCODING = "utf-8"
 SUBSTITUTION_COUNT = 1
+
+# What classify_substitution() returns: apply the pair, skip it because upstream already reads
+# the way the pair would make it read, or refuse because neither of those is true.
+SUBSTITUTION_APPLY = "apply"
+SUBSTITUTION_SKIP = "skip"
+SUBSTITUTION_UNDECIDABLE = "undecidable"
+
+
+class UpstreamDriftError(Exception):
+    """A registered local correction can no longer be applied to what upstream now ships.
+
+    Both registries below name an upstream skill and the text they expect to find in it. When
+    upstream edits that text — even by a bullet marker — renames the skill, or drops it, the
+    correction stops being applied. Warning and carrying on published the uncorrected upstream
+    content with the run still reporting success, so the sync refuses instead.
+
+    Raised by verify_local_corrections, which runs before the first write, so a sync that fails
+    this way has changed nothing.
+    """
+
+
+class LocalCorrectionLost(UpstreamDriftError):
+    """A correction could not be applied to a skill already copied into the tree.
+
+    verify_local_corrections checks the same conditions against the clone the copy is made
+    from, so this is unreachable unless the two disagree. It exists so that the uncorrected
+    upstream content cannot reach the tree even then; the tree is left partly refreshed.
+    """
+
 
 GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET = """**Enable Network Policy Enforcement:**
 
@@ -123,7 +159,7 @@ GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_pa
 # gcloud, and one file per project/cluster/location, the naming _thread_kubeconfig_path in
 # agents/platform/scripts/platform_mcp_server.py builds and is the source of truth for.
 GKE_BASICS_OLD_CREDENTIALS_SNIPPET = """4. **Cluster Credentials:**
-   - Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials:
+   * Always explicitly specify `--region` (for regional clusters) or `--zone` (for zonal clusters) when fetching credentials:
      ```bash
      gcloud container clusters get-credentials CLUSTER_NAME --region=REGION --quiet
      ```"""
@@ -345,6 +381,166 @@ probe and how to report it; follow it rather than restating it here.
 }
 
 
+def abort(message):
+    """Report a fatal error after the progress log and exit non-zero.
+
+    stdout is block-buffered when it is not a terminal, so a `> log 2>&1` run prints the whole
+    stderr message above every `Syncing '...'` line unless stdout is flushed first — detaching
+    the error from the skill it names.
+    """
+    sys.stdout.flush()
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+def target_agents():
+    """Every agent directory this script writes into, as directory names."""
+    return sorted(
+        set(DEFAULT_TARGET_AGENTS + [a for agents in SKILL_AGENT_OVERRIDES.values() for a in agents])
+    )
+
+
+def written_pathspecs():
+    """Git pathspecs covering everything this script writes, and nothing else.
+
+    A recovery instruction is only safe if it names what the run could have touched. The sync
+    writes prefixed skills under the target agents and nowhere else: `agents/cluster/skills/gke-*`
+    is maintained in this repository rather than synced, and the unprefixed skills beside the
+    synced ones under a target agent are too, so a pathspec one level broader than this discards
+    uncommitted work no run of this script could have produced.
+    """
+    return [f"agents/{agent}/skills/{SKILL_PREFIX}*" for agent in target_agents()]
+
+
+def local_correction_lost_message(detail):
+    """The operator-facing text for a backstop failure, recovery commands included.
+
+    Separate from the handler that prints it because the pre-flight makes the handler
+    unreachable from a fixture: the only way to read what an operator would be told to run is
+    to call this.
+    """
+    recovery = "".join(
+        f"  git checkout -- '{pathspec}'\n  git clean -fd '{pathspec}'\n"
+        for pathspec in written_pathspecs()
+    )
+    return (
+        f"\nError: Synchronization aborted. {detail}\n"
+        "The clone and the copy made from it disagree, which should not happen. Skills copied "
+        "before this point are already written, and a copy adds untracked files as well as "
+        "modifying tracked ones, so discarding them takes all of:\n"
+        f"{recovery}"
+        "Those pathspecs are everything this script writes; run nothing broader, because the "
+        "skills beside them are maintained in this repository and the sync never touched them."
+    )
+
+
+def classify_substitution(content, target, replacement):
+    """Decide whether a registered pair still applies to content.
+
+    The pre-flight reads this against the clone and the backstop reads it against the copy made
+    from it, both through substitute(), so the one place the rule is written is the only place
+    it can be got wrong. Two
+    earlier versions of this file stated it twice and the two statements disagreed, which is how
+    an uncorrected passage shipped under exit 0.
+
+    Returns (SUBSTITUTION_APPLY, None) when the pair applies cleanly, (SUBSTITUTION_SKIP, None)
+    when upstream already reads the way applying it would leave it, and
+    (SUBSTITUTION_UNDECIDABLE, reason) otherwise. Undecidable covers three shapes, and the
+    reason says which: the target is gone, the target is there but so is the replacement, and
+    the target occurs more than once.
+    """
+    occurrences = content.count(target)
+    has_replacement = replacement in content
+
+    # A pair is applied with a count of SUBSTITUTION_COUNT, so exactly that many occurrences is
+    # the only count under which applying it leaves nothing uncorrected behind.
+    if occurrences == SUBSTITUTION_COUNT and not has_replacement:
+        return SUBSTITUTION_APPLY, None
+    if occurrences == 0 and has_replacement:
+        return SUBSTITUTION_SKIP, None
+
+    if occurrences == 0:
+        return SUBSTITUTION_UNDECIDABLE, (
+            "target snippet not found. Upstream has rewritten the passage this repository "
+            "corrects; update the target to match the current upstream text, or drop the pair "
+            "if upstream has fixed the defect."
+        )
+    if has_replacement:
+        return SUBSTITUTION_UNDECIDABLE, (
+            "the target and the replacement are both present, so whether the correction still "
+            "applies cannot be decided. Extend the target with surrounding context until only "
+            "one of them matches."
+        )
+    return SUBSTITUTION_UNDECIDABLE, (
+        f"target snippet occurs {occurrences} times and a pair is applied once, so every copy "
+        f"after the first would ship uncorrected. Extend the target with surrounding context "
+        f"until it matches one passage."
+    )
+
+
+def substitute(content, pairs):
+    """Apply a skill's pairs in order, each classified against the text the earlier ones left.
+
+    Returns (content, problems): the rewritten text, and one (target, reason) per pair
+    classify_substitution calls undecidable, which is left unapplied. The pre-flight and
+    apply_substitutions both call this, so a later pair whose verdict an earlier pair's
+    replacement changes is judged the same way by each.
+    """
+    problems = []
+    for target, replacement in pairs:
+        verdict, reason = classify_substitution(content, target, replacement)
+        if verdict == SUBSTITUTION_UNDECIDABLE:
+            problems.append((target, reason))
+        elif verdict == SUBSTITUTION_APPLY:
+            content = content.replace(target, replacement, SUBSTITUTION_COUNT)
+    return content, problems
+
+
+def verify_local_corrections(upstream_skills_dir, discovered_skills):
+    """Check every registered correction against the clone before anything is written.
+
+    The sync rmtree's each destination before copying, so a correction found unappliable
+    mid-loop would leave a partly-refreshed tree. Every registry entry is checked here, against
+    the clone, while the tree is still untouched, and every problem is reported at once rather
+    than one re-clone at a time.
+
+    Raises UpstreamDriftError listing every registry entry that no longer matches upstream.
+    """
+    discovered = set(discovered_skills)
+    problems = []
+
+    for registry_name, registry in (
+        ("SKILL_SUBSTITUTIONS", SKILL_SUBSTITUTIONS),
+        ("SKILL_FOOTERS", SKILL_FOOTERS),
+    ):
+        for skill_name in sorted(registry):
+            if skill_name not in discovered:
+                problems.append(
+                    f"{registry_name}[{skill_name!r}]: upstream no longer ships this skill "
+                    f"(renamed or removed). Move the entry to the new name, or drop it."
+                )
+                continue
+            skill_md = os.path.join(upstream_skills_dir, skill_name, SKILL_MD_FILENAME)
+            if not os.path.isfile(skill_md):
+                problems.append(
+                    f"{registry_name}[{skill_name!r}]: upstream skill has no {SKILL_MD_FILENAME}."
+                )
+                continue
+            if registry_name != "SKILL_SUBSTITUTIONS":
+                continue
+            with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
+                content = f.read()
+            _, undecidable = substitute(content, registry[skill_name])
+            for target, reason in undecidable:
+                problems.append(
+                    f"{registry_name}[{skill_name!r}]: {reason} "
+                    f"Target begins: {target.splitlines()[0]!r}"
+                )
+
+    if problems:
+        raise UpstreamDriftError("\n".join(f"  - {p}" for p in problems))
+
+
 def apply_substitutions(dest_path, skill_name):
     """Apply in-place string substitutions to a freshly-synced skill's SKILL.md.
 
@@ -352,8 +548,14 @@ def apply_substitutions(dest_path, skill_name):
     sequence where an appended footer would still leave the broken command in the
     body of the skill).
 
-    Idempotent: if replacement text is already present, the substitution is skipped.
-    Returns True if at least one substitution was applied, else False.
+    Idempotent: a pair whose replacement is present and whose target is not has already been
+    applied, or adopted upstream, and is skipped. Returns True if at least one substitution was
+    applied, else False.
+
+    substitute() decides which pairs apply; this raises LocalCorrectionLost on the first it calls
+    undecidable. verify_local_corrections has already rejected those against the clone,
+    so reaching one here means the copy and the clone disagree; the raise keeps the defect out
+    of the tree.
     """
     substitutions = SKILL_SUBSTITUTIONS.get(skill_name)
     if not substitutions:
@@ -361,30 +563,26 @@ def apply_substitutions(dest_path, skill_name):
 
     skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
     if not os.path.isfile(skill_md):
-        print(f"Warning: {skill_md} not found; cannot apply substitutions.", file=sys.stderr)
-        return False
+        raise LocalCorrectionLost(
+            f"{skill_name} has substitutions configured but {skill_md} does not exist."
+        )
 
     with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
         content = f.read()
 
-    modified = False
-    for target, replacement in substitutions:
-        if replacement in content:
-            continue
-        if target in content:
-            content = content.replace(target, replacement, SUBSTITUTION_COUNT)
-            modified = True
-        else:
-            print(
-                f"Warning: target snippet for substitution not found in {skill_name}/{SKILL_MD_FILENAME}",
-                file=sys.stderr,
-            )
+    substituted, problems = substitute(content, substitutions)
+    if problems:
+        target, reason = problems[0]
+        raise LocalCorrectionLost(
+            f"{skill_name}/{SKILL_MD_FILENAME}: {reason} The entry is in "
+            f"SKILL_SUBSTITUTIONS. Target begins: {target.splitlines()[0]!r}"
+        )
 
-    if modified:
-        with open(skill_md, "w", encoding=UTF_8_ENCODING) as f:
-            f.write(content)
-
-    return modified
+    if substituted == content:
+        return False
+    with open(skill_md, "w", encoding=UTF_8_ENCODING) as f:
+        f.write(substituted)
+    return True
 
 
 def inject_footer(dest_path, skill_name):
@@ -392,6 +590,10 @@ def inject_footer(dest_path, skill_name):
 
     Idempotent: does nothing if the skill has no footer configured or the footer marker is
     already present. Returns True if a footer was written, else False.
+
+    Raises LocalCorrectionLost when a skill with a footer configured has no SKILL.md, on the
+    same terms as apply_substitutions: a footer dropped in silence ships a skill missing the
+    step that couples it to this repository.
     """
     footer = SKILL_FOOTERS.get(skill_name)
     if footer is None:
@@ -399,8 +601,9 @@ def inject_footer(dest_path, skill_name):
 
     skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
     if not os.path.isfile(skill_md):
-        print(f"Warning: {skill_md} not found; cannot inject Cluster Agent footer.", file=sys.stderr)
-        return False
+        raise LocalCorrectionLost(
+            f"{skill_name} has a footer configured but {skill_md} does not exist."
+        )
 
     with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
         existing = f.read()
@@ -446,17 +649,29 @@ def main():
                 if name.startswith(SKILL_PREFIX) and os.path.isdir(os.path.join(upstream_skills_dir, name))
             ])
             
+            # Not a warning: an empty discovery is indistinguishable from upstream having moved
+            # the skills, and the prune below removes every local skill not in the list, so a
+            # run that continued from here would delete all of them. The pre-flight cannot catch
+            # it either, since it only reads the skills that were discovered.
             if not discovered_skills:
-                print(f"Warning: No skills found matching prefix '{SKILL_PREFIX}' in {upstream_skills_dir}", file=sys.stderr)
-                return
-                
+                abort(
+                    f"\nError: Synchronization aborted, nothing written. No skills matching "
+                    f"prefix '{SKILL_PREFIX}' in the clone at {UPSTREAM_SKILLS_PATH}. Upstream "
+                    f"has moved or renamed them; update UPSTREAM_SKILLS_PATH or SKILL_PREFIX in "
+                    f"{os.path.basename(__file__)} and re-run."
+                )
+
+
             print(f"\nDiscovered {len(discovered_skills)} skills matching prefix '{SKILL_PREFIX}':")
             for name in discovered_skills:
                 print(f"  - {name}")
 
+            # Nothing below this line is reversible without git, so every registered local
+            # correction is checked against the clone first.
+            verify_local_corrections(upstream_skills_dir, discovered_skills)
+
             # Prune obsolete local skill directories that were renamed/removed upstream
-            target_agents = set(DEFAULT_TARGET_AGENTS + [a for agents in SKILL_AGENT_OVERRIDES.values() for a in agents])
-            for agent in target_agents:
+            for agent in target_agents():
                 agent_skills_dir = os.path.join(repo_root, "agents", agent, "skills")
                 if os.path.isdir(agent_skills_dir):
                     for local_name in sorted(os.listdir(agent_skills_dir)):
@@ -493,12 +708,18 @@ def main():
                         print(f"  Injected kube-agents footer into {skill_name}/{SKILL_MD_FILENAME}")
 
             print("\nSynchronization complete!")
+    except LocalCorrectionLost as e:
+        abort(local_correction_lost_message(e))
+    except UpstreamDriftError as e:
+        abort(
+            f"\nError: Synchronization aborted, nothing written. Upstream has moved away from "
+            f"corrections this repository registers:\n{e}\n"
+            f"Update the entries in {os.path.basename(__file__)} and re-run."
+        )
     except subprocess.CalledProcessError:
-        print("\nError: Synchronization failed due to command error. Details above.", file=sys.stderr)
-        sys.exit(1)
+        abort("\nError: Synchronization failed due to command error. Details above.")
     except Exception as e:
-        print(f"\nError: An unexpected error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
+        abort(f"\nError: An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
     main()

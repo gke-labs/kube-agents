@@ -476,8 +476,13 @@ fi
 # service address is not in this file at all — the operator derives it from the
 # agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
 # when the file is silent. That is why no `api_url` key belongs here.
+#
+# The onboarding prompts are in this list because bootstrap_onboarding reads the PVC
+# copy ahead of the image's, and the first-install-hello eval cases grade the greeting
+# they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
+        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
@@ -954,7 +959,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # only id this call may force, which keeps the merge it does alongside the
 # retirement a subset of 2c-bis rather than a second policy for the same file:
 # two of the jobs in this roster DELETE THEMSELVES — bootstrap_delivery.py's
-# _cleanup removes the scan/delivery pair once the onboarding report lands — and
+# _retire_jobs removes the scan/delivery pair once the onboarding report lands — and
 # an unfiltered merge would put both back.
 if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
@@ -999,7 +1004,7 @@ fi
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
-# bootstrap_delivery.py:_cleanup retired the two onboarding jobs, so they would look new and
+# bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
 # be reinstalled. .bootstrap_completed is that record.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
@@ -1214,9 +1219,13 @@ fi
 # is otherwise frozen at whatever version first created the PVC — a helper script
 # fixed months ago is still the broken one on every upgraded cluster.
 #
-# Skills are wholly image-owned (nothing writes runtime state under them; the
-# cluster overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the
-# same way), so this is a whole-directory REPLACE rather than a copy-over: a
+# Skills are wholly image-owned (nothing durable lives under them: the cluster
+# overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the same
+# way, the image's skill_manage gate refuses a write that would touch a shipped
+# skill and its file tools refuse any write under the tree --
+# deploy/docker/patches/skill_manage_image_owned.py -- and a skill the
+# agent authors under a new name is discarded by this replace, deliberately),
+# so this is a whole-directory REPLACE rather than a copy-over: a
 # skill deleted from the image has to actually disappear, or a retired procedure
 # stays loadable forever. That is also why this still runs for the platform
 # profile even though step 2.6 just listed `skills` in its --items: the
@@ -1741,6 +1750,33 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     # shellcheck disable=SC3013 # -ef is implemented by dash and busybox ash, the shells this image runs
     if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
         ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
+    fi
+fi
+
+# 4b. Copy the managed terminal settings into every profile's .env, then check with Hermes
+# that each profile's scheduled runs resolve the ssh backend. The terminal scope a cron job
+# runs under ignores the managed config, so without the copy it falls back to Hermes'
+# default local backend; terminal_env_pin.py says why .env is the place. A key in a
+# profile's config.yaml that outranks the copy is deleted, as Hermes' own save does.
+# Cluster profiles scaffolded after start-up are pinned by cluster_agent_profile.py.
+#
+# FATAL, unlike the managed-scope assertion above: the operator configures one terminal
+# for every agent run, and a profile whose scheduled runs resolve another is misconfigured.
+# A profile whose .env took the copy but whose config.yaml Hermes cannot read or parse is
+# only reported: its scheduled runs fail until the file is fixed.
+# With HERMES_MANAGED_DIR set, the operator's marker as for the managed-scope assertion, a
+# managed config that is missing, unreadable, not ssh, or holds a value .env cannot carry
+# is fatal too; elsewhere (compose, `docker run`, the kustomize bases) it copies only a
+# terminal block it finds.
+# Primary only, under the bootstrap lock, for the same shared-PVC reason as step 4.
+# Run from the image, not the PVC copy the agent can write. The `-f` guard skips only on
+# a host: every image copies the file to this path, and the platform build check runs it
+# from here.
+TERMINAL_ENV_PIN_SCRIPT="/opt/defaults/scripts/terminal_env_pin.py"
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
+    if ! "$INSTALL_DIR/.venv/bin/python3" "$TERMINAL_ENV_PIN_SCRIPT" --hermes-home "$TARGET_DIR" --sweep; then
+        echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
+        exit 1
     fi
 fi
 

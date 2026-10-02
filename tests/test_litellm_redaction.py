@@ -64,6 +64,10 @@ _RULES_CONFIG = {
     ],
 }
 _OAUTH_TOKEN = "ya29." + "A" * 195
+# Joined to its URL at runtime rather than written into it: GitHub secret scanning
+# reads a whole `postgres://user:password@host/db` literal as a leaked connection
+# string, and the redactor's URL rule does not depend on this placeholder's value.
+_URL_PASSWORD = "hunter2-example-pw"
 
 
 def _stub_litellm() -> None:
@@ -185,7 +189,7 @@ class TestCallback(unittest.TestCase):
         arguments = json.dumps(
             {
                 "command": f"curl -H 'Authorization: Bearer {_OAUTH_TOKEN}' http://10.0.0.5/",
-                "env": ["DB_URL=postgres://app:hunter2-example-pw@db.internal/x"],
+                "env": ["DB_URL=postgres://app:" + _URL_PASSWORD + "@db.internal/x"],
                 "timeout": 30,
             }
         )

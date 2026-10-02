@@ -91,6 +91,21 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
+	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
+	// collector is admitted to a listener that serves counters and nothing
+	// else, and the credentialed port keeps admitting only the sandbox and the
+	// gateway. One constant for the container port, the value of
+	// CREDENTIAL_PROXY_METRICS_PORT the runtime binds, and the collector's
+	// ingress rule; the chart's PodMonitoring scrapes it by number, held to
+	// this one by tests/test_chart_platform_agent_monitoring.py.
+	credentialProxyMetricsPort     int32 = 8766
+	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
+	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyPortEnv tells the runtime the credentialed port, so its
+	// refusal of a metrics port equal to it compares against the number the
+	// operator renders rather than the runtime's own default.
+	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -1512,26 +1527,65 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// gitopsRefusalWithholdsManaged reports whether a refused gitops repository is
+// keeping accepted managed ones out of managed_repos, as the seed below does.
+func gitopsRefusalWithholdsManaged(resolved *agentv1alpha1.ResolvedIntegration) bool {
+	return resolved != nil && resolved.GitOps() != nil &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps)) == 0 &&
+		len(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged)) > 0
+}
+
 // buildGitopsStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
 func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	data := map[string]string{}
 
-	// Extract primary repository from CR Spec if provided
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
-		if gitRepo != "" && gitRepo != "None" {
-			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
-				if cleanedURL, err := agentv1alpha1.CleanRepoURLWithOrg(gitRepo, org); err == nil {
-					entries := []agentv1alpha1.ManagedRepoEntry{
-						{Type: "github", URL: cleanedURL},
+	// Seed the declared repositories from the CR spec: the GitOps repository and
+	// the managed ones into managed_repos, GitOps first, and the context ones
+	// into context_repos. Each entry's `type` is its forge's provider, which is
+	// how the discriminator reaches the agent — written down rather than
+	// inferred from the URL's text. Only entries Problems accepts are seeded:
+	// with the webhook off, nothing else stops a refused one reaching the
+	// agent and the minter. The token refresh mints for the first
+	// managed_repos entry when no repository is named, so while a declared
+	// gitops repository is refused no managed one is seeded either: it would
+	// take that place.
+	if agent.Spec.Integration != nil {
+		resolved, err := agent.Spec.Integration.ResolveGit()
+		if err != nil {
+			manifestsLog.Info("Skipping initial configmap seed due to conflicting git integration", "error", err)
+		} else {
+			seedEntries := func(repos []*agentv1alpha1.ResolvedRepository) []agentv1alpha1.ManagedRepoEntry {
+				var entries []agentv1alpha1.ManagedRepoEntry
+				for _, repo := range repos {
+					entry, err := repo.ManagedRepoEntry()
+					if err != nil {
+						// By field, not value: a clone URL can carry a token.
+						manifestsLog.Info("Skipping initial configmap seed of an unparseable or invalid repository",
+							"index", repo.Index, "forge", repo.ForgeName, "role", repo.Role)
+						continue
 					}
-					if jsonBytes, err := json.Marshal(entries); err == nil {
-						data["managed_repos"] = string(jsonBytes)
-					}
+					entries = append(entries, entry)
+				}
+				return entries
+			}
+			managed := seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps))
+			if len(managed) == 0 && resolved.GitOps() != nil {
+				if gitopsRefusalWithholdsManaged(resolved) {
+					manifestsLog.Info("Skipping initial configmap seed of the managed repositories: the gitops repository is refused")
 				}
 			} else {
-				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+				managed = append(managed, seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleManaged))...)
+			}
+			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
+				gitopsStateManagedReposKey: managed,
+				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
+			} {
+				if len(entries) == 0 {
+					continue
+				}
+				if jsonBytes, err := json.Marshal(entries); err == nil {
+					data[key] = string(jsonBytes)
+				}
 			}
 		}
 	}
@@ -1547,6 +1601,24 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 		},
 		Data: data,
 	}
+}
+
+// seededGitOpsEntry is the managed_repos entry the CR's GitOps repository
+// seeds, or nil when it declares none or declares an invalid one.
+func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ManagedRepoEntry {
+	if agent.Spec.Integration == nil {
+		return nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return nil
+	}
+	for _, repo := range resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps) {
+		if entry, err := repo.ManagedRepoEntry(); err == nil {
+			return &entry
+		}
+	}
+	return nil
 }
 
 // renderConfigYAML builds the MANAGED config the pod runs under.
@@ -2144,6 +2216,9 @@ type renderOptions struct {
 	// otlpEndpoint because empty already means the managed collector, and the two
 	// outcomes need opposite manifests.
 	otlpDisabled bool
+	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
+	// the declaration cannot name the organisation (see heldGitHubOrg).
+	heldGitHubOrg string
 }
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
@@ -2621,22 +2696,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				})
 			}
 		}
-		if github := integration.GitHub; github != nil {
-			org := strings.TrimSpace(github.Org)
-			if org == "" && github.GitRepo != "" {
-				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
-					parts := strings.SplitN(cleaned, "/", 2)
-					if len(parts) == 2 {
-						org = parts[0]
-					}
-				}
-			}
-			if org != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "GITHUB_ORG",
-					Value: org,
-				})
-			}
+		// GITHUB_ORG still names GitHub because that is what the agent reads it
+		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
+		// and doing it here would rename a variable the pod's scripts still spell
+		// the old way. Until then it names the primary GitHub forge's namespace,
+		// and is unset when no GitHub forge is declared. While the declaration
+		// cannot name it, the pod keeps the one it has, as the minter does.
+		org := ""
+		if resolved, err := integration.ResolveGit(); err == nil {
+			org = resolved.PrimaryNamespace(agentv1alpha1.GitProviderGitHub)
+		}
+		if org == "" {
+			org = opts.heldGitHubOrg
+		}
+		if org != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GITHUB_ORG",
+				Value: org,
+			})
 		}
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			allowAll := false
@@ -3880,6 +3957,16 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		// The credentialed port, the same constant the container port and the
+		// policy are rendered from: the runtime refuses a metrics port equal to
+		// it before binding, so its idea of that port has to be the operator's.
+		// Envoy's listener carries the same number in its config, held to this
+		// constant by the runtime's OperatorContractTest.
+		{Name: credentialProxyPortEnv, Value: strconv.Itoa(credentialProxyPort)},
+		// The metrics-only listener's port (see credentialProxyMetricsPort). In
+		// the managed set, so a spec.deployment.env entry cannot move the
+		// listener off the port the container declares and the policy admits.
+		{Name: credentialProxyMetricsPortEnv, Value: strconv.Itoa(int(credentialProxyMetricsPort))},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
@@ -4063,7 +4150,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
-		"CREDENTIAL_PROXY_PORT",
+		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
+		// and so reserved there by the loop above; listed for buildAgentAPIAuthEnv,
+		// whose managed set carries neither, and whose credential_proxy.py parses
+		// CREDENTIAL_PROXY_PORT as an integer before the api-proxy role returns.
+		credentialProxyPortEnv,
+		credentialProxyMetricsPortEnv,
 		"CREDENTIAL_PROXY_ROLE",
 		// Same argument as the authentication settings above, one layer over.
 		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch
@@ -5091,7 +5183,27 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 	return fmt.Sprintf("%x", hash), nil
 }
 
-// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf.
+//
+// Three parser passes run over every line the sidecar tails. gchat_event lifts
+// the chat user and session out of the gateway's own lines. The other two are
+// the audit trail's: hermes_audit_line recognises a line the tool_call_audit
+// plugin or the chat_message_audit hook wrote — Hermes' timestamp, level and
+// logger name, then one JSON object — and captures the object as audit_json;
+// audit_json then decodes it into top-level fields and drops the capture. A
+// line neither parser matches passes through untouched, and the raw line stays
+// under `log` either way, so Cloud Logging carries the record's fields as its
+// own jsonPayload keys (event_type, tool, status, ...) beside the text every
+// existing reader still greps. The lift is what makes an audit record
+// filterable without a regex; the record's shape is common/audit_schema.py's.
+//
+// The line prefix the regex reads is Hermes' own log format, which this
+// repository does not own: `%(asctime)s %(levelname)s%(session_tag)s %(name)s:
+// %(message)s` in the pinned image's hermes_logging.py, where session_tag is
+// ` [<session id>]` on a record emitted on a thread that holds a session
+// context and empty otherwise. Both forms have to match, or the records of
+// tools Hermes runs inline on the turn thread would pass through unlifted and
+// silently. TestFluentBitLiftsAuditRecordsIntoFields carries a sample of each.
 func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -5130,6 +5242,22 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Preserve_Key  On
 
 [FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      log
+    Parser        hermes_audit_line
+    Reserve_Data  On
+    Preserve_Key  On
+
+[FILTER]
+    Name          parser
+    Match         agent.logs
+    Key_Name      audit_json
+    Parser        audit_json
+    Reserve_Data  On
+    Preserve_Key  Off
+
+[FILTER]
     Name              record_modifier
     Match             agent.logs
     Record            app agent
@@ -5144,6 +5272,15 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name    gchat_event
     Format  regex
     Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+[PARSER]
+    Name    hermes_audit_line
+    Format  regex
+    Regex   ^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} [A-Z]+(?: \[[^\]]*\])? hermes\.(?:plugin\.tool_call_audit|hook\.chat_message_audit): (?<audit_json>\{.*\})$
+
+[PARSER]
+    Name    audit_json
+    Format  json
 `,
 		},
 	}
@@ -5340,6 +5477,10 @@ func isFQDNNetworkPolicyEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 
 // buildFQDNNetworkPolicy generates the companion FQDNNetworkPolicy (networking.gke.io/v1alpha1)
 // for GKE Dataplane V2 clusters when enable-fqdn-network-policy annotation is set.
+//
+// It selects the gateway pod only. The credential broker, which is the pod that
+// actually calls the forge, is not covered by it; how the broker's egress should
+// be narrowed is an open question in docs/designs/version-control-support.md.
 func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Unstructured {
 	patterns := []string{
 		// Google APIs & GCP Services (Vertex AI, GKE, Cloud Logging/Monitoring, Workload Identity)
@@ -5367,10 +5508,17 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.gcr.io",
 		"pkg.dev",
 		"*.pkg.dev",
-		// GitOps & Source Control
-		"github.com",
-		"*.github.com",
-		"*.githubusercontent.com",
+	}
+	// GitOps & Source Control: derived from the forge declaration, so a forge
+	// at a customer-chosen hostname is reachable without a literal here. Kept
+	// in its old position in the list, so an upgrade re-renders a GitHub
+	// install's policy byte for byte.
+	var integration *agentv1alpha1.IntegrationSpec
+	if agent != nil && agent.Spec.Integration != nil {
+		integration = &agent.Spec.Integration.IntegrationSpec
+	}
+	patterns = append(patterns, agentv1alpha1.ForgeEgressPatterns(integration)...)
+	patterns = append(patterns,
 		// Chat Integrations
 		"slack.com",
 		"*.slack.com",
@@ -5380,7 +5528,7 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.login.microsoftonline.com",
 		"botframework.com",
 		"*.botframework.com",
-	}
+	)
 
 	matches := make([]interface{}, 0, len(patterns))
 	for _, p := range patterns {

@@ -1,0 +1,25 @@
+
+## 2026-09-29T14:57:58Z [label/before] K -n scen get pods -l app=label-pinned -o wide
+NAME                            READY   STATUS    RESTARTS   AGE   IP          NODE                                  NOMINATED NODE   READINESS GATES
+label-pinned-5746f57c68-dqvg6   1/1     Running   0          61s   10.60.1.5   gke-upg-12b-work-pool-2a66ef4f-0g10   <none>           <none>
+## exit 0
+
+## 2026-09-29T14:57:58Z [label/node-labels] K get nodes -l role=work -L team
+NAME                                  STATUS   ROLES    AGE   VERSION                TEAM
+gke-upg-12b-work-pool-2a66ef4f-0g10   Ready    <none>   77s   v1.34.11-gke.1056000   legacy
+## exit 0
+
+## 2026-09-29T15:11:53Z [label/after] K -n scen get pods -l app=label-pinned -o wide
+NAME                            READY   STATUS    RESTARTS   AGE     IP       NODE     NOMINATED NODE   READINESS GATES
+label-pinned-5746f57c68-ghnpj   0/1     Pending   0          3m22s   <none>   <none>   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:11:54Z [label/after-node-labels] K get nodes -l role=work -L team
+NAME                                  STATUS   ROLES    AGE     VERSION               TEAM
+gke-upg-12b-work-pool-2a66ef4f-oxpm   Ready    <none>   3m36s   v1.35.8-gke.1380000   
+## exit 0
+
+## 2026-09-29T15:11:54Z [label/events] K -n scen get events --field-selector reason=FailedScheduling -o custom-columns=T:.lastTimestamp,O:.involvedObject.name,M:.message
+T                      O                               M
+2026-09-29T15:11:24Z   label-pinned-5746f57c68-ghnpj   0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling.
+## exit 0

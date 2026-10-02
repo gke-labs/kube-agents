@@ -30,6 +30,21 @@ order the block's comment states (NATS, callout, provisioning Job, agent, the
 inject door, the sidecar's roll, the bridge's log line), and two workloads are
 deliberately absent from it: the A2A gateway, reported and not gated, and the
 shell StatefulSet, which does not change under next.
+
+The two provision runs (gke-labs/kube-agents#2077). The operator sizes the
+TASKS stream's consumer budget from the CR's maxSessions and from the bridge
+workers its sidecars declare, creates the stream at the larger of that budget
+and a floor of 64, never edits a stream that exists, and refuses a later
+render whose budget the live stream cannot hold. Step 6b declares the sidecar
+only after the bus is up, so the first provision creates TASKS for a CR with
+no sidecar and the sidecar patch re-renders the Job against it. The tests here
+pin the two halves of the tech lead's decision: (b) the first patch carries a
+maxSessions sized so the second budget fits the floor, computed from four
+constants copied from the operator's and pinned against them (the Go side's
+TestCiDeploySizesMaxSessionsToTheTasksFloor pins the same four against the
+functions that derive them), and (c) the step waits for the re-run Job and
+reads the CR's phase after it, so a refusal reds the lane instead of parking
+the CR Degraded over a working bus while the step proceeds.
 """
 
 import json
@@ -203,6 +218,25 @@ def lifted_block(start: str, stop: str, what: str) -> str:
                     return "\n".join(lines[index : end + 1])
             break
     raise AssertionError(f"{what} not found in {_CI_DEPLOY}")
+
+
+def shell_function(name: str) -> str:
+    """A function of the script, from its `name() {` line to the `}` that
+    closes it in column 0."""
+    lines = text(_CI_DEPLOY).splitlines()
+    for index, line in enumerate(lines):
+        if line == f"{name}() {{":
+            for end in range(index, len(lines)):
+                if lines[end] == "}":
+                    return "\n".join(lines[index : end + 1])
+            break
+    raise AssertionError(f"{name}() not found in {_CI_DEPLOY} in the shape this test lifts")
+
+
+def max_sessions_derivation() -> str:
+    """Section 2b's sizing of MODE_NEXT_MAX_SESSIONS: the arithmetic and the
+    clamp under it."""
+    return lifted_block("MODE_NEXT_MAX_SESSIONS=$((", "  fi", "the maxSessions derivation")
 
 
 def prow_guard() -> str:
@@ -602,12 +636,16 @@ class FlagSetIsNextTest(unittest.TestCase):
         )
         markers = [
             'gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"',
-            'case " ${JOB_CONDITIONS} " in',
+            'wait_provision_job "the mode patch"',
+            'FIRST_PROVISION_JOB="${PROVISION_JOB_NAME}"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'kubectl get "service/${A2A_INJECT_NAME}" "secret/${A2A_INJECT_NAME}"',
             "render_mode_next_sidecar_patch \\",
             'kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${SIDECAR_PATCH}"',
+            'SIDECAR_CR_GENERATION="$(kubectl get platformagent',
             'wait_agent_generation_past "${SIDECAR_GEN_BEFORE}"',
+            'wait_provision_job "the sidecar patch" "${FIRST_PROVISION_JOB}" "${SIDECAR_CR_GENERATION}"',
+            'gate_cr_not_degraded "the sidecar patch"',
             'gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"',
             'grep -F "${BRIDGE_CONSUMING_LOG_MSG}" | grep -F "${BRIDGE_CONSUMING_LOG_PROFILE}"',
         ]
@@ -624,43 +662,23 @@ class FlagSetIsNextTest(unittest.TestCase):
                         self.assertNotIn(never_gated, line)
 
     def test_the_provisioning_job_gate_stops_on_either_terminal_condition(self) -> None:
-        """The gate polls the Job's True conditions and stops on Complete or
+        """The gate polls the Jobs' True conditions and stops on Complete or
         Failed; a Failed Job must not sit out the budget, and no condition at
-        all must. Lifted with its failure branch and run against a kubectl
+        all must. The function is lifted whole and run against a kubectl
         stub, on a budget of a few seconds."""
-        gate = lifted_block("JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))", "  fi", "the provisioning Job gate")
-        consts = constants()
-        setup = "\n".join(
-            [
-                'NAMESPACE="kubeagents-system"',
-                'A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"',
-                'A2A_NATS_POD_SELECTOR="app=platform-agent-a2a-nats"',
-                "MODE_NEXT_DIAG_LOG_LINES=5",
-                "MODE_NEXT_POLL_SECONDS=1",
-                "MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=3",
-                f'JOB_CONDITION_COMPLETE="{consts["JOB_CONDITION_COMPLETE"]}"',
-                f'JOB_CONDITION_FAILED="{consts["JOB_CONDITION_FAILED"]}"',
-                "JOB_GATE_START=0; MODE_NEXT_START=0",
-                # The stub answers the conditions read with what the test set,
-                # in the shape the jsonpath emits (each type followed by a space).
-                'kubectl() { case "$*" in *"-o jsonpath="*) printf "%s" "${JOB_STUB}" ;; *) echo "kubectl $*" ;; esac; }',
-                'dump_mode_next_state() { echo "DUMPED"; }',
-                "SECONDS=0",
-            ]
-        )
         cases = {
-            # what the jsonpath prints -> (exit status, message fragment)
-            "SuccessCriteriaMet Complete ": (0, None),
-            "Failed ": (1, "conditions: Failed"),
+            # what the jobs jsonpath prints -> (exit status, message fragment)
+            "j1:SuccessCriteriaMet,Complete, ": (0, None),
+            "j1:Failed, ": (1, "conditions: Failed"),
             "": (1, "conditions: none"),
-            "Suspended ": (1, "conditions: Suspended"),
+            "j1:Suspended, ": (1, "conditions: Suspended"),
         }
         for stub, (status, fragment) in cases.items():
             with self.subTest(conditions=stub):
-                result = run_bash(f'export JOB_STUB="{stub}"\n{setup}\n{gate}\necho "PASSED"')
+                result = run_provision_wait(jobs=stub, call='wait_provision_job "the mode patch"')
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 if fragment is None:
-                    self.assertIn("PASSED", result.stdout)
+                    self.assertIn("PASSED NAME=j1 CONDITIONS=Complete", result.stdout)
                 else:
                     self.assertIn(fragment, result.stdout)
                     self.assertIn("DUMPED", result.stdout)
@@ -668,30 +686,18 @@ class FlagSetIsNextTest(unittest.TestCase):
         # How long each takes is the next test's.
 
     def test_a_failed_job_is_reported_within_one_poll_and_an_absent_one_at_the_deadline(self) -> None:
-        gate = lifted_block("JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))", "  done", "the provisioning Job poll")
-        consts = constants()
-        setup = "\n".join(
-            [
-                'NAMESPACE="kubeagents-system"',
-                'A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"',
-                "MODE_NEXT_POLL_SECONDS=1",
-                "MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=3",
-                f'JOB_CONDITION_COMPLETE="{consts["JOB_CONDITION_COMPLETE"]}"',
-                f'JOB_CONDITION_FAILED="{consts["JOB_CONDITION_FAILED"]}"',
-                'kubectl() { printf "%s" "${JOB_STUB}"; }',
-                "SECONDS=0",
-            ]
-        )
-        for stub, expected, bound in (("Failed ", "Failed", 2), ("", "", None)):
+        # The stub answers the Ready condition read at once, so the Failed
+        # branch's wait for the operator's status costs nothing here; the
+        # dump runs last before the exit and carries the clock.
+        for stub, bound in (("j1:Failed, ", 2), ("", None)):
             with self.subTest(conditions=stub):
-                result = run_bash(f'export JOB_STUB="{stub}"\n{setup}\n{gate}\necho "CONDITIONS=${{JOB_CONDITIONS}} ELAPSED=${{SECONDS}}"')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                conditions, elapsed = re.search(r"CONDITIONS=(.*) ELAPSED=(\d+)", result.stdout).groups()
-                self.assertEqual(conditions, expected)
+                result = run_provision_wait(jobs=stub, call='wait_provision_job "the mode patch"', ready="A2AProvisionFailed: refused")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                elapsed = int(re.search(r"DUMPED ELAPSED=(\d+)", result.stdout).group(1))
                 if bound is None:
-                    self.assertGreaterEqual(int(elapsed), 3, "an absent Job runs the budget out")
+                    self.assertGreaterEqual(elapsed, 3, "an absent Job runs the budget out")
                 else:
-                    self.assertLess(int(elapsed), bound, "a Failed Job is reported within one poll")
+                    self.assertLess(elapsed, bound, "a Failed Job is reported within one poll")
 
     def test_the_generation_is_read_before_each_patch(self) -> None:
         block = lifted(*_MODE_SECTION)
@@ -701,6 +707,253 @@ class FlagSetIsNextTest(unittest.TestCase):
         # And the render reads the Deployment after the mode roll, so the
         # environment it copies is the next-mode one.
         self.assertLess(block.index('gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"'), block.index("SIDECAR_PATCH="))
+
+
+class TasksBudgetSizingTest(unittest.TestCase):
+    """(b): the first patch carries a maxSessions sized so the sidecar patch's
+    budget fits the TASKS the first provision creates at the floor."""
+
+    def test_the_budget_terms_are_the_operators(self) -> None:
+        """The four numbers are copied from the operator, which keeps them as
+        Go constants and a function over them; each is read back from the
+        source it came from. The Go side pins the same four against the
+        functions (TestCiDeploySizesMaxSessionsToTheTasksFloor)."""
+        consts = constants()
+        manifests = text(_A2A_MANIFESTS)
+        self.assertEqual(int(consts["A2A_TASKS_FLOOR"]), go_int_constant(_A2A_MANIFESTS, "a2aTasksMaxConsumersFloor"))
+        per_session = go_int_constant(_A2A_MANIFESTS, "a2aSessionConsumersPerSession")
+        self.assertEqual(int(consts["A2A_SESSION_CONSUMERS"]), per_session)
+        # The reserve table at zero workers, and its slope. The overlap row
+        # is an alias of the per-session count, not a literal.
+        self.assertRegex(manifests, re.compile(r"^\s*a2aTasksIncarnationOverlap\s*=\s*a2aSessionConsumersPerSession$", re.MULTILINE))
+        tail = go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayTailFactor")
+        fixed = (
+            go_int_constant(_A2A_MANIFESTS, "a2aTasksStandingDurables")
+            + go_int_constant(_A2A_MANIFESTS, "a2aTasksAuditDurableHeadroom")
+            + per_session
+            + go_int_constant(_A2A_MANIFESTS, "a2aTasksWebReaders")
+            + tail * (go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayBridgeDispatch") + go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayGatewaySweep"))
+        )
+        per_worker = tail * (go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayAsk") + go_int_constant(_A2A_MANIFESTS, "a2aTasksReplayLookAhead"))
+        self.assertEqual(int(consts["A2A_RESERVE_FIXED"]), fixed)
+        self.assertEqual(int(consts["A2A_RESERVE_PER_WORKER"]), per_worker)
+        # And the function the operator evaluates is that table, in the
+        # order the script's comment states it.
+        self.assertRegex(
+            manifests,
+            r"func a2aTasksReservedConsumersFor\(bridgeConcurrency int\) int \{\s*"
+            r"return a2aTasksStandingDurables \+ a2aTasksAuditDurableHeadroom \+ a2aTasksIncarnationOverlap \+\s*"
+            r"a2aTasksWebReaders \+ a2aTasksReplayConsumersFor\(bridgeConcurrency\)",
+        )
+
+    def test_max_sessions_is_the_largest_that_fits_the_floor_and_at_least_one(self) -> None:
+        """Section 2b's arithmetic, run for the lane's worker counts. The
+        tech lead's numbers: 6 at the presubmit's 4 workers, 2 at 6; at 8 the
+        floor cannot hold the reserve and the clamp gives 1, which (c) then
+        turns into a red lane rather than a parked CR."""
+        consts = constants()
+        floor, per_session = int(consts["A2A_TASKS_FLOOR"]), int(consts["A2A_SESSION_CONSUMERS"])
+        fixed, per_worker = int(consts["A2A_RESERVE_FIXED"]), int(consts["A2A_RESERVE_PER_WORKER"])
+        expected = {1: 12, 2: 10, 4: 6, 6: 2, 7: 1, 8: 1, int(consts["BRIDGE_QUEUE_CAPACITY"]): 1}
+        for workers, want in expected.items():
+            with self.subTest(workers=workers):
+                result = run_bash(
+                    "\n".join(
+                        [
+                            constants_block(),
+                            f"MODE_NEXT_BRIDGE_CONCURRENCY={workers}",
+                            max_sessions_derivation(),
+                            'echo "N=${MODE_NEXT_MAX_SESSIONS}"',
+                        ]
+                    )
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                got = int(re.search(r"N=(\d+)", result.stdout).group(1))
+                self.assertEqual(got, want)
+                budget = got * per_session + fixed + per_worker * workers
+                if budget <= floor:
+                    self.assertGreater(budget + per_session, floor, "not the largest maxSessions that fits")
+                else:
+                    self.assertEqual(got, 1, "past the floor only the clamp is left")
+        # The default lane fits; the reason the sizing exists.
+        default = int(consts["EVAL_TASK_PARALLELISM_DEFAULT"])
+        self.assertLessEqual(expected[default] * per_session + fixed + per_worker * default, floor)
+
+    def test_the_first_patch_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
+        consts = constants()
+        patch = json.loads(consts["MODE_NEXT_PATCH_FORMAT"] % 6)
+        self.assertEqual(patch, {"spec": {"mode": "next", "harness": {"tuning": {"maxSessions": 6}}}})
+        # The path is the CRD's: PlatformAgentSpec.Harness -> HarnessSpec.Tuning
+        # -> TuningSpec.MaxSessions, as the API package tags them.
+        api = text(_API_TYPES)
+        self.assertIn('Tuning *TuningSpec `json:"tuning,omitempty"`', api)
+        self.assertIn('MaxSessions *int `json:"maxSessions,omitempty"`', api)
+        self.assertIn('Harness *HarnessSpec `json:"harness,omitempty"`', text(_API_TYPES.parent / "platformagent_types.go"))
+        # Sized in section 2b, from the concurrency the guard there admitted,
+        # before anything is built.
+        script = text(_CI_DEPLOY)
+        guard = script.index('MODE_NEXT_BRIDGE_CONCURRENCY="${EVAL_TASK_PARALLELISM:-${EVAL_TASK_PARALLELISM_DEFAULT}}"')
+        derivation = script.index("MODE_NEXT_MAX_SESSIONS=$((")
+        self.assertLess(guard, derivation)
+        self.assertLess(derivation, script.index("# ─── 4. Build Container Images"))
+        self.assertIn("A2A_RESERVE_PER_WORKER * MODE_NEXT_BRIDGE_CONCURRENCY", script[derivation : derivation + 200])
+        # And in step 6b the log line, the patch's rendering, the patch and
+        # the first Job wait, in that order.
+        block = lifted(*_MODE_SECTION)
+        markers = [
+            'echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge\'s budget',
+            'printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"',
+            'kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"',
+            'wait_provision_job "the mode patch"',
+        ]
+        position = 0
+        for marker in markers:
+            with self.subTest(marker=marker):
+                found = block.find(marker, position)
+                self.assertGreater(found, -1, f"{marker!r} is missing after offset {position}")
+                position = found + len(marker)
+        # No other patch precedes it: the first render sees the cap.
+        self.assertEqual(block.index("kubectl patch platformagent"), block.index(markers[2]))
+
+
+def run_provision_wait(*, jobs: str, call: str, observed: str = "", ready: str = "", phase: str = "", status_attempts: int = 1) -> subprocess.CompletedProcess:
+    """Run wait_provision_job or gate_cr_not_degraded as step 6b calls them,
+    against a kubectl stub that answers each jsonpath read with what the test
+    set: the Jobs listing (name, colon, True condition types each followed by
+    a comma, then a space, per Job), the CR's observedGeneration, its Ready
+    condition as `reason: message`, and its phase. On a budget of three
+    seconds and a one-second poll."""
+    consts = constants()
+    stub = (
+        'kubectl() { case "$*" in '
+        '*"get jobs"*) printf "%s" "${JOBS_STUB}" ;; '
+        '*observedGeneration*) printf "%s" "${OBSERVED_STUB}" ;; '
+        "*'type==\"Ready\"'*) printf \"%s\" \"${READY_STUB}\" ;; "
+        '*status.phase*) printf "%s" "${PHASE_STUB}" ;; '
+        '*) echo "kubectl $*" ;; esac; }'
+    )
+    return run_bash(
+        "\n".join(
+            [
+                f'export JOBS_STUB="{jobs}" OBSERVED_STUB="{observed}" READY_STUB="{ready}" PHASE_STUB="{phase}"',
+                'NAMESPACE="kubeagents-system"',
+                'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                f'A2A_PROVISION_JOB_SELECTOR="{consts["A2A_PROVISION_JOB_SELECTOR"]}"',
+                'A2A_NATS_POD_SELECTOR="app=platform-agent-a2a-nats"',
+                "MODE_NEXT_DIAG_LOG_LINES=5",
+                "MODE_NEXT_POLL_SECONDS=1",
+                "MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=3",
+                f"MODE_NEXT_STATUS_ATTEMPTS={status_attempts}",
+                f'JOB_CONDITION_COMPLETE="{consts["JOB_CONDITION_COMPLETE"]}"',
+                f'JOB_CONDITION_FAILED="{consts["JOB_CONDITION_FAILED"]}"',
+                f'CR_PHASE_DEGRADED="{consts["CR_PHASE_DEGRADED"]}"',
+                f'CR_READY_REASON_PROVISION_FAILED="{consts["CR_READY_REASON_PROVISION_FAILED"]}"',
+                "MODE_NEXT_START=0",
+                stub,
+                'dump_mode_next_state() { echo "DUMPED ELAPSED=${SECONDS}"; }',
+                shell_function("cr_ready_condition"),
+                shell_function("wait_provision_job"),
+                shell_function("gate_cr_not_degraded"),
+                "SECONDS=0",
+                call,
+                'echo "PASSED NAME=${PROVISION_JOB_NAME:-} CONDITIONS=${PROVISION_JOB_CONDITIONS:-} RERENDERED=${PROVISION_JOB_RERENDERED:-} ELAPSED=${SECONDS}"',
+            ]
+        )
+    )
+
+
+class ProvisionRerunGateTest(unittest.TestCase):
+    """(c): after the sidecar patch the step waits for the provision Job's
+    re-run, counting only a Job that is not the first run's, and reds on a
+    refusal instead of proceeding over it."""
+
+    _RERUN = 'wait_provision_job "the sidecar patch" j1 3'
+
+    def test_the_rerun_wait_counts_only_the_new_job(self) -> None:
+        # The first run, j1, stays listed until the operator's pass sweeps it,
+        # and that pass rolls the agent Deployment before it touches the Job,
+        # so the read after the generation wait can still show j1 alone.
+        with self.subTest("the new Job completes beside the old one"):
+            result = run_provision_wait(jobs="j1:Complete, j2:SuccessCriteriaMet,Complete, ", call=self._RERUN)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("PASSED NAME=j2 CONDITIONS=Complete RERENDERED=true", result.stdout)
+            self.assertIn("✓ A2A provisioning Job j2 complete", result.stdout)
+        with self.subTest("the old Job's Complete does not count for the new one"):
+            result = run_provision_wait(jobs="j1:Complete, j2: ", call=self._RERUN, observed="3")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("(Job: j2; conditions: none)", result.stdout)
+            self.assertGreaterEqual(int(re.search(r"DUMPED ELAPSED=(\d+)", result.stdout).group(1)), 3, "a running re-run is waited for")
+        with self.subTest("the old Job swept and the new one not yet listed is waited for"):
+            result = run_provision_wait(jobs="", call=self._RERUN, observed="3")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("(Job: none; conditions: none)", result.stdout)
+            self.assertGreaterEqual(int(re.search(r"DUMPED ELAPSED=(\d+)", result.stdout).group(1)), 3)
+
+    def test_an_unchanged_render_is_told_from_a_job_not_yet_created_by_the_observed_generation(self) -> None:
+        with self.subTest("the operator kept the old Job after observing the patch"):
+            result = run_provision_wait(jobs="j1:Complete, ", call=self._RERUN, observed="3")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("PASSED NAME=j1 CONDITIONS=Complete RERENDERED=false", result.stdout)
+            self.assertIn("left the A2A provisioning Job's render unchanged (j1 is still the current run)", result.stdout)
+        with self.subTest("the operator has not observed the patch yet"):
+            result = run_provision_wait(jobs="j1:Complete, ", call=self._RERUN, observed="2")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertNotIn("PASSED", result.stdout)
+            self.assertGreaterEqual(int(re.search(r"DUMPED ELAPSED=(\d+)", result.stdout).group(1)), 3)
+        with self.subTest("no observedGeneration on the CR is not observed"):
+            result = run_provision_wait(jobs="j1:Complete, ", call=self._RERUN, observed="")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_a_failed_rerun_reds_the_step_with_the_operators_refusal(self) -> None:
+        refusal = "A2AProvisionFailed: TASKS holds 64 consumers and this configuration needs 71"
+        result = run_provision_wait(jobs="j2:Failed, ", call=self._RERUN, observed="3", ready=refusal, status_attempts=3)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("(Job: j2; conditions: Failed)", result.stdout)
+        self.assertIn(f"platform-agent Ready condition: {refusal}", result.stdout)
+        self.assertIn("--- provisioning Job pod logs ---", result.stdout)
+        self.assertIn("DUMPED", result.stdout)
+        self.assertNotIn("PASSED", result.stdout)
+        # The status can lag the Job by one operator requeue; the wait for it
+        # is bounded and the failure is reported without it.
+        result = run_provision_wait(jobs="j2:Failed, ", call=self._RERUN, observed="3", ready="Ready: fine", status_attempts=2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("platform-agent Ready condition: Ready: fine", result.stdout)
+        self.assertLess(int(re.search(r"DUMPED ELAPSED=(\d+)", result.stdout).group(1)), 4)
+
+    def test_the_degraded_gate_reds_on_a_refusal_the_job_did_not_show(self) -> None:
+        gate = 'gate_cr_not_degraded "the sidecar patch"'
+        cases = {
+            # (phase, Ready condition) -> exit status
+            ("Ready", "Ready: all workloads ready"): 0,
+            ("Degraded", "A2AProvisionFailed: TASKS holds 64 consumers"): 1,
+            ("Ready", "A2AProvisionFailed: TASKS holds 64 consumers"): 1,
+            ("Degraded", "InvalidGitRepoURL: not this PR's"): 1,
+            ("", ""): 0,
+        }
+        for (phase, ready), status in cases.items():
+            with self.subTest(phase=phase, ready=ready):
+                result = run_provision_wait(jobs="", call=gate, phase=phase, ready=ready)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                if status == 0:
+                    self.assertIn("PASSED", result.stdout)
+                    self.assertIn(f"✓ platform-agent is {phase or 'unphased'} after the sidecar patch", result.stdout)
+                else:
+                    self.assertIn(f"ERROR: platform-agent is {phase} after the sidecar patch; Ready condition: {ready}", result.stdout)
+                    self.assertIn("DUMPED", result.stdout)
+                    self.assertNotIn("PASSED", result.stdout)
+
+    def test_the_status_words_are_the_operators(self) -> None:
+        consts = constants()
+        controller = text(_CONTROLLER / "platformagent_controller.go")
+        self.assertIn(f'agent.Status.Phase = "{consts["CR_PHASE_DEGRADED"]}"', controller)
+        self.assertIn(f'r.updateStatusDegraded(ctx, instance, "{consts["CR_READY_REASON_PROVISION_FAILED"]}", a2aState.message', controller)
+        self.assertRegex(controller, r'Type:\s*"Ready",\s*Status:\s*metav1\.ConditionFalse,\s*Reason:\s*reason,')
+        self.assertIn('ObservedGeneration int64 `json:"observedGeneration,omitempty"`', text(_API_TYPES))
+        # The ordering the wait relies on: the pass rolls the agent
+        # Deployment before it creates or sweeps the provision Job, and
+        # nothing watches Jobs, so the Failed status arrives on a requeue.
+        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance)"))
+        self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 
 class SidecarPatchTest(unittest.TestCase):
@@ -809,13 +1062,27 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertNotRegex(dockerfile, r"(?m)^ENTRYPOINT")
         self.assertRegex(dockerfile, r'(?m)^CMD \["/usr/local/bin/hermes-bridge"\]$')
 
-    def test_the_inventory_check_pins_its_builder_and_states_the_exclusion(self) -> None:
+    def test_the_inventory_check_pins_its_builder_and_the_inventory_carries_it(self) -> None:
         script = text(_INVENTORY_CHECK)
         # The go-directive call site is pinned by test_check_image_inventory_go_directive.
         self.assertIn("check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION", script)
-        self.assertIn("a2a/Dockerfile.hermes-bridge) is deliberately NOT", script)
+        # The bridge is release surface: a first-party entry the release
+        # workflow publishes, with no operator override since the operator
+        # renders no bridge and the sidecar's image is the CR's.
         inventory = json.loads(text(_REPO_ROOT / "images.json"))
-        self.assertNotIn("hermes-bridge", [image["name"] for image in inventory["images"]])
+        by_name = {image["name"]: image for image in inventory["images"]}
+        self.assertIn("hermes-bridge", by_name)
+        bridge = by_name["hermes-bridge"]
+        self.assertEqual(bridge["origin"], "first-party")
+        self.assertEqual(bridge["tagPolicy"], "release")
+        self.assertNotIn("override", bridge)
+        for name, override in (
+            ("a2a-gateway", "A2A_GATEWAY_IMAGE"),
+            ("a2a-worker", "A2A_WORKER_IMAGE"),
+            ("a2a-authcallout", "A2A_CALLOUT_IMAGE"),
+        ):
+            self.assertEqual(by_name[name]["override"], override)
+            self.assertEqual(by_name[name]["tagPolicy"], "release")
 
     def test_the_a2a_step_starts_at_once_and_builds_the_three_in_order(self) -> None:
         """The three A2A images do not depend on the platform image, so their

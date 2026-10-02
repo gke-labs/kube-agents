@@ -131,18 +131,27 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_pubsub_platform       = true
 # enable_stockout_investigator = true
 
-# Optional drift audit-log ingress: the Log Router sink, drift-audit Pub/Sub
-# topic and pull subscription the drift detector reads. Exports every GKE
-# cluster in the project. Provisions the input only: the detector starts when
-# the PlatformAgent sets spec.harness.driftDetector.enabled, which is left to
-# extra_helm_values below -- see the README before turning either on.
-# Hand-driven applies only: the installer front doors regenerate this file
-# without the key and would remove the trio on their next run; through them,
-# put TF_VAR_enable_drift_pubsub=true in install.env instead. A second install
-# in the same project names its own trio (drift_pubsub_topic,
+# Optional out-of-band change detection, in two halves. enable_drift_pubsub
+# provisions the input -- the Log Router sink, drift-audit Pub/Sub topic and
+# pull subscription -- exporting every GKE cluster in the project.
+# enable_drift_detector starts the consumer, by setting
+# spec.harness.driftDetector.enabled on the PlatformAgent. The first without
+# the second is a subscription filling up with nobody reading it; the second
+# without the first is refused by a precondition, because the block carrying
+# that field is written only where the ingress is on, so the apply would
+# otherwise succeed having provisioned and started nothing. A second
+# precondition refuses a project_id given as the project number: the operator
+# will not start the detector on one. See the README before turning either on.
+# The installer front doors write both of these from one install.env key,
+# ENABLE_DRIFT_DETECTOR, and regenerate this file on every run, so a value
+# written here by hand belongs to a hand-driven apply -- and is planned away
+# under -auto-approve, with up to 31 days of retained audit records, the next
+# time a front door runs without that key. A second install in the
+# same project names its own trio (drift_pubsub_topic,
 # drift_pubsub_subscription, drift_pubsub_sink): lifecycle.sh adopts them by
 # name, and would adopt the first install's.
-# enable_drift_pubsub = true
+# enable_drift_pubsub   = true
+# enable_drift_detector = true
 
 # IAM. "read-only" (default) selects the bundle the composition grants;
 # "custom" requires project_roles. An explicit project_roles list overrides
@@ -150,21 +159,29 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # means naming the roles, so that the grant is explicit and reviewed.
 # permission_set = "read-only"
 
-# Multi-project scope: the projects, folders and organisations beyond
-# project_id whose GKE clusters get a Cluster Agent, and what to leave
+# Multi-project scope: the projects, folders, organisations, Shared VPC hosts
+# and Metrics Scopes beyond project_id whose GKE clusters get a Cluster Agent, and what to leave
 # unmanaged. The IAM module binds the read roles in each listed project, and
 # the read roles plus roles/cloudasset.viewer on each folder and organisation
 # (numeric IDs; every project beneath inherits the grant), and the chart
 # renders the same object into the PlatformAgent CR. A folder or organisation
-# also enables cloudasset.googleapis.com in project_id. Omit the block, or
+# also enables cloudasset.googleapis.com in project_id. A Shared VPC host or a
+# Metrics Scope's scoping project (project IDs) is resolved at plan time, as
+# the identity planning, to the projects it reaches, and each of those, and the
+# scoping project itself, is bound like a listed project, and a host not
+# otherwise in scope with roles/compute.viewer alone, for the lookup; nothing
+# is inherited through either, so a
+# project attached or linked later waits for the next apply. Omit the block, or
 # leave the lists empty, for the management project alone. A PlatformAgent
 # that already declares spec.scope by hand: copy it here before the first
 # apply, which renders the block for the first time and replaces the live
 # lists with these. An organisation is wide: prefer folders.
 # scope = {
-#   projects      = ["payments-prod", "payments-staging"]
-#   folders       = ["123456789012"]
-#   organizations = []
+#   projects         = ["payments-prod", "payments-staging"]
+#   folders          = ["123456789012"]
+#   organizations    = []
+#   shared_vpc_hosts = ["shared-vpc-host"]
+#   metrics_scopes   = []
 #   exclude = {
 #     projects = ["*-sandbox"]
 #     clusters = [

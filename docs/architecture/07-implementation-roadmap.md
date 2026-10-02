@@ -133,8 +133,9 @@ acceptance criteria pass.
 - **Work:** author a **developer-team `Agent` CR** + namespace-scoped read-only identity
   manifests; Cluster Admin Agent proposes them; the controller reconciles them in the team's namespace;
   default-deny NetworkPolicy + ResourceQuota per namespace; **complete the ChatOps router** — add the
-  **NL-inference** mode (low-confidence → ask a clarifying question, never guess) and thread affinity
-  across all three tiers, with the model output **never** trusted for authorization
+  **session-agent fallback** for unaddressed text (the conversation's session agent resolves the target;
+  unsure → ask a clarifying question, never guess) and thread affinity across all three tiers, with the
+  model output **never** trusted for authorization
   ([06](06-api-and-data-contracts.md) §2b, [03](03-security-model.md) §4a).
 - **Accept:** a Developer Team Agent operates only in its namespace; it is **provably unable** to
   read another namespace or escalate (negative test passes) — this holds regardless of who is asking,
@@ -236,8 +237,8 @@ Built end-to-end means all of these pass — the concrete form of [01](01-vision
   both mutate directly _and_ via PR.
 - **ChatOps router is net-new behavior** — the multi-tier gateway (slash / `@handle` / NL resolution,
   cross-pod dispatch, gateway-side `allowedUsers` enforcement) has **no implementation today** — only a
-  single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 NL
-  fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
+  single-agent Hermes fan-in exists. Build it incrementally (Phase 2 deterministic modes, Phase 3 the
+  session-agent fallback) and keep routing **out of the trust path**: a mis-route must never bypass an allowlist, and
   the per-pod gateway stays as an enforcement backstop ([03](03-security-model.md) §4a,
   [06](06-api-and-data-contracts.md) §2b).
 - **Cross-cluster networking** — spoke agents depend on **private** reachability to the hub's inference

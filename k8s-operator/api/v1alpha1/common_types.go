@@ -666,14 +666,17 @@ type TuningSpec struct {
 	// stream is too small for the configured cap makes the provision Job
 	// fail rather than letting the shortfall surface later as a legitimate
 	// session's consumer create being refused and reported as a task
-	// failure. What that refusal names is the two ways out, and neither is
-	// a stream edit, because max_consumers is the one limit nats-server
-	// will not change on a stream that already exists: lower this number
-	// until it fits the stream, or delete TASKS and let provisioning
-	// recreate it at the width this number asks for, paying the task
-	// history the stream was holding. The two do not finish the same way.
-	// Lowering this number re-renders the provision Job, so it re-runs by
-	// itself. Recreating the stream also needs the provision Job re-run,
+	// failure. What that refusal names is the ways out - two, or three for
+	// a CR that declares a bridge sidecar with more workers than the
+	// bridge's default of 2, where declaring it with fewer is offered too -
+	// and none is a stream edit, because max_consumers is the one limit
+	// nats-server will not change on a stream that already exists: lower
+	// this number (or that worker count) until it fits the stream, or
+	// delete TASKS and let provisioning recreate it at the width this
+	// number asks for, paying the task history the stream was holding.
+	// They do not finish the same way. Lowering this number, or the worker
+	// count, re-renders the provision Job, so it re-runs by itself.
+	// Recreating the stream also needs the provision Job re-run,
 	// and then the A2A gateway restarted - deleting a stream deletes the
 	// durable consumers on it, the gateway's event relay and any Hermes
 	// bridge sidecar do not re-create theirs, and a gateway in that state
@@ -1292,12 +1295,164 @@ type ScopedServiceAccount struct {
 
 // IntegrationSpec isolates common platform-specific external connections.
 type IntegrationSpec struct {
+	// Forges declares the forges this agent works with: which provider each
+	// one is, where it is, and which organisation it acts for. Repositories
+	// name a forge from this list.
+	//
+	// Set Forges and Repositories, or the deprecated GitHub alias, not both;
+	// there is no rule for which one wins that would not surprise somebody.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Forges []ForgeSpec `json:"forges,omitempty"`
+
+	// Repositories declares the repositories this agent works with, each on
+	// one of Forges, and what the agent does with it. The operator seeds them
+	// into the gitops-state ConfigMap: the GitOps repository and the managed
+	// ones into managed_repos, in that order, and the context ones into
+	// context_repos. Seeding only adds; an entry removed here stays in the
+	// ConfigMap until an administrator removes it there too.
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:XValidation:rule="self.filter(r, r.role == 'gitops').size() <= 1",message="at most one repository may have role gitops"
+	// +optional
+	Repositories []RepositorySpec `json:"repositories,omitempty"`
+
 	// GitHub configures the GitHub integration.
+	//
+	// Deprecated: use Forges and Repositories, which name their forge. This
+	// field is kept as an alias: it means one forge named "github" with
+	// provider "github" and namespace Org, and, when GitRepo is set, one
+	// repository on it with role "gitops". It will be removed in a future API
+	// version.
 	// +optional
 	GitHub *GitHubSpec `json:"github,omitempty"`
 }
 
+// Repository roles: what the agent does with a declared repository.
+const (
+	// RepositoryRoleGitOps is the repository the agent's GitOps work lands in.
+	// It is seeded first into managed_repos, and at most one repository has it.
+	RepositoryRoleGitOps = "gitops"
+	// RepositoryRoleManaged is a further repository the agent writes to. It is
+	// seeded into managed_repos after the GitOps one.
+	RepositoryRoleManaged = "managed"
+	// RepositoryRoleContext is a repository the agent only reads. It is seeded
+	// into context_repos, for which the token minter renders read-only scopes.
+	RepositoryRoleContext = "context"
+)
+
+// writeRoles are the roles of the repositories the agent writes to, in the
+// order they are seeded into managed_repos.
+var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
+
+// ForgeSpec declares one forge: which provider it is, where, and which
+// organisation the agent acts for there.
+//
+// Each provider asserts its own hosts, namespace grammar, and path depth, so a
+// repository on another host is refused rather than rewritten into a
+// same-named repository on this one. See
+// docs/designs/version-control-support.md §6.
+type ForgeSpec struct {
+	// Name identifies the forge within this PlatformAgent. Repositories refer
+	// to it by this name. The deprecated GitHub alias is the forge "github".
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// Provider names the forge's kind. It is the discriminator the operator
+	// writes into the gitops-state ConfigMap as each repository's `type`, so
+	// the agent reads which forge was declared rather than guessing from the
+	// URL's text.
+	//
+	// Only "github" is registered today; the enum grows with each agent-side
+	// provider. Defaults to "github".
+	// +kubebuilder:validation:Enum=github
+	// +kubebuilder:default=github
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// Host is the forge hostname. Omit it for the provider's default
+	// ("github.com" for GitHub). A host the declared provider does not serve is
+	// rejected, and an alternative spelling of one it does serve resolves to the
+	// provider's canonical host.
+	//
+	// The pattern is a DNS name, which every forge's host is; it is here rather
+	// than only in the webhook so the API server still refuses whitespace and
+	// control characters when the operator runs with ENABLE_WEBHOOKS=false.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`
+	// +optional
+	Host string `json:"host,omitempty"`
+
+	// Namespace is the organisation, user, or group path the agent acts for on
+	// this forge — the GitHub org that GitHubSpec called Org. A repository
+	// given as a bare name is qualified by it, so without it every repository
+	// on this forge must name its namespace. If omitted, the organisation the
+	// token minter and GITHUB_ORG use is read from the first accepted
+	// repository the agent writes to on this forge, the GitOps one first; bare
+	// repository names are not qualified by it.
+	//
+	// On GitHub it is also the organisation the token minter scopes the
+	// agent's credentials to; a repository in another organisation is not
+	// given a token.
+	//
+	// The schema pattern is every forge's grammar at once, not GitHub's: the
+	// tight rule depends on Provider and a CRD pattern cannot dispatch on a
+	// sibling field, so the provider applies that one. What the schema is for is
+	// the part that does not vary — a namespace holds no whitespace and no
+	// control characters, which the API server must keep enforcing when the
+	// operator runs with ENABLE_WEBHOOKS=false.
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
+	// the credentials for this forge. It is for providers whose credentials an
+	// administrator supplies. GitHub's come from the install's GitHub App
+	// through the token minter, so it is ignored for provider "github", and
+	// admission warns when it is set there.
+	// +optional
+	CredentialsRef *corev1.LocalObjectReference `json:"credentialsRef,omitempty"`
+}
+
+// RepositorySpec declares one repository on a declared forge, and what the
+// agent does with it.
+type RepositorySpec struct {
+	// Forge is the name of the entry in Forges this repository lives on.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Forge string `json:"forge"`
+
+	// Repository is a clone URL, an scp-style remote, a namespace-qualified
+	// path, or a bare name to be qualified by Namespace. A URL or remote must
+	// name one of the forge's own hosts.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Repository string `json:"repository"`
+
+	// Namespace qualifies a bare repository name, overriding the forge's
+	// namespace for this repository only.
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$`
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Role is what the agent does with the repository: "gitops" for the
+	// repository its GitOps work lands in, "managed" for a further repository
+	// it writes to, "context" for one it only reads.
+	// +kubebuilder:validation:Enum=gitops;managed;context
+	Role string `json:"role"`
+}
+
 // GitHubSpec contains the configuration for the GitHub integration.
+//
+// Deprecated: use ForgeSpec and RepositorySpec. Kept so existing
+// PlatformAgent resources keep applying unchanged; ResolveGit folds it into
+// the same ResolvedIntegration and every consumer reads that instead.
 type GitHubSpec struct {
 	// Org is the target GitHub organization or user account for the agent environment.
 	// If omitted and GitRepo is provided, the organization is inferred from the repository owner.
@@ -1693,170 +1848,146 @@ const (
 	MaxGitHubOrgLength = 39
 	// MaxGitRepoURLLength defines the maximum character length for Git repository URLs.
 	MaxGitRepoURLLength = 2048
+	// NoRepositorySentinel is a value meaning "no GitOps repository", as
+	// distinct from an unset field. Nothing in this repository writes it —
+	// hack/ci-deploy.sh opts out with an empty string — but the validators have
+	// accepted it since before the git spec existed, so hand-written CRs and
+	// values files in the wild may carry it. It has to keep round-tripping as a
+	// valid, empty declaration rather than becoming an error.
+	NoRepositorySentinel = "None"
 )
-
-var validRepoSlugPart = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
 // githubOrgRegex validates GitHub organization or username format
 // (alphanumeric and hyphens, not starting or ending with hyphen, max 39 chars).
 var githubOrgRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
 
 // CleanRepoSlug cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format.
+//
+// Deprecated: GitHub-bound. Resolve through the declared provider —
+// ResolvedRepository.Resolve — for anything that has one.
 func CleanRepoSlug(rawURL string) (string, error) {
 	return CleanRepoSlugWithOrg(rawURL, "")
 }
 
 // CleanRepoSlugWithOrg cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format,
 // using the provided org if a bare repository name (without a slash) is given.
+//
+// It parses the host first and holds the owner to GitHub's grammar, so a
+// single-slash value whose first segment is another forge's host —
+// `gitlab.com/project` — is refused rather than read as owner `gitlab.com`. See
+// repo_ref.go's header.
+//
+// Deprecated: GitHub-bound, and kept for the minter policy sync, which reads
+// the state ConfigMap's GitHub entries with no declaration to dispatch on. Use
+// ResolvedRepository.Resolve.
 func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
-	cleaned := strings.TrimSpace(rawURL)
-	cleaned = strings.TrimSuffix(cleaned, ".git")
-
-	// Validate URL scheme if a scheme is present and strip it
-	if idx := strings.Index(cleaned, "://"); idx != -1 {
-		scheme := strings.ToLower(cleaned[:idx])
-		if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
-			return "", fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
-		}
-		cleaned = cleaned[idx+3:]
-	}
-
-	// Handle user@host prefix (e.g. git@github.com:owner/repo or git@github.com/owner/repo)
-	if idx := strings.Index(cleaned, "@"); idx != -1 {
-		cleaned = cleaned[idx+1:]
-	}
-
-	// Handle SCP-style host:path syntax (e.g. github.com:owner/repo)
-	if strings.Contains(cleaned, ":") {
-		parts := strings.SplitN(cleaned, ":", 2)
-		if len(parts) == 2 {
-			host := strings.ToLower(parts[0])
-			if host != "github.com" && host != "www.github.com" {
-				return "", fmt.Errorf("unsupported host %q for GitHub repository", host)
-			}
-			cleaned = parts[1]
-		}
-	}
-
-	// Strip common domain prefixes or validate host if present with slashes (e.g. host/owner/repo)
-	if strings.HasPrefix(cleaned, "github.com/") {
-		cleaned = strings.TrimPrefix(cleaned, "github.com/")
-	} else if strings.HasPrefix(cleaned, "www.github.com/") {
-		cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
-	} else if strings.Count(cleaned, "/") > 1 {
-		parts := strings.SplitN(cleaned, "/", 2)
-		if len(parts) == 2 && parts[0] != "" {
-			host := strings.ToLower(parts[0])
-			if host != "github.com" && host != "www.github.com" {
-				return "", fmt.Errorf("unsupported host %q for GitHub repository", host)
-			}
-			cleaned = parts[1]
-		}
-	}
-
-	cleaned = strings.Trim(cleaned, "/")
-
-	if cleaned == "" {
-		return "", fmt.Errorf("empty repository")
-	}
-
-	// If no slash is present and an org was supplied, prefix with org
-	if !strings.Contains(cleaned, "/") && strings.TrimSpace(org) != "" {
-		cleaned = strings.TrimSpace(org) + "/" + cleaned
-	}
-
-	// Basic verification of owner/repo structure and component character set
-	parts := strings.Split(cleaned, "/")
-	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid repository format")
-	}
-
-	owner, repo := parts[0], parts[1]
-	for _, part := range []string{owner, repo} {
-		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, "-") {
-			return "", fmt.Errorf("invalid repository slug %q", cleaned)
-		}
-	}
-	if !validRepoSlugPart.MatchString(owner) || !validRepoSlugPart.MatchString(repo) {
-		return "", fmt.Errorf("invalid characters in repository slug %q", cleaned)
-	}
-
-	return cleaned, nil
-}
-
-// CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
-// It rejects non-GitHub repository hosts.
-func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
-	trimmed := strings.TrimSpace(rawURL)
-	if trimmed == "" || trimmed == "None" {
-		return "", fmt.Errorf("empty repository")
-	}
-	cleanedSlug, err := CleanRepoSlugWithOrg(rawURL, org)
+	ref, err := resolveGitHub(rawURL, org)
 	if err != nil {
 		return "", err
 	}
-	return "https://github.com/" + cleanedSlug, nil
+	return ref.Path, nil
+}
+
+// CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
+//
+// Deprecated: GitHub-bound. Use ResolvedRepository.Resolve, whose RepoRef.URL is the
+// same rendering against the declared provider's host.
+func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
+	ref, err := resolveGitHub(rawURL, org)
+	if err != nil {
+		return "", err
+	}
+	return ref.URL(), nil
+}
+
+// resolveGitHub is the GitHub-bound path the three deprecated helpers share.
+func resolveGitHub(rawURL, org string) (RepoRef, error) {
+	if trimmed := strings.TrimSpace(rawURL); trimmed == "" || trimmed == NoRepositorySentinel {
+		return RepoRef{}, fmt.Errorf("empty repository")
+	}
+	provider, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		return RepoRef{}, err
+	}
+	return provider.Resolve("", rawURL, org)
+}
+
+// validateDeclaredValue applies the checks every declared forge string owes
+// before any provider sees it: a length bound, and no whitespace or non-graphic
+// runes. The second is the injection guard (PI-004) — these values reach a
+// SETTINGS file, a shell, and a ConfigMap, so a newline in one is not a format
+// error but a way to write a second line.
+func validateDeclaredValue(field, value string, maxLength int) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	if utf8.RuneCountInString(trimmed) > maxLength {
+		return fmt.Errorf("git %s exceeds maximum length of %d characters", field, maxLength)
+	}
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
+			return fmt.Errorf("git %s contains whitespace or non-graphic characters", field)
+		}
+	}
+	return nil
 }
 
 // ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid,
 // contains no whitespace or non-graphic character injections, and targets github.com.
+//
+// Deprecated: GitHub-bound. Use IntegrationSpec.ValidateGit, which dispatches on
+// the declared provider.
 func ValidateGitRepoURL(gitRepo string) error {
 	return ValidateGitRepoURLWithOrg(gitRepo, "")
 }
 
 // ValidateGitRepoURLWithOrg verifies that a Git repository URL or shorthand (with optional org context)
 // is structurally valid, contains no whitespace or non-graphic character injections, and targets github.com.
+//
+// Deprecated: GitHub-bound. Use IntegrationSpec.ValidateGit.
 func ValidateGitRepoURLWithOrg(gitRepo, org string) error {
 	trimmed := strings.TrimSpace(gitRepo)
-	if trimmed == "" || trimmed == "None" {
+	if trimmed == "" || trimmed == NoRepositorySentinel {
 		return nil
 	}
-
-	if utf8.RuneCountInString(trimmed) > MaxGitRepoURLLength {
-		return fmt.Errorf("git repo URL exceeds maximum length of %d characters", MaxGitRepoURLLength)
+	if err := validateDeclaredValue("repo URL", trimmed, MaxGitRepoURLLength); err != nil {
+		return err
 	}
-
-	for _, r := range trimmed {
-		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
-			return fmt.Errorf("git repo URL contains whitespace or non-graphic characters")
-		}
-	}
-
 	if _, err := CleanRepoSlugWithOrg(trimmed, org); err != nil {
-		return fmt.Errorf("invalid git repository format %q: expected owner/repo or valid git URL", trimmed)
+		return fmt.Errorf("invalid git repository format %q: expected owner/repo or valid git URL: %w", trimmed, err)
 	}
-
 	return nil
 }
 
 // ValidateGitHubOrg verifies that a GitHub Org string is a valid organization or user name
 // and contains no control characters, slashes, or newline injections (PI-004).
+//
+// Deprecated: GitHub-bound. Use IntegrationSpec.ValidateGit, which applies the
+// declared provider's namespace grammar instead of GitHub's to every forge.
 func ValidateGitHubOrg(org string) error {
 	trimmed := strings.TrimSpace(org)
 	if trimmed == "" {
 		return nil
 	}
-
-	if utf8.RuneCountInString(trimmed) > MaxGitHubOrgLength {
-		return fmt.Errorf("github org exceeds maximum length of %d characters", MaxGitHubOrgLength)
+	if err := validateDeclaredValue("org", trimmed, MaxGitHubOrgLength); err != nil {
+		return err
 	}
-
-	// Disallow whitespace and any non-graphic characters
-	for _, r := range trimmed {
-		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
-			return fmt.Errorf("github org contains whitespace or non-graphic characters")
-		}
+	provider, err := LookupGitProvider(GitProviderGitHub)
+	if err != nil {
+		return err
 	}
-
-	if !githubOrgRegex.MatchString(trimmed) {
-		return fmt.Errorf("invalid github org %q: must contain only alphanumeric characters and hyphens, and cannot begin or end with a hyphen", trimmed)
+	if err := provider.ValidateNamespace(trimmed); err != nil {
+		return fmt.Errorf("%w: must contain only alphanumeric characters and hyphens, and cannot begin or end with a hyphen", err)
 	}
-
 	return nil
 }
 
 // ManagedRepoEntry represents a single managed repository in the gitops-state ConfigMap.
 type ManagedRepoEntry struct {
+	// Type is the forge the repository lives on — the declared provider, not a
+	// constant. It is the discriminator the agent dispatches on; see
+	// docs/designs/version-control-support.md §6.
 	Type string `json:"type"`
 	URL  string `json:"url"`
 }
