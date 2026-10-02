@@ -912,10 +912,15 @@ resource "google_service_account" "agent" {
         self.assertIn("Pub/Sub subscription 'platform-agent-drift-audit-sub' already exists", proc.stderr)
         self.assertIn("Log Router sink 'platform-agent-drift-audit-sink' already exists", proc.stderr)
 
-    def test_guard_drift_adoption_names_both_ways_out(self):
-        """Renaming and deleting are the two remedies, and which one applies
-        depends on something the guard cannot see: whether the other install
-        is still live. So it prints both, with the commands."""
+    def test_guard_drift_adoption_names_every_way_out(self):
+        """Rename, import, delete, or go without -- and which one applies
+        depends on the thing the guard cannot see: whose trio this is. So it
+        prints all four, with the commands for the three that have any.
+
+        The count is the assertion. A refusal that names three of them reads
+        as complete to the operator it stops, who then takes the closest fit
+        rather than the right one -- deleting a trio they could have imported
+        is the expensive direction."""
         proc = self._run_guard(
             "guard_drift_adoption",
             state_list="",
@@ -930,6 +935,11 @@ resource "google_service_account" "agent" {
         self.assertIn("gcloud pubsub topics delete platform-agent-drift-audit --project test-project", proc.stderr)
         self.assertIn("gcloud pubsub subscriptions delete platform-agent-drift-audit-sub --project test-project", proc.stderr)
         self.assertIn("gcloud logging sinks delete platform-agent-drift-audit-sink --project test-project", proc.stderr)
+        self.assertIn(
+            "terraform import 'module.drift_pubsub[0].google_pubsub_topic.drift_audit' "
+            "projects/test-project/topics/platform-agent-drift-audit",
+            proc.stderr,
+        )
         self.assertIn("ENABLE_DRIFT_DETECTOR=false", proc.stderr)
 
     def test_guard_drift_adoption_checks_the_names_this_state_would_create(self):
