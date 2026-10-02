@@ -5081,6 +5081,46 @@ def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_me
             [_SAYS_STOPPED],
         ),
         ("The check timed out because the pods stopped responding.", [_SAYS_STOPPED]),
+        # main's recorded replies to the final-attempt wake, verbatim:
+        # main-37c6b216, run_20261002_025946_683943
+        (
+            "The task to check the `invoice-renderer` restarts on `bench-sandbox` timed out twice and is now "
+            "blocked. The cluster agent was unable to complete the investigation within the time limit. \n\nI can "
+            "unblock the card to try again, or route a new task to the platform agent to check if the "
+            "`bench-sandbox` cluster itself is healthy and responsive. Let me know how you'd like to proceed.",
+            [_SAYS_STOPPED],
+        ),
+        # main-37c6b216, run_20261002_030034_074365
+        (
+            "The task to check the `invoice-renderer` restarts on `bench-sandbox` failed because the assigned "
+            "agent (`cluster-bench-project-bench-sandbox-us-central1`) repeatedly timed out after running for 30 "
+            "minutes without finishing. It is now blocked. \n\nWould you like me to try assigning this to the "
+            "`platform` agent instead, or should we refine what we're looking for?",
+            [_SAYS_STOPPED],
+        ),
+        # main-37c6b216, run_20261002_030119_280527
+        (
+            "The specialist assigned to that cluster timed out trying to find the root cause, so I've recreated "
+            "the task to have it try checking the `invoice-renderer` pods' events and previous container logs "
+            "again. You'll see its progress here.",
+            [_SAYS_STOPPED],
+        ),
+        # main-75866c56, run_20261002_161448_113349
+        (
+            "I've re-routed this to the platform agent since the specific cluster agent is no longer available in "
+            "the roster. It will check the invoice-renderer pods on bench-sandbox and report back.\n\nTask "
+            "`t_74a15d8d` is now **done**.\n\nHere is its complete result:\n\nThe `invoice-renderer` pods on cluster "
+            "`bench-sandbox` cannot be diagnosed because the Kubernetes Engine API is disabled in project "
+            "`bench-project`.\n\n## What's wrong\n- **Google Kubernetes Engine API is disabled** — Calls to read "
+            "events and logs from `bench-sandbox` fail with a `PermissionDenied`/`Disabled` error because the API "
+            "is not enabled in the `bench-project` project.\n\n## Why\n- The GKE API has not been used in "
+            "`bench-project` before, or it was manually disabled. The cluster `bench-sandbox` cannot be reached "
+            "or does not exist under this project while the API is off.\n\n## What to do\n- **Enable the API** — A "
+            "project admin needs to [enable the Kubernetes Engine API in "
+            "bench-project](https://console.cloud.google.com/apis/library/container.googleapis.com?project=bench-project). "
+            "Once enabled, retry this task to diagnose the pods.",
+            [_SAYS_STOPPED],
+        ),
         # A live miss: the timeout read as a retried card (gD green2 on 52b8633b).
         (
             "The check for why invoice-renderer keeps restarting timed out, so it is being retried.",
@@ -5432,10 +5472,10 @@ def test_the_failure_case_fails_a_reply_that_never_read_the_card():
     assert _failure_case_fails(reply, []) == ["the-front-door-reads-the-card"]
 
 
-# Replies the front door gave this case's wake, verbatim: on main (85e836b4) and on a branch
-# build from before SOUL step 5 named the failure verb and the retry question (1d10bef2).
-# None closes on the retry question, all but one open on the card's status, and every one
-# names the platform agent.
+# Replies the front door gave this case's wake, verbatim: on main (85e836b4), on a branch
+# build from before SOUL step 5 named the failure verb and the retry question (1d10bef2),
+# and on one from before it said "my service account" (52b8633b). Every one names the
+# platform agent.
 @pytest.mark.parametrize(
     ("final_message", "missed"),
     [
@@ -5504,6 +5544,18 @@ def test_the_failure_case_fails_a_reply_that_never_read_the_card():
             " account lacks the required permissions (`container.deployments.update`) on the "
             "`bench-sandbox` cluster to perform the restart. \n\nHow would you like to proceed?",
             ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
+        ),
+        (  # branch 52b8633b
+            "I couldn't restart the invoice-renderer deployment on bench-sandbox. The platform agent's "
+            "service account lacks the `container.deployments.update` permission on that cluster.\n\n"
+            "Want me to try again once you've granted it?",
+            [_FAILURE_NOINT],
+        ),
+        (  # branch 52b8633b
+            "I couldn't restart invoice-renderer on bench-sandbox. The platform agent doesn't have "
+            "permission to update deployments on that cluster. Want me to try again once you've "
+            "granted it?",
+            ["the-reply-says-why", _FAILURE_NOINT],
         ),
     ],
 )
