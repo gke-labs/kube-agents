@@ -264,16 +264,17 @@ the same layout and is collected from the moment it starts running.
   collector applies the script's own test (`collect.graded_nothing`) and
   records it as the plain RED with a note on stderr, never as this field;
   the field is the infrastructure-loss shape only, until the next-mode view
-  gives the other one a lane. The list is empty when the artifact names
-  none (an entry
-  that does not match the case-id grammar the pages use, stated under "URL
-  contract" below, is dropped, and the list is cut at 64 entries, because
-  the artifact is the pull request's own and the ids are posted in the bot's
-  comment). A line
-  without an agreeing artifact writes neither field and a warning, and the
-  run is the plain `RED` its `Failed` word says — the same double check the
-  script makes before it prints the marker, so a broken invocation cannot
-  dress itself as weather. `eval_verdict` stays `RED` either way. Absent
+  gives the other one a lane. An entry that does not match the case-id
+  grammar the pages use, stated under "URL contract" below, is dropped, and
+  the list is cut at 64 entries, because the artifact is the pull request's
+  own and the ids are posted in the bot's comment. The list is never empty:
+  the suite names every gradable case or the admitted ones it lost on this
+  shape, so an artifact that names no case id after the filter writes
+  neither field and a warning, and so does a line without an agreeing
+  artifact; the run is then the plain `RED` its `Failed` word says — the
+  same double check the script makes before it prints the marker, so a
+  broken invocation cannot dress itself as weather, and a hand-written
+  artifact cannot headline "0 gate cases lost". `eval_verdict` stays `RED` either way. Absent
   means the suite graded the run, or the record predates the field; both
   read as they always did.
 

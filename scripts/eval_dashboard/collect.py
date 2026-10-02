@@ -52,9 +52,13 @@ them, and `outcome: not_evaluated` in the `eval-verdict.json` that
 `bench-gate suite` wrote into the job's artifacts (hack/ci-eval-pr.sh,
 announce_suite_verdict). The line alone is not trusted: for a build whose
 final line carries the marker, that one artifact is read as well, and only
-when its `outcome` agrees does the run carry `eval_outcome: "not_evaluated"`
-and the `not_evaluated` case ids -- the same double check the script makes
-before it prints the marker. The same outcome word and marker also end an
+when its `outcome` agrees and it names at least one case id under
+`not_evaluated` does the run carry `eval_outcome: "not_evaluated"` and those
+ids -- the same double check the script makes before it prints the marker,
+plus the list: the suite names every gradable case or the admitted ones it
+lost on that shape (scoring.py, grade_suite), both non-empty, so an artifact
+with the outcome word and no usable id is hand-written or corrupted, and
+recording it would headline "0 gate cases lost". The same outcome word and marker also end an
 inject-lane run whose every case was set aside as not graded on its
 transport (scoring.py, `nothing_gradable`): that artifact names nothing
 under `not_evaluated` and the cases under `not_graded`, and the script's
@@ -627,8 +631,9 @@ def graded_nothing(doc: dict) -> bool:
 def not_evaluated_ids(doc: dict) -> list[str]:
     """The case ids under `not_evaluated`. A list that is absent or
     malformed reads as empty, and an entry that is not shaped like a case id
-    (`_CASE_ID_SHAPE`) is dropped; the outcome is the fact and the list is
-    detail."""
+    (`_CASE_ID_SHAPE`) is dropped. Empty is not recorded: build_run keeps
+    such a build on the plain RED (module docstring), because the suite
+    always names a case on the infrastructure shape."""
     named = doc.get(NOT_EVALUATED_KEY)
     if not isinstance(named, list):
         return []
@@ -638,16 +643,17 @@ def not_evaluated_ids(doc: dict) -> list[str]:
 def parse_eval_verdict(text: str | None) -> list[str] | None:
     """The case ids a not-evaluated `eval-verdict.json` names, or None.
 
-    None for a missing or malformed file, for any other `outcome`, and for
-    the inject lane's graded-nothing shape (graded_nothing): the caller then
+    None for a missing or malformed file, for any other `outcome`, for the
+    inject lane's graded-nothing shape (graded_nothing), and for an
+    infrastructure-shape artifact that names no case id: the caller then
     records the run as the plain RED its final line's `Failed` word already
-    says. build_run reads the three pieces itself so its stderr line can
-    say which of the two it was.
+    says. build_run reads the pieces itself so its stderr line can say
+    which of the three it was.
     """
     doc = load_eval_verdict(text)
     if doc is None or graded_nothing(doc):
         return None
-    return not_evaluated_ids(doc)
+    return not_evaluated_ids(doc) or None
 
 
 def _iso(ts) -> str | None:
@@ -810,6 +816,16 @@ def build_run(
                 f"note: build {build_id}: {EVAL_VERDICT_FILE} says every case was not graded on"
                 f" its transport ({NOT_GRADED_KEY} named, {NOT_EVALUATED_KEY} empty); recorded as a"
                 " plain RED, which is not an infrastructure loss",
+                file=sys.stderr,
+            )
+        elif not not_evaluated_ids(doc):
+            # The infrastructure shape with nothing usable under the key
+            # (module docstring): the suite names at least one case there,
+            # so this is not its artifact. Recording it would headline
+            # "0 gate cases lost" and tell the author to retest.
+            print(
+                f"warning: build {build_id}: {EVAL_VERDICT_FILE} says {EVAL_OUTCOME_NOT_EVALUATED} but"
+                f" names no case id under {NOT_EVALUATED_KEY}; recorded as a plain RED",
                 file=sys.stderr,
             )
         else:
