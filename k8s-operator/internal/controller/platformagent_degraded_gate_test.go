@@ -27,6 +27,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -283,5 +284,66 @@ func TestAPrunedObservedGenerationDoesNotWriteDegradedEveryPass(t *testing.T) {
 	degrade()
 	if counter.writes != 1 {
 		t.Errorf("%d status writes across three unchanged refusals under a pruning CRD, want 1: this is the write-every-pass loop", counter.writes)
+	}
+}
+
+// TestStaleCacheLaggingInformerDoesNotWriteStatusDegraded verifies that an in-flight
+// reconcile pass reading from a lagging informer cache (which has not yet observed
+// an earlier status update) checks the live object via APIReader and avoids issuing
+// a duplicate, conflicting status update.
+func TestStaleCacheLaggingInformerDoesNotWriteStatusDegraded(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	agent.Status.Phase = "Degraded"
+	agent.Status.ObservedGeneration = 1
+	now := metav1.Now()
+	agent.Status.LastReconcileTime = &now
+	agent.Status.Conditions = []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonRuntimeClassNotFound,
+		Message:            "RuntimeClass 'gvisor' is not configured",
+		ObservedGeneration: 1,
+		LastTransitionTime: now,
+	}}
+	counter := &statusWriteCounter{}
+	scheme := setupScheme()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(counter.interceptors()).
+		Build()
+
+	// Cached client simulates a lagging informer cache: returning the agent with
+	// un-updated status (empty phase and conditions).
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				pa.Status.Phase = ""
+				pa.Status.Conditions = nil
+				pa.Status.ObservedGeneration = 0
+				pa.Status.LastReconcileTime = nil
+			}
+			return nil
+		},
+	})
+
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	ctx := context.Background()
+
+	staleAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cached.Get(ctx, client.ObjectKeyFromObject(agent), staleAgent); err != nil {
+		t.Fatalf("reading stale agent: %v", err)
+	}
+
+	if err := r.updateStatusDegraded(ctx, staleAgent, reasonRuntimeClassNotFound, "RuntimeClass 'gvisor' is not configured", workloadNotRendered); err != nil {
+		t.Fatalf("updateStatusDegraded failed: %v", err)
+	}
+
+	if counter.writes != 0 {
+		t.Fatalf("updateStatusDegraded made %d status writes on a stale cache pass, want 0: the live object already held matching status", counter.writes)
 	}
 }
