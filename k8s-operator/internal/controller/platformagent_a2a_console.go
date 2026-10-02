@@ -62,15 +62,10 @@ const (
 	a2aConsolePortName   = "http"
 	a2aConsoleHealthPath = "/healthz"
 
-	// The static user the server logs in as. consoleIdentity() renders the
-	// same name into nats.conf, and TestTheConsoleServerLogsInAsTheConsoleIdentity
-	// holds the two together.
-	a2aConsoleConfUser = "console"
-
 	// One key of the creds Secret, mounted as a directory rather than a
 	// subPath so a rotated password reaches the pod.
-	a2aConsoleCredsVolume   = "console-credential"
-	a2aConsoleCredsMountDir = "/var/run/secrets/a2a-console" // #nosec G101 -- a path, not a credential
+	a2aConsoleKeyVolume = "console-key"
+	a2aConsoleMountDir  = "/var/run/secrets/a2a-console"
 	// 0440 with FSGroup below: the kubelet makes the file group-owned by the
 	// pod's fsGroup, so UID 1000 reads it and nobody else in the pod exists
 	// to.
@@ -183,7 +178,7 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Volumes: []corev1.Volume{{
-						Name: a2aConsoleCredsVolume,
+						Name: a2aConsoleKeyVolume,
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 							SecretName: a2aCredsSecretName(agent),
 							// One key out of a Secret that holds every static
@@ -213,13 +208,13 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Env: []corev1.EnvVar{
 							{Name: a2aConsoleEnvBusURL, Value: a2aNATSWebSocketURL(agent)},
 							{Name: a2aConsoleEnvUser, Value: a2aConsoleConfUser},
-							{Name: a2aConsoleEnvPasswordFile, Value: path.Join(a2aConsoleCredsMountDir, a2aConsolePasswordKey)},
+							{Name: a2aConsoleEnvPasswordFile, Value: path.Join(a2aConsoleMountDir, a2aConsolePasswordKey)},
 							{Name: a2aConsoleEnvAllowedHosts, Value: strings.Join(a2aConsoleHosts(), a2aConsoleHostSep)},
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aConsolePortName, ContainerPort: a2aConsolePort}},
 						VolumeMounts: []corev1.VolumeMount{{
-							Name:      a2aConsoleCredsVolume,
-							MountPath: a2aConsoleCredsMountDir,
+							Name:      a2aConsoleKeyVolume,
+							MountPath: a2aConsoleMountDir,
 							ReadOnly:  true,
 						}},
 						// /healthz is the one path the server answers for any

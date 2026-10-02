@@ -126,6 +126,13 @@ const (
 	// the container above.
 	a2aBridgeUser = "bridge"
 
+	// a2aConsoleConfUser is the static user the console server logs in as.
+	// The operator renders it into the server's env too, and
+	// TestTheConsoleServerLogsInAsTheConsoleIdentity holds the two together.
+	// It lives in this file because tests/conformance resolves each
+	// identity's user name out of this file and no other.
+	a2aConsoleConfUser = "console"
+
 	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a
 	// credential: it selects the inbox prefix the client pins, and the grants
 	// come from the callout's answer about the ServiceAccount, not from this.
