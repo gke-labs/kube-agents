@@ -27,7 +27,10 @@ is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field.
 :func:`blocks_answer` lays a headline, links and choices out as blocks; its
 caller is ``slack_moments``, which lays out the messages ``slack_ux_moments``
-posts.
+posts. :func:`with_side_bar` puts every block below the headline in one legacy
+attachment whose ``color`` is the side bar, for ``slack_ux_moments`` posting and
+settling a moment and ``slack_ux_clicks`` rewriting one; :func:`message_blocks`
+and :func:`side_bar_color` read a click's echoed message back.
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model
@@ -562,7 +565,9 @@ def with_side_bar(blocks: Sequence[dict], color: str, text: str) -> dict:
 
     ``text`` is the message's own, given as the attachment's ``fallback``:
     without one Slack stores "[no preview available]", which a thread read back
-    shows, and the adapter drops a fallback the message's text already holds.
+    shows. The Slack adapter reads a fallback only from an attachment with no
+    text it can extract (``_extract_text_from_slack_attachments``), and drops
+    one the message's text already holds.
     ``attachments`` is always present, empty when nothing is left for the bar,
     since ``chat.update`` keeps a message's attachments unless it is sent some.
     """
