@@ -173,17 +173,21 @@ operator who chose the number is not told their stream predates the limit. The
 block is treated the other way - it refuses - because a short consumer budget is not a
 bound the install never had but a shortfall with a load-time failure already attached.
 
-Where that report lands bounds what it is worth, so it is worth saying plainly: the
-provision Job's pod log, and nowhere else. The script exits 0, the reconcile reads the
-Job's `Complete` condition and nothing else, and no Event, no CR condition and no status
-field records that the stream is still unbounded - an install that predates this render
-reads `Ready` with the gap open, exactly as it did before. The 24h TTL removes the
-finished Job and the next reconcile recreates it under the same digested name, so the
-report reappears roughly daily rather than expiring; it is still a pod log, and someone
-has to go and read it. Surfacing it where an operator would see it without being told to
-look is deferred for the same reason the `max_consumers` refusal's own CR surfacing is -
-status plumbing with a blast radius of its own, which is a change about status and not
-about the bus render.
+Where that report lands: the pod log, and an Event on the `PlatformAgent`. The script
+still exits 0, so the Job completes and the CR reads `Ready` - the gap is a report, not a
+failure - but the closing block also writes the finding as one line of JSON to the
+container's termination message (`/dev/termination-log`, the kubelet's default; `{}` when
+it found nothing), and the reconcile that first sees the Job `Complete` reads that off
+the Job's succeeded pod and records a `Warning` Event, reason `TasksSubjectCapMissing`,
+naming the Job, the live and rendered caps, and the `nats stream edit` with its cost. It
+stamps the Job with an annotation so later passes over the same completed Job add
+nothing; the 24h TTL removes the finished Job and the next reconcile recreates it under
+the same digested name, so an unfixed gap is reported once per run, roughly daily, and
+`kubectl describe platformagent` shows it without anyone reading a pod log. It is an
+Event and not a condition because it is a fact about the live stream that a Job
+discovered, not a state the reconcile converges on; the operator's `Recorder` field
+draws that line once. The `max_consumers` refusal in the same block already fails the
+Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
@@ -307,7 +311,20 @@ Layout:
   a pull-only principal may hold no task-subject subscribe at all, which is what the
   session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping the parked tightening under the authority work.
+  with per-task scoping the parked tightening under the authority work. **Amended
+  10/1:** "deny by default" holds per side, and only while that side has entries in
+  it. An empty allow list is nats-server's spelling of _unrestricted_, not of
+  _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
+  that side's allow or deny list is non-empty, and the two sides are independent), so
+  a rendered entry that lost its publish list would grant the whole subject space on
+  that side while its subscribes stayed narrow. Neither side of a non-narrowed entry
+  may therefore be empty: in the callout identity map the operator refuses such a
+  render and the callout refuses it again at the mint, and in the static `nats.conf`
+  users - which have no validator - a side left empty beside a populated one renders
+  an explicit `deny = [">"]` rather than an absent key. A user with NEITHER side,
+  which is how `sys` ships, still gets no permissions block at all. A principal that
+  must not publish cannot be expressed by omission - there is no deny list in the map
+  - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -405,14 +422,33 @@ Layout:
   on `TASKS` that bound is no longer the flat 64 but a number derived from
   `spec.harness.tuning.maxSessions`, since a session pod creates three consumers there
   and a stream that cannot hold the configured concurrency refuses a legitimate session.
-  The number is `maxSessions` times three plus a fixed reserve for what is nobody's
+  The number is `maxSessions` times three plus a reserve for what is nobody's
   session, itemized term by named term beside `a2aTasksReservedConsumers` in the
   operator: the two standing durables, headroom for the audit durable, one incarnation's
   overlap, the web rail's readers, and - amended 9/25 - the `tasks/get` replay
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for.
+  between calls are named there as what the term does not size for. Amended 9/28: the
+  replay term scales with the bridge's worker count, which the render reads as
+  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
+  sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
+  earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
+  default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below
+  one, and 2 when no sidecar sets it, and at
+  most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
+  the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
+  bridge's worker count, and each surface says what it read. The provision script's refusal
+  quotes the count it used, the per-entry rule it read it by, and whether it capped it; the
+  `Ready` condition's message on that refusal says, when an entry it could not read as a
+  count took the default in its place, that the count is what the render read, not what the
+  CR declares, and states the rule; and the script prints a `NOTE:` on every run, refused or
+  not, when an entry took the default or a sidecar carries `envFrom` with no entry in `env`
+  (a `BRIDGE_CONCURRENCY` delivered through `envFrom` is not read), since the budget may then
+  be short for the real count with no refusal to say so. Where the count is above the
+  default, both refusal surfaces offer fewer workers as the third way out beside a lower
+  `maxSessions` and a deleted stream; the message attributes the need to the count wherever
+  it moved the reserve, one worker included.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and

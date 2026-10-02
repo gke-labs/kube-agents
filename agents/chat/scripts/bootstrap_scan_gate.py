@@ -10,9 +10,8 @@ deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
 no kubectl), so it cannot run the sweep itself even as an LLM job.
 
 Nor can the job simply move to ``platform``. Every marker that makes onboarding
-once-only — ``.bootstrap_scan_filed`` below, ``.bootstrap_completed``,
-``INVENTORY.raw.md``, and the ``INVENTORY.md`` the delivery job reads — lives
-in the Chat Agent's home, and a
+once-only — ``.bootstrap_scan_filed`` below, ``.bootstrap_greeted`` and
+``.bootstrap_completed`` — lives in the Chat Agent's home, and a
 job on the platform profile would gate itself on a different directory. (Cron
 on a named profile does now fire, via ``profile_cron_tick.py``; that is no
 longer the reason this lives here.)
@@ -49,7 +48,9 @@ file time covers every case.
 
 Archiving the previous run's ``bootstrap-inventory-*`` cards and then deleting
 ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which nothing
-else ever removes and which ``should_skip`` also gates on — is the supported way
+else ever removes and whose presence makes the sweep skip discovery
+(``should_skip`` checks it too, but sees it only with the shell sandbox off) —
+is the supported way
 to re-arm discovery after a sweep has genuinely failed (the runbook is
 bootstrap_onboarding/README.md §5). Deleting the marker alone leaves the gate
 closed; deleting it without archiving lets the board answer the new sweep card's
@@ -94,9 +95,9 @@ SCAN_ASSIGNEE = "platform"
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 
 # The scan runs as a `platform` worker, whose HERMES_HOME is the platform profile
-# home — but every other piece of onboarding state (`.user_aligned`,
-# `.bootstrap_completed`, and the delivery job that reads the report) lives in the
-# Chat Agent's home. Pin the output to an absolute path so both halves agree.
+# home, but the delivery job looks for the report at one absolute path: on the
+# sandbox pod when the shell sandbox is on, in the Chat Agent's home when it is
+# off. Pin the output to that path so both halves agree.
 INVENTORY_PATH = "/opt/data/INVENTORY.md"
 # What the sweep writes: every finding, no length limit, never delivered directly.
 # It stays on disk after delivery so the user can ask for the full inventory.

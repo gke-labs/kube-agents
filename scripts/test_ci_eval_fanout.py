@@ -330,6 +330,55 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertEqual(len({inject for _, _, inject in seen}), 3)
         self.assertFalse({api for _, api, _ in seen} & {inject for _, _, inject in seen})
 
+    def stamps(self, audit_id: str, gitops_override: str = "") -> list[str]:
+        """EVAL_STREAM_STARTED_AT, EVAL_AUDIT_STREAM and EVAL_STREAM_REPO as each of case-y's
+        reps, then case-x's, sees them (`-` for unset).
+        `date` ticks per call here, so a stamp taken per unit would differ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            record = pathlib.Path(tmp) / "stamps"
+            extra = "\n".join([
+                'tick=1000; date() { if [ "$*" = "-u +%s" ]; then tick=$((tick + 1)); echo "${tick}"; '
+                'else command date "$@"; fi; }',
+                f'ledger_audit_id_for_task() {{ echo "{audit_id}"; }}',
+                'reset_audit_ledgers() { :; }',
+                'EVAL_LEDGER_REPO=gke-agentic/kube-agents-evals-4-infra',
+                f'EVAL_GITOPS_REPO="{gitops_override}"',
+                f'uv() {{ echo "STAMP ${{EVAL_CASE_ID}} ${{EVAL_STREAM_STARTED_AT:--}} ${{EVAL_AUDIT_STREAM:--}} ${{EVAL_STREAM_REPO:--}}" >> "{record}"; '
+                'echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }',
+                'for rep in 1 2 3; do run_one_unit ./tasks/y/task.yaml case-y "${rep}" "" "" "$((rep + 3))"; done',
+            ])
+            result = self.run_reps(extra)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = record.read_text(encoding="utf-8") if record.exists() else ""
+        return re.findall(r"^STAMP (\S+ \S+ \S+ \S+)$", recorded, re.MULTILINE)
+
+    def test_every_unit_on_a_stream_sees_when_the_stream_began(self):
+        """pull_request_opened's accepts_stream_pull_request measures from
+        EVAL_STREAM_STARTED_AT: the pull request case-y's rep 1 opened is the
+        one case-x's reps find open, so all six must see case-y's rep 1 start."""
+        self.assertEqual(
+            self.stamps("obtainability-audit"),
+            ["case-y 1001 obtainability-audit gke-agentic/kube-agents-evals-4-infra"] * 3
+            + ["case-x 1001 obtainability-audit gke-agentic/kube-agents-evals-4-infra"] * 3,
+        )
+
+    def test_a_developers_gitops_repo_is_the_streams_repository(self):
+        """The deploy told the agent to write to EVAL_GITOPS_REPO, so its pull
+        requests are there; `none` is the opt-out, not a repository."""
+        self.assertEqual(
+            {s.split()[3] for s in self.stamps("obtainability-audit", "me/infra")},
+            {"me/infra"},
+        )
+        self.assertEqual(
+            {s.split()[3] for s in self.stamps("obtainability-audit", "none")},
+            {"gke-agentic/kube-agents-evals-4-infra"},
+        )
+
+    def test_a_case_with_no_stream_gets_no_stream_window(self):
+        """Nothing ties a streamless case's earlier pull request to it, so the
+        verifier gets no stamp and measures from the run."""
+        self.assertEqual(self.stamps(""), ["case-y - - -"] * 3 + ["case-x - - -"] * 3)
+
     def test_the_state_files_are_written_under_the_task_lock(self):
         unit = lifted("run_one_unit")
         written = unit.index('> "${STATE_DIR}/${name}.rep${rep}.end"')

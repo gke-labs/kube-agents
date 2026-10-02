@@ -386,6 +386,58 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_notes_start_from_the_release_commits_own_history_not_the_numerically_previous_tag(self):
+        """A 0.1.7 cut on a release line is not where 0.2.0's notes start; 0.1.0 in its history is."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            bin_dir, gh_log = self._repo_with_release_tags(
+                temp_dir, repo_dir, git, tags=["0.1.0", MOCK_TARGET_RELEASE_TAG]
+            )
+            # A line off the previous release's history: 0.1.7's stamp descends from
+            # a commit the release commit does not.
+            git("switch", "-c", "release/0.1", "HEAD~1")
+            (pathlib.Path(repo_dir) / "line.txt").write_text("line\n")
+            git("add", "line.txt")
+            git("commit", "-m", "fix: on the line")
+            (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.1.7\n")
+            git("add", "stamp.txt")
+            git("commit", "-m", "chore(release): stamp release version 0.1.7")
+            git("tag", "0.1.7")
+            git("switch", "main")
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN},
+                bin_dir=str(bin_dir),
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Notes Start Tag:   0.1.0", proc.stdout)
+            self.assertIn("--notes-start-tag 0.1.0", self._release_create_line(gh_log))
+        finally:
+            temp_dir.cleanup()
+
+    def test_the_latest_mark_follows_the_numerically_highest_release(self):
+        """A patch below the newest minor is published without the `latest` mark."""
+        for higher_tag, expected in ((None, "--latest=true"), ("0.3.0", "--latest=false")):
+            with self.subTest(higher_tag=higher_tag):
+                temp_dir, repo_dir, git = create_mock_git_repo()
+                try:
+                    bin_dir, gh_log = self._repo_with_release_tags(
+                        temp_dir, repo_dir, git, tags=["0.1.0", MOCK_TARGET_RELEASE_TAG]
+                    )
+                    if higher_tag:
+                        git("tag", higher_tag, "HEAD~1")
+                    proc = self._run_script(
+                        [MOCK_TARGET_RELEASE_TAG],
+                        env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN},
+                        bin_dir=str(bin_dir),
+                        cwd=repo_dir,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(expected, self._release_create_line(gh_log))
+                finally:
+                    temp_dir.cleanup()
+
     def test_publish_omits_notes_start_tag_for_the_first_release(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:

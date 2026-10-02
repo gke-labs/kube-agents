@@ -79,3 +79,39 @@ func TestIsDelegate(t *testing.T) {
 		}
 	}
 }
+
+func TestIsSessionCommand(t *testing.T) {
+	yes := map[string]string{
+		"/session":                             "",
+		"/session off":                         "off",
+		"/SESSION Off":                         "Off",
+		"  /session what is running in ns x  ": "what is running in ns x",
+		"/session\nmultiline first turn":       "multiline first turn",
+		"/session\toff":                        "off",
+	}
+	for in, want := range yes {
+		got, ok := isSessionCommand(in)
+		if !ok || got != want {
+			t.Errorf("isSessionCommand(%q) = (%q, %v), want (%q, true)", in, got, ok, want)
+		}
+	}
+	no := []string{
+		"/sessions", "/sessionoff", "/ session", "session", "session off",
+		"delegate: /session", "/help", "/", "", "please /session",
+	}
+	for _, in := range no {
+		if got, ok := isSessionCommand(in); ok {
+			t.Errorf("isSessionCommand(%q) = (%q, true), want false", in, got)
+		}
+	}
+	for _, rest := range []string{"off", "OFF", " off ", "off.", "off!", "Off,"} {
+		if !isSessionOff(rest) {
+			t.Errorf("isSessionOff(%q) = false, want true", rest)
+		}
+	}
+	for _, rest := range []string{"", "offline", "turn off", "on"} {
+		if isSessionOff(rest) {
+			t.Errorf("isSessionOff(%q) = true, want false", rest)
+		}
+	}
+}

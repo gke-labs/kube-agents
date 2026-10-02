@@ -38,22 +38,16 @@ agents/cluster/skills/*/SKILL.md
 
 agents/platform/governance/*.md
   agents/platform/governance/ai_security_audit_sop.md
-  agents/platform/governance/blueprint_sync_sop.md
   agents/platform/governance/cluster_inventory_audit_sop.md
   agents/platform/governance/compliance_audit_sop.md
-  agents/platform/governance/eod_event_watcher_daily_report_sop.md
   agents/platform/governance/fleet_consistency_drift_sop.md
   agents/platform/governance/fleet_wide_cost_analysis_sop.md
   agents/platform/governance/gce_compute_fleet_sop.md
   agents/platform/governance/gcp_networking_fabric_sop.md
-  agents/platform/governance/global_capacity_orchestrator_sop.md
   agents/platform/governance/inventory.md
   agents/platform/governance/inventory_prioritize_sop.md
-  agents/platform/governance/lifecycle_deprecation_manager_sop.md
   agents/platform/governance/obtainability_audit_sop.md
-  agents/platform/governance/policy_propagation_sop.md
   agents/platform/governance/security_patch_orchestrator_sop.md
-  agents/platform/governance/standardization_validator_sop.md
   agents/platform/governance/stockout_prevention_sop.md
 
 agents/platform/scripts/testdata/providers/*/README.md
@@ -62,6 +56,7 @@ agents/platform/scripts/testdata/providers/*/README.md
 agents/platform/skills/*/SKILL.md
   agents/platform/skills/capacity-obtainability/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
+  agents/platform/skills/fleet-audit-reports/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
   agents/platform/skills/fleet-upgrade-verification/SKILL.md
   agents/platform/skills/gce-compute-fleet-audit/SKILL.md

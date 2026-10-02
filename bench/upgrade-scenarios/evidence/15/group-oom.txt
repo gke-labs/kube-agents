@@ -1,0 +1,38 @@
+
+## 2026-09-29T14:25:24Z [group-oom/default-pool-pod] K -n scen get pod forker-default -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,LAST:.status.containerStatuses[0].lastState.terminated.reason
+NAME             PHASE     RESTARTS   LAST
+forker-default   Running   4          OOMKilled
+## exit 0
+
+## 2026-09-29T14:25:25Z [group-oom/default-pool-log] K -n scen logs forker-default --previous --tail=6
+unable to retrieve container logs for containerd://089737612988929a8ac14775e1d12d8929155c2f27aec6a74d0669fadc85bebf## exit 0
+
+## 2026-09-29T14:25:25Z [group-oom/single-pool] G container node-pools create single-pool --cluster upg-15b --zone us-central1-a --num-nodes 1 --machine-type e2-standard-2 --disk-size 32 --node-labels=oompool=single --system-config-from-file bench/upgrade-scenarios/evidence/15/single-process-oom-kill.yaml --quiet
+Creating node pool single-pool...
+........................................................................................................................................................................................................................................................................................................................................................................................done.
+Created [https://container.googleapis.com/v1/projects/<PROJECT_ID>/zones/us-central1-a/clusters/upg-15b/nodePools/single-pool].
+NAME         MACHINE_TYPE   DISK_SIZE_GB  NODE_VERSION
+single-pool  e2-standard-2  32            1.35.8-gke.1380000
+## exit 0
+
+## 2026-09-29T14:28:46Z [group-oom/single-pool-pod] K -n scen get pod forker-single -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,LAST:.status.containerStatuses[0].lastState.terminated.reason
+NAME            PHASE     RESTARTS   LAST
+forker-single   Running   0          <none>
+## exit 0
+
+## 2026-09-29T14:28:46Z [group-oom/single-pool-log] K -n scen logs forker-single --tail=8
+children=2
+children=2
+children=2
+children=2
+children=2
+children=2
+children=2
+children=2
+## exit 0
+
+## 2026-09-29T14:28:47Z [group-oom/both] K -n scen get pods -l app=forker -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[0].restartCount
+NAME             NODE                                    RESTARTS
+forker-default   gke-upg-15b-work-pool-b0ce4175-g4qd     6
+forker-single    gke-upg-15b-single-pool-b9273c14-gx08   0
+## exit 0

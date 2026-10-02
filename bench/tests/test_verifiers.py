@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -704,6 +705,57 @@ def test_a_phrase_that_rescues_a_wrong_answer_stays_out_of_the_list(phrase):
         assert verifiers._normalize(phrase) in verifiers._normalize(report), name
 
 
+@pytest.mark.parametrize("name", _WRONG_ANSWERS.keys())
+def test_no_shipped_phrase_occurs_in_either_recorded_wrong_answer(name):
+    """The property the test above only samples: both recorded wrong answers
+    fail on any_of alone, with no help from the forbidden list.
+
+    Membership of the two cut phrases is not enough. "older than the", shipped
+    2026-09-29 as the article-carrying form of a cut phrase, was not in that
+    list and still sat inside "older than the channel's default version", so
+    one of the two cleared any_of and only the forbidden list kept it red --
+    and a wrong verdict one word off the nine forbidden shapes passed (the
+    test below). The 2026-10-01 entries spell the default out instead.
+    """
+    text = verifiers._normalize(_WRONG_ANSWERS[name])
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert [p for p in shipped if verifiers._normalize(p) in text] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        ("exclusion-means-up-to-date", "is currently **up to date**", "is **up to date**"),
+        ("lag-is-expected", "older than its", "older than the"),
+    ],
+)
+def test_a_wrong_answer_one_word_off_the_forbidden_list_still_fails(name, old, new):
+    """The two variants the 2026-10-01 review walked: drop "currently" from
+    the first recorded wrong answer and it no longer carries any forbidden
+    phrase; swap "its" for "the" in the second and it hedges with the same
+    "older than the" the first one uses. Both passed while "older than the"
+    was an any_of entry. They fail now because nothing in any_of matches
+    them, which is the property the test above pins.
+    """
+    report = _WRONG_ANSWERS[name].replace(old, new)
+    assert report != _WRONG_ANSWERS[name], old
+    assert _upgrades_verdict(report) == "fail"
+
+
+def test_the_moved_ahead_phrase_is_bound_to_a_space():
+    """"moved ahead" sits inside "removed ahead of", which a correct reply
+    can say about the planted patch or the exclusion with no lag word near
+    it; the entry carries a leading space, which `_normalize` keeps, so the
+    recorded "has moved ahead" still matches and "removed ahead" does not.
+    """
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert "moved ahead" not in shipped
+    assert " moved ahead" in shipped
+    assert _upgrades_verdict("The exclusion will be removed ahead of 2026-12-02.") == "fail"
+    assert "removed ahead" in verifiers._normalize("the patch was removed ahead of the rotation")
+    assert " moved ahead" not in verifiers._normalize("the patch was removed ahead of the rotation")
+
+
 def test_the_channel_absence_phrase_keeps_its_preposition():
     """"aged out" alone sits inside "managed outage" -- the "of" is the anchor.
 
@@ -716,6 +768,284 @@ def test_the_channel_absence_phrase_keeps_its_preposition():
     for innocent in ("a Google-managed outage window", "damaged outside the window"):
         assert "aged out" in verifiers._normalize(innocent)
         assert "aged out of" not in verifiers._normalize(innocent)
+
+
+# The 2026-09-29 widening (#1493, #2124), measured over all 279 scored
+# presubmit repetitions of 2026-09-25 to 09-29: 17 more spellings of the lag,
+# and a forbidden list for the verdict the phrases above only describe around.
+# Same discipline: verbatim `output` fields, read through the shipped check.
+
+# kube-agents-evals-25 rep 1, build 2104637844441010176 (#2050). The largest
+# miss of the 15-phrase list: "older than the default", 17 of the 39 correct
+# answers it failed. Bare "older than" and "older than the" both stay out
+# (the tests above): "older than the current default" is what admits this,
+# and neither recorded wrong answer contains it or "older than the default".
+_LAG_OLDER_THAN_THE_DEFAULT = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_727d75f2`. The answer will post into this thread as soon as it's ready.
+
+The task `t_727d75f2` has finished. Here is the result from the **platform** agent:
+
+The `seeded-b` cluster is on **version 1.34.10-gke.1328000** for both its control plane and its nodes, and is enrolled in the **Regular release channel**.
+
+## Current State
+
+- **Current control plane version:** `1.34.10-gke.1328000`
+- **Current release channel:** Regular (`REGULAR`)
+- **Default version for the Regular channel (in `us-central1-a`):** `1.35.8-gke.1225000`
+- **Latest available version in the Regular channel (in `us-central1-a`):** `1.36.4-gke.1247000`
+
+The control plane is older than the current default for its release channel.
+
+## Sources
+- **GCP command:** `gcloud container get-server-config --zone us-central1-a --project kube-agents-evals-25`
+- **Tool:** `mcp-gke` (`mcp__gke__get_cluster` and `mcp__gke__get_k8s_version`)
+"""
+
+# kube-agents-evals-34 rep 3, build 2104630680196485120 (#1628). Once GKE
+# dropped the planted patch from REGULAR's valid list on 2026-09-28 the agent
+# described an absence in words "no longer offered" did not cover.
+_LAG_MISSING_FROM_THE_LIST = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_edf38c95`. The answer will post into this thread as soon as it's ready.
+
+The task `t_edf38c95` has completed. Here is the result from the platform agent:
+
+The `seeded-b` cluster is running a control plane version that is no longer available in its release channel.
+
+## Current state
+- **Cluster:** `seeded-b` (in `us-central1-a`)
+- **Release Channel:** `REGULAR`
+- **Current Version:** `1.34.11-gke.1102000`
+
+## Channel availability
+The `REGULAR` release channel currently offers the following versions:
+- `1.36.4-gke.1247000`
+- `1.36.3-gke.1767000`
+- `1.35.8-gke.1380000`
+- `1.35.8-gke.1225000` (Default and Upgrade Target)
+- `1.34.11-gke.1056000`
+- `1.34.11-gke.1044000`
+
+The version `seeded-b` is currently running (`1.34.11-gke.1102000`) is missing from the list of valid versions for the `REGULAR` channel in `us-central1-a`.
+"""
+
+# kube-agents-evals-7 rep 3, build 2103664100058861568 (#1884). One of the
+# four wrong verdicts the 15-phrase list PASSED: "current relative to its
+# configured release channel", rescued by "slightly behind" a few lines down.
+# It also says "No action is required" -- advice, not the verdict, and not on
+# the forbidden list; what fails it is "is current relative".
+_WRONG_CURRENT_RELATIVE_TO_ITS_CHANNEL = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_b4165eb5`. The answer will post into this thread as soon as it's ready.
+
+The task `t_b4165eb5` has finished successfully. Here is the result from the **platform** agent:
+
+The control plane for `seeded-b` is current relative to its configured release channel.
+
+## Current state
+- **Current Version:** `1.34.10-gke.1328000`
+- **Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1036000`
+
+While `1.34.10-gke.1328000` is slightly behind the current default for the REGULAR channel (`1.35.8-gke.1036000`), it remains an actively valid and supported version within that channel. No action is required.
+"""
+
+# kube-agents-evals-31 rep 2, build 2104675369926791168 (#2084). "matches the
+# default version" in the first sentence, "older than the default version"
+# two lines later. The widened list accepts the second sentence, so only the
+# forbidden pattern keeps this red -- and it is a pattern rather than a
+# phrase because "no longer matches the default version" is a correct answer.
+_WRONG_MATCHES_THE_DEFAULT = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_261f4a31`. The answer will post into this thread as soon as it's ready.
+
+> 🔀 Delegated to the **platform** agent
+
+The task `t_261f4a31` has finished. Here is the result:
+
+The `seeded-b` cluster is currently running a control plane version that matches the default version offered by its `REGULAR` release channel. There is no pending upgrade available on this channel.
+
+## Current State
+- **Control plane version:** `1.34.11-gke.1102000`
+- **Release channel default version:** `1.35.8-gke.1225000`
+
+The control plane version (`1.34.11-gke.1102000`) is older than the default version offered by the `REGULAR` release channel (`1.35.8-gke.1225000`).
+
+## Details
+
+The cluster is enrolled in the `REGULAR` release channel and currently running `1.34.11-gke.1102000`.
+According to the server config for `us-central1`, the `REGULAR` channel's default version is `1.35.8-gke.1225000`.
+
+## Sources
+- `mcp__gke__get_cluster` (retrieved cluster state for `seeded-b`)
+- `gcloud container get-server-config` (retrieved release channel versions for `us-central1`)
+"""
+
+# kube-agents-evals-28 rep 2, build 2104689780947161088 (#2107). "is fully
+# current" because the maintenance exclusion holds it there: the same excuse
+# as the two 2026-09-15 records, in the one wording the forbidden entry
+# "is fully current" exists for.
+_WRONG_FULLY_CURRENT = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_cab2ac71`. The answer will post into this thread as soon as it's ready.
+
+The task has finished. Here is the result from the **platform** agent:
+
+The `seeded-b` control plane is fully current with its release channel.
+
+- **Current Master Version:** `1.34.10-gke.1328000`
+- **Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1225000`
+- **Upgrade Target Version (REGULAR):** `1.35.8-gke.1225000`
+
+While `1.35.8-gke.1225000` is the default and upgrade target for the `REGULAR` channel, `seeded-b` is currently on `1.34.10-gke.1328000`. However, the cluster has an active maintenance exclusion (`hold-the-minor-lag`) with scope `NO_MINOR_UPGRADES` valid from `2026-09-03` to `2026-12-02`. Therefore, `1.34.10-gke.1328000` is the correct, current version for this cluster given its active exclusions.
+
+## Sources
+- `gcloud container clusters describe`
+- `gcloud container get-server-config`
+"""
+
+_WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES = {
+    "current-relative-to-its-channel": _WRONG_CURRENT_RELATIVE_TO_ITS_CHANNEL,
+    "matches-the-default": _WRONG_MATCHES_THE_DEFAULT,
+    "fully-current": _WRONG_FULLY_CURRENT,
+}
+
+# Build 2105820178175496192 (#2088) rep 3, 2026-10-01: the first presubmits
+# on a front door carrying #2169 (c16fc9ef), whose acknowledgement names the
+# target in the user's words instead of the fixed "Delegated to the platform
+# agent" receipt every fixture above opens with. That line is the first line
+# of the final message, so the forbidden lists read it too. Over the first
+# day on such a front door (46 presubmit runs, 138 acks in 21 wordings, this
+# one 12 times) no ack carried a forbidden entry or matched the pattern.
+_LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET = """checking the seeded-b cluster control plane version.
+
+The task `t_03d57096` checking the seeded-b cluster control plane version has finished. 
+
+Here is the result:
+
+The `seeded-b` cluster is on the **REGULAR** release channel, but its control plane is running version `1.34.11-gke.1209000`, which is **not a valid version** for that channel in `us-central1-a`.
+
+## Version Mismatch
+
+- **Current Control Plane:** `1.34.11-gke.1209000`
+- **Current Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1225000`
+
+The control plane version `1.34.11-gke.1209000` is currently valid only in the **RAPID** channel. The highest valid `1.34.x` version on the REGULAR channel is `1.34.11-gke.1056000`.
+
+This means the cluster was likely downgraded to the REGULAR channel after being created or upgraded while on the RAPID channel, leaving it stranded on a version the REGULAR channel doesn't currently support.
+"""
+
+
+@pytest.mark.parametrize(
+    "report",
+    [_LAG_OLDER_THAN_THE_DEFAULT, _LAG_MISSING_FROM_THE_LIST],
+    ids=["older-than-the-default", "missing-from-the-list"],
+)
+def test_the_widened_list_accepts_the_reports_it_was_widened_for(report):
+    """Both read the versions and state the lag; the 15-phrase list failed both."""
+    assert _upgrades_verdict(report) == "pass"
+
+
+def test_a_reply_that_opens_with_the_named_target_ack_passes():
+    """The ack is inside the match since #2169, so it is pinned as recorded:
+    the shipped lists pass the whole reply, and the ack line on its own
+    carries no forbidden phrase and matches no forbidden pattern.
+    """
+    assert _upgrades_verdict(_LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET) == "pass"
+    ack = _LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET.splitlines()[0]
+    assert ack == "checking the seeded-b cluster control plane version."
+    check = _upgrades_probe_check()
+    assert [p for p in check["forbidden_phrases"] if verifiers._normalize(p) in verifiers._normalize(ack)] == []
+    assert [p for p in check["forbidden_patterns"] if re.search(p, verifiers._normalize_lines(ack))] == []
+
+
+@pytest.mark.parametrize(
+    "report",
+    _WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES.values(),
+    ids=_WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES.keys(),
+)
+def test_the_forbidden_list_fails_a_report_that_calls_the_lagging_cluster_current(
+    report,
+):
+    """The verdict is graded now, not only the description.
+
+    The first two contain an accepted spelling of the lag ("behind", "older
+    than the default version") and passed, or would pass, on any_of alone;
+    the forbidden list is the only thing that fails them. Every one of the
+    three also prints the two versions that contradict its own verdict.
+    """
+    assert _upgrades_verdict(report) == "fail"
+
+
+@pytest.mark.parametrize("phrase", _upgrades_probe_check()["forbidden_phrases"])
+def test_each_forbidden_verdict_fails_a_report_on_its_own(phrase):
+    """One hand-written sentence per shipped entry, failing on that entry and
+    nothing else: the sentence clears any_of on "one minor" and "behind", so
+    the reason has to name the forbidden phrase. The recorded wrong verdicts
+    above pin three of the nine; this pins each, so a dropped or misspelt
+    entry fails here under its own name.
+    """
+    transcript.set(f"seeded-b {phrase}; it is one minor behind.", [])
+    v = parse_node(_upgrades_probe_check())
+    assert isinstance(v, ReportContainsVerifier)
+    result = v.verify(5.0)
+    assert result.status == "fail"
+    assert "forbidden phrases present" in result.reason and phrase in result.reason
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        "The seeded-b control plane is not fully current: it is one minor behind.",
+        "seeded-b **no longer matches the default version** for REGULAR; "
+        "it is one minor behind.",
+        "There is no pending upgrade operation, yet the control plane is one "
+        "minor behind the REGULAR default. No action is required while the "
+        "NO_MINOR_UPGRADES exclusion holds it.",
+        "seeded-b's control plane is not up-to-date with its REGULAR channel; "
+        "the default is 1.35.8.",
+        "seeded-b's version mismatches the default version for REGULAR; "
+        "it is one minor behind.",
+        "seeded-b's 1.34.11-gke.1209000 is current with the RAPID channel but "
+        "is not a valid version for REGULAR; it is one minor behind.",
+        "The REGULAR channel's default has moved ahead to 1.35.8-gke.1225000.",
+    ],
+    ids=[
+        "not-fully-current",
+        "no-longer-matches",
+        "advice-is-not-a-verdict",
+        "not-up-to-date-hyphenated",
+        "mismatches",
+        "current-with-rapid",
+        "has-moved-ahead",
+    ],
+)
+def test_a_negated_verdict_or_plain_advice_stays_green(report):
+    """Hand-written, not recorded: the correct sentences the forbidden list
+    must not red, one per edit that shaped it. Each entry keeps its "is", the
+    "matches" shapes are a pattern that excludes "no longer / not / never"
+    and starts on a word boundary (so "mismatches" is not "matches"), "no
+    pending upgrade" / "no action is required" are not on the list because a
+    correct answer that reads the planted exclusion says both, and the
+    hyphenated "not up-to-date" is an any_of entry beside the spaced one.
+    """
+    assert _upgrades_verdict(report) == "pass"
+
+
+def test_every_forbidden_verdict_carries_its_subject():
+    """Every forbidden phrase starts with "is": that prefix is what keeps
+    "is not current" and "not fully up to date" out of the match, and one
+    entry without it ("fully current") was the review finding that put this
+    test here.
+    """
+    check = _upgrades_probe_check()
+    forbidden = check["forbidden_phrases"]
+    assert forbidden, check
+    assert all(p.startswith("is ") for p in forbidden), forbidden
+    assert len(check.get("forbidden_patterns") or []) == 1, check
 
 
 # ------------------ the capacity probe's shipped phrase list
@@ -2144,6 +2474,7 @@ def _pr_head_routes(
     *,
     changed_files: int = 3,
     repo: str = _PR_REPO,
+    head_ref: str = "platform-agent/fix",
 ) -> None:
     """Route the reads `_head_push` makes: the pulls payload for the file count
     and the page of the commit listing the head sits on."""
@@ -2154,7 +2485,7 @@ def _pr_head_routes(
             "number": 7,
             "changed_files": changed_files,
             "commits": 1,
-            "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA},
+            "head": {"ref": head_ref, "sha": _PR_HEAD_SHA},
         },
     )
     github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
@@ -2206,6 +2537,246 @@ def test_a_previous_reps_pull_request_is_a_fail(token, github):
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "BEFORE this run started" in res.reason
+
+
+# An hour before _RUN_START: the first unit on this case's audit stream began then.
+_STREAM_START = datetime(2026, 8, 21, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+_STREAM_AUDIT = "obtainability-audit"
+# A branch the audit's `finish` names: platform-agent/fix-<audit>-<slug>-<digest>.
+_STREAM_BRANCH = f"platform-agent/fix-{_STREAM_AUDIT}-checkout-gateway-0123abcd"
+
+
+@pytest.fixture
+def stream(monkeypatch):
+    """The three variables hack/ci-eval-pr.sh exports for a unit on an audit stream."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, _STREAM_AUDIT)
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, f"gke-agentic/{_PR_REPO}")
+
+
+def test_a_pull_request_an_earlier_run_on_the_stream_opened_passes_with_the_option(
+    token, github, stream
+):
+    """#2228: a fleet audit's `finish` finds rep 1's pull request open on its
+    branch and pushes nothing, and the presubmit cannot close it between reps.
+    Opened and pushed after the stream's first unit began, on the audit's
+    branch, it is this job's work."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "earlier run on this audit stream" in res.reason
+    # Without the option the same pull request is the leftover #1755 guards.
+    assert _pr_check().verify(5.0).status == "fail"
+
+
+def test_a_pull_request_from_before_the_stream_fails_with_the_option(
+    token, github, stream
+):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this audit stream's first run began" in res.reason
+
+
+def test_a_head_commit_from_before_the_stream_fails_with_the_option(
+    token, github, stream
+):
+    """Written to during the stream, but the fix itself was pushed before it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T08:30:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-20T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "before this audit stream's first run began" in res.reason
+
+
+def test_this_runs_own_pull_request_still_reads_as_this_runs_with_the_option(
+    token, github, stream
+):
+    """Rep 1 opens its own pull request; the widened window must not relabel it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "during this run" in res.reason
+
+
+def test_a_stream_stamp_later_than_the_run_never_narrows_the_window(
+    token, github, stream, monkeypatch
+):
+    """A stale window file or clock skew can put the stamp after the run began;
+    the option widens the window and must never shrink it below the run."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_RUN_START + 600))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "during this run" in res.reason
+
+
+def test_a_late_stream_stamp_says_the_window_was_not_widened(token, github, stream, monkeypatch):
+    """A rejection under a dropped stamp must not read as the plain #1755 fail."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_RUN_START + 600))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "is not before this run, so the window was not widened" in res.reason
+
+
+def test_a_rejection_with_the_option_says_what_the_window_was(
+    token, github, stream
+):
+    """The summary line must not tell a triager the check wanted this run's own pull request."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T07:30:00Z"))
+    _pr_head_routes(github, "2026-08-21T07:29:50Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "this run opened" not in res.reason
+    assert "this audit stream's first run began" in res.reason
+
+
+def test_another_cases_pull_request_in_the_window_fails_with_the_option(
+    token, github, stream
+):
+    """Another case in the job opens its pull request in the same repository
+    during the stream's window. The stamp alone would admit it; its branch is
+    not one the audit's `finish` names, so it is not the stream's."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref="rca-fix-crashloop")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_another_audits_branch_is_not_this_streams(token, github, stream):
+    """`platform-agent/fix-` alone is every audit's; the audit id is the tie."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(
+        github,
+        "2026-08-21T08:19:50Z",
+        head_ref="platform-agent/fix-compliance-audit-netpol-0123abcd",
+    )
+    assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "fail"
+
+
+def test_this_runs_own_pull_request_needs_no_stream_branch(token, github, stream):
+    """The branch only gates what the widened window admits."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z", head_ref="rca-fix-crashloop")
+    assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "pass"
+
+
+def test_a_stamp_without_an_audit_stream_measures_from_the_run(
+    token, github, monkeypatch
+):
+    """With no audit id nothing could tie an older pull request to the stream."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    monkeypatch.delenv(verifiers.STREAM_AUDIT_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+
+
+def test_a_recent_write_over_an_old_push_still_needs_the_stream_branch(
+    token, github, stream
+):
+    """A comment or label during this run moves `updated_at` but not the head
+    commit, which an earlier run pushed: the widened window is what admits
+    that commit, so the branch must still be the stream's."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-21T08:20:00Z", "2026-08-21T09:04:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref="rca-fix-crashloop")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_the_option_off_a_stream_says_it_was_dropped(token, github, monkeypatch):
+    """A case without a ledger `audit` key gets no stream, so the option does
+    nothing; the rejection must say so rather than read as the plain #1755 fail."""
+    monkeypatch.delenv(verifiers.STREAM_STARTED_ENV_VAR, raising=False)
+    monkeypatch.delenv(verifiers.STREAM_AUDIT_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "`accepts_stream_pull_request` is set" in res.reason
+
+
+def test_a_sibling_jobs_pull_request_in_another_repository_fails(
+    token, github, stream, monkeypatch
+):
+    """Two presubmit jobs on different pool projects run the same audit, so
+    both open pull requests on `platform-agent/fix-<audit>-` branches. The
+    branch and the stamp both admit the other job's; the repository does not."""
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, "gke-agentic/kube-agents-evals-9-infra")
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "in a repository other than this job's" in res.reason
+
+
+def test_a_stream_without_the_jobs_repository_measures_from_the_run(
+    token, github, stream, monkeypatch
+):
+    """A lease whose GitOps repository did not resolve exports none; the
+    window must not widen to every pool repository."""
+    monkeypatch.delenv(verifiers.STREAM_REPO_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert f"{verifiers.STREAM_REPO_ENV_VAR} is not" in res.reason
+
+
+def test_the_remediation_branch_prefix_matches_group_branch_for():
+    """REMEDIATION_BRANCH_PREFIX copies the literal in audit_report.py's
+    `group_branch_for`, which cannot be imported here; a drift would grade every
+    stream pull request `fail` with nothing red in this suite."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (prefix,) = set(re.findall(r'f"(platform-agent/[a-z-]+)\{audit_id\}-', script.read_text()))
+    assert prefix == verifiers.REMEDIATION_BRANCH_PREFIX
+
+
+@pytest.mark.parametrize("raw", ["", "soon", "-5", "inf", "nan"])
+def test_without_a_readable_stream_stamp_the_option_measures_from_the_run(
+    token, github, stream, monkeypatch, raw
+):
+    """A direct devops-bench run exports no stamp, and an unreadable one is not a licence."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, raw)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+    assert f"{verifiers.STREAM_STARTED_ENV_VAR} is missing or unreadable" in res.reason
 
 
 def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):
@@ -2275,6 +2846,373 @@ def test_a_pull_url_over_an_issue_number_is_a_fail(token, github):
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "is an issue, not a pull request" in res.reason
+
+
+def _closed_from(ref: str = "platform-agent/fix") -> str:
+    return (
+        f"https://api.github.com/repos/gke-agentic/{_PR_REPO}/pulls"
+        f"?state=closed&head=gke-agentic:{ref.replace('/', '%2F')}&per_page=100"
+    )
+
+
+def _closed_six() -> dict:
+    return {"number": 6, "created_at": "2026-08-21T09:00:10Z", "state": "closed",
+            "head": {"sha": "c" * 40}}
+
+
+def _commits_of(number: int = 7, page: int = 1) -> str:
+    # On `_pr_api`, the spelling `_pr_head_routes` uses, so a test that routes
+    # both is seen to route one URL.
+    return f"{_pr_api('pulls', number)}/commits?per_page=100&page={page}"
+
+
+def _stash_spent_report(github) -> None:
+    """The case's reply, which names both: the closed pull request and the open one."""
+    _stash_pr_report(
+        f"Closed: https://github.com/gke-agentic/{_PR_REPO}/pull/6\nOpen: {_PR_URL}"
+    )
+    github.routes[_pr_api(number=6)] = (200, _closed_six() | {"pull_request": {}})
+
+
+def test_a_second_proposal_on_a_name_this_run_spent_passes(token, github):
+    """#1918's case: close a pull request, then propose again under its branch."""
+    _stash_spent_report(github)
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "closed pull request had used" in res.reason
+    # The head ref comes from the pulls payload `_head_push` already read.
+    assert [url for url, _ in github.calls].count(_pr_api("pulls")) == 1
+
+
+def test_a_report_that_leaves_the_closed_proposal_out_is_a_fail(token, github):
+    """Right on the forge, but the reply names only the open one. The inject
+    lane's write safeguard would red the closed one as a write nobody asked
+    for, so the objective does not pass what the safeguard fails."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "does not name #6" in res.reason
+
+
+def test_two_closed_proposals_at_one_revision_must_both_be_named(token, github):
+    """Opened, closed, opened again from the unpushed branch and closed: both
+    share a head. The report names only one of them, so the other is a write
+    the inject lane's safeguard reds, and the objective fails it too."""
+    _stash_spent_report(github)
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    # The named one listed last, where keying the closed ones by revision
+    # would keep it and drop #5.
+    github.routes[_closed_from()] = (200, [_closed_six() | {"number": 5}, _closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "does not name #5" in res.reason
+
+
+def test_a_second_proposal_built_on_the_closed_one_is_a_fail(token, github):
+    """The same name reached by cloning the spent branch and adding to it: the
+    closed proposal's revision rides along into the new one."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": "c" * 40}, {"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail"
+    assert "added to rather than cleared" in res.reason
+
+
+def test_an_earlier_closed_proposal_riding_along_is_a_fail(token, github):
+    """Two proposals opened and closed on the name this run, newest first as
+    GitHub lists them. The new one leaves the second's revision out but builds
+    on the first's, which is the closed change back under review all the same."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    second = {"number": 6, "created_at": "2026-08-21T09:00:20Z", "state": "closed",
+              "head": {"sha": "d" * 40}}
+    first = {"number": 5, "created_at": "2026-08-21T09:00:10Z", "state": "closed",
+             "head": {"sha": "c" * 40}}
+    github.routes[_closed_from()] = (200, [second, first])
+    github.routes[_commits_of()] = (200, [{"sha": "c" * 40}, {"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "closed pull request #5" in res.reason
+
+
+def test_a_closed_revision_past_the_first_page_of_commits_is_a_fail(token, github):
+    """A clone of the spent branch with a hundred commits added: the listing is
+    oldest first, so the closed revision is on page 1 only when the branch is
+    short. Here it sits on page 2 behind a hundred earlier commits."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": f"{i:040x}"} for i in range(100)])
+    github.routes[_commits_of(page=2)] = (200, [{"sha": "c" * 40}, {"sha": "f" * 40}])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "added to rather than cleared" in res.reason
+
+
+_SPENT_BRANCH_CASE = TASKS / "vcs-spent-branch-reuse" / "task.yaml"
+
+
+def _route_patterns() -> list[str]:
+    spec = yaml.safe_load(_SPENT_BRANCH_CASE.read_text())
+    entries = [
+        e for e in spec["verification_spec"]
+        if e["name"] == "the-forge-was-reached-without-a-cli"
+    ]
+    assert len(entries) == 1, _SPENT_BRANCH_CASE
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr close 5",
+        "cd /workspace/infra && gh pr list --state closed",
+        "timeout 60 gh pr close 5",
+        'bash -c "gh pr close 5"',
+        "state=$(gh pr view 5 --json state)",
+        "cd /workspace/infra\ngh pr close 5",
+        "timeout 60 git push origin :platform-agent/fix",
+        "python3 credential_proxy_client.py gh pr close 5",
+        'python3 credential_proxy_client.py --endpoint "$CREDENTIAL_PROXY_URL" gh pr close 5',
+        "python3 credential_proxy_client.py --endpoint=http://127.0.0.1:8080 git push origin :b",
+        "/opt/credential-proxy/bin/gh pr close 5",
+        "/usr/bin/gh pr close 5",
+        "cd /workspace/infra && ./gh pr close 5",
+        "/opt/credential-proxy/bin/git push origin :platform-agent/fix",
+        "timeout 60 /usr/bin/git push origin :platform-agent/fix",
+        # git's global options before the subcommand.
+        "git -C /workspace/infra push origin :platform-agent/fix",
+        "cd /workspace/infra && git -C . push origin :platform-agent/fix",
+        "git --git-dir=/workspace/infra/.git push origin :platform-agent/fix",
+        "git -c http.extraheader=x push origin :platform-agent/fix",
+        # A path that starts at the sanctioned git and resolves to the shim.
+        "/opt/vcs/libexec/../../credential-proxy/bin/git push origin :platform-agent/fix",
+        "GH_TOKEN=x gh pr close 5",
+        # Wrappers that take options, and the one-line shell keywords.
+        "timeout -k 5 60 gh pr close 5",
+        "nice -n 10 gh pr close 5",
+        "env -i gh pr close 5",
+        "sudo -u agent gh pr close 5",
+        "exec -a x gh pr close 5",
+        "if gh pr view 5 --json state | grep -q CLOSED; then gh pr close 5; fi",
+        "for n in 5 6; do gh pr close $n; done",
+        '[ -n "$x" ] && { gh pr close 5; }',
+        'eval "gh pr close 5"',
+        "gh pr list --json number | xargs gh pr close",
+        "gh pr view 5 --json number -q .number | xargs -n 1 gh pr close",
+        "! gh pr view 5",
+        'bash -lc "gh pr close 5"',
+        "if ! git push origin :platform-agent/fix; then echo refused; fi",
+        "/bin/bash -e -c 'gh pr close 5'",
+        # The proxy client after a bare `--`, and run as a module.
+        "python3 credential_proxy_client.py -- gh pr close 5",
+        "cd /opt/defaults/scripts && python3 -m credential_proxy_client gh pr close 5",
+        # A quoted or escaped name runs the same binary; it only skips an alias.
+        '"gh" pr close 5',
+        "'gh' pr close 5",
+        "\\gh pr close 5",
+        '"/opt/credential-proxy/bin/gh" pr close 5',
+        '"/opt/credential-proxy/bin/git" push origin :platform-agent/fix',
+        "\\git push origin :platform-agent/fix",
+        "command gh pr close 5",
+        "command -p gh pr close 5",
+        # The client under the name the sandbox installs it as, and its route
+        # without the client.
+        "credential-proxy-exec gh pr close 5",
+        "/usr/local/bin/credential-proxy-exec git push origin :platform-agent/fix",
+        'curl -X POST "$CREDENTIAL_PROXY_URL/v1/exec" -H "Authorization: Bearer $(cat $CREDENTIAL_PROXY_TOKEN_FILE)" -d \'{"requestId":"x","argv":["gh","pr","close","5"]}\'',
+        "python3 - <<'EOF'\nimport json, os, urllib.request\nurl = os.environ['CREDENTIAL_PROXY_URL'] + '/v1/exec'\nEOF",
+        # A wrapper named by path.
+        "/usr/bin/env gh pr close 5",
+        "/usr/bin/timeout 60 gh pr close 5",
+        "/usr/bin/env -i /usr/bin/git push origin :platform-agent/fix",
+        "setsid gh pr close 5",
+        "ionice -c3 gh pr close 5",
+        "stdbuf -oL /usr/bin/git push origin :platform-agent/fix",
+        # A quoted value with a space in it, before the command or the subcommand.
+        'git -c user.name="Platform Agent" push origin :platform-agent/fix',
+        "git -c 'user.name=Platform Agent' push origin :platform-agent/fix",
+        'GIT_COMMITTER_NAME="Platform Agent" git push origin :platform-agent/fix',
+        'GH_PAGER="less -R" gh pr close 5',
+        'git --git-dir="/workspace/my infra/.git" push origin :platform-agent/fix',
+    ],
+)
+def test_the_spent_branch_route_check_sees_every_spelling_of_the_cli(command):
+    assert any(re.search(p, command) for p in _route_patterns()), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 /opt/vcs/vcs.py remote-branch delete platform-agent/fix --revision abc",
+        "python3 /opt/vcs/vcs.py clone gke-agentic/infra",
+        "python3 submit_suggestion.py prepare --branch platform-agent/fix",
+        "git -C /workspace/infra commit -am 'scale web'",
+        "git status && git log --oneline -3",
+        "python3 credential_proxy_client.py kubectl get pods -n web",
+        "credential-proxy-exec kubectl get pods -n web",
+        # Markdown in prose: a backtick is not a command position.
+        'python3 $S submit --branch platform-agent/fix --body "Closed the first with \\`gh pr close\\`, then reopened"',
+        "python3 $S submit --branch platform-agent/fix --title 'Publishing was refused (`git push` non-fast-forward)'",
+        # The sanctioned local git, which has no route to a forge.
+        "/opt/vcs/libexec/git -C /workspace/infra push origin platform-agent/fix",
+        "cd /workspace/infra && /opt/vcs/libexec/git fetch origin",
+        # Free prose on the command line is not a route.
+        'python3 /opt/vcs/vcs.py commit -m "git push was refused as BRANCH_DIVERGED, cleared the spent branch"',
+        "python3 submit_suggestion.py publish --title 'Second proposal after gh pr close'",
+        'python3 /opt/vcs/vcs.py commit -m "retry if git push is refused, then gh pr close"',
+        # Counting its own log is not a route; only a shell's -c runs its string.
+        'grep -c "gh pr" /workspace/run.log',
+        "grep -c 'git push' notes.txt",
+        # The sanctioned git with a doubled slash is still the sanctioned git.
+        "//opt/vcs/libexec/git push origin platform-agent/fix",
+        "/opt/vcs/libexec//git push origin platform-agent/fix",
+        '"/opt/vcs/libexec/git" push origin platform-agent/fix',
+        # Asking whether the binary exists runs nothing.
+        "command -v gh 2>/dev/null || echo missing",
+        "command -V gh && python3 /opt/vcs/vcs.py status",
+    ],
+)
+def test_the_spent_branch_route_check_passes_the_verbs(command):
+    assert not any(re.search(p, command) for p in _route_patterns()), command
+
+
+def test_the_spent_branch_route_check_is_linear_on_a_long_proxied_command():
+    # A run of `--` flags straight after the client and no CLI: the earlier
+    # pattern tried every way to split each into `-` or `--` and a name, and
+    # the run into flags and values -- sixteen took seven seconds, each two
+    # more about four times that.
+    command = "python3 credential_proxy_client.py " + " ".join(
+        f"--p{i}" for i in range(20)
+    )
+    began = time.monotonic()
+    assert not any(re.search(p, command) for p in _route_patterns())
+    assert time.monotonic() - began < 1.0
+
+
+def test_the_spent_branch_route_check_is_linear_on_a_long_wrapper_run():
+    # Wrappers with options, and nothing after them. An option's value may not
+    # be a wrapper's name; before that rule `env -i env -i ...` could split
+    # each `env` as a value or a wrapper, and doubled in time every two.
+    command = (
+        "env -i " * 40 + "nice -n 1 " * 20 + "command -p " * 20
+        + "/usr/bin/env -i /usr/bin/env " * 20 + "setsid ionice -c3 stdbuf -oL " * 20
+        + "true"
+    )
+    began = time.monotonic()
+    assert not any(re.search(p, command) for p in _route_patterns())
+    assert time.monotonic() - began < 1.0
+
+
+def test_the_spent_branch_route_check_is_linear_on_long_quoted_values():
+    # Quoted values and assignments, then no push: each value is one shell
+    # word, so there is one way to read it.
+    command = 'A="x y" ' * 40 + "git " + '-c k="a b" ' * 40 + "status"
+    began = time.monotonic()
+    assert not any(re.search(p, command) for p in _route_patterns())
+    assert time.monotonic() - began < 1.0
+
+
+def test_unreadable_commits_of_the_second_proposal_are_an_error(token, github):
+    # A pulls payload with no commit total, so `_head_push` reads no page and
+    # the 403 is `_spent_before`'s own.
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (403, {"message": "Resource not accessible by integration"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert "listing the commits of" in res.reason
+    assert "pull_requests: read" in res.reason
+    assert _closed_from() in [url for url, _ in github.calls]
+
+
+def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
+    """`_head_push` already read the whole listing of a one-page proposal to
+    date its head; the revision clause reuses it."""
+    _stash_spent_report(github)
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert [url for url, _ in github.calls].count(_commits_of()) == 1
+
+
+def test_the_revision_clause_reads_the_pages_the_commit_total_names(token, github):
+    """Two full pages and a total of 200: there is no third page to read, and
+    reading one blind would error the check on GitHub's 404."""
+    _stash_spent_report(github)
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (
+        200,
+        {"number": 7, "changed_files": 3, "commits": 200,
+         "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA}},
+    )
+    github.routes[_closed_from()] = (200, [_closed_six()])
+    github.routes[_commits_of()] = (200, [{"sha": f"{i:040x}"} for i in range(100)])
+    github.routes[_commits_of(page=2)] = (
+        200,
+        [{"sha": f"{i:040x}"} for i in range(100, 199)]
+        + [{"sha": _PR_HEAD_SHA, "commit": {"committer": {"date": "2026-08-21T09:00:20Z"}}}],
+    )
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    urls = [url for url, _ in github.calls]
+    assert _commits_of(page=3) not in urls
+    # The head's page, which `_head_push` already read, is not read again.
+    assert urls.count(_commits_of(page=2)) == 1
+
+
+def test_the_same_change_on_a_fresh_branch_is_a_fail(token, github):
+    """What a worker refused the spent name does: a real pull request, written
+    this run, on a branch nothing closed. Every other clause passes it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    github.routes[_pr_api("pulls")] = (200, _pr_payload(as_issue=False))
+    github.routes[_closed_from()] = (200, [])
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not a second proposal on a spent name" in res.reason
+    # Off by default: the remediation cases grade the pull request alone.
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_name_spent_by_an_earlier_run_does_not_count(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(as_issue=False))
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (
+        200,
+        [{"number": 3, "created_at": "2026-08-20T09:00:00Z", "state": "closed"}],
+    )
+    assert _pr_check(reuses_spent_branch=True).verify(5.0).status == "fail"
+
+
+def test_an_unlistable_branch_history_is_an_error_not_a_fail(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload(as_issue=False))
+    _pr_head_routes(github)
+    github.routes[_closed_from()] = (403, {"message": "Resource not accessible"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
 
 
 def test_a_pull_request_outside_the_eval_org_is_rejected_unasked(token, github):
@@ -2644,3 +3582,252 @@ def test_no_task_still_grades_a_pull_request_by_substring():
         "report_contains cannot tell this run's pull request from a previous "
         f"rep's; use pull_request_opened: {offenders}"
     )
+
+
+# The read-only reports case lets a worker read through `gh`, so its
+# enumerated write forms are the whole guard; read them out of the task file.
+_PAST_RUN = TASKS / "fleet-audit-reports-past-run" / "task.yaml"
+_PAST_RUN_OBJECTIVE = "the-store-was-queried"
+# Each runs the query script: the recorded greens' two paths, the SKILL.md's
+# relative one, and the script run from its own directory.
+_STORE_QUERIES = [
+    "python3 ./skills/fleet-audit-reports/scripts/report_query.py streams",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit",
+    "python3 scripts/report_query.py --root /tmp/r show compliance-audit",
+    "cd scripts && python3 report_query.py findings compliance-audit",
+    "python -u report_query.py runs compliance-audit",
+]
+# Each only names the script.
+_STORE_QUERY_MENTIONS = [
+    "grep -n 'report_query.py show' ./skills/fleet-audit-reports/SKILL.md",
+    'echo "report_query.py streams"',
+    "cat ./skills/fleet-audit-reports/SKILL.md",
+]
+
+
+def _past_run_required():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_OBJECTIVE]
+    assert len(entries) == 1, f"{_PAST_RUN_OBJECTIVE} is not in {_PAST_RUN}"
+    return entries[0]["check"]["required_patterns"]
+
+
+@pytest.mark.parametrize("command", _STORE_QUERIES)
+def test_the_past_run_objective_matches_every_query(command):
+    assert any(re.search(p, command) for p in _past_run_required()), command
+
+
+@pytest.mark.parametrize("command", _STORE_QUERY_MENTIONS)
+def test_the_past_run_objective_ignores_a_mention(command):
+    assert not any(re.search(p, command) for p in _past_run_required()), command
+
+
+_PAST_RUN_SAFEGUARD = "nothing-was-run-or-published"
+# Each writes to the ledger issue or a remediation pull request, through gh or
+# git. `gh api` defaults to POST once a field is supplied.
+_LEDGER_WRITES = [
+    "gh api repos/o/r/issues/3/comments -f body=hi",
+    "gh api repos/o/r/issues/3 -F state=closed",
+    "gh api repos/o/r/issues/3/comments --raw-field body=hi",
+    "gh api repos/o/r/issues/3 --input body.json",
+    "gh api -iX POST repos/o/r/issues/3/comments",
+    "gh api --method=PATCH repos/o/r/issues/3",
+    "gh api -XDELETE repos/o/r/issues/comments/9",
+    "gh pr review 3 --approve",
+    "gh pr ready 3",
+    "gh issue transfer 3 o/other",
+    "gh issue pin 3",
+    "gh issue unlock 3",
+    "cd /tmp && gh api repos/o/r/issues/3/comments --field body=hi",
+    # Behind a wrapper: the proxy's rule has no start anchor, and neither may this.
+    'timeout 120 gh issue comment 3 -b "done"',
+    "env GH_PAGER= gh pr close 8",
+    'bash -lc "gh issue close 3"',
+    "echo 8 | xargs gh pr close",
+    "timeout 60 gh api repos/o/r/issues/3/comments -f body=hi",
+    "env X=1 gh api -X PATCH repos/o/r/issues/3",
+    # The repository flag gh accepts between the command and its verb.
+    "gh issue -R acme/fleet close 3",
+    "gh pr --repo=acme/fleet comment 8 -b x",
+    "gh -R acme/fleet issue edit 3 --body x",
+    # The git route to a remediation pull request's branch.
+    "git push origin fleet-audit/cost-fix",
+    "git push -f origin HEAD:fleet-audit/cost-fix",
+    "git -C /opt/data/gitops push origin fleet-audit/cost-fix",
+    "git -c user.name=x commit -am fix",
+    "git --no-pager commit -m fix",
+    "cd /opt/data/gitops && git commit -m fix && git push",
+    "timeout 60 git push origin fleet-audit/cost-fix",
+]
+# What the recorded greens ran, and `gh` reads a worker may make.
+_READS = [
+    "python3 scripts/report_query.py streams",
+    "python3 /opt/skills/fleet-audit-reports/scripts/report_query.py show fleet-wide-cost-analysis --repo acme/fleet",
+    "gh api repos/o/r/issues/3",
+    "gh api -X GET search/issues -f q=repo:o/r",
+    "gh api --method GET repos/o/r/issues -F per_page=100",
+    "gh api repos/o/r/pulls --paginate --jq '.[].number'",
+    "gh issue view 3",
+    "gh pr list",
+    "timeout 60 gh issue view 3 --comments",
+    "gh issue -R acme/fleet view 3",
+    "gh pr list --state closed",
+    'gh issue list --search "is:open close"',
+    "gh issue list --search close --repo acme/fleet",
+    'gh search issues "pr close" --repo acme/fleet',
+    # git reads, including ones whose arguments name a write verb.
+    "git -C /opt/data/gitops log --oneline -5",
+    "git log --grep push",
+    "git show HEAD --stat",
+    "git status",
+]
+
+
+def _past_run_forbidden():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_SAFEGUARD]
+    assert len(entries) == 1, f"{_PAST_RUN_SAFEGUARD} is not in {_PAST_RUN}"
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize("command", _LEDGER_WRITES)
+def test_the_past_run_safeguard_catches_every_ledger_write_form(command):
+    assert any(re.search(p, command) for p in _past_run_forbidden()), command
+
+
+@pytest.mark.parametrize("command", _READS)
+def test_the_past_run_safeguard_lets_reads_through(command):
+    assert not any(re.search(p, command) for p in _past_run_forbidden()), command
+
+
+_PAST_RUN_ENVELOPE_SAFEGUARD = "the-envelope-was-not-read-whole"
+# The store root audit_report.REPORTS_DIR defaults to.
+_STORE = "/opt/data/fleet-audit/reports/fleet-wide-cost-analysis/acme/fleet"
+# Each prints a whole envelope: the findings document and the ledger body.
+_WHOLE_ENVELOPE_READS = [
+    f"cat {_STORE}/latest.json",
+    f"head -n 40 {_STORE}/runs/20260929T010000Z.json",
+    f"cd /tmp && tail {_STORE}/latest.json",
+    # Behind a wrapper, which is why the pattern has no start anchor.
+    f"timeout 30 cat {_STORE}/latest.json",
+    f"sudo cat {_STORE}/latest.json",
+    # The file named before the command that prints it.
+    f"find {_STORE} -name latest.json -exec cat {{}} \\;",
+    f"find {_STORE}/runs -name '*.json' -exec /bin/cat {{}} +",
+    f"ls {_STORE}/runs/*.json | xargs cat",
+    f"find {_STORE} -name latest.json | xargs -0 head -c 4000",
+    f"cd {_STORE}/runs && cat 2026*.json",
+    "cd runs; less *.json",
+    # Filters that pass the whole file through, and the other printers.
+    f"jq . {_STORE}/latest.json",
+    f"jq '.' {_STORE}/latest.json",
+    f"jq -C . {_STORE}/runs/20260929T010000Z.json",
+    f"jq '' {_STORE}/latest.json",
+    f"jq . < {_STORE}/latest.json",
+    f"python3 -m json.tool {_STORE}/latest.json",
+    f"python -m json.tool {_STORE}/latest.json",
+    f"grep '' {_STORE}/latest.json",
+    f"grep -h '' {_STORE}/runs/20260929T010000Z.json",
+    f"sed -n p {_STORE}/latest.json",
+    f"sed '' {_STORE}/latest.json",
+    f"awk 1 {_STORE}/latest.json",
+    f"awk '{{print}}' {_STORE}/latest.json",
+    f"nl {_STORE}/latest.json",
+    f"bat {_STORE}/latest.json",
+    # One key, but the key is the payload.
+    f"jq .document {_STORE}/latest.json",
+    f"jq -r .ledger_body {_STORE}/latest.json",
+    f"jq -c '.document' {_STORE}/runs/20260929T010000Z.json",
+    f'jq -r ".ledger_body" {_STORE}/latest.json',
+    f"jq .ledger_document < {_STORE}/latest.json",
+]
+# What the recorded greens ran, and projections of one key.
+_ENVELOPE_PROJECTIONS = [
+    "python3 scripts/report_query.py streams",
+    "python3 /opt/skills/fleet-audit-reports/scripts/report_query.py show fleet-wide-cost-analysis --repo acme/fleet",
+    "python3 scripts/report_query.py runs fleet-wide-cost-analysis --repo acme/fleet",
+    f"jq .status {_STORE}/latest.json",
+    f"ls {_STORE}/runs",
+    f"cd {_STORE}/runs && ls",
+    f"jq -r .status {_STORE}/latest.json",
+    f"jq '.status' {_STORE}/latest.json",
+    f"grep -c FINDINGS {_STORE}/latest.json",
+    # Bounded reads of the payload keys.
+    f"jq '.document.findings | length' {_STORE}/latest.json",
+    f"jq -r .document_sha {_STORE}/latest.json",
+    f"jq '.ledger_body | length' {_STORE}/latest.json",
+]
+
+
+def _past_run_envelope_forbidden():
+    spec = yaml.safe_load(_PAST_RUN.read_text())
+    entries = [
+        e for e in spec["verification_spec"] if e["name"] == _PAST_RUN_ENVELOPE_SAFEGUARD
+    ]
+    assert len(entries) == 1, f"{_PAST_RUN_ENVELOPE_SAFEGUARD} is not in {_PAST_RUN}"
+    return entries[0]["check"]["forbidden_patterns"]
+
+
+@pytest.mark.parametrize("command", _WHOLE_ENVELOPE_READS)
+def test_the_envelope_safeguard_catches_every_whole_read(command):
+    assert any(re.search(p, command) for p in _past_run_envelope_forbidden()), command
+
+
+@pytest.mark.parametrize("command", _ENVELOPE_PROJECTIONS)
+def test_the_envelope_safeguard_lets_projections_through(command):
+    assert not any(
+        re.search(p, command) for p in _past_run_envelope_forbidden()
+    ), command
+
+
+_ACK_CASE = TASKS / "chat-voice-ack-names-target" / "task.yaml"
+_ACK_VOICE_OBJECTIVES = ("the-ack-is-not-a-receipt", "no-apology-or-sign-off-in-the-ack")
+_ACK_RESULT = (
+    "Result of delegated task t_cc52a43d:\n"
+    "checkout-gateway is not crashlooping. I delegated to the cluster agent; "
+    "let me know if you want the logs."
+)
+
+
+def _ack_voice_patterns() -> list[str]:
+    spec = yaml.safe_load(_ACK_CASE.read_text())
+    entries = [e for e in spec["verification_spec"] if e["name"] in _ACK_VOICE_OBJECTIVES]
+    assert len(entries) == len(_ACK_VOICE_OBJECTIVES), _ACK_CASE
+    return [p for e in entries for p in e["check"]["forbidden_patterns"]]
+
+
+def _ack_voice_hits(final_message: str) -> list[str]:
+    text = verifiers._normalize_lines(final_message)
+    return [p for p in _ack_voice_patterns() if re.search(p, text)]
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        # The old receipt, which is two paragraphs of its own.
+        "> 🔀 Delegated to the **platform** agent\n\n"
+        "I've started this as task `t_cc52a43d`. The answer will post into this thread.",
+        # A clean ack line with the receipt or a sign-off after a blank line.
+        "checking checkout-gateway.\n\n> 🔀 Delegated to the **platform** agent\n\n"
+        "I've started this as task `t_cc52a43d`. The answer will post into this thread.",
+        "checking checkout-gateway.\n\nlet me know if you'd like anything else.",
+        f"checking checkout-gateway.\n\nsorry for the wait.\n\n{_ACK_RESULT}",
+        f"checking checkout-gateway.\n\nI've started task t_cc52a43d.\n\n{_ACK_RESULT}",
+    ],
+)
+def test_the_ack_voice_objectives_read_the_whole_closing_message(final_message):
+    assert _ack_voice_hits(final_message), final_message
+
+
+@pytest.mark.parametrize(
+    "final_message",
+    [
+        "checking checkout-gateway.",
+        f"checking checkout-gateway.\n\n{_ACK_RESULT}",
+        "checking checkout-gateway.\n\n"
+        "Artifact rca.md produced by delegated task t_cc52a43d:\n"
+        "delegated to the cluster agent; sorry, the answer will post later.",
+    ],
+)
+def test_the_ack_voice_objectives_stop_at_the_delivered_sections(final_message):
+    assert not _ack_voice_hits(final_message), final_message

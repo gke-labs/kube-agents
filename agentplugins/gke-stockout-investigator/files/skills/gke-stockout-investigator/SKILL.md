@@ -83,7 +83,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 2. **Get a working copy.** The pod is not a git checkout. `submit_suggestion.py prepare` brings the GitOps repository down onto this filesystem, stands you on the remediation branch, and prints one JSON line:
 
    ```bash
-   ./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+   python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
      --repo "<owner>/<repo>" \
      --branch "platform-agent/remediate-stockout-<workload_name>"
    ```
@@ -101,18 +101,25 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    **Keep that whole line — every step from here works inside `workspace`.**
 
-   **If `prepare` refuses the branch name**, it is because an earlier
-   remediation pull request for this same workload was closed, or merged in a
-   way that did not carry its last revision into the base — a squash merge, the
-   ordinary setting on a GitOps repository. The name is one per workload, so a
-   repeat alert reaches this every time. Step 2's duplicate check has already
-   established that no pull request for this workload is open, so nothing is
-   being overwritten;
-   what is unknown is whether the forge still holds the branch, and no read verb
-   can say. Re-run the command with `--allow-reused-branch`, which says the
-   name is free; if the remote does still hold the branch, Step 7 refuses the
-   publish as `BRANCH_DIVERGED`, and the branch has to be deleted on the forge
-   before this workload can be remediated again. Report that and stop.
+   **A repeat alert reuses the name.** It is one per workload, so an earlier
+   remediation pull request for this workload that was closed or squash-merged
+   left its branch behind. `prepare` deletes that spent branch itself and says
+   so in its log; nothing is needed from you.
+
+   **If `prepare` refuses the branch name**, it names the code. `NOT_SPENT`:
+   the old branch holds revisions no closed pull request carried.
+   `BRANCH_NOT_OURS`: the closed pull request on it was not this install's, or
+   it has carried a full page of pull requests, too many to read, or an open
+   pull request targets it. Treat those
+   revisions as somebody's. Report the refusal, its code and the branch,
+   and stop. `BRANCH_MOVED` (something pushed to it just now), `OPEN_PROPOSAL` (a pull
+   request was opened on it just now; the next run adds to it), and
+   `FORGE_CALL_FAILED`, `GIT_FAILED` or a refusal with no code (the delete did
+   not complete) all mean run `prepare` once more before reporting.
+   `FORGE_RATE_LIMITED` or `FORGE_UNAVAILABLE` (the forge turned the delete
+   away for now) means wait a few minutes, then run `prepare` once more.
+   Any other refusal: report it and stop. The helper's own message may suggest
+   another name; for this skill the name is fixed.
 
    **Do not put a suffix on the name to get past the refusal.** The duplicate
    check in Step 2 §A asks the forge about
@@ -122,9 +129,9 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    One name per workload is what makes the duplicate check a check.
 
    > [!CAUTION]
-   > **Every version-control command from here on runs inside the printed `workspace`, and through the credential-free binary `/opt/vcs/libexec/git`.** Export it once — `export G=/opt/vcs/libexec/git` — and use `$G` for `add`, `commit`, `diff` and every other local verb. Plain `git` on this machine is a different program that reaches the network holding a credential; running it is a security error rather than a retryable failure. Do not alias it: each command arrives in a fresh non-interactive shell, which never expands aliases. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
+   > **Every version-control command from here on runs inside the printed `workspace`, and through the credential-free binary `/opt/vcs/libexec/git`.** Call it by that full path for `add`, `commit`, `diff` and every other local verb. Plain `git` on this machine is a different program that reaches the network holding a credential; running it is a security error rather than a retryable failure. Do not put the path in a shell variable or an alias: the command scanner refuses a command whose program is a variable (`$G add`), and in an unattended run that refusal is final; each command also arrives in a fresh non-interactive shell, which never expands aliases. There is no shared clone to work in either — `/opt/data/workspace` and any other invented path will be rejected.
 
-   `prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `$G checkout main`, `$G pull` or `$G checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
+   `prepare` has already brought the repository down and cut the branch from the repository's own default branch (`base`), so do **not** run a separate token refresh, `/opt/vcs/libexec/git checkout main`, `/opt/vcs/libexec/git pull` or `/opt/vcs/libexec/git checkout -b`. The copy has no remote to fetch from; the revisions go back up in Step 7.
 
 3. **Search the workspace**: Locate the YAML manifests **inside the printed `workspace`** using targeted file searches (DO NOT use pattern `.*` or broad wildcard loops that paginate indefinitely):
    - For ComputeClass definitions, check `<workspace>/agents/platform/skills/gke-compute-classes/assets/` directly or use `search_files(pattern="compute-class")`.
@@ -194,7 +201,19 @@ If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot
        --format="json"
    ```
 
-_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), and capacity history (`gcloud beta compute advice capacity-history`), and report ALL executed `gcloud` and `kubectl` diagnostic commands in BOTH the chat notification (`send_notification`) and the Pull Request description.
+#### E. Autoscaler Status & Backoff Loop Verification
+
+To check if the cluster autoscaler is actively scaling, stalled, or stuck in a priority backoff reset loop:
+
+```bash
+kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
+```
+
+_Note: The `.data.status` field in this ConfigMap is a multi-line text block. Parse it as text, locate the `NodeGroups` section, and check if any groups show `BackoffInfo` with `BackoffUntil` timestamps._
+
+**RBAC Fallback:** If this command returns `Forbidden` or is otherwise unavailable, do not fail. Fall back to analyzing pod events for `NotTriggerScaleUp` or `FailedScheduling` events, and rely on `gcloud compute regions describe` and Spot capacity advice.
+
+_CRITICAL MANDATE_: You MUST execute the quota check (`gcloud compute regions describe`), Spot capacity advice (`gcloud beta compute advice capacity`), capacity history (`gcloud beta compute advice capacity-history`), and attempt the autoscaler status check (`kubectl get configmap cluster-autoscaler-status`), and report ALL executed `gcloud` and `kubectl` diagnostic commands (including failed/denied attempts) in BOTH the chat notification (`send_notification`) and the Pull Request description.
 
 ### 5. Diagnose Using ComputeClass Debugging Guidelines
 
@@ -232,17 +251,23 @@ Inspect the target `ComputeClass` and workload manifests in the printed `workspa
 - **Problem**: A workload requests more total resources (CPUs or GPUs) than the regional quota limit configured for the project in that region (e.g., requesting 32 L4 GPUs when `gcloud compute regions describe us-central1` shows the `NVIDIA_L4_GPUS` quota limit is 24).
 - **Fix**: Identify this explicitly as a **Regional Quota Exceeded Violation** in the diagnosis. Propose adjusting the workload deployment manifest to cap total requested GPUs/CPUs to fit strictly within the regional quota limit (e.g. reducing replicas from 4 to 3 so total GPUs = 24), and create a `ComputeClass` providing multi-zone fallback capabilities.
 
-#### Rule G: CCC Priority Starvation & Reset Loop (Excessive Granular Machine Types)
+#### Rule G: CCC Priority Starvation & Reset Loop (Excessive Granular Machine Types) [ccc-priority-starvation]
 
 > [!IMPORTANT]
 > **MANDATORY PRIORITY CHECK**: If a ComputeClass `priorities[]` list contains more than 10 granular `machineType` rules (e.g., 25 priority rules for specific machine shapes like `n2-standard-4`, `n2-standard-8`, etc.), this is a Rule G violation. You MUST NOT add more `machineType` rules. Instead, you MUST auto-compress the configuration by replacing ALL 25 granular `machineType` rules with 4 family-level (`machineFamily`) rules (e.g., `n4`, `c3`, `n2`, `e2`).
 
 - **Problem**: A Custom Compute Class (CCC) contains excessive granular `machineType` rules (e.g., 25 priority rules for specific machine shapes), exceeding Flex Advisor's cache limit (generating >200 combinations) and triggering a Cluster Autoscaler backoff reset loop. Lower-priority fallbacks (`n2`, `e2`) are starved and pods remain stuck in `Pending`.
+- **Diagnosis**:
+  1. **Static manifest check:** Inspect the `ComputeClass` manifest. If `spec.priorities` contains **more than 10 granular `machineType` rules**, or if total rule-to-zone permutations exceed Flex Advisor's 200-combination hard limit, flag as a Rule G violation. Note that `location.zones` is evaluated per priority rule (falling back to cluster default locations if omitted).
+  2. **Runtime status check:** Inspect the `cluster-autoscaler-status` ConfigMap output (or recent pod events if RBAC-denied). Identify if the node groups created for fallback priorities (e.g., `n2`, `e2`) show continuous `backoffInfo` blocks or if they are repeatedly failing to scale up, while the primary node group is retried over a long duration (>5 minutes). This indicates a shared-backoff reset loop.
 - **Fix**: Auto-compress the CCC configuration: Completely REPLACE the entire list of specific granular machine sizes (`machineType`) with 4 family-level definitions (`machineFamily`: `n4`, `c3`, `n2`, `e2`), reducing priority rules from 25 to 4 family-level priorities and avoiding the starvation loop.
 
-#### Rule H: Hyperdisk Incompatibility with Older Generation Machines
+#### Rule H: Hyperdisk Incompatibility with Older Generation Machines [ccc-hyperdisk-incompatible]
 
 - **Problem**: A workload using Hyperdisk (e.g. `hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`, or StorageClass with hyperdisk CSI provisioner) uses a CCC definition whose 1st choice is a 3rd/4th generation machine type (e.g. `c3-standard-4`, `c4-standard-4`), but has fallbacks to older generation machine types (e.g. `c2`, `n2`, `e2`). Once there is a stockout on the 1st choice, Cluster Autoscaler falls back to an incompatible machine type (`c2`, `n2`, `e2`) that does not support Hyperdisk, causing scale-up to fail.
+- **Diagnosis**:
+  1. **Storage volume check:** Check if the workload uses Hyperdisk storage (e.g., look for `hyperdisk-balanced`, `hyperdisk-throughput`, or `hyperdisk-extreme` in the `StorageClass` or `Volume` definitions).
+  2. **Incompatible fallback check:** Inspect the `ComputeClass` `priorities` list. If the workload uses Hyperdisk and the `priorities` list contains Gen 2 machine families (like `c2`, `n2`, or `e2`) as fallbacks, flag this as a Rule H violation.
 - **Fix**: Increase CCC fallback options to other machine families compatible with Hyperdisk (e.g. `c3`, `c4`, `n4`, `c3d`), and remove fallbacks which do not work with Hyperdisk (`c2`, `n2`, `e2`).
 
 ### 6. Create GitOps Remediation Proposal
@@ -258,7 +283,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 1. Apply the fixes to the ComputeClass or workload YAML files **inside `<workspace>`**.
    - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate stockouts.
 2. **Self-Review Step**:
-   - Run `cd <workspace> && $G diff` to inspect all proposed changes before committing.
+   - Run `cd <workspace> && /opt/vcs/libexec/git diff` to inspect all proposed changes before committing.
    - Verify that ONLY changes strictly necessary to mitigate the stockout are included (no unrelated formatting or whitespace edits).
    - Confirm that every updated YAML line includes the explanatory remediation comment.
 3. **Special Case (Major Changes / Migration)**: If migrating to another region or changing architecture (Rule E), do NOT just change files. You **must** also write a detailed migration playbook in `<workspace>/docs/migrations/stockout-<workload_name>-plan.md`. This plan must detail:
@@ -266,8 +291,8 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
    - Resource copy strategy (DBs, storage, persistent volumes).
    - Network routing/DNS cutover approach.
    - Rollout steps.
-4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && $G add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `$G add .`, `$G add -A`, or `$G commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
-5. Commit using a Conventional Commit message (e.g., `cd <workspace> && $G commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
+4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && /opt/vcs/libexec/git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `/opt/vcs/libexec/git add .`, `/opt/vcs/libexec/git add -A`, or `/opt/vcs/libexec/git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
+5. Commit using a Conventional Commit message (e.g., `cd <workspace> && /opt/vcs/libexec/git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
 
 ### 7. Submit Suggestion & Open PR
 
@@ -275,7 +300,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 
 **MANDATORY Summary Requirements**:
 
-- 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
+- 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
 - Do NOT omit the `Checks Performed` section or its code block.
 - Do NOT include any forge CLI commands in the summary or PR description. The `Checks Performed` block records diagnostics, not how the PR was opened.
 
@@ -295,6 +320,7 @@ cat > "$BODY" <<'EOF'
 ```bash
 # Diagnostic commands executed during analysis:
 kubectl describe pod <pod_name> -n <namespace>
+kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml
 gcloud compute regions describe us-central1 --format="json(quotas.filter(metric=NVIDIA_L4_GPUS))"
 gcloud beta compute advice capacity --provisioning-model=SPOT --instance-selection-machine-types="g2-standard-4,g2-standard-12" --target-distribution-shape=ANY --size=1 --region=us-central1 --format="json"
 gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-type=g2-standard-4 --types=PREEMPTION,PRICE --region=us-central1 --format="json"
@@ -303,7 +329,7 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 - **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
 EOF
 
-./skills/submit-suggestion/scripts/submit_suggestion.py submit \
+python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --repo "<owner>/<repo>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE stockout for <workload_name>" \
@@ -317,7 +343,7 @@ The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc exp
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
 
 ````json
-send_notification(message="🛠️ GKE Stockout Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
+send_notification(message="🛠️ GKE Stockout Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
 ````
 
 After calling the tool, provide the user with the generated PR URL and a summary of your findings.

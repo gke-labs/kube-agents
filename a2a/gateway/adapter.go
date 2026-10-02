@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -99,8 +100,11 @@ type Adapter interface {
 // TaskObserver is the optional extension an Adapter implements when it has to
 // answer questions ABOUT a task rather than only render one. The gateway type
 // asserts for it and calls it where it mints and retires tasks; an adapter
-// that does not implement it sees no change at all, which is every chat
-// backend — a human reads the chat, so the chat text is the whole interface.
+// that does not implement it sees no change at all, which is Discord and
+// Google Chat — a human reads the chat, so the chat text is the whole
+// interface. The Slack adapter implements it for TaskStarted and TaskTerminal, because
+// a task starting in a thread is what makes that thread a session thread and
+// the adapter has to know (see SessionLookup).
 //
 // The inject backend is the case that needs more. Its caller is a program: it
 // posts a message and has to know which task that started and when that task
@@ -247,10 +251,15 @@ const (
 // released the conversation on some turn is immaterial to that caller: it
 // keys every case and repetition to a fresh conversation.
 //
+// taskID names the task whose stream to read; "" reads the record's active
+// task. A caller that names one reads that task whether or not the record
+// still holds it as active -- the relay clears the active task when it
+// posts the terminal, and a finished run's trace is read after that.
+//
 // Called off the adapter's own request goroutine, never from a gateway
 // worker; it costs one KV read and one replay of the task's stream, so a
 // caller bounds ctx.
-type ConversationProbe func(ctx context.Context, conversation string) (ConversationState, error)
+type ConversationProbe func(ctx context.Context, conversation, taskID string) (ConversationState, error)
 
 // ProbeSink is the optional extension an Adapter implements to receive the
 // gateway's ConversationProbe. The gateway type asserts for it in New, the
@@ -258,6 +267,62 @@ type ConversationProbe func(ctx context.Context, conversation string) (Conversat
 // not implement it is never offered one.
 type ProbeSink interface {
 	SetProbe(ConversationProbe)
+}
+
+// SessionLookup answers whether the gateway has started a task in a
+// conversation and the session is not idle past the idle TTL, and, with a
+// true, the moment that answer stops being trustworthy. A running task
+// counts regardless of age: the conversation is a session for as long as
+// the task runs. Otherwise it is one only while its record shows activity
+// within the TTL.
+//
+// A record alone is not the answer, in either direction. One is minted for
+// any verified turn, including a "stop" with nothing running, so its
+// existence does not say a task started; and the reap keeps the record --
+// it deletes the idle session's pod and leaves the record, past tasks
+// included, and nothing deletes records at all -- so its existence does not
+// say the session is live either. The lookup reads the two facts the record
+// does carry, the active task and the last activity, and answers from
+// those. Running means what it means to the reap: an active task that is
+// not detached.
+//
+// It is a PURE READ of the session registry, like ConversationProbe: no
+// lock, no heal, no post, no write, one KV read.
+//
+// It exists because an adapter can be asked whether a conversation is one
+// the gateway is in before it has been told so on this process, or after it
+// has stopped being one. The Slack adapter's session-thread cache is process
+// memory: a thread the gateway adopted mid-conversation -- a verified
+// sender's mentioned ask in someone else's thread -- is forgotten on a
+// restart or a cache eviction, and its unmentioned follow-ups ("stop") have
+// no other source to be recognised from. The registry is the source of
+// truth for which conversations the gateway is in, so a cold cache asks it
+// first, and a positive entry that has expired asks it again.
+//
+// until is the registry's own bound on a true, handed back so the adapter's
+// cache expires when the answer does and not later: for an idle-bounded
+// session it is the last activity plus the TTL, the instant the registry
+// would begin answering false; for a running task, which has no bound, it
+// is a TTL from now, when the adapter asks again and is answered again. A
+// cache that stamped its own clock instead would hold a true for up to a
+// TTL past the registry's word whenever the message that made it ask moved
+// no activity -- one the gateway refused, an unmapped sender's. With a
+// false, until is the zero time and means nothing.
+//
+// The TTL is still handed over beside the lookup (SessionLookupSink): a
+// true the adapter writes on its own word (TaskStarted) has no registry
+// answer to take a bound from, and expires a TTL after the start.
+//
+// Called on the adapter's own event goroutine under the adapter's own
+// bound, never from a gateway worker.
+type SessionLookup func(ctx context.Context, conversation string) (held bool, until time.Time, err error)
+
+// SessionLookupSink is the optional extension an Adapter implements to
+// receive the gateway's SessionLookup and the idle TTL it is bounded by.
+// Wired in New the way ProbeSink is; an adapter that does not implement it
+// is never offered either.
+type SessionLookupSink interface {
+	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
 }
 
 // ConversationState is one read's answer: the record as it stands, plus the
@@ -273,9 +338,12 @@ type ConversationState struct {
 	// Grace is the gateway's FirstEventGrace: the window inside which an
 	// active task with nothing on its stream is legitimately pre-first-event.
 	Grace time.Duration
-	// Active is whether the record holds an active task; the four fields
-	// after it describe that task. Detached is one the gateway has already
-	// published a cancel for.
+	// TaskID is the task this read describes: the one the caller named,
+	// else the record's active task. Active is whether the record holds
+	// that task as its active one; SubmittedAt and the active-task fields
+	// after it describe the active task and are zero for a named task the
+	// record has released.
+	// Detached is one the gateway has already published a cancel for.
 	Active      bool
 	TaskID      string
 	SubmittedAt time.Time
@@ -305,4 +373,17 @@ type ConversationState struct {
 	TerminalSource TerminalSource
 	Result         string
 	Reason         string
+	// Activity is the task's tool-call trace as the stream holds it: the
+	// data part of every part of the activity artifact, in arrival order
+	// (stream order for an executor that appends to one artifact id),
+	// each one the executor's own JSON record of one tool invocation. Set
+	// whenever the task's stream was read, final or not, and non-nil then
+	// even with no calls -- nil means the stream was not read (no active
+	// task, or the read failed), and a caller telling "this executor
+	// called nothing" from "nobody looked" needs the two kept apart. The
+	// relay deliberately never posts it; this is the only way a caller
+	// sees it. Progress is the last text part of the progress artifact,
+	// which is the line the relay's rolling edit shows.
+	Activity []json.RawMessage
+	Progress string
 }

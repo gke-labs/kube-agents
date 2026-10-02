@@ -386,7 +386,7 @@ point the agent at a Hindsight service the install never deployed. Taking a
 default has to mean "keep what you have". An enterprise fleet that wants ranked
 recall is in a position to say so, and `--memory=hindsight` is how. Consequently
 `multiuser_memory` is the provider named wherever there is no install to ask — the
-CRD default, `common.sh`, and the Chat Agent's `config.yaml`. The specialist
+CRD default, `install.defaults.env`, and the Chat Agent's `config.yaml`. The specialist
 profile names no provider at all, because a file store has no gateway identity for
 a specialist to key on; see the overlay rule below.
 

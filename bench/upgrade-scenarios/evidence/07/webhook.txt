@@ -1,0 +1,50 @@
+
+## 2026-09-29T13:55:12Z [webhook/before-pods] K -n scen get pods -l app=guarded -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP          NODE                                 NOMINATED NODE   READINESS GATES
+guarded-7cf87d9df4-dnv4k   1/1     Running   0          63s   10.48.2.4   gke-upg-07-work-pool-5dbbaf69-kv6p   <none>           <none>
+guarded-7cf87d9df4-pvv9t   1/1     Running   0          63s   10.48.1.5   gke-upg-07-work-pool-5dbbaf69-p6jh   <none>           <none>
+## exit 0
+
+## 2026-09-29T13:55:13Z [webhook/create-by-hand] K -n scen run probe --image=registry.k8s.io/pause:3.9 --restart=Never
+Error from server (InternalError): Internal error occurred: failed calling webhook "gate.scen.example.com": failed to call webhook: Post "https://absent-hook.scen.svc:443/validate?timeout=5s": no endpoints available for service "absent-hook"
+## exit 1
+
+## 2026-09-29T14:13:50Z [webhook/after-pods] K -n scen get pods -l app=guarded -o wide
+No resources found in scen namespace.
+## exit 0
+
+## 2026-09-29T14:13:50Z [webhook/deploy] K -n scen get deploy guarded
+NAME      READY   UP-TO-DATE   AVAILABLE   AGE
+guarded   0/2     0            0           19m
+## exit 0
+
+## 2026-09-29T14:13:51Z [webhook/events] K -n scen get events --sort-by=.lastTimestamp -o custom-columns=T:.lastTimestamp,R:.reason,O:.involvedObject.name,M:.message
+T                      R                   O                          M
+2026-09-29T13:54:10Z   ScalingReplicaSet   guarded                    Scaled up replica set guarded-7cf87d9df4 from 0 to 2
+2026-09-29T13:54:10Z   SuccessfulCreate    guarded-7cf87d9df4         Created pod: guarded-7cf87d9df4-pvv9t
+2026-09-29T13:54:10Z   Scheduled           guarded-7cf87d9df4-dnv4k   Successfully assigned scen/guarded-7cf87d9df4-dnv4k to gke-upg-07-work-pool-5dbbaf69-kv6p
+2026-09-29T13:54:10Z   SuccessfulCreate    guarded-7cf87d9df4         Created pod: guarded-7cf87d9df4-dnv4k
+2026-09-29T13:54:10Z   Scheduled           guarded-7cf87d9df4-pvv9t   Successfully assigned scen/guarded-7cf87d9df4-pvv9t to gke-upg-07-work-pool-5dbbaf69-p6jh
+2026-09-29T13:54:12Z   Pulling             guarded-7cf87d9df4-dnv4k   Pulling image "registry.k8s.io/pause:3.9"
+2026-09-29T13:54:12Z   Pulling             guarded-7cf87d9df4-pvv9t   Pulling image "registry.k8s.io/pause:3.9"
+2026-09-29T13:54:21Z   Created             guarded-7cf87d9df4-pvv9t   Created container: web
+2026-09-29T13:54:21Z   Started             guarded-7cf87d9df4-pvv9t   Started container web
+2026-09-29T13:54:21Z   Pulled              guarded-7cf87d9df4-pvv9t   Successfully pulled image "registry.k8s.io/pause:3.9" in 1.799s (8.964s including waiting). Image size: 321520 bytes.
+2026-09-29T13:54:23Z   Started             guarded-7cf87d9df4-dnv4k   Started container web
+2026-09-29T13:54:23Z   Created             guarded-7cf87d9df4-dnv4k   Created container: web
+2026-09-29T13:54:23Z   Pulled              guarded-7cf87d9df4-dnv4k   Successfully pulled image "registry.k8s.io/pause:3.9" in 1.524s (11.549s including waiting). Image size: 321520 bytes.
+2026-09-29T14:03:41Z   Killing             guarded-7cf87d9df4-dnv4k   Stopping container web
+2026-09-29T14:03:41Z   Preempted           guarded-7cf87d9df4-dnv4k   Preempted by pod 08d85ce0-0845-45ac-bd5d-3654205e9de2 on node gke-upg-07-work-pool-5dbbaf69-kv6p
+2026-09-29T14:10:49Z   Killing             guarded-7cf87d9df4-pvv9t   Stopping container web
+2026-09-29T14:10:50Z   FailedCreate        guarded-7cf87d9df4         Error creating: Internal error occurred: failed calling webhook "gate.scen.example.com": failed to call webhook: Post "https://absent-hook.scen.svc:443/validate?timeout=5s": no endpoints available for service "absent-hook"
+## exit 0
+
+## 2026-09-29T14:13:51Z [webhook/fix] K delete validatingwebhookconfiguration fail-closed-gate
+validatingwebhookconfiguration.admissionregistration.k8s.io "fail-closed-gate" deleted
+## exit 0
+
+## 2026-09-29T14:14:37Z [webhook/after-fix] K -n scen get pods -l app=guarded -o wide
+NAME                       READY   STATUS    RESTARTS   AGE   IP          NODE                                 NOMINATED NODE   READINESS GATES
+guarded-7cf87d9df4-cq5k2   1/1     Running   0          14s   10.48.2.5   gke-upg-07-work-pool-5dbbaf69-tji5   <none>           <none>
+guarded-7cf87d9df4-pj58p   1/1     Running   0          14s   10.48.3.7   gke-upg-07-work-pool-5dbbaf69-z3d1   <none>           <none>
+## exit 0

@@ -1,0 +1,57 @@
+
+## 2026-09-29T14:57:13Z [placement/before] K -n scen get pods -l app in (same-node,spread) -o wide
+NAME                         READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+same-node-654495d894-flgw8   1/1     Running   0          63s   10.84.33.5   gke-upg-03b-work-pool-4d59afbc-zzk2   <none>           <none>
+same-node-654495d894-t7vqv   1/1     Running   0          63s   10.84.33.4   gke-upg-03b-work-pool-4d59afbc-zzk2   <none>           <none>
+spread-789f4fb6cd-w28nf      1/1     Running   0          61s   10.84.33.6   gke-upg-03b-work-pool-4d59afbc-zzk2   <none>           <none>
+spread-789f4fb6cd-zntwz      1/1     Running   0          61s   10.84.34.5   gke-upg-03b-work-pool-4d59afbc-hmdr   <none>           <none>
+## exit 0
+
+## 2026-09-29T14:57:14Z [placement/before-ready] K -n scen get deploy same-node spread
+NAME        READY   UP-TO-DATE   AVAILABLE   AGE
+same-node   2/2     2            2           64s
+spread      2/2     2            2           63s
+## exit 0
+
+## 2026-09-29T15:06:14Z [placement/before-pool] K -n scen get pods -l app in (same-node,spread) -o wide
+NAME                         READY   STATUS    RESTARTS   AGE   IP           NODE                                  NOMINATED NODE   READINESS GATES
+same-node-654495d894-flgw8   1/1     Running   0          10m   10.84.33.5   gke-upg-03b-work-pool-4d59afbc-zzk2   <none>           <none>
+same-node-654495d894-t7vqv   1/1     Running   0          10m   10.84.33.4   gke-upg-03b-work-pool-4d59afbc-zzk2   <none>           <none>
+spread-789f4fb6cd-w28nf      1/1     Running   0          10m   10.84.33.6   gke-upg-03b-work-pool-4d59afbc-zzk2   <none>           <none>
+spread-789f4fb6cd-zntwz      1/1     Running   0          10m   10.84.34.5   gke-upg-03b-work-pool-4d59afbc-hmdr   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:14:55Z [placement/summary-same-node] serving_summary placement
+samples=44 zero_serving=18
+2026-09-29T15:11:04Z /Pending// gke-upg-03b-work-pool-4d59afbc-zzk2/Running/True/2026-09-29T15:11:23Z /Pending// gke-upg-03b-work-pool-4d59afbc-zzk2/Running/True/2026-09-29T15:11:23Z 
+2026-09-29T15:11:15Z /Pending// gke-upg-03b-work-pool-4d59afbc-zzk2/Running/True/2026-09-29T15:11:23Z /Pending// gke-upg-03b-work-pool-4d59afbc-zzk2/Running/True/2026-09-29T15:11:23Z 
+2026-09-29T15:11:27Z /Pending// /Pending// 
+2026-09-29T15:11:38Z /Pending// /Pending// 
+2026-09-29T15:11:50Z /Pending// /Pending// 
+## exit 0
+
+## 2026-09-29T15:14:55Z [placement/summary-spread] serving_summary spread
+samples=44 zero_serving=0
+## exit 0
+
+## 2026-09-29T15:14:55Z [placement/after] K -n scen get pods -l app in (same-node,spread) -o wide
+NAME                         READY   STATUS    RESTARTS   AGE     IP            NODE                                  NOMINATED NODE   READINESS GATES
+same-node-654495d894-c9nfm   1/1     Running   0          4m3s    10.84.34.11   gke-upg-03b-work-pool-4d59afbc-cwd0   <none>           <none>
+same-node-654495d894-j6rsk   1/1     Running   0          4m3s    10.84.34.12   gke-upg-03b-work-pool-4d59afbc-cwd0   <none>           <none>
+spread-789f4fb6cd-5749t      1/1     Running   0          4m3s    10.84.34.10   gke-upg-03b-work-pool-4d59afbc-cwd0   <none>           <none>
+spread-789f4fb6cd-6bqqb      1/1     Running   0          7m26s   10.84.35.7    gke-upg-03b-work-pool-4d59afbc-nd0f   <none>           <none>
+## exit 0
+
+## 2026-09-29T15:14:56Z [placement/after-ready] K -n scen get deploy same-node spread
+NAME        READY   UP-TO-DATE   AVAILABLE   AGE
+same-node   2/2     2            2           18m
+spread      2/2     2            2           18m
+## exit 0
+
+## 2026-09-29T15:14:56Z [placement/killing-events] K -n scen get events --field-selector reason=Killing -o custom-columns=T:.lastTimestamp,O:.involvedObject.name,M:.message
+T                      O                            M
+2026-09-29T15:10:53Z   same-node-654495d894-flgw8   Stopping container web
+2026-09-29T15:10:53Z   same-node-654495d894-t7vqv   Stopping container web
+2026-09-29T15:10:53Z   spread-789f4fb6cd-w28nf      Stopping container web
+2026-09-29T15:07:30Z   spread-789f4fb6cd-zntwz      Stopping container web
+## exit 0

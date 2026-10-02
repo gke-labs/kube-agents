@@ -67,6 +67,20 @@ Slack only routes a leading-slash message to the app's slash handler if that sla
 
 Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel message rather than a command. The `legacy_slash_commands` plugin on the Planning Agent profile unwraps that form before the gateway resolves it, so `/hermes sethome` behaves as `/sethome` either way — registering the slashes adds Slack's autocomplete, not the behaviour. The plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/legacy_slash_commands/README.md) is the design of record.
 
+### Agent view
+
+With `KAGE_SLACK_UX=true` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`), the Slack bot offers three suggested prompts (is anything unhealthy in my clusters right now, what's on the board, which clusters are behind their release channel), and tapping one sends it as the user's message. Slack shows them when a user starts a new assistant thread or, on an app using agent view, opens the bot's Messages tab. An assistant thread that already exists, a channel mention, and an app whose manifest carries neither view (one generated with `--no-assistant`, or built by hand without them) do not show them. No `PlatformAgent` field replaces the three.
+
+Slack's agent view, where the bot's DM opens on a Messages tab, needs a new manifest, and **the switch cannot be undone**: once Slack applies a manifest carrying agent view, the app cannot go back to the assistant view it has today. The manifest also replaces the whole app definition, so pass the name, description and long description your app already has; left out, the name and description become Hermes's and the long description is dropped. Drop `--long-description` if your app has none; Hermes refuses one under 175 characters or over 4,000. Run it with the flag set as above, which is what names the agent view after `--name`; without the flag it reads "Chat with Hermes in Slack Messages.":
+
+```bash
+kubectl exec -n kubeagents-system deploy/platform-agent-gateway -c platform-agent -- \
+  hermes slack manifest --agent-view --name "<app name>" --description "<app description>" \
+  --long-description "<app long description>"
+```
+
+Paste the output into your app's **App Manifest** page in the Slack App Console and reinstall the app when Slack asks. Try agent view on an app nobody else depends on first. The manifest does not subscribe `agent_session_stopped`, so Slack offers no Stop button on a running reply. The flag is off by default, and with it off the manifest and the DM are unchanged; with it on or off, `hermes slack manifest` without `--agent-view` prints the same manifest and never switches the view.
+
 ### Home channel
 
 `SLACK_HOME_CHANNEL` designates the channel an unprompted message lands in when no user thread is involved. Set it to a monitoring/oncall channel your team already watches.
@@ -74,6 +88,10 @@ Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel mess
 It is optional at install time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
+
+### Reactions
+
+By default the agent follows the Hermes Slack adapter: it adds 👀 to your message when it starts and ✅ or ❌ when the turn ends. Setting `KAGE_SLACK_UX=true` in the `PlatformAgent` CR's `spec.deployment.env` (the chart's `platformAgent.deployment.env`) changes two things. The first reaction names the kind of ask, picked from its words before any model call: 👀 for a question or check, 🛠️ for a change, 📋 for the board, 🚨 for an incident. The second reaction goes beside it when the work actually settles, rather than when the turn ends: ✅ done, ⏸️ waiting on you, ❌ failed. For work the agent hands to the board, that is when every card the turn opened for your message has finished, along with any follow-up cards those cards' workers filed in the thread: ✅ if all of them completed, ❌ if any gave up or the turn itself failed. A follow-up that had already given up when the card above it completed posts its own failure line in the thread and leaves your message ✅. ⏸️ can come first and stay, since a card that waits on you runs on once answered: your answer gets its own reaction when its turn ends, and the card's outcome lands on the message that started it. A cancelled turn adds no second reaction, and neither does work still running when the agent restarts, nor a card closed or archived by hand rather than finishing. No reaction is ever removed. The flag is off by default, and with it off nothing changes.
 
 ## Proactive alerts (both channels)
 
@@ -118,7 +136,7 @@ This reaches the Platform Agent directly, bypassing the front door: a request ty
 
 The other way in is the [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be.
 
-Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays on the agent's volume at `/opt/data/INVENTORY.md`; read it with `kubectl exec` rather than waiting for it.
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And `bootstrap-inventory-delivery` waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume; read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 
 ## Where to go next
 

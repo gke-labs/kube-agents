@@ -22,7 +22,7 @@ The operator renders one `NetworkPolicy` over the agent Pod, `<agent-name>-gatew
 ### GKE Dataplane V2 & FQDN Network Policies
 
 > [!IMPORTANT]
-> **GKE Dataplane V2 Requirement**: Setting the annotation `kubeagents.x-k8s.io/enable-fqdn-network-policy: "true"` on the `PlatformAgent` CR makes the operator render a companion `FQDNNetworkPolicy` (`networking.gke.io/v1alpha1`) and omit the blanket `0.0.0.0/0:443` rule. That custom resource **requires GKE Dataplane V2** (`--enable-dataplane-v2`) **and FQDN Network Policy enabled** (`--enable-fqdn-network-policy`) on your Google Kubernetes Engine (GKE) cluster (running GKE 1.26.4-gke.500 or 1.27.1-gke.400 or later). Standard clusters running kube-proxy without Dataplane V2 will not enforce or support `FQDNNetworkPolicy` objects.
+> **GKE Dataplane V2 Requirement**: Setting the annotation `kubeagents.x-k8s.io/enable-fqdn-network-policy: "true"` on the `PlatformAgent` CR makes the operator render a companion `FQDNNetworkPolicy` (`networking.gke.io/v1alpha1`) and omit the blanket `0.0.0.0/0:443` rule. That custom resource **requires GKE Dataplane V2** (`--enable-dataplane-v2`) **and FQDN Network Policy enabled** (`--enable-fqdn-network-policy`) on your Google Kubernetes Engine (GKE) cluster (running GKE 1.26.4-gke.500 or 1.27.1-gke.400 or later). Standard clusters running kube-proxy without Dataplane V2 will not enforce or support `FQDNNetworkPolicy` objects. The policy selects only the gateway pod, and its forge hosts are derived from the CR's `spec.integration.forges` declaration; [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specintegration) is canonical for that field.
 
 ### Configuring NetworkPolicy for GKE Private Clusters, Dataplane V2, & Custom CIDRs
 

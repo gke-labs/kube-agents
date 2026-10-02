@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -110,14 +113,30 @@ func startBridgeN(t *testing.T, url string, command []string, concurrency int) {
 // bridge's shutdown for a test that ends it early.
 func startBridgeWith(t *testing.T, url string, command []string, concurrency int, mutate func(*Bridge)) context.CancelFunc {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{
+	_, cancel := startBridgeConfig(t, Config{
 		NATSURL:      url,
 		Command:      command,
 		Concurrency:  concurrency,
 		TaskDeadline: 20 * time.Second,
 		KillGrace:    500 * time.Millisecond,
-	})
+	}, mutate)
+	return cancel
+}
+
+// startBridgeConfig runs a bridge from the caller's Config until test cleanup
+// and waits for its durable consumer, so a submission published right after
+// cannot race the subscribe. mutate, when set, sees the bridge between New
+// and Run.
+func startBridgeConfig(t *testing.T, cfg Config, mutate func(*Bridge)) (*Bridge, context.CancelFunc) {
+	t.Helper()
+	// A scratch dir of the test's own: the default is the host's shared
+	// $TMPDIR/hermes-bridge, which the start-time sweep would clear under
+	// any other bridge on the machine.
+	if cfg.ScratchDir == "" {
+		cfg.ScratchDir = t.TempDir()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	b, err := New(ctx, cfg)
 	if err != nil {
 		cancel()
 		t.Fatalf("bridge new: %v", err)
@@ -139,7 +158,7 @@ func startBridgeWith(t *testing.T, url string, command []string, concurrency int
 		}
 	})
 	waitFor(t, 10*time.Second, "bridge durable consumer", func() bool {
-		nc, err := nats.Connect(url)
+		nc, err := nats.Connect(cfg.NATSURL)
 		if err != nil {
 			return false
 		}
@@ -153,7 +172,7 @@ func startBridgeWith(t *testing.T, url string, command []string, concurrency int
 		_, err = js.Consumer(ctx, lib.TasksStream, "bridge-platform")
 		return err == nil
 	})
-	return cancel
+	return b, cancel
 }
 
 func gatewayClient(t *testing.T, url string) *lib.Client {
@@ -1116,7 +1135,7 @@ func TestCancelInStream_Cases(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
 	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, Concurrency: 8})
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, Concurrency: 8, ScratchDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1263,7 +1282,7 @@ func TestFinalize_IdempotentAndCancelAfterFinalIsANoOp(t *testing.T) {
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
 	ctx, cancel := context.WithCancel(context.Background())
-	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}})
+	b, err := New(ctx, Config{NATSURL: url, Command: []string{"true"}, ScratchDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1346,6 +1365,277 @@ exit 3`))
 	}
 	if !strings.Contains(s.Status.Message.Parts[0].Text, "exit status 3") {
 		t.Fatal("failed event does not carry the exit code")
+	}
+}
+
+// A failed turn's diagnosis is on stdout: `hermes chat -Q` prints a failed
+// turn's final_response there and exits 1, and prints the session id last on
+// stderr. The terminal carries both, so the loss class #2036 recorded (an
+// "Error: max retries exhausted" discarded with the exit) is in the status
+// message and the transcript is findable from it.
+func TestLifecycle_FailedKeepsStdoutAndSessionID(t *testing.T) {
+	_, url := startServer(t)
+	startBridge(t, url, script(t, `echo "Error: max retries exhausted after 6 attempts"
+echo "[hermes-otel] disabled" >&2
+echo "" >&2
+echo "session_id: 20260925_181506_ab12cd" >&2
+exit 1`))
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-fail-out", "doomed")
+	task := waitTerminal(t, c, "task-fail-out")
+	if task.State != lib.StateFailed {
+		t.Fatalf("state = %s, want failed", task.State)
+	}
+	reason := terminalReason(t, task)
+	for _, want := range []string{
+		"reason: hermes-exited-nonzero - exit status 1",
+		"session: 20260925_181506_ab12cd",
+		"stdout tail: Error: max retries exhausted after 6 attempts",
+		"stderr tail: ",
+	} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("terminal reason lacks %q:\n%s", want, reason)
+		}
+	}
+}
+
+// Exit 75 is Hermes's EX_TEMPFAIL for a turn that gave up on the provider's
+// rate limit. The terminal names it, so the harness classes a quota storm as
+// infrastructure rather than the persona's failure.
+func TestLifecycle_RateLimitedExitIsNamed(t *testing.T) {
+	_, url := startServer(t)
+	startBridge(t, url, script(t, `echo "Error: rate limit retries exhausted"
+echo "session_id: 20260925_181506_rl" >&2
+exit 75`))
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-rl", "doomed")
+	task := waitTerminal(t, c, "task-rl")
+	if task.State != lib.StateFailed {
+		t.Fatalf("state = %s, want failed", task.State)
+	}
+	reason := terminalReason(t, task)
+	if !strings.HasPrefix(reason, "reason: hermes-rate-limited - exit status 75") {
+		t.Errorf("reason = %q, want the rate-limited token", reason)
+	}
+	if strings.Contains(reason, "hermes-exited-nonzero") {
+		t.Errorf("reason names the generic token beside the specific one: %q", reason)
+	}
+}
+
+// The tails are bounded and cut on a rune boundary.
+func TestTail_BoundedOnARuneBoundary(t *testing.T) {
+	long := strings.Repeat("é", 2000) // 4000 bytes, every rune two of them
+	// An odd budget lands the byte cut inside a rune, so the walk has to move.
+	got := tail(long, 2047)
+	if len(got) != 2046 || !utf8.ValidString(got) || !strings.HasSuffix(long, got) {
+		t.Fatalf("tail: len=%d (want 2046) valid=%v suffix=%v", len(got), utf8.ValidString(got), strings.HasSuffix(long, got))
+	}
+	if tail("short", 2048) != "short" {
+		t.Fatal("a short string is returned whole")
+	}
+	// The stderr buffer cuts on bytes as it fills and opens on a rune when read.
+	tb := newTailBuffer(4)
+	_, _ = tb.Write([]byte("aé")) // 3 bytes
+	_, _ = tb.Write([]byte("éb")) // +3 = 6; the last 4 bytes open inside the first é
+	if got := tb.String(); !utf8.ValidString(got) || got != "éb" {
+		t.Fatalf("tailBuffer.String() = %q (valid=%v), want \"éb\"", got, utf8.ValidString(got))
+	}
+}
+
+// A transient lookup failure on a submission is retried, not dropped: the
+// lib acks after the handler returns, so without the retry the task was lost.
+// Driven through the tasksGet seam so no bus fault has to be staged.
+func TestLookup_TransientErrorIsRetriedThenAccepted(t *testing.T) {
+	_, url := startServer(t)
+	var calls atomic.Int32
+	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
+		real := b.c.TasksGetOpened
+		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
+			if calls.Add(1) < 2 {
+				return nil, false, errors.New("nats: timeout on the horizon get")
+			}
+			return real(ctx, addressee, taskID)
+		}
+	})
+	defer stop()
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-retry", "hello")
+	task := waitTerminal(t, c, "task-retry")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed after the lookup retries", task.State)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("lookup attempts = %d, want 2 (one transient failure, then the real read)", got)
+	}
+}
+
+// The cancel's retry schedule outlasts the fault it is named for: a
+// consumer-cap refusal clears when the ephemeral consumers holding the cap
+// are reaped, after the lib's inactive threshold. (The submission's lookup
+// never opens a consumer for a new task, so its schedule is one quick retry.) Pinned as arithmetic, because the
+// constant it has to beat lives in another package and could move.
+func TestLookup_ScheduleOutlastsTheConsumerInactiveThreshold(t *testing.T) {
+	var total time.Duration
+	for attempt := 1; attempt < cancelLookupAttempts; attempt++ {
+		total += cancelLookupBackoff * time.Duration(attempt)
+	}
+	if total <= lib.EphemeralConsumerInactiveThreshold {
+		t.Fatalf("retry schedule waits %s in total, which does not outlast the %s inactive threshold a cap refusal clears on",
+			total, lib.EphemeralConsumerInactiveThreshold)
+	}
+}
+
+// The same retry stands behind an orphan's cancel: a cancel for a task with
+// non-final events and no live executor used to be dropped on the first
+// lookup error, leaving the orphan non-terminal for the retention window.
+// The fixture is TestSweep_OrphanFinalized's prior incarnation without the
+// in-flight KV key, so the start-up sweep leaves it alone and the cancel is
+// what finalizes it.
+func TestLookup_OrphanCancelRetriesThenSynthesizes(t *testing.T) {
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	taskID := "task-orphan-cancel"
+	origin := submit(t, c, taskID, "died midway, nobody holds me")
+	bridgeParty := lib.Party{Session: "platform-bridge", AgentType: "hermes-bridge", Profile: "platform"}
+	x, err := c.NewTaskExecution(origin, bridgeParty, "platform")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.PublishStatus(testCtx(t), lib.StateSubmitted, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.PublishStatus(testCtx(t), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cons, err := js.CreateOrUpdateConsumer(testCtx(t), lib.TasksStream, jetstream.ConsumerConfig{
+		Durable:       "bridge-platform",
+		FilterSubject: "a2a.tasks.platform.*.in",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := cons.FetchNoWait(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for msg := range msgs.Messages() {
+		_ = msg.Ack()
+	}
+
+	var calls atomic.Int32
+	stop := startBridgeWith(t, url, script(t, `echo unreachable`), 1, func(b *Bridge) {
+		real := b.c.TasksGetOpened
+		b.tasksGet = func(ctx context.Context, addressee, id string) (*lib.Task, bool, error) {
+			if id == taskID && calls.Add(1) < 3 {
+				return nil, false, errors.New("nats: maximum consumers limit reached")
+			}
+			return real(ctx, addressee, id)
+		}
+	})
+	defer stop()
+
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, taskID)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("state = %s, want canceled", task.State)
+	}
+	if reason := terminalReason(t, task); !strings.Contains(reason, "canceled-while-orphaned") {
+		t.Fatalf("reason = %q, want canceled-while-orphaned", reason)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("lookup attempts on the cancel = %d, want 3 (two refusals, then the read)", got)
+	}
+}
+
+// A lookup that keeps failing is still dropped, after the bounded attempts,
+// and a not-found answer is never retried.
+func TestLookup_BoundedAndNotFoundIsAnAnswer(t *testing.T) {
+	_, url := startServer(t)
+	var calls atomic.Int32
+	stop := startBridgeWith(t, url, script(t, `echo ok`), 1, func(b *Bridge) {
+		b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
+			calls.Add(1)
+			return nil, false, errors.New("nats: timeout")
+		}
+	})
+	defer stop()
+	c := gatewayClient(t, url)
+	submit(t, c, "task-drop", "hello")
+	time.Sleep(3 * time.Second) // the submission schedule (one 200ms retry) plus slack
+	if got := calls.Load(); got != submissionLookupAttempts {
+		t.Fatalf("lookup attempts = %d, want %d", got, submissionLookupAttempts)
+	}
+	if ev := replayEvents(t, url, "task-drop"); len(ev) != 0 {
+		t.Fatalf("a dropped submission published %d events, want none", len(ev))
+	}
+
+	b := &Bridge{cfg: Config{Profile: "platform", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	var nf atomic.Int32
+	b.tasksGet = func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error) {
+		nf.Add(1)
+		return nil, false, &lib.A2AError{Code: lib.CodeTaskNotFound}
+	}
+	if _, attempts, err := b.lookupTask(context.Background(), "x", cancelLookupAttempts, cancelLookupBackoff); !isTaskNotFound(err) || nf.Load() != 1 || attempts != 1 {
+		t.Fatalf("not-found was retried or lost: err=%v calls=%d attempts=%d", err, nf.Load(), attempts)
+	}
+
+	// A context that ends inside the first backoff reports one attempt, not
+	// the bound: the drop log must not count a shutdown as a cap incident.
+	ctx, cancel := context.WithCancel(context.Background())
+	b.tasksGet = func(context.Context, string, string) (*lib.Task, bool, error) {
+		cancel()
+		return nil, false, errors.New("nats: timeout")
+	}
+	if _, attempts, err := b.lookupTask(ctx, "y", cancelLookupAttempts, cancelLookupBackoff); err == nil || attempts != 1 {
+		t.Fatalf("interrupted lookup: err=%v attempts=%d, want an error and 1", err, attempts)
+	}
+
+	// An error after the read opened its consumer is not retried: that
+	// consumer is live for the inactive threshold, and another attempt
+	// would open another against the same cap.
+	var opened atomic.Int32
+	b.tasksGet = func(context.Context, string, string) (*lib.Task, bool, error) {
+		opened.Add(1)
+		return nil, true, errors.New("protocol error folding events")
+	}
+	if _, attempts, err := b.lookupTask(context.Background(), "z", cancelLookupAttempts, cancelLookupBackoff); err == nil || attempts != 1 || opened.Load() != 1 {
+		t.Fatalf("post-create failure: err=%v attempts=%d calls=%d, want an error after exactly one lookup", err, attempts, opened.Load())
+	}
+}
+
+// The session id is the CLI's own line, the last one, and a label with
+// nothing after it is no id at all rather than the next line's first word.
+func TestFailureReason_SessionIDIsTheLastWholeLine(t *testing.T) {
+	err := errors.New("exit status 1")
+	cases := []struct{ stderr, want string }{
+		{"session_id: a1\n[tool] nested run said\nsession_id: b2\n", "session: b2"},
+		{"session_id:\n[hermes-otel] disabled\n", ""},
+		{"nothing here\n", ""},
+	}
+	for _, c := range cases {
+		got := failureReason(err, "", c.stderr)
+		if c.want == "" {
+			if strings.Contains(got, "session:") {
+				t.Errorf("stderr %q: reason reports a session id: %q", c.stderr, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.want) || strings.Contains(got, "session: a1") || strings.Contains(got, "session: [hermes-otel]") {
+			t.Errorf("stderr %q: reason = %q, want %q and not an earlier line or the next line's word", c.stderr, got, c.want)
+		}
 	}
 }
 

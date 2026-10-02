@@ -46,11 +46,13 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from devops_bench.k8s import get_resource
 from devops_bench.verification.base import (
@@ -62,7 +64,7 @@ from devops_bench.verification.base import (
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
 
-from kube_agents_bench import discovery, github_writes, transcript
+from kube_agents_bench import discovery, github_writes, onboarding, transcript
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -71,7 +73,10 @@ from kube_agents_bench.fleet import (
 )
 
 __all__ = [
+    "BootstrapDeliveredVerifier",
     "BootstrapFanoutVerifier",
+    "BootstrapFindingsVerifier",
+    "BootstrapReportReadVerifier",
     "FleetResourcePropertyVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
@@ -92,6 +97,10 @@ _NO_WORKER_CALLS_REASON = (
     "the workers cannot observe its subject"
 )
 _FANOUT_READ_TIMEOUT_SEC = 60.0
+_ONBOARDING_READ_TIMEOUT_SEC = 60.0
+# The sandbox's report changes at most twice (written, then renamed), so at most
+# two of three sandbox re-reads can differ from the read before them.
+_REPORT_READ_ATTEMPTS = 3
 
 # Emphasis and code markers, dropped before matching. The agent answers in
 # Markdown, and a phrase spanning an emphasised word cannot match the raw
@@ -390,6 +399,21 @@ LEDGER_AUDIT_IDS = frozenset(
 # LedgerIssueContainsVerifier's docstring for what it has to be.
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
+# When the first unit on the case's audit stream began, in epoch seconds, and
+# which audit that stream is; hack/ci-eval-pr.sh exports both for a case that
+# writes a ledger. Read only by PullRequestOpenedVerifier's
+# `accepts_stream_pull_request`.
+STREAM_STARTED_ENV_VAR = "EVAL_STREAM_STARTED_AT"
+STREAM_AUDIT_ENV_VAR = "EVAL_AUDIT_STREAM"
+STREAM_REPO_ENV_VAR = "EVAL_STREAM_REPO"
+
+# The head branch every remediation pull request a fleet audit opens sits on is
+# this, the audit id, a dash, then the fix's slug and digest
+# (agents/platform/skills/fleet-audit/scripts/audit_report.py,
+# `group_branch_for`). What ties a pull request older than the run to the
+# stream rather than to whichever case wrote it.
+REMEDIATION_BRANCH_PREFIX = "platform-agent/fix-"
+
 # The first line of the closing comment hack/ci_reset_audit_ledgers.py leaves
 # on a ledger it retires before a repetition (RESET_MARKER there;
 # scripts/test_ci_eval_ledger_reset.py pins the two literals equal). A closed
@@ -494,6 +518,8 @@ _MAX_PR_CANDIDATES = 8
 # reports; GitHub caps the listing at 250, and a pull request longer than that
 # simply yields no head commit rather than the wrong one.
 _PR_COMMITS_PAGE_SIZE = 100
+# `/pulls/{n}/commits` lists at most 250 commits.
+_PR_COMMITS_MAX_PAGES = 3
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -1363,9 +1389,31 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         )
 
 
+def _stream_audit() -> str:
+    """The audit id of the case's stream, from STREAM_AUDIT_ENV_VAR; "" if unset."""
+    return os.environ.get(STREAM_AUDIT_ENV_VAR, "").strip()
+
+
+def _stream_repo() -> str:
+    """The ``owner/name`` the stream's pull requests land in, from STREAM_REPO_ENV_VAR, lowercased; "" if unset."""
+    return os.environ.get(STREAM_REPO_ENV_VAR, "").strip().lower()
+
+
+def _stream_started() -> datetime | None:
+    """When the case's audit stream first ran, from STREAM_STARTED_ENV_VAR; None if unset or unreadable."""
+    raw = os.environ.get(STREAM_STARTED_ENV_VAR, "").strip()
+    try:
+        stamp = float(raw)
+        return datetime.fromtimestamp(stamp, tz=timezone.utc) if stamp > 0 else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 @VERIFIERS.register("pull_request_opened")
 class PullRequestOpenedVerifier(BaseVerifier):
-    """A remediation pull request THIS run opened, resolved through GitHub.
+    """A remediation pull request THIS run opened (or, with
+    ``accepts_stream_pull_request``, one an earlier run on its audit stream
+    opened), resolved through GitHub.
 
     WHY THIS EXISTS. The remediation cases used to grade on a
     ``report_contains`` over ``["github.com/", "/pull/"]``, which asks only
@@ -1389,7 +1437,35 @@ class PullRequestOpenedVerifier(BaseVerifier):
     branch moves the head commit, rep 2 quoting rep 1's URL does not. One
     surviving candidate is enough — a reply may link the ticket it came from
     beside the fix — and a candidate GitHub cannot answer for ends the check
-    only when no other candidate passes.
+    only when no other candidate passes. With ``reuses_spent_branch`` it also
+    asks that the branch carried a closed pull request created during this
+    run, that the candidate does not contain that one's head revision, and
+    that the report names that one too.
+
+    With ``accepts_stream_pull_request`` the two "since this run started"
+    clauses measure instead from when the first unit on the case's audit
+    stream began (``EVAL_STREAM_STARTED_AT``, which ``hack/ci-eval-pr.sh``
+    exports with the audit id in ``EVAL_AUDIT_STREAM``), so a pull request an
+    earlier unit on the stream opened passes when the reply names it -- and
+    only if its head branch is one that audit's ``finish`` names
+    (``platform-agent/fix-<audit>-``) and it is in the job's GitOps repository
+    (``EVAL_STREAM_REPO``; without it the window is not widened). The stamp bounds when; the branch is
+    what says the pull request is the stream's and not another case's in the
+    same repository. That is for a case whose later runs meet a pull
+    request an earlier run left open on the same branch, as a fleet audit's
+    remediation case does: ``finish`` names the branch after the files the
+    fix touches, so every
+    later run of the audit on the stream -- this case's later repetitions, or
+    another case auditing the same fleet -- finds the pull request open on it,
+    leaves it, and pushes nothing. The presubmit holds no credential to close
+    it between units (docs/ci-pool-projects.md 5.3), so without the option
+    only the first unit on the stream could pass. A leftover from before the
+    stream's first unit -- an earlier job on the pool project -- predates the
+    stamp and is still rejected. The branch ties the pull request to the
+    audit, not to this case's defect: another case on the same stream opens
+    on the same branch prefix, and a later repetition passes by naming the
+    one repetition 1 opened. Run through ``devops-bench`` directly, without
+    both variables, the clauses measure from the run as they otherwise do.
 
     WHICH ENDPOINT. ``/issues/{n}`` first: a pull request is an issue to that
     API, the response carries ``created_at``, and it is the endpoint the read
@@ -1401,8 +1477,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
     unreadable API is the absence of an observation. 404 on both is either the
     number or a repository this credential cannot see; nothing in the API
     separates them, so both are graded as absence. ``_head_push`` then reads
-    ``/pulls/{n}`` outright, which needs ``pull_requests: read`` --
-    ``hack/ci-eval-pr.sh`` mints it.
+    ``/pulls/{n}`` outright, and the ``reuses_spent_branch`` clause reads
+    ``/pulls`` endpoints whatever the first answer was, so both need
+    ``pull_requests: read`` -- ``hack/ci-eval-pr.sh`` mints it.
     """
 
     type: Literal["pull_request_opened"]
@@ -1415,6 +1492,156 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # clock, which are two different machines. Small on purpose: every second
     # of it is a second of a previous rep's pull request reading as this one's.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    # Also require that the pull request's branch is one a pull request closed
+    # during this run already used -- the second proposal on a spent name. A
+    # worker refused the name can open the same change on a fresh branch and
+    # pass every other clause here, which is exactly the outcome a reuse case
+    # must fail. And it must not contain the closed one's head revision: a
+    # worker that clones the spent branch and adds to it lands on the same
+    # name with the rejected change carried along. Listed from
+    # `/pulls?state=closed&head=` and `/pulls/{n}/commits`, so the credential
+    # needs `pull_requests: read`.
+    reuses_spent_branch: bool = False
+    # Measure "written since" and "head commit since" from the first unit on
+    # the case's audit stream rather than the run, so a later run of the audit
+    # passes on the pull request an earlier one opened and this one found
+    # already open. See the docstring.
+    accepts_stream_pull_request: bool = False
+
+    def _spent_before(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        pull: dict,
+        listing: tuple[int, list] | None,
+        token: str,
+        budget: float,
+        started: datetime,
+        named: set[int],
+    ) -> tuple[str | None, str | None]:
+        """``(rejection, unevaluable)`` for :attr:`reuses_spent_branch`; both None passes.
+
+        ``pull`` is the pulls payload and ``listing`` the ``(page, commits)``
+        of the commit listing, both as :meth:`_head_push` read them: the
+        issues endpoint's answer carries no head ref, and reading
+        ``/pulls/{n}`` or that page a second time would spend the budget on
+        the same answer. ``named`` is every pull request number the report
+        names in this repository.
+        """
+        slug = f"{owner}/{repo}#{number}"
+        head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+        ref = str(head.get("ref") or "")
+        if not ref:
+            return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
+        status_code, listed = _http_get_json(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
+            token,
+            budget,
+        )
+        if status_code != 200 or not isinstance(listed, list):
+            return None, (
+                f"GitHub answered {status_code} listing the closed pull requests from "
+                f"{ref}; add `pull_requests: read` if that is 403 — this check could "
+                "not be evaluated"
+            )
+        # Every one this run opened and closed, not only the newest: a worker
+        # that opens and closes a second proposal on the name and then rebuilds
+        # on the first's revision carries the first's change, not the second's.
+        spent = []
+        for earlier in listed:
+            if not isinstance(earlier, dict) or earlier.get("number") == number:
+                continue
+            created = _parse_github_time(earlier.get("created_at"))
+            if created and (started - created).total_seconds() <= self.max_clock_skew_sec:
+                spent.append(earlier)
+        if spent:
+            # The name alone is not the reuse. A worker that clones the spent
+            # branch and publishes on top of it also lands on the same name,
+            # and its proposal carries the closed one's revisions -- the
+            # rejected change, back under review. A branch cut fresh from the
+            # base carries none of them.
+            carried = {}
+            for closed in spent:
+                sha = str((closed.get("head") or {}).get("sha") or "")
+                if not sha:
+                    return None, (
+                        f"GitHub returned no head revision for #{closed.get('number')}, so "
+                        f"whether {slug} builds on it could not be read; this check "
+                        "could not be evaluated"
+                    )
+                carried[sha] = closed.get("number")
+            # Oldest first, so on a long branch the closed revision sits on an
+            # early page and a fresh cut's own commits fill the later ones; read
+            # every page, up to the 250 commits this endpoint ever lists. The
+            # payload's total says how many that is; without one, read until a
+            # short page.
+            total = pull.get("commits")
+            known = isinstance(total, int) and total >= 1
+            pages = (
+                min(
+                    _PR_COMMITS_MAX_PAGES,
+                    (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE,
+                )
+                if known
+                else _PR_COMMITS_MAX_PAGES
+            )
+            for page in range(1, pages + 1):
+                if listing is not None and page == listing[0]:
+                    commits = listing[1]
+                    status_code = 200
+                else:
+                    status_code, commits = _http_get_json(
+                        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
+                        f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
+                        token,
+                        budget,
+                    )
+                if status_code != 200 or not isinstance(commits, list):
+                    return None, (
+                        f"GitHub answered {status_code} listing the commits of {slug}; "
+                        "add `pull_requests: read` if that is 403 — this check could "
+                        "not be evaluated"
+                    )
+                found = next(
+                    (c["sha"] for c in commits if isinstance(c, dict) and c.get("sha") in carried),
+                    None,
+                )
+                if found:
+                    return (
+                        f"{slug}: it builds on {found[:12]}, the last revision of the "
+                        f"closed pull request #{carried[found]}, so the spent branch "
+                        "was added to rather than cleared and the closed change is back "
+                        "under review",
+                        None,
+                    )
+                if not known and len(commits) < _PR_COMMITS_PAGE_SIZE:
+                    break
+            # The task asks the report for both pull requests, and the inject
+            # lane's write safeguard excuses a pull request this run opened
+            # only when the report names it. Graded here too, so the two
+            # checks agree on the same reply instead of one passing a run the
+            # other reds.
+            # From `spent`, not `carried`: two closed at one revision share a
+            # key there, and both are writes the safeguard reads.
+            unnamed = sorted(
+                c.get("number") for c in spent if c.get("number") not in named
+            )
+            if unnamed:
+                return (
+                    f"{slug}: the report does not name "
+                    + ", ".join(f"#{n}" for n in unnamed)
+                    + f", the pull request this run opened and closed on {ref}, "
+                    "so it cannot be told apart from a write nobody asked for",
+                    None,
+                )
+            return None, None
+        return (
+            f"{slug}: its branch {ref} carries no pull request that this run opened "
+            "and closed, so this is not a second proposal on a spent name",
+            None,
+        )
 
     def _resolve(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -1474,8 +1701,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
         resolved: dict,
         token: str,
         budget: float,
-    ) -> tuple[int | None, datetime | None, str | None]:
-        """``(changed files, head commit date, unevaluable reason)``.
+    ) -> tuple[int | None, datetime | None, dict, tuple[int, list] | None, str | None]:
+        """``(changed files, head commit date, pull, listing, unevaluable reason)``.
+
+        ``pull`` is the pulls payload and ``listing`` the ``(page, commits)``
+        of the commit listing it read (``None`` when it read none), for
+        :meth:`_spent_before`; ``pull`` is empty when the payload was not read.
 
         Both reads want ``pull_requests: read``. ``/pulls/{n}`` carries the
         file count and the commit total, and is skipped when ``_resolve``
@@ -1501,6 +1732,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 return (
                     None,
                     None,
+                    {},
+                    None,
                     f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
                     f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
                     "an installation token expires an hour after it is minted — so "
@@ -1509,6 +1742,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             if status == 403:
                 return (
                     None,
+                    None,
+                    {},
                     None,
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
                     f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
@@ -1519,15 +1754,18 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 return (
                     None,
                     None,
+                    {},
+                    None,
                     f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
                     "on the pulls endpoint; this check could not be evaluated",
                 )
         changed = payload.get("changed_files")
         changed = changed if isinstance(changed, int) else None
         total = payload.get("commits")
-        head_sha = (payload.get("head") or {}).get("sha") or ""
+        head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
+        head_sha = head.get("sha") or ""
         if not isinstance(total, int) or total < 1:
-            return changed, None, None
+            return changed, None, payload, None, None
         page = (total + _PR_COMMITS_PAGE_SIZE - 1) // _PR_COMMITS_PAGE_SIZE
         status, commits = _http_get_json(
             f"{base}/pulls/{number}/commits"
@@ -1536,10 +1774,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             budget,
         )
         if status == 404:
-            return changed, None, None
+            return changed, None, payload, None, None
         if status == 401:
             return (
                 None,
+                None,
+                {},
                 None,
                 f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
                 f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
@@ -1550,6 +1790,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return (
                 None,
                 None,
+                {},
+                None,
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
                 f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "
@@ -1559,15 +1801,18 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return (
                 None,
                 None,
+                {},
+                None,
                 f"unexpected GitHub response {status} for {owner}/{repo}#{number} "
                 "on the commits page; this check could not be evaluated",
             )
+        listing = (page, commits)
         for entry in reversed(commits):
             if not isinstance(entry, dict) or entry.get("sha") != head_sha:
                 continue
             committer = (entry.get("commit") or {}).get("committer") or {}
-            return changed, _parse_github_time(committer.get("date")), None
-        return changed, None, None
+            return changed, _parse_github_time(committer.get("date")), payload, listing, None
+        return changed, None, payload, listing, None
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -1614,6 +1859,48 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
 
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        # The floor every "since" clause below measures from: the run, or with
+        # accepts_stream_pull_request the stream's first unit, when the harness
+        # exported one.
+        since, since_what = started, "this run started"
+        stream_branch = ""
+        if self.accepts_stream_pull_request and not _stream_audit():
+            # The option does nothing off a stream, and a rejection that only
+            # said "before this run started" would hide that it was dropped.
+            since_what = (
+                "this run started (`accepts_stream_pull_request` is set, but "
+                f"{STREAM_AUDIT_ENV_VAR} is not: the harness puts a case on an "
+                "audit stream only through a `ledger_issue_contains` check with "
+                "an `audit` key)"
+            )
+        elif self.accepts_stream_pull_request and not _stream_repo():
+            # Without the job's repository a sibling job's pull request on the
+            # same audit's branch in another pool repository would pass.
+            since_what = (
+                "this run started (`accepts_stream_pull_request` is set and the "
+                f"case is on an audit stream, but {STREAM_REPO_ENV_VAR} is not: "
+                "without the job's GitOps repository the widened window cannot "
+                "tell this job's pull request from a sibling job's)"
+            )
+        elif self.accepts_stream_pull_request:
+            stream_started = _stream_started()
+            if stream_started is not None and stream_started < started:
+                since, since_what = stream_started, "this audit stream's first run began"
+                stream_branch = f"{REMEDIATION_BRANCH_PREFIX}{_stream_audit()}-"
+            elif stream_started is None:
+                since_what = (
+                    "this run started (`accepts_stream_pull_request` is set and the "
+                    f"case is on an audit stream, but {STREAM_STARTED_ENV_VAR} is "
+                    "missing or unreadable, so the window was not widened)"
+                )
+            else:
+                # Never narrowed below the run: a late stamp is a stale window
+                # file or a clock step, not a later start.
+                since_what = (
+                    "this run started (`accepts_stream_pull_request` is set, but "
+                    f"{STREAM_STARTED_ENV_VAR} ({stream_started.isoformat()}) is not "
+                    "before this run, so the window was not widened)"
+                )
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         # A candidate the API cannot answer for only ends the check if nothing
@@ -1669,11 +1956,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # the reason names both readings.
             updated = _parse_github_time(payload.get("updated_at"))
             touched = updated if updated and updated > created else created
-            age = (started - touched).total_seconds()
+            age = (since - touched).total_seconds()
             if age > self.max_clock_skew_sec:
                 rejected.append(
                     f"{slug}: last written at {touched.isoformat()}, {age:.0f}s "
-                    f"BEFORE this run started ({started.isoformat()}) — a leftover "
+                    f"BEFORE {since_what} ({since.isoformat()}) — a leftover "
                     "an earlier run opened, which this run either quoted or "
                     "resubmitted unchanged"
                 )
@@ -1682,7 +1969,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # only wrote to a pull request. `updated_at` moves on a comment and
             # on a label. The head commit moves on neither.
             try:
-                changed, pushed, unevaluable = self._head_push(
+                changed, pushed, pull, listing, unevaluable = self._head_push(
                     owner, repo, number, payload, token, budget
                 )
             except OSError as exc:
@@ -1696,19 +1983,71 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"{slug}: changes no files, so it carries no proposed fix"
                 )
                 continue
-            if pushed and (started - pushed).total_seconds() > self.max_clock_skew_sec:
+            if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
                 rejected.append(
                     f"{slug}: its head commit dates from {pushed.isoformat()}, "
-                    f"before this run started ({started.isoformat()}) — this run "
+                    f"before {since_what} ({since.isoformat()}) — this run "
                     "wrote to a pull request an earlier one pushed the fix to"
                 )
                 continue
+            # Only the widened window needs the branch: a pull request this
+            # run wrote and pushed to is this run's whatever it is called.
+            skew = self.max_clock_skew_sec
+            if stream_branch and (
+                (started - touched).total_seconds() > skew
+                or (pushed and (started - pushed).total_seconds() > skew)
+            ):
+                if f"{owner}/{repo}".lower() != _stream_repo():
+                    rejected.append(
+                        f"{slug}: last written or pushed to before this run "
+                        f"started, in a repository other than this job's "
+                        f"({_stream_repo()}) — another job's pull request on "
+                        "the same audit stream, not this one's"
+                    )
+                    continue
+                head = str(((pull or payload).get("head") or {}).get("ref") or "")
+                if not head.startswith(stream_branch):
+                    rejected.append(
+                        f"{slug}: last written or pushed to before this run "
+                        f"started, on branch "
+                        f"{head or '(unreadable)'!r}, which is not one this audit "
+                        f"stream's `finish` names ({stream_branch}*) — another "
+                        "case's pull request, not the stream's"
+                    )
+                    continue
+            if self.reuses_spent_branch:
+                try:
+                    rejection, unevaluable = self._spent_before(
+                        owner, repo, number, pull, listing, token, budget, started,
+                        {n for o, r, n in seen
+                         if o.lower() == owner.lower() and r.lower() == repo.lower()},
+                    )
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                if rejection:
+                    rejected.append(rejection)
+                    continue
+            # Within the skew allowance a pull request a hair older than the
+            # run is still this run's; "an earlier repetition" only when the
+            # widened window is what admitted it.
+            during = (
+                "during this run"
+                if since == started or (started - touched).total_seconds() <= self.max_clock_skew_sec
+                else f"by an earlier run on this audit stream (found already open; "
+                f"{since_what} at {since.isoformat()})"
+            )
             return done(
                 True,
                 f"{slug} was {'opened' if touched == created else 'updated'} at "
-                f"{touched.isoformat()}, during this run, and carries "
+                f"{touched.isoformat()}, {during}, and carries "
                 f"{changed if changed is not None else 'an unreported number of'} "
-                "changed file(s)",
+                "changed file(s)"
+                + (", on a branch this run's closed pull request had used"
+                   if self.reuses_spent_branch else ""),
                 raw={
                     "pull_request": slug,
                     "created_at": created.isoformat(),
@@ -1727,8 +2066,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return done(
             False,
-            "none of the pull request URLs the report names is one this run opened: "
-            + "; ".join(rejected),
+            "none of the pull request URLs the report names was opened or "
+            f"pushed to since {since_what}: " + "; ".join(rejected),
         )
 
 
@@ -1954,7 +2293,7 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
     kubeconfig, because that fallback is the whole defect.
 
     Roles rather than cluster names because every eval project carries its own
-    trio of seeded clusters. ``bench/tf/fleet/fixtures.json`` is the role
+    set of seeded clusters. ``bench/tf/fleet/fixtures.json`` is the role
     catalog and the only place the role-to-cluster mapping exists.
 
     **It can FAIL, not only error.** A safeguard that cannot tell "the agent
@@ -2006,7 +2345,7 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
     subject is a legitimately absent object such as a pathless ``absent``, the
     namespace containing it. Anything else is an environment that was never
     ready, which is an error and not the agent's doing. The first draft of this
-    gate confirmed only the NAMESPACE, which four of the eight roles do not
+    gate confirmed only the NAMESPACE, which the cluster-scoped roles do not
     have: on a live-but-empty cluster ``compliance-rbac-overgrant`` reported a
     catastrophic ``fail`` against an agent that had touched nothing.
 
@@ -2296,3 +2635,201 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
                 raw=raw,
             )
         return result
+
+
+class ExpectedFinding(BaseModel):
+    """One finding a ``bootstrap_findings`` check expects, by check id and object."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    check: str = Field(min_length=1)
+    object: str = Field(min_length=1)
+
+
+class _OnboardingPollVerifier(BaseVerifier):
+    """Polls :meth:`_check`, reading onboarding's files off the install.
+
+    A ``fail`` from an earlier poll outranks a final read that errors: a read
+    that could not reach a pod does not un-observe what an earlier one saw.
+    """
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        read_timeout = min(single_call_timeout(timeout_sec), _ONBOARDING_READ_TIMEOUT_SEC)
+        # _poll_to_result reports the last poll even when it is an error; the
+        # latest fail stands in that case.
+        last_fail: tuple[str, dict[str, Any] | None] | None = None
+
+        def attempt() -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+            nonlocal last_fail
+            status, reason, raw = self._check(read_timeout)
+            if status == "fail":
+                last_fail = (reason, raw)
+            return status, reason, raw
+
+        result = self._poll_to_result(attempt, timeout_sec)
+        if result.status == "error" and last_fail is not None:
+            reason, raw = last_fail
+            return VerificationResult(
+                success=False,
+                status="fail",
+                elapsed_time=result.elapsed_time,
+                reason=f"{reason} (the last read failed: {result.reason})",
+                name=self.name,
+                raw=raw,
+            )
+        return result
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        raise NotImplementedError
+
+
+@VERIFIERS.register("bootstrap_findings")
+class BootstrapFindingsVerifier(_OnboardingPollVerifier):
+    """Checks the findings the onboarding prioritization stage extracted.
+
+    The prioritization card is filed by the discovery sweep's worker, not by
+    the conversation, and its worker runs ``inventory_findings.py extract``
+    through its terminal. This reads the file that writes,
+    ``INVENTORY.items.json``, off the shell sandbox's data volume
+    (:mod:`kube_agents_bench.onboarding`), where that terminal runs.
+
+    ``expected_findings``: the ``(check, object)`` pairs of the raw report's
+    findings block. Passes when the file's items carry exactly those pairs,
+    each as many times as listed.
+
+    An unreadable sandbox is ``status="error"``. No file, a file that is not
+    the extract's JSON, and a different set of findings are each a fail: the
+    stage did not run where the worker's terminal is, or did not run as the
+    SOP says.
+    """
+
+    type: Literal["bootstrap_findings"]
+    expected_findings: list[ExpectedFinding] = Field(min_length=1)
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        state, text, why = onboarding.read_items(onboarding.sandbox_shell, read_timeout)
+        if state == "error":
+            return "error", why, None
+        if state == "absent":
+            return "fail", f"{why}: extract did not run where the card's worker has its terminal", None
+        where = onboarding.ITEMS_FILE
+        if len(text.encode()) > onboarding.MAX_ITEMS_BYTES:
+            return "fail", f"{where} is larger than {onboarding.MAX_ITEMS_BYTES} bytes", None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return "fail", f"{where} is not JSON: {exc}", None
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+            return "fail", f"{where} has no list of items, so it is not what extract writes", None
+        found = Counter((str(i.get("check")), str(i.get("object"))) for i in items)
+        expected = Counter((f.check, f.object) for f in self.expected_findings)
+        raw = {"found": sorted(found.elements())}
+        missing = sorted((expected - found).elements())
+        extra = sorted((found - expected).elements())
+        if missing or extra:
+            parts = [f"{where} holds {len(items)} finding(s) for {len(self.expected_findings)} expected"]
+            if missing:
+                parts.append(f"missing {missing}")
+            if extra:
+                parts.append(f"not in the raw report's block {extra}")
+            return "fail", "; ".join(parts), raw
+        return "pass", f"{where} holds the {len(items)} expected finding(s)", raw
+
+
+@VERIFIERS.register("bootstrap_report_read")
+class BootstrapReportReadVerifier(_OnboardingPollVerifier):
+    """Checks that onboarding's delivery job read the ranked report off the sandbox.
+
+    The prioritization card's worker writes ``INVENTORY.md`` on the shell
+    sandbox; ``bootstrap_delivery.py`` runs in the agent pod, reads it from
+    there, claims the delivery by writing ``.bootstrap_completed`` on the agent
+    pod, and renames the sandbox's copy to ``INVENTORY.delivered.md``. Passes
+    when the marker is on the agent pod and the sandbox holds the renamed
+    report and not the original.
+
+    Whether the scheduler then kept the run's output is not checked here.
+    Either pod unreadable is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_report_read"]
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        # The two pods cannot be read at one instant. A report written and claimed
+        # between the reads, or claimed and renamed between them, reads as a state
+        # the job never occupies; a sandbox read that matches the one before the
+        # agent-pod read shows the sandbox did not change while the agent pod was read.
+        files = [onboarding.REPORT_FILE, onboarding.DELIVERED_FILE]
+        # The delivery job fails on a dangling report symlink, so it is a report here; a
+        # dangling marker stays unclaimed, since the job can neither stat it nor claim over it.
+        links = [onboarding.REPORT_FILE]
+        unreadable = f"{onboarding.sandbox_pod()} could not be read (kubectl exec failed or the command did not run)"
+        sandbox = onboarding.read_files(onboarding.sandbox_shell, files, read_timeout, links)
+        if sandbox is None:
+            return "error", unreadable, None
+        for _ in range(_REPORT_READ_ATTEMPTS):
+            agent = onboarding.read_files(onboarding.agent_shell, [onboarding.COMPLETED_MARKER], read_timeout)
+            if agent is None:
+                return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
+            before, sandbox = sandbox, onboarding.read_files(onboarding.sandbox_shell, files, read_timeout, links)
+            if sandbox is None:
+                return "error", unreadable, None
+            if sandbox == before:
+                break
+        claimed = agent[onboarding.COMPLETED_MARKER]
+        report = sandbox[onboarding.REPORT_FILE]
+        delivered = sandbox[onboarding.DELIVERED_FILE]
+        raw = {"claimed": claimed, "report": report, "delivered": delivered}
+        marker, pod = onboarding.COMPLETED_MARKER, onboarding.sandbox_pod()
+        if claimed and delivered and not report:
+            return "pass", f"the delivery job claimed the report ({marker}) and renamed {pod}'s INVENTORY.md to INVENTORY.delivered.md", raw
+        if not claimed and report:
+            return "fail", f"{pod} holds INVENTORY.md and there is no {marker}: the delivery job did not read the report off the sandbox", raw
+        if not claimed and not delivered:
+            return "fail", f"no INVENTORY.md on {pod}: the prioritization stage wrote no report, so there was nothing to deliver", raw
+        if not claimed:
+            return "fail", f"{pod} holds INVENTORY.delivered.md but there is no {marker}", raw
+        if report:
+            return "fail", f"{marker} exists but {pod} still holds INVENTORY.md: the delivery job did not archive the report it claimed", raw
+        return "fail", f"{marker} exists but {pod} holds neither INVENTORY.md nor INVENTORY.delivered.md", raw
+
+
+@VERIFIERS.register("bootstrap_delivered")
+class BootstrapDeliveredVerifier(_OnboardingPollVerifier):
+    """Checks that the scheduler kept the run that delivered the onboarding report.
+
+    ``bootstrap_delivery.py`` claims the report by writing
+    ``.bootstrap_completed`` and prints it; the scheduler posts what it prints
+    only if the run completes. A run whose job is removed while it runs is
+    recorded as failed and its output is discarded. This finds the delivery
+    job's run in the agent pod's ``cron/executions.db`` whose window holds the
+    marker's mtime, and passes when that run completed.
+
+    Where the output went is not checked: the bench stack delivers to
+    ``local``, which the scheduler records as ``suppressed``. The agent pod
+    unreadable, or a marker, cron store or run timestamp the read cannot use,
+    is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_delivered"]
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_delivery_runs(onboarding.agent_shell, read_timeout)
+        if read is None:
+            return "error", "the agent pod's cron store could not be read (kubectl exec failed or the command did not run)", None
+        if read.get("error"):
+            return "error", f"the agent pod's claim marker or cron store could not be read: {read['error']}", read
+        marker, job = onboarding.COMPLETED_MARKER, onboarding.DELIVERY_JOB_ID
+        if read.get("marker") is None:
+            return "fail", f"there is no {marker}: the delivery job never claimed the report", read
+        claimed = datetime.fromtimestamp(read["marker"], timezone.utc).isoformat()
+        runs = read["runs"]
+        if not runs:
+            return "fail", f"no run of {job} in {onboarding.EXECUTIONS_DB} spans the claim at {claimed}", read
+        run = runs[0]
+        status = run.get("status")
+        if status == "completed":
+            return "pass", f"the {job} run that claimed the report at {claimed} completed", read
+        if status in ("claimed", "running"):
+            return "fail", f"the {job} run that claimed the report at {claimed} is still {status}", read
+        return "fail", f"the {job} run that claimed the report at {claimed} ended {status}: {run.get('error') or 'no error recorded'}", read

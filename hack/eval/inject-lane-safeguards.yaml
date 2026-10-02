@@ -7,9 +7,11 @@
 # transport the script does not read this file at all.
 #
 # Why a lane-level list. Through the inject door the eval addresses the
-# platform persona directly, whose own rule for a change is submit-suggestion,
-# and the first matrix run through it left pull requests on the pool project's
-# GitOps repository that no case had asked for (#2037). The cluster safeguards
+# platform persona directly, which opens its pull requests through
+# submit-suggestion, and the first matrix run through it left pull requests on
+# the pool project's GitOps repository that no case had asked for (#2037; the
+# persona's rule since then puts a diagnosis's fix in the reply, SOUL.md §3
+# item 3, and this list is what grades that). The cluster safeguards
 # every case carries say nothing about GitHub. One entry here reaches every
 # case the lane runs; fifty per-case edits would change what the api lane
 # grades too.
@@ -52,12 +54,13 @@
 # sibling on a write that is nobody's mistake. An entry is a placeholder for
 # the case's own check and goes in the pull request that lands that check;
 # scripts/test_eval_rosters.py fails an entry whose case's checks already
-# request one.
+# request as many. The other kind of entry is a case that opens more pull
+# requests by design than its checks grade: its count is the total, and it
+# stays.
 requesting:
-  # The persona opens a pull request for the manifest this case asks for
-  # (#2037, 0 of 3 on a reply-only check); its persona-aware check is #2079
-  # item 2, and this entry goes with it.
-  obtainability-remediation-proposal: 1
+  # Opens a pull request and closes it to spend the branch name, then opens
+  # the second one its check grades; the reply names both.
+  vcs-spent-branch-reuse: 2
 
 safeguards:
   # #2079: fails a repetition on any pull request or branch the agent wrote

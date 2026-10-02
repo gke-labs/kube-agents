@@ -52,7 +52,10 @@ selects who decides, and it defaults to `roster`:
   `bench/kube_agents_bench/baselines.py` still computes what the store would do and
   reports it per case — `would-admit` and `would-demote` for a full window
   (`EVAL_ADMISSION_MIN_RUNS` runs, default 20, at the current key, above or below the
-  `EVAL_ADMISSION_RATE` bar), `collecting` for a partial one, `stale` for evidence only at a
+  `EVAL_ADMISSION_RATE` bar, 0.90 since 2026-09-29 so that it is the same ≥ 90 % bar the
+  held-out entries below hold a case to; the measurement it was set from is
+  [on #1493](https://github.com/gke-labs/kube-agents/issues/1493#issuecomment-5892741229)),
+  `collecting` for a partial one, `stale` for evidence only at a
   superseded key, `none` for nothing — and a roster edit cites that sentence. Nothing the
   nightly appends changes which cases block.
 - **`record`**: the store decides once it holds a full window for a case, either way — a
@@ -187,7 +190,9 @@ they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `
 #43, #46, then leftover #12), so a reading in the 50–67 % band is the isolation design
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
 it is agent regression; step 3 either counts it, grades repetition 1 only, or sweeps between
-repetitions, and says which. The roster edit (step 4, an eval-crew approval) takes
+repetitions, and says which. `pull_request_opened`'s `accepts_stream_pull_request` is not a
+fourth answer here: it widens only a fleet audit's stream, and this case has no ledger and
+opens submit-suggestion branches. The roster edit (step 4, an eval-crew approval) takes
 `remediation` off the `docs/designs/domains.yaml` allowlist. Until then the domain sits there
 beside fleet-audits.
 
@@ -284,6 +289,71 @@ ending in a pull request, is still first seen by the next nightly that finishes 
 eval crew took that trade with the policy; what makes a break on a GitHub-write path block is
 a roster line for one of these seats (#2013 step 4, #2016 step 4), and until one lands a pull
 request that touches that path should still say what it ran by hand.
+
+## The whole-suite rate
+
+Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
+pass rate of every roster case's scored repetitions — twelve cases × three = 36 units, `infra`
+repetitions left out — against `main`'s rate over the same cases from the evidence store (the
+newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
+which made several cases a little worse without making any one of them fail three times. The
+verdict prints it on every run today:
+
+```
+Admitted-case pass rate: 91.7% (main: 92.4%, margin 10.0%)
+```
+
+The margin is `EVAL_AGGREGATE_MARGIN`, default 0.10, measured on 2026-09-29 against 94 green
+presubmit runs since 2026-09-26 and the four clean nightlies: the worst unchanged run fell 0.063
+below `main` (five failed repetitions of 36; the 0.05 the rule shipped with would have redded it),
+and 0.10 reds none of them while redding the seventh failed repetition at `main`'s rate that day,
+the sixth once `main` sits near 0.94. The measurement and the two-proportion alternative are in
+[the scorer design](designs/eval-scorer.md#sizing-the-aggregate-margin-measured-2026-09-29).
+
+**It is advisory until armed, and arming is one line in Prow.** With `EVAL_AGGREGATE_ARMED`
+unset — the script's default, pinned by `bench/tests/test_gate.py` — a rate below the margin is a
+note in the verdict, not a red. To arm it, add one line to `pull-kube-agents-smoke-test`'s
+script in `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml` of
+`GoogleCloudPlatform/oss-test-infra`, beside the existing `export EVAL_BASELINE_STORE=...` line
+(the job has no `env:` block; every `EVAL_*` setting is an `export` in its `bash -c` script):
+
+```bash
+export EVAL_AGGREGATE_ARMED="1"
+```
+
+Nothing in this repository changes for the flip, and the same line removed disarms it. The nightly
+periodic does not get the line: it records `main` and grades itself against a window that already
+holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
+window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
+sample contains); the eval dashboard's Trend page draws that window from the same store, per case
+and per domain, so it is the place to watch for it.
+
+**What an author sees when it fires.** No case is marked blocking; the failures are spread. The
+job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,
+and `eval-verdict.md` opens:
+
+```
+**RED**
+
+Admitted-case pass rate: 80.6% (main: 92.4%, margin 10.0%)
+
+### Why it is red
+
+- suite pass rate 0.806 is below main's 0.924 by more than the 0.100 margin (over 36 scored repetitions)
+```
+
+followed by the per-case table, where the failed repetitions sit under `Passes` as `2/3` on
+several rows and each failing repetition's reason and the agent's report are quoted below it.
+Because the sample said seven failed repetitions of 36 is beyond what an unchanged pull request
+produces, the first move is the same as for any red: read the quoted reasons. If they are the
+familiar phrase-match misses spread over unrelated probes, rerun once; a second red at the same
+rate is a finding against the change. `main`'s side of the line is the same number the eval
+dashboard's Trend page draws from the store (`docs/ci-health.md`), so a rate that looks wrong can
+be checked there, and a `main` window that has itself slipped is a nightly problem to fix on
+`main`, not a reason to widen the margin. A case that is dragging both sides down (on
+2026-09-29 `upgrades-lagging-master-probe` was 52 of the sample's 116 failed repetitions) is
+handled under [Demoting a flaky case](#demoting-a-flaky-case), which raises `main`'s rate and
+tightens this rule at the same time.
 
 ## The inject lane
 
@@ -400,7 +470,17 @@ to have shown all of the following first, and the decision is still a team one a
    `EVAL_ADMISSION_RATE` sits above it: two consecutive nights on the same `main` commit are
    the "run it twice, see how much it moves" calibration
    [`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2 asks for, and a
-   bar below the noise floor demotes cases for weather.
+   bar below the noise floor demotes cases for weather. Read once so far, on 2026-09-29
+   ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)): over the four full-matrix
+   nights since oss-test-infra#2707, 20 of the 45 cases with all four nights moved 0 points
+   and 31 moved at most one repetition, so the bar moved from 0.95 (19 of 20, a number nobody
+   had chosen from data) to 0.90, the bar the entries above already hold a case to. At 0.95
+   the record would have demoted 6 of the 12 roster cases (17/21, 19/21, 18/21, 18/21, 18/20,
+   16/20); at 0.90 it demotes 4, and the two that flip are the ones one miss short of the
+   old bar. This item is not "holds" yet: one reading, and the four that remain below the
+   bar are not one story — the two crashloop cases miss this week only, capacity misses in
+   both weeks, and upgrades-lagging-master-probe's misses are all from 09-20 to 09-25 with
+   12 of 12 since.
 
 Switching before 2 holds leaves a listed case with no full window with the list (the list
 is the fallback in `record` mode) but hands every full-window case to the record the same

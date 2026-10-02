@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -1352,6 +1353,28 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
+	// The Slack UX flag is read by the gateway's Slack adapter and kanban
+	// notifier, both in this container. Off the allowlist, the documented
+	// `spec.deployment.env` override renders on the CR and never reaches them,
+	// so the feature cannot be turned on at all.
+	custom := []corev1.EnvVar{
+		{Name: "KAGE_SLACK_UX", Value: "1"},
+		{
+			Name: "KAGE_SLACK_UX",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "1" || got[0].ValueFrom != nil {
+		t.Errorf("expected only the literal KAGE_SLACK_UX=1 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
 	// reads both from the environment on every tick and there is no config
@@ -2428,6 +2451,82 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(fbConf, "Name              tail") {
 		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+// The audit lift: the sidecar recognises a tool_call_audit or chat_message_audit
+// line, captures its JSON object and decodes it into top-level fields, in that
+// order and before the record modifier stamps the record. The regex is checked
+// against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
+// translated to Go's, since the two engines agree on everything else in it.
+// Those lines are frozen here: the test holds the regex to the format as
+// sampled and cannot notice a Hermes release that changes it. That check is a
+// live one after an agent image change: jsonPayload.audit_event in Logs
+// Explorer, a key the broker's own records do not carry, as the observability
+// page says.
+func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
+	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	})
+	fbConf := cm.Data["fluent-bit.conf"]
+	parsers := cm.Data["parsers.conf"]
+
+	order := []string{"Parser        gchat_event", "Parser        hermes_audit_line", "Key_Name      audit_json", "Parser        audit_json", "Name              record_modifier"}
+	last := -1
+	for _, needle := range order {
+		at := strings.Index(fbConf, needle)
+		if at < 0 {
+			t.Fatalf("fluent-bit.conf lacks %q", needle)
+		}
+		if at < last {
+			t.Errorf("%q is out of order in fluent-bit.conf; the lift has to capture before it decodes and decode before the record is stamped", needle)
+		}
+		last = at
+	}
+	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
+		t.Errorf("parsers.conf lacks the json decoder the lift needs; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	}
+
+	var expr string
+	for _, line := range strings.Split(parsers, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "Regex   ^") {
+			expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Regex"))
+		}
+	}
+	if expr == "" {
+		t.Fatal("parsers.conf has no anchored Regex line for hermes_audit_line")
+	}
+	re := regexp.MustCompile(strings.ReplaceAll(expr, "(?<", "(?P<"))
+	const sample = `2026-09-28 15:45:43,391 INFO hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "duration_ms": 53, "result": "{\"ok\": true}", "task_id": "k8s-evt-a9c4f17a", "tool_name": "kanban_create"}`
+	match := re.FindStringSubmatch(sample)
+	if match == nil {
+		t.Fatalf("the audit regex does not match a line Hermes wrote: %q", sample)
+	}
+	captured := match[re.SubexpIndex("audit_json")]
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(captured), &decoded); err != nil {
+		t.Fatalf("the capture is not the JSON object: %v (%q)", err, captured)
+	}
+	if decoded["tool_name"] != "kanban_create" {
+		t.Errorf("decoded record = %v, want the plugin's fields", decoded)
+	}
+	if re.MatchString(`2026-09-28 15:45:43,376 WARNING tools.kanban_event_routing: kanban event routing: {"not": "an audit record"}`) {
+		t.Error("the audit regex matches a line from another logger; only the two audit emitters may be lifted")
+	}
+	if !re.MatchString(`2026-09-28 15:45:43,391 INFO hermes.hook.chat_message_audit: {"audit_event": "chat_message_end"}`) {
+		t.Error("the audit regex does not match the chat_message_audit hook's lines")
+	}
+	// Hermes tags a record emitted on a thread holding a session context with
+	// ` [<session id>]` between the level and the logger name; the tools it
+	// runs inline on the turn thread log that way, and an unmatched line passes
+	// through the sidecar unlifted with no signal.
+	tagged := `2026-09-28 15:45:43,391 INFO [20260928_154543_50074bf0] hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "tool_name": "clarify"}`
+	match = re.FindStringSubmatch(tagged)
+	if match == nil {
+		t.Fatalf("the audit regex does not match a session-tagged line: %q", tagged)
+	}
+	if !strings.HasPrefix(match[re.SubexpIndex("audit_json")], `{"audit_event": "tool_call_end"`) {
+		t.Errorf("the capture on a tagged line is not the JSON object: %q", match[re.SubexpIndex("audit_json")])
 	}
 }
 
@@ -6794,6 +6893,205 @@ func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 					"only caller disagree", hasPods, armed)
 			}
 		})
+	}
+}
+
+// TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider covers the state
+// ConfigMap half of docs/designs/version-control-support.md §6: each entry's
+// `type` is its forge's provider, each role lands in its own list, and a
+// repository on a host the provider does not serve seeds nothing rather than
+// being rewritten onto a host it does.
+func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
+	const githubEntry = `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"}]`
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "gke-labs"}}
+	gitops := func(repository string) []agentv1alpha1.RepositorySpec {
+		return []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: repository, Role: "gitops"}}
+	}
+
+	cases := []struct {
+		name    string
+		spec    agentv1alpha1.IntegrationSpec
+		managed string
+		context string
+	}{
+		{
+			name:    "lists",
+			spec:    agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("kube-agents")},
+			managed: githubEntry,
+		},
+		{
+			name: "lists with the provider defaulted",
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "github"}},
+				Repositories: gitops("https://github.com/gke-labs/kube-agents.git")},
+			managed: githubEntry,
+		},
+		{
+			// The two spellings must seed the identical entry, or the deprecated
+			// alias is a second code path rather than an alias.
+			name: "deprecated github alias",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				Org: "gke-labs", GitRepo: "kube-agents"}},
+			managed: githubEntry,
+		},
+		{
+			// GitOps first whatever the declaration order, because the agent
+			// reads the first managed entry as the repository its GitOps work
+			// lands in; context entries go to their own list.
+			name: "every role",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"},` +
+				`{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			// An invalid entry is skipped, not the list: one typo must not take
+			// the GitOps repository out of the ConfigMap with it.
+			name: "an invalid repository does not drop its neighbours",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "git@gitlab.com:group/project.git", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			// With the webhook off (the chart default) nothing but the seeding
+			// itself stops an entry Problems refuses: "None" would qualify into
+			// gke-labs/None, a duplicate would be written twice, and a namespace
+			// outside GitHub's grammar would reach the minter's scopes.
+			name: "entries Problems refuses are not seeded",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"},
+				{Forge: "github", Repository: "None", Role: "managed"},
+				{Forge: "github", Repository: "https://github.com/gke-labs/kube-agents", Role: "context"},
+				{Forge: "github", Repository: "apps", Namespace: "my.org", Role: "managed"},
+			}},
+			managed: githubEntry,
+		},
+		{
+			name: "a repository on a forge with a bad namespace is not seeded",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "my.org"}},
+				Repositories: gitops("kube-agents"),
+			},
+		},
+		{
+			// The agent reads the first managed_repos entry as its GitOps
+			// repository, so an accepted managed one must not take the place of
+			// a refused gitops one. Context repositories hold no such place.
+			name: "a refused gitops repository seeds no managed one in its place",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "in fra", Role: "gitops"},
+				{Forge: "github", Repository: "apps", Role: "managed"},
+				{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"},
+			}},
+			context: `[{"type":"github","url":"https://github.com/kubernetes/kubernetes"}]`,
+		},
+		{
+			name: "managed repositories are seeded where no gitops one is declared",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"},
+			}},
+			managed: `[{"type":"github","url":"https://github.com/gke-labs/apps"}]`,
+		},
+		{
+			// Before this change the operator wrote
+			// {"type":"github","url":"https://github.com/group/project"} here: the
+			// host was discarded, the two remaining slashes passed the shape check,
+			// and the URL was rebuilt against github.com. The agent then had a
+			// registered repository nobody had declared.
+			name: "an scp remote on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("git@gitlab.com:group/project.git")},
+		},
+		{
+			// The other half of the same defect: CleanRepoURLWithOrg returned an
+			// https URL verbatim, so this seeded a gitlab.com URL under
+			// "type":"github" — an entry whose two fields named different forges.
+			name: "an https URL on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops("https://gitlab.com/group/project")},
+		},
+		{
+			name: "a repository on an undeclared forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "gitlab", Repository: "group/project", Role: "gitops"}}},
+		},
+		{
+			name: "both spellings at once seed nothing",
+			spec: agentv1alpha1.IntegrationSpec{
+				Forges:       gh,
+				Repositories: gitops("kube-agents"),
+				GitHub:       &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+			},
+		},
+		{
+			name: "the no-repository sentinel seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				GitRepo: agentv1alpha1.NoRepositorySentinel}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: tc.spec},
+				},
+			}
+			data := buildGitopsStateConfigMap(agent).Data
+			if got := data["managed_repos"]; got != tc.managed {
+				t.Errorf("managed_repos = %q, expected %q", got, tc.managed)
+			}
+			if got := data["context_repos"]; got != tc.context {
+				t.Errorf("context_repos = %q, expected %q", got, tc.context)
+			}
+		})
+	}
+}
+
+// TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub is the upgrade half
+// of deriving the forge egress: an install that declares nothing, one on the
+// deprecated `github` alias, and one on the forge lists with GitHub must all
+// render the identical allowlist — and the forge patterns must sit where the
+// literals used to, so an upgrade re-renders a GitHub install's policy
+// unchanged rather than churning every FQDNNetworkPolicy in the fleet.
+func TestFQDNForgePatternsAreTheSameForEverySpellingOfGitHub(t *testing.T) {
+	render := func(integration *agentv1alpha1.PlatformAgentIntegrationSpec) []string {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
+			Spec:       agentv1alpha1.PlatformAgentSpec{Integration: integration},
+		}
+		spec := buildFQDNNetworkPolicy(agent).Object["spec"].(map[string]interface{})
+		rule := spec["egress"].([]interface{})[0].(map[string]interface{})
+		var patterns []string
+		for _, m := range rule["matches"].([]interface{}) {
+			patterns = append(patterns, m.(map[string]interface{})["pattern"].(string))
+		}
+		return patterns
+	}
+
+	baseline := render(nil)
+	at := slices.Index(baseline, "*.pkg.dev")
+	if at < 0 || !slices.Equal(baseline[at+1:at+4], []string{"github.com", "*.github.com", "*.githubusercontent.com"}) {
+		t.Fatalf("GitHub's patterns moved from their pre-derivation position after *.pkg.dev: %v", baseline)
+	}
+
+	for name, integration := range map[string]*agentv1alpha1.PlatformAgentIntegrationSpec{
+		"deprecated alias": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			GitHub: &agentv1alpha1.GitHubSpec{Org: "gke-labs", GitRepo: "kube-agents"}}},
+		"lists": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "github.com"}},
+			Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "gke-labs/kube-agents", Role: "gitops"}}}},
+		"two github forges": {IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "ours", Namespace: "gke-labs"}, {Name: "upstream", Host: "www.github.com"}}}},
+	} {
+		if got := render(integration); !slices.Equal(got, baseline) {
+			t.Errorf("%s renders %v, expected the undeclared install's %v", name, got, baseline)
+		}
 	}
 }
 

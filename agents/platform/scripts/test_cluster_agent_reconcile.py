@@ -1139,7 +1139,7 @@ class ScopeTest(HomesMixin):
                 # Honours the timeout the way gcloud's would: sleeps no longer than it.
                 time.sleep(min(1.5, timeout if timeout is not None else 1.5))
             return [], rec.OUTCOME_OK
-        baseline = threading.active_count()
+        before = set(threading.enumerate())
         start = time.monotonic()
         with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
@@ -1153,7 +1153,8 @@ class ScopeTest(HomesMixin):
         # by more than the grace: the interpreter joins the pool's threads at exit.
         self.assertLessEqual(cuts["slow"], 1.0)
         time.sleep(1.2)
-        self.assertEqual(threading.active_count(), baseline)
+        # Threads, not a count: an earlier test's pool worker can still be exiting when this starts.
+        self.assertEqual([t for t in threading.enumerate() if t not in before], [])
 
     # ---- phase 2: folders and organisations through Cloud Asset Inventory ----
 
@@ -2429,12 +2430,261 @@ class ScopeTest(HomesMixin):
         self.assertNotIn("222", report["projects"])
 
     def test_excluding_the_bare_number_drops_a_member_the_run_could_not_name(self):
-        report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
-                                       {self.MGMT: [(self.MGMT, "m", "us-central1")]},
-                                       selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        # An excluded number whose naming call is refused (the install path withheld the
+        # grant on that entry) is dropped on the number, and is neither reported as unnamed
+        # nor a hold on the prune: the number is the declaration speaking.
+        with mock.patch.object(rec, "log") as logged:
+            report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
+                                           {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                           selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
         self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
         self.assertEqual(sorted(report["projects"]), [self.MGMT])
         self.assertNotIn("333", {p["id"] for p in self._snapshot()["projects"]})
+        self.assertNotIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(self._snapshot()["containers"], [{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+
+    def test_excluding_the_number_drops_a_member_a_past_run_named_once_its_grant_is_gone(self):
+        # Run N named 111 as team-a and listed it. The operator then names 111 in
+        # exclude.projects and applies: the install path withholds team-a's grant on that
+        # entry, so this run's naming call is refused and the member is keyed under the ID
+        # the snapshot remembers. The entry has to match that row by its number, or the
+        # project reads denied under its ID on every tick, profiles kept, instead of leaving.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"metricsScopes": ["mon-proj"], "exclude": {"projects": ["111"]}}
+        report, created, deleted = self._run(declaration, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                             numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((created, deleted), ([], []))
+        self.assertNotIn("team-a", report["projects"])
+        self.assertEqual(report["retiring"], ["team-a"])
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-a")
+        self.assertEqual((row["state"], row[rec.NUMBER_KEY]), (rec.STATE_RETIRING, "111"))
+        # The same entry keeps the member out when the selector's own lookup fails and its
+        # previous members are carried frozen.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, _, _ = self._run(declaration, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                 selectors={self.SCOPE: (None, rec.OUTCOME_DENIED)})
+        self.assertNotIn("team-a", report["projects"])
+
+    def test_excluding_the_number_drops_the_project_on_the_explicit_and_container_routes_too(self):
+        # team-a is monitored by the scope (number 111), declared in `projects` and under a
+        # declared folder; 111 is excluded. The explicit and folder routes reach it by ID, so
+        # the entry has to be tied to the ID: by naming the number, which the grant those
+        # routes carry allows, whether or not a past row kept it. Without that the project
+        # stays fully managed with nothing saying the entry matched nothing.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "folders": ["123456789012"], "metricsScopes": ["mon-proj"],
+                       "exclude": {"projects": ["111"]}}
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        # `numberless`: the row a run before the scope was declared wrote, explicit and under
+        # the folder with no number; the scope and the number entry arrive in one edit, so the
+        # tie is this run's naming pass alone. The retire hold has to see that tie as the
+        # resolution did, or the project is held a day as an index lag with its profile kept,
+        # the declaration having named it.
+        for previous in (None, "named", "numberless"):
+            with self.subTest(previous_row=previous):
+                if previous:
+                    row = {"id": "team-a", "via": ["explicit", self.FOLDER, self.SCOPE], "state": rec.STATE_IN_SCOPE,
+                           rec.NUMBER_KEY: "111"}
+                    if previous == "numberless":
+                        row = {"id": "team-a", "via": ["explicit", self.FOLDER], "state": rec.STATE_IN_SCOPE}
+                    self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}, row],
+                                         containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1}]
+                                         + ([{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}] if previous == "named" else []))
+                report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                                     profiles=["cluster-a"], identities=ids,
+                                                     searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                                     selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                                     numbers={"111": ("team-a", rec.OUTCOME_OK)})
+                self.assertEqual((created, deleted), ([], []))
+                self.assertNotIn("team-a", report["projects"])
+                # In scope last run: retiring now, its profile kept until the next clean run.
+                self.assertEqual(report["retiring"], ["team-a"] if previous else [])
+                snap = self._snapshot()
+                self.assertEqual([u["reason"] for u in snap["unmanaged"]],
+                                 ["left the scope this run; retiring, pruned on the next clean run" if previous else "never in scope"])
+                if previous:
+                    row = next(p for p in snap["projects"] if p["id"] == "team-a")
+                    self.assertEqual((row["state"], row[rec.NUMBER_KEY]), (rec.STATE_RETIRING, "111"))
+        # A snapshot that no longer carries the row (the project dropped last run, nothing
+        # to retire) still drops it: the naming pass ties the number every run.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, _, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                 searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                 selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                 numbers={"111": ("team-a", rec.OUTCOME_OK)})
+        self.assertNotIn("team-a", report["projects"])
+        # An ID no run can tie to the number (the naming call refused, no row kept) is beyond
+        # the entry's reach on those routes: the number matches the bare-number row a
+        # selector keys it under, and that only.
+        declaration["exclude"]["projects"].append("222")
+        report, created, _ = self._run(declaration, {self.MGMT: [], "team-b": [("team-b", "x", "us-central1")]},
+                                       searches={self.FOLDER: ({"team-b": [("team-b", "x", "us-central1")]}, rec.OUTCOME_OK)},
+                                       selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)})
+        self.assertIn("team-b", report["projects"])
+        self.assertNotIn("222", report["projects"])
+
+    def test_a_transient_naming_failure_does_not_re_admit_a_project_excluded_by_number(self):
+        # team-a is explicit, under a declared folder and monitored (111); 111 is excluded. Once
+        # the exclusion has held for a run the project has no row, so the number -> ID pair has
+        # to live somewhere else: the snapshot's `numbers` memo. On a run whose naming call is
+        # cut, the memo ties the number and the project stays out; without it the explicit and
+        # folder routes would admit it, create its profiles, and the next run would retire them.
+        declaration = {"projects": ["team-a"], "folders": ["123456789012"], "metricsScopes": ["mon-proj"],
+                       "exclude": {"projects": ["111"]}}
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, created, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                       selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                       numbers={"111": ("team-a", rec.OUTCOME_OK)})
+        self.assertEqual((created, sorted(report["projects"])), ([], [self.MGMT]))
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self.assertEqual(rec._previous_numbers(self._snapshot()), {"111": "team-a"})
+        # A tick that consults no selector keeps every pair, as it carries the last declaration
+        # and every row: the CR without its scope block, a render from before the selector
+        # keys, and an unreadable file. Each would otherwise forget the one pair no row holds.
+        self._run({rec.SCOPE_PRESENT_KEY: False}, {self.MGMT: []})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        (Path(self._tmp.name) / "scope.json").write_text(json.dumps(
+            {rec.SCOPE_PRESENT_KEY: True, "projects": ["team-a"], "folders": ["123456789012"], "organizations": [],
+             "exclude": {"projects": ["111"], "clusters": []}}), encoding="utf-8")
+        self._run(None, {self.MGMT: [], "team-a": members["team-a"]}, searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        (Path(self._tmp.name) / "scope.json").write_text("{not json", encoding="utf-8")
+        self._run(None, {self.MGMT: []})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        for naming in (rec.OUTCOME_UNREACHABLE, rec.OUTCOME_DENIED):
+            with self.subTest(naming=naming), mock.patch.object(rec, "log") as logged:
+                report, created, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                               searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                               selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                               numbers={"111": (None, naming)})
+                self.assertEqual((created, sorted(report["projects"]), report["retiring"]), ([], [self.MGMT], []))
+                logs = " ".join(str(c) for c in logged.call_args_list)
+                self.assertNotIn("prune", logs)
+                self.assertNotIn("could not be named", logs)
+                # The pair outlives the run that could not name it, for the next one.
+                self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        # The pair also serves the other direction: the exclusion lifted while the naming call
+        # is refused, the member is reported under its ID rather than by number with the prune
+        # held, the identity being one a run has named.
+        with mock.patch.object(rec, "log") as logged:
+            report, created, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                           selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                           numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((report["projects"].get("team-a"), created), (rec.OUTCOME_DENIED, []))
+        self.assertNotIn("111", report["projects"])
+        self.assertNotIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        # The memo follows what needs the tie: kept while a lookup fails (what it would report
+        # is unknown), kept while the entry names the number although the scope no longer
+        # reports it, and dropped once neither holds.
+        self._run(declaration, {self.MGMT: []}, selectors={self.SCOPE: (None, rec.OUTCOME_UNREACHABLE)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self._run(declaration, {self.MGMT: []}, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self._run({**declaration, "exclude": {"projects": []}}, {self.MGMT: []}, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {})
+        # No run has ever named the number and this one cannot: the entry drops the member by
+        # number alone, and the log says the ID routes are beyond it until a run names it. A
+        # refusal is the install path having withheld the grant, which no route lists without,
+        # and stays silent.
+        for naming, said in ((rec.OUTCOME_UNREACHABLE, True), (rec.OUTCOME_DENIED, False)):
+            with self.subTest(never_named=naming), mock.patch.object(rec, "log") as logged:
+                self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+                report, _, _ = self._run(declaration, {self.MGMT: []},
+                                         searches={self.FOLDER: ({}, rec.OUTCOME_OK)},
+                                         selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)}, numbers={"111": (None, naming)})
+                self.assertNotIn("111", report["projects"])
+                logs = " ".join(str(c) for c in logged.call_args_list)
+                self.assertEqual("reaches no route that names the project by ID" in logs, said, naming)
+                self.assertNotIn("prune", logs)
+
+    def test_an_entry_naming_a_number_only_a_row_tied_keeps_the_tie_past_the_row(self):
+        # team-a was named 111 once (the row keeps it) and has since left the Metrics Scope, so
+        # the memo no longer holds the pair; the operator now excludes 111 while team-a is still
+        # explicit with profiles. The entry drops team-a on the row's number and retires it, the
+        # profiles go on the next clean run, and the row with them: the memo has to keep the
+        # pair for as long as the entry stands, or the third run, finding no row and no pair,
+        # admits team-a again and scaffolds the profiles it just deleted.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "metricsScopes": ["mon-proj"], "exclude": {"projects": ["111"]}}
+        listings = {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")]}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, created, deleted = self._run(declaration, listings, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted, report["retiring"]), ([], [], ["team-a"]))
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        report, created, deleted = self._run(declaration, listings, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted), ([], ["cluster-a"]))
+        snap = self._snapshot()
+        self.assertNotIn("team-a", {p["id"] for p in snap["projects"]})
+        self.assertEqual(snap[rec.NUMBERS_KEY], {"111": "team-a"})
+        for _ in range(2):
+            report, created, _ = self._run(declaration, listings, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+            self.assertEqual((created, sorted(report["projects"])), ([], [self.MGMT]))
+            self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        # The entry withdrawn, the number unreported: the pair leaves, and team-a is explicit again.
+        report, created, _ = self._run({"projects": ["team-a"], "metricsScopes": ["mon-proj"]}, listings,
+                                       selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, self._snapshot()[rec.NUMBERS_KEY]), ([("team-a", "prod", "us-central1")], {}))
+
+    def test_a_glob_never_matches_a_project_number(self):
+        # `*[0-9]*` is written against IDs, to keep numbered sandboxes out. Now that a number
+        # matches on every route, a glob that happens to match twelve digits would drop every
+        # monitored project once a run had named it, and retire its profiles, while the install
+        # path (an exact filter) kept the binding. A number matches an entry by equality alone,
+        # tied to an ID or keyed bare, on the explicit route, the selector route and the retire hold.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "metricsScopes": ["mon-proj"], "exclude": {"projects": ["*[0-9]*"]}}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "461802785698"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")],
+                                                           "team1-dev": [("team1-dev", "x", "us-central1")]},
+                                             profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: (["461802785698", "222"], rec.OUTCOME_OK)},
+                                             numbers={"461802785698": ("team-a", rec.OUTCOME_OK), "222": ("team1-dev", rec.OUTCOME_OK)})
+        self.assertEqual((report["projects"].get("team-a"), report["retiring"], deleted), (rec.OUTCOME_OK, [], []))
+        self.assertIn("cluster-a", report["kept"])
+        self.assertNotIn("team1-dev", report["projects"])  # the glob still matches the ID it was written for
+        self.assertEqual(created, [])
+        self.assertEqual(self._snapshot()["ignoredExcludes"], [])
+        # A bare-number key is a number too: the glob leaves the unnamed member, and its hold, alone.
+        with mock.patch.object(rec, "log") as logged:
+            report, _, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["*3*"]}}, {self.MGMT: []},
+                                     selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(report["projects"].get("333"), rec.OUTCOME_DENIED)
+        self.assertIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(rec._excluded_by("333", ["*3*"]), None)
+        self.assertEqual(rec._excluded_by("333", ["333"]), "333")
+
+    def test_an_entry_naming_the_management_projects_number_is_ignored_and_recorded(self):
+        # The scope monitors the management project too, and the operator's number entry
+        # names it: ignored like an entry that names its ID, and recorded the same way, on the
+        # run that names the number and on a later one whose naming call is refused, when the
+        # tie is the row's.
+        declaration = {"metricsScopes": ["mon-proj"], "exclude": {"projects": ["999"]}}
+        for numbers in ({"999": (self.MGMT, rec.OUTCOME_OK)}, {"999": (None, rec.OUTCOME_DENIED)}):
+            with self.subTest(numbers=numbers), mock.patch.object(rec, "log") as logged:
+                report, created, _ = self._run(declaration, {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                               selectors={self.SCOPE: (["999"], rec.OUTCOME_OK)}, numbers=numbers)
+                self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
+                self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+                snap = self._snapshot()
+                self.assertEqual(snap["ignoredExcludes"], [{"project": self.MGMT, "pattern": "999"}])
+                row = next(p for p in snap["projects"] if p["id"] == self.MGMT)
+                self.assertEqual((row["via"], row[rec.NUMBER_KEY]), (["management", self.SCOPE], "999"))
+                self.assertIn(f"matches the management project {self.MGMT} by its number 999",
+                              " ".join(str(c) for c in logged.call_args_list))
 
     def test_a_row_written_under_the_bare_number_is_no_mapping(self):
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},

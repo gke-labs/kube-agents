@@ -182,18 +182,17 @@ func classifyPullFailure(message string) pullClass {
 // Bounded in both directions. Entries expire after ttl because a pod that recovers
 // and later fails for a different reason must not inherit the stale class, and the
 // map is capped so a cluster churning through pods cannot grow it without limit.
+// The map, the expiry and the eviction are boundedEntries (memo.go), shared
+// with scaleUpMemo; an entry here is dated by when it was recorded.
 type pullClassMemo struct {
 	mu      sync.Mutex
-	entries map[string]pullClassEntry
-	ttl     time.Duration
-	max     int
+	entries boundedEntries[pullClassEntry]
 	now     func() time.Time
 }
 
 type pullClassEntry struct {
-	class    pullClass
-	cause    string
-	recorded time.Time
+	class pullClass
+	cause string
 }
 
 // pullResolution is everything the dispatcher needs to know about an image-pull
@@ -233,11 +232,7 @@ func newPullClassMemo(ttl time.Duration, max int) *pullClassMemo {
 	if max <= 0 {
 		max = defaultPullClassEntries
 	}
-	return &pullClassMemo{
-		entries: make(map[string]pullClassEntry),
-		ttl:     ttl,
-		max:     max,
-	}
+	return &pullClassMemo{entries: newBoundedEntries[pullClassEntry](ttl, max)}
 }
 
 func (m *pullClassMemo) clock() time.Time {
@@ -282,11 +277,7 @@ func (m *pullClassMemo) Resolve(uid, message string) pullResolution {
 	// stops inheriting on schedule.
 	informative := class != pullClassUnknown || cause != ""
 
-	prev, ok := m.entries[uid]
-	if ok && now.Sub(prev.recorded) > m.ttl {
-		delete(m.entries, uid)
-		ok = false
-	}
+	prev, _, ok := m.entries.lookup(uid, now)
 	if ok {
 		if cause == "" {
 			cause = prev.cause
@@ -307,42 +298,13 @@ func (m *pullClassMemo) Resolve(uid, message string) pullResolution {
 		// Inheritance only: report what is known, write nothing.
 		return pullResolution{Class: class, Cause: cause}
 	}
-	if !ok {
-		m.evictIfFull(now)
-	}
-	m.entries[uid] = pullClassEntry{class: class, cause: cause, recorded: now}
+	m.entries.store(uid, pullClassEntry{class: class, cause: cause}, now, now)
 	return pullResolution{Class: class, Cause: cause}
-}
-
-// evictIfFull is called under lock. Drops expired entries first, and only if that
-// frees nothing evicts the oldest — the same bounded-scan approach dedupCache uses,
-// on a map an order of magnitude smaller.
-func (m *pullClassMemo) evictIfFull(now time.Time) {
-	if len(m.entries) < m.max {
-		return
-	}
-	for uid, e := range m.entries {
-		if now.Sub(e.recorded) > m.ttl {
-			delete(m.entries, uid)
-		}
-	}
-	if len(m.entries) < m.max {
-		return
-	}
-	var oldestUID string
-	var oldest time.Time
-	first := true
-	for uid, e := range m.entries {
-		if first || e.recorded.Before(oldest) {
-			oldestUID, oldest, first = uid, e.recorded, false
-		}
-	}
-	delete(m.entries, oldestUID)
 }
 
 // Len reports the current entry count. Test helper.
 func (m *pullClassMemo) Len() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.entries)
+	return m.entries.len()
 }

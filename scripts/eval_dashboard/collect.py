@@ -1262,10 +1262,10 @@ def annotate_pr_merged(runs: list[dict], gh: str, now: datetime | None = None) -
 # --------------------------------------------------------------------------
 
 
-def _gsutil_call(args: list[str], gsutil: str = "gsutil") -> tuple[str | None, str]:
+def _gsutil_call(args: list[str], gsutil: str = "gsutil", runner=subprocess.run) -> tuple[str | None, str]:
     """(stdout, stderr) of one gsutil call; stdout None when it failed."""
     try:
-        proc = subprocess.run(
+        proc = runner(
             [gsutil, *args],
             capture_output=True,
             text=True,

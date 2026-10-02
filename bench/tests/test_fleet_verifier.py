@@ -34,7 +34,7 @@ The load-bearing properties, in rough order of what they cost if wrong:
    That is the one shape A5 broke SILENTLY, so the namespace preflight is
    what makes an empty list an observation rather than an accident.
 4. **Nothing outside the catalog names a cluster or a project.** Every eval
-   project carries its own trio of seeded clusters, so a case naming
+   project carries its own set of seeded clusters, so a case naming
    ``seeded-a`` is a case that cannot run in the next project. The drift
    tests keep the task corpus, the catalog, and the Terraform agreeing.
 5. **``fixture_role`` is required, and the ordinary path costs what upstream
@@ -404,7 +404,7 @@ def test_a_cluster_scoped_object_that_was_confirmed_and_is_gone_is_a_fail(
     """The `resource_name` branch with NO namespace to lean on.
 
     Every other fail in this file is anchored by a namespace, so the
-    cluster-scoped shape -- which four of the eight roles use -- needs its own
+    cluster-scoped shape -- which several roles use -- needs its own
     proof that a confirmed subject going missing is still charged to the run.
     """
     provisioned("rbac-overgrant")
@@ -960,8 +960,8 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
     seen = 0
     for role, entry in _catalog()["roles"].items():
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
-        # Slots b and c carry GKE-level defects only, declared in main.tf, so
-        # they have no defects file and no probes to check.
+        # Slot c carries GKE-level defects only, declared in main.tf, so it
+        # has no defects file; a slot without one contributes no probes.
         body = main + (defects.read_text() if defects.is_file() else "")
         for probe in entry["probes"]:
             seen += 1
@@ -980,7 +980,7 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
 def test_every_catalog_role_is_a_legal_name_and_a_known_slot():
     catalog = _catalog()
     slots = set(catalog["cluster_slots"])
-    assert slots == {"a", "b", "c"}
+    assert slots == {"a", "b", "c", "d"}
     for role, entry in catalog["roles"].items():
         assert fleet.ROLE_PATTERN.fullmatch(role), role
         assert entry["cluster_slot"] in slots, role
@@ -1168,9 +1168,9 @@ def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
 
 
 def test_the_labels_the_runner_filters_on_are_the_labels_terraform_applies(shell):
-    """hack/fleet-kubeconfigs.sh finds the trio with a label filter. If the
-    Terraform stops applying either label, discovery silently returns nothing
-    and every fleet check errors -- so pin the pair from both sides.
+    """hack/fleet-kubeconfigs.sh finds the seeded clusters with a label filter.
+    If the Terraform stops applying either label, discovery silently returns
+    nothing and every fleet check errors -- so pin the pair from both sides.
 
     The runner's side is read off the filter gcloud was ACTUALLY handed, not
     grepped out of the script: a substring search passes on a label mentioned
@@ -1383,7 +1383,7 @@ def test_a_labelled_cluster_matching_no_slot_is_reported_and_ignored(shell):
 
 
 def test_two_clusters_claiming_one_slot_drop_the_slot_rather_than_guess(shell):
-    """A leftover trio under an old cluster_prefix is the live shape of this.
+    """A leftover fleet under an old cluster_prefix is the live shape of this.
 
     Letting gcloud's listing order pick the winner turns "the runner addressed
     the wrong cluster" into "the agent destroyed the fixture" -- the exact
@@ -1591,10 +1591,12 @@ def _provision(shell, tmp_path, **env) -> Path:
         "FLEET_CATALOG": str(_CATALOG),
         "BENCH_FLEET_KUBECONFIG_DIR": str(out),
         "STUB_CLUSTERS": (
-            "seeded-a\tus-central1-a\nseeded-b\tus-central1-a\nseeded-c\tus-central1-a\n"
+            "seeded-a\tus-central1-a\nseeded-b\tus-central1-a\n"
+            "seeded-c\tus-central1-a\nseeded-d\tus-central1-a\n"
         ),
         "STUB_NAMESPACES": (
-            "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation"
+            "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
+            " seeded-upgrade seeded-topology"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.
@@ -1615,7 +1617,7 @@ def test_the_runner_writes_one_kubeconfig_per_catalog_role(shell, tmp_path):
     assert context[0] == "project=kube-agents-evals"
     # And each role's file holds credentials for the cluster its catalog SLOT
     # discovered -- the whole point of the indirection. A role that resolved to
-    # the wrong member of the trio would read a live cluster and report the
+    # the wrong member of the fleet would read a live cluster and report the
     # fixture destroyed, which is indistinguishable in a Prow log from a real
     # violation.
     for role, entry in _catalog()["roles"].items():
@@ -1822,8 +1824,8 @@ def test_a_cluster_that_exists_but_was_never_planted_leaves_its_role_unresolvabl
 
     A labelled cluster is not a planted fixture: an apply that created the
     clusters and stopped before the Kubernetes provider ran -- observed live on
-    kube-agents-evals-3, before its fleet was finished -- leaves a trio that
-    answers every API call and holds none of the objects. Without this gate
+    kube-agents-evals-3, before its fleet was finished -- leaves clusters that
+    answer every API call and hold none of the objects. Without this gate
     the verifier would read the empty cluster as "the agent destroyed the
     fixture" and red the presubmit on every PR. With it, the role never
     resolves, and an unresolvable role is an error about the environment.
@@ -1852,7 +1854,7 @@ def test_a_cluster_scoped_fixture_that_was_never_planted_is_caught_too(
 ):
     """The same gate for the roles that have no namespace to gate on.
 
-    Four of the eight roles are cluster-scoped, and a namespace-only presence
+    Several roles are cluster-scoped, and a namespace-only presence
     check is a NO-OP for every one of them: their kubeconfigs were written
     unconditionally, so `compliance-rbac-overgrant` read a live-but-empty
     cluster and reported a catastrophic fail. Each cluster-scoped role is
@@ -1943,6 +1945,46 @@ def test_a_project_with_no_seeded_fleet_says_so_and_still_exits_zero(shell, tmp_
     assert list(out.glob("*.kubeconfig")) == []
     assert "carries no clusters labelled environment=seeded" in done.stderr
     assert "kube-agents-evals-3" in done.stderr
+
+
+def test_a_slot_no_cluster_resolved_to_is_named(shell, tmp_path):
+    """A project whose fleet predates a slot, or whose cluster lost its
+    labels, leaves that slot's roles unresolved with no cluster to warn
+    about. Unless the runner says so, the pool verifier can only read the
+    count, and a refused credential on another cluster in the same run then
+    reads as the reason the slot is empty."""
+    _provision(
+        shell,
+        tmp_path,
+        STUB_CLUSTERS="seeded-a\tus-central1-a\nseeded-b\tus-central1-a\nseeded-c\tus-central1-a\n",
+    )
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert "has no labelled seeded cluster for slot 'd'" in done.stderr
+    for slot in ("a", "b", "c"):
+        assert f"for slot '{slot}'" not in done.stderr
+    # A full fleet names no slot.
+    _provision(shell, tmp_path / "full")
+    assert "has no labelled seeded cluster for slot" not in _provision.last.stderr
+
+
+def test_an_ambiguous_slot_is_not_also_called_missing(shell, tmp_path):
+    """Two clusters ending in '-a' already print the ambiguity warning. A
+    second line calling slot 'a' missing would be wrong, and it is the line
+    the fixture-state scan quotes, since it names the slot in the
+    `slot 'a'` form and the ambiguity line does not."""
+    _provision(
+        shell,
+        tmp_path,
+        STUB_CLUSTERS=(
+            "seeded-a\tus-central1-a\nseeded-legacy-a\tus-central1-a\n"
+            "seeded-b\tus-central1-a\nseeded-c\tus-central1-a\nseeded-d\tus-central1-a\n"
+        ),
+    )
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert "more than one labelled seeded cluster whose name ends in '-a'" in done.stderr
+    assert "has no labelled seeded cluster for slot" not in done.stderr
 
 
 def test_gclouds_own_words_survive_into_the_warning(shell, tmp_path):

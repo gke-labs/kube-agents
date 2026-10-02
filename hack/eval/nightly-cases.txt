@@ -39,13 +39,8 @@
 # of the presubmit, which is what the record is for, and the ~10 minutes of
 # matrix it costs a night is bought back by the wider fan-out. The one case
 # that stays out is one whose fixture does not exist at all; it waits in the
-# validator's FIXTURE_NOT_READY allowlist with the issue that plants it, and
-# today that is obtainability-declared-intent-no-finding (#1341, needs a
-# second multi-replica workload as a role of its own plus a declaration
-# seeded in each pool project's *-infra repository), vcs-history-only-fact
-# (#1253, needs the git-access-ab/r200 branch pushed to every pool
-# project's GitOps repository) and scope-second-project-denied (#1865, needs
-# a second GCP project in scope per pool project).
+# validator's FIXTURE_NOT_READY allowlist with the issue that plants it;
+# that allowlist is the list, and each entry says what it waits for.
 #
 # BUDGET, priced the way EVAL_REPETITIONS' comment in the script prices the
 # presubmit. The twenty-six-case matrix of 2026-09-09 priced at ~532-552min
@@ -93,7 +88,7 @@
 # wider, realises ~2.4x or better. Night one (2026-09-16, build
 # 2100374258805903360, #1491)
 # realised 5.57x on the thirty-nine-case matrix and used 71% of the budget,
-# so the thirteen additions since are priced inside its headroom. The first nights after this change measure it:
+# so the twenty additions since are priced inside its headroom. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -110,9 +105,21 @@
 # 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
 # 2026-09-29: the canary returned to the presubmit file held out (#2013) and
 # pdb-remediation-pr moved there held out beside it (#2016, seat opened
-# 2026-09-28), so this file's share is thirty-eight cases (114 units) of the
-# fifty-two-case, 156-unit matrix the additions through 2026-09-29 made it; the
+# 2026-09-28), so this file's share was thirty-eight cases (114 units) of the
+# fifty-two-case, 156-unit matrix before the declared-intent addition below; the
 # nightly runs both files, so its matrix and its price do not change.
+# fleet-audit-reports-past-run makes it thirty-nine cases (117 units) of a
+# fifty-three-case, 159-unit matrix, +3 units, and
+# platform-worker-refuses-shipped-skill-edit forty (120) of fifty-four (162),
+# +3 more: one delegation round trip at the 200s default.
+# Counted from the lists, since the totals above had fallen one behind
+# (vcs-spent-branch-reuse's paragraph re-used fifty-two):
+# first-install-hello-running and -done (listed earlier in the file) make
+# it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
+# fixture. chat-voice-ack-names-target makes it forty-four (132) of
+# fifty-eight (174), +3 more: one front-door turn plus the card round trip.
+# bootstrap-inventory-ranking-delivery (the last entry below) makes it
+# forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -133,6 +140,17 @@
 # repetitions measured 710-1325s). With the 2026-09-23 additions above it
 # grows the matrix to fifty cases and 150 units, ~1212-1232 serial
 # minutes, on nights the 2026-09-22 paragraph already says can truncate.
+#
+# 2026-09-29 adds vcs-spent-branch-reuse (#1918): one case, three units,
+# ~50 serial minutes at its 1000s hint (three dev-install repetitions
+# measured 587-1512s, 937s the middle one). It grows the matrix to
+# fifty-two cases and 156 units. At parallelism 8 the 2026-09-22 paragraph
+# leaves the worst measured night about two hours inside the deadline, and
+# ~6 more minutes of fan-out does not change that answer.
+# 2026-09-29 adds obtainability-declared-intent-no-finding (#1409): one case,
+# three units, measured 209-1317s a repetition on its green presubmit run, so
+# this file's share is forty-five cases (135 units) of a fifty-nine-case,
+# 177-unit matrix (with the presubmit file's fourteen).
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -295,6 +313,18 @@
 # 900s audit band.
 ./tasks/obtainability-planted-orphan-service/task.yaml
 
+# The obtainability stream's declared-intent case (#1341 criterion 4, #1409):
+# notification-relay in seeded-intent (role declared-no-pdb-workload, a
+# second two-replica workload without a budget, so the declaration silences
+# none of the checkout-gateway cases) plus the knowledge/ note in every
+# pool project's *-infra repository that declares the posture, which
+# scripts/provision_ci_pool_project.sh seeds. Graded on the reply naming the
+# note and closing "missing-PDB findings: 0". Red on the smoke test before
+# the fixture and note existed (build 2104920166281252864, 0/3), green after
+# (build 2104979469071552512, 3/3, 209-1317s), both on this case's bench
+# pull request. deployer: noop, read-only over the seeded fleet.
+./tasks/obtainability-declared-intent-no-finding/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is
@@ -379,6 +409,11 @@
 # launches in the first cost tier rather than the last.
 ./tasks/vcs-issue-resolver-triage/task.yaml
 ./tasks/vcs-review-feedback-read-back/task.yaml
+# A second proposal under a spent branch name (#1918): open and close one
+# pull request, then open another on the same branch: two pull requests a
+# repetition on the throwaway repository, one of them left closed. Priced at
+# 1000s in unit_cost_hint.
+./tasks/vcs-spent-branch-reuse/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
 # The seven cases the presubmit ran without letting them block, when the
@@ -449,3 +484,32 @@
 # rather than presubmit because the fan-out's cards take dispatcher slots
 # from whatever else is running.
 ./tasks/bootstrap-discovery-fanout/task.yaml
+
+# The first-install hello, both variants: the greeting's shape (one message,
+# kube-agents, read-only, results in this chat, changes as pull requests, one
+# question) over the bootstrap_onboarding plugin's eval seam, which
+# prebuilt/first-install-hello arms per case. No fixture; the host install only.
+./tasks/first-install-hello-running/task.yaml
+./tasks/first-install-hello-done/task.yaml
+
+# The fleet-audit report store's reader: a user's question about a past
+# audit, graded on the route (the worker queried the store through the
+# fleet-audit-reports skill) and on nothing being run or published. Reads
+# no fixture; the store holds whatever the install's streams last wrote.
+./tasks/fleet-audit-reports-past-run/task.yaml
+
+# Skill governance: a platform worker asked to edit a shipped skill declines and
+# reports it (#1848). Read-only, transcript-graded, one delegation round trip.
+./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
+
+# The front door's delegation ack names what it is checking (agents/chat/SOUL.md
+# §2, step 4). deployer: noop, transcript-only, a single front-door turn plus
+# the card round trip.
+./tasks/chat-voice-ack-names-target/task.yaml
+
+# The onboarding prioritization stage (#2143): plants a fixed raw inventory
+# report on the install under test's shell sandbox, files the
+# bootstrap-inventory-prioritize card, and grades the findings its worker
+# extracts in the sandbox. Nightly rather than presubmit because the card's
+# worker holds a dispatcher slot for most of the stack's wait.
+./tasks/bootstrap-inventory-ranking-delivery/task.yaml

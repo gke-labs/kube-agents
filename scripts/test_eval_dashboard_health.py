@@ -1273,6 +1273,105 @@ def pooled(doc=None, now=T0, prev=None, posted=None, wall_clock=None, **artifact
     )
 
 
+def periodic_reading(job, when, passed=True, build="100", artifact=None):
+    reading = {"job": job, "build": build, "finished_at": health.iso(when), "passed": passed, "result": "SUCCESS" if passed else "FAILURE"}
+    if artifact is not None:
+        reading["artifact"] = artifact
+    return reading
+
+
+class PeriodicNote(unittest.TestCase):
+    """The watched Prow periodics ride beside the state as notes, never as a
+    state: a failed or overdue run is evidence and a `periodics` entry."""
+
+    WEEKLY = "ci-kube-agents-fleet-reconcile-all"
+    SWEEP = "ci-kube-agents-pull-sweep"
+
+    def judge(self, readings, prev=None, now=T0):
+        return health.adjudicate(data(), now, prev, health.Roster.fixed(ADMITTED), periodics_readings=readings)
+
+    def test_a_failed_reconcile_is_a_note_with_its_projects_and_the_state_stays_green(self):
+        artifact = {"dry_run": True, "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete google_container_cluster.seeded_b"}}}
+        result = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, artifact=artifact)})
+        self.assertEqual(result["state"], "GREEN", "a failed periodic is a note, not a state")
+        note = result["periodics"][self.WEEKLY]
+        self.assertEqual((note["verdict"], note["build"], note["since"], note["dry_run"]), ("FAILED", "100", health.iso(T0), True))
+        self.assertEqual(note["detail"], ["kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)"])
+        self.assertEqual(result["periodics_read"], [self.WEEKLY])
+        self.assertTrue(any("seeded-fleet reconcile (weekly): build 100 failed" in line for line in result["evidence"]), result["evidence"])
+        # The episode's start carries through the previous health.json.
+        again = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False, build="100")}, prev=result, now=T0 + timedelta(hours=1))
+        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0))
+
+    def test_a_clean_fresh_pool_writes_no_note_and_names_what_it_read(self):
+        result = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=10)), self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=2))})
+        self.assertEqual(result["periodics"], {})
+        self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
+        self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
+        # What each read job's latest build did, for the recovery message.
+        self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
+
+        self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
+        self.assertIsNone(result["periodics_runs"][self.SWEEP]["summary"], "no report, no summary")
+
+    def test_the_sweeps_single_failed_build_is_no_note_and_its_streak_carries(self):
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        # A previous health.json without counts yet (the first tick after the
+        # counts ship); a tick with none at all is the test below.
+        first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev={})
+        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
+        self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
+        self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
+        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=True, build="102")}, prev=second, now=T0 + timedelta(minutes=30))
+        self.assertEqual(third["periodics_streaks"][self.SWEEP], {"build": "102", "projects": {}, "runs": 0}, "a clean build clears every count")
+        self.assertEqual(third["periodics"], {})
+
+    def test_a_tick_without_the_previous_health_json_does_not_hide_a_failing_sweep(self):
+        # The counts live in the previous health.json; without it they start
+        # over, so on that tick the thresholds are off and a failed build is a
+        # note (the poster keys on the verdict and does not re-announce).
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        blind = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev=None)
+        self.assertIn(self.SWEEP, blind["periodics"])
+        self.assertEqual(blind["periodics_streaks"][self.SWEEP]["runs"], 1)
+
+    def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
+        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})
+        self.assertEqual(stale["periodics"][self.SWEEP]["verdict"], "STALE")
+        blind = self.judge(None)
+        self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
+
+    def test_an_episodes_start_survives_a_blind_tick_and_ends_on_a_clean_reading(self):
+        failing = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(hours=1), passed=False)}
+        first = self.judge(failing)
+        self.assertEqual(first["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        blind = self.judge(None, prev=first, now=T0 + timedelta(hours=1))
+        self.assertEqual((blind["periodics"], blind["periodics_since"]), ({}, {self.WEEKLY: health.iso(T0)}))
+        again = self.judge(failing, prev=blind, now=T0 + timedelta(hours=2))
+        self.assertEqual(again["periodics"][self.WEEKLY]["since"], health.iso(T0), "the start is not the blind tick's end")
+        clean = self.judge({self.WEEKLY: periodic_reading(self.WEEKLY, T0 + timedelta(hours=2))}, prev=again, now=T0 + timedelta(hours=3))
+        self.assertEqual((clean["periodics"], clean["periodics_since"]), ({}, {}))
+        # Blind to one job, not another: the unread job's start survives.
+        partial = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(hours=1))}, prev=first, now=T0 + timedelta(hours=1))
+        self.assertEqual(partial["periodics_since"], {self.WEEKLY: health.iso(T0)})
+        self.assertEqual(partial["periodics_read"], [self.SWEEP])
+        # A job no longer watched leaves the carry.
+        retired = dict(first, periodics_since={**first["periodics_since"], "ci-kube-agents-retired": health.iso(T0)})
+        self.assertEqual(self.judge(None, prev=retired, now=T0 + timedelta(hours=1))["periodics_since"], {self.WEEKLY: health.iso(T0)})
+
+    def test_staleness_is_measured_on_the_wall_clock_not_the_data_horizon(self):
+        # A stalled archive freezes data.json's generated_at with the jobs; the
+        # dead-man's switch has to read the time it is.
+        reading = {self.WEEKLY: periodic_reading(self.WEEKLY, T0 - timedelta(days=9))}
+        frozen = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), periodics_readings=reading)
+        self.assertEqual(frozen["periodics"], {}, "on the data's own horizon the run is a day old")
+        live = health.adjudicate(data(), T0 - timedelta(days=8), None, health.Roster.fixed(ADMITTED), wall_clock=T0, periodics_readings=reading)
+        self.assertEqual(live["periodics"][self.WEEKLY]["verdict"], "STALE")
+
+
 class PoolNote(unittest.TestCase):
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet
