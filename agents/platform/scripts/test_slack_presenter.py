@@ -286,6 +286,14 @@ class FallbackTextTest(unittest.TestCase):
         self.assertNotIn("<@", text)
         self.assertIn("&lt;@U1&gt; &amp; &lt;!channel&gt;", text)
 
+    def test_a_link_url_cannot_end_the_link_early(self):
+        text = sp.fallback_text("h", links=[("Logs", "https://p/?q=a|b>c<d&e")])
+        self.assertIn("<https://p/?q=a%7Cb%3Ec%3Cd&amp;e|Logs>", text)
+
+    def test_an_entity_in_a_link_url_is_kept_as_written(self):
+        text = sp.fallback_text("h", links=[("Logs", "https://p/?q=a&lt;b")])
+        self.assertIn("<https://p/?q=a&amp;lt;b|Logs>", text)
+
 
 class LinkAckTest(unittest.TestCase):
     def test_ack_does_nothing_else(self):

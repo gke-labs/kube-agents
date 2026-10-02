@@ -533,6 +533,19 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, pushed))
         self.assertEqual(triage["links"], [("GKE Workloads", WORKLOADS_URL)])
 
+    def test_a_url_holding_an_entity_opens_the_same_link_from_the_button_and_the_text(self):
+        url = "https://console.cloud.google.com/logs/query;query=a&lt;b&c"
+        adapter = _Adapter()
+        self.deliver(adapter, result=REPORT.replace(LOGS_URL, url))
+        update = adapter.log[0][1]
+        buttons = [b for block in update["blocks"] if block["type"] == "actions" for b in block["elements"]]
+        button = next(b for b in buttons if b["text"]["text"].startswith("Cloud Logs"))
+        target = re.search(r"<([^|>]+)\|Cloud Logs>", update["text"]).group(1)
+        # Slack decodes these three entities in mrkdwn text, and nothing in a button's url.
+        opened = target.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        self.assertEqual(button["url"], url)
+        self.assertEqual(opened, button["url"])
+
     def test_an_already_encoded_url_is_not_encoded_again(self):
         url = "https://console.cloud.google.com/logs/query;query=severity%3E%3DERROR"
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))

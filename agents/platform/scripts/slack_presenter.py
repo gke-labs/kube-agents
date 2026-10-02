@@ -157,6 +157,9 @@ MD_CODE = re.compile(r"(?<!`)(`+)([^\n]+?)(?<!`)\1(?!`)")
 #: Holds a code span's place while the other markup is stripped; NUL never appears in an answer.
 CODE_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
 MRKDWN_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
+#: The characters that would end a Slack mrkdwn link early, percent-encoded so the button and
+#: the fallback text carry the same url; ``%`` is left alone, so an encoded url stays as it is.
+MRKDWN_URL_ESCAPES = str.maketrans({"<": "%3C", ">": "%3E", "|": "%7C"})
 #: A candidate sentence end: punctuation, then space, then anything but a
 #: lowercase letter ("in ns. prod" runs on).
 #: A sentence ends at ``.``, ``!`` or ``?``, or just after the emphasis that closes on one.
@@ -304,6 +307,15 @@ def _escape(text: str) -> str:
     return text
 
 
+def _link_url(url: str) -> str:
+    """``url`` as the target of a mrkdwn ``<url|label>`` that opens what a button with ``url`` opens.
+
+    ``&`` goes first, as ``&amp;``, which Slack decodes back, so an entity already in the url
+    (``&lt;``) reaches the browser as written.
+    """
+    return url.replace("&", "&amp;").translate(MRKDWN_URL_ESCAPES)
+
+
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
@@ -394,7 +406,8 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
     Used as the ``text`` of a blocks message (notifications, screen readers).
     ``headline`` is already plain, as :func:`split_answer` gives it; a second
     plain pass would strip markup a code span had kept. Links become inline
-    ``<url|label>``; choices become one "Reply with one of:" line. Every label
+    ``<url|label>``, the url escaped by :func:`_link_url` so the link opens what
+    its button opens; choices become one "Reply with one of:" line. Every label
     is escaped, so none can mention anyone.
     """
     parts: list[str] = []
@@ -403,7 +416,7 @@ def fallback_text(headline: str, links: Iterable[Any] = (), choices: Iterable[st
         parts.append(f"*{_escape(title)}*")
     pairs = _link_pairs(links)
     if pairs:
-        parts.append(CHOICE_SEPARATOR.join(f"<{url}|{_escape(label)}>" for label, url in pairs))
+        parts.append(CHOICE_SEPARATOR.join(f"<{_link_url(url)}|{_escape(label)}>" for label, url in pairs))
     labels = [_escape(str(c)) for c in choices or () if str(c).strip()]
     if labels:
         parts.append(CHOICES_LEAD + CHOICE_SEPARATOR.join(labels))

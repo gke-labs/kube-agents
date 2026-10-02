@@ -126,9 +126,6 @@ RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", 
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: How many edited alerts this process remembers.
 EDITED_MAX = 512
-#: The characters that would end a Slack mrkdwn link early, percent-encoded so the button and
-#: the fallback text carry the same url; ``%`` is left alone, so an encoded url stays as it is.
-MRKDWN_URL_ESCAPES = str.maketrans({"<": "%3C", ">": "%3E", "|": "%7C"})
 
 #: ``(chat_id, thread_id)`` of the alerts this process has edited, oldest first.
 _edited: OrderedDict[tuple[str, str], None] = OrderedDict()
@@ -227,7 +224,7 @@ def parse_triage(report: str) -> dict | None:
         "links": [
             (_presenter._plain(label), url) for line in lines if LINKS_LINE.match(line)
             for label, raw in MD_LINK.findall(line)
-            for url in (raw.translate(MRKDWN_URL_ESCAPES),) if len(url) <= BUTTON_URL_MAX
+            for url in (raw.translate(_presenter.MRKDWN_URL_ESCAPES),) if len(url) <= BUTTON_URL_MAX
         ],
         "fold_title": FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE,
     }
