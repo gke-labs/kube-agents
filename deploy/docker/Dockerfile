@@ -761,6 +761,15 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # calls it for a Slack card. slack_status.py is staged for the verifier as
 # slack_presenter.py is. Also rides this COPY and RUN. See
 # deploy/docker/patches/slack_ux_status.py.
+# Same flag, same block: gateway/slack_boilerplate.py keeps Hermes' own
+# boilerplate off Slack -- the cron wrapper (other targets, and the Chat relay
+# that routes on it, keep it), the opt-in heartbeat's tool trace (generic
+# phrase instead), the back-online notices, session-database warnings and
+# busy-input hint (not sent), and the restart/shutdown notices, slash-command
+# replies and other system replies (reworded in SlackAdapter.send and
+# edit_message; the steer and auth failure replies are replaced where they
+# are built, so no exception text reaches Slack). See
+# deploy/docker/patches/slack_boilerplate.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -773,6 +782,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_ux_status.py \
      deploy/docker/patches/verify_slack_ux_status.py \
      deploy/docker/patches/slack_ux_status.py \
+     deploy/docker/patches/apply_slack_boilerplate.py \
+     deploy/docker/patches/verify_slack_boilerplate.py \
+     deploy/docker/patches/slack_boilerplate.py \
      agents/platform/scripts/slack_presenter.py \
      agents/platform/scripts/slack_status.py \
      deploy/docker/patches/patchlib.py \
@@ -792,12 +804,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_ux_status.py /opt/hermes/gateway/slack_ux_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_status.py /opt/hermes && \
     grep -qF "_kage_slack_status.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
+    grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_reactions.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_status.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates

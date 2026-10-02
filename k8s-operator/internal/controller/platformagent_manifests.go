@@ -4255,15 +4255,18 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	//
-	// KAGE_SLACK_UX switches the Slack gateway between code paths already in
-	// the image: which reaction goes on an ask and when it settles, how much
-	// of a delegated card's delivery posts in the thread, whether a thread's
-	// cards show as one plan message, and the session status and title Slack
-	// shows on the thread. It is compared
-	// against `FLAG_ON_VALUES` in `slack_presenter.py`; any other value is off,
-	// the image default. It names no path, URL, credential or image, and no
-	// value of it reaches anything but how the gateway presents messages in
-	// threads it already serves.
+	// KAGE_SLACK_UX switches between code paths already in the image, all of
+	// them about Slack: which reaction goes on an ask and when it settles, how
+	// much of a delegated card's delivery posts in the thread, whether a
+	// thread's cards show as one plan message, the session status and title
+	// Slack shows on the thread, and whether the harness's own Slack messages
+	// (the scheduled-report wrapper, the heartbeat, restart and shutdown
+	// notices, command and system replies) are reworded or left out. It is
+	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
+	// value is off, the image default. It names no path, URL, credential or
+	// image, and no value of it adds a destination or a credential: its writes
+	// go only to Slack, in the channels and threads the gateway already
+	// serves.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's
