@@ -119,6 +119,10 @@ class OpenedPrTest(unittest.TestCase):
         blocks, _ = m.pr_opened(*m.opened_pr(f"**Done, opened PR {PR}**"))
         self.assertEqual(_contexts(blocks)[0], "**Done, opened PR #412**")
 
+    def test_another_link_on_the_pr_line_stays_text(self):
+        blocks, _ = m.pr_opened(*m.opened_pr(f"Opened PR {PR}, see [docs](https://other.example/x)"))
+        self.assertEqual(_contexts(blocks)[0], "Opened PR #412, see [docs](https://other.example/x)")
+
     def test_a_draft_pr_is_an_opened_pr(self):
         for line in (f"Opened a draft PR {PR}", f"Opened a new draft PR: {PR}"):
             self.assertIsNotNone(m.opened_pr(line), line)
@@ -330,6 +334,25 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you("```bash\nWhich namespace?\n- default\n- prod")
         self.assertEqual(blocks[0]["text"]["text"], "*Which namespace?*")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["default", "prod"])
+
+    def test_a_markdown_link_in_the_detail_is_a_slack_link(self):
+        blocks, _ = m.needs_you("Which?\nSee [runbook](https://x.example/a?b=1&c=2) or `[no](https://y.example)`.")
+        self.assertEqual(
+            blocks[1]["elements"][0]["text"],
+            "See <https://x.example/a?b=1&amp;c=2|runbook> or `[no](https://y.example)`.",
+        )
+
+    def test_a_link_that_is_not_safe_stays_escaped_text(self):
+        blocks, _ = m.needs_you("Which?\nSee [<@U1>](javascript:alert) now.")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "See [&lt;@U1&gt;](javascript:alert) now.")
+
+    def test_a_link_label_cannot_mention_anyone(self):
+        blocks, _ = m.needs_you("Which?\nSee [<!channel>](https://x.example).")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "See <https://x.example|&lt;!channel&gt;>.")
+
+    def test_a_nul_in_the_detail_is_dropped_rather_than_read_as_a_code_span(self):
+        blocks, _ = m.needs_you("Which?\nA \x000\x00 b")
+        self.assertEqual(blocks[1]["elements"][0]["text"], "A 0 b")
 
     def test_a_question_opening_with_a_code_span_heads_itself(self):
         blocks, text = m.needs_you("```checkout-gateway``` is in two clusters. Which?\n- seeded-a\n- seeded-b")

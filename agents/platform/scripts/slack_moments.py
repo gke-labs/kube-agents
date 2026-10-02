@@ -252,12 +252,32 @@ def _escape(text: str) -> str:
     return text
 
 
-def _with_subline(blocks: list[dict], subline: str) -> list[dict]:
+def _link(match: re.Match) -> str:
+    label, url = match.group(1), match.group(2)
+    if not _presenter._safe_link_url(url):
+        return _escape(match.group(0))
+    return f"<{_presenter._link_url(url)}|{_escape(label)}>"
+
+
+def _subline_mrkdwn(subline: str) -> str:
+    """``subline`` escaped, with each Markdown link outside a code span as a mrkdwn link."""
+    held, spans = _presenter._hold_code(subline.replace("\x00", ""))
+    parts, last = [], 0
+    for match in _presenter.MD_LINK.finditer(held):
+        parts += [_escape(held[last : match.start()]), _link(match)]
+        last = match.end()
+    text = "".join(parts) + _escape(held[last:])
+    return _presenter.CODE_PLACEHOLDER.sub(lambda m: _escape(spans[int(m.group(1))][0]), text)
+
+
+def _with_subline(blocks: list[dict], subline: str, links: bool = False) -> list[dict]:
     """``blocks`` with ``subline`` as a context line under the headline, escaped so
-    the worker's words cannot mention anyone."""
+    the worker's words cannot mention anyone; with ``links``, a Markdown link stays
+    a link. An opened PR's line keeps its links as text, for :data:`PR_URL`'s reason."""
     if not subline:
         return blocks
-    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": _escape(subline)}]}
+    text = _subline_mrkdwn(subline) if links else _escape(subline)
+    context = {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
     return [*blocks[:1], context, *blocks[1:]]
 
 
@@ -392,6 +412,7 @@ def needs_you(reason: str, buttons: bool = True) -> tuple[list[dict], str] | Non
     blocks = _with_subline(
         _presenter.blocks_answer(headline, choices=options, action_id_prefix=NEEDS_YOU_ACTION_PREFIX),
         detail,
+        links=True,
     )
     blocks.append({
         "type": "context",
