@@ -14,7 +14,8 @@ Two things are checked:
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
    ``_get_client``, ``_handle_slack_message``, ``_is_interactive_user_authorized``,
    ``_channel_gate_allows`` and ``_slack_message_matches_mention_patterns``, sets
-   ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
+   ``_bot_user_id`` and ``_team_bot_user_ids`` in ``__init__``, plus ``_client_for`` for ``slack_ux_incident``;
+   the adapter file still defines ``_slack_mention_detection_text(event)`` at module level and still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
    action handlers, and the flag guard calling
@@ -59,6 +60,8 @@ RUNTIME_MEMBERS = (
     "_get_client", "_handle_slack_message", "_client_for", "_is_interactive_user_authorized",
     "_channel_gate_allows", "_slack_message_matches_mention_patterns",
 )
+#: The adapter file's module-level functions the runtime calls, and how: positional arguments, keywords.
+RUNTIME_FUNCTIONS = {"_slack_mention_detection_text": (1, ())}
 #: The instance attributes the runtime reads, set in ``__init__``.
 RUNTIME_ATTRIBUTES = ("_bot_user_id", "_team_bot_user_ids")
 #: The members the runtime awaits; every other one it calls plainly.
@@ -224,6 +227,16 @@ def check_members(tree: ast.Module) -> None:
     unset = [name for name in RUNTIME_ATTRIBUTES if name not in _init_attributes(classes[0])]
     if unset:
         raise _fail(f"{ADAPTER_CLASS}.__init__ no longer sets {', '.join(unset)}, which the runtime reads")
+    functions = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for name, (positional, keywords) in RUNTIME_FUNCTIONS.items():
+        function = functions.get(name)
+        if function is None or function.decorator_list:
+            raise _fail(f"{ADAPTER} no longer defines {name}() at module level, which the runtime calls")
+        if isinstance(function, ast.AsyncFunctionDef):
+            raise _fail(f"{ADAPTER}'s {name} is now async; the runtime calls it")
+        # _accepts binds a leading self, which a function's first parameter takes instead.
+        if not _accepts(function.args, positional - 1, keywords):
+            raise _fail(f"{ADAPTER}'s {name} no longer accepts {positional} positional argument(s), as the runtime calls it")
     for name, calls in CALL_SHAPES.items():
         args = _method_args(tree, members[name])
         if args is None:

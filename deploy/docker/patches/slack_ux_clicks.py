@@ -321,13 +321,21 @@ def _typed_apply(text: str, options: frozenset[tuple[str, str]]) -> bool:
     return ((typed.group(1) or "").upper(), _option_text(text[typed.end():])) in options
 
 
+def _mention_text(adapter: Any, reply: dict) -> str:
+    """The text the gateway reads mentions in: adapter.py's ``_slack_mention_detection_text``,
+    the flat text plus a mention only in the blocks. Found through the gate's own globals, which
+    hold it however the plugin loader named the module."""
+    detect = type(adapter)._channel_gate_allows.__globals__["_slack_mention_detection_text"]
+    return str(detect(reply))
+
+
 async def _gateway_hears(adapter: Any, reply: dict, channel_id: str, team_id: str, thread_ts: str) -> bool:
     """Whether the adapter's channel gate passes ``reply`` as it would a typed message: with
     the mention rules a click skips. A 1:1 DM, or no bot id yet, skips the gate there too."""
     bot_uid = adapter._team_bot_user_ids.get(team_id, adapter._bot_user_id)
     if channel_id.startswith(DM_CHANNEL_PREFIX) or not bot_uid:
         return True
-    text = str(reply.get("text") or "")
+    text = _mention_text(adapter, reply)
     return await adapter._channel_gate_allows(
         channel_id=channel_id, routing_text=text, bot_uid=bot_uid,
         is_mentioned=f"<@{bot_uid}>" in text or bool(adapter._slack_message_matches_mention_patterns(text)),

@@ -37,6 +37,10 @@ UPSTREAM = '''\
 import re
 
 
+def _slack_mention_detection_text(event):
+    return event.get("text", "")
+
+
 def _flag_getter(key):
     def getter(self):
         return False
@@ -228,6 +232,11 @@ class ApplierTest(unittest.TestCase):
             ("is_dm: bool,\n        force_process: bool)", "is_dm: bool)", "_channel_gate_allows no longer accepts"),
             ("def _slack_message_matches_mention_patterns(", "def _mention_patterns(",
              "_slack_message_matches_mention_patterns"),
+            ("def _slack_mention_detection_text(", "def _mention_text(", "_slack_mention_detection_text"),
+            ("def _slack_mention_detection_text(event)", "def _slack_mention_detection_text(event, bot_uid)",
+             "_slack_mention_detection_text no longer accepts"),
+            ("def _slack_mention_detection_text(", "async def _slack_mention_detection_text(",
+             "_slack_mention_detection_text is now async"),
             ("        self._bot_user_id: str = \"\"\n", "", "no longer sets _bot_user_id"),
             ("self._team_bot_user_ids, self._other = {}, {}", "self._bot_ids, self._other = {}, {}",
              "no longer sets _team_bot_user_ids"),
@@ -335,6 +344,22 @@ class _Client:
         if "chat_postMessage" in self.fail:
             raise RuntimeError("post refused")
         self.log.append(("chat_postMessage", kwargs))
+
+
+def _slack_mention_detection_text(event):
+    """Stands in for adapter.py's module function, found through ``_Adapter``'s module: the flat
+    text plus a mention only in the blocks."""
+    def users(node):
+        if isinstance(node, list):
+            return [u for n in node for u in users(n)]
+        if not isinstance(node, dict):
+            return []
+        own = [f"<@{node['user_id']}>"] if node.get("type") == "user" else []
+        return own + users(node.get("elements", []))
+
+    flat = event.get("text", "") or ""
+    extra = [m for m in users(event.get("blocks") or []) if m not in flat]
+    return (flat.strip() + "\n" + " ".join(extra)).strip() if extra else flat
 
 
 class _Adapter:
@@ -704,6 +729,17 @@ class RuntimeTest(unittest.TestCase):
                 adapter = _Adapter(replies=[{**reply, "text": text}], **kwargs)
                 self._incident(adapter)
                 self._drops(adapter)
+
+    def test_a_mention_only_in_the_blocks_reaches_the_gate_as_the_gateway_reads_it(self):
+        blocks = [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+            {"type": "user", "user_id": "U0TEAMBOT"}, {"type": "text", "text": " apply B"},
+        ]}]}]
+        reply = {"type": "message", "user": "U4", "text": "apply B", "blocks": blocks, "ts": "223.000"}
+        adapter = _Adapter(replies=[reply])
+        self._incident(adapter)
+        self.assertEqual(
+            [(g["routing_text"], g["is_mentioned"]) for g in adapter.gated], [("apply B\n<@U0TEAMBOT>", True)],
+        )
 
     def test_a_mention_the_gateway_reads_is_passed_to_its_gate(self):
         for text in ("<@U0TEAMBOT> apply B", "@kage apply B"):
