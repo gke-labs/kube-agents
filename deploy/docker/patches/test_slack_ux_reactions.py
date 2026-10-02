@@ -678,9 +678,9 @@ class RuntimeTest(unittest.TestCase):
                 self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
 
     def test_an_earlier_asks_follow_up_that_gave_up_within_the_turn_does_not_fail_it(self):
-        # t_c's worker files t_a while "why?" is answered, and t_a gives up and
-        # closes before the turn ends: no own card is left open, and only the
-        # closed t_a has a creator neither read shows.
+        # t_c's worker files t_a while "why?" is answered, after the end read's
+        # snapshot, and t_a's give-up is delivered while that read awaits: t_a
+        # is in neither read, so only the lineage shows its creator.
         adapter = _Stub()
         self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c"}
         self._turn_racing("why?", _cards("t_c"), _cards("t_c"), [("t_a", "gave_up")], adapter)
