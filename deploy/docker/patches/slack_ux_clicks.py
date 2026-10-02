@@ -48,8 +48,9 @@ applies it, and the buttons are still there. So before such a click counts,
 the thread is read once, and if a person the adapter would answer (its own
 interactive authorization, the check the clicker passed, and its channel gate
 with the mention rule the click skips) has replied with one
-of the call to action's forms (``apply``, ``apply Option B``, ``apply B``)
-since the buttons appeared, the buttons are replaced with "answered in the
+of the call to action's forms (``apply``, ``apply Option B``, ``apply B``, or
+a button's whole text, ``apply Option B: <that option's text>``; a colon before
+anything else is not one) since the buttons appeared, the buttons are replaced with "answered in the
 thread" and the click is dropped. The buttons appear when the alert is edited
 into its triage, so that edit's time, which the click's payload carries, is
 the start; a reply typed during the diagnosis does not count. The match is a
@@ -124,8 +125,19 @@ TYPED_LEAD = re.compile(
 )
 
 #: The call to action's own forms, ``apply``, ``apply Option B`` or ``apply B``, ending
-#: the reply or followed by ``:`` as a button's text is.
-TYPED_APPLY = re.compile(r"apply(?:\s+(?:option\s+)?[A-Z]\b)?(?::|[.!]*\s*$)", re.IGNORECASE)
+#: the reply or followed by ``:`` as a button's text is. A colon counts only before that
+#: option's own text: :func:`_typed_apply`.
+TYPED_APPLY = re.compile(r"apply(?:\s+(?:option\s+)?([A-Z])\b)?(?::|[.!]*\s*$)", re.IGNORECASE)
+
+#: An incident option button's value, its whole label, ``slack_ux_incident.OPTION_LABEL``
+#: or ``SINGLE_LABEL``: its capital letter, if it has one, and the option's own text.
+BUTTON_FORM = re.compile(r"apply(?: Option ([A-Z]))?: (.+)", re.DOTALL)
+
+#: Slack's escapes in a message's text, undone before typed option text is compared.
+SLACK_ESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
+
+#: Trailing characters typed option text may end in and still be the option's own.
+OPTION_TEXT_END = ".! "
 
 #: The one reply subtype that is still a person typing: "also send to channel".
 TYPED_SUBTYPES = frozenset({"thread_broadcast"})
@@ -263,10 +275,39 @@ def _buttons_shown(message: dict, msg_ts: str) -> str:
     return edited_ts if _after(edited_ts, msg_ts) else msg_ts
 
 
-def _typed_apply(text: str) -> bool:
-    """Whether ``text`` is one of the call to action's forms. A guess at what the agent applies."""
+def _option_text(text: str) -> str:
+    """``text`` as option text is compared: without markup, Slack's escapes, case or extra spaces."""
+    for escaped, char in SLACK_ESCAPES:
+        text = text.replace(escaped, char)
+    return " ".join(text.translate(TYPED_MARKUP).split()).casefold().rstrip(OPTION_TEXT_END)
+
+
+def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
+    """The incident option buttons on ``message``, each as its letter (``""`` for the single
+    button's ``apply:``) and its own text, read from the value: the shown text may be clipped."""
+    found = set()
+    for block in message.get("blocks") or ():
+        if not isinstance(block, dict) or block.get("type") != "actions":
+            continue
+        for element in block.get("elements") or ():
+            if not isinstance(element, dict) or not str(element.get("action_id") or "").startswith(
+                INCIDENT_CHOICE_PREFIX
+            ):
+                continue
+            form = BUTTON_FORM.match(str(element.get("value") or ""))
+            if form:
+                found.add((form.group(1) or "", _option_text(form.group(2))))
+    return frozenset(found)
+
+
+def _typed_apply(text: str, options: frozenset[tuple[str, str]]) -> bool:
+    """Whether ``text`` is one of the call to action's forms: bare, or a button's, where the text
+    after the colon is that option's own in ``options``. A guess at what the agent applies."""
     text = text.translate(TYPED_MARKUP)
-    return bool(TYPED_APPLY.match(text, TYPED_LEAD.match(text).end()))
+    typed = TYPED_APPLY.match(text, TYPED_LEAD.match(text).end())
+    if not typed or not typed.group(0).endswith(":"):
+        return bool(typed)
+    return ((typed.group(1) or "").upper(), _option_text(text[typed.end():])) in options
 
 
 async def _gateway_hears(adapter: Any, reply: dict, channel_id: str, team_id: str, thread_ts: str) -> bool:
@@ -286,6 +327,7 @@ async def _gateway_hears(adapter: Any, reply: dict, channel_id: str, team_id: st
 
 async def _applied_by_typing(
     adapter: Any, client: Any, channel_id: str, team_id: str, thread_ts: str, since: str,
+    options: frozenset[tuple[str, str]],
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
     One read; a read that fails answers no, so the click runs as it would without the check.
@@ -305,7 +347,7 @@ async def _applied_by_typing(
             and not reply.get("bot_id")
             and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
             and _after(reply.get("ts"), since)
-            and _typed_apply(str(reply.get("text") or ""))
+            and _typed_apply(str(reply.get("text") or ""), options)
             and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
             and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts)
         ):
@@ -341,7 +383,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     thread_ts = _thread_ts(body, message, msg_ts)
     client = adapter._get_client(channel_id, team_id=team_id)
     typed = action_id.startswith(INCIDENT_CHOICE_PREFIX) and await _applied_by_typing(
-        adapter, client, channel_id, team_id, thread_ts, _buttons_shown(message, msg_ts),
+        adapter, client, channel_id, team_id, thread_ts, _buttons_shown(message, msg_ts), _option_texts(message),
     )
     # Checked again: another click on this message may have landed during the read.
     if key in _answered:

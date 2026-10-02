@@ -731,7 +731,7 @@ class RuntimeTest(unittest.TestCase):
 
     def test_only_the_call_to_actions_forms_drop_the_click(self):
         drops = (
-            "apply", "apply.", "Apply!", "apply B", "apply Option B", "apply option b: Restore the secret",
+            "apply", "apply.", "Apply!", "apply B", "apply Option B",
             "yes, apply B", "please apply B", "ok apply", "@kage apply B", "<@U0BOT> <@U0BOT2> apply B",
             "*apply* B", "'apply'", "`apply Option A`", "&gt; apply B", "> apply B", ":white_check_mark: apply B",
             "\u2705 apply B",
@@ -746,6 +746,51 @@ class RuntimeTest(unittest.TestCase):
                 adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
                 self._incident(adapter)
                 check(adapter)
+
+    def _options_incident(self, adapter, *labels):
+        body, action = _alert_choice(1, labels[-1])
+        triage = {"headline": "Pod OOMKilled", "links": [], "fold_title": "Options", "choices": [
+            (label, False) for label in labels
+        ]}
+        body["message"]["blocks"] = incident.blocks_triage(triage, [])
+        self._answer(adapter, body, action)
+
+    def test_a_colon_counts_only_before_that_options_own_text(self):
+        options = ("apply Option A: Raise the limit", "apply Option B: Restore the secret")
+        long_title = "Roll back checkout-gateway to the last revision that served without OOMKills in prod"
+        quoted = ("apply Option A: Don't restart it", f"apply Option B: {long_title}", "apply Option C: Scale & wait")
+        single = ("apply: Roll back checkout-gateway",)
+        cases = [
+            (options, self._drops, (
+                "apply Option B: Restore the secret", "apply b: restore  the *secret*.", "<@U0BOT> apply A: Raise the limit",
+            )),
+            (options, self._runs, (
+                "apply: no wait", "apply B: actually no, hold off", "apply A: Restore the secret",
+                "apply: Restore the secret", "apply Option B:", "apply Option B: Restore the secret, then wait",
+            )),
+            (single, self._drops, ("apply: roll back checkout-gateway",)),
+            (single, self._runs, ("apply: no wait", "apply A: Roll back checkout-gateway")),
+            # The text after the colon is matched as typed: an apostrophe, a title the button clips,
+            # and an ampersand as Slack sends it.
+            (quoted, self._drops, ("apply A: Don't restart it", f"apply B: {long_title}", "apply C: Scale &amp; wait")),
+        ]
+        for labels, check, texts in cases:
+            for text in texts:
+                with self.subTest(labels=labels, text=text):
+                    importlib.reload(runtime)
+                    adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                    self._options_incident(adapter, *labels)
+                    check(adapter)
+
+    def test_a_colon_on_a_message_without_the_option_buttons_does_not_drop_the_click(self):
+        adapter = _Adapter(replies=[
+            {"type": "message", "user": "U2", "text": "apply option b: Restore the secret", "ts": "223.000"},
+        ])
+        body, action = _alert_choice(1, "Apply Option B")
+        # A button in that form that is not an incident option is not one to type.
+        body["message"]["blocks"][1]["elements"][2]["value"] = "apply Option B: Restore the secret"
+        self._answer(adapter, body, action)
+        self._runs(adapter)
 
     def test_a_typed_apply_also_sent_to_the_channel_drops_the_click(self):
         adapter = _Adapter(replies=[
