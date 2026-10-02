@@ -73,6 +73,7 @@ from kube_agents_bench.fleet import (
 )
 
 __all__ = [
+    "AnswerFirstVerifier",
     "BootstrapDeliveredVerifier",
     "BootstrapFanoutVerifier",
     "BootstrapFindingsVerifier",
@@ -256,6 +257,146 @@ class ReportContainsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason="report contains " + ", ".join(satisfied),
+        )
+
+
+# The header ``_append_delivered`` opens each card's result with in the final
+# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
+# delivered result runs from its header to the next header of either kind.
+_DELIVERED_HEADER = re.compile(
+    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    re.MULTILINE,
+)
+_RESULT_HEADER_PREFIX = "Result of delegated task "
+# A bold span opening the text, closed on its own line.
+_BOLD_LEAD = re.compile(r"\A\*\*([^\n]+?)\*\*")
+_ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
+# A sentence ends at terminal punctuation followed by whitespace; a line break
+# ends one too, so each bullet counts.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
+_INNER_SENTENCE_BREAK = re.compile(r"[.!?]\s+\S")
+# What trails a bold lead whose terminal punctuation sits outside the bold.
+_LEAD_TRAIL = ".!? \t"
+
+
+def _delivered_results(final_message: str) -> list[str]:
+    """Each delivered card result in ``final_message``, artifacts excluded."""
+    headers = list(_DELIVERED_HEADER.finditer(final_message))
+    results = []
+    for i, header in enumerate(headers):
+        if not header.group(0).startswith(_RESULT_HEADER_PREFIX):
+            continue
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
+        results.append(final_message[header.end() : end].strip())
+    return results
+
+
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in _SENTENCE_BREAK.split(text) if s.strip()]
+
+
+@VERIFIERS.register("answer_first")
+class AnswerFirstVerifier(BaseVerifier):
+    """Whether each delivered card result opens on its answer and stops.
+
+    The shape a chat answer owes the person who asked: one bold sentence that
+    answers the ask, a sentence or two of the evidence that settles it, an
+    offer if there is a next step, and nothing said twice. It reads the raw
+    result rather than ``report_contains``'s normalized text, because that
+    normalization drops the ``**`` this check is partly about.
+
+    Every delivered result must pass: the lead is a bold span opening the
+    result and holding one sentence, carrying each of ``lead_terms`` (matched
+    like ``report_contains`` phrases, so ``memory`` finds ``MemoryPressure``);
+    no ATX heading anywhere; at most ``max_chars`` characters and
+    ``max_sentences`` sentences, a bullet counting as one; and no sentence
+    after the lead matching any of ``recap_patterns``, regexes searched in each
+    later sentence's normalized text, which name the ways a restated verdict
+    reads ("the cluster is healthy", "in summary"). Restatement in other words
+    is the judge's to notice; this is the part an exact check can hold.
+
+    A run that delivered no result fails rather than erroring: the transcript
+    was read, and an answer that never arrived does not have the shape.
+    """
+
+    type: Literal["answer_first"]
+    lead_terms: list[str] = Field(default_factory=list)
+    max_chars: int = Field(default=600, gt=0)
+    max_sentences: int = Field(default=4, gt=0)
+    recap_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("recap_patterns")
+    @classmethod
+    def _recap_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as err:
+                raise ValueError(f"recap pattern {pattern!r} does not compile: {err}") from err
+        return patterns
+
+    def _defects(self, result: str) -> list[str]:
+        defects = []
+        lead = _BOLD_LEAD.match(result)
+        if lead is None:
+            defects.append("does not open with a bold sentence")
+            rest = result
+        else:
+            inner = lead.group(1).strip()
+            if _INNER_SENTENCE_BREAK.search(inner):
+                defects.append(f"the bold lead is more than one sentence: {inner!r}")
+            lead_text = _normalize(inner)
+            missing = [t for t in self.lead_terms if _normalize(t) not in lead_text]
+            if missing:
+                defects.append(f"the bold lead does not mention {missing}: {inner!r}")
+            rest = result[lead.end() :].lstrip(_LEAD_TRAIL)
+        if _ATX_HEADING.search(result):
+            defects.append("carries a section heading")
+        if len(result) > self.max_chars:
+            defects.append(f"{len(result)} characters, over {self.max_chars}")
+        later = _sentences(rest)
+        count = len(later) + (lead is not None)
+        if count > self.max_sentences:
+            defects.append(f"{count} sentences, over {self.max_sentences}")
+        recaps = [
+            s for s in later if any(re.search(p, _normalize(s)) for p in self.recap_patterns)
+        ]
+        if recaps:
+            defects.append(f"restates its verdict: {recaps}")
+        return defects
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        results = _delivered_results(snap.final_message)
+        if not results:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason="no delegated card result was delivered, so there is no answer to read",
+            )
+        failures = [
+            f"result {i + 1}: " + "; ".join(defects)
+            for i, result in enumerate(results)
+            if (defects := self._defects(result))
+        ]
+        if failures:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=" | ".join(failures),
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"{len(results)} delivered result(s) open on a bold one-sentence answer and stop",
         )
 
 

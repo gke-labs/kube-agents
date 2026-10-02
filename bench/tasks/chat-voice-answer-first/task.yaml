@@ -1,0 +1,91 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. What it grades is the voice of the answer a
+# delegated ask gets back. The front door acks (chat-voice-ack-names-target
+# grades that); the specialist's card `result` is then posted into the thread
+# verbatim (agents/chat/SOUL.md §2, step 5), so the answer's shape is set by
+# the report stanza every card body carries
+# (deploy/docker/patches/kanban_report_format.py) and agents/platform/SOUL.md
+# §0. A yes/no health question is answered in one bold sentence, the evidence
+# that settles it, and an offer if there is a next step: not a report with
+# Pod Status, Node Memory and Sources sections, and not the verdict said a
+# second time in other words under the lead.
+#
+# answer_first reads each delivered result raw, because report_contains
+# normalizes the `**` away. It checks the shape, not the facts: whether a pod
+# is failing on platform-agent-host depends on the install, and this case
+# grades how the answer reads, so it declares no `fixtures:`.
+# platform-agent-host is the agent's own host cluster on every install the
+# presubmit and a dev project run (hack/ci-env.sh HOST_CLUSTER_NAME).
+#
+# The summary line the notifier used to post above the result is the other
+# copy of the verdict a user saw. It never reaches final_message, so this case
+# cannot see it; deploy/docker/patches/test_kanban_notifier.py holds that half.
+#
+# Planted defect required: none. Isolation class: read-only.
+id: chat-voice-answer-first
+name: A delegated answer opens on one bold sentence and does not restate it
+prompt: >-
+  Check the platform-agent-host cluster: are any pods outside kube-system not
+  Running, and is any node under memory pressure?
+expected_output: >-
+  The front door files a kanban task and acks it. The answer that comes back
+  opens with one bold sentence answering both questions, follows it with a
+  sentence or two of evidence and an offer if there is a next step, carries
+  no section headings or list of the commands run, and does not restate the
+  verdict.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's reply to a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+verification_spec:
+  # The answer is only the specialist's if work was handed over.
+  - name: the-ask-was-delegated
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # One bold sentence that answers the memory half of the ask at least (the
+  # pod half has too many honest spellings to pin), at most four sentences
+  # and 600 characters, no heading, and no later sentence that re-announces
+  # the verdict. The recap patterns are the shapes the delivered reports
+  # took ("The cluster is healthy across the requested checks.") and the
+  # stock closers; a recap in the lead itself is the answer, not a restatement.
+  - name: the-answer-opens-on-one-bold-sentence-and-stops
+    role: objective
+    mode: assert
+    check:
+      type: answer_first
+      lead_terms: ["memory"]
+      max_chars: 600
+      max_sentences: 4
+      recap_patterns:
+        - '\b(?:the |this )?cluster (?:is|looks|appears) (?:healthy|fine|good|in good shape)\b'
+        - '\bhealthy across\b'
+        - '\beverything (?:is|looks) (?:healthy|fine|good)\b'
+        - '\ball (?:the |requested )?checks (?:passed|are green|look good)\b'
+        - '\bin summary\b'
+        - '\bto summari[sz]e\b'
+        - '\A(?:overall|in short)\b'
+  # The delegation boundary: the front door files the card and never works it.
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # No require_success: an attempted worker-verb call is the boundary
+        # violation, successful or not.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
