@@ -74,8 +74,11 @@ SEND_LANES = ("_deliver_via_live_adapter", "_deliver_standalone")
 TARGET_TEXT = "target_text"
 WRAPPER_HEADER = "Cronjob Response: "
 TARGET_CLASS = "_TargetDelivery"
+TARGET_FACTORY = "_prepare_target_delivery"
 #: What ``cron_delivery_text`` reads off a target. ``drive`` below passes a
-#: SimpleNamespace, so only this check ties the names to upstream's class.
+#: SimpleNamespace, so only this check ties the names to upstream's class. Only
+#: ``platform_name`` changes what is sent; the other two feed a log line, and are
+#: pinned anyway so a read the helper makes is never left to a default.
 TARGET_FIELDS = ("platform_name", "chat_id", "job")
 
 RUN_TURN = "gateway/run_turn.py"
@@ -306,8 +309,20 @@ def check_delivery(root: Path) -> None:
 
 
 def check_target_fields(root: Path) -> None:
+    # Fields declared on the class itself only: a field moved to a base class or
+    # turned into a property refuses the build, loudly, until this is re-derived.
+    tree = _tree(root, DELIVERY)
+    sources = [
+        node for node in ast.walk(_function(tree, DELIVER_FN, DELIVERY))
+        if isinstance(node, ast.Assign) and [ast.unparse(t) for t in node.targets] == ["t"]
+    ]
+    if [ast.unparse(node.value.func) for node in sources if isinstance(node.value, ast.Call)] != [TARGET_FACTORY]:
+        raise _fail(f"{DELIVER_FN}() no longer binds t once, from {TARGET_FACTORY}()")
+    factory = _function(tree, TARGET_FACTORY, DELIVERY)
+    if factory.returns is None or TARGET_CLASS not in ast.unparse(factory.returns):
+        raise _fail(f"{TARGET_FACTORY}() is no longer annotated to return {TARGET_CLASS}")
     classes = [
-        node for node in _tree(root, DELIVERY).body
+        node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == TARGET_CLASS
     ]
     if len(classes) != 1:
@@ -681,7 +696,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
         f"notices and {len(replies)} system replies reworded, exception text kept out of the "
         "steer and auth failure replies where they are built, and both back-online notices, the "
         "session-database warnings and the busy-input hint kept off Slack; every name the hooks read "
-        "is bound; flag off and every other platform unchanged"
+        "is bound, and upstream's cron target still declares every field the helper reads; flag off and "
+        "every other platform unchanged"
     )
 
 

@@ -49,7 +49,7 @@ class _TargetDelivery:
     live_adapter_ready: bool = False
 
 
-def _prepare_target_delivery(target):
+def _prepare_target_delivery(target) -> "Optional[_TargetDelivery]":
     return target
 
 
@@ -780,12 +780,35 @@ class ApplierTest(unittest.TestCase):
             node for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef) and node.name == "cron_delivery_text"
         )
-        read = {
-            node.args[1].value for node in ast.walk(fn)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
-            and isinstance(node.args[0], ast.Name) and node.args[0].id == "target"
-        }
+        read = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                if isinstance(node.args[0], ast.Name) and node.args[0].id == "target":
+                    read.add(ast.literal_eval(node.args[1]))
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "target":
+                read.add(node.attr)
+            elif isinstance(node, ast.Call) and any(
+                isinstance(arg, ast.Name) and arg.id == "target" for arg in node.args
+            ):
+                self.assertEqual(ast.unparse(node.func), "getattr", "target is handed to a helper this test cannot see into")
         self.assertEqual(read, set(verifier.TARGET_FIELDS))
+
+    def test_verifier_refuses_a_target_from_elsewhere(self):
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.DELIVERY
+        patched = path.read_text()
+        for old, new, detail in (
+            ('-> "Optional[_TargetDelivery]"', '-> "Optional[_SlackTarget]"', "no longer annotated"),
+            ("t = _prepare_target_delivery(target)", "t = _prepare_slack_target(target)", "no longer binds t"),
+        ):
+            with self.subTest(detail=detail):
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.check_target_fields(self.root.dir)
+                self.assertIn(detail, str(caught.exception))
+        path.write_text(patched)
+        verifier.check_target_fields(self.root.dir)
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)
