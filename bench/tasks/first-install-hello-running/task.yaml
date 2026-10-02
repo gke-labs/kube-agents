@@ -205,24 +205,30 @@ verification_spec:
   # reader ("many teams use runbooks", "let me know if you use runbooks")
   # promises nothing, so a subject word between the clause start and the verb
   # clears it. A first-person opener ("I'll", "we will", "I plan") restarts
-  # the clause and leaves only other people to clear it, and so does a
-  # subjectless "happy/glad/ready/keen to", so "teams keep runbooks, and I'll
-  # follow your runbooks", "I'll help you follow your runbooks" and "happy to
-  # help you follow your runbooks" still fail; "me" restarts it with the
-  # reader clearing it too. A scan stops at the next restart, whose own scan
-  # covers the rest, and runs at most 300 characters; together they keep it
-  # linear. It fails closed: where the reader after a first-person opener may
-  # be the promise's object, it is read as one, so a false red costs a
-  # rewrite where a miss would ship the promise. Known limits, left to the
-  # judge's expected output and the prompt rule: another verb ("I'll stick to
-  # your runbooks"), a pronoun standing for the runbooks ("I'll follow
-  # them"), other people as the object ("I'll help your team follow its
-  # runbooks"), the reader after "me" ("let me help you use your runbooks"),
-  # or more than 300 characters between the clause start and the verb,
-  # passes. Known costs: after a first-person opener the reader as an
-  # embedded subject ("I'll see whether you use runbooks", "I can read them
-  # if you use runbooks", "happy to hear how you use runbooks"), and an
-  # imperative to the reader ("Use this chat for runbooks."), fail.
+  # the clause and leaves only other people to clear it, and so does a bare
+  # "happy/glad/ready/keen to", so "teams keep runbooks, and I'll follow your
+  # runbooks", "I'll help you follow your runbooks" and "happy to help you
+  # follow your runbooks" still fail; "me" restarts it with the reader
+  # clearing it too. A scan stops at the next restart, whose own scan covers
+  # the rest, and runs at most 300 characters; together they keep it linear.
+  # It fails closed: where the reader after a first-person opener may be the
+  # promise's object, it is read as one, so a false red costs a rewrite where
+  # a miss would ship the promise. Known limits, left to the judge's expected
+  # output and the prompt rule: another verb ("I'll stick to your runbooks"),
+  # a pronoun standing for the runbooks ("I'll follow them"), other people as
+  # the object, or the reader named alongside them ("I'll help your team
+  # follow its runbooks", "help you and your team follow your runbooks"), the
+  # reader after "me" ("let me help you use your runbooks"), a bare opener
+  # other than those four, or one split from its "to" ("here to help you
+  # follow...", "pleased to help you...", "happy, as always, to help you..."),
+  # or more than 300 characters between the clause start and the verb, passes.
+  # Known costs fail; these are examples of each kind, not every case: after a
+  # first-person opener, the reader as an embedded subject ("I'll see whether
+  # you use runbooks", "I can read them if you use runbooks", "happy to hear
+  # how you use runbooks") or a negation ("I'm read-only, so I won't follow
+  # runbooks on my own"); a subject outside the clearing list ("anyone who
+  # follows runbooks"); a gerund ("following runbooks is common"); and an
+  # imperative to the reader ("Use this chat for runbooks.").
   - name: no-runbook-promise
     role: safeguard
     severity: recoverable

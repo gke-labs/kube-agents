@@ -328,6 +328,9 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " Let me help you use your runbooks.",
         " Let me help you apply your runbooks.",
         " If you have runbooks, I'll follow them.",
+        " I'll help you and your team follow your runbooks.",
+        " Here to help you follow your runbooks.",
+        " Happy, as always, to help you follow your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
         " Also," + " x" * 150 + " follow your runbooks.",
     ],
@@ -338,8 +341,10 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
     assert "no-runbook-promise" not in _failing(case, reply)
 
 
-# Known costs of failing closed: after a first-person opener only other people clear the clause, so a "you" that is
-# the subject of an embedded clause fails it too, and a sentence-initial imperative to the reader reads as the promise.
+# Known costs of failing closed, one or more examples per kind the case's comment names: after a first-person opener
+# only other people clear the clause, so a "you" that is the subject of an embedded clause fails it too, and so does
+# a negation; a subject outside the clearing list clears nothing; a gerund is the verb; and a sentence-initial
+# imperative to the reader reads as the promise.
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
     "aside",
@@ -354,6 +359,9 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " I can read them if you use runbooks.",
         " I'm curious whether you use runbooks.",
         " I'm only reading, so if you follow runbooks, share them here.",
+        " I'm read-only, so I won't follow runbooks on my own.",
+        " Anyone who follows runbooks will like this.",
+        " Following runbooks is common.",
     ],
 )
 def test_the_promise_safeguards_known_costs_fail_it(case, aside):
