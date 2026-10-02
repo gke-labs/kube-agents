@@ -41,8 +41,8 @@ gateway restart leaves a thread open to a second edit. A report with no
 ``block_kit`` cannot render or that would hold a block outside
 ``FOLD_CHILD_TYPES``, or any failure to edit, also falls back to that reply,
 and a refused fold logs why. The fold stops at the report's first divider
-outside a code fence, so a closing ``---`` and a note after it do not refuse
-it; the message ``text`` still carries them.
+outside a code fence, read as ``block_kit`` reads one, so a closing ``---``
+and a note after it do not refuse it; the message ``text`` still carries them.
 """
 
 from __future__ import annotations
@@ -103,6 +103,10 @@ FOLD_TEXT_MAX = 12000
 FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
 #: A line the plugin renders as a ``divider`` (its ``_HR_RE``); the fold ends before the first.
 DIVIDER = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+#: A line the plugin opens a code fence on (its ``_FENCE_RE``): any indent, a code span's
+#: backticks included. Not the presenter's CommonMark rule, so the cut falls where the plugin
+#: renders the divider.
+BLOCK_KIT_FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 
 HEADING = re.compile(r"^ {0,3}#{1,6} +(.+?)[ #]*$")
 WHATS_WRONG = re.compile(r"what(?:['’]s| is) wrong", re.IGNORECASE)
@@ -250,11 +254,19 @@ def _load_block_kit() -> Any:
     return _block_kit
 
 
+def _block_kit_fence(line: str, fence: str | None) -> str | None:
+    """The fence open after ``line`` as ``render_blocks`` reads it: any line starting with the opener closes it."""
+    if fence is None:
+        match = BLOCK_KIT_FENCE.match(line)
+        return match.group(1) if match else None
+    return None if line.lstrip().startswith(fence) else fence
+
+
 def _before_divider(report: str) -> str:
-    """``report`` up to its first :data:`DIVIDER` line outside a code fence."""
+    """``report`` up to its first :data:`DIVIDER` line outside a code fence the plugin reads."""
     lines, fence = report.split("\n"), None
     for i, line in enumerate(lines):
-        was, fence = fence, _next_fence(line, fence)
+        was, fence = fence, _block_kit_fence(line, fence)
         if was is None and fence is None and DIVIDER.match(line):
             return "\n".join(lines[:i]).rstrip()
     return report

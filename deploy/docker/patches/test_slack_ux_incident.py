@@ -354,6 +354,30 @@ class RuntimeTest(unittest.TestCase):
         fold = adapter.log[0][1]["blocks"][-1]
         self.assertEqual(fold["child_blocks"], _render_blocks(report.strip()))
 
+    def test_a_divider_in_an_indented_fence_does_not_cut_the_fold(self):
+        # block_kit opens a fence at any indent, where CommonMark reads four spaces as a code block.
+        adapter = _Adapter()
+        report = f"{REPORT}\n    ```\n---\n    ```\n"
+        self.deliver(adapter, result=report)
+        fold = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual(fold["child_blocks"], _render_blocks(report.strip()))
+
+    def test_a_divider_after_a_code_span_opener_does_not_cut_the_fold(self):
+        # block_kit opens a fence on a line starting with a code span's backticks.
+        adapter = _Adapter()
+        report = f"{REPORT}\n```kubectl get pods``` printed:\n---\n```\n"
+        self.deliver(adapter, result=report)
+        fold = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual(fold["child_blocks"], _render_blocks(report.strip()))
+
+    def test_the_fold_stops_at_a_divider_after_a_fence_the_plugin_closes(self):
+        # block_kit closes a fence on any line that starts with the opener, text after it included.
+        adapter = _Adapter()
+        shown = f"{REPORT}\n```\nkubectl get pods\n``` (trimmed)"
+        self.deliver(adapter, result=f"{shown}\n---\n\nNothing was changed on the cluster.\n")
+        fold = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual(fold["child_blocks"], _render_blocks(shown.strip()))
+
     def test_a_divider_before_the_options_keeps_the_reply_and_says_why(self):
         adapter = _Adapter()
         report = REPORT.replace("## What to do", "---\n\n## What to do")
