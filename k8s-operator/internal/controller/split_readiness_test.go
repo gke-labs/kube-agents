@@ -31,6 +31,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -694,5 +695,66 @@ func TestTheDarkGatewayConditionClearsEvenWhenTheReadyMessageDoesNot(t *testing.
 	}
 	if meta.FindStatusCondition(persisted.Status.Conditions, a2aGatewayConditionType) != nil {
 		t.Error("the NoChatBackend condition survived on a CR whose gateway is rendered and running")
+	}
+}
+
+// TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions verifies that an
+// in-flight reconcile pass with a lagging informer cache (which has not yet observed
+// an earlier status update) checks live status via APIReader and avoids
+// issuing a duplicate status update.
+func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	now := metav1.Now()
+	darkMsg := "no chat backend configured; A2A gateway is dark"
+	agent.Status.Conditions = []metav1.Condition{{
+		Type:               a2aGatewayConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             a2aGatewayDarkReason,
+		Message:            darkMsg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	}}
+	counter := &statusWriteCounter{}
+	scheme := setupScheme()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(counter.interceptors()).
+		Build()
+
+	// Cached client simulates an informer cache that has not yet observed the
+	// dark gateway status write:
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				pa.Status.Conditions = nil
+			}
+			return nil
+		},
+	})
+
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	ctx := context.Background()
+
+	staleAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cached.Get(ctx, client.ObjectKeyFromObject(agent), staleAgent); err != nil {
+		t.Fatalf("reading stale agent: %v", err)
+	}
+
+	a2aState := a2aProvisionState{
+		gatewayDark:       true,
+		gatewayDarkReason: darkMsg,
+	}
+
+	if err := r.syncA2AConditions(ctx, staleAgent, a2aState); err != nil {
+		t.Fatalf("syncA2AConditions failed: %v", err)
+	}
+
+	if counter.writes != 0 {
+		t.Fatalf("syncA2AConditions made %d status writes on a stale cache pass, want 0: the live object already held matching status", counter.writes)
 	}
 }

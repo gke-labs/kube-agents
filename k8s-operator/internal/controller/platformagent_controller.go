@@ -3187,6 +3187,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) {
 		return nil
 	}
+	if r.APIReader != nil {
+		live := &agentv1alpha1.PlatformAgent{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err == nil {
+			wantLive := wantBusProvisioned(live, a2a)
+			if a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive) {
+				return nil
+			}
+		}
+	}
 	now := metav1.Now()
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
@@ -4069,6 +4078,22 @@ const (
 // The generation witness is the condition's observedGeneration rather than the
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
+	if existing == nil ||
+		agent.Status.Phase != "Degraded" ||
+		existing.Status != metav1.ConditionFalse ||
+		existing.Reason != reason ||
+		existing.Message != message ||
+		existing.ObservedGeneration != agent.Generation {
+		return false
+	}
+	if !rendered {
+		return true
+	}
+	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+}
+
 //
 // rendered says whether the caller got as far as reconcileWorkload, and gates
 // the VolumesDropped condition alone -- everything else here is written either
@@ -4091,7 +4116,6 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// same reason: a term no write can satisfy would make every requeue tick a
 	// status write (#1392).
 	hostPathDroppedMsg := ""
-	hostPathDroppedUnchanged := true
 	if rendered {
 		// Qualified the same way updateStatusReady qualifies it. That function
 		// reads the roll off the gateway workload it fetches anyway; this one
@@ -4112,16 +4136,20 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 			oldPods = r.gatewayRollIncomplete(ctx, agent)
 		}
 		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
-		hostPathDroppedUnchanged = hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 	}
-	if existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); existing != nil &&
-		agent.Status.Phase == "Degraded" &&
-		existing.Status == metav1.ConditionFalse &&
-		existing.Reason == reason &&
-		existing.Message == message &&
-		existing.ObservedGeneration == agent.Generation &&
-		hostPathDroppedUnchanged {
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg) {
 		return nil
+	}
+
+	// If the cached agent missed the status condition due to watch event lag,
+	// check the live object before attempting an Update that would conflict (409).
+	if r.APIReader != nil {
+		live := &agentv1alpha1.PlatformAgent{}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err == nil {
+			if degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg) {
+				return nil
+			}
+		}
 	}
 
 	agent.Status.Phase = "Degraded"
