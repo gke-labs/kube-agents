@@ -80,6 +80,9 @@ def test_the_greeting_without_the_invitation_fails_only_on_it(case):
         " Do you have runbooks, and where do they live?",
         " Could you share your runbooks - the main ones?",
         " Any runbooks - or conventions - I should know about?",
+        " Share your team's runbooks here...?",
+        " Share your team's runbooks here!?",
+        " Share your team's runbooks here…?",
     ],
 )
 def test_asking_for_runbooks_is_a_stacked_ask_and_no_invitation(case, ask):
@@ -136,10 +139,19 @@ def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(c
         " Please do share your team's runbooks here.",
         " 📚 Share your team's runbooks here.",
         " - Share your team's runbooks here.",
+        " Please feel free to share your team's runbooks here.",
     ],
 )
 def test_a_short_lead_in_without_a_negation_still_counts_as_the_invitation(case, invitation):
     assert "invites-runbooks" not in _failing(case, _example(case).replace(INVITATION, invitation))
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("join", [": share", " — share", " - share", " – share"])
+def test_a_colon_or_dash_join_still_opens_the_invitation(case, join):
+    example = _example(case)
+    joined = POINT4.removesuffix(".") + join + INVITATION.removeprefix(" Share")
+    assert "invites-runbooks" not in _failing(case, example.replace(POINT4 + INVITATION, joined))
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -165,6 +177,13 @@ def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, in
 def test_an_invitation_promising_any_time_fails_the_invitation_check(case, invitation):
     # The greeting must not promise a runbook path the agent has not been given.
     assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
+
+
+# A known limit the cases' comment names: a second runbook ask with no "?" passes no-stacked-asks.
+@pytest.mark.parametrize("case", CASES)
+def test_an_imperative_runbook_ask_passes_no_stacked_asks(case):
+    reply = _example(case).replace(INVITATION, INVITATION + " Send me your on-call runbooks too.")
+    assert "no-stacked-asks" not in _failing(case, reply)
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -328,6 +347,8 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " I'll apply every one of your runbooks.",
         " I'll follow your team's incident and on-call runbooks.",
         " I'll make use of your runbooks.",
+        " If your team agrees, fixes will follow your runbooks.",
+        " Your team keeps runbooks, and fixes will follow your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
@@ -378,6 +399,7 @@ def test_a_promise_after_a_prepositional_team_fails_the_promise_safeguard(case, 
         " Many on your team use runbooks.",
         " Some of you follow runbooks.",
         " Most of your team follows runbooks.",
+        " I'm only reading, so if you follow runbooks, share them here.",
     ],
 )
 def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case, aside):
@@ -402,6 +424,8 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " Happy, as always, to help you follow your runbooks.",
         " I'll follow the long list of incident and on-call runbooks.",
         " Fixes sent to your team follow your runbooks.",
+        " You'll get fixes that follow your runbooks.",
+        " Your team will get pull requests that follow your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
         " Also," + " x" * 150 + " follow your runbooks.",
     ],
@@ -430,7 +454,6 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " Use this chat for runbooks.",
         " I can read them if you use runbooks.",
         " I'm curious whether you use runbooks.",
-        " I'm only reading, so if you follow runbooks, share them here.",
         " I'm read-only, so I won't follow runbooks on my own.",
         " When you're ready to use runbooks here, share them.",
         " Anyone who follows runbooks will like this.",

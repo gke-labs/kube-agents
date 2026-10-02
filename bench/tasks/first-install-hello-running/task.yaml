@@ -135,10 +135,13 @@ verification_spec:
   # share...", "Please don't share...", "I can't read them if you
   # share..."). A sentence opens at the start of the reply, after ".", "!",
   # "?" or "…" past any closing bracket or quote and a space, at a line
-  # break, or after "; " or ", and". A longer lead-in fails it, a known cost;
-  # a lead-in that withdraws it without a listed negation ("Only if you
-  # must, share...") passes, a known limit. It ends with
-  # ".", "!" or "…" past any closing bracket or quote, never "?"; rejecting
+  # break, after "; ", ": " or ", and", or at a dash with a space on each
+  # side. A longer lead-in fails it, a known cost; a lead-in that withdraws
+  # it without a listed negation ("Only if you must, share..."), or a
+  # negation before the join ("One thing you needn't do: share..."), passes,
+  # a known limit. It ends with ".", "!" or "…" past any closing bracket or
+  # quote, and no "?" in the run of marks that follows ("here...?" and
+  # "here!?" fail); rejecting
   # "here anytime" is intended, and so is the invitation joined to the
   # closing question by a comma or a dash, which no-stacked-asks also fails,
   # though it asks nothing about runbooks. The reply is lowercased; any run
@@ -151,14 +154,16 @@ verification_spec:
   # "…" ("Any runbooks here... I should read first?"), passes
   # no-stacked-asks. A known cost: a period with no space after it does not
   # end a sentence, so a runbook sentence run into the closing question
-  # ("Share your team's runbooks here.Is there anything...?") fails it.
+  # ("Share your team's runbooks here.Is there anything...?") fails it. A
+  # second runbook ask with no "?" ("Send me your on-call runbooks too.")
+  # passes it, a known limit.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|;\s|,\s+and\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|without|cannot|unless)\b|n[''’]t\b)[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|without|cannot|unless)\b|n[''’]t\b)[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -217,11 +222,14 @@ verification_spec:
   # runbook sentence with a "?"; this catches the promise itself: follow,
   # apply or use as a verb (not "useful", "users" or "used to", nor "use"
   # after a, an, the, no, any, its or their, which is the noun: "the use of
-  # runbooks"), then up to six words, none of them "to", then runbooks ("use this chat
-  # to share your team's runbooks" is not a promise). A clause whose subject
-  # is other people or the reader ("many teams use runbooks", "let me know if
-  # you use runbooks") promises nothing, so a subject word between the clause
-  # start and the verb clears it. The same word inside a prepositional phrase
+  # runbooks"), then up to six words, none of them "to", then runbooks ("use
+  # this chat to share your team's runbooks" is not a promise). A clause
+  # whose subject is other people or the reader ("many teams use runbooks",
+  # "let me know if you use runbooks") promises nothing, so a subject word
+  # between the clause start and the verb clears it. A clause starts at the
+  # start of the reply, at a line break, or after ".", "!", "?", "…", ";",
+  # ":" or ",", so a reader word in an earlier comma-joined clause ("if your
+  # team agrees, fixes will follow your runbooks") clears nothing. The same word inside a prepositional phrase
   # (for, in, on, at, of, from, by, about, across or into, then optionally
   # the, your, their or its) is not the subject and clears nothing, so "pull
   # requests for your team to review that follow your runbooks" still fails;
@@ -249,7 +257,9 @@ verification_spec:
   # split from its "to" ("here to help you follow...", "pleased to help
   # you...", "happy, as always, to help you..."), a clearing word after "to"
   # or "with", which are not in the preposition list ("fixes sent to your
-  # team follow your runbooks"), more than six words between the verb and
+  # team follow your runbooks"), the reader or their team as the promise's
+  # subject ("you'll get fixes that follow your runbooks"), more than six
+  # words between the verb and
   # runbooks ("I'll follow the long list of incident and on-call runbooks"),
   # or more than 300 characters between the clause start and the verb,
   # passes. Known costs fail; these are examples of each kind, not every
@@ -271,7 +281,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?:(?:(?:\A|[.!?…;:\n])|(?=(?:\bme\b)))(?:(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:\n])(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:\n]){0,299}?)??|(?=(?:\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\b(?:happy|glad|ready|keen) to\b))(?:(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b)[^.!?…;:\n])(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:\n]){0,299}?)??)\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bno )(?<!\bany )(?<!\bits )(?<!\btheir )us(?:e|es|ing))\s+(?:(?!to\s)[\w''’-]+\s+){0,6}run[ -]?books?\b'
+        - '(?:(?:(?:\A|[.!?…;:,\n])|(?=(?:\bme\b)))(?:(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:,\n])(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:,\n]){0,299}?)??|(?=(?:\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\b(?:happy|glad|ready|keen) to\b))(?:(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b)[^.!?…;:,\n])(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:,\n]){0,299}?)??)\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bno )(?<!\bany )(?<!\bits )(?<!\btheir )us(?:e|es|ing))\s+(?:(?!to\s)[\w''’-]+\s+){0,6}run[ -]?books?\b'
 
   - name: claims-no-save
     role: safeguard
