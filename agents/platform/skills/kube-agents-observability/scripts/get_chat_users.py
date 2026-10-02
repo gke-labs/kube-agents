@@ -27,9 +27,15 @@ LOG_LIMIT = 1000
 LOG_FORMAT = "json"
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 DEFAULT_HOURS = 24
-# `logging read` returns within a minute or two; the shim's own connect
-# timeout is separate.
-GCLOUD_TIMEOUT_SECONDS = 300
+# `logging read` returns within a minute or two. The broker runs the command
+# under its own deadline (CREDENTIAL_PROXY_TIMEOUT_SECONDS, 300 s by default,
+# in credential_proxy.py) measured from when the command starts, after up to
+# COMMAND_SLOT_WAIT_SECONDS (60 s) queued for a slot, while this clock starts
+# before the shim has connected. This value sits above both together, so the
+# broker's answer, the output or its own timeout notice, arrives here rather
+# than the shim being killed first with no stderr from either side; the test
+# module reads both numbers from the broker's source and holds the ordering.
+GCLOUD_TIMEOUT_SECONDS = 420
 # The broker caps a relayed command's stdout; past the cap the shim writes the
 # cut body, prints this line on stderr and exits as the command did. The cut
 # body is not the read, so the line is a failure here whatever the exit code.
@@ -74,7 +80,10 @@ def read_entries(project_id: str, hours: int) -> list:
     except FileNotFoundError as exc:
         raise RuntimeError(f"{GCLOUD} was not found on PATH: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"gcloud logging read did not finish in {GCLOUD_TIMEOUT_SECONDS}s") from exc
+        raise RuntimeError(
+            f"the credential broker did not answer gcloud logging read within "
+            f"{GCLOUD_TIMEOUT_SECONDS}s, past the command deadline it enforces itself"
+        ) from exc
     if completed.returncode != 0:
         raise RuntimeError(
             f"gcloud logging read exited {completed.returncode}: {completed.stderr.strip()}"
