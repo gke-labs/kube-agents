@@ -329,6 +329,7 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " Let me help you apply your runbooks.",
         " If you have runbooks, I'll follow them.",
         " I'll help you and your team follow your runbooks.",
+        " I could help you follow your runbooks.",
         " Here to help you follow your runbooks.",
         " Happy, as always, to help you follow your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
