@@ -61,6 +61,46 @@ if _REFRESH_MATCH is None:
 PAGE_REFRESH_MS = int(_REFRESH_MATCH.group(1))
 # Boot, then two polls, then half an interval of slack, on the sped-up clock.
 TWO_POLLS_BUDGET_MS = (2 * PAGE_REFRESH_MS + PAGE_REFRESH_MS // 2) // TIMER_SPEEDUP
+# dom_html's budget when a test names none: boot and the refresh after it;
+# the first poll is far outside it unless the page's timers are sped up.
+DEFAULT_BUDGET_MS = 3000
+# fast_timers_page names its copies with this stem suffix and writes this shim
+# into them. dom_html reads the shim from the copy, not the suffix from the
+# name: every page-copy helper appends its own suffix after whatever it is
+# handed, so the name says which wrapper was outermost, and only the shim
+# says how soon the page polls.
+FAST_TIMERS_SUFFIX = "-fast"
+FAST_TIMERS_SHIM = ("<script>(() => { const native = window.setInterval;"
+                    f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
+# The Brief's bare view anchors (#gate, #agent), each the id of a section.
+# dom_html refuses one on a budget the poll fires inside: a fragment naming
+# an element, polled under virtual time, is what stalls headless Chrome on CI.
+def brief_view_anchors(pages_js: str) -> frozenset:
+    """PAGE.views' values from pages.js's text, a flat object of quoted
+    strings. Any other shape raises, so a reshaped literal fails the import
+    rather than the guard: the match cannot cross a nested brace, where one
+    stopping at the first `}` would read a nested value's first strings as
+    the anchors, keep the import quiet, and let the views after it reach
+    Chrome on the poll budget."""
+    match = re.search(r"^\s*views:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views is not a flat object literal; dom_html cannot tell a bare view anchor")
+    anchors = frozenset(re.findall(r'"([^"]+)"', match.group(1)))
+    if not anchors:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.views names no quoted view; dom_html cannot tell a bare view anchor")
+    return anchors
+
+
+BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+# The Cases page's one polled call, in
+# test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
+# the bare case name, under boot and two polls on the page's real clock.
+# The element it scrolls to is id="case-<name>" (pages.js renders the row
+# and reads the hash through linkState's caseHash), so Chrome's native
+# anchor matches nothing and the call has no stall on record. The call
+# site and DomHtmlGuardTest's kept list read these two names, not copies.
+CASES_ROW_ANCHOR = "#cluster-agent-crashloop-evidence-chain"
+CASES_TWO_POLLS_BUDGET_MS = 130000
 # Below this the page may not finish booting inside the budget, and the
 # scroll-once test would pass or fail on load time rather than on the poll.
 MIN_TWO_POLLS_BUDGET_MS = 1000
@@ -150,12 +190,20 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = 3000) -> str:
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = DEFAULT_BUDGET_MS) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
     an XHR with a login redirect puts the pages in. ``budget_ms`` is the
     virtual time the page is given; timers fire inside it, so a budget past
-    PAGE.refreshMs runs the poll too."""
+    PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
+    on a budget the poll fires inside; see fast_timers_page for the stall."""
+    anchor = fragment.lstrip("#")
+    poll_ms = PAGE_REFRESH_MS // TIMER_SPEEDUP if FAST_TIMERS_SHIM in page.read_text() else PAGE_REFRESH_MS
+    if budget_ms >= poll_ms and anchor in BRIEF_VIEW_ANCHORS:
+        raise ValueError(
+            f"{fragment} on a {budget_ms} ms budget of a page that polls every {poll_ms} ms: a bare view anchor "
+            f"polled under virtual time stalled headless Chrome on CI (#2227); use #view={anchor}, or a budget the poll is outside"
+        )
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
         [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
@@ -174,17 +222,27 @@ def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
+def scrolls(html: str) -> "re.Match[str] | None":
+    """The scroll count a scroll_counting_page recorded, or None when
+    nothing scrolled."""
+    return re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
+
+
 def fast_timers_page(page: pathlib.Path) -> pathlib.Path:
     """A copy of the rendered page whose setInterval runs TIMER_SPEEDUP
     times faster, so the poll every PAGE.refreshMs fires inside a short
     virtual-time budget. A budget spanning real polls (130 s) on a URL whose
     fragment names an element on the page (#gate) intermittently stalled
     headless Chrome's virtual clock on CI until the wall-clock timeout;
-    bare anchors on short budgets have a clean record."""
-    shim = ("<script>(() => { const native = window.setInterval;"
-            f" window.setInterval = (fn, ms, ...rest) => native(fn, ms / {TIMER_SPEEDUP}, ...rest); }})();</script>")
-    copy = page.with_name(page.stem + "-fast" + page.suffix)
-    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    bare anchors on short budgets have a clean record. The sped-up clock
+    alone did not remove the stall: #gate under TWO_POLLS_BUDGET_MS stalled
+    the same way, so no call on the poll budget carries a fragment that
+    names an element (test_the_bare_anchor_scrolls_once), and dom_html
+    refuses a bare view anchor on a budget the poll fires inside, telling
+    the sped-up clock by this shim in the copy, whichever wrapper is
+    outermost."""
+    copy = page.with_name(page.stem + FAST_TIMERS_SUFFIX + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + FAST_TIMERS_SHIM, 1))
     return copy
 
 
@@ -562,6 +620,99 @@ ROSTER_AT_SPLIT = frozenset({
     "cluster-agent-crashloop-evidence-chain",
     "agent-kanban-smoke",
 })
+
+
+class DomHtmlGuardTest(unittest.TestCase):
+    """dom_html's refusal of a bare view anchor on a budget the poll fires
+    inside, and the parse of PAGE.views it reads the anchors from. Both are
+    decided before Chrome runs, so they hold on a host without one, and the
+    admitted calls are checked against a mocked subprocess."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        data = load_fixture()
+        data["generated_at"] = NOW
+        out = render_to(cls.tmp.name, data, health=health_doc())
+        cls.index = out / "index.html"
+        cls.cases = out / render.CASES_PAGE
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def no_chrome():
+        """subprocess.run replaced, so a call the guard admits is recorded
+        and never launches a browser: the refused shapes below are the
+        ones that stalled CI, and a guard that let one through must fail
+        the test, not hang it."""
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        return unittest.mock.patch.object(subprocess, "run", return_value=completed)
+
+    def test_a_bare_view_anchor_on_the_poll_budget_is_refused_whichever_wrapper_is_outermost(self):
+        # The sped-up clock is read from the shim in the copy, not from the
+        # file name: scroll_counting_page(fast_timers_page(...)) is named
+        # "-fast-scrolls", and a check on the name's end would admit the
+        # exact call that stalled CI (#2227).
+        pages = (fast_timers_page(scroll_counting_page(self.index)),
+                 scroll_counting_page(fast_timers_page(self.index)),
+                 clock_page(fast_timers_page(self.index), NOW))
+        with self.no_chrome():
+            for page in pages:
+                for anchor in sorted(BRIEF_VIEW_ANCHORS):
+                    with self.subTest(page=page.name, anchor=anchor):
+                        with self.assertRaises(ValueError) as refused:
+                            dom_html(page, fragment=f"#{anchor}", budget_ms=TWO_POLLS_BUDGET_MS)
+                        self.assertIn(f"polls every {PAGE_REFRESH_MS // TIMER_SPEEDUP} ms", str(refused.exception))
+                        self.assertIn(f"use #view={anchor}", str(refused.exception))
+            with self.assertRaises(ValueError) as refused:
+                dom_html(scroll_counting_page(self.index), fragment="#gate", budget_ms=CASES_TWO_POLLS_BUDGET_MS)
+            self.assertIn(f"polls every {PAGE_REFRESH_MS} ms", str(refused.exception), "a plain page polls at PAGE.refreshMs")
+
+    def test_a_reshaped_views_literal_fails_the_import_not_the_guard(self):
+        # The guard refuses exactly the anchors the parse found, so a parse
+        # that misreads a reshaped literal loses an anchor with no test
+        # noticing: a match stopping at the first `}` reads the nested
+        # literal below as {"gate", "Gate"}, non-empty, and #agent on the
+        # poll budget then reaches Chrome. The parse must raise instead,
+        # naming the file, as it does for a literal with no quoted value.
+        flat = 'const PAGE = {\n  views: { gate: "gate", agent: "agent" },\n  refreshMs: 60000,\n};\n'
+        nested = ('const PAGE = {\n  views: { gate: { id: "gate", label: "Gate" }, agent: { id: "agent", label: "Agent" } },\n'
+                  '  refreshMs: 60000,\n};\n')
+        unquoted = 'const PAGE = {\n  views: { gate: GATE, agent: AGENT },\n};\n'
+        self.assertEqual(brief_view_anchors(flat), frozenset({"gate", "agent"}))
+        for shape, text in (("nested", nested), ("unquoted", unquoted), ("empty", "const PAGE = {\n  views: {},\n};\n")):
+            with self.subTest(shape=shape):
+                with self.assertRaises(RuntimeError) as refused:
+                    brief_view_anchors(text)
+                self.assertIn(str(PAGES_JS), str(refused.exception))
+
+    def test_the_calls_the_suite_keeps_reach_chrome(self):
+        # The polled calls the suite makes, each on the page copy its call
+        # site uses: the Brief's two under the sped-up clock, the bare
+        # anchor on the default budget, and the Cases page's row anchor,
+        # which is the bare case name (its element is case-<name>), not a
+        # fragment naming the element. The Cases shape reads the call
+        # site's constants so the list cannot drift from the call.
+        fast = scroll_counting_page(fast_timers_page(self.index))
+        plain = scroll_counting_page(self.index)
+        cases = scroll_counting_page(self.cases)
+        kept = [
+            (fast, {"fragment": "#since=2026-09-07T14:00:00Z&view=gate", "budget_ms": TWO_POLLS_BUDGET_MS}),
+            (fast, {"budget_ms": TWO_POLLS_BUDGET_MS}),
+            (plain, {"fragment": "#gate"}),
+            (cases, {"fragment": CASES_ROW_ANCHOR, "budget_ms": CASES_TWO_POLLS_BUDGET_MS}),
+        ]
+        self.assertFalse(CASES_ROW_ANCHOR.lstrip("#").startswith("case-"), "the Cases call names the row by case name; case-<name> is the element id")
+        with self.no_chrome() as run:
+            for page, call in kept:
+                dom_html(page, **call)
+        self.assertEqual(run.call_count, len(kept))
+        for (page, call), invocation in zip(kept, run.call_args_list):
+            argv = invocation.args[0]
+            self.assertIn(f"--virtual-time-budget={call.get('budget_ms', DEFAULT_BUDGET_MS)}", argv, call)
+            self.assertEqual(argv[-1], page.as_uri() + call.get("fragment", ""), call)
 
 
 @unittest.skipUnless(chrome(), "headless Chrome not found")
@@ -1064,10 +1215,22 @@ class BrowserTest(unittest.TestCase):
         # they fit in a short budget. The section is scrolled to once; the
         # polls, which re-render the page, must not pull a reader back to it.
         page = fast_timers_page(scroll_counting_page(self.index))
-        scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
         self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1")
-        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=TWO_POLLS_BUDGET_MS)).group(1), "1", "the bare anchor, the same way")
         self.assertIsNone(scrolls(dom_html(page, budget_ms=TWO_POLLS_BUDGET_MS)), "no view, no scroll")
+
+    def test_the_bare_anchor_scrolls_once(self):
+        # The bare anchor selects the view the same way (#gate and view=gate
+        # reach the same link.view in linkState), so the poll test above
+        # covers its poll. This call stays off the poll budget: #gate under
+        # TWO_POLLS_BUDGET_MS, the fast-timer shim in effect, still stalled
+        # headless Chrome on CI until the 90 s wall-clock timeout (#2227,
+        # after #2202's sped-up clock). A fragment naming an element, polled
+        # under virtual time, is the condition that stalls it; the default
+        # budget ends before the first poll, the shape
+        # test_agent_view_shows_the_numbers uses for #agent, and dom_html
+        # refuses #gate on a budget the poll fires inside.
+        page = scroll_counting_page(self.index)
+        self.assertEqual(scrolls(dom_html(page, fragment="#gate")).group(1), "1", "the bare anchor, the same way")
 
     def test_hostile_parameters_never_reach_the_dom(self):
         for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):
@@ -1382,8 +1545,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
         # The row is scrolled to once, on navigation; the polls that follow
         # re-render without pulling the reader back to it.
-        scrolls = re.search(r'<body[^>]*data-scrolls="(\d+)"', dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000))
-        self.assertEqual(scrolls.group(1), "1")
+        self.assertEqual(scrolls(dom_html(scroll_counting_page(self.cases_page), fragment=CASES_ROW_ANCHOR, budget_ms=CASES_TWO_POLLS_BUDGET_MS)).group(1), "1")
         clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
         self.assertIn('id="case-retired-probe"', clicked)
 

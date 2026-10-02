@@ -146,6 +146,7 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
+    "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
 ]
 
 # Admitted after the split, each by a pull request that cited the record
@@ -403,10 +404,11 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
-    # Listed in the safeguards file's `requesting:` rather than by its own
-    # checks: the persona answers its prompt with a pull request before its
-    # persona-aware check lands (#2079 item 2), which removes the entry.
-    "obtainability-remediation-proposal",
+    # obtainability-remediation-proposal was listed in the safeguards file's
+    # `requesting:` while the persona answered its "propose a manifest" prompt
+    # with a pull request; the persona's rule now puts that manifest in the
+    # reply (SOUL.md §3, item 3), so the allowance is gone and the lane's
+    # github_writes safeguard grades the case at zero like any other.
     "pdb-remediation-pr",
     "rca-remediation-pr",
     "vcs-review-feedback-read-back",

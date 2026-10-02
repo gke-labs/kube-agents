@@ -3,7 +3,8 @@
 
 The sandbox holds the agent's shell, and some of what a SKILL.md tells the model
 to run is not a shell command in any useful sense: it needs the `hermes` binary,
-the profiles tree on the agent pod's PVC, or Hermes' own Python namespace. None
+the profiles tree on the agent pod's PVC, the session database, or Hermes' own
+Python namespace. None
 of those crossed the boundary and none of them should — the point of #737 is
 that code the model runs cannot reach them.
 
@@ -27,7 +28,7 @@ print(
     "This is the sandbox — the container the agent's terminal, file and\n"
     "code-execution tools run in, reached over SSH from the agent pod. It has\n"
     "no `hermes` binary, no profiles tree, and no access to the agent pod's\n"
-    "data volume. The script this file stands in for needs all three.\n"
+    "volumes. The script this file stands in for needs at least one of them.\n"
     "\n"
     "There is no way to run it from here, and no argument to this command that\n"
     "changes that. Report the request as blocked on work that has to happen in\n"

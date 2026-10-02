@@ -2429,6 +2429,27 @@ run_with_spinner() {
   return "$rc"
 }
 
+# lifecycle.sh writes two gitignored override files around each `terraform
+# import` -- a helm provider placeholder beside the composition and a scope
+# resolver pin inside that module's directory -- and removes them on an EXIT
+# trap and again at the start of every subcommand, because a lifecycle.sh
+# killed by a signal the trap cannot see leaves them behind. The dry run below
+# reads the same composition directly, through the checkout acquire_source_repo
+# reuses from run to run, and a plan that merged the scope pin would resolve
+# every declared selector to no members and preview the removal of the bindings
+# those members hold, under a banner calling it what a real run would do. So the
+# dry run clears them the way the engine does, through the engine's own
+# function, so the file names have one home. Runs in the composition directory
+# the caller has cd'd into; the subshell keeps the engine's `set -u`, its `cd`
+# and its definitions out of this script. lifecycle.sh is linted on its own.
+drop_stale_import_overrides() {
+  (
+    # shellcheck disable=SC1091
+    KUBE_AGENTS_SOURCE_ONLY=true source ./lifecycle.sh
+    drop_override
+  )
+}
+
 # The dry run's Terraform check. At file scope, rather than inside main(), so the
 # test suite can source install.sh and drive this exact function instead of its
 # own copy of the chain -- a copy asserts that the copy short-circuits, which is
@@ -5208,10 +5229,8 @@ main() {
   local scope_metrics_scopes="${PARAM_SCOPE_METRICS_SCOPES:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
-  # This rule is also written in init_var_platform_agent_permission_set
-  # (scripts/installer/common.sh), which has no caller left in the repository
-  # -- the numbered provision scripts that used to invoke it went with #797. So
-  # this is the only place it runs, not a duplicate of somewhere it also runs.
+  # This is the only place this rule runs: the installer library's copy went
+  # with the numbered provision scripts that called it (#797).
   if [ "$permission_set" = "custom" ] && [ "$PARAM_NON_INTERACTIVE" = "true" ] && [ -z "$custom_roles" ]; then
     print_error "--permission-set=custom requires --custom-roles with at least one role."
     exit 1
@@ -5434,11 +5453,11 @@ main() {
   #
   # `none` rather than an empty string: the choice has to survive the trip
   # through the CR, and an absent provider takes the CRD default. The operator
-  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
-  # in scripts/installer/common.sh.
+  # translates `none` back to Hermes' own spelling when it renders config.yaml.
   #
   # `multiuser_memory` is the default provider everywhere it is named with no
-  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # install to ask (the CRD default, install.defaults.env, and both profiles'
+  # config.yaml),
   # and `file` is what an install that says nothing about memory gets — the same
   # store those installs already had before the searchable one existed.
   # When PARAM_MEMORY_EXPLICIT is false (--non-interactive with neither
@@ -5711,6 +5730,9 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
+      # Before terraform first reads the configuration; the plan further down
+      # runs in this same directory and nothing between the two writes them.
+      drop_stale_import_overrides
       local tf_log=""
       tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
       local rc=0

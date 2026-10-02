@@ -611,10 +611,11 @@ config_is_pristine_upstream_example() {
 # Fill the keys an image template declares and the live config.yaml does not, at any
 # depth, and change nothing the file already says. $1 = the template, $2 = the live file.
 #
-# A function because two profiles need it: the default profile immediately below, and —
-# when the front-door flag makes the gateway write to it — the platform profile at step
-# 2.6b. One copy so the two cannot drift, and one heredoc so the tests can go on lifting
-# this program out by its marker and running it against real files.
+# A function because three places need it: the default profile immediately below, every
+# cluster-* profile in step 2.6's cluster loop, and — when the front-door flag makes the
+# gateway write to it — the platform profile at step 2.6b. One copy so they cannot drift,
+# and one heredoc so the tests can go on lifting this program out by its marker and
+# running it against real files.
 #
 # The caller reports its own failure: which file the fill was for is the whole of what a
 # reader needs from the warning, and only the caller knows.
@@ -959,7 +960,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # only id this call may force, which keeps the merge it does alongside the
 # retirement a subset of 2c-bis rather than a second policy for the same file:
 # two of the jobs in this roster DELETE THEMSELVES — bootstrap_delivery.py's
-# _cleanup removes the scan/delivery pair once the onboarding report lands — and
+# _retire_jobs removes the scan/delivery pair once the onboarding report lands — and
 # an unfiltered merge would put both back.
 if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
@@ -1004,7 +1005,7 @@ fi
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
-# bootstrap_delivery.py:_cleanup retired the two onboarding jobs, so they would look new and
+# bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
 # be reinstalled. .bootstrap_completed is that record.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
@@ -1089,11 +1090,13 @@ fi
 #     cluster_agent_reconcile.py matches a profile to its cluster by, and the
 #     reconciler would then scaffold a duplicate profile it can never prune.
 #     (KUBECONFIG is not in this file — it is pinned in the profile's .env by
-#     cluster_agent_profile.py:_pin_kubeconfig_env.) The two image-owned values
-#     inside it are repaired in place instead, in the cluster loop below: the
-#     retired `memory.provider` key is dropped, and the remote MCP User-Agent is
-#     set to the template's, so an upgraded volume sends the same header a fresh
-#     one does.
+#     cluster_agent_profile.py:_pin_kubeconfig_env.) So the cluster loop below
+#     back-fills it instead, with step 2d's fill-only rule — keys the template
+#     adds arrive, and `cluster_identity`, which the template never declares, is
+#     left alone — and repairs the image-owned values the fill cannot reach in
+#     place: the retired `memory.provider` key is dropped, and the remote MCP
+#     User-Agent is set to the template's, so an upgraded volume sends the same
+#     header a fresh one does.
 #
 # Profile identity is NOT at risk either way: `hermes profile create` records the
 # name and description in profiles/<name>/profile.yaml, a separate file that no
@@ -1459,8 +1462,9 @@ if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
 fi
 
 # 2.6 (continued), for the cluster profiles: personas from the template, skills through
-# the helper defined just above, and one targeted config repair. Kept after 2.6a only
-# because it is the caller — everything here belongs to 2.6's force-sync, not to it.
+# the helper defined just above, a fill-only config back-fill, and targeted config
+# repairs. Kept after 2.6a only because it is the caller — everything here belongs to
+# 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     for d in "$TARGET_DIR"/profiles/cluster-*; do
@@ -1487,6 +1491,17 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         if [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
                 || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
+        fi
+        # Keys the template adds after a profile was scaffolded, filled with step 2d's
+        # program: without this a cluster profile keeps the template it was onboarded
+        # with for the life of the volume, while every newly onboarded cluster gets the
+        # current one. Fill-only, so `cluster_identity` and every value the profile
+        # already holds stay as they are. It comes after the memory.provider strip
+        # (the template has no `memory.provider`, so it cannot put one back) and before
+        # the User-Agent repair, the same order step 2.6b uses.
+        if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
+            backfill_config_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
+                || echo "WARN: config back-fill failed for $d/config.yaml; this cluster agent keeps the keys it was scaffolded with" >&2
         fi
         # Second targeted self-heal, same file, same reason it is not force-synced: the
         # User-Agent the profile's remote MCP calls carry is image-owned, and lives in

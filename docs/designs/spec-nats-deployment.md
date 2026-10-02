@@ -311,7 +311,20 @@ Layout:
   a pull-only principal may hold no task-subject subscribe at all, which is what the
   session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping the parked tightening under the authority work.
+  with per-task scoping the parked tightening under the authority work. **Amended
+  10/1:** "deny by default" holds per side, and only while that side has entries in
+  it. An empty allow list is nats-server's spelling of _unrestricted_, not of
+  _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
+  that side's allow or deny list is non-empty, and the two sides are independent), so
+  a rendered entry that lost its publish list would grant the whole subject space on
+  that side while its subscribes stayed narrow. Neither side of a non-narrowed entry
+  may therefore be empty: in the callout identity map the operator refuses such a
+  render and the callout refuses it again at the mint, and in the static `nats.conf`
+  users - which have no validator - a side left empty beside a populated one renders
+  an explicit `deny = [">"]` rather than an absent key. A user with NEITHER side,
+  which is how `sys` ships, still gets no permissions block at all. A principal that
+  must not publish cannot be expressed by omission - there is no deny list in the map
+  - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
   supervisor's - one writer class each, which is the whole point: a consumer derives the
@@ -409,14 +422,33 @@ Layout:
   on `TASKS` that bound is no longer the flat 64 but a number derived from
   `spec.harness.tuning.maxSessions`, since a session pod creates three consumers there
   and a stream that cannot hold the configured concurrency refuses a legitimate session.
-  The number is `maxSessions` times three plus a fixed reserve for what is nobody's
+  The number is `maxSessions` times three plus a reserve for what is nobody's
   session, itemized term by named term beside `a2aTasksReservedConsumers` in the
   operator: the two standing durables, headroom for the audit durable, one incarnation's
   overlap, the web rail's readers, and - amended 9/25 - the `tasks/get` replay
   ephemerals. A replay's ordered consumer holds a slot for five seconds after the call
   returns, its inactive threshold, so the term counts what the replaying callers can hold
   in flight at once and one tail each; the callers that replay in a loop with nothing
-  between calls are named there as what the term does not size for.
+  between calls are named there as what the term does not size for. Amended 9/28: the
+  replay term scales with the bridge's worker count, which the render reads as
+  `BRIDGE_CONCURRENCY` off `spec.deployment.sidecars` - the sum over every sidecar that
+  sets it, each read as the bridge runs it: the literal, with a `$(NAME)` reference to an
+  earlier literal in the same sidecar expanded as the kubelet expands it, or the bridge's
+  default of 2 for a `valueFrom` or a reference to one, an unparsable value or one below
+  one, and 2 when no sidecar sets it, and at
+  most 1024, the bridge's queue capacity, since the CRD bounds `maxSessions` at 10000 against
+  the same wrap and a sidecar's env is bounded nowhere else - so the reserve moves with the
+  bridge's worker count, and each surface says what it read. The provision script's refusal
+  quotes the count it used, the per-entry rule it read it by, and whether it capped it; the
+  `Ready` condition's message on that refusal says, when an entry it could not read as a
+  count took the default in its place, that the count is what the render read, not what the
+  CR declares, and states the rule; and the script prints a `NOTE:` on every run, refused or
+  not, when an entry took the default or a sidecar carries `envFrom` with no entry in `env`
+  (a `BRIDGE_CONCURRENCY` delivered through `envFrom` is not read), since the budget may then
+  be short for the real count with no refusal to say so. Where the count is above the
+  default, both refusal surfaces offer fewer workers as the third way out beside a lower
+  `maxSessions` and a deleted stream; the message attributes the need to the count wherever
+  it moved the reserve, one worker included.
   The trade is stated where it is made: an install that raises `maxSessions` raises
   `web`'s unreapable-durable ceiling in the same proportion. Deriving downward on a small
   install would silently tighten a working one, so the render takes the larger of 64 and

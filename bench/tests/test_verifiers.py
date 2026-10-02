@@ -705,6 +705,57 @@ def test_a_phrase_that_rescues_a_wrong_answer_stays_out_of_the_list(phrase):
         assert verifiers._normalize(phrase) in verifiers._normalize(report), name
 
 
+@pytest.mark.parametrize("name", _WRONG_ANSWERS.keys())
+def test_no_shipped_phrase_occurs_in_either_recorded_wrong_answer(name):
+    """The property the test above only samples: both recorded wrong answers
+    fail on any_of alone, with no help from the forbidden list.
+
+    Membership of the two cut phrases is not enough. "older than the", shipped
+    2026-09-29 as the article-carrying form of a cut phrase, was not in that
+    list and still sat inside "older than the channel's default version", so
+    one of the two cleared any_of and only the forbidden list kept it red --
+    and a wrong verdict one word off the nine forbidden shapes passed (the
+    test below). The 2026-10-01 entries spell the default out instead.
+    """
+    text = verifiers._normalize(_WRONG_ANSWERS[name])
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert [p for p in shipped if verifiers._normalize(p) in text] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "old", "new"),
+    [
+        ("exclusion-means-up-to-date", "is currently **up to date**", "is **up to date**"),
+        ("lag-is-expected", "older than its", "older than the"),
+    ],
+)
+def test_a_wrong_answer_one_word_off_the_forbidden_list_still_fails(name, old, new):
+    """The two variants the 2026-10-01 review walked: drop "currently" from
+    the first recorded wrong answer and it no longer carries any forbidden
+    phrase; swap "its" for "the" in the second and it hedges with the same
+    "older than the" the first one uses. Both passed while "older than the"
+    was an any_of entry. They fail now because nothing in any_of matches
+    them, which is the property the test above pins.
+    """
+    report = _WRONG_ANSWERS[name].replace(old, new)
+    assert report != _WRONG_ANSWERS[name], old
+    assert _upgrades_verdict(report) == "fail"
+
+
+def test_the_moved_ahead_phrase_is_bound_to_a_space():
+    """"moved ahead" sits inside "removed ahead of", which a correct reply
+    can say about the planted patch or the exclusion with no lag word near
+    it; the entry carries a leading space, which `_normalize` keeps, so the
+    recorded "has moved ahead" still matches and "removed ahead" does not.
+    """
+    shipped = _upgrades_probe_check()["any_of_phrases"]
+    assert "moved ahead" not in shipped
+    assert " moved ahead" in shipped
+    assert _upgrades_verdict("The exclusion will be removed ahead of 2026-12-02.") == "fail"
+    assert "removed ahead" in verifiers._normalize("the patch was removed ahead of the rotation")
+    assert " moved ahead" not in verifiers._normalize("the patch was removed ahead of the rotation")
+
+
 def test_the_channel_absence_phrase_keeps_its_preposition():
     """"aged out" alone sits inside "managed outage" -- the "of" is the anchor.
 
@@ -717,6 +768,284 @@ def test_the_channel_absence_phrase_keeps_its_preposition():
     for innocent in ("a Google-managed outage window", "damaged outside the window"):
         assert "aged out" in verifiers._normalize(innocent)
         assert "aged out of" not in verifiers._normalize(innocent)
+
+
+# The 2026-09-29 widening (#1493, #2124), measured over all 279 scored
+# presubmit repetitions of 2026-09-25 to 09-29: 17 more spellings of the lag,
+# and a forbidden list for the verdict the phrases above only describe around.
+# Same discipline: verbatim `output` fields, read through the shipped check.
+
+# kube-agents-evals-25 rep 1, build 2104637844441010176 (#2050). The largest
+# miss of the 15-phrase list: "older than the default", 17 of the 39 correct
+# answers it failed. Bare "older than" and "older than the" both stay out
+# (the tests above): "older than the current default" is what admits this,
+# and neither recorded wrong answer contains it or "older than the default".
+_LAG_OLDER_THAN_THE_DEFAULT = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_727d75f2`. The answer will post into this thread as soon as it's ready.
+
+The task `t_727d75f2` has finished. Here is the result from the **platform** agent:
+
+The `seeded-b` cluster is on **version 1.34.10-gke.1328000** for both its control plane and its nodes, and is enrolled in the **Regular release channel**.
+
+## Current State
+
+- **Current control plane version:** `1.34.10-gke.1328000`
+- **Current release channel:** Regular (`REGULAR`)
+- **Default version for the Regular channel (in `us-central1-a`):** `1.35.8-gke.1225000`
+- **Latest available version in the Regular channel (in `us-central1-a`):** `1.36.4-gke.1247000`
+
+The control plane is older than the current default for its release channel.
+
+## Sources
+- **GCP command:** `gcloud container get-server-config --zone us-central1-a --project kube-agents-evals-25`
+- **Tool:** `mcp-gke` (`mcp__gke__get_cluster` and `mcp__gke__get_k8s_version`)
+"""
+
+# kube-agents-evals-34 rep 3, build 2104630680196485120 (#1628). Once GKE
+# dropped the planted patch from REGULAR's valid list on 2026-09-28 the agent
+# described an absence in words "no longer offered" did not cover.
+_LAG_MISSING_FROM_THE_LIST = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_edf38c95`. The answer will post into this thread as soon as it's ready.
+
+The task `t_edf38c95` has completed. Here is the result from the platform agent:
+
+The `seeded-b` cluster is running a control plane version that is no longer available in its release channel.
+
+## Current state
+- **Cluster:** `seeded-b` (in `us-central1-a`)
+- **Release Channel:** `REGULAR`
+- **Current Version:** `1.34.11-gke.1102000`
+
+## Channel availability
+The `REGULAR` release channel currently offers the following versions:
+- `1.36.4-gke.1247000`
+- `1.36.3-gke.1767000`
+- `1.35.8-gke.1380000`
+- `1.35.8-gke.1225000` (Default and Upgrade Target)
+- `1.34.11-gke.1056000`
+- `1.34.11-gke.1044000`
+
+The version `seeded-b` is currently running (`1.34.11-gke.1102000`) is missing from the list of valid versions for the `REGULAR` channel in `us-central1-a`.
+"""
+
+# kube-agents-evals-7 rep 3, build 2103664100058861568 (#1884). One of the
+# four wrong verdicts the 15-phrase list PASSED: "current relative to its
+# configured release channel", rescued by "slightly behind" a few lines down.
+# It also says "No action is required" -- advice, not the verdict, and not on
+# the forbidden list; what fails it is "is current relative".
+_WRONG_CURRENT_RELATIVE_TO_ITS_CHANNEL = """🔀 Delegated to the **platform** agent
+
+I've started this as task `t_b4165eb5`. The answer will post into this thread as soon as it's ready.
+
+The task `t_b4165eb5` has finished successfully. Here is the result from the **platform** agent:
+
+The control plane for `seeded-b` is current relative to its configured release channel.
+
+## Current state
+- **Current Version:** `1.34.10-gke.1328000`
+- **Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1036000`
+
+While `1.34.10-gke.1328000` is slightly behind the current default for the REGULAR channel (`1.35.8-gke.1036000`), it remains an actively valid and supported version within that channel. No action is required.
+"""
+
+# kube-agents-evals-31 rep 2, build 2104675369926791168 (#2084). "matches the
+# default version" in the first sentence, "older than the default version"
+# two lines later. The widened list accepts the second sentence, so only the
+# forbidden pattern keeps this red -- and it is a pattern rather than a
+# phrase because "no longer matches the default version" is a correct answer.
+_WRONG_MATCHES_THE_DEFAULT = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_261f4a31`. The answer will post into this thread as soon as it's ready.
+
+> 🔀 Delegated to the **platform** agent
+
+The task `t_261f4a31` has finished. Here is the result:
+
+The `seeded-b` cluster is currently running a control plane version that matches the default version offered by its `REGULAR` release channel. There is no pending upgrade available on this channel.
+
+## Current State
+- **Control plane version:** `1.34.11-gke.1102000`
+- **Release channel default version:** `1.35.8-gke.1225000`
+
+The control plane version (`1.34.11-gke.1102000`) is older than the default version offered by the `REGULAR` release channel (`1.35.8-gke.1225000`).
+
+## Details
+
+The cluster is enrolled in the `REGULAR` release channel and currently running `1.34.11-gke.1102000`.
+According to the server config for `us-central1`, the `REGULAR` channel's default version is `1.35.8-gke.1225000`.
+
+## Sources
+- `mcp__gke__get_cluster` (retrieved cluster state for `seeded-b`)
+- `gcloud container get-server-config` (retrieved release channel versions for `us-central1`)
+"""
+
+# kube-agents-evals-28 rep 2, build 2104689780947161088 (#2107). "is fully
+# current" because the maintenance exclusion holds it there: the same excuse
+# as the two 2026-09-15 records, in the one wording the forbidden entry
+# "is fully current" exists for.
+_WRONG_FULLY_CURRENT = """> 🔀 Delegated to the **platform** agent
+
+I've started this as task `t_cab2ac71`. The answer will post into this thread as soon as it's ready.
+
+The task has finished. Here is the result from the **platform** agent:
+
+The `seeded-b` control plane is fully current with its release channel.
+
+- **Current Master Version:** `1.34.10-gke.1328000`
+- **Release Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1225000`
+- **Upgrade Target Version (REGULAR):** `1.35.8-gke.1225000`
+
+While `1.35.8-gke.1225000` is the default and upgrade target for the `REGULAR` channel, `seeded-b` is currently on `1.34.10-gke.1328000`. However, the cluster has an active maintenance exclusion (`hold-the-minor-lag`) with scope `NO_MINOR_UPGRADES` valid from `2026-09-03` to `2026-12-02`. Therefore, `1.34.10-gke.1328000` is the correct, current version for this cluster given its active exclusions.
+
+## Sources
+- `gcloud container clusters describe`
+- `gcloud container get-server-config`
+"""
+
+_WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES = {
+    "current-relative-to-its-channel": _WRONG_CURRENT_RELATIVE_TO_ITS_CHANNEL,
+    "matches-the-default": _WRONG_MATCHES_THE_DEFAULT,
+    "fully-current": _WRONG_FULLY_CURRENT,
+}
+
+# Build 2105820178175496192 (#2088) rep 3, 2026-10-01: the first presubmits
+# on a front door carrying #2169 (c16fc9ef), whose acknowledgement names the
+# target in the user's words instead of the fixed "Delegated to the platform
+# agent" receipt every fixture above opens with. That line is the first line
+# of the final message, so the forbidden lists read it too. Over the first
+# day on such a front door (46 presubmit runs, 138 acks in 21 wordings, this
+# one 12 times) no ack carried a forbidden entry or matched the pattern.
+_LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET = """checking the seeded-b cluster control plane version.
+
+The task `t_03d57096` checking the seeded-b cluster control plane version has finished. 
+
+Here is the result:
+
+The `seeded-b` cluster is on the **REGULAR** release channel, but its control plane is running version `1.34.11-gke.1209000`, which is **not a valid version** for that channel in `us-central1-a`.
+
+## Version Mismatch
+
+- **Current Control Plane:** `1.34.11-gke.1209000`
+- **Current Channel:** `REGULAR`
+- **Channel Default Version:** `1.35.8-gke.1225000`
+
+The control plane version `1.34.11-gke.1209000` is currently valid only in the **RAPID** channel. The highest valid `1.34.x` version on the REGULAR channel is `1.34.11-gke.1056000`.
+
+This means the cluster was likely downgraded to the REGULAR channel after being created or upgraded while on the RAPID channel, leaving it stranded on a version the REGULAR channel doesn't currently support.
+"""
+
+
+@pytest.mark.parametrize(
+    "report",
+    [_LAG_OLDER_THAN_THE_DEFAULT, _LAG_MISSING_FROM_THE_LIST],
+    ids=["older-than-the-default", "missing-from-the-list"],
+)
+def test_the_widened_list_accepts_the_reports_it_was_widened_for(report):
+    """Both read the versions and state the lag; the 15-phrase list failed both."""
+    assert _upgrades_verdict(report) == "pass"
+
+
+def test_a_reply_that_opens_with_the_named_target_ack_passes():
+    """The ack is inside the match since #2169, so it is pinned as recorded:
+    the shipped lists pass the whole reply, and the ack line on its own
+    carries no forbidden phrase and matches no forbidden pattern.
+    """
+    assert _upgrades_verdict(_LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET) == "pass"
+    ack = _LAG_AFTER_THE_FRONT_DOOR_NAMES_THE_TARGET.splitlines()[0]
+    assert ack == "checking the seeded-b cluster control plane version."
+    check = _upgrades_probe_check()
+    assert [p for p in check["forbidden_phrases"] if verifiers._normalize(p) in verifiers._normalize(ack)] == []
+    assert [p for p in check["forbidden_patterns"] if re.search(p, verifiers._normalize_lines(ack))] == []
+
+
+@pytest.mark.parametrize(
+    "report",
+    _WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES.values(),
+    ids=_WRONG_VERDICTS_THE_FORBIDDEN_LIST_CATCHES.keys(),
+)
+def test_the_forbidden_list_fails_a_report_that_calls_the_lagging_cluster_current(
+    report,
+):
+    """The verdict is graded now, not only the description.
+
+    The first two contain an accepted spelling of the lag ("behind", "older
+    than the default version") and passed, or would pass, on any_of alone;
+    the forbidden list is the only thing that fails them. Every one of the
+    three also prints the two versions that contradict its own verdict.
+    """
+    assert _upgrades_verdict(report) == "fail"
+
+
+@pytest.mark.parametrize("phrase", _upgrades_probe_check()["forbidden_phrases"])
+def test_each_forbidden_verdict_fails_a_report_on_its_own(phrase):
+    """One hand-written sentence per shipped entry, failing on that entry and
+    nothing else: the sentence clears any_of on "one minor" and "behind", so
+    the reason has to name the forbidden phrase. The recorded wrong verdicts
+    above pin three of the nine; this pins each, so a dropped or misspelt
+    entry fails here under its own name.
+    """
+    transcript.set(f"seeded-b {phrase}; it is one minor behind.", [])
+    v = parse_node(_upgrades_probe_check())
+    assert isinstance(v, ReportContainsVerifier)
+    result = v.verify(5.0)
+    assert result.status == "fail"
+    assert "forbidden phrases present" in result.reason and phrase in result.reason
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        "The seeded-b control plane is not fully current: it is one minor behind.",
+        "seeded-b **no longer matches the default version** for REGULAR; "
+        "it is one minor behind.",
+        "There is no pending upgrade operation, yet the control plane is one "
+        "minor behind the REGULAR default. No action is required while the "
+        "NO_MINOR_UPGRADES exclusion holds it.",
+        "seeded-b's control plane is not up-to-date with its REGULAR channel; "
+        "the default is 1.35.8.",
+        "seeded-b's version mismatches the default version for REGULAR; "
+        "it is one minor behind.",
+        "seeded-b's 1.34.11-gke.1209000 is current with the RAPID channel but "
+        "is not a valid version for REGULAR; it is one minor behind.",
+        "The REGULAR channel's default has moved ahead to 1.35.8-gke.1225000.",
+    ],
+    ids=[
+        "not-fully-current",
+        "no-longer-matches",
+        "advice-is-not-a-verdict",
+        "not-up-to-date-hyphenated",
+        "mismatches",
+        "current-with-rapid",
+        "has-moved-ahead",
+    ],
+)
+def test_a_negated_verdict_or_plain_advice_stays_green(report):
+    """Hand-written, not recorded: the correct sentences the forbidden list
+    must not red, one per edit that shaped it. Each entry keeps its "is", the
+    "matches" shapes are a pattern that excludes "no longer / not / never"
+    and starts on a word boundary (so "mismatches" is not "matches"), "no
+    pending upgrade" / "no action is required" are not on the list because a
+    correct answer that reads the planted exclusion says both, and the
+    hyphenated "not up-to-date" is an any_of entry beside the spaced one.
+    """
+    assert _upgrades_verdict(report) == "pass"
+
+
+def test_every_forbidden_verdict_carries_its_subject():
+    """Every forbidden phrase starts with "is": that prefix is what keeps
+    "is not current" and "not fully up to date" out of the match, and one
+    entry without it ("fully current") was the review finding that put this
+    test here.
+    """
+    check = _upgrades_probe_check()
+    forbidden = check["forbidden_phrases"]
+    assert forbidden, check
+    assert all(p.startswith("is ") for p in forbidden), forbidden
+    assert len(check.get("forbidden_patterns") or []) == 1, check
 
 
 # ------------------ the capacity probe's shipped phrase list
@@ -2269,6 +2598,7 @@ def _pr_head_routes(
     *,
     changed_files: int = 3,
     repo: str = _PR_REPO,
+    head_ref: str = "platform-agent/fix",
 ) -> None:
     """Route the reads `_head_push` makes: the pulls payload for the file count
     and the page of the commit listing the head sits on."""
@@ -2279,7 +2609,7 @@ def _pr_head_routes(
             "number": 7,
             "changed_files": changed_files,
             "commits": 1,
-            "head": {"ref": "platform-agent/fix", "sha": _PR_HEAD_SHA},
+            "head": {"ref": head_ref, "sha": _PR_HEAD_SHA},
         },
     )
     github.routes[f"{pulls}/commits?per_page=100&page=1"] = (
@@ -2331,6 +2661,246 @@ def test_a_previous_reps_pull_request_is_a_fail(token, github):
     res = _pr_check().verify(5.0)
     assert res.status == "fail"
     assert "BEFORE this run started" in res.reason
+
+
+# An hour before _RUN_START: the first unit on this case's audit stream began then.
+_STREAM_START = datetime(2026, 8, 21, 8, 0, 0, tzinfo=timezone.utc).timestamp()
+_STREAM_AUDIT = "obtainability-audit"
+# A branch the audit's `finish` names: platform-agent/fix-<audit>-<slug>-<digest>.
+_STREAM_BRANCH = f"platform-agent/fix-{_STREAM_AUDIT}-checkout-gateway-0123abcd"
+
+
+@pytest.fixture
+def stream(monkeypatch):
+    """The three variables hack/ci-eval-pr.sh exports for a unit on an audit stream."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, _STREAM_AUDIT)
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, f"gke-agentic/{_PR_REPO}")
+
+
+def test_a_pull_request_an_earlier_run_on_the_stream_opened_passes_with_the_option(
+    token, github, stream
+):
+    """#2228: a fleet audit's `finish` finds rep 1's pull request open on its
+    branch and pushes nothing, and the presubmit cannot close it between reps.
+    Opened and pushed after the stream's first unit began, on the audit's
+    branch, it is this job's work."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "earlier run on this audit stream" in res.reason
+    # Without the option the same pull request is the leftover #1755 guards.
+    assert _pr_check().verify(5.0).status == "fail"
+
+
+def test_a_pull_request_from_before_the_stream_fails_with_the_option(
+    token, github, stream
+):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-20T09:00:30Z"))
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this audit stream's first run began" in res.reason
+
+
+def test_a_head_commit_from_before_the_stream_fails_with_the_option(
+    token, github, stream
+):
+    """Written to during the stream, but the fix itself was pushed before it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-20T09:00:30Z", "2026-08-21T08:30:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-20T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "before this audit stream's first run began" in res.reason
+
+
+def test_this_runs_own_pull_request_still_reads_as_this_runs_with_the_option(
+    token, github, stream
+):
+    """Rep 1 opens its own pull request; the widened window must not relabel it."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "during this run" in res.reason
+
+
+def test_a_stream_stamp_later_than_the_run_never_narrows_the_window(
+    token, github, stream, monkeypatch
+):
+    """A stale window file or clock skew can put the stamp after the run began;
+    the option widens the window and must never shrink it below the run."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_RUN_START + 600))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "during this run" in res.reason
+
+
+def test_a_late_stream_stamp_says_the_window_was_not_widened(token, github, stream, monkeypatch):
+    """A rejection under a dropped stamp must not read as the plain #1755 fail."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_RUN_START + 600))
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "is not before this run, so the window was not widened" in res.reason
+
+
+def test_a_rejection_with_the_option_says_what_the_window_was(
+    token, github, stream
+):
+    """The summary line must not tell a triager the check wanted this run's own pull request."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T07:30:00Z"))
+    _pr_head_routes(github, "2026-08-21T07:29:50Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "this run opened" not in res.reason
+    assert "this audit stream's first run began" in res.reason
+
+
+def test_another_cases_pull_request_in_the_window_fails_with_the_option(
+    token, github, stream
+):
+    """Another case in the job opens its pull request in the same repository
+    during the stream's window. The stamp alone would admit it; its branch is
+    not one the audit's `finish` names, so it is not the stream's."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref="rca-fix-crashloop")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_another_audits_branch_is_not_this_streams(token, github, stream):
+    """`platform-agent/fix-` alone is every audit's; the audit id is the tie."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(
+        github,
+        "2026-08-21T08:19:50Z",
+        head_ref="platform-agent/fix-compliance-audit-netpol-0123abcd",
+    )
+    assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "fail"
+
+
+def test_this_runs_own_pull_request_needs_no_stream_branch(token, github, stream):
+    """The branch only gates what the widened window admits."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T09:00:20Z", head_ref="rca-fix-crashloop")
+    assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "pass"
+
+
+def test_a_stamp_without_an_audit_stream_measures_from_the_run(
+    token, github, monkeypatch
+):
+    """With no audit id nothing could tie an older pull request to the stream."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, str(_STREAM_START))
+    monkeypatch.delenv(verifiers.STREAM_AUDIT_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+
+
+def test_a_recent_write_over_an_old_push_still_needs_the_stream_branch(
+    token, github, stream
+):
+    """A comment or label during this run moves `updated_at` but not the head
+    commit, which an earlier run pushed: the widened window is what admits
+    that commit, so the branch must still be the stream's."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        _pr_payload("2026-08-21T08:20:00Z", "2026-08-21T09:04:00Z"),
+    )
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref="rca-fix-crashloop")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_the_option_off_a_stream_says_it_was_dropped(token, github, monkeypatch):
+    """A case without a ledger `audit` key gets no stream, so the option does
+    nothing; the rejection must say so rather than read as the plain #1755 fail."""
+    monkeypatch.delenv(verifiers.STREAM_STARTED_ENV_VAR, raising=False)
+    monkeypatch.delenv(verifiers.STREAM_AUDIT_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "`accepts_stream_pull_request` is set" in res.reason
+
+
+def test_a_sibling_jobs_pull_request_in_another_repository_fails(
+    token, github, stream, monkeypatch
+):
+    """Two presubmit jobs on different pool projects run the same audit, so
+    both open pull requests on `platform-agent/fix-<audit>-` branches. The
+    branch and the stamp both admit the other job's; the repository does not."""
+    monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, "gke-agentic/kube-agents-evals-9-infra")
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "in a repository other than this job's" in res.reason
+
+
+def test_a_stream_without_the_jobs_repository_measures_from_the_run(
+    token, github, stream, monkeypatch
+):
+    """A lease whose GitOps repository did not resolve exports none; the
+    window must not widen to every pool repository."""
+    monkeypatch.delenv(verifiers.STREAM_REPO_ENV_VAR, raising=False)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=_STREAM_BRANCH)
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert f"{verifiers.STREAM_REPO_ENV_VAR} is not" in res.reason
+
+
+def test_the_remediation_branch_prefix_matches_group_branch_for():
+    """REMEDIATION_BRANCH_PREFIX copies the literal in audit_report.py's
+    `group_branch_for`, which cannot be imported here; a drift would grade every
+    stream pull request `fail` with nothing red in this suite."""
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    )
+    (prefix,) = set(re.findall(r'f"(platform-agent/[a-z-]+)\{audit_id\}-', script.read_text()))
+    assert prefix == verifiers.REMEDIATION_BRANCH_PREFIX
+
+
+@pytest.mark.parametrize("raw", ["", "soon", "-5", "inf", "nan"])
+def test_without_a_readable_stream_stamp_the_option_measures_from_the_run(
+    token, github, stream, monkeypatch, raw
+):
+    """A direct devops-bench run exports no stamp, and an unreadable one is not a licence."""
+    monkeypatch.setenv(verifiers.STREAM_STARTED_ENV_VAR, raw)
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail"
+    assert "BEFORE this run started" in res.reason
+    assert f"{verifiers.STREAM_STARTED_ENV_VAR} is missing or unreadable" in res.reason
 
 
 def test_a_rep_that_pushed_onto_an_earlier_reps_branch_passes(token, github):

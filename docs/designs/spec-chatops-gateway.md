@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; nor yet the pieces "Sessions by default" names as transition work: the `/session` opt-in, the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, and the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
 
 ## Purpose
 
@@ -283,10 +283,21 @@ delegated, which is also what keeps the per-conversation pod cost small.
 
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
-setting today (`A2A_DEFAULT_ADDRESSEE`), and the Delegate flow covers one task; a
-per-conversation opt-in - a `/session` command, deterministic, resolved with the other
-slash commands and naming a route rather than a handle - is not implemented and lands
-with the transition. The default flips when the delegation primitive lands: the session's request to
+setting today (`A2A_DEFAULT_ADDRESSEE`), and the Delegate flow covers one task; the
+per-conversation opt-in is `/session`: deterministic, resolved before status, stop and steer,
+naming a route rather than a handle. A bare `/session` marks the conversation session-routed
+and the next message opens the pod; `/session <text>` marks it and runs the text as the first
+turn; `/session off` releases the incarnation (refused while a session task runs; stop it
+first) and re-homes to the default addressee. The conversation's `contextId` is unchanged by
+either. Without a spawner the on-forms answer with a note and change nothing, and the way back
+still works; on an install whose default is already the session route the bare forms answer
+with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <text>` while a task is still running turns the route on and holds the text, unless the running task is the session's own, in which case the text steers it as a plain message would. On Slack a leading slash belongs to the Slack client, which
+refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
+stripped before the gateway reads the text, and in a channel thread the next message needs the
+mention too: the adapter forwards an unmentioned reply only once a task has started there, and
+the ack says so. The way back is answered even on an install whose spawner has since been disarmed, so a
+record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
+not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
 mint, the relay of the child's events into the conversation, and the wake-up turn on the
 child's terminal. The session's bus grants do not change for it (its only subscribe grant is
@@ -1100,7 +1111,7 @@ and an unescaped `<!channel>` in a result would ping the room.
 
 Not in stage 2: the classifier, the LCD permissions tool, `grants`, anything that makes
 `authority` decision-grade, and the transition work "Sessions by default" names (the
-`/session` opt-in, the gateway-minted child task, the `chat` profile's skills, the warm
+gateway-minted child task, the `chat` profile's skills, the warm
 pool). (The gchat and slack adapters were on this list until 9/5 and 9/4 respectively;
 each now has its own section above.)
 

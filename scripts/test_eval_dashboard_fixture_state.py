@@ -198,15 +198,18 @@ def _cluster_b():
     return {
         "currentMasterVersion": "1.33.4-gke.1134000",
         "releaseChannel": {"channel": "REGULAR"},
+        # The no-surge pool as `clusters describe` reports it; the
+        # readiness-surge-blocked role asserts on maxUnavailable here.
+        "nodePools": [{"name": "default-pool", "upgradeSettings": {"maxSurge": 1}}, {"name": "no-surge-pool", "upgradeSettings": {"maxUnavailable": 1}}],
         "maintenancePolicy": {"window": {"maintenanceExclusions": {"hold-the-minor-lag": {"startTime": "2026-09-01T00:00:00Z", "endTime": _future(), "maintenanceExclusionOptions": {"scope": "NO_MINOR_UPGRADES"}}}}},
     }
 
 
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project."""
-    trio = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"]]
+    fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
     return {
-        "clusters": {project: trio for project in projects},
+        "clusters": {project: fleet for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
@@ -227,6 +230,34 @@ def healthy_world(*projects):
             "service/legacy-endpoints-lane": {"spec": {"clusterIP": "None"}},
             "endpoints/legacy-endpoints-lane": {"subsets": [{"addresses": [{"ip": "192.0.2.10"}], "ports": [{"port": 9}]}]},
             "job?app=legacy-endpoints-writer": {"items": [{"status": {"succeeded": 1, "conditions": [{"type": "Complete", "status": "True"}]}}]},
+            # seeded-b's upgrade-readiness fixtures: the pool that cannot
+            # surge, the workload pinned to it, the budget that refuses its
+            # eviction, and the fail-closed webhook. The
+            # first two gate on being up and Running respectively, because
+            # the finding is what a drain WOULD do, which is only meaningful
+            # while they are healthy.
+            "namespace/seeded-upgrade": {"metadata": {"name": "seeded-upgrade"}},
+            "poddisruptionbudget/pinned-batch-runner": {"spec": {"maxUnavailable": 0}, "status": {"disruptionsAllowed": 0, "currentHealthy": 1}},
+            "node?cloud.google.com/gke-nodepool=no-surge-pool": {"items": [{"spec": {}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "deployment/pinned-batch-runner": {
+                "spec": {"template": {"spec": {"nodeSelector": {"seeded-role": "no-surge"}}}},
+                "status": {"readyReplicas": 1, "replicas": 1},
+            },
+            "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
+            "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]},
+            # seeded-d's zonal-skew trio. Each is in the state its role's
+            # `state` block asserts: a scheduled pod for the scheduling case,
+            # a Bound claim for the volume case, and a Pending pod for the
+            # capacity case -- the three signals that say the skew's cause is
+            # actually present rather than merely that the objects exist.
+            "namespace/seeded-topology": {"metadata": {"name": "seeded-topology"}},
+            "deployment/zone-pinned-api": {"spec": {"template": {"spec": {"topologySpreadConstraints": [{"whenUnsatisfiable": "ScheduleAnyway"}], "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "topology.kubernetes.io/zone", "operator": "In", "values": ["z-a"]}]}]}}}}}}, "status": {"readyReplicas": 2, "replicas": 2}},
+            "pod?app=zone-pinned-api": _pods(_pod(restarts=0, last_reason=None)),
+            "statefulset/zone-bound-store": {"spec": {"volumeClaimTemplates": [{"spec": {"storageClassName": "seeded-zonal-pd"}}]}, "status": {"readyReplicas": 1}},
+            "persistentvolumeclaim?app=zone-bound-store": {"items": [{"status": {"phase": "Bound"}}]},
+            "deployment/capacity-starved-worker": {"status": {"readyReplicas": 1, "replicas": 4}},
+            "deployment/first-zone-sponge": {"spec": {"replicas": 6}},
+            "pod?app=capacity-starved-worker": _pods(_pod(restarts=0, last_reason=None), _pod(restarts=0, last_reason=None, phase="Pending")),
         },
         "describe": {project: {"seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"}} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
@@ -306,10 +337,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 9, "drifted": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 16, "drifted": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 9, "drifted": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "healthy": 16, "drifted": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -363,7 +394,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 17, "drifted": 1, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "healthy": 31, "drifted": 1, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

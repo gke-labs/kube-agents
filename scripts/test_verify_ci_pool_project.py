@@ -762,14 +762,14 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertIn("not checked", result.message)
 
     def test_unresolved_with_no_warning_at_all_still_fails(self):
-        # The hole the excuse opened, and the reason it now wants positive
+        # The hole the excuse opened, and the reason it wants positive
         # evidence rather than the absence of a contrary warning. A seeded
         # cluster that keeps its name and loses its labels never enters the
-        # listing: no per-cluster warning names it (:215 fires only for a
-        # LABELLED cluster), `labelled` stays non-zero so :406 is silent, the
-        # other slots resolve so :411 is silent, and its roles increment
-        # `unresolved` with nothing printed. check_gke_and_state matches by
-        # name and passes it, so this check is the only one that can fail it.
+        # listing, so no per-cluster warning names it. The script now names
+        # the empty slot (the missing-slot test above); this pins that a
+        # count with no warning at all still fails. check_gke_and_state
+        # matches by name and passes it, so this check is the only one that
+        # can fail it.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok("v1.30.0"),
@@ -777,6 +777,33 @@ class SeededFleetFixturesTest(unittest.TestCase):
             ]
             result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
         self.assertFalse(result.passed, result.message)
+
+    def test_one_unreachable_cluster_does_not_excuse_a_missing_slot(self):
+        # A project applied before the catalog declared slot d, on a run where
+        # seeded-c's credentials were refused. The unreachable-cluster note is
+        # real, but it is about seeded-c; slot d's three roles are unresolved
+        # because no cluster exists for them, which the script now says. Read
+        # together, the verdict must be the one the same project gets with
+        # seeded-c reachable, not "not checked".
+        catalog = json.loads(checker._FLEET_CATALOG.read_text(encoding="utf-8"))["roles"]
+        on = lambda slot: sum(1 for r in catalog.values() if r["cluster_slot"] == slot)
+        missing = on("c") + on("d")
+        stderr = "\n".join([
+            "WARNING: no credentials for seeded cluster seeded-c in kube-agents-evals-5: "
+            "ERROR: (gcloud.container.clusters.get-credentials) deadline exceeded",
+            "WARNING: project kube-agents-evals-5 has no labelled seeded cluster for slot 'd' "
+            "(a name ending in '-d'), so every check naming a role on it will report status=error.",
+            self._summary(self._roles() - missing, unresolved=missing),
+        ])
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", stderr),
+                (0, "", self._state(self._roles() - missing)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertFalse(result.passed, result.message)
+        self.assertEqual("Seeded fleet incomplete", result.message)
 
     def test_a_skipped_cluster_is_a_visibility_limit_too(self):
         # hack/fleet-kubeconfigs.sh:386. Not a refusal, but the slot ends up
@@ -998,7 +1025,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         text = checker._FLEET_KUBECONFIGS.read_text(encoding="utf-8")
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
-        self.assertEqual(4, len(wrong))
+        self.assertEqual(5, len(wrong))
         self.assertEqual(3, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
@@ -1040,7 +1067,7 @@ class ArtifactRegistryTest(unittest.TestCase):
 
     # `gcloud container clusters list --format=value(...)` is tab-separated, and
     # "default" is what the API reports for a pool that was never given an
-    # account. The seeded trio is in the listing on a real project and must not
+    # account. The seeded fleet is in the listing on a real project and must not
     # influence the result.
     _NODES = "platform-agent-host\tdefault"
     _NODES_WITH_FLEET = (
@@ -1383,7 +1410,7 @@ class ArtifactRegistryTest(unittest.TestCase):
         self.assertTrue(result.passed, result.details)
 
     def test_seeded_fleet_node_accounts_are_not_asserted(self):
-        # The trio runs its own account and pulls no kube-agents image. Holding
+        # The fleet runs its own account and pulls no kube-agents image. Holding
         # it to the host cluster's requirement would fail every real project.
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [

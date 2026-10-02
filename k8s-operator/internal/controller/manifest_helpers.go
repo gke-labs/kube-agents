@@ -288,11 +288,8 @@ func fluentBitImage() string {
 }
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
-//
-// qualify_image_ref() in scripts/installer/common.sh is the provisioning-time
-// twin of this rule and must agree on how a reference is split. The no-tag
-// fallback deliberately differs: this path is serving a live CR and settles for
-// "latest", while the shell helper can still abort the run and does.
+// A reference with no tag or digest settles for "latest": this path is serving
+// a live CR and cannot abort the run.
 func resolveAgentImage(deployment *agentv1alpha1.DeploymentSpec, defaultImage string) string {
 	image := defaultImage
 	if deployment != nil && deployment.Image != "" {

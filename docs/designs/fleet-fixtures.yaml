@@ -14,9 +14,9 @@
 # slot and no entry in a catalogue keyed by one).
 #
 # A case names a fixture by role and never by a cluster name or a project id.
-# Each eval project carries its own trio of clusters (`bench/tf/fleet/`,
+# Each eval project carries its own set of clusters (`bench/tf/fleet/`,
 # `var.cluster_prefix` defaults to "seeded", so the live names are
-# seeded-a/b/c), and a case written against one project has to run unchanged
+# seeded-a to seeded-d), and a case written against one project has to run unchanged
 # against the next. The slot letter is the addressable thing; the name is a
 # rendering of it.
 #
@@ -32,7 +32,7 @@
 # runs per project, so a fleet-wide assertion holds only from the most recently
 # applied project's date.
 
-# The three cluster slots. `slot` is what a case addresses; `suffix` is what
+# The cluster slots. `slot` is what a case addresses; `suffix` is what
 # the Terraform appends to var.cluster_prefix to render the live name.
 slots:
   - slot: a
@@ -40,10 +40,13 @@ slots:
     carries: The seeded namespaces and the two defect node pools
   - slot: b
     suffix: b
-    carries: The held-back control plane, and no workloads
+    carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
     carries: The configuration outlier, and no workloads
+  - slot: d
+    suffix: d
+    carries: Nodes in two zones, and the zonal-skew workloads
 
 fixtures:
   - role: rbac-overgrant
@@ -169,7 +172,83 @@ fixtures:
     objects:
       - cluster/self
     defect: >-
-      Master authorized networks absent, where slots a and b carry an
+      Master authorized networks absent, where slots a, b and d carry an
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
-      under 24 hours old from every cohort, and its cohort floor of three
-      clusters means a replaced cluster silences the audit fleet-wide for a day.
+      under 24 hours old from every cohort, and its cohort floor is three
+      clusters: replacing c silences the finding for a day, and so does
+      replacing any cluster on a project whose fleet predates slot d.
+
+  - role: readiness-surge-blocked
+    slot: b
+    available_from_day: 0
+    objects:
+      - nodepool/no-surge-pool
+    defect: >-
+      A node pool with maxSurge 0 and maxUnavailable 1, so an upgrade recreates
+      its only node in place. Tainted seeded-role=no-surge so only the pinned
+      workload lands there. Not a Blocker on its own: the gke-upgrades skill
+      prescribes the setting for reservation-bound pools.
+
+  - role: readiness-pinned-workload
+    slot: b
+    available_from_day: 0
+    objects:
+      - deployment/pinned-batch-runner
+    namespace: seeded-upgrade
+    defect: >-
+      One replica whose nodeSelector names no-surge-pool alone, so it is down
+      for the whole of each in-place node recreate.
+
+  - role: readiness-drain-blocked
+    slot: b
+    available_from_day: 0
+    objects:
+      - poddisruptionbudget/pinned-batch-runner
+    namespace: seeded-upgrade
+    defect: >-
+      A PodDisruptionBudget with maxUnavailable 0 over the pinned workload, so
+      disruptionsAllowed is 0 permanently and no drain that touches it can
+      finish.
+
+  - role: readiness-failclosed-webhook
+    slot: b
+    available_from_day: 0
+    objects:
+      - validatingwebhookconfiguration/seeded-fail-closed-gate
+    defect: >-
+      failurePolicy Fail with the maximum 30-second timeout, pointing at a
+      Service that does not exist. The missing backend is the defect; Fail
+      alone is set by healthy webhooks. Selectors confine it so it rejects no
+      other scenario's writes.
+
+  - role: zonal-skew-scheduling
+    slot: d
+    available_from_day: 0
+    objects:
+      - deployment/zone-pinned-api
+    namespace: seeded-topology
+    defect: >-
+      Two replicas with a ScheduleAnyway zonal spread beside a required
+      nodeAffinity only one zone satisfies, so both land in one zone. The fix
+      is a manifest edit.
+
+  - role: zonal-skew-volume
+    slot: d
+    available_from_day: 0
+    objects:
+      - statefulset/zone-bound-store
+    namespace: seeded-topology
+    defect: >-
+      One replica on a zonal standard-rwo claim, so the pod cannot change zone
+      without leaving its data. The fix is a migration, not an edit.
+
+  - role: zonal-skew-capacity
+    slot: d
+    available_from_day: 0
+    objects:
+      - deployment/capacity-starved-worker
+    namespace: seeded-topology
+    defect: >-
+      Four replicas at 120m CPU against two e2-small nodes, so those that do
+      not fit stay Pending on insufficient CPU. Its distribution looks like
+      the scheduling case; only the Pending pods' events say otherwise.

@@ -394,7 +394,18 @@ that starts before NATS resolves crash-loops the agent's pod), with that image, 
 the `bridge` user's password from the operator's creds Secret as the bridge doc lists its env,
 and `BRIDGE_CONCURRENCY` set to `EVAL_TASK_PARALLELISM`, sized against the bridge's fixed queue
 as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
-as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The
+as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
+sizes the `TASKS` consumer reserve from that `BRIDGE_CONCURRENCY` too, and provisioning
+never edits a stream that exists, so a bus provisioned before the sidecar is declared would
+hold a `TASKS` narrower than the CR then asks for, and the second provision Job would refuse
+it. The deploy therefore sizes the first provision for the sidecar (decided 2026-09-30 on
+gke-labs/kube-agents#2077): its mode patch also sets `spec.harness.tuning.maxSessions` to the
+largest value whose budget at the lane's worker count fits the 64-consumer floor the first
+run creates (6 at 4 workers, 2 at 6; at 8 or more the floor cannot hold the reserve and the
+value clamps to 1), computed from four constants the script copies from the operator and
+pins against it, and after the sidecar patch it waits for the re-run provision Job and reads
+the CR's phase, so a refusal reds the lane rather than parking the CR `Degraded` over a
+working bus. The
 sidecar also carries the agent container's own environment, mounts, security context and
 resources, derived from the rendered Deployment at deploy time rather than copied into the
 script: the bridge's subprocess stands in for the `hermes chat -q` a kanban worker spawns inside
@@ -416,7 +427,10 @@ the API server, which runs the default profile, the Planning Agent: its model-fa
 kanban set, it delegates fleet work to the platform persona over a card, and it relays the
 worker's report. Same prompt, two agents reading it: `obtainability-remediation-proposal` is 12
 of 12 on the first, where the Planning Agent inlines a manifest, and was 0 of 3 on the second,
-where the persona follows its own rule and opens a pull request. The lane's record is therefore
+where the persona followed its own rule and opened a pull request (the rule has since been
+scoped, in `agents/platform/SOUL.md` §3: a request to investigate or report is answered in the
+reply, and a pull request is opened only when the request asks for one or for a change to be
+submitted or fixed; the unattended case is `fleet-audit`'s own path). The lane's record is therefore
 the platform persona's, and parity in [#2007](https://github.com/gke-labs/kube-agents/issues/2007)
 (phase 2) is that persona's record being acceptable per case and stable across the on-demand
 runs, not the api lane's numbers; the first run's 94.4% against 77.8% is withdrawn as a
@@ -561,7 +575,8 @@ it, and the wait goes.
 
 `EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
 today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, merge-patches the CR, and waits for the generation to move before
+Deployment's generation, merge-patches the CR (the mode, and the `maxSessions` sized for the
+sidecar to come), and waits for the generation to move before
 asking any workload for status, because the flip is a rollout and a status read before it lands
 describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
@@ -571,7 +586,11 @@ the door and the executor. The deploy arms the gateway's inject door on the oper
 same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
 image overrides) and waits for the door's Service and token Secret; it then declares the bridge
 sidecar on the CR through `spec.deployment.sidecars` (the executor paragraph in stage 1 says
-what the sidecar carries), waits for the agent Deployment to roll once more, and ends on the
+what the sidecar carries), waits for the agent Deployment to roll once more and for the
+provisioning Job's re-run (the sidecar's `BRIDGE_CONCURRENCY` is an input to the `TASKS`
+budget, so the patch re-renders the Job; the mode patch carried the `maxSessions` that makes
+that run fit, and a refusal now fails the deploy on the CR's `Degraded` phase rather than
+being read past), and ends on the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
 bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now

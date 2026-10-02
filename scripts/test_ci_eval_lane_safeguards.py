@@ -175,11 +175,14 @@ class InjectLaneTest(unittest.TestCase):
         self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
         # The presubmit cases that request a pull request, by their own
-        # checks or the file's `requesting:` list (the persona answers the
-        # case with one before its own check says so): the second phase
-        # holds them and the log says so. The matrix has one of each today.
+        # checks or the file's `requesting:` list: the second phase holds
+        # them and the log says so. obtainability-remediation-proposal left
+        # the list when the persona's rule put its manifest in the reply
+        # (#2037), so it is graded at zero writes with the rest of the first
+        # phase; pdb-remediation-pr asks for its pull request by its own check.
         requesting = requesting_among(presubmit_tasks())
-        self.assertIn("obtainability-remediation-proposal", requesting.split(","))
+        self.assertNotIn("obtainability-remediation-proposal", requesting.split(","))
+        self.assertIn("pdb-remediation-pr", requesting.split(","))
         self.assertEqual(value(result, "REQUESTING"), requesting)
         self.assertIn(f"run after every other unit: {requesting}\n", result.stdout)
 
