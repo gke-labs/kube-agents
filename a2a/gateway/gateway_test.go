@@ -1965,36 +1965,21 @@ func TestSessionOffWorksWithoutASpawner(t *testing.T) {
 	waitFor(t, "not enabled", postedContaining(r, "not enabled"))
 }
 
-// TestHasSessionCountsASessionRoutedRecord: the Slack adapter admits an
-// unmentioned thread reply only where hasSession says so; a thread bound by
-// /session is a session thread while it is active, task or no task.
-func TestHasSessionCountsASessionRoutedRecord(t *testing.T) {
+// TestHasSessionDoesNotCountATaskLessRoutedRecord: the Slack adapter's rule
+// stands - a session thread is one the gateway has started a task in. A
+// /session binding alone does not make one, because the adapter caches the
+// registry's answer and nothing but a started task overwrites it; promising
+// otherwise is a promise the adapter cannot keep.
+func TestHasSessionDoesNotCountATaskLessRoutedRecord(t *testing.T) {
 	r, _ := startRigWithSpawner(t)
 	ctx := context.Background()
-	fresh := &SessionRecord{Key: "slack:channel/C1/1.1", ContextID: "ctx-f", Kind: "group", SessionRouted: true, Profile: "chat",
+	bound := &SessionRecord{Key: "slack:channel/C1/1.1", ContextID: "ctx-f", Kind: "group", SessionRouted: true, Profile: "chat",
 		LastActivity: time.Now().UTC()}
-	if err := r.g.reg.Put(ctx, fresh); err != nil {
+	if err := r.g.reg.Put(ctx, bound); err != nil {
 		t.Fatal(err)
 	}
-	held, until, err := r.g.hasSession(ctx, fresh.Key)
-	if err != nil || !held || until.IsZero() {
-		t.Fatalf("fresh session-routed record: held=%v until=%v err=%v", held, until, err)
-	}
-	stale := &SessionRecord{Key: "slack:channel/C1/2.2", ContextID: "ctx-s", Kind: "group", SessionRouted: true, Profile: "chat",
-		LastActivity: time.Now().UTC().Add(-2 * r.g.cfg.IdleTTL)}
-	if err := r.g.reg.Put(ctx, stale); err != nil {
-		t.Fatal(err)
-	}
-	if held, _, _ := r.g.hasSession(ctx, stale.Key); held {
-		t.Fatal("a session-routed record idle past the TTL still counts as a session thread")
-	}
-	plain := &SessionRecord{Key: "slack:channel/C1/3.3", ContextID: "ctx-p", Kind: "group", Addressee: "platform",
-		LastActivity: time.Now().UTC()}
-	if err := r.g.reg.Put(ctx, plain); err != nil {
-		t.Fatal(err)
-	}
-	if held, _, _ := r.g.hasSession(ctx, plain.Key); held {
-		t.Fatal("a plain record with no task counts as a session thread")
+	if held, _, _ := r.g.hasSession(ctx, bound.Key); held {
+		t.Fatal("a task-less session-routed record counted as a session thread")
 	}
 }
 
@@ -2085,22 +2070,6 @@ func TestPostFlipSessionStopIsAStop(t *testing.T) {
 	}
 }
 
-// TestHasSessionIgnoresTheMintedRouteOnASessionDefaultInstall: post-flip
-// every record is minted session-routed, so the route alone must not adopt
-// a thread; only a started task does, as the Slack rule says.
-func TestHasSessionIgnoresTheMintedRouteOnASessionDefaultInstall(t *testing.T) {
-	r, _ := startRigWithSpawnerRoute(t, RouteSession)
-	ctx := context.Background()
-	minted := &SessionRecord{Key: "slack:channel/C9/1.1", ContextID: "ctx-m", Kind: "group", SessionRouted: true, Profile: "chat",
-		LastActivity: time.Now().UTC()}
-	if err := r.g.reg.Put(ctx, minted); err != nil {
-		t.Fatal(err)
-	}
-	if held, _, _ := r.g.hasSession(ctx, minted.Key); held {
-		t.Fatal("a task-less minted record adopted the thread on a session-default install")
-	}
-}
-
 // TestSessionWithTextOnARunningSessionSteers: already on the route with its
 // own task running, "/session <text>" is what a plain message would be - a
 // steer into that task - not an ack that drops the text.
@@ -2128,5 +2097,26 @@ func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
 	})
 	if got := len(spawn.calls()); got != 1 {
 		t.Fatalf("a steer spawned: %d", got)
+	}
+}
+
+// TestSessionOnAckTellsSlackChannelsToMention: the Slack adapter forwards an
+// unmentioned thread reply only once a task has started there, so the ack
+// after a bare /session in a Slack channel must not promise that the next
+// message opens the pod - it asks for the mention. DMs and every other
+// backend keep the plain promise.
+func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
+	slackChannel := sessionOnAck("slack", "group", "platform")
+	if !strings.Contains(slackChannel, "mention") || strings.Contains(slackChannel, "your next message opens") {
+		t.Fatalf("slack channel ack = %q", slackChannel)
+	}
+	for _, c := range [][2]string{{"slack", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
+		ack := sessionOnAck(c[0], c[1], "platform")
+		if !strings.Contains(ack, "your next message opens a session pod") || strings.Contains(ack, "mention") {
+			t.Fatalf("%s/%s ack = %q", c[0], c[1], ack)
+		}
+	}
+	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
+		t.Fatal("the ack does not name the default addressee")
 	}
 }

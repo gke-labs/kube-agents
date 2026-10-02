@@ -21,6 +21,10 @@ import (
 // conversation front door of spec-subagent-profiles.md (a2a/profiles/chat.yaml).
 const sessionProfile = "chat"
 
+// sessionKindDM is the SessionRecord.Kind of a direct message, the one Slack
+// surface that carries every message without a mention.
+const sessionKindDM = "dm"
+
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
 // one leaves the route, and the user needs to hear which did not happen.
@@ -649,7 +653,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	stopping := msg.Intent == IntentCancel || isStop(msg.Text)
 	switch {
 	case msg.Intent == "" && sessionCmd:
-		if !g.sessionCommand(ctx, rec, msg, sessionRest, principal, authority) {
+		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
 		}
 	case msg.Intent == "" && active != nil && isStatusQuery(msg.Text, wideStatus):
@@ -1053,7 +1057,7 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 // and the idle clock moves as it does for "nothing is running"); false only
 // when the turn was refused part-way (the cap, or a previous task that could
 // not be closed) and the in-memory route change must not persist.
-func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, rest, principal string, authority []byte) bool {
+func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, rest, principal string, authority []byte) bool {
 	off := isSessionOff(rest)
 	// The way back is answered even with no spawner: a record left
 	// session-routed after A2A_SPAWN_SESSIONS was disarmed (the W4-rollback
@@ -1122,7 +1126,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		g.post(rec.Key, "🧵 session route on — the running task finishes first; the message after it opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
 		return true
 	case rest == "":
-		g.post(rec.Key, "🧵 session route on — your next message opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
+		g.post(rec.Key, sessionOnAck(backend, rec.Kind, g.cfg.DefaultAddressee))
 		return true
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
@@ -1140,6 +1144,19 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	g.startTask(ctx, rec, msg, principal, authority)
 	return true
+}
+
+// sessionOnAck is the reply to a bare /session. It promises what the backend
+// will deliver: the Slack adapter forwards an unmentioned channel-thread
+// reply only once the gateway has started a task in that thread, and a
+// /session binding starts none, so in a Slack channel the next message needs
+// the mention. DMs carry every message; the other backends route the next
+// message on their own rules.
+func sessionOnAck(backend, kind, defaultAddressee string) string {
+	if backend == slackBackend && kind != sessionKindDM {
+		return "🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); `/session off` returns to `" + defaultAddressee + "`"
+	}
+	return "🧵 session route on — your next message opens a session pod; `/session off` returns to `" + defaultAddressee + "`"
 }
 
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
@@ -1189,20 +1206,6 @@ func (g *Gateway) hasSession(ctx context.Context, conversation string) (bool, ti
 	now := time.Now()
 	if rec.ActiveTask != nil && !rec.ActiveTask.Detached {
 		return true, now.Add(g.cfg.IdleTTL), nil
-	}
-	if rec.SessionRouted && g.cfg.DefaultAddressee != RouteSession {
-		// A thread a user bound with /session is a session thread while it
-		// is active, task or no task: the Slack adapter admits an unmentioned
-		// reply only where this says so, and the ack after a bare /session
-		// promises the next message opens the pod. LastActivity is the right
-		// clock here because the binding is the record's own; it clears on
-		// /session off. Opt-in installs only: post-flip, mintSession marks
-		// every record session-routed, and a route the install hands out
-		// must not adopt a thread a bare stop or a cap-refused ask touched -
-		// there, only a started task does (the branch below).
-		if until := rec.LastActivity.Add(g.cfg.IdleTTL); now.Before(until) {
-			return true, until, nil
-		}
 	}
 	if len(rec.Tasks) > 0 {
 		// The last TASK's activity, not the record's: LastActivity moves on
