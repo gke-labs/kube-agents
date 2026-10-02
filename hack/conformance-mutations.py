@@ -872,7 +872,8 @@ Mutation(
     Mutation(
         "D1-principal-not-logged",
         "agents/platform/scripts/credential_proxy.py",
-        ("            _sanitize_for_logging(principal.describe(), max_length=512),", "            \"-\","),
+        ("        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)",
+         "        principal_label = \"-\""),
         "test_D1_the_exec_route_records_a_principal",
         "drop the principal from the exec record while refactoring a handler "
         "that does not yet read it",

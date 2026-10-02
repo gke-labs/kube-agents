@@ -106,8 +106,11 @@ fi
 # main commit with no images at all. The candidate is normally chosen because
 # its images exist, so this firing means something moved underneath it.
 #
-# All of REQUIRED_RELEASE_IMAGES, deliberately, though an eval install on this
-# path renders only the operator, the agent, the proxy and the sandbox: both
+# All of REQUIRED_RELEASE_IMAGES as the candidate's own common.sh lists it
+# (required_release_images_at, which check_commit_images_exist reads; the
+# diagnostic below walks the same list, since this tree may be a newer main
+# whose list has grown past the candidate's), deliberately, though an eval
+# install on this path renders only the operator, the agent, the proxy and the sandbox: both
 # plugins default to enabled=false, and the A2A next-stack images and the
 # bridge belong to a mode: next install, which this path refuses
 # (hack/ci-deploy.sh, RC_COMMIT_SHA with EVAL_MODE_NEXT). The gate
@@ -120,13 +123,14 @@ fi
 registry_prefix="$(get_registry_prefix)"
 if ! check_commit_images_exist "${RC_COMMIT_SHA}"; then
   echo "❌ ERROR: ${registry_prefix} is missing at least one of the required images at ${RC_COMMIT_SHA:0:7}:" >&2
-  for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+  # 2>/dev/null: the gate just printed which list this is.
+  while IFS= read -r img; do
     if registry_image_exists "${registry_prefix}/${img}:${RC_COMMIT_SHA}"; then
       echo "   ✓ ${img}" >&2
     else
       echo "   ✗ ${img}" >&2
     fi
-  done
+  done < <(required_release_images_at "${RC_COMMIT_SHA}" 2>/dev/null)
   exit 1
 fi
 

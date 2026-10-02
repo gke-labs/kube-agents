@@ -41,7 +41,7 @@ Findings are reported in **resource units — GiB, vCPU, node and object counts 
 
 Fleet consistency drift, weekly. For each configuration facet — release channel, Shielded Nodes, logging and monitoring config, network policy, node auto-provisioning, Binary Authorization, label keys — it computes what the majority of _comparable_ clusters do and reports the outliers, and it reports a cluster whose missing environment label keeps it out of every comparison.
 
-The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where the retired `blueprint_sync_sop.md` and `standardization_validator_sop.md` are not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
+The baseline is derived from the live fleet and nowhere else. That is what makes this one runnable where the retired blueprint-sync and standardization-validator SOPs were not: it needs no master blueprint, no CMDB, and no standards document. Invoked by the `fleet-consistency-drift` watchdog.
 
 ### `stockout_prevention_sop.md`
 
@@ -67,13 +67,15 @@ GCE Compute Engine and MIG Fleet Audit, daily. Checks GCE startup script status,
 
 Invoked by the `gce-compute-fleet-audit` watchdog.
 
-## The unscheduled SOPs
+## The retired SOPs
 
-`blueprint_sync_sop.md`, `policy_propagation_sop.md`, `global_capacity_orchestrator_sop.md`, `standardization_validator_sop.md`, and `lifecycle_deprecation_manager_sop.md` are retained on disk, but no cron job invokes them — their watchdogs were disabled and then [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). As written, each depends on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicates an audit above. Rewrite the SOP before scheduling a job against it, or the run will find nothing.
+The SOPs behind the five watchdogs [retired from the roster](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs) — blueprint sync, policy propagation, global capacity orchestration, standardization validation, and lifecycle deprecation — are no longer in the tree or the image; git history has them. As written, each depended on an input a stock install does not provide — a master blueprint, a `/opt/defaults/templates/` directory, a corporate patterns document — or duplicated an audit above, so reviving one means writing a new SOP against what an install actually has, not restoring the old file.
+
+## SOPs that are not fleet audits
 
 `inventory.md` is not a fleet audit. It is the first-boot environment discovery procedure behind [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding), which builds `/opt/data/INVENTORY.raw.md` once and then returns `[SILENT]` forever after. Its companions run as separate cards on the same one-shot path: `cluster_inventory_audit_sop.md` is what each Cluster Agent follows on the one cluster it is pinned to, returning structured `metadata` the waiting sweep card merges, and `inventory_prioritize_sop.md` scores the merged findings against a fixed rubric, registers all of them in the findings queue, and renders the short `/opt/data/INVENTORY.md` that reaches the user from the top of that order.
 
-`eod_event_watcher_daily_report_sop.md` is not a fleet audit either, and it is the one SOP here that no agent ever reads. It documents `eod_report_generator.py`, a `no_agent` script that renders the k8s-event-watcher recap deterministically from the session ledger; the file exists so the behaviour has an owner next to the SOPs it sits beside, not to instruct a model.
+The k8s-event-watcher daily recap has no SOP here: it is a `no_agent` script, `eod_report_generator.py`, that renders the recap deterministically from the session ledger and prompts no model, so its description is a design note rather than agent material — [`docs/designs/eod-event-watcher-daily-report.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/eod-event-watcher-daily-report.md).
 
 ## How SOPs work
 

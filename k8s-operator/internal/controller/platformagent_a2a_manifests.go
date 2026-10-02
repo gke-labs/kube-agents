@@ -598,8 +598,9 @@ const (
 	//	|       | on each conversation whose task is running -- a chat turn's      |
 	//	|       | heal and status answer, or an inject-door read's probe before    |
 	//	|       | and after its wait -- and in the shape this operator renders     |
-	//	|       | the running conversations are the bridge's                       |
-	//	|       | a2aBridgeDefaultConcurrency runs                                  |
+	//	|       | the running conversations are the bridge's workers:              |
+	//	|       | a2aBridgeDefaultConcurrency of them unless the CR declares a     |
+	//	|       | bridge sidecar with its own BRIDGE_CONCURRENCY (below)           |
 	//	|     2 | a2aTasksReplayBridgeLookAhead: the pre-spawn look-ahead, at      |
 	//	|       | most one lib.TaskInReplay per spawn from each of the bridge's     |
 	//	|       | a2aBridgeDefaultConcurrency workers, concurrently                 |
@@ -626,7 +627,13 @@ const (
 	// TASKS from 13 down to 11 for nothing, and it came back with the call.
 	// TestBridgeLookAheadIsInTheA2AModule reads the bridge's sources and
 	// fails on the day the call leaves them, naming the arithmetic that has
-	// to move back with it.
+	// to move back with it. The row is one slot per worker
+	// (a2aTasksReplayLookAhead), so like the asks row it is written twice:
+	// a2aTasksReplayBridgeLookAhead at the default in the sum below, and
+	// a2aTasksReplayLookAhead per worker inside a2aTasksReplayConsumersFor,
+	// the spelling the budget reads for a CR.
+	// TestReservedConsumersIsTheSumOfItsTerms holds the two equal at the
+	// default.
 	//
 	// The asks row is the one that rests on the shape of the install rather
 	// than on a lock, so the shape is stated. A conversation has one asker:
@@ -650,31 +657,82 @@ const (
 	// a2aSessionConsumersPerSession.
 	//
 	// Two more things the three bridge rows rest on, both settable on the
-	// CR and neither read by this render. BRIDGE_CONCURRENCY: the sidecar is
-	// declared in spec.deployment.sidecars, so its env is the CR's, and an
-	// install that raises it (hack/ci-deploy.sh sets the eval install's to
-	// its task parallelism: 4 on the presubmit, 8 on the nightly) scales the
-	// asks and look-ahead rows with it while this reserve stays put. At 4,
-	// in flight is 1+1+8+4 = 14 and the term would be 28, and 16+28 = 44
-	// sits inside a 64-wide stream; at 8 it is 1+1+16+8 = 26, the term 52,
-	// and 16+52 = 68 is past the 64 the default render creates. Such an
-	// install runs today because its trigger-paced sources never all fire
-	// inside one five-second window and it spawns no session pods, so it
-	// spends none of its maxSessions*3 -- an observation about load, not a
-	// guarantee this reserve gives it.
-	// Reading the sidecar's env into the budget is the follow-up, not a
-	// number here. And one agent replica: replicas share the bridge's
-	// durable and each brings its own workers, so a second replica doubles
-	// the dispatch row.
+	// CR. BRIDGE_CONCURRENCY is read. The sidecar is declared in
+	// spec.deployment.sidecars, so its env is the CR's, and an install that
+	// raises it (docs/designs/eval-next-transport.md commits the eval install
+	// to at least its task parallelism) has that many running conversations
+	// to be asked about, and that many workers looking ahead: the asks row
+	// is a2aTasksReplayAsk per worker, the look-ahead row
+	// a2aTasksReplayLookAhead per worker, and
+	// a2aBridgeConcurrency reads the worker count off the CR the way the
+	// bridge reads it off its environment. The rule, and what it cannot see:
 	//
-	// Where the floor hides all this. The budget is maxSessions*3 + 32 and a
-	// stream is created at max(64, budget), so a default install
-	// (maxSessions=10, budget 62) still renders 64. The first maxSessions
-	// whose budget clears the floor is 11 (65); it was 13 when the reserve
-	// was 28 and 17 when it was 16. Above it the stream is 16 wider than it
-	// would have been, and
-	// so is the web user's unreapable-durable ceiling, which is the trade
-	// the block above already states.
+	//   - A sidecar is a bridge declaring its workers when its env sets
+	//     BRIDGE_CONCURRENCY. Nothing else identifies the bridge container:
+	//     the operator copies sidecars verbatim and names none of them
+	//     (a2a/docs/hermes-bridge.md), and the env key is the bridge's own
+	//     contract (a2a/cmd/hermes-bridge/main.go), so it is the one thing a
+	//     bridge that changed its count must have written. A container that
+	//     is not a bridge and sets it is over-counted, which widens.
+	//   - The value is read the way envInt and Config.defaults read it once
+	//     the kubelet has handed it over: a $(NAME) reference in the literal
+	//     is expanded against the entries declared before it in the same
+	//     container, in declaration order, as the kubelet expands it before
+	//     the process starts (a2aBridgeConcurrencyValue), and then an
+	//     integer above zero is the count, up to a2aBridgeConcurrencyMax,
+	//     past which it is the cap and the refusal says so; an empty,
+	//     non-integer or non-positive value is a2aBridgeDefaultConcurrency,
+	//     because that is what the bridge runs with, and so is a literal too
+	//     wide for an int, which envInt cannot parse either. A valueFrom
+	//     cannot be read at render
+	//     time -- the Secret or ConfigMap it names is read in the pod, not
+	//     here -- and counts as the default too, as does a reference to
+	//     one, stated in a NOTE the provision script prints on every run,
+	//     refused or not, and in the refusal's status message, so an
+	//     operator who set it that way knows the budget did not see it. No
+	//     condition is raised for it: the number is a floor the bridge may
+	//     exceed, not a refusal, and the provision script's log is where
+	//     the reserve is already explained.
+	//   - More than one sidecar setting it is summed, and the sum is capped
+	//     at a2aBridgeConcurrencyMax the way one literal is: each bridge
+	//     brings its own workers. A bridge that leaves it unset, or takes it
+	//     through envFrom, which this render does not read, cannot be told
+	//     from a fluent-bit container, so it is not counted -- the script's
+	//     NOTE names a sidecar with envFrom and no entry in env, since the
+	//     key may be arriving that way (a2aBridgeEnvFromUnread) -- and a CR where no
+	//     sidecar sets it gets the default, which is exactly one bridge at
+	//     the bridge's own default -- the shape this render assumed before
+	//     it read anything. Within one container the last entry of that
+	//     name wins, as it does in the pod.
+	//
+	// And one agent replica: replicas share the bridge's durable and each
+	// brings its own workers, so a second replica doubles the dispatch row.
+	// spec.deployment.replicas is not read here.
+	//
+	// Where the floor hides all this. The budget is maxSessions*3 + the
+	// reserve, 32 at the default concurrency, and a stream is created at
+	// max(64, budget), so a default install (maxSessions=10, budget 62)
+	// still renders 64. The first maxSessions whose budget clears the floor
+	// is 11 (65); it was 13 when the reserve was 28 and 17 when it was 16.
+	// Above it the stream is 16 wider than it would have been, and so is the
+	// web user's unreapable-durable ceiling, which is the trade the block
+	// above already states.
+	//
+	// A declared bridge concurrency moves the reserve by
+	// a2aTasksReplayTailFactor*(a2aTasksReplayAsk+a2aTasksReplayLookAhead),
+	// 6 per worker -- the asks and the look-ahead, each with its tail: 44
+	// at 4, 56 at 6, and either clears the floor at the default maxSessions
+	// (74, 86). The gate at the end of the provision
+	// script compares the budget to the live stream, so an install that
+	// provisioned TASKS at 64 and then declared the sidecar is refused the
+	// way a raised maxSessions is, with the same two ways out and a third
+	// the refusal and the status message offer only then: declare the
+	// sidecar with fewer workers, which re-renders the Job the way a
+	// maxSessions edit does. A literal above a2aBridgeConcurrencyMax (below)
+	// counts as the cap, and both surfaces say so. The mode-next step of
+	// hack/ci-deploy.sh is such an install: it declares the sidecar after
+	// the bus is up, so its second provision Job refuses against the first
+	// one's stream.
 	a2aTasksStandingDurables     = 2
 	a2aTasksAuditDurableHeadroom = 1
 	a2aTasksIncarnationOverlap   = a2aSessionConsumersPerSession
@@ -683,11 +741,41 @@ const (
 	// a2aBridgeDefaultConcurrency mirrors defaultConcurrency in
 	// a2a/cmd/hermes-bridge/main.go, the number of hermes subprocesses -- and
 	// so of running conversations -- one bridge has when BRIDGE_CONCURRENCY
-	// is unset, which this operator leaves unset.
+	// is unset or unreadable, and what a2aBridgeConcurrency answers for a CR
+	// that declares no bridge sidecar.
 	// The two modules cannot import each other;
 	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
 	// if this one stops matching it.
 	a2aBridgeDefaultConcurrency = 2
+	// a2aBridgeConcurrencyEnvVar is the env key the bridge reads its worker
+	// count from (a2a/cmd/hermes-bridge/main.go), and so the key
+	// a2aBridgeConcurrency looks for on spec.deployment.sidecars.
+	a2aBridgeConcurrencyEnvVar = "BRIDGE_CONCURRENCY"
+	// a2aBridgeConcurrencyMax is the most bridge workers the budget sizes for,
+	// whatever the CR's literal says. The bridge itself has no ceiling: envInt
+	// takes any integer strconv.Atoi returns and Config.defaults rewrites only
+	// a count below one, so BRIDGE_CONCURRENCY="9223372036854775807" is what
+	// the bridge would be told to run. Multiplied into the asks row, that
+	// literal wraps the replay term negative, the reserve falls below the
+	// default install's and the gate passes a stream that is short; a merely
+	// large one renders a --max-consumers in the billions. The other input to
+	// this arithmetic is bounded at the API (spec.harness.tuning.maxSessions,
+	// Maximum=10000 in api/v1alpha1/common_types.go, kept there for the same
+	// wrap); a sidecar's env is not, because the operator copies sidecars
+	// verbatim, so the bound is here. The number is taskQueueCapacity in
+	// a2a/hermes-bridge/bridge.go, the queue behind the workers, and the
+	// ceiling hack/ci-deploy.sh already puts on the EVAL_TASK_PARALLELISM it
+	// writes into this env (1..1024): a bridge with more workers than its
+	// queue holds accepted tasks is a typo, not a sizing. At both ceilings
+	// the budget is 10000*3 + 20 + 6*1024 = 36164, nowhere near a wrap. A
+	// literal past the cap counts as the cap, not as the default -- the
+	// default would silently under-budget a large install, the cap sizes it
+	// for every worker its queue can feed -- and the sum over sidecars is
+	// capped the same way; the provision script's refusal and the status
+	// message say when the count was capped.
+	// TestBridgeConcurrencyMaxMatchesTheBridgeQueue reads the bridge's
+	// constant and fails if this one stops matching it.
+	a2aBridgeConcurrencyMax = 1024
 
 	a2aTasksReplayBridgeDispatch = 1
 	a2aTasksReplayGatewaySweep   = 1
@@ -696,10 +784,14 @@ const (
 	// read's probeConversation before and after its wait.
 	a2aTasksReplayAsk  = 2
 	a2aTasksReplayAsks = a2aTasksReplayAsk * a2aBridgeDefaultConcurrency
-	// a2aTasksReplayBridgeLookAhead is the bridge's pre-spawn look-ahead:
-	// lib.TaskInReplay at most once per dequeue from each worker, and at most
-	// Concurrency of them in hand at once, which the bridge paces.
-	a2aTasksReplayBridgeLookAhead = a2aBridgeDefaultConcurrency
+	// a2aTasksReplayLookAhead is the pre-spawn look-ahead replays one bridge
+	// worker holds: lib.TaskInReplay at most once per dequeue, and at most
+	// Concurrency of them in hand across the bridge at once, which the bridge
+	// paces. a2aTasksReplayBridgeLookAhead is that at the bridge's default,
+	// the look-ahead row above; a2aTasksReplayConsumersFor carries it per
+	// worker.
+	a2aTasksReplayLookAhead       = 1
+	a2aTasksReplayBridgeLookAhead = a2aTasksReplayLookAhead * a2aBridgeDefaultConcurrency
 	// a2aTasksReplayTailFactor is the slots one trigger-paced source holds:
 	// the replay running and the one before it, still inside its five-second
 	// inactive threshold.
@@ -1973,6 +2065,123 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
 	server := a2aNATSAddress(agent)
+	// The reserve the refusal quotes is this CR's, not the default table's:
+	// a CR that declares a bridge at 6 is told the 44 it was sized for, and
+	// a CR that declares more workers than the bridge's default is told the
+	// need has two inputs and offered the lever on the second one; the
+	// refusal's worker-count lines are rendered here, per CR, because the
+	// count is a render-time fact the script cannot recompute.
+	reserveN := a2aTasksReserve(agent)
+	reserve := strconv.Itoa(reserveN)
+	oneSession := strconv.Itoa(a2aSessionConsumersPerSession + reserveN)
+	maxSessionsN := resolveA2AMaxSessions(agent)
+	maxSessions := strconv.Itoa(maxSessionsN)
+	perSession := strconv.Itoa(a2aSessionConsumersPerSession)
+	bridgeWorkersN, bridgeWorkersCapped, bridgeWorkersDefaulted := a2aBridgeWorkers(agent)
+	bridgeWorkers := strconv.Itoa(bridgeWorkersN)
+	bridgeWorkersNoun := "workers"
+	if bridgeWorkersN == 1 {
+		bridgeWorkersNoun = "worker"
+	}
+	bridgeDefault := strconv.Itoa(a2aBridgeDefaultConcurrency)
+	bridgeMax := strconv.Itoa(a2aBridgeConcurrencyMax)
+	// The reserve without its per-worker term and the term itself, so the
+	// script can compute the worker count that fits beside this CR's
+	// maxSessions from the live stream the way it computes the maxSessions
+	// that fits: reserve(w) = fixedReserve + perWorker*w, where a worker is
+	// its asks and its look-ahead, each with a tail.
+	fixedReserve := strconv.Itoa(a2aTasksReservedConsumersFor(0))
+	perWorker := strconv.Itoa(a2aTasksReplayTailFactor * (a2aTasksReplayAsk + a2aTasksReplayLookAhead))
+	oneWorker := strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
+	oneAndOne := strconv.Itoa(a2aSessionConsumersPerSession + a2aTasksReservedConsumersFor(1))
+	bridgeAboveDefault := bridgeWorkersN > a2aBridgeDefaultConcurrency
+
+	// The parenthetical under the reserve: where the worker count came from,
+	// and that it was capped when it was.
+	bridgeNote := `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge ` + bridgeWorkersNoun + `: each spec.deployment.sidecars entry" >&2
+  echo "  that sets ` + a2aBridgeConcurrencyEnvVar + ` counts its literal - a \$(NAME) reference to an earlier literal in the same entry is expanded" >&2
+  echo "  as the kubelet expands it - or ` + bridgeDefault + ` for a value this render cannot read, a valueFrom or a reference to one; ` + bridgeDefault + ` when none sets it)." >&2
+`
+	if bridgeWorkersCapped {
+		bridgeNote = `  echo "  (the replay share of that reserve is sized for ` + bridgeWorkers + ` bridge workers, the most this render sizes for: this CR" >&2
+  echo "  declares more than that across the spec.deployment.sidecars entries that set ` + a2aBridgeConcurrencyEnvVar + `, and ` + bridgeMax + ` is" >&2
+  echo "  the queue behind the bridge's workers, so a count past it is a typo, not a sizing - correct the literal)." >&2
+`
+	}
+	// What the budget could not read, said on every run and not only in the
+	// refusal. An entry that took the default in place of a count the render
+	// could not read, or a sidecar whose envFrom may be delivering the key
+	// where the render does not look, leaves the budget sized for a count
+	// the bridge may exceed; a stream that passes the gate on that count is
+	// short for the real one with nothing to say so, which is the
+	// under-sizing gke-labs#2043 names. The numbers do not move on either.
+	// Same shape as the max_msgs_per_subject drift report: a NOTE printed
+	// before the gate, exiting nothing. The status message states the
+	// per-entry rule on refusal (a2aProvisionRefusalStatus); this is the
+	// surface a successful run has.
+	readNote := ""
+	if bridgeWorkersDefaulted {
+		readNote += `# An entry set ` + a2aBridgeConcurrencyEnvVar + ` to something this render could not read as a count.
+echo "NOTE: a spec.deployment.sidecars entry sets ` + a2aBridgeConcurrencyEnvVar + ` to a value this render could not read as a count -" >&2
+echo "  a valueFrom, a \$(NAME) reference to one or to a name no earlier literal in the same entry set, or a value" >&2
+echo "  that is not a count - and it counted as the bridge's default of ` + bridgeDefault + `. The bridge runs whatever the value resolves" >&2
+echo "  to in the pod, so the ` + bridgeWorkers + ` bridge ` + bridgeWorkersNoun + ` this budget is sized for may be fewer than it runs, and TASKS may be" >&2
+echo "  short for the real count with no refusal to say so. To have the budget read the count, set a literal," >&2
+echo "  or a \$(NAME) reference to an earlier literal in the same entry." >&2
+`
+	}
+	if a2aBridgeEnvFromUnread(agent) {
+		readNote += `# A sidecar carries envFrom and sets no ` + a2aBridgeConcurrencyEnvVar + ` in env; the key may be arriving unread.
+echo "NOTE: a spec.deployment.sidecars entry carries envFrom and sets no ` + a2aBridgeConcurrencyEnvVar + ` in env. A ` + a2aBridgeConcurrencyEnvVar + `" >&2
+echo "  delivered through envFrom is not read: this render cannot see the keys a ConfigMap or Secret carries, so" >&2
+echo "  the entry counted as no bridge and added nothing to the ` + bridgeWorkers + ` bridge ` + bridgeWorkersNoun + ` this budget is sized for. If the key" >&2
+echo "  arrives that way, TASKS may be short for the real count with no refusal to say so. To have the budget" >&2
+echo "  read it, set it in env as a literal, which the kubelet lets override envFrom." >&2
+`
+	}
+	// The third lever, only where the CR declared more workers than the
+	// default: at or below the default there is no worker count to lower --
+	// one worker has nothing beneath it -- and the refusal reads as it did,
+	// with the reserve line above naming the count either way. Which worker
+	// count fits is computed from the live stream in the script, like
+	// ${fits}.
+	workersFit := ""
+	thirdLever := ""
+	oneSessionAt := ""
+	// At the default, a maxSessions that cannot fit leaves the delete; above
+	// it, the third lever below says what is left.
+	thatLeaves := `    echo "  That leaves deleting the TASKS stream and provisioning again." >&2
+`
+	finishesOnItsOwn := `  if [ "${fits}" -ge 1 ]; then
+    echo "The two ways out do not finish the same way. Lowering spec.harness.tuning.maxSessions" >&2
+    echo "  finishes on its own: this Job's name carries a digest of the rendered spec, the" >&2
+    echo "  consumer count is part of that render, so the edit produces a new Job that runs by" >&2
+    echo "  itself. Nothing below applies to it - there is nothing else to delete or restart." >&2
+  fi
+`
+	if bridgeAboveDefault {
+		workersFit = `  workers_fit=$(( (live_consumers - ` + strconv.Itoa(maxSessionsN*a2aSessionConsumersPerSession) + ` - ` + fixedReserve + `) / ` + perWorker + ` ))
+`
+		oneSessionAt = ` at ` + bridgeWorkers + ` bridge workers`
+		thatLeaves = ""
+		thirdLever = `  if [ "${workers_fit}" -ge 1 ]; then
+    echo "Or keep spec.harness.tuning.maxSessions at ` + maxSessions + ` and declare the bridge sidecar with at most ${workers_fit}" >&2
+    echo "  workers - ` + a2aBridgeConcurrencyEnvVar + ` on its spec.deployment.sidecars entry; unset, the bridge runs ` + bridgeDefault + ` - which is" >&2
+    echo "  the most this stream has room for beside those sessions: the reserve is ` + fixedReserve + ` plus ` + perWorker + ` a worker." >&2
+  else
+    echo "Fewer bridge workers alone will not fit it beside spec.harness.tuning.maxSessions=` + maxSessions + `: one worker" >&2
+    echo "  still needs ` + oneWorker + `, more than this stream holds. One session beside one worker needs ` + oneAndOne + `;" >&2
+    echo "  below that, only deleting the TASKS stream and provisioning again fits." >&2
+  fi
+`
+		finishesOnItsOwn = `  if [ "${fits}" -ge 1 ] || [ "${workers_fit}" -ge 1 ]; then
+    echo "The ways out do not finish the same way. Lowering spec.harness.tuning.maxSessions, or the" >&2
+    echo "  bridge's worker count, finishes on its own: this Job's name carries a digest of the rendered" >&2
+    echo "  spec, the consumer count is part of that render, so either edit produces a new Job that" >&2
+    echo "  runs by itself. Nothing below applies to them - there is nothing else to delete or restart." >&2
+  fi
+`
+	}
 	return a2aPostureComment + `
 set -euo pipefail
 # This Job authenticates to the bus with its own projected ServiceAccount
@@ -2205,7 +2414,7 @@ if [ -w "` + a2aProvisionTerminationLogPath + `" ]; then
     || echo "WARNING: could not write the provision report to the termination log; the log above is this run's only record" >&2
 fi
 
-required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
+` + readNote + `required_consumers=` + strconv.Itoa(a2aTasksConsumerBudget(agent)) + `
 live_consumers="$(printf '%s' "${tasks_json}" \
   | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
 if [ -z "${live_consumers}" ]; then
@@ -2214,33 +2423,26 @@ if [ -z "${live_consumers}" ]; then
 fi
 if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
   echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
-  echo "  spec.harness.tuning.maxSessions is ` + strconv.Itoa(resolveA2AMaxSessions(agent)) + `, each session creates ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` consumers on TASKS," >&2
-  echo "  plus ` + strconv.Itoa(a2aTasksReservedConsumers) + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
-  echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
+  echo "  spec.harness.tuning.maxSessions is ` + maxSessions + `, each session creates ` + perSession + ` consumers on TASKS," >&2
+  echo "  plus ` + reserve + ` reserved for the standing durables, the web rail and tasks/get replays." >&2
+` + bridgeNote + `  echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
   echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
   echo "  \"stream configuration update can not change MaxConsumers\"" >&2
   echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
-  fits=$(( (live_consumers - ` + strconv.Itoa(a2aTasksReservedConsumers) + `) / ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` ))
-  if [ "${fits}" -ge 1 ]; then
+  fits=$(( (live_consumers - ` + reserve + `) / ` + perSession + ` ))
+` + workersFit + `  if [ "${fits}" -ge 1 ]; then
     echo "So either lower spec.harness.tuning.maxSessions to at most ${fits} - the most a" >&2
-    echo "  stream holding ${live_consumers} consumers has room for, with ` + strconv.Itoa(a2aTasksReservedConsumers) + ` of them reserved and" >&2
-    echo "  the rest going ` + strconv.Itoa(a2aSessionConsumersPerSession) + ` to a session - or delete the TASKS stream and provision again." >&2
+    echo "  stream holding ${live_consumers} consumers has room for, with ` + reserve + ` of them reserved and" >&2
+    echo "  the rest going ` + perSession + ` to a session - or delete the TASKS stream and provision again." >&2
   else
     echo "Lowering spec.harness.tuning.maxSessions will not fit it either: the field's" >&2
-    echo "  minimum is 1, and one session still needs ` + strconv.Itoa(a2aSessionConsumersPerSession+a2aTasksReservedConsumers) + `, more than this stream holds." >&2
-    echo "  That leaves deleting the TASKS stream and provisioning again." >&2
-  fi
-  echo "This script creates every stream it does not find, and it does that before these" >&2
+    echo "  minimum is 1, and one session still needs ` + oneSession + oneSessionAt + `, more than this stream holds." >&2
+` + thatLeaves + `  fi
+` + thirdLever + `  echo "This script creates every stream it does not find, and it does that before these" >&2
   echo "  checks, so the next run recreates TASKS at ` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + `. Deleting the stream discards the" >&2
   echo "  tasks it is holding - the 72h task history the design treats as the audit" >&2
   echo "  substrate - which is why provisioning will not do it on an operator's behalf." >&2
-  if [ "${fits}" -ge 1 ]; then
-    echo "The two ways out do not finish the same way. Lowering spec.harness.tuning.maxSessions" >&2
-    echo "  finishes on its own: this Job's name carries a digest of the rendered spec, the" >&2
-    echo "  consumer count is part of that render, so the edit produces a new Job that runs by" >&2
-    echo "  itself. Nothing below applies to it - there is nothing else to delete or restart." >&2
-  fi
-  echo "Deleting TASKS does not finish on its own. It takes three steps, in this order:" >&2
+` + finishesOnItsOwn + `  echo "Deleting TASKS does not finish on its own. It takes three steps, in this order:" >&2
   echo "  1. delete the stream." >&2
   echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
   echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
@@ -2261,8 +2463,11 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   # podFailurePolicy matches on 2 and fails the Job from the first pod
   # (buildA2AProvisionJob), so a refusal nothing about a re-run can change
   # does not spend the backoffLimit before it is heard. This refusal is in
-  # that class: both numbers are fixed until an operator lowers maxSessions
-  # or recreates the stream, and provisioning does neither. Note that
+  # that class: the budget's two inputs, maxSessions and the bridge's worker
+  # count, and the stream's max_consumers are all fixed until an operator
+  # lowers maxSessions, declares the bridge sidecar with fewer workers where
+  # it declared more than the default, or recreates the stream, and
+  # provisioning does none of those. Note that
   # set -euo pipefail exits with the failing command's own status, which is
   # not 2, so an unexpected failure stays on the retry budget.
   exit 2
@@ -2283,8 +2488,8 @@ echo "a2a provisioning complete"
 // max_consumers refusal is deterministic and now fails the Job from its
 // first pod (the podFailurePolicy below), so the daily re-create is the only
 // thing that ever re-checks that refusal — against a stream an operator has
-// since recreated, or a maxSessions that has come down to fit the stream that
-// is there. That churn is one short-lived pod a day; the alternative —
+// since recreated, or a maxSessions -- or a declared bridge worker count --
+// that has come down to fit the stream that is there. That churn is one short-lived pod a day; the alternative —
 // a Job kept forever as the done-marker — trades it for permanent clutter, a
 // stale-looking object in every kubectl listing, and a refusal that never
 // looks again.
@@ -2667,13 +2872,216 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	return defaultA2AMaxSessions
 }
 
+// a2aBridgeConcurrency is the number of bridge workers this CR declares: the
+// sum of BRIDGE_CONCURRENCY over every sidecar whose env sets it, each read
+// the way the bridge reads it, capped at a2aBridgeConcurrencyMax, and
+// a2aBridgeDefaultConcurrency when none does. The comment above
+// a2aTasksReservedConsumers states the rule and what it cannot see (a
+// valueFrom or a reference to one, a bridge that leaves the key unset or
+// takes it through envFrom, replicas).
+func a2aBridgeConcurrency(agent *agentv1alpha1.PlatformAgent) int {
+	n, _, _ := a2aBridgeWorkers(agent)
+	return n
+}
+
+// a2aBridgeWorkers is a2aBridgeConcurrency and two facts about how the count
+// was read, for the two refusal surfaces to say: capped when a literal above
+// a2aBridgeConcurrencyMax, or a sum over sidecars above it, counted as the
+// cap; defaulted when an entry that sets the key was not one this render
+// could read as a count -- a valueFrom, a reference to one, a value the
+// bridge would not take -- and counted as a2aBridgeDefaultConcurrency in its
+// place, so the count is not what the CR literally declares. Neither flag is
+// set when no sidecar sets the key: the default is then the count, not a
+// stand-in for one.
+func a2aBridgeWorkers(agent *agentv1alpha1.PlatformAgent) (count int, capped, defaulted bool) {
+	if agent == nil || agent.Spec.Deployment == nil {
+		return a2aBridgeDefaultConcurrency, false, false
+	}
+	total, declared := 0, false
+	for _, c := range agent.Spec.Deployment.Sidecars {
+		value, set := a2aBridgeConcurrencyValue(c)
+		if !set {
+			continue
+		}
+		declared = true
+		n, over, fell := a2aBridgeConcurrencyOf(value)
+		total += n
+		capped = capped || over
+		defaulted = defaulted || fell
+	}
+	if !declared {
+		return a2aBridgeDefaultConcurrency, false, false
+	}
+	if total > a2aBridgeConcurrencyMax {
+		return a2aBridgeConcurrencyMax, true, defaulted
+	}
+	return total, capped, defaulted
+}
+
+// a2aBridgeEnvFromUnread is whether a sidecar could be taking
+// BRIDGE_CONCURRENCY through envFrom, where this render does not look: it
+// carries envFrom and its env sets no entry of that name. The kubelet lets an
+// env entry override an envFrom key of the same name, so a sidecar that sets
+// one in env, literal or valueFrom, is read from env and is not this shape;
+// one that sets none is counted as no bridge by a2aBridgeWorkers, the count
+// the render can stand behind, and the provision script's NOTE says the key
+// may be arriving unread. Nothing the budget computes moves on it.
+func a2aBridgeEnvFromUnread(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, c := range agent.Spec.Deployment.Sidecars {
+		if len(c.EnvFrom) == 0 {
+			continue
+		}
+		if _, set := a2aBridgeConcurrencyValue(c); !set {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aBridgeConcurrencyValue is the string the bridge's envInt reads for
+// BRIDGE_CONCURRENCY in this container, as far as a render can know it, and
+// whether the container sets the key at all. The kubelet does not hand a
+// container its env[].value verbatim: before the process starts it expands
+// each entry's $(NAME) references against the entries declared before it in
+// the same container, in declaration order, so a later entry sees an earlier
+// one's expanded value (corev1.EnvVar.Value's contract, applied by
+// makeEnvironmentVariables in the kubelet). A sidecar declared as
+// EVAL_PARALLELISM=6, BRIDGE_CONCURRENCY=$(EVAL_PARALLELISM) runs six
+// workers; a render that read the literal counted two, budgeted for two and
+// passed the gate on a stream sized for two, with no refusal to say so. So
+// the walk here is the kubelet's: every literal entry is expanded against
+// what came before it and remembered under its name; a valueFrom entry is
+// remembered as unknowable, since its value is read in the pod, so a
+// reference to it -- or to a name an earlier literal set and a later
+// valueFrom shadowed -- is left as written, fails Atoi and takes the default;
+// the last entry of the name is the one that counts, as in the pod. What the
+// kubelet can see and this cannot -- an envFrom key, a service variable -- is
+// likewise left as written and takes the default. Nothing else this render
+// emits changes: the expansion is computed to read this one value, and the
+// sidecar is still copied verbatim.
+func a2aBridgeConcurrencyValue(c corev1.Container) (value string, set bool) {
+	known := map[string]string{}
+	for _, e := range c.Env {
+		if e.ValueFrom != nil {
+			delete(known, e.Name)
+			if e.Name == a2aBridgeConcurrencyEnvVar {
+				value, set = "", true
+			}
+			continue
+		}
+		v := expandEnvReferences(e.Value, known)
+		known[e.Name] = v
+		if e.Name == a2aBridgeConcurrencyEnvVar {
+			value, set = v, true
+		}
+	}
+	return value, set
+}
+
+// expandEnvReferences follows the kubelet's expansion.Expand
+// (k8s.io/kubernetes/third_party/forked/golang/expansion, which this module
+// does not depend on) with its MappingFuncFor over known: $(NAME) becomes
+// known[NAME] when the name is there and is left as written when it is not,
+// $$ becomes $, and a $ followed by anything else -- including an unclosed
+// $( -- is the literal characters. Nothing is chased after substitution:
+// a value known holds was itself expanded when its entry was walked, which
+// is how a reference through a reference resolves in declaration order.
+func expandEnvReferences(input string, known map[string]string) string {
+	var out strings.Builder
+	for i := 0; i < len(input); i++ {
+		if input[i] != '$' || i+1 >= len(input) {
+			out.WriteByte(input[i])
+			continue
+		}
+		switch input[i+1] {
+		case '$':
+			out.WriteByte('$')
+			i++
+		case '(':
+			end := strings.IndexByte(input[i+2:], ')')
+			if end < 0 {
+				out.WriteString("$(")
+				i++
+				continue
+			}
+			name := input[i+2 : i+2+end]
+			if v, ok := known[name]; ok {
+				out.WriteString(v)
+			} else {
+				out.WriteString("$(" + name + ")")
+			}
+			i += 2 + end
+		default:
+			out.WriteByte('$')
+		}
+	}
+	return out.String()
+}
+
+// a2aBridgeConcurrencyOf is envInt (a2a/cmd/hermes-bridge/main.go) and
+// Config.defaults (a2a/hermes-bridge/bridge.go) applied to the value
+// a2aBridgeConcurrencyValue read off one sidecar -- the literal with its
+// $(NAME) references expanded as the kubelet expands them, so a reference to
+// an earlier literal counts what the bridge runs with -- then the cap the
+// bridge does not have: strconv.Atoi on the string, the default on an empty
+// or unparsable one -- which includes a literal too wide for an int, the one
+// shape past the cap envInt itself refuses, and a reference this render could
+// not resolve, left as written: one the kubelet cannot resolve either, or one
+// to a valueFrom, whose value is read in the pod -- the default again below
+// one, and a2aBridgeConcurrencyMax above it, reported as capped. A valueFrom
+// itself has no literal to parse and arrives here empty, so it takes the
+// default too. Every path to the default reports defaulted, so the status
+// message can say the count is a read and not the CR's declaration.
+func a2aBridgeConcurrencyOf(value string) (count int, capped, defaulted bool) {
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return a2aBridgeDefaultConcurrency, false, true
+	}
+	if n > a2aBridgeConcurrencyMax {
+		return a2aBridgeConcurrencyMax, true, false
+	}
+	return n, false, false
+}
+
+// a2aTasksReplayConsumersFor is a2aTasksReplayConsumers as a function of the
+// bridge's worker count: the asks row is a2aTasksReplayAsk per worker, the
+// look-ahead row a2aTasksReplayLookAhead per worker, and the other two rows
+// do not move. Each per-worker term sits beside its constant twin in the
+// a2aTasksReplayConsumers sum -- a2aTasksReplayAsks and
+// a2aTasksReplayBridgeLookAhead, both at a2aBridgeDefaultConcurrency -- and
+// TestReservedConsumersIsTheSumOfItsTerms holds the two spellings equal
+// there.
+func a2aTasksReplayConsumersFor(bridgeConcurrency int) int {
+	return a2aTasksReplayTailFactor *
+		(a2aTasksReplayBridgeDispatch + a2aTasksReplayGatewaySweep +
+			a2aTasksReplayAsk*bridgeConcurrency + a2aTasksReplayLookAhead*bridgeConcurrency)
+}
+
+// a2aTasksReservedConsumersFor is the reserve's table evaluated at a bridge
+// worker count; at a2aBridgeDefaultConcurrency it is the literal
+// a2aTasksReservedConsumers, which TestReservedConsumersIsTheSumOfItsTerms
+// holds.
+func a2aTasksReservedConsumersFor(bridgeConcurrency int) int {
+	return a2aTasksStandingDurables + a2aTasksAuditDurableHeadroom + a2aTasksIncarnationOverlap +
+		a2aTasksWebReaders + a2aTasksReplayConsumersFor(bridgeConcurrency)
+}
+
+// a2aTasksReserve is the reserve this CR carries: the table at the bridge
+// concurrency the CR declares.
+func a2aTasksReserve(agent *agentv1alpha1.PlatformAgent) int {
+	return a2aTasksReservedConsumersFor(a2aBridgeConcurrency(agent))
+}
+
 // a2aTasksConsumerBudget is what this CR's configuration needs TASKS to hold.
 // It is the number the provision script checks a live stream against, which is
 // deliberately the budget and not the rendered max_consumers: an existing
 // stream sized at the floor holds a default install fine, and failing it for
 // being below a floor it was never going to be below is a false alarm.
 func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
-	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReservedConsumers
+	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReserve(agent)
 }
 
 // a2aTasksMaxConsumers is what a fresh TASKS stream is created with.
@@ -2682,6 +3090,72 @@ func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
 		return budget
 	}
 	return a2aTasksMaxConsumersFloor
+}
+
+// a2aProvisionRefusalStatus is what the status message adds for a provision
+// Job the podFailurePolicy failed: the exit-2 refusal, which is the script's
+// closing consumer gate, and the ways out of it. The need has two inputs now
+// that the budget reads the bridge sidecar's BRIDGE_CONCURRENCY, so a CR
+// that declares more workers than the bridge's default is told both numbers
+// and offered the lever on the second one -- fewer workers, which re-renders
+// the Job the way a maxSessions edit does -- and told when the count was
+// capped. The count is attributed to the CR only when it is the CR's: where
+// an entry took the default because this render could not read it as a count
+// (a valueFrom, a reference to one, a value the bridge would not take), the
+// CR declares something other than the number, so the message says the count
+// is what the render read and states the per-entry rule the script's
+// parenthetical states, in one clause. The attribution goes out whenever the
+// declared count moved the reserve, below the default as well as above it:
+// one worker is a reserve of 26, not 32, and a message that named
+// maxSessions alone over that number would be quoting an input it did not
+// name. The read clause goes out whenever an entry took the default, the
+// count it summed to included: a CR whose only entry is a valueFrom resolves
+// to the default and is told that the count is what the render read, since
+// the sidecar may be running more than the budget was sized for, and the
+// reserve is stated once, as the default's, rather than against itself. The
+// lever goes out only above the default, since one worker has no lower
+// count beneath it, and the message says so in the clause instead. At the
+// default the CR declared -- a literal 2, or no entry -- there is no worker
+// sentence, and the message reads as it did, with the two ways out. The
+// third number the remedy wants, what the live stream holds, is on the bus
+// and in the pod log.
+func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
+	maxSessions := resolveA2AMaxSessions(agent)
+	workers, capped, defaulted := a2aBridgeWorkers(agent)
+	need := fmt.Sprintf("spec.harness.tuning.maxSessions=%d needs (%d)", maxSessions, a2aTasksConsumerBudget(agent))
+	ways := "the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream"
+	fits := "the maxSessions that fits"
+	finish := "The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
+	if workers != a2aBridgeDefaultConcurrency || defaulted {
+		source := fmt.Sprintf("the CR declares (%s on spec.deployment.sidecars)", a2aBridgeConcurrencyEnvVar)
+		countIs := "The CR declares"
+		if defaulted {
+			source = fmt.Sprintf("the render reads from spec.deployment.sidecars (%s; an entry it cannot read as a count, a valueFrom or a reference to one among them, counts as the bridge's default of %d)", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
+			countIs = "That count is"
+		}
+		noun, noLower := "workers", ""
+		if workers == 1 {
+			noun, noLower = "worker", ", with no lower count left to declare"
+		}
+		reserve := fmt.Sprintf("the reserve is %d at %d %s and %d at the bridge's default of %d%s", a2aTasksReserve(agent), workers, noun, a2aTasksReservedConsumers, a2aBridgeDefaultConcurrency, noLower)
+		if workers == a2aBridgeDefaultConcurrency {
+			reserve = fmt.Sprintf("the reserve is %d at %d %s, the bridge's default", a2aTasksReserve(agent), workers, noun)
+		}
+		need = fmt.Sprintf("spec.harness.tuning.maxSessions=%d and the %d bridge %s %s need together (%d; %s)",
+			maxSessions, workers, noun, source, a2aTasksConsumerBudget(agent), reserve)
+		if capped {
+			need += fmt.Sprintf(". %s more than %d; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct", countIs, a2aBridgeConcurrencyMax)
+		}
+	}
+	if workers > a2aBridgeDefaultConcurrency {
+		ways = fmt.Sprintf("the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower %s, or none for the bridge's default of %d) until it does, or to delete the TASKS stream", a2aBridgeConcurrencyEnvVar, a2aBridgeDefaultConcurrency)
+		fits = "the maxSessions, or the worker count, that fits"
+		finish = "The three do not finish the same way. Lowering maxSessions or the bridge's worker count finishes by itself: either CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted."
+	}
+	return fmt.Sprintf(
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
+		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
+		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
 
 func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
@@ -3458,7 +3932,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// so it goes out only on the refusal it fixes; the pod
 				// log still says what happened either way.
 				//
-				// Neither way out it names is a stream edit, because
+				// No way out it names is a stream edit, because
 				// max_consumers is the one limit nats-server will not
 				// change on a stream that exists — an update carrying
 				// a different MaxConsumers comes back "stream
@@ -3466,14 +3940,18 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 				// and the bus this operator renders is pinned to
 				// nats:2.10, where that holds. What is left is
 				// lowering maxSessions until the budget fits the
-				// stream, or deleting TASKS and letting the script
+				// stream — or, where the CR declares a bridge sidecar
+				// with more workers than the bridge's default, its
+				// worker count, which the message offers only then —
+				// or deleting TASKS and letting the script
 				// recreate it — the create-only guards create every
 				// stream they do not find, ahead of these checks — at
 				// the cost of the task history the stream is holding.
 				//
-				// The two do not finish the same way, and the message
-				// says so rather than making one claim about both.
-				// Lowering maxSessions edits the CR, which re-renders
+				// They do not finish the same way, and the message
+				// says so rather than making one claim about all of
+				// them. Lowering maxSessions, or the worker count,
+				// edits the CR, which re-renders
 				// the provision script, which moves the digest the Job
 				// name carries (a2aProvisionJobName) — a new Job, and
 				// it runs by itself. Deleting TASKS changes nothing
@@ -3509,10 +3987,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 					"A2A provision Job %s failed (%s: %s); its pod log names what it refused. Every stream and bucket is created before the checks that can refuse an already-provisioned bus, so this does not mean the bus is empty, and deleting the Job re-runs the same script — which helps only where the cause has since gone away.",
 					existing.Name, cond.Reason, cond.Message)
 				if cond.Reason == batchv1.JobReasonPodFailurePolicy {
-					state.message += fmt.Sprintf(
-						" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than spec.harness.tuning.maxSessions=%d needs (%d). max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore the maxSessions that fits. The two do not finish the same way. Lowering maxSessions finishes by itself: the CR edit re-renders this Job, so a new one appears and runs, and nothing has to be deleted. Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
-						resolveA2AMaxSessions(agent), a2aTasksConsumerBudget(agent), a2aTasksMaxConsumers(agent),
-						a2aGatewayName(agent), agent.Namespace, agent.Name)
+					state.message += a2aProvisionRefusalStatus(agent)
 				}
 			}
 		}
@@ -4067,12 +4542,35 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Four reads answer it instead of twenty-three:
+	// cost for a no-op. Seven reads answer it instead of twenty-three:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
 	//     earlier pass ran to completion rather than dying partway,
 	//   - the gateway Deployment, which the render creates last and this
 	//     function deletes first, so it catches a pass that failed immediately,
+	//   - the NATS fence and the session fence, for the render that never
+	//     reaches reconcileA2A. reconcileAgentNetworkGuardrails applies the
+	//     fences on every refusal under mode next, so a CR refused on its
+	//     first reconcile has the fences and none of the other objects here;
+	//     without these two the exit stepped over them on the flip to today
+	//     (#2197). The NATS fence is the first object that path writes, so a
+	//     guardrail render that died anywhere leaves it; the session fence is
+	//     the last fence the teardown deletes, so a cleanup pass that died
+	//     between the two leaves it,
+	//   - the inject door's fence, for the shape neither of those two covers.
+	//     It is written after both and deleted before both, so a render or a
+	//     cleanup that dies partway always leaves one of the two standing
+	//     beside it. The hand does not die partway: an operator triaging an
+	//     EgressAllowlistRefused who deletes the NATS and session fences and
+	//     flips the CR to today before the reconcile that delete enqueued has
+	//     re-applied them hands the first today reconcile a tree holding the
+	//     inject fence alone. Nothing on the today path but this walk removes
+	//     it -- removeA2AInjectBackend runs from the next render only -- so
+	//     without this entry the exit returned, and did so again on every
+	//     reconcile after, over an owned A2A NetworkPolicy. Listed whatever
+	//     the flag says, like its teardown entry: the install that has it is
+	//     the one whose operator was deployed with the flag, and the read
+	//     finds nothing on one that never was,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -4083,18 +4581,36 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//     an operator upgraded across this change and then flipped to `today`
 	//     would otherwise step over a config Secret no later object accompanies.
 	//
-	// Without the third and fourth the exit would step over those objects and
-	// leave an A2A object on a `today` install, which is the darkness property.
-	// The first two are Owns kinds and free; the two Secret reads are uncached
-	// and happen only when the free two both miss.
+	// Without the Secrets and the fences the exit would step over those objects
+	// and leave an A2A object on a `today` install, which is the darkness
+	// property. The first five are Owns kinds and free; the two Secret reads
+	// are uncached and happen only when the free five all miss.
 	//
-	// Adding an object to reconcileA2A ahead of the keys Secret means adding it
-	// here. TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
-	// prefix of the render and is what makes forgetting it red rather than
-	// silent: without the keys Secret below, its writes 3 and 4 fail.
+	// A sentinel counts only when this CR owns it: a squatted or stale-UID
+	// object under a reserved name is not residue of this CR and is left to
+	// its owner or to the garbage collector. The walk below refuses to delete
+	// anything this CR does not own, so a present-but-unowned sentinel that
+	// counted would send every reconcile of a today install into that refusal
+	// -- the shape a next CR deleted and re-created under the same name in
+	// today mode takes, while its old fences still carry the old UID.
+	// Ownership is read off the fetched object, so the exit stays at seven
+	// Gets.
+	//
+	// Adding an object to reconcileA2A ahead of the keys Secret, or to
+	// reconcileA2ANetworkFences ahead of the NATS fence, means adding it here.
+	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
+	// prefix of both renders and is what makes forgetting it red rather than
+	// silent: without the keys Secret below, its writes 3 and 4 fail, and
+	// without the fences every guardrail prefix does. The inject fence is
+	// the one no prefix leaves alone;
+	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip is what reds
+	// without it.
 	sentinels := []a2aTeardownEntry{
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}
@@ -4102,8 +4618,11 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	for _, s := range sentinels {
 		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
 		if err == nil {
-			anyPresent = true
-			break
+			if metav1.IsControlledBy(s.obj, agent) {
+				anyPresent = true
+				break
+			}
+			continue
 		}
 		if client.IgnoreNotFound(err) != nil {
 			return err

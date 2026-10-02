@@ -130,5 +130,25 @@ class TestOptionalFields(HandlerTestCase):
         self.assertEqual(record["message"], "")
 
 
+class TestEnvelope(HandlerTestCase):
+    """Every turn record is self-describing under the structured audit schema."""
+
+    def test_the_record_carries_the_envelope_and_the_principal(self):
+        record = self.emit("agent:start", {"platform": "google_chat", "user_id": EMAIL, "session_id": "sess-1", "message": "hi"})
+        self.assertEqual(record["event_type"], "chat_message_start")
+        self.assertEqual(record["audit_event"], record["event_type"])
+        self.assertEqual(record["severity"], "INFO")
+        self.assertRegex(record["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+        self.assertEqual(record["principal"], AuditRedactor.hmac_hash(EMAIL))
+        self.assertEqual(record["principal"], record["user_id"])
+
+    def test_every_record_is_one_line_of_json(self):
+        with self.assertLogs(handler.logger, level="INFO") as captured:
+            asyncio.run(handler.handle("agent:end", {"response": "line one\nline two", "session_id": "s"}))
+        line = captured.records[0].getMessage()
+        self.assertNotIn("\n", line)
+        self.assertEqual(json.loads(line)["response"], "line one\nline two")
+
+
 if __name__ == "__main__":
     unittest.main()

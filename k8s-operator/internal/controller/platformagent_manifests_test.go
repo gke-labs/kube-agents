@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -1352,6 +1353,28 @@ func TestSafeSandboxEnvOverridesPassesEodRecapFilters(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesSlackUxFlag(t *testing.T) {
+	// The Slack UX flag is read by the gateway's Slack adapter and kanban
+	// notifier, both in this container. Off the allowlist, the documented
+	// `spec.deployment.env` override renders on the CR and never reaches them,
+	// so the feature cannot be turned on at all.
+	custom := []corev1.EnvVar{
+		{Name: "KAGE_SLACK_UX", Value: "1"},
+		{
+			Name: "KAGE_SLACK_UX",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+				Key:                  "k",
+			}},
+		},
+	}
+
+	got := safeSandboxEnvOverrides(custom)
+	if len(got) != 1 || got[0].Name != "KAGE_SLACK_UX" || got[0].Value != "1" || got[0].ValueFrom != nil {
+		t.Errorf("expected only the literal KAGE_SLACK_UX=1 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesFeedbackPromptKnobs(t *testing.T) {
 	// The feedback prompt's whole per-install surface: `feedback_prompt.py`
 	// reads both from the environment on every tick and there is no config
@@ -2428,6 +2451,82 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(fbConf, "Name              tail") {
 		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+// The audit lift: the sidecar recognises a tool_call_audit or chat_message_audit
+// line, captures its JSON object and decodes it into top-level fields, in that
+// order and before the record modifier stamps the record. The regex is checked
+// against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
+// translated to Go's, since the two engines agree on everything else in it.
+// Those lines are frozen here: the test holds the regex to the format as
+// sampled and cannot notice a Hermes release that changes it. That check is a
+// live one after an agent image change: jsonPayload.audit_event in Logs
+// Explorer, a key the broker's own records do not carry, as the observability
+// page says.
+func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
+	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	})
+	fbConf := cm.Data["fluent-bit.conf"]
+	parsers := cm.Data["parsers.conf"]
+
+	order := []string{"Parser        gchat_event", "Parser        hermes_audit_line", "Key_Name      audit_json", "Parser        audit_json", "Name              record_modifier"}
+	last := -1
+	for _, needle := range order {
+		at := strings.Index(fbConf, needle)
+		if at < 0 {
+			t.Fatalf("fluent-bit.conf lacks %q", needle)
+		}
+		if at < last {
+			t.Errorf("%q is out of order in fluent-bit.conf; the lift has to capture before it decodes and decode before the record is stamped", needle)
+		}
+		last = at
+	}
+	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
+		t.Errorf("parsers.conf lacks the json decoder the lift needs; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	}
+
+	var expr string
+	for _, line := range strings.Split(parsers, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "Regex   ^") {
+			expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Regex"))
+		}
+	}
+	if expr == "" {
+		t.Fatal("parsers.conf has no anchored Regex line for hermes_audit_line")
+	}
+	re := regexp.MustCompile(strings.ReplaceAll(expr, "(?<", "(?P<"))
+	const sample = `2026-09-28 15:45:43,391 INFO hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "duration_ms": 53, "result": "{\"ok\": true}", "task_id": "k8s-evt-a9c4f17a", "tool_name": "kanban_create"}`
+	match := re.FindStringSubmatch(sample)
+	if match == nil {
+		t.Fatalf("the audit regex does not match a line Hermes wrote: %q", sample)
+	}
+	captured := match[re.SubexpIndex("audit_json")]
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(captured), &decoded); err != nil {
+		t.Fatalf("the capture is not the JSON object: %v (%q)", err, captured)
+	}
+	if decoded["tool_name"] != "kanban_create" {
+		t.Errorf("decoded record = %v, want the plugin's fields", decoded)
+	}
+	if re.MatchString(`2026-09-28 15:45:43,376 WARNING tools.kanban_event_routing: kanban event routing: {"not": "an audit record"}`) {
+		t.Error("the audit regex matches a line from another logger; only the two audit emitters may be lifted")
+	}
+	if !re.MatchString(`2026-09-28 15:45:43,391 INFO hermes.hook.chat_message_audit: {"audit_event": "chat_message_end"}`) {
+		t.Error("the audit regex does not match the chat_message_audit hook's lines")
+	}
+	// Hermes tags a record emitted on a thread holding a session context with
+	// ` [<session id>]` between the level and the logger name; the tools it
+	// runs inline on the turn thread log that way, and an unmatched line passes
+	// through the sidecar unlifted with no signal.
+	tagged := `2026-09-28 15:45:43,391 INFO [20260928_154543_50074bf0] hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "tool_name": "clarify"}`
+	match = re.FindStringSubmatch(tagged)
+	if match == nil {
+		t.Fatalf("the audit regex does not match a session-tagged line: %q", tagged)
+	}
+	if !strings.HasPrefix(match[re.SubexpIndex("audit_json")], `{"audit_event": "tool_call_end"`) {
+		t.Errorf("the capture on a tagged line is not the JSON object: %q", match[re.SubexpIndex("audit_json")])
 	}
 }
 

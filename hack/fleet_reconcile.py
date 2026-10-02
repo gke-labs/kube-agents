@@ -18,8 +18,10 @@ Each project is acquired from Boskos out of `free` into `reconciling` for the
 minutes the apply takes and released back, so a project a run holds is never
 applied under it and a run arriving mid-apply waits at its own acquire. The
 plan is inspected before it is applied: only creates and in-place updates
-are applied, and a plan with anything else (a destroy, a replace, a forget)
-is refused and named, because nothing this stack declares should ever need
+are applied, plus the one replacement this stack declares on purpose (the
+no-surge pool's, when the lagging minor rolls; `REPLACE_ALLOWED_ADDRESSES`),
+and a plan with anything else (a destroy, another replace, a forget) is
+refused and named, because nothing else this stack declares should ever need
 that on a re-apply, and a plan that does is a code change or an incident a
 person should look at first.
 
@@ -66,6 +68,15 @@ ACTION_CREATE = "create"
 ACTION_UPDATE = "update"
 IGNORED_ACTIONS = ([ACTION_NOOP], [ACTION_READ])
 APPLIED_ACTIONS = ([ACTION_CREATE], [ACTION_UPDATE])
+ACTION_DELETE = "delete"
+REPLACE_ACTIONS = ([ACTION_DELETE, ACTION_CREATE], [ACTION_CREATE, ACTION_DELETE])
+# The one replacement a re-apply may make, by address. seeded-b's no-surge
+# pool is replaced when the lagging minor moves and never updated in place:
+# an in-place update drains the node, the budget planted on it holds that
+# drain for an hour, and the provider times out at thirty minutes; a deletion
+# does not respect the budget, so the replace takes minutes. Everything else
+# that would be replaced or deleted is still a code change or an incident.
+REPLACE_ALLOWED_ADDRESSES = frozenset({"google_container_node_pool.no_surge_pool"})
 
 # Boskos: this script's hold state and owner. A project is held for one apply.
 HOLD_STATE = "reconciling"
@@ -252,16 +263,21 @@ def plan_changes(show_json):
     return changes
 
 
+def _applied(actions, address):
+    return actions in APPLIED_ACTIONS or (actions in REPLACE_ACTIONS and address in REPLACE_ALLOWED_ADDRESSES)
+
+
 def refused_changes(changes):
-    """The changes a re-apply must not make: everything but a create or an in-place update."""
-    return ["%s %s" % ("+".join(actions), address) for actions, address in changes if actions not in APPLIED_ACTIONS]
+    """The changes a re-apply must not make: everything but a create, an in-place update, or the one allowed replace."""
+    return ["%s %s" % ("+".join(actions), address) for actions, address in changes if not _applied(actions, address)]
 
 
 def describe(changes):
     add = sum(1 for actions, _ in changes if actions == [ACTION_CREATE])
     change = sum(1 for actions, _ in changes if actions == [ACTION_UPDATE])
-    refused = sum(1 for actions, _ in changes if actions not in APPLIED_ACTIONS)
-    return "%d to add, %d to change, %d refused" % (add, change, refused)
+    replace = sum(1 for actions, address in changes if actions in REPLACE_ACTIONS and address in REPLACE_ALLOWED_ADDRESSES)
+    refused = sum(1 for actions, address in changes if not _applied(actions, address))
+    return "%d to add, %d to change, %d to replace, %d refused" % (add, change, replace, refused)
 
 
 def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJECT_TIMEOUT_SECONDS):
@@ -424,20 +440,25 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
             # during the release still leaves this project's apply on record.
             _record(p, outcomes, runner, dry_run)
 
-        outcome = boskos_pool.acquire_and_hold(
-            server,
-            owner,
-            HOLD_STATE,
-            lambda project=project: boskos_pool.acquire(server, owner, HOLD_STATE, name=project),
-            visit,
-            release_failures,
-            heartbeat=True,
-        )
+        try:
+            outcome = boskos_pool.acquire_and_hold(
+                server,
+                owner,
+                HOLD_STATE,
+                lambda project=project: boskos_pool.acquire(server, owner, HOLD_STATE, name=project),
+                visit,
+                release_failures,
+                heartbeat=True,
+            )
+        finally:
+            # Merged in a finally, as the pool walk's: a release that failed
+            # before a termination unwound the hold is on the record the run
+            # writes on its way out, and an interrupted project keeps its outcome.
+            if project in release_failures:
+                _merge_release_failure(outcomes, project, release_failures[project])
         if outcome is boskos_pool.NOT_ACQUIRED:
             outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
             _line(project, outcomes[project])
-        elif project in release_failures:
-            outcomes[project] = (OUTCOME_FAILED, release_failures[project])
             _line(project, outcomes[project])
     return outcomes
 
@@ -457,11 +478,27 @@ def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known
         else:
             _record(project, outcomes, runner, dry_run)
 
-    _, release_failures = boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True)
-    for project, reason in release_failures.items():
-        outcomes[project] = (OUTCOME_FAILED, reason)
-        _line(project, outcomes[project])
+    # Merged in a finally, so a release that failed before a termination
+    # unwound the walk is on the record the run writes on its way out.
+    release_failures = {}
+    try:
+        boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True, release_failures=release_failures)
+    finally:
+        for project, reason in release_failures.items():
+            _merge_release_failure(outcomes, project, reason)
     return outcomes
+
+
+def _merge_release_failure(outcomes, project, reason):
+    """A project the termination landed in keeps its interrupted outcome (and
+    its force-unlock hint); the release failure joins its reason. Any other
+    outcome becomes the failure."""
+    outcome, detail = outcomes.get(project) or (None, None)
+    if outcome == OUTCOME_INTERRUPTED:
+        outcomes[project] = (OUTCOME_INTERRUPTED, "%s; %s" % (detail, reason))
+    else:
+        outcomes[project] = (OUTCOME_FAILED, reason)
+    _line(project, outcomes[project])
 
 
 def main(argv=None):
@@ -582,7 +619,7 @@ def _run(args, outcomes, error):
         # in included; the summary says how far the run got.
         report(outcomes)
         interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
-        message = "terminated (%s) after %d project(s)%s; held projects were released" % (
+        message = "terminated (%s) after %d project(s)%s; held projects were released unless named above" % (
             exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
         )
         error.append(message)

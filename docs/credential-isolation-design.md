@@ -111,8 +111,8 @@ checkout the credential holder runs `git` in.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
-OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, and the
-`FEEDBACK_PROMPT_*` switch and delay —
+OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
+`FEEDBACK_PROMPT_*` switch and delay, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or change what code runs; `safeSandboxEnvOverrides` in
@@ -1011,6 +1011,14 @@ place holding cluster credentials, GCP tokens, and chat secrets, and everything 
 stdout leaves the cluster through Cloud Logging. The same rule covers the event watcher in the
 gateway Pod's `agent-api-auth` sidecar: it logs identifiers — cluster, namespace, pod, event
 reason, profile directory — and never a token, a kubeconfig body, or a request header.
+
+The broker's log is one JSON object per line (`JsonLineFormatter` in `credential_proxy.py`):
+the envelope keys and, on the exec route's records, the `tool_execution_audit` fields the site's
+[observability page](site/src/content/docs/concepts/observability.md#cloud-logging) lists, passed
+as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
+mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
+command line out of the record by construction rather than by scrubbing. The `message` beside the
+mapping is the ordinary log text, and keeps to the identifier-over-value rule above.
 
 The exposure to watch when changing this code is **wrapped errors**, not deliberate logging. A
 failure from parsing a profile's `kubeconfig.yaml`, minting a token, or an API server rejecting a

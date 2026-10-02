@@ -229,8 +229,8 @@ func TestSideDoorHandsTheProbeToTheDoor(t *testing.T) {
 		t.Fatal("the composite does not implement ProbeSink; the gateway would offer the door no probe")
 	}
 	want := ConversationState{Active: true, TaskID: "task-1", ExecutorState: lib.StateWorking, Backend: gchatBackend}
-	sink.SetProbe(func(context.Context, string) (ConversationState, error) { return want, nil })
-	report := door.runProbe(context.Background(), injectKeyPrefix+"any")
+	sink.SetProbe(func(context.Context, string, string) (ConversationState, error) { return want, nil })
+	report := door.runProbe(context.Background(), injectKeyPrefix+"any", "")
 	if !report.Active || report.TaskID != want.TaskID || report.ExecutorState != string(want.ExecutorState) ||
 		report.Backend != gchatBackend || report.InjectOnly {
 		t.Fatalf("the door answered %+v, want the probe the composite was handed", report)

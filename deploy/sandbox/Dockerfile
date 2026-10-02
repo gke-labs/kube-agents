@@ -456,16 +456,29 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          skill trees are not staged in this image (see
 #                          deploy/sandbox/entrypoint.sh: everything agents/cluster
 #                          names is under /opt/data/scripts)
+#   inventory_findings.py  the onboarding ranking card's bridge from
+#                          INVENTORY.raw.md to the findings queue
+#                          (governance/inventory_prioritize_sop.md). `extract`
+#                          is stdlib parsing and runs here. `register` and
+#                          `ranked` call the queue on the agent pod's loopback,
+#                          which this container cannot reach, so they exit 13
+#                          and the SOP writes the report from its own scores
+#   findings_queue.py      imported by inventory_findings for the finding
+#                          schema it validates against. Its sqlite3 functions
+#                          take a connection the caller opens, and nothing here
+#                          opens one
 #
 # agents/platform/scripts/test_sandbox_delivery.py holds this list to the agents'
 # instructions: a skill that starts calling a shared script the sandbox does not
 # have fails that test rather than failing in a pod.
 #
-# Deliberately absent, and stubbed below instead: two scripts that cannot run here.
+# Deliberately absent, and stubbed below instead: three scripts that cannot run here.
 # cluster_agent_profile.py and cluster_agent_reconcile.py shell out to
 # `hermes profile create` and write /opt/data/profiles on the agent pod's PVC —
-# cluster_agent_profile.py:325 says so of itself. Leaving the paths empty reads as
-# a broken image; the stub says what is actually true and exits non-zero.
+# cluster_agent_profile.py:325 says so of itself. eod_report_generator.py reads the
+# session database on the agent pod's session volume; its SOP names it for a hand
+# run, and its cron runs it in the agent pod. Leaving the paths empty reads as a
+# broken image; the stub says what is actually true and exits non-zero.
 COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/repo_ref.py \
      agents/platform/scripts/forge.py \
@@ -479,9 +492,12 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      agents/platform/scripts/stall_report.py \
+     agents/platform/scripts/inventory_findings.py \
+     agents/platform/scripts/findings_queue.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
+COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/eod_report_generator.py
 
 # Three things, in one layer.
 #

@@ -45,6 +45,7 @@ import unittest
 import yaml
 
 from tests.testing.common import create_mock_git_repo, get_isolated_test_env
+from tests.testing.release import parse_required_release_images
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
@@ -786,10 +787,12 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
     # reads every step's name. The name classes admit any repository-legal
     # name (dots and underscores included), so an entry cannot slip out of
     # all three lists at once by its spelling; the array's own entries are
-    # counted against the parsed names for the same reason.
+    # counted against the parsed names for the same reason, in
+    # parse_required_release_images, the one copy of that parse. common.sh's
+    # required_release_images_in_text mirrors it for the release gate, and
+    # test_release_common.py pins the two to each other.
     _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([^/:\s]+):\$\{\{ github\.sha \}\}")
     _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([^/@\s]+)@\$")
-    _ARRAY_ENTRY_RE = re.compile(r"^\s*\"([^\"\s]+)\"\s*$", re.M)
 
     def test_the_workflow_builds_and_signs_exactly_the_required_release_images(self):
         """The three lists this workflow and the release ladder share are kept by
@@ -798,13 +801,10 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         refuse every commit; one in the workflow but not the sign loop ships
         unsigned. So the names the steps tag with :<sha> must equal the array,
         and each must be signed once."""
-        common = _COMMON_SH.read_text()
-        block = re.search(r"REQUIRED_RELEASE_IMAGES=\((.*?)\)", common, re.S)
-        self.assertIsNotNone(block, "REQUIRED_RELEASE_IMAGES not found in common.sh")
-        entries = [line for line in block.group(1).splitlines() if line.strip()]
-        required = set(self._ARRAY_ENTRY_RE.findall(block.group(1)))
-        self.assertEqual(len(required), len(entries), "an entry of REQUIRED_RELEASE_IMAGES was not read (unquoted, or two on one line)")
-        self.assertTrue(required)
+        try:
+            required = set(parse_required_release_images(_COMMON_SH.read_text()))
+        except ValueError as err:
+            self.fail(str(err))
         built = set()
         signed = []
         for job in self.jobs.values():

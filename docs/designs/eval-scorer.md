@@ -229,9 +229,9 @@ the JSON, derived from `outcome`, so a reader that only knows the boolean sees n
 not green.
 
 **Why the aggregate has a sample floor and the per-case rungs do not.** A flat margin is a
-suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 19/20
-admission bar the blocking threshold is 0.85, so a run of `n` scored repetitions survives
-`floor(n × 0.15)` failures — which is **zero** below `n = 7`. With one admitted case at three
+suite-scale rule, and at small `n` it measures luck. Against a baseline screened at the 18/20
+admission bar the blocking threshold is 0.80, so a run of `n` scored repetitions survives
+`floor(n × 0.20)` failures — which is **zero** below `n = 5`. With one admitted case at three
 repetitions, `n` is 3: one flaky repetition is 2/3 = 0.667, and the job reds. That is
 `agent-kanban-smoke`'s failure mode — one bad run reds an unchanged pull request — reintroduced
 through the aggregate on the day the first case is screened in, directly contradicting what the
@@ -334,8 +334,12 @@ deterministic checks alone (rungs 1–4), and a case's rate is `passes / runs` o
 that were scored: `blocked` and `infra` repetitions are counted in the record and kept out of the
 rate. Admission reads that rate over a window — the newest whole records at the current version key
 pooled until they hold `EVAL_ADMISSION_MIN_RUNS` runs (20; seven nightlies at three repetitions
-give 21) — against `EVAL_ADMISSION_RATE` (0.95), and the presubmit's aggregate rule compares the
-same kind of rate against `main`'s. Nothing judged enters it.
+give 21) — against `EVAL_ADMISSION_RATE` (0.90 since 2026-09-29: the roster page's bar of ≥ 90 %
+of graded repetitions, set from the store's night-to-night movement, #1493; 0.95 before that,
+a number nobody had chosen from data), and the presubmit's aggregate rule compares the same
+kind of rate against `main`'s. Nothing judged enters it. Under `EVAL_ADMISSION_MODE=roster`
+the rate is advisory: it changes the record's sentence beside the roster's answer, not which
+cases block.
 
 **Judged quality is advisory.** `OutcomeValidity` and the other GEval metrics never fail a
 repetition on their own; rung 6 reads the mean of one metric against `main`'s pooled mean with a
@@ -905,7 +909,7 @@ recomputed on every read.
    **current** key, walks them newest-first, and sums `runs` and `passes` until it holds
    `EVAL_ADMISSION_MIN_RUNS` (default 20).
 3. The case is admitted when that pool has ≥ 20 runs **and** a rate ≥ `EVAL_ADMISSION_RATE`
-   (default 0.95).
+   (default 0.90: 18 of 20, or 19 of a 21-run window).
 
 So "the case admits itself" is not a transition anybody writes — it is the same pure function
 returning a different answer once the file crossed a threshold.
@@ -1197,7 +1201,7 @@ Reported distinctly, because only one of them is a problem with the case:
 | Nothing at this key     | `no screening evidence for this case yet`           |
 | Evidence at an old key  | `stale: …`, never compared against                  |
 | Fewer than the min runs | `collecting: 9/9 runs recorded … 11 more needed`    |
-| At the bar, below rate  | `screened at 17/21 …, below the bar of 95% over 20` |
+| At the bar, below rate  | `screened at 17/21 …, below the bar of 90% over 20` |
 
 The middle two are the store filling up, which is the ordinary state of a new case and of every
 case after a version bump. During that window nothing is admitted on evidence, so for an unlisted
@@ -1560,7 +1564,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition
   stricter, so the flat margin stays for its legibility. Two things to watch when it is replaced:
-  `30` is not load-bearing except as "enough to tolerate four failed repetitions at the 0.85
+  `30` is not load-bearing except as "enough to tolerate six failed repetitions at the 0.80
   threshold", and the advisory note must keep reporting when the rate fell below the margin, or a
   rule that never fires goes unnoticed. The rule is still unarmed by default above the floor
   (`EVAL_AGGREGATE_ARMED`): the margin is measured now, so what remains is the decision, taken in

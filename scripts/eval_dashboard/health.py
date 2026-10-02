@@ -20,7 +20,8 @@ periodics' readings (`--periodics-dir`, scripts/eval_dashboard/periodics.py)
 -- health.json out (abridged; SCHEMA.md has every key)::
 
     {state, since, cause, failing_cases, evidence, advice, slow, pool,
-     fixture_state, pool_state, periodics, periodics_read, periodics_since,
+     fixture_state, pool_state, periodics, periodics_read, periodics_runs,
+     periodics_streaks, periodics_since,
      metrics, generated_at}
 
 `state` is GREEN, DEGRADED or OUTAGE. The rules are the module-level
@@ -2229,7 +2230,15 @@ def adjudicate(
     # The wall clock, as the pool note's: a job that stopped is measured
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
-    watched = periodics.assess(readings, pool_clock, prev_notes)
+    # Per job, consecutive failed checks (and per project, for the message),
+    # so a ten-minute job's single flap is not news and two in a row are. The
+    # counts live in the previous health.json; a tick that could not fetch it
+    # starts them over, which would hide a told, still-failing job for a tick
+    # or two, so on that tick the thresholds are off: a failed build is a note,
+    # and the poster, which keys on the verdict, does not re-announce one it
+    # has told.
+    streaks = periodics.streaks(readings, (prev or {}).get("periodics_streaks"))
+    watched = periodics.assess(readings, pool_clock, prev_notes, streaks=streaks if prev is not None else None)
     evidence.extend(periodics.evidence(note) for _, note in sorted(watched.items()))
     # Per job: a job read this tick keeps its start only while it is noted;
     # a job with no reading this tick keeps whatever start it had.
@@ -2264,6 +2273,8 @@ def adjudicate(
         "pool": pool,
         "periodics": watched,
         "periodics_read": sorted(readings),
+        "periodics_runs": periodics.runs(readings),
+        "periodics_streaks": streaks,
         "periodics_since": periodics_since,
         "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,

@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; nor yet the pieces "Sessions by default" names as transition work: the `/session` opt-in, the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, and the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
 
 ## Purpose
 
@@ -283,10 +283,21 @@ delegated, which is also what keeps the per-conversation pod cost small.
 
 Transition. `platform` remains the default addressee until the session can hand platform
 topics on to the platform agent without the user noticing. The route is a deploy-time
-setting today (`A2A_DEFAULT_ADDRESSEE`), and the Delegate flow covers one task; a
-per-conversation opt-in - a `/session` command, deterministic, resolved with the other
-slash commands and naming a route rather than a handle - is not implemented and lands
-with the transition. The default flips when the delegation primitive lands: the session's request to
+setting today (`A2A_DEFAULT_ADDRESSEE`), and the Delegate flow covers one task; the
+per-conversation opt-in is `/session`: deterministic, resolved before status, stop and steer,
+naming a route rather than a handle. A bare `/session` marks the conversation session-routed
+and the next message opens the pod; `/session <text>` marks it and runs the text as the first
+turn; `/session off` releases the incarnation (refused while a session task runs; stop it
+first) and re-homes to the default addressee. The conversation's `contextId` is unchanged by
+either. Without a spawner the on-forms answer with a note and change nothing, and the way back
+still works; on an install whose default is already the session route the bare forms answer
+with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <text>` while a task is still running turns the route on and holds the text, unless the running task is the session's own, in which case the text steers it as a plain message would. On Slack a leading slash belongs to the Slack client, which
+refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
+stripped before the gateway reads the text, and in a channel thread the next message needs the
+mention too: the adapter forwards an unmentioned reply only once a task has started there, and
+the ack says so. The way back is answered even on an install whose spawner has since been disarmed, so a
+record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
+not the taught interface. The default flips when the delegation primitive lands: the session's request to
 the gateway to mint a child task to a named addressee, the gateway's allowlist check and
 mint, the relay of the child's events into the conversation, and the wake-up turn on the
 child's terminal. The session's bus grants do not change for it (its only subscribe grant is
@@ -679,9 +690,14 @@ not be silent about it.
   come back the way the relay posts them - the placeholder, the rolling progress line's edits,
   the deliverable, the terminal - because what a verifier grades has to be what a customer would
   have read. With `probe=1` the same read is also the **read route**: a pure read of the
-  conversation's session record and of the active task's stream, which mutates nothing - no
-  heal, no lock, no post, no publish, no write. It returns the record's active task with its
-  `submittedAt`, age and `detached` flag, the latest executor state the stream shows (none,
+  conversation's session record and of the active task's stream (or, with `task=`, of a named task the record owns, its active one or one of the last fifty it ran; another conversation's task, or one older than that, is not read; the named
+  task's stream whether or not the record still holds it as active - the relay clears the active
+  task when it posts the terminal, and that is how a harness reads a finished run's trace after
+  the release), which mutates nothing - no
+  heal, no lock, no post, no publish, no write. It returns the id of the task it was asked about
+  (the active one when none was named), with its `submittedAt`, age and `detached` flag when that
+  task is the record's active one (a `task=`
+  read of a task the record no longer holds as active carries none of the three), the latest executor state the stream shows (none,
   `submitted`, `working`, or a terminal, with `final`), whether `working` was ever on the stream
   (`reachedWorking`, read off the fold's history, because two events can land between a
   caller's reads and the latest state alone would hide the one that says a model ran) and, when
@@ -689,7 +705,12 @@ not be silent about it.
   fold of it: whose word the terminal is (`terminalSource`, the executor's for a terminal on the
   task's events subject and the supervisor's for one on its supervisor subject - distinct from
   the gateway's own source, which says it could not publish the task at all), the result
-  artifact's text and the terminal's status message; plus the conversation's last post, the
+  artifact's text and the terminal's status message; whenever the stream was read, final or
+  not, the task's tool-call trace (`activity`, the data parts of the activity artifact in
+  arrival order per artifact, which is stream order for an executor that appends to one artifact
+  id, present as `[]` when the executor called nothing and absent when no stream was
+  read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
+  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed
@@ -1159,7 +1180,7 @@ because the chat backend beside it is still good.
 
 Not in stage 2: the classifier, the LCD permissions tool, `grants`, anything that makes
 `authority` decision-grade, and the transition work "Sessions by default" names (the
-`/session` opt-in, the gateway-minted child task, the `chat` profile's skills, the warm
+gateway-minted child task, the `chat` profile's skills, the warm
 pool). (The gchat and slack adapters were on this list until 9/5 and 9/4 respectively;
 each now has its own section above.)
 
