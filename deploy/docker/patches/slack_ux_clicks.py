@@ -116,6 +116,9 @@ ANSWERED_MAX = 512
 #: presenter's choice segment, copied because that module is not imported here.
 INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
 
+#: Struck-through text, ``~like this~``: taken back, so removed before a reply is matched.
+TYPED_STRUCK = re.compile(r"~[^~\n]+~")
+
 #: Inline markup a reply can wrap the word in, dropped before it is matched.
 TYPED_MARKUP = str.maketrans("", "", "*_~`'\"‘’“”")
 
@@ -311,7 +314,7 @@ def _option_texts(message: dict) -> frozenset[tuple[str, str]]:
 def _typed_apply(text: str, options: frozenset[tuple[str, str]]) -> bool:
     """Whether ``text`` is one of the call to action's forms: bare, or a button's, where the text
     after the colon is that option's own in ``options``. A guess at what the agent applies."""
-    text = text.translate(TYPED_MARKUP)
+    text = TYPED_STRUCK.sub("", text).translate(TYPED_MARKUP)
     typed = TYPED_APPLY.match(text, TYPED_LEAD.match(text).end())
     if not typed or not typed.group(0).endswith(":"):
         return bool(typed)

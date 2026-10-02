@@ -822,6 +822,23 @@ class RuntimeTest(unittest.TestCase):
                 self._incident(adapter)
                 check(adapter)
 
+    def test_a_struck_through_apply_does_not_drop_the_click(self):
+        for text, check in (("~apply B~", self._runs), ("~apply A~ apply B", self._drops), ("~no~ apply B", self._drops),
+                            ("~no~ apply B ~now~", self._drops)):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                check(adapter)
+
+    def test_a_colon_form_asked_as_a_question_does_not_drop_the_click(self):
+        for text in ("Apply B: Restore the secret?", "apply B: will it restart the pods?"):
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._options_incident(adapter, "apply Option A: Raise the limit", "apply Option B: Restore the secret")
+                self._runs(adapter)
+
     def test_a_typed_apply_also_sent_to_the_channel_drops_the_click(self):
         adapter = _Adapter(replies=[
             {"type": "message", "subtype": "thread_broadcast", "user": "U2", "text": "apply B", "ts": "223.000"},
