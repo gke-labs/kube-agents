@@ -3333,17 +3333,24 @@ def test_the_leased_repository_is_matched_case_insensitively(token, github, leas
     assert _sibling_check().verify(5.0).status == "pass"
 
 
-def test_a_space_joined_stamp_is_refused_for_its_shape(token, github, lease, monkeypatch):
-    """`2026-08-21 08:00:00Z` parses and has a time of day; it is still not the
-    shape the script writes, and the reason says that and not something the
-    stamp does not lack."""
-    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-21 08:00:00Z")
+@pytest.mark.parametrize(
+    "stamp",
+    ["2026-08-21 08:00:00Z", "2026-08-21T08Z", "2026-08-21T08:00:00"],
+    ids=["space-joined", "hour-only", "zone-less"],
+)
+def test_a_stamp_outside_the_scripts_shape_is_refused_for_its_shape(token, github, lease, monkeypatch, stamp):
+    """Each of these parses (`_parse_github_time` reads all three as 08:00Z)
+    and each is a shape the script never writes; the hour-only and zone-less
+    ones carry a `T`, which is why the test is the shape and not the letter.
+    The reason says the shape, not something the stamp does not lack."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, stamp)
     _stash_pr_report()
     _sibling_routes(github)
     res = _sibling_check().verify(5.0)
     assert res.status == "fail", res.reason
-    assert "EVAL_LEASE_STARTED_AT='2026-08-21 08:00:00Z' is not in the script's YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window" in res.reason
+    assert f"EVAL_LEASE_STARTED_AT={stamp!r} is not in the script's YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window" in res.reason
     assert "no time of day" not in res.reason
+    assert "is not an ISO-8601 stamp" not in res.reason
 
 
 def test_the_sibling_rule_is_off_unless_the_case_sets_it(token, github, lease):

@@ -515,7 +515,8 @@ one used and edits the pull request already open on it. The stamp cannot decide 
 moves on a comment as readily as on a push — so the check also reads the head commit, and fails a
 pull request that changes no files or whose head commit predates the run. That is the first of two
 rules, and on a hand run the only one: rep 2 pushing onto rep 1's branch moves the head commit,
-rep 2 quoting rep 1's URL does not. Inside an eval job the second rule, two paragraphs down, passes
+rep 2 quoting rep 1's URL does not. Inside an eval job, and only for a case that sets
+`accepts_in_job_sibling`, the second rule, two paragraphs down, passes
 the quoted sibling too and names itself in the reason. A Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run
 from `main` only) closes the agent's leftovers in free pool projects every ten minutes and deletes
 their branches (a leftover branch refuses an identical fix "nothing to commit"), so a lease
@@ -524,7 +525,7 @@ A pull request closed without being merged is rejected: closing moves `updated_a
 what the case grades is that the fix went out. `owner: gke-agentic` pins the organisation, a fair exact
 match across every pool project that breaks loudly if the organisation ever moves.
 
-The head commit is one of two ways to pass, and the check names which one led in the first word of
+The head commit is one of two ways to pass, the other an option two seats set, and the check names which one led in the first word of
 its reason (`own-head-commit` or `in-job-sibling`), so the run record's `verification_report` and
 anything reading it can tell them apart. The second is per case: a check takes it by setting
 `accepts_in_job_sibling`, and pdb-remediation-pr and rca-remediation-pr do, because its cost (below)

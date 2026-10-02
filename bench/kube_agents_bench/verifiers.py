@@ -411,6 +411,8 @@ LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 # two names to the script's exports.
 LEASED_REPO_ENV = "EVAL_LEDGER_REPO"
 LEASE_START_ENV = "EVAL_LEASE_STARTED_AT"
+# The one shape `hack/ci-eval-pr.sh` writes for it; the sibling rule refuses any other.
+_LEASE_STAMP_SHAPE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"
 # How far before a repetition's start the window may begin and still be this
 # job's. The script stamps it at its own start, and a nightly's last
 # repetition runs hours later, never a day; a stamp older than this came from
@@ -2050,11 +2052,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"{LEASE_START_ENV}={lease_raw!r} is not an ISO-8601 stamp, so it is "
                 "read as no window"
             )
-        elif lease_start is not None and "T" not in lease_raw.upper():
-            # A bare date parses as midnight and sits inside the day's bound,
-            # and a date and time joined by a space parses too. The script
-            # writes one shape (`date -u +%Y-%m-%dT%H:%M:%SZ`), so any other
-            # is not its stamp and is refused for the shape, named as such.
+        elif lease_start is not None and not re.fullmatch(_LEASE_STAMP_SHAPE, lease_raw):
+            # The script writes one shape (`date -u +%Y-%m-%dT%H:%M:%SZ`).
+            # Other stamps parse and mean something else: a bare date is
+            # midnight, a date and time joined by a space is the same instant
+            # in another spelling, an hour-only `T08Z` is the top of the hour,
+            # and a zone-less time is read as UTC whatever the writer meant.
+            # So the shape is tested, not the letter T, and any other is
+            # refused for the shape, named as such.
             window_fault = (
                 f"{LEASE_START_ENV}={lease_raw!r} is not in the script's "
                 "YYYY-MM-DDTHH:MM:SSZ form, so it is read as no window"

@@ -213,10 +213,12 @@ verification_spec:
       # behind (#1755, and `test_no_task_still_grades_a_pull_request_by_substring`
       # refuses the old shape). This resolves the URL the report names through
       # GitHub and requires a pull request that is not closed unmerged and
-      # either carries this run's own head commit or, inside an eval job
-      # (#2016 step 3), was opened in the leased repository by an earlier
-      # repetition of the same job; a hand run has no lease window, so only
-      # the first applies there.
+      # carries this run's own head commit. The in-job sibling rule (#2016
+      # step 3: a pull request an earlier repetition of the same job opened
+      # in the leased repository) is an option a case sets with
+      # `accepts_in_job_sibling`; pdb-remediation-pr and rca-remediation-pr
+      # do, this case does not, so here a repetition that quotes an earlier
+      # one's pull request fails, in a job and by hand alike.
       type: pull_request_opened
       # Any organisation, deliberately, where the remediation cases pin
       # `gke-agentic`: this case is also run by hand against the dev install,
