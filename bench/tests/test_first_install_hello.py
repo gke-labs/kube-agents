@@ -271,6 +271,13 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " Happy to follow your runbooks.",
         " I'll use your runbooks.",
         " Many teams keep runbooks, and I'll follow your runbooks.",
+        " Many thanks for installing me, happy to follow your runbooks.",
+        " With many alerts firing, I plan to apply your runbooks.",
+        " Most of all, I want to use your runbooks.",
+        " I've got many ideas, and I use runbooks to act on them.",
+        " Like many teams, we'll follow your runbooks.",
+        " Most clusters look healthy, and happy to follow your runbooks.",
+        " Like most teams, happy to follow your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
@@ -289,6 +296,12 @@ def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise)
         " Many teams use runbooks for on-call.",
         " Most people follow their own runbooks.",
         " They apply runbooks during incidents.",
+        " If you use runbooks, share them here.",
+        " You probably use runbooks already.",
+        " Your team uses runbooks.",
+        " If your team already follows runbooks, share them here.",
+        " SREs use runbooks.",
+        " Engineers on your team follow runbooks.",
     ],
 )
 def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case, aside):
@@ -303,10 +316,18 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
     "promise",
     [
         " I'll stick to your runbooks.",
-        " Like most teams, happy to follow your runbooks.",
+        " I'll" + " x" * 150 + " follow your runbooks.",
     ],
 )
 def test_the_promise_safeguards_known_limits_pass_it(case, promise):
     example = _example(case)
     reply = example.replace(INVITATION, INVITATION + promise)
     assert "no-runbook-promise" not in _failing(case, reply)
+
+
+# The length limit is the 300-character bound, not the filler: under it, the same promise fails.
+@pytest.mark.parametrize("case", CASES)
+def test_the_promise_safeguard_holds_a_promise_inside_its_bound(case):
+    example = _example(case)
+    reply = example.replace(INVITATION, INVITATION + " I'll" + " x" * 140 + " follow your runbooks.")
+    assert "no-runbook-promise" in _failing(case, reply)

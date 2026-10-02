@@ -181,15 +181,17 @@ verification_spec:
   # does. The invitation must name runbooks, so no-stacked-asks only catches a
   # runbook sentence with a "?"; this catches the promise itself: follow,
   # apply or use as a verb (not "useful", "users" or "used to"), then up to
-  # three words, then runbooks. A clause whose subject is other people
-  # ("many teams use runbooks") promises nothing, so a subject word between
-  # the clause start and the verb clears it; "I'll" or "I will" restarts the
-  # clause, so "teams keep runbooks, and I'll follow your runbooks" still
-  # fails. The 300-character bound keeps the scan linear. Known limits, left
-  # to the judge's expected output and the prompt rule: another verb ("I'll
-  # stick to your runbooks"), a subject word ahead of a subjectless promise
-  # ("Like most teams, happy to follow your runbooks"), or more than 300
-  # characters between the clause start and the verb passes.
+  # three words, then runbooks. A clause whose subject is other people or the
+  # reader ("many teams use runbooks", "if you use runbooks") promises
+  # nothing, so a subject word between the clause start and the verb clears
+  # it. A first-person opener ("I'll", "we will", "I plan", "me") or a
+  # subjectless "happy/glad/ready/keen to" restarts the clause, so "teams
+  # keep runbooks, and I'll follow your runbooks" still fails. A scan stops
+  # at the next restart, whose own scan covers the rest, and runs at most 300
+  # characters; together they keep it linear. Known limits, left to the
+  # judge's expected output and the prompt rule: another verb ("I'll stick to
+  # your runbooks"), or more than 300 characters between the clause start and
+  # the verb, passes.
   - name: no-runbook-promise
     role: safeguard
     severity: recoverable
@@ -197,7 +199,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?:\A|[.!?…;:\n]|\bi(?:''ll| will|''d| would| can|''m| am)\b)(?:(?!\b(?:teams|people|they|others|many|most|everyone|folks)\b)[^.!?…;:\n]){0,300}?\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|us(?:e|es|ing))\s+(?:[\w''’-]+\s+){0,3}run[ -]?books?\b'
+        - '(?:\A|[.!?…;:\n]|(?=\b(?:(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|me\b|(?:happy|glad|ready|keen) to\b)))(?:(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:\n](?:(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|me\b|(?:happy|glad|ready|keen) to\b))[^.!?…;:\n]){0,299}?)??\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|us(?:e|es|ing))\s+(?:[\w''’-]+\s+){0,3}run[ -]?books?\b'
 
   - name: claims-no-save
     role: safeguard
