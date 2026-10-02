@@ -280,6 +280,8 @@ _ABBREVIATION = re.compile(r"\b(?:e\.g|i\.e|vs|etc|a\.m|p\.m)\.", re.IGNORECASE)
 # What trails a bold lead whose terminal punctuation sits outside the bold.
 _LEAD_TRAIL = ".!? \t"
 _TERMINAL = ".!?"
+# A markdown link; chat shows its text, not its target.
+_MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 
 
 def _delivered_results(final_message: str) -> list[str]:
@@ -313,8 +315,9 @@ class AnswerFirstVerifier(BaseVerifier):
     normalization drops the ``**`` this check is partly about.
 
     Every delivered result must pass: the lead is a bold span opening the
-    result and holding one whole sentence; no ATX heading anywhere; at most ``max_chars`` characters and
-    ``max_sentences`` sentences, a bullet counting as one; and no sentence
+    result and holding one whole sentence; no ATX heading anywhere; at most
+    ``max_chars`` characters as chat shows them, a markdown link counting as
+    its text, and ``max_sentences`` sentences, a bullet counting as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
     reads ("the cluster is healthy", "in summary"). Restatement in other words
@@ -366,8 +369,9 @@ class AnswerFirstVerifier(BaseVerifier):
             rest = after.lstrip(_LEAD_TRAIL)
         if _ATX_HEADING.search(result):
             defects.append("carries a section heading")
-        if len(result) > self.max_chars:
-            defects.append(f"{len(result)} characters, over {self.max_chars}")
+        shown = len(_MARKDOWN_LINK.sub(r"\1", result))
+        if shown > self.max_chars:
+            defects.append(f"{shown} characters, over {self.max_chars}")
         later = _sentences(rest)
         count = len(later) + (lead is not None)
         if count > self.max_sentences:

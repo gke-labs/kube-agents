@@ -107,6 +107,13 @@ def test_abbreviations_end_no_sentence():
     assert outcome.success, outcome.reason
 
 
+def test_a_link_counts_as_its_text():
+    url = "https://console.cloud.google.com/kubernetes/clusters/details/" + "x" * 600
+    assert _run(f"**The [cluster]({url}) is fine.** All three nodes report False.").success
+    long = f"**The [{'cluster ' * 80}]({url}) is fine.** All three nodes report False."
+    assert "characters, over 600" in _run(long).reason
+
+
 def test_the_caps_count_characters_and_sentences():
     long = "**It is fine.** " + "Evidence sentence. " * 40
     assert "characters, over 600" in _run(long).reason
