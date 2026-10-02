@@ -221,6 +221,10 @@ _plans: OrderedDict[tuple, _Plan] = OrderedDict()
 _lapsed: OrderedDict[tuple, list] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
+#: ``(channel, thread) -> suspended`` for a card waiting after a restart, with
+#: no plan to hold it: :func:`_settle_orphan` sends the legacy setter a clear,
+#: and :func:`set_thread_status` reads this once to send the wait instead.
+_orphan_waits: OrderedDict[tuple, str] = OrderedDict()
 
 
 def enabled() -> bool:
@@ -275,10 +279,10 @@ async def set_thread_status(
     caller only hands over when the SDK has Agent Sessions.
     """
     wanted = _status.session_status(status)
+    key = (str(chat_id), str(thread_ts))
     if wanted == _status.SESSION_CLOSED:
         # A Planning Agent turn ends with a clear; the thread's plan outlives it.
-        wanted = _plan_session(str(chat_id), str(thread_ts)) or wanted
-    key = (str(chat_id), str(thread_ts))
+        wanted = _plan_session(*key) or _orphan_waits.pop(key, "") or wanted
     sent = _sessions.get(key)
     now = time.monotonic()
     if sent and sent[0] == wanted and (
@@ -822,8 +826,13 @@ async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None
     if not (key[0] and key[1]) or setter is None or (sent and sent[0] == _status.SESSION_PROCESSING):
         return
     chat_id, thread_ts = key
-    phrase = "" if wanted == _status.SESSION_CLOSED else wanted
+    # The legacy setter takes free text, so it gets only a clear, as from
+    # :func:`_session`; the Agent Sessions path turns it back into the wait.
+    if wanted == _status.SESSION_SUSPENDED:
+        _remember(_orphan_waits, key, wanted, SESSIONS_MAX)
+    else:
+        _orphan_waits.pop(key, None)
     try:
-        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, phrase, PLAN_STATUS_LABEL)
+        await setter(chat_id, str(sub.get("team_id") or ""), thread_ts, "", PLAN_STATUS_LABEL)
     except Exception as exc:  # noqa: BLE001 — cosmetic
         logger.debug("slack_ux_status: setting the session status after a restart failed: %s", exc)

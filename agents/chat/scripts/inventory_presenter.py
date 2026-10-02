@@ -274,10 +274,12 @@ ALSO_FOUND = re.compile(
 #: runs split one run of spaces every way before failing.
 ROLLUP_MARK = re.compile(
     r"\b\d+\s+" + MORE_WORD + r"\b|\b" + MORE_WORD + r"(?:\s+" + FINDINGS_WORD + r")?\s*(?::\s*)?\d|\balso found\b"
-    r"|\b\d+\s+(?:critical|high|major|medium|moderate|minor|low)" + SEVERITY_SUFFIX + r"(?![\w-])"
-    r"|" + WHOLE + r"\d+\s+" + FINDINGS_WORD + r"[^.:]{0,200}:",
+    r"|\b\d+\s+(?:critical|high|major|medium|moderate|minor|low)" + SEVERITY_SUFFIX + r"(?![\w-])",
     re.IGNORECASE,
 )
+#: :data:`ROLLUP_MARK`'s colon form, which marks one only when the count is not
+#: an offer's (:func:`_offered`): not "I can open 2 issues: one per cluster".
+COLON_MARK = re.compile(WHOLE + r"\d+\s+" + FINDINGS_WORD + r"[^.:]{0,200}:", re.IGNORECASE)
 #: A findings count, its digits in group "n".
 LOOSE_COUNT = r"(?P<n>\d+)\s+" + FINDINGS_WORD
 #: A roll-up worded as a sentence: "also" or "plus" up to one word before a
@@ -338,6 +340,11 @@ OFFER_MODAL = re.compile(
     re.IGNORECASE,
 )
 OFFER_VERB = frozenset({"fix", "open", "patch", "remediate", "address", "resolve", "handle"})
+#: The verbs that make a count before a colon an offer, with :data:`OFFER_MODAL`
+#: before them: "Shall I raise 2 items: ...".
+OFFER_COLON_VERB = OFFER_VERB | {"file", "raise", "create"}
+#: The verb, after an optional "also", just before an offered count.
+OFFER_TAIL = re.compile(r"(?:\balso\s+)?\b(?P<verb>[a-z]+)\s+$", re.IGNORECASE)
 #: How far back from "also" :data:`OFFER_MODAL` reads.
 OFFER_LOOKBACK = 24
 #: How far back from a count :func:`_loose_rollup` reads, so a long paragraph of
@@ -409,6 +416,21 @@ def _loose_rollup(text: str, listed: int | None = None) -> bool:
     return False
 
 
+def _offered(text: str, start: int) -> bool:
+    """Whether the count at ``start`` is an offer's: a modal, maybe "also", and a verb of :data:`OFFER_COLON_VERB`."""
+    before = text[max(0, start - OFFER_LOOKBACK) : start]
+    tail = OFFER_TAIL.search(before)
+    if not tail:
+        return False
+    modal = OFFER_MODAL.search(before[: tail.start()])
+    return bool(modal) and bool(modal.group("always") or tail.group("verb").lower() in OFFER_COLON_VERB)
+
+
+def _marked(text: str) -> bool:
+    """Whether ``text`` has a :data:`ROLLUP_MARK`, or a :data:`COLON_MARK` that is not an offer's."""
+    return bool(ROLLUP_MARK.search(text)) or any(not _offered(text, m.start()) for m in COLON_MARK.finditer(text))
+
+
 def _restated(text: str, term: re.Match, listed: int | None) -> bool:
     """Whether roll-up ``term`` counts the listed ones: "these" or "those" before a count they can hold."""
     if listed is not None and int(term.group(1)) > listed:
@@ -425,7 +447,7 @@ def _rollup_count(text: str, listed: int | None = None) -> int | None:
     (:data:`ROLLUP_MARK`, or a roll-up worded as a sentence,
     :func:`_loose_rollup`, given the ``listed`` count) has none.
     """
-    if not ROLLUP_MARK.search(text) and not _loose_rollup(text, listed):
+    if not _marked(text) and not _loose_rollup(text, listed):
         return None
     more = [int(n) for n in MORE_TOTAL.findall(text)]
     if more:
@@ -628,7 +650,7 @@ class _Shape:
             total = len(items)
         # Never fewer than the report lists.
         self.total = max(total, len(items))
-        self.ask = ASK_ALL.format(count=self.total) if rollup and not self.closing and self.total > len(self.top) else ""
+        self.ask = ASK_ALL.format(count=self.total) if rollup is not None and tail[-1] is rollup and self.total > len(self.top) else ""
 
 
 def _shape(report: str) -> _Shape | None:

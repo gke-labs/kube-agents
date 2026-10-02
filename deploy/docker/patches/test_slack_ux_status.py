@@ -319,6 +319,17 @@ class _Adapter:
         return self.client.calls
 
 
+class _LegacyAdapter(_Adapter):
+    """An adapter whose SDK predates Agent Sessions: upstream's free-text setter."""
+
+    def __init__(self):
+        super().__init__()
+        self.texts = []
+
+    async def _set_thread_status(self, chat_id, team_id, thread_ts, status, fail_label):
+        self.texts.append(status)
+
+
 class _RuntimeCase(unittest.TestCase):
     def setUp(self):
         importlib.reload(runtime)
@@ -741,6 +752,13 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "blocked"))
         _run(runtime.settle_row(adapter, _sub(), "completed"))
         self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_a_wait_after_a_restart_sends_the_legacy_setter_only_a_clear(self):
+        # Without Agent Sessions upstream's setter shows its text as is.
+        adapter = _LegacyAdapter()
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.texts, ["", ""])
 
     def test_a_restart_leaves_running_and_retried_cards_alone(self):
         adapter = _Adapter()

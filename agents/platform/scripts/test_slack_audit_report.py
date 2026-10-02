@@ -275,6 +275,7 @@ class HeadlineFromIssueTest(unittest.TestCase):
         for line, gap in (
             ("Security audit: 7 findings across 3 clusters (1 skipped, 2 unreachable).", "1 cluster skipped, 2 clusters unreachable."),
             ("Security audit: 7 findings across 3 clusters (2 new and 1 skipped).", "1 cluster skipped."),
+            ("Security audit: 7 findings across 3 clusters, 1 skipped.", "1 cluster skipped."),
             ("Security audit: 7 findings across 3 clusters (2 new but 1 unreachable).", "1 cluster unreachable."),
             ("Security audit: 7 findings across 3 clusters (2 new and seeded-c skipped).", "seeded-c skipped."),
             ("Security audit: 7 findings across 3 clusters; skipped: seeded-d (no credentials).", "Skipped: seeded-d (no credentials)."),
@@ -679,7 +680,12 @@ class HeadlineFallbackTest(unittest.TestCase):
 
 class LedgerLineTest(unittest.TestCase):
     def test_a_ledger_url_wrapped_onto_its_own_line_is_not_the_line(self):
-        for report in (f"{LINE} —\n{LEDGER}", f"{LINE}\nLedger:\n<{LEDGER}>"):
+        for report in (
+            f"{LINE} —\n{LEDGER}",
+            f"{LINE}\nLedger:\n<{LEDGER}>",
+            f"{LINE} —\n[#231]({LEDGER})",
+            f"Here's the 2026-10-02 security audit.\n{LINE}\nLedger: {LEDGER}",
+        ):
             with self.subTest(report=report):
                 self.assertEqual(sar.ledger_ref(report), REF)
                 self.assertEqual(sar._ledger_line(report), LINE)

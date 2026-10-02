@@ -324,6 +324,10 @@ class PresentTest(unittest.TestCase):
                 self.assertTrue(out.endswith(f"\n\nAsk me to see all {total}.\n"), out)
                 self.assertNotIn(tail, out)
 
+    def test_a_roll_up_after_a_closing_line_becomes_the_ask(self):
+        out = inventory_presenter.present(TWO_ITEMS + "Fixing the first two clears most alerts.\n\nAlso found: 18 more items.\n")
+        self.assertTrue(out.endswith("\n\nFixing the first two clears most alerts.\n\nAsk me to see all 20.\n"), out)
+
     def test_unparseable_reports_are_unchanged(self):
         for report in (
             "",
@@ -628,6 +632,9 @@ CARD_TOTALS = (
     ('Once these are merged, 2 issues remain.', 2),
     ('I also recommend fixing 2 issues before the upgrade.', 2),
     ("I'd also prioritize fixing 2 issues first.", 2),
+    ('If you want, I can open 2 issues: one per cluster.', 2),
+    ('I can also file 2 problems: one for each namespace.', 2),
+    ('Shall I raise 2 items: the quota and the PDB?', 2),
     ('Also note that 2 issues block the upgrade.', 2),
     ('I also suggest fixing 2 issues first.', 2),
     ('I also recommend fixing 18 more issues.', 20),

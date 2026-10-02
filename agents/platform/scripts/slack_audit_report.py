@@ -56,6 +56,7 @@ from typing import NamedTuple
 
 from slack_presenter import (
     BACKTICK,
+    CLAUSE_ENDS,
     ELLIPSIS,
     HEADLINE_MAX,
     LIST_MARKER,
@@ -436,7 +437,7 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
 
 def _cluster_gap(part: str, coverage: re.Match | None) -> str:
     """``part`` with a bare count ("1 unreachable") naming the coverage's clusters."""
-    bare = BARE_GAP_COUNT.fullmatch(part.strip())
+    bare = BARE_GAP_COUNT.fullmatch(part.strip().rstrip(CLAUSE_ENDS))
     if not (bare and coverage):
         return part
     count = int(bare.group(1))
@@ -570,19 +571,20 @@ def _ledger_line(report: str) -> str:
     """The report's ledger line as plain text without its link, read to ``LINE_READ_MAX``.
 
     The last line, the SOPs' one line. When the last is only the link, labelled
-    or bare, the
-    first unindented line that carries a count and is not a list item: an
-    orienting sentence the relay turn put at the top carries none, and a
-    finding row, or the evidence indented under it, is not the report's line.
-    Empty when no line qualifies.
+    (whatever the label says) or bare, the last unindented line above it that
+    carries a count and is not a list item: the SOPs' line sits just above the
+    link, an orienting sentence the relay turn put at the top may carry a date,
+    and a finding row, or the evidence indented under it, is not the report's
+    line. Empty when no line qualifies.
     """
     lines = [line for line in report.splitlines() if line.strip()]
     if not lines:
         return ""
-    last = "" if BARE_URL_LINE.match(lines[-1].strip()) else _fallback_line(lines[-1])
+    end = lines[-1].strip()
+    last = "" if BARE_URL_LINE.match(end) or TRAILING_LEDGER.match(end) else _fallback_line(lines[-1])
     if last:
         return last
-    for line in lines[:-1]:
+    for line in reversed(lines[:-1]):
         if COUNTS_DIGIT.search(line) and not line[:1].isspace() and not LIST_MARKER.match(line):
             return _fallback_line(line)
     return ""
@@ -593,7 +595,7 @@ def headline_fallback(report: str, ref: LedgerRef) -> str | None:
 
     The ledger line is the report's last, the SOPs' one line; a sentence the
     relay turn put above it is not the headline. A last line that is only the
-    link falls back to the first line carrying a count; with none, there is no
+    link falls back to the last line above it carrying a count; with none, there is no
     headline and the report goes out unchanged.
     """
     head = _clip(_ledger_line(report), REPORT_LINE_MAX)
