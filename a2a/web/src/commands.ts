@@ -4,14 +4,13 @@
  * cap match the gateway's (a2a/gateway/console.go), so the page never shows
  * a turn as sent that the gateway would drop.
  */
-import { CONSOLE_TEXT_CAP, textBytes } from "./console.ts";
+import { CONSOLE_TEXT_CAP, goTrim, textBytes } from "./console.ts";
 import { STREAMS } from "./protocol.ts";
 import { capacities, failuresOf, recentTasks, taskTimes } from "./derive.ts";
 import type { UiState } from "./model.ts";
 
-/** Go's unicode.IsSpace set, which strings.TrimSpace strips. Not JS \s. */
-const GO_SPACE = "[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
-const GO_TRIM_RE = new RegExp(`^${GO_SPACE}+|${GO_SPACE}+$`, "g");
+export { goTrim };
+
 const COMMAND_PREFIX = "/";
 const TASKS_SHOWN = 10;
 
@@ -39,10 +38,6 @@ export const HELP_TEXT = [
   "/help - this list",
   "Anything else goes to the agent.",
 ].join("\n");
-
-export function goTrim(s: string): string {
-  return s.replace(GO_TRIM_RE, "");
-}
 
 function parseCommand(line: string): Command {
   const [head, ...rest] = line.slice(COMMAND_PREFIX.length).split(/\s+/);

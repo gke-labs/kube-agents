@@ -4,6 +4,7 @@ import { parseSubject } from "./protocol.ts";
 import {
   GATEWAY_SESSION,
   IDLE_MS,
+  PENDING_EXPIRE_MS,
   PENDING_STALE_MS,
   durationMs,
   initialState,
@@ -834,6 +835,101 @@ describe("pending console turns", () => {
     expect(state.pending).toEqual([]);
     state = consoleTurn(state, "task-1", "hi");
     expect(state.chat).toHaveLength(2);
+  });
+});
+
+describe("console turns the gateway never makes a task of", () => {
+  const up: UiState = { ...initialState, connection: "up" };
+
+  it("settles a stop word at send: never pending, never noted", () => {
+    for (const word of ["stop", "Cancel", "abort!"]) {
+      let state = sent(up, "m-1", word);
+      expect(state.pending).toEqual([]);
+      expect(state.chat).toEqual([{ id: "sent:m-1", kind: "sent", text: word, correlationId: "sent:m-1" }]);
+      state = reduce(state, { type: "tick", now: SENT_AT + PENDING_EXPIRE_MS + 1 });
+      expect(state.chat[0].note).toBeUndefined();
+    }
+  });
+
+  it("settles a bare /session, /session off and /session stop at send", () => {
+    for (const text of ["/session", "/SESSION off.", "/session stop"]) {
+      const state = sent(up, "m-1", text);
+      expect(state.pending).toEqual([]);
+      expect(state.chat[0]).toMatchObject({ kind: "sent", text });
+    }
+  });
+
+  it("keeps a /session first turn pending, attachable on its argument", () => {
+    let state = sent(up, "m-1", "/session check the nodes");
+    expect(state.pending).toHaveLength(1);
+    state = consoleTurn(state, "task-1", "check the nodes");
+    expect(state.pending).toEqual([]);
+    expect(state.chat).toHaveLength(1);
+    expect(state.chat[0]).toMatchObject({ id: "pending:m-1", kind: "user", taskId: "task-1" });
+  });
+
+  it("attaches a delegate turn once, on the stripped text the gateway submits", () => {
+    let state = sent(up, "m-1", "delegate: check the nodes");
+    state = consoleTurn(state, "task-1", "check the nodes");
+    expect(state.pending).toEqual([]);
+    expect(state.chat).toHaveLength(1);
+    expect(state.chat[0]).toMatchObject({ id: "pending:m-1", kind: "user", text: "check the nodes", taskId: "task-1" });
+  });
+
+  it("still attaches a delegate turn submitted verbatim (sessions off on this install)", () => {
+    let state = sent(up, "m-1", "delegate: check the nodes");
+    state = consoleTurn(state, "task-1", "delegate: check the nodes");
+    expect(state.pending).toEqual([]);
+    expect(state.chat).toHaveLength(1);
+  });
+
+  it("repro: stop then delegate leaves one line each and nothing pending or noted", () => {
+    let state = sent(up, "m-stop", "stop");
+    state = sent(state, "m-del", "delegate: check the nodes");
+    state = consoleTurn(state, "task-d", "check the nodes");
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    expect(state.pending).toEqual([]);
+    expect(state.chat.map((c) => [c.id, c.kind, c.text, c.note])).toEqual([
+      ["sent:m-stop", "sent", "stop", undefined],
+      ["pending:m-del", "user", "check the nodes", undefined],
+    ]);
+  });
+
+  it("words the stale note so it does not claim the gateway dropped the turn", () => {
+    let state = sent(up, "m-1", "what is it doing");
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    const note = state.chat[0].note ?? "";
+    expect(note).toMatch(/^no task on the bus for this turn yet/);
+    expect(note).toMatch(/answered by a gateway notice instead of a task/);
+    expect(note).toMatch(/may be slow or may have dropped it/);
+    expect(note).not.toMatch(/below/);
+    expect(note).not.toMatch(/may be down/);
+  });
+
+  it("drops a turn past the expiry from the attach set, and its line keeps its note", () => {
+    let state = sent(up, "m-1", "hello?");
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    const note = state.chat[0].note;
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_EXPIRE_MS - 1 });
+    expect(state.pending).toHaveLength(1);
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_EXPIRE_MS + 1 });
+    expect(state.pending).toEqual([]);
+    expect(state.chat[0]).toMatchObject({ kind: "pending", note });
+    state = consoleTurn(state, "task-1", "hello?");
+    expect(state.chat.map((c) => c.kind)).toEqual(["pending", "user"]);
+  });
+
+  it("marks and expires in one tick when the clock jumps past both", () => {
+    let state = sent(up, "m-1", "hello?");
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_EXPIRE_MS + 1 });
+    expect(state.pending).toEqual([]);
+    expect(state.chat[0].note).toMatch(/^no task on the bus/);
+  });
+
+  it("says a settled send failed", () => {
+    let state = sent(up, "m-1", "stop");
+    state = reduce(state, { type: "sendFailed", messageId: "m-1", error: "Permissions Violation" });
+    expect(state.chat[0]).toMatchObject({ kind: "local", text: "stop", note: "not sent: Permissions Violation" });
   });
 });
 

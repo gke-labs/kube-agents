@@ -20,6 +20,22 @@ export const CONSOLE_TEXT_CAP = 16_384;
 const TOKEN_BYTES = 8;
 const MESSAGE_ID_BYTES = 6;
 const MESSAGE_ID_PREFIX = "m-";
+/** Go's unicode.IsSpace set, which strings.TrimSpace strips. Not JS \s. */
+const GO_SPACE = "[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+const GO_TRIM_RE = new RegExp(`^${GO_SPACE}+|${GO_SPACE}+$`, "g");
+const GO_SPACE_RE = new RegExp(GO_SPACE);
+/** a2a/gateway/text.go stopWords. */
+const STOP_WORDS = new Set(["stop", "cancel", "abort"]);
+/** a2a/gateway/text.go isDelegate's word, separators and left-trim cutset. */
+const DELEGATE_WORD = "delegate";
+const DELEGATE_SEPARATORS = new Set([" ", "\t", "\n", ":", ",", "-", "\u2014"]);
+const DELEGATE_TRIM_RE = /^[:,\-\u2014 \t\n]+/;
+/** a2a/gateway/text.go slashSessionWord and slashOffWord. */
+const SLASH = "/";
+const SESSION_WORD = "session";
+const SESSION_OFF_WORD = "off";
+/** The one non-ASCII rune whose simple case fold (Go strings.EqualFold) is an ASCII letter of "session". */
+const LONG_S = /\u017f/g;
 
 export interface ConsoleInFrame {
   messageId: string;
@@ -99,4 +115,97 @@ export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null
   if (typeof r.messageId !== "string" || r.messageId === "") return null;
   if (typeof r.text !== "string") return null;
   return { messageId: r.messageId, text: r.text, edit: r.edit === true };
+}
+
+/** Mirrors Go's strings.TrimSpace (the unicode.IsSpace set). */
+export function goTrim(s: string): string {
+  return s.replace(GO_TRIM_RE, "");
+}
+
+// The gateway decides what a console turn becomes from its text alone
+// (a2a/gateway/gateway.go, the slash/stop/status/delegate switch). The
+// mirrors below copy the text rules the page can apply without knowing the
+// gateway's state, so it knows which turns can never come back as a task and
+// which come back under a different text.
+
+/** Mirrors a2a/gateway/text.go normalize. */
+export function normalizeTurn(s: string): string {
+  let out = "";
+  let lastSpace = true;
+  for (const r of goTrim(s).toLowerCase()) {
+    if ((r >= "a" && r <= "z") || (r >= "0" && r <= "9")) {
+      out += r;
+      lastSpace = false;
+    } else if (r === "'") {
+      lastSpace = false;
+    } else if (r === " " || r === "\t" || r === "\n") {
+      if (!lastSpace) out += " ";
+      lastSpace = true;
+    }
+  }
+  return goTrim(out);
+}
+
+/** Mirrors a2a/gateway/text.go isStop. */
+export function isStopTurn(text: string): boolean {
+  return STOP_WORDS.has(normalizeTurn(text));
+}
+
+/** Mirrors a2a/gateway/text.go isDelegate: the task text, or null if the turn is not a delegation. */
+export function delegateRest(text: string): string | null {
+  const trimmed = goTrim(text);
+  if (trimmed.length < DELEGATE_WORD.length || trimmed.slice(0, DELEGATE_WORD.length).toLowerCase() !== DELEGATE_WORD) {
+    return null;
+  }
+  const rest = trimmed.slice(DELEGATE_WORD.length);
+  if (rest === "" || !DELEGATE_SEPARATORS.has(rest[0])) return null;
+  const task = goTrim(rest.replace(DELEGATE_TRIM_RE, ""));
+  return task === "" ? null : task;
+}
+
+/** Mirrors a2a/gateway/text.go isSessionCommand: the argument after `/session`, or null if the turn is not one. */
+export function sessionCommandRest(text: string): string | null {
+  const trimmed = goTrim(text);
+  if (!trimmed.startsWith(SLASH)) return null;
+  const body = trimmed.slice(SLASH.length);
+  const end = body.search(GO_SPACE_RE);
+  const word = end >= 0 ? body.slice(0, end) : body;
+  const rest = end >= 0 ? goTrim(body.slice(end)) : "";
+  return word.replace(LONG_S, "s").toLowerCase() === SESSION_WORD ? rest : null;
+}
+
+/** Mirrors a2a/gateway/text.go isSessionOff. */
+export function isSessionOffArg(rest: string): boolean {
+  return normalizeTurn(rest) === SESSION_OFF_WORD;
+}
+
+/**
+ * What the gateway can make of a console turn, judged from its text alone.
+ * `settled`: no branch of the gateway's switch ever publishes it as a task
+ * message (a stop word, a bare `/session`, `/session off`, `/session stop`).
+ * `task`: it may become a task, and the submission's text is one of `texts`.
+ * The gateway may still answer a `task` turn with only a notice (a status
+ * question, a session-cap refusal, a full queue): that depends on state the
+ * page cannot see.
+ */
+export type TurnFate = { kind: "settled" } | { kind: "task"; texts: string[] };
+
+/** Follows a2a/gateway/gateway.go's switch: slash command first, then stop, then delegate. */
+export function turnFate(text: string): TurnFate {
+  const trimmed = goTrim(text);
+  const sessionRest = sessionCommandRest(trimmed);
+  if (sessionRest !== null) {
+    // Pre-flip the argument is the first turn as written; post-flip it is
+    // unwrapped into an ordinary turn, which the delegate rule then reads.
+    if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest)) return { kind: "settled" };
+    return { kind: "task", texts: withDelegate(sessionRest) };
+  }
+  if (isStopTurn(trimmed)) return { kind: "settled" };
+  return { kind: "task", texts: withDelegate(trimmed) };
+}
+
+/** A delegate turn is published as its rest where sessions are on, and verbatim where they are off. */
+function withDelegate(text: string): string[] {
+  const rest = delegateRest(text);
+  return rest === null ? [text] : [text, rest];
 }

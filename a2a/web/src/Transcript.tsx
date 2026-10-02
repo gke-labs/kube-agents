@@ -4,7 +4,9 @@
  * Entries render by kind: `user` is the ask the gateway echoed onto the bus,
  * `steer` a follow-up into a running task, `answer` the result artifact
  * streaming in, `progress`/`status`/`topic`/`cancel` the quieter lines,
- * `pending` a console turn not yet seen on the bus, `notice` a gateway line
+ * `pending` a console turn not yet seen on the bus, `sent` a console turn
+ * the gateway never makes a task of (a stop word, a bare `/session`), so it
+ * settles at send, `notice` a gateway line
  * from the console door, `local` the page's own output, `anomaly` an
  * envelope that broke the protocol, reported rather than folded in. Each
  * exchange group gets one correlation chip colored by corrColor.
@@ -26,6 +28,7 @@ const GLYPH: Record<ChatEntry["kind"], string> = {
   cancel: "✕",
   anomaly: "⚠",
   pending: "ask>",
+  sent: "ask>",
   notice: "gw",
   local: "›",
 };

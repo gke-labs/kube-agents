@@ -156,7 +156,8 @@ body {
   color: var(--ink-dim);
 }
 
-.chat-user {
+.chat-user,
+.chat-sent {
   color: #fff;
 }
 

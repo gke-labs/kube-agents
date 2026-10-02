@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   CONSOLE_TEXT_CAP,
+  delegateRest,
   encodeInFrame,
+  isSessionOffArg,
+  isStopTurn,
+  normalizeTurn,
+  sessionCommandRest,
+  turnFate,
   inSubject,
   mintConversation,
   mintMessageId,
@@ -95,5 +101,52 @@ describe("console frames", () => {
     for (const bad of ["not json", "[]", "null", '{"text":"x"}', '{"messageId":"","text":"x"}', '{"messageId":"c-1"}']) {
       expect(parseOutFrame(bad), bad).toBeNull();
     }
+  });
+});
+
+describe("gateway text mirrors", () => {
+  it("normalizes like text.go normalize", () => {
+    expect(normalizeTurn("  What's it DOING?!  ")).toBe("whats it doing");
+    expect(normalizeTurn("a\t\n  b")).toBe("a b");
+    expect(normalizeTurn("a\rb")).toBe("ab");
+  });
+
+  it("reads the stop words like isStop", () => {
+    for (const t of ["stop", "STOP", " cancel. ", "abort!"]) expect(isStopTurn(t)).toBe(true);
+    for (const t of ["stop it", "stopped", "please stop"]) expect(isStopTurn(t)).toBe(false);
+  });
+
+  it("strips a delegate turn like isDelegate", () => {
+    expect(delegateRest("delegate: check the nodes")).toBe("check the nodes");
+    expect(delegateRest("  Delegate - Check It")).toBe("Check It");
+    expect(delegateRest("DELEGATE\u2014 x")).toBe("x");
+    expect(delegateRest("delegate,:-  x ")).toBe("x");
+    expect(delegateRest("delegate\tx")).toBe("x");
+    expect(delegateRest("delegate")).toBeNull();
+    expect(delegateRest("delegate:  ")).toBeNull();
+    expect(delegateRest("delegated tasks are neat")).toBeNull();
+    expect(delegateRest("delegate.x")).toBeNull();
+  });
+
+  it("reads /session like isSessionCommand and isSessionOff", () => {
+    expect(sessionCommandRest("/session")).toBe("");
+    expect(sessionCommandRest("  /Session   off  ")).toBe("off");
+    expect(sessionCommandRest("/session\u00a0check it")).toBe("check it");
+    expect(sessionCommandRest("/\u017fession")).toBe("");
+    expect(sessionCommandRest("/sessions")).toBeNull();
+    expect(sessionCommandRest("session")).toBeNull();
+    expect(sessionCommandRest("/var/log/messages is full")).toBeNull();
+    expect(isSessionOffArg("Off!")).toBe(true);
+    expect(isSessionOffArg("off now")).toBe(false);
+  });
+
+  it("settles only the turns no gateway branch makes a task of", () => {
+    for (const t of ["stop", "/session", "/session off", "/session stop"]) {
+      expect(turnFate(t)).toEqual({ kind: "settled" });
+    }
+    expect(turnFate("is acme-prod ready?")).toEqual({ kind: "task", texts: ["is acme-prod ready?"] });
+    expect(turnFate("delegate: x")).toEqual({ kind: "task", texts: ["delegate: x", "x"] });
+    expect(turnFate("/session delegate: x")).toEqual({ kind: "task", texts: ["delegate: x", "x"] });
+    expect(turnFate("/session check it")).toEqual({ kind: "task", texts: ["check it"] });
   });
 });

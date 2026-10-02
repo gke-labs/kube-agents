@@ -23,7 +23,7 @@ import {
   type SubjectInfo,
   type TaskState,
 } from "./protocol.ts";
-import type { ConsoleOutFrame } from "./console.ts";
+import { turnFate, type ConsoleOutFrame } from "./console.ts";
 
 /** The chatops gateway's session name (a2a/gateway/gateway.go). */
 export const GATEWAY_SESSION = "gateway";
@@ -31,10 +31,17 @@ export const GATEWAY_SESSION = "gateway";
 export const IDLE_MS = 60_000;
 /** A sent turn with no submission on TASKS after this long gets a note. */
 export const PENDING_STALE_MS = 30_000;
+/**
+ * A pending turn this old leaves the attach set; its line keeps its note.
+ * Some turns never become a task (a status question, a refusal, a dropped
+ * frame) and the page cannot tell which, so without a bound they would sit
+ * in `pending` for the life of the tab.
+ */
+export const PENDING_EXPIRE_MS = 10 * 60_000;
 /** Local lines (command output) share one correlation group. */
 export const LOCAL_CORRELATION = "local";
 const STALE_NOTE_GATEWAY =
-  "no submission on the bus 30s after sending. The gateway may be down or may have dropped the turn - its notice, if any, is below";
+  "no task on the bus for this turn yet. Status questions and refused turns are answered by a gateway notice instead of a task; if no notice came, the gateway may be slow or may have dropped it";
 /**
  * The link itself was down when this fired, so the gateway is not the likely
  * cause the way `STALE_NOTE_GATEWAY` implies — this turn may never have left
@@ -165,6 +172,8 @@ export type ChatKind =
   | "anomaly"
   /** Sent from this page, not yet seen on TASKS. */
   | "pending"
+  /** Sent from this page and settled at once: the gateway never makes a task of it (a stop word, a bare `/session`). */
+  | "sent"
   /** A frame the gateway posted on this conversation's `.out` subject. */
   | "notice"
   /** Produced by the page itself: command output, a send that never left. */
@@ -236,8 +245,14 @@ export interface StreamAttachView {
 
 export interface PendingTurn {
   messageId: string;
-  /** Trimmed, exactly as sent - the gateway's submission carries it verbatim. */
+  /** Trimmed, exactly as sent. */
   text: string;
+  /**
+   * The texts the gateway's submission may carry for this turn: the sent
+   * text, plus the stripped task of a `delegate` or `/session` turn
+   * (console.ts turnFate).
+   */
+  texts: string[];
   conversation: string;
   at: number;
   stale: boolean;
@@ -468,9 +483,7 @@ function reduceMessage(
   // identical texts attach in order.
   const match =
     authority.conversation !== undefined
-      ? state.pending.findIndex(
-          (p) => p.conversation === authority.conversation && p.text === text && (live || p.at < tsMs(env)),
-        )
+      ? pendingMatch(state.pending, authority.conversation, text, live, tsMs(env))
       : -1;
   if (match >= 0) {
     const turn = state.pending[match];
@@ -499,6 +512,10 @@ function reduceMessage(
     });
     next.conversations = conversations;
   }
+}
+
+function pendingMatch(pending: PendingTurn[], conversation: string, text: string, live: boolean, ts: number): number {
+  return pending.findIndex((p) => p.conversation === conversation && p.texts.includes(text) && (live || p.at < ts));
 }
 
 function reduceStatusUpdate(
@@ -782,16 +799,21 @@ function withEntry(chat: ChatEntry[], id: string, patch: Partial<ChatEntry>): Ch
   return next;
 }
 
-/** Marks pending turns that have waited too long. Returns null if none changed. */
+/**
+ * Marks pending turns that have waited too long, and drops the ones past
+ * PENDING_EXPIRE_MS from the attach set. Returns null if none changed.
+ */
 function staleTurns(state: UiState, now: number): Pick<UiState, "pending" | "chat"> | null {
   let chat = state.chat;
   let changed = false;
-  const pending = state.pending.map((p) => {
+  const marked = state.pending.map((p) => {
     if (p.stale || now - p.at <= PENDING_STALE_MS) return p;
     changed = true;
     chat = withEntry(chat, `pending:${p.messageId}`, { note: staleNote(state.connection) });
     return { ...p, stale: true };
   });
+  const pending = marked.filter((p) => now - p.at <= PENDING_EXPIRE_MS);
+  if (pending.length !== marked.length) changed = true;
   return changed ? { pending, chat } : null;
 }
 
@@ -854,6 +876,13 @@ export function reduce(state: UiState, event: BusEvent): UiState {
     }
 
     case "consoleSent": {
+      const fate = turnFate(event.text);
+      if (fate.kind === "settled") {
+        // No branch of the gateway makes a task of this turn, so there is
+        // nothing to wait for: its answer, if any, is a notice.
+        const id = `sent:${event.messageId}`;
+        return { ...state, chat: [...state.chat, { id, kind: "sent", text: event.text, correlationId: id }] };
+      }
       const id = `pending:${event.messageId}`;
       return {
         ...state,
@@ -862,6 +891,7 @@ export function reduce(state: UiState, event: BusEvent): UiState {
           {
             messageId: event.messageId,
             text: event.text,
+            texts: fate.texts,
             conversation: event.conversation,
             at: event.at,
             stale: false,
@@ -871,15 +901,14 @@ export function reduce(state: UiState, event: BusEvent): UiState {
       };
     }
 
-    case "sendFailed":
+    case "sendFailed": {
+      const failed = { kind: "local" as const, note: `not sent: ${event.error}` };
       return {
         ...state,
         pending: state.pending.filter((p) => p.messageId !== event.messageId),
-        chat: withEntry(state.chat, `pending:${event.messageId}`, {
-          kind: "local",
-          note: `not sent: ${event.error}`,
-        }),
+        chat: withEntry(withEntry(state.chat, `pending:${event.messageId}`, failed), `sent:${event.messageId}`, failed),
       };
+    }
 
     case "notice": {
       const id = `notice:${event.frame.messageId}`;
