@@ -26,7 +26,11 @@
 # reply that only quotes an earlier lease's open pull request carrying the
 # manifest passes too; that is accepted because the persona's skill lands a
 # repeated proposal on the existing pull request without a write, and the
-# sweep closes the agent's pull requests between leases.
+# sweep closes the agent's pull requests between leases. Not within one:
+# pdb-remediation-pr asks for the same budget for the same workload on the
+# same inject lane, ahead of this case, so its open pull request carrying
+# this manifest is there before each of this case's repetitions, and a
+# repetition that wrote nothing and pointed at it passes the diff arm.
 # Eligible tier: presubmit.
 id: obtainability-remediation-proposal
 name: Reliability remediation proposes a valid PodDisruptionBudget manifest

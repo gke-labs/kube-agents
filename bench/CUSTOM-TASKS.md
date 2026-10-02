@@ -588,8 +588,9 @@ and its reply carries the URL and, at most, the kind and the budget. The same pr
 proposal where the persona put it: the phrases of `report_contains`, matched the same way except
 that the underscore is kept on both sides (in a diff it separates identifiers rather than marking
 emphasis, so a snake_case comment is not the camelCase manifest), over
-the added lines of every file the pull request changes, never the file names, which would let a
-path carry the nouns with no manifest behind it. A case writes the two places as one `any`; an arm over the whole transcript
+the added lines of one changed file at a time (a manifest is one file, so the kind, its selector and
+the budget key must share one; a forbidden phrase anywhere in the diff rejects), never the file
+names, which would let a path carry the nouns with no manifest behind it. A case writes the two places as one `any`; an arm over the whole transcript
 (`scope: full`) is left out on purpose, since it would pass on an interim message that names the
 nouns while planning, the progress-prose false pass that scope is documented to produce above:
 
@@ -613,7 +614,7 @@ What it deliberately does not ask is whether this run opened the pull request. T
 `pull_request_opened`'s question, and a remediation case that needs both declares both. Here a
 repetition that recomputed the same manifest, found the branch already carrying it and pointed at
 the open pull request has proposed a concrete manifest, which is what the objective grades. The
-cost is stated rather than hidden: a reply that only quotes an earlier lease's open pull request carrying the manifest passes too, the leftover grading described under `pull_request_opened` above; it is accepted because requiring a push would fail that correct repetition, the sweep closes the agent's pull requests between leases, and a case that must prove the write declares `pull_request_opened` beside this. The write itself is not this objective's question; `pull_request_opened` asks it. Three binds
+cost is stated rather than hidden: a reply that only quotes an earlier lease's open pull request carrying the manifest passes too, the leftover grading described under `pull_request_opened` above; it is accepted because requiring a push would fail that correct repetition, the sweep closes the agent's pull requests between leases (not within one: `pdb-remediation-pr` asks for the same budget for the same workload on the same inject lane, ahead of this case in the second phase, so its open pull request carrying this manifest is in the repository before each of this case's repetitions, and a repetition that wrote nothing and pointed at it passes this arm), and a case that must prove the write declares `pull_request_opened` beside this. The write itself is not this objective's question; `pull_request_opened` asks it. Three binds
 keep that cost to exactly that shape: the pull request must be open (the skill's "already exists"
 path matches open ones only, so a merged or closed one in a reply is a leftover quoted, not a
 proposal made, and a merged manifest anywhere in the organisation is not a standing pass); its
@@ -624,9 +625,10 @@ holds the key for; the check's credential is the ledger App's and does not know 
 asks the API's `user.type`), so a human's pull request under the prefix is not the agent's while
 another App's on such a branch would pass; and when the run sets `BENCH_GITOPS_REPO`, the
 repository it was told the agent writes to (`hack/ci-eval-pr.sh` exports it from the project
-mapping on every lane, honouring a local run's `EVAL_GITOPS_REPO`, `none` included, as the deploy
-does), the pull request must be in
-that repository. It reads
+mapping on every lane; on the api lane a local run's `EVAL_GITOPS_REPO` is honoured as the deploy
+does, `none` meaning no repository, while the inject lane's own step re-exports the name with
+`none` meaning the mapping, since its write safeguard cannot run without a repository), the pull
+request must be in that repository. It reads
 `BENCH_GITHUB_TOKEN` as the two checks above do, needs `pull_requests: read` on both endpoints,
 and errors only on a fault of ours (a 401, a denial, an unexpected status, an API it could not
 reach) and only when no other URL in the reply passes; a reply naming no pull request fails before

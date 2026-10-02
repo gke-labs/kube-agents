@@ -409,6 +409,31 @@ def test_a_files_name_does_not_count(token, github):
     assert check().verify(5.0).status == "pass"
 
 
+def test_the_nouns_must_share_one_file(token, github):
+    """A manifest is one file. A Deployment edit with `selector:`, a README
+    that says PodDisruptionBudget and a values file with `minAvailable:` are
+    three files and no manifest; the same three beside one file carrying the
+    manifest pass on that file, which the reason names."""
+    stash()
+    github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))
+    spread = [
+        {"filename": "seeded-reliability/deploy.yaml", "status": "modified", "patch": "@@ -1 +1,2 @@\n+  selector:\n+    app: checkout-gateway"},
+        {"filename": "README.md", "status": "modified", "patch": "@@ -1 +1,2 @@\n+Consider a PodDisruptionBudget here"},
+        {"filename": "values.yaml", "status": "modified", "patch": "@@ -1 +1,2 @@\n+minAvailable: 1"},
+    ]
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (200, spread)
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "required phrases absent from its diff: ['PodDisruptionBudget']" in res.reason
+    assert "the manifest is one file, so the phrases must share one" in res.reason
+    manifest = {"filename": "seeded-reliability/checkout-gateway-pdb.yaml", "status": "added", "patch": "@@ -0,0 +1,3 @@\n+kind: PodDisruptionBudget\n+  selector:\n+  minAvailable: 1"}
+    github.routes[f"{API}/pulls/39/files?per_page=100&page=1"] = (200, spread + [manifest])
+    res = check().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "in seeded-reliability/checkout-gateway-pdb.yaml" in res.reason
+    assert res.raw["file"] == "seeded-reliability/checkout-gateway-pdb.yaml"
+
+
 def test_a_withheld_patch_is_named_on_the_fail_path_too(token, github):
     stash()
     github.routes[f"{API}/pulls/39"] = (200, fixture("pull-39.json"))

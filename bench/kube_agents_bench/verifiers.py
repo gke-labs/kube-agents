@@ -2147,12 +2147,13 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     the reply for its load-bearing nouns. The Planning Agent, which today's
     api transport reaches, inlines the manifest; the platform persona, which
     the inject door reaches directly, follows its own rule and opens a pull
-    request instead, naming the URL and nothing of the manifest (#2037:
+    request instead, naming the URL and at most the kind and the budget (#2037:
     ``obtainability-remediation-proposal`` 12 of 12 on one, 0 of 3 on the
     other, for the same proposal). The proposal is in the diff, so this check
     reads it there: the same phrase semantics as ``report_contains``, over
-    the added lines of every file the pull request changes, never the file
-    names.
+    the added lines of one changed file at a time -- a manifest is one file,
+    so the kind, its selector and the budget key must share one, while a
+    forbidden phrase anywhere in the diff rejects -- never the file names.
 
     WHAT IT ASSERTS, AND WHAT IT DOES NOT. The reply names a github.com pull
     request URL under ``owner`` and, when the run was told the repository it
@@ -2182,7 +2183,12 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
     open-only binds above are what keep that cost to exactly that shape. It
     is accepted here because requiring a push would fail the correct third
     repetition, because the sweep closes the agent's pull requests between
-    leases when it reaches them, and because a case that must prove the write
+    leases when it reaches them (not within one: ``pdb-remediation-pr`` asks
+    for the same budget for the same workload on the same inject lane, ahead
+    of this case in the second phase, so its open pull request carrying this
+    manifest is in the repository before each of this case's repetitions,
+    and a repetition that wrote nothing and pointed at it passes this arm),
+    and because a case that must prove the write
     declares ``pull_request_opened`` beside this. Open-only is safe against
     that sweep: ``hack/ci_sweep_agent_pulls.py`` acquires only projects Boskos
     reports free (``FREE_STATE`` in ``hack/boskos_pool.py``), so a leased
@@ -2226,11 +2232,13 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
 
     def _diff(
         self, owner: str, repo: str, number: int, token: str, budget: float
-    ) -> tuple[str | None, str | None, list[str]]:
-        """``(diff text, None, notes)`` when read, ``(None, reason, notes)``
-        when the candidate could not be evaluated, ``(None, None, notes)``
-        when it is not a gradable pull request (absent, an issue, closed
-        unmerged); the notes say why."""
+    ) -> tuple[list[tuple[str, str]] | None, str | None, list[str]]:
+        """``(files, None, notes)`` when read -- one ``(name, added lines)``
+        per changed file, since a manifest is one file and the phrases are
+        matched within one -- ``(None, reason, notes)`` when the candidate
+        could not be evaluated, ``(None, None, notes)`` when it is not a
+        gradable pull request (absent, an issue, closed unmerged); the notes
+        say why."""
         base = f"https://api.github.com/repos/{owner}/{repo}"
         slug = f"{owner}/{repo}#{number}"
         status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
@@ -2272,7 +2280,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 f"{slug}: opened by {author.get('login') or 'an unknown user'}, not by a GitHub "
                 "App, so it is not a pull request the agent opened"
             ]
-        chunks: list[str] = []
+        added_by_file: list[tuple[str, str]] = []
         notes: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
@@ -2301,7 +2309,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 # Added lines only, never the file name: a path such as
                 # `PodDisruptionBudget-selector-notes.md` would otherwise
                 # supply the manifest's nouns with no manifest behind it.
-                chunks.append("\n".join(added))
+                added_by_file.append((name, "\n".join(added)))
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
         else:
@@ -2309,7 +2317,7 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 f"{slug} changes at least {_PR_FILES_PAGE_SIZE * _PR_FILES_MAX_PAGES} files; "
                 "graded on the first pages"
             )
-        return "\n".join(chunks), None, notes
+        return added_by_file, None, notes
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -2372,26 +2380,46 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 )
                 continue
             try:
-                diff, unevaluable, notes = self._diff(owner, repo, number, token, budget)
+                files, unevaluable, notes = self._diff(owner, repo, number, token, budget)
             except OSError as exc:
                 unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                 continue
-            if diff is None:
+            if files is None:
                 if unevaluable:
                     unresolved.append("; ".join([unevaluable, *notes]))
                 else:
                     rejected.extend(notes)
                 continue
-            haystack = _normalize_diff(diff)
-            missing = [p for p in self.required_phrases if _normalize_diff(p) not in haystack]
-            present_forbidden = [p for p in self.forbidden_phrases if _normalize_diff(p) in haystack]
-            any_ok = not any_of or any(p in haystack for p in any_of)
-            if missing or present_forbidden or not any_ok:
+            # A manifest is one file, so the required phrases and one of the
+            # alternatives must come from one file's added lines: a Deployment
+            # edit with `selector:`, a README that says "PodDisruptionBudget"
+            # and a values file with `minAvailable:` are three files and no
+            # manifest. A forbidden phrase anywhere in the diff still rejects.
+            whole = _normalize_diff("\n".join(text for _, text in files))
+            present_forbidden = [p for p in self.forbidden_phrases if _normalize_diff(p) in whole]
+            carrier: str | None = None
+            closest: tuple[str, list[str], bool] | None = None
+            for name, text in files:
+                hay = _normalize_diff(text)
+                missing = [p for p in self.required_phrases if _normalize_diff(p) not in hay]
+                any_ok = not any_of or any(p in hay for p in any_of)
+                if not missing and any_ok:
+                    carrier = name
+                    break
+                if closest is None or (len(missing), not any_ok) < (len(closest[1]), not closest[2]):
+                    closest = (name, missing, any_ok)
+            if carrier is None or present_forbidden:
                 parts = []
-                if missing:
-                    parts.append(f"required phrases absent from its diff: {missing}")
-                if not any_ok:
-                    parts.append(f"none of the alternative phrasings in its diff: {self.any_of_phrases}")
+                if carrier is None:
+                    name, missing, any_ok = closest or ("", list(self.required_phrases), not any_of)
+                    nearest = (
+                        f" (closest file {name}; the manifest is one file, so the phrases must share one)"
+                        if len(files) > 1 else ""
+                    )
+                    if missing:
+                        parts.append(f"required phrases absent from its diff: {missing}{nearest}")
+                    if not any_ok:
+                        parts.append(f"none of the alternative phrasings in its diff: {self.any_of_phrases}")
                 if present_forbidden:
                     parts.append(f"forbidden phrases in its diff: {present_forbidden}")
                 # The notes ride along: a manifest in a file whose patch
@@ -2404,9 +2432,9 @@ class PullRequestDiffContainsVerifier(BaseVerifier):
                 True,
                 f"{slug}'s diff adds all {len(self.required_phrases)} required phrase(s)"
                 + (f", one of {self.any_of_phrases}" if any_of else "")
-                + f", none of {len(self.forbidden_phrases)} forbidden"
+                + f" in {carrier}, none of {len(self.forbidden_phrases)} forbidden"
                 + (f" ({'; '.join(notes)})" if notes else ""),
-                raw={"pull_request": slug, "notes": notes},
+                raw={"pull_request": slug, "file": carrier, "notes": notes},
             )
 
         if unresolved:
