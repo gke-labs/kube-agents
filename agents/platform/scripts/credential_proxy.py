@@ -1001,9 +1001,12 @@ class Principal:
     pod: str = ""
 
     def describe(self) -> str:
+        # The pod is deliberately NOT here. This string is the `principal`
+        # field of every tool_execution_audit record, and the shell's token is
+        # pod-bound too, so folding the pod in would turn an identity every
+        # log filter keys on into a composite for every brokered command. The
+        # pod travels in the record's own `pod` field (_tool_audit).
         described = self.workload
-        if self.pod:
-            described = f"{described} pod={self.pod}"
         if self.caller:
             described = f"{described} (caller {self.caller})"
         return described
@@ -5527,6 +5530,7 @@ def _tool_audit(
     exit_code: int | None = None,
     duration_ms: int | None = None,
     rule: str | None = None,
+    pod: str = "",
 ) -> dict[str, Any]:
     """The `audit` mapping of one tool-execution record.
 
@@ -5544,6 +5548,11 @@ def _tool_audit(
         "subcommand": subcommand,
         "status": status,
     }
+    if pod:
+        # The caller's pod, from the TokenReview's pod-name extra: every
+        # session pod shares one ServiceAccount, so this is what ties a
+        # brokered command back to a conversation.
+        record["pod"] = pod
     if exit_code is not None:
         record["exit_code"] = exit_code
     if duration_ms is not None:
@@ -6068,7 +6077,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
-            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, **fields)}
+            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
 
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",

@@ -7077,8 +7077,22 @@ class PrincipalPodTest(unittest.TestCase):
             )
         )
         self.assertEqual("agent-a2a-session-abc12", principal.pod)
-        self.assertIn("pod=agent-a2a-session-abc12", principal.describe())
-        self.assertIn(self.CALLER, principal.describe())
+        # The pod rides on the principal and in the audit record's own field,
+        # never in describe(): that string is the `principal` field of every
+        # tool_execution_audit record, and the shell's calls carry a pod name
+        # too, so a composite there would change an identity every filter
+        # keys on.
+        self.assertEqual(principal.pod, "agent-a2a-session-abc12")
+        self.assertEqual(self.CALLER, principal.describe())
+        record = credential_proxy._tool_audit(
+            credential_proxy.AUDIT_STATUS_STARTED, "req-1", principal.describe(), "kubectl", "get", pod=principal.pod
+        )
+        self.assertEqual(record["pod"], "agent-a2a-session-abc12")
+        self.assertEqual(record["principal"], self.CALLER)
+        bare = credential_proxy._tool_audit(
+            credential_proxy.AUDIT_STATUS_STARTED, "req-2", self.CALLER, "kubectl", "get", pod=""
+        )
+        self.assertNotIn("pod", bare)
 
     def test_a_token_with_no_pod_binding_names_no_pod(self):
         for extra in (None, {}, {"authentication.kubernetes.io/pod-name": []}):
