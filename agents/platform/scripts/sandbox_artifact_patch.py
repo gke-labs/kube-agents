@@ -343,6 +343,9 @@ def _stage(paths: list[str]) -> tuple[list[str], str | None]:
             except sandbox_exec.SandboxMisconfigured:
                 LOGGER.warning("cannot tell where %s lives", path, exc_info=True)
                 continue
+            except sandbox_exec.SandboxReadFailed as exc:
+                LOGGER.warning("%s is not staged for delivery: %s", path, exc)
+                continue
             except Exception:
                 # The path comes from a record the model composes. A NUL in it
                 # reaches `subprocess` as a ValueError, not as a `False` from
@@ -353,8 +356,8 @@ def _stage(paths: list[str]) -> tuple[list[str], str | None]:
                 continue
 
             if raw is None:
-                # Not a readable file over there either, so it is the "mentioned
-                # for reference only" case the original method already tolerates.
+                # Not over there either, so it is the "mentioned for reference
+                # only" case the original method already tolerates.
                 continue
             if len(raw) > STAGE_MAX_BYTES:
                 LOGGER.warning(

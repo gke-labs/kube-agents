@@ -346,7 +346,8 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
 - Say what the operator does not get until they enable a platform: scheduled reports and
   alert-driven triage are delivered to chat only, and the first-run inventory report waits on a
   human connecting over chat — read it with
-  `kubectl exec deployment/platform-agent-gateway -n kubeagents-system -c platform-agent -- cat /opt/data/INVENTORY.md`.
+  `kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md`
+  (the report is on the shell sandbox pod, not the agent pod).
 
 ## GitOps Repository & GitHub Token Minter Configuration
 

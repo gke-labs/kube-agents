@@ -114,11 +114,13 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides, and
 #     arms the gateway's inject door the same way (A2A_INJECT_BACKEND=true);
-#   - step 6b patches the CR, waits for the agent Deployment to roll, gates on
-#     the NATS StatefulSet, the callout Deployment, the provisioning Job and
-#     the agent Deployment, in that order, waits for the inject door's Service
-#     and token Secret, declares the bridge sidecar on the CR, and waits for
-#     the bridge to log that it is consuming `platform` tasks.
+#   - step 6b patches the CR (the mode, and the maxSessions section 2b sized
+#     for the sidecar to come), waits for the agent Deployment to roll, gates
+#     on the NATS StatefulSet, the callout Deployment, the provisioning Job
+#     and the agent Deployment, in that order, waits for the inject door's
+#     Service and token Secret, declares the bridge sidecar on the CR, waits
+#     for the provisioning Job's re-run and reads the CR's phase after it,
+#     and waits for the bridge to log that it is consuming `platform` tasks.
 # hack/ci-eval-pr.sh then runs the matrix through the door (AGENT_TRANSPORT=
 # inject) under the same flag. The chart deliberately renders no spec.mode
 # (docs/designs/spec-mode-switch.md), so the flip is a merge patch on the CR
@@ -146,7 +148,13 @@ readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agen
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly AGENT_CONTAINER_NAME="platform-agent"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
-readonly MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
+# The first patch: the mode, and the maxSessions section 2b sizes for the
+# sidecar patch to come, in one merge so the first render -- and so the first
+# provision Job -- sees both. A printf format; %d is MODE_NEXT_MAX_SESSIONS.
+# The field path is the CRD's (HarnessSpec.Tuning.MaxSessions in
+# k8s-operator/api/v1alpha1), which TestCiDeploySizesMaxSessionsToTheTasksFloor
+# holds by decoding this patch into the type.
+readonly MODE_NEXT_PATCH_FORMAT='{"spec":{"mode":"next","harness":{"tuning":{"maxSessions":%d}}}}'
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
@@ -198,6 +206,26 @@ readonly A2A_BUS_TOKEN_VOLUME="a2a-bus-token"
 # never approaches it, so the bound below catches a typo, not a sizing.
 readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
+# The TASKS consumer budget's terms, as the operator sizes it
+# (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
+# stream is created at max(budget, A2A_TASKS_FLOOR), where the budget is
+# maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
+# A2A_RESERVE_PER_WORKER * (the bridge workers the CR declares); provisioning
+# never edits a stream that exists, and a later render whose budget exceeds
+# the live stream is refused. Step 6b patches the mode and the sidecar
+# separately (a bridge cannot start before the bus), so the first provision
+# creates TASKS for a CR with no sidecar and the second is measured against
+# it: section 2b sizes spec.harness.tuning.maxSessions from these four so the
+# second budget fits the first stream. Copied, not derived, because the
+# operator's are Go constants (a2aTasksMaxConsumersFloor,
+# a2aSessionConsumersPerSession, and the reserve table
+# a2aTasksReservedConsumersFor evaluates: 20 fixed plus 6 per worker with
+# #2010's look-ahead row); TestCiDeploySizesMaxSessionsToTheTasksFloor there
+# and tests/test_ci_deploy_mode_next.py here fail when either side moves.
+readonly A2A_TASKS_FLOOR=64
+readonly A2A_SESSION_CONSUMERS=3
+readonly A2A_RESERVE_FIXED=20
+readonly A2A_RESERVE_PER_WORKER=6
 # The line the bridge logs once its durable consumer is bound
 # (a2a/hermes-bridge/bridge.go, Run): a JSON record with these two fields.
 # Until it appears the bus has an executor for nobody, and every case on the
@@ -217,6 +245,18 @@ readonly MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS=1500
 # come.
 readonly JOB_CONDITION_COMPLETE="Complete"
 readonly JOB_CONDITION_FAILED="Failed"
+# What the CR's status says when the operator refused a provision render
+# (updateStatusDegraded in platformagent_controller.go: the phase, and the
+# Ready condition's reason a Failed provision Job is given). Step 6b reads
+# both after the re-run Job, so a refusal reds the lane rather than parking
+# the CR Degraded over a working bus.
+readonly CR_PHASE_DEGRADED="Degraded"
+readonly CR_READY_REASON_PROVISION_FAILED="A2AProvisionFailed"
+# How long a Failed Job is given to reach the CR's status before the failure
+# is reported without it: the operator does not watch Jobs, it reads them on
+# its requeue (30s while a provision Job runs), so the status lags the Job by
+# up to one requeue. Polls of MODE_NEXT_POLL_SECONDS.
+readonly MODE_NEXT_STATUS_ATTEMPTS=12
 readonly A2A_PART_OF_SELECTOR="app.kubernetes.io/part-of=a2a-next"
 readonly A2A_PROVISION_JOB_SELECTOR="kubeagents.x-k8s.io/a2a-component=provision"
 readonly A2A_NATS_POD_SELECTOR="app=${PLATFORM_AGENT_CR_NAME}-a2a-nats"
@@ -550,6 +590,20 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   if [ "${MODE_NEXT_BRIDGE_CONCURRENCY_OK}" != "true" ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -lt 1 ] || [ "${MODE_NEXT_BRIDGE_CONCURRENCY}" -gt "${BRIDGE_QUEUE_CAPACITY}" ]; then
     echo "ERROR: EVAL_TASK_PARALLELISM='${MODE_NEXT_BRIDGE_CONCURRENCY}' is not a concurrency the bridge can be given (an integer 1..${BRIDGE_QUEUE_CAPACITY})." >&2
     exit 1
+  fi
+  # The maxSessions the first provision is given, so that the sidecar patch
+  # in step 6b re-renders a budget the first run's TASKS already holds: the
+  # largest value with maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED
+  # + A2A_RESERVE_PER_WORKER * workers <= A2A_TASKS_FLOOR, and at least 1
+  # (the API's minimum; the eval spawns no session pods, so the number is
+  # capacity nobody draws on). At the presubmit's 4 workers that is 6, at 6
+  # it is 2. At 8 or more the floor cannot hold even the reserve: the clamp
+  # gives 1, the second provision Job refuses, and the lane relies on step
+  # 6b's wait for that re-run to red visibly on the refusal rather than
+  # proceed over a Failed Job.
+  MODE_NEXT_MAX_SESSIONS=$(((A2A_TASKS_FLOOR - A2A_RESERVE_FIXED - A2A_RESERVE_PER_WORKER * MODE_NEXT_BRIDGE_CONCURRENCY) / A2A_SESSION_CONSUMERS))
+  if [ "${MODE_NEXT_MAX_SESSIONS}" -lt 1 ]; then
+    MODE_NEXT_MAX_SESSIONS=1
   fi
 fi
 
@@ -952,7 +1006,13 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # bridge that starts before NATS resolves crash-loops in the agent's pod and
 # holds the pod NotReady (a2a/docs/hermes-bridge.md, "What this deployment
 # method costs"). That declaration rolls the agent Deployment once more, and
-# the step ends on the bridge's own word that it is consuming `platform`
+# re-renders the provisioning Job, because the sidecar's BRIDGE_CONCURRENCY
+# is an input to the TASKS consumer budget: the step waits for that second
+# run and reads the CR's phase after it, so a refusal reds the lane instead
+# of parking the CR Degraded while the step proceeds (#2077). The first patch
+# carries the maxSessions section 2b sized so that second budget fits the
+# stream the first run created (the constants block says the arithmetic).
+# Then the step ends on the bridge's own word that it is consuming `platform`
 # tasks; until then the bus has an executor for nobody and every case on the
 # inject transport ends as infrastructure. The teardown's `helm uninstall`
 # removes the CR whole, so the flip-back-with-sidecar failure the bridge doc
@@ -1012,6 +1072,135 @@ wait_agent_generation_past() {
     exit 1
   fi
   echo "Agent Deployment generation ${before} -> ${after} at $((SECONDS - MODE_NEXT_START))s after ${what}"
+}
+
+# The CR's Ready condition as "<reason>: <message>", or nothing when the CR
+# carries none, for the two readers below and the artifact log.
+cr_ready_condition() {
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.reason}{": "}{.message}{end}' 2>/dev/null || true
+}
+
+# Waits for the A2A provisioning Job to reach a terminal condition and stops
+# the deploy unless it is Complete. The Job's name carries a digest of its
+# rendered spec, so it is found by its component label. Polled for either
+# terminal condition rather than `kubectl wait --for=condition=complete`,
+# which would sit out the whole budget on a Job that has already failed and
+# errors on a selector that matches nothing; the read prints nothing for a
+# Job not yet created and the loop simply comes back, so the budget covers
+# the Job's creation too. The read lists every Job the label matches with
+# its True conditions; a Complete on any counted Job is the gate passing, a
+# Failed on one with no Complete elsewhere is the gate failing.
+#
+# Arguments: what the Job follows, for the log; then, for a wait after a
+# patch that re-renders the Job, the name of the Job the patch supersedes and
+# the CR generation the patch produced. The superseded Job is not counted:
+# it is Complete, and it stays listed until the operator's next pass sweeps
+# it, which is after that pass has rolled the agent Deployment (reconcileA2A
+# runs after reconcileWorkload in the operator's Reconcile), so a read right
+# after the generation moves can still show only the old run. A render the
+# patch did not change keeps the old Job -- same digest, same name -- and
+# there is nothing to wait for; that is told from "not created yet" by the
+# CR's status.observedGeneration, which the pass that would have created it
+# writes at its end. Sets PROVISION_JOB_NAME to the Job that passed and
+# PROVISION_JOB_RERENDERED to false when the patch kept the old one.
+#
+# A Failed re-run is a refusal: the operator writes it to the CR's Ready
+# condition on the requeue that reads the Job (it does not watch Jobs), so
+# the failure waits up to MODE_NEXT_STATUS_ATTEMPTS polls for that condition
+# and prints it beside the Job's own log, then stops the deploy either way.
+wait_provision_job() {
+  local what="$1" superseded="${2:-}" cr_generation="${3:-}"
+  local gate_start=$SECONDS deadline=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))
+  local listing entry name conditions complete failed observed condition
+  local -a entries
+  PROVISION_JOB_NAME=""
+  PROVISION_JOB_CONDITIONS=""
+  PROVISION_JOB_RERENDERED="true"
+  while :; do
+    # One entry per Job: its name, a colon, its True condition types each
+    # followed by a comma, then a space.
+    listing="$(kubectl get jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" -o jsonpath='{range .items[*]}{.metadata.name}{":"}{range .status.conditions[?(@.status=="True")]}{.type}{","}{end}{" "}{end}' 2>/dev/null || true)"
+    read -r -a entries <<<"${listing}"
+    complete=""
+    failed=""
+    PROVISION_JOB_NAME=""
+    PROVISION_JOB_CONDITIONS=""
+    for entry in ${entries[@]+"${entries[@]}"}; do
+      name="${entry%%:*}"
+      conditions="${entry#*:}"
+      [ -n "${superseded}" ] && [ "${name}" = "${superseded}" ] && continue
+      case ",${conditions}" in
+      *",${JOB_CONDITION_COMPLETE},"*) complete="${name}" ;;
+      *",${JOB_CONDITION_FAILED},"*) failed="${name}" ;;
+      esac
+      PROVISION_JOB_NAME="${name}"
+      PROVISION_JOB_CONDITIONS="${conditions//,/ }"
+    done
+    if [ -n "${complete}" ]; then
+      PROVISION_JOB_NAME="${complete}"
+      PROVISION_JOB_CONDITIONS="${JOB_CONDITION_COMPLETE}"
+      break
+    elif [ -n "${failed}" ]; then
+      PROVISION_JOB_NAME="${failed}"
+      PROVISION_JOB_CONDITIONS="${JOB_CONDITION_FAILED}"
+      break
+    elif [ -n "${superseded}" ] && [ -z "${PROVISION_JOB_NAME}" ] && [[ " ${listing}" == *" ${superseded}:"* ]]; then
+      # Only the superseded Job is listed. Kept by a pass that has observed
+      # the patched generation, it is the current render.
+      observed="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)"
+      if [ -n "${observed}" ] && [ "${observed}" -ge "${cr_generation}" ]; then
+        PROVISION_JOB_NAME="${superseded}"
+        PROVISION_JOB_CONDITIONS="${JOB_CONDITION_COMPLETE}"
+        PROVISION_JOB_RERENDERED="false"
+        break
+      fi
+    fi
+    [ "${SECONDS}" -ge "${deadline}" ] && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  if [ "${PROVISION_JOB_CONDITIONS}" != "${JOB_CONDITION_COMPLETE}" ]; then
+    echo "ERROR: the A2A provisioning Job did not complete within ${MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS}s after ${what} (Job: ${PROVISION_JOB_NAME:-none}; conditions: ${PROVISION_JOB_CONDITIONS:-none})"
+    if [ "${PROVISION_JOB_CONDITIONS}" = "${JOB_CONDITION_FAILED}" ]; then
+      condition=""
+      for _ in $(seq 1 "${MODE_NEXT_STATUS_ATTEMPTS}"); do
+        condition="$(cr_ready_condition)"
+        [[ "${condition}" == "${CR_READY_REASON_PROVISION_FAILED}: "* ]] && break
+        sleep "${MODE_NEXT_POLL_SECONDS}"
+      done
+      echo "${PLATFORM_AGENT_CR_NAME} Ready condition: ${condition:-none}"
+    fi
+    kubectl describe jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" || true
+    echo "--- provisioning Job pod logs ---"
+    kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+    echo "--- NATS pod log ---"
+    kubectl logs -n "${NAMESPACE}" -l "${A2A_NATS_POD_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+    dump_mode_next_state
+    exit 1
+  fi
+  if [ "${PROVISION_JOB_RERENDERED}" = "false" ]; then
+    echo "✓ ${what} left the A2A provisioning Job's render unchanged (${PROVISION_JOB_NAME} is still the current run) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  else
+    echo "✓ A2A provisioning Job ${PROVISION_JOB_NAME} complete $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  fi
+}
+
+# Reads the CR's phase and Ready condition after a provisioning Job completed
+# and stops the deploy on a refusal the Job's own conditions did not show:
+# phase Degraded, or Ready carrying the reason a refused provision is given.
+# One read: a Degraded here is a refusal already written, not a lag. Prints
+# the condition either way, so the artifact says what the CR said.
+gate_cr_not_degraded() {
+  local what="$1" phase condition
+  phase="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  condition="$(cr_ready_condition)"
+  if [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || [[ "${condition}" == "${CR_READY_REASON_PROVISION_FAILED}: "* ]]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what}; Ready condition: ${condition:-none}"
+    echo "--- provisioning Job pod logs ---"
+    kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
+    dump_mode_next_state
+    exit 1
+  fi
+  echo "✓ ${PLATFORM_AGENT_CR_NAME} is ${phase:-unphased} after ${what} (Ready condition: ${condition:-none})"
 }
 
 # Renders the merge patch that declares the bridge sidecar on the CR, from the
@@ -1074,6 +1263,15 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next (EVAL_MODE_NEXT=1) ==="
+  # The mode and the session cap in one patch, so the first render -- and the
+  # first provisioning Job -- sees both. Section 2b sized the cap so the TASKS
+  # that Job creates at the floor holds the budget the sidecar patch below
+  # re-renders; the arithmetic is in the log for a reader of the artifact who
+  # finds a non-default maxSessions on the eval CR.
+  echo "setting spec.harness.tuning.maxSessions=${MODE_NEXT_MAX_SESSIONS} so the ${A2A_TASKS_FLOOR}-wide TASKS holds the ${MODE_NEXT_BRIDGE_CONCURRENCY}-worker bridge's budget (${MODE_NEXT_MAX_SESSIONS}*${A2A_SESSION_CONSUMERS} + ${A2A_RESERVE_FIXED} + ${A2A_RESERVE_PER_WORKER}*${MODE_NEXT_BRIDGE_CONCURRENCY} <= ${A2A_TASKS_FLOOR})"
+  # The format is a named constant, which is the point of it (SC2059 wants a literal).
+  # shellcheck disable=SC2059
+  printf -v MODE_NEXT_PATCH "${MODE_NEXT_PATCH_FORMAT}" "${MODE_NEXT_MAX_SESSIONS}"
   GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${MODE_NEXT_PATCH}"
   wait_agent_generation_past "${GEN_BEFORE}" "the mode patch"
@@ -1086,37 +1284,10 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   gate_mode_next_rollout "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
 
-  # The Job's name carries a digest of its rendered spec, so it is found by
-  # its component label. Polled for either terminal condition rather than
-  # `kubectl wait --for=condition=complete`, which would sit out the whole
-  # budget on a Job that has already failed and errors on a selector that
-  # matches nothing; this read prints nothing for a Job not yet created and
-  # the loop simply comes back, so the budget covers the Job's creation too.
-  # The read lists every True condition on every Job the label matches; a
-  # Complete anywhere is the gate passing.
-  JOB_GATE_START=$SECONDS
-  JOB_DEADLINE=$((SECONDS + MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS))
-  JOB_CONDITIONS=""
-  while :; do
-    JOB_CONDITIONS="$(kubectl get jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" -o jsonpath='{range .items[*]}{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}{end}' 2>/dev/null || true)"
-    case " ${JOB_CONDITIONS} " in
-    *" ${JOB_CONDITION_COMPLETE} "*) break ;;
-    *" ${JOB_CONDITION_FAILED} "*) JOB_CONDITIONS="${JOB_CONDITION_FAILED}"; break ;;
-    esac
-    [ "${SECONDS}" -ge "${JOB_DEADLINE}" ] && break
-    sleep "${MODE_NEXT_POLL_SECONDS}"
-  done
-  if [[ " ${JOB_CONDITIONS} " != *" ${JOB_CONDITION_COMPLETE} "* ]]; then
-    echo "ERROR: the A2A provisioning Job did not complete within ${MODE_NEXT_PROVISION_JOB_TIMEOUT_SECONDS}s (conditions: ${JOB_CONDITIONS:-none})"
-    kubectl describe jobs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" || true
-    echo "--- provisioning Job pod logs ---"
-    kubectl logs -n "${NAMESPACE}" -l "${A2A_PROVISION_JOB_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
-    echo "--- NATS pod log ---"
-    kubectl logs -n "${NAMESPACE}" -l "${A2A_NATS_POD_SELECTOR}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
-    dump_mode_next_state
-    exit 1
-  fi
-  echo "✓ A2A provisioning Job complete $((JOB_GATE_START - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the patch"
+  # The first run, against a bus with no streams; its name is kept so the
+  # re-run after the sidecar patch is told from it.
+  wait_provision_job "the mode patch"
+  FIRST_PROVISION_JOB="${PROVISION_JOB_NAME}"
 
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
 
@@ -1158,7 +1329,18 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   printf '%s' "${SIDECAR_PATCH}" | python3 -c 'import json,sys; c=json.load(sys.stdin)["spec"]["deployment"]["sidecars"][0]; print("  " + " ".join(e["name"] for e in c["env"])); print("  mounts: " + " ".join(m["name"] for m in c["volumeMounts"]))'
   SIDECAR_GEN_BEFORE="$(kubectl get "deployment/${AGENT_DEPLOYMENT_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   kubectl patch platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" --type merge -p "${SIDECAR_PATCH}"
+  SIDECAR_CR_GENERATION="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath='{.metadata.generation}')"
   wait_agent_generation_past "${SIDECAR_GEN_BEFORE}" "the sidecar patch"
+
+  # The sidecar's BRIDGE_CONCURRENCY is an input to the TASKS consumer
+  # budget, so this patch re-renders the provisioning Job, and its second run
+  # measures the new budget against the stream the first run created. Waited
+  # for, and the CR read after it: a refusal here used to park the CR
+  # Degraded over a working bus while this step went on to a green bridge
+  # line (#2077). The first patch's maxSessions was sized so this budget
+  # fits; this is the guard for a budget that moves.
+  wait_provision_job "the sidecar patch" "${FIRST_PROVISION_JOB}" "${SIDECAR_CR_GENERATION}"
+  gate_cr_not_degraded "the sidecar patch"
   gate_mode_next_rollout "deployment/${AGENT_DEPLOYMENT_NAME}"
 
   # Ready is not consuming: the bridge sweeps its registry and binds its

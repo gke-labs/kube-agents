@@ -42,7 +42,7 @@
           "path": "status.readyReplicas",
           "op": "eq",
           "value": 2,
-          "why": "the fleet's one healthy workload: cluster-agent-healthy-workload-no-finding asks whether the agent invents a fault, which means something only while both replicas are Running and Ready. On 2026-09-07 they sat Pending and the case could not be read either way"
+          "why": "a healthy workload, as notification-relay in seeded-intent is: cluster-agent-healthy-workload-no-finding asks whether the agent invents a fault, which means something only while both replicas are Running and Ready. On 2026-09-07 they sat Pending and the case could not be read either way"
         },
         {
           "subject": "poddisruptionbudget?",
@@ -215,6 +215,27 @@
           "op": "any_eq",
           "value": "192.0.2.10",
           "why": "the hand-written subset on a selector-less Service, which the endpoints controller leaves alone. An Endpoints without it was rewritten or replaced, and the object the writer patches is no longer the planted one"
+        }
+      ]
+    },
+    "declared-no-pdb-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-intent",
+      "probes": ["deployment/notification-relay"],
+      "fixture": "notification-relay Deployment, two replicas, no PodDisruptionBudget in the namespace; the workload a repository declaration covers, so the declared-intent case silences nothing another case grades",
+      "state": [
+        {
+          "subject": "deployment/notification-relay",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "the posture is a healthy two-replica workload without a budget; Pending replicas would make the missing budget a fault rather than a declared posture"
+        },
+        {
+          "subject": "poddisruptionbudget?",
+          "path": null,
+          "op": "absent",
+          "why": "a PodDisruptionBudget anyone adds to seeded-intent removes the posture the declaration covers, and the case then grades nothing"
         }
       ]
     }

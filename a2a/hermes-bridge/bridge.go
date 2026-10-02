@@ -13,7 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -106,6 +110,29 @@ type Config struct {
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
 	ResultChunkSize int
+	// ActivityListen is the loopback address of the activity door, where
+	// hermes's outbound webhooks deliver the persona's tool calls
+	// (activity.go). Empty leaves the door closed: no listener, no key in
+	// the child's environment, no activity artifact. The daemon defaults it
+	// to DefaultActivityListen; the zero value here is "off" so a bridge
+	// under test binds nothing it did not ask for.
+	ActivityListen string
+	// ManagedScopeDir is hermes's managed scope as this process sees it:
+	// the directory whose config.yaml and .env each child's own scope is
+	// copied from before the hook is added (activity.go). Empty means
+	// nothing to copy and a hook-only scope; the daemon resolves it from
+	// $HERMES_MANAGED_DIR, else /etc/hermes (cmd/hermes-bridge), so the
+	// library reads no environment and a test's bridge copies nothing from
+	// the machine it runs on.
+	ManagedScopeDir string
+	// ScratchDir holds the per-task managed scopes (default: hermes-bridge
+	// under the temp dir). Each is removed when its child exits.
+	ScratchDir string
+	// ProgressInterval is the heartbeat cadence on the progress artifact.
+	// Zero takes the default (60s), as every other field here does; a
+	// negative value turns the heartbeat off. The daemon maps its
+	// environment's 0 to that, since "0 seconds" can only mean off there.
+	ProgressInterval time.Duration
 	// NATSOptions carries credentials etc; applied to both connections.
 	NATSOptions []nats.Option
 	Logger      *slog.Logger
@@ -135,6 +162,12 @@ func (c *Config) defaults() {
 	if c.ResultChunkSize <= 0 {
 		c.ResultChunkSize = 256 * 1024
 	}
+	if c.ProgressInterval == 0 {
+		c.ProgressInterval = DefaultProgressInterval
+	}
+	if c.ScratchDir == "" {
+		c.ScratchDir = filepath.Join(os.TempDir(), "hermes-bridge")
+	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -163,6 +196,14 @@ type taskRun struct {
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
+
+	// act is the task's side of the activity door (activity.go): its
+	// signing key, the calls seen, the heartbeat's lifecycle. Stored before
+	// the subprocess starts, so no delivery can precede it, and atomic
+	// because the door reads it with no lock held, after copying the runs
+	// under b.mu, while the worker writes it under mu - the two locks never
+	// nest, on purpose.
+	act atomic.Pointer[activityState]
 }
 
 // Bridge is one running instance. Two connections by design: the lib client
@@ -212,6 +253,12 @@ type Bridge struct {
 	// so a test can keep the release pending and count slots in hand without
 	// racing the timer.
 	holdReplaySlot func(release func())
+
+	// The activity door (activity.go); nil when Config.ActivityListen is "".
+	activityLn   net.Listener
+	activitySrv  *http.Server
+	activityDone chan struct{} // closed by closeActivity, so serveActivity's shutdown waiter stops too
+	activityOnce sync.Once
 	// tasksGet is the task lookup lookupTask retries, in the shape of
 	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
 	// drive the retry without a bus fault.
@@ -260,12 +307,17 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		b.close()
 		return nil, fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
 	}
+	if err := b.listenActivity(); err != nil {
+		b.close()
+		return nil, err
+	}
 	return b, nil
 }
 
 func (b *Bridge) close() {
 	b.c.Close()
 	b.nc.Close()
+	b.closeActivity()
 }
 
 // Run sweeps orphans from a prior incarnation, then consumes the profile's
@@ -277,6 +329,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err := b.sweep(ctx); err != nil {
 		return fmt.Errorf("startup sweep: %w", err)
 	}
+	b.serveActivity(ctx)
 	for i := 0; i < b.cfg.Concurrency; i++ {
 		b.wg.Add(1)
 		go b.worker(ctx)
@@ -712,6 +765,24 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	stderr := newTailBuffer(stderrTailBytes)
 	cmd.Stdout = &stdout
 	cmd.Stderr = stderr
+	// The activity door's side of this task: a signing key in the child's
+	// environment when the door is open, and the heartbeat either way.
+	act := newActivityState(b.activityLn != nil)
+	if b.activityLn != nil {
+		scope, err := b.childManagedScope(taskID)
+		if err != nil {
+			b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
+			return
+		}
+		defer func() {
+			// The scope holds the managed .env; a removal that fails leaves
+			// it in the shared scratch dir until the next start's sweep.
+			if err := os.RemoveAll(scope); err != nil {
+				b.cfg.Logger.Warn("child scope not removed", "task", run.origin.TaskID, "scope", scope, "err", err)
+			}
+		}()
+		cmd.Env = append(os.Environ(), act.childEnv(b.ActivityURL(), scope)...)
+	}
 
 	run.mu.Lock()
 	if run.state != stateRunning {
@@ -719,12 +790,16 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		run.mu.Unlock()
 		return
 	}
+	run.act.Store(act)
 	if err := cmd.Start(); err != nil {
+		// No child, so no publisher to join and nothing to drain.
+		run.act.Store(nil)
 		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: spawn-failed - %v", err), nil)
 		return
 	}
 	run.proc = cmd
+	go b.runActivity(run)
 	// Cancel may have raced the spawn: its kill saw no process, so re-check
 	// under the same lock its kill path takes.
 	if run.canceled.Load() {
@@ -859,6 +934,11 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 		run.mu.Unlock()
 		return
 	}
+	// The trace first, while the state still admits it: any call still
+	// open, and the budget marker if calls were cut, go out ahead of the
+	// result inside this critical section, so the activity artifact is
+	// complete and nothing of it can follow the final event.
+	b.drainActivity(run)
 	run.state = stateDone
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	if resultOutput != nil {
@@ -870,6 +950,7 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
 	run.mu.Unlock()
+	b.waitActivity(run)
 	if err != nil {
 		// The task stays in the KV registry, so a restart's sweep writes the
 		// terminal event this publish could not.
