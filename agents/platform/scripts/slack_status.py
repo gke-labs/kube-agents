@@ -44,6 +44,8 @@ SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLO
 TITLE_MAX = 80
 TITLE_REPLACEMENTS = ((":", ","), ("·", ","), ("/", "\u2215"))
 ELLIPSIS = "…"
+#: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
+CLIP_MIN_SHARE = 2
 
 #: Slack markup in an ask: a user or channel mention, and a link with or
 #: without its label. Mentions go; a channel keeps its name, a link its label,
@@ -127,9 +129,11 @@ def _clip(text: str, limit: int) -> str:
     """``text`` cut on a word to ``limit`` characters, ellipsis included."""
     if len(text) <= limit:
         return text
-    cut = text[: limit - len(ELLIPSIS)]
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
+    hard = text[: limit - len(ELLIPSIS)]
+    cut = hard.rsplit(" ", 1)[0]
+    # A long unbroken word would otherwise take everything after the last space with it.
+    if len(cut) * CLIP_MIN_SHARE < len(hard):
+        cut = hard
     return cut.rstrip(" ,") + ELLIPSIS
 
 

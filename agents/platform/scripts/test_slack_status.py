@@ -134,6 +134,10 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is #prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
 
+    def test_a_long_word_after_a_short_one_is_cut_not_dropped(self):
+        self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 71 + s.ELLIPSIS)
+        self.assertEqual(s.session_title("word " * 40), ("word " * 15).rstrip() + s.ELLIPSIS)
+
     def test_title_keeps_what_real_markup_gives(self):
         cases = {
             "is <@U123> ok with <#C1|ops> and <https://x.example/a|the doc> or <https://y.example>?": (
