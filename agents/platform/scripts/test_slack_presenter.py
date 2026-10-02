@@ -376,12 +376,10 @@ class ButtonsTest(unittest.TestCase):
         self.assertLessEqual(len(button["value"]), sp.BUTTON_TEXT_MAX)
         self.assertNotIn("HIDDEN-TAIL", button["value"])
 
-    def test_a_choice_pair_shows_its_label_and_carries_its_turn(self):
-        blocks = sp.blocks_report("h", choices=[("Fix it", "Fix it: the row"), "See all 3"], action_id_prefix="kage")
+    def test_the_first_choice_is_primary_and_every_value_is_its_label(self):
+        blocks = sp.blocks_report("h", choices=["Fix it", "", "See all 3"], action_id_prefix="kage")
         buttons = next(b for b in blocks if b["type"] == "actions")["elements"]
-        self.assertEqual(
-            [(b["text"]["text"], b["value"]) for b in buttons], [("Fix it", "Fix it: the row"), ("See all 3", "See all 3")]
-        )
+        self.assertEqual([(b["text"]["text"], b["value"]) for b in buttons], [("Fix it", "Fix it"), ("See all 3", "See all 3")])
         self.assertEqual(buttons[0]["style"], "primary")
 
     def test_buttons_wrap_at_five(self):
@@ -678,13 +676,6 @@ class BlocksReportTest(unittest.TestCase):
         detail = self._report(detail="**" + "y" * (sp.ROW_TEXT_MAX + 50) + "**")[0]["elements"][1]["elements"][0]["text"]
         self.assertLessEqual(len(detail), sp.ROW_TEXT_MAX)
         self.assertNotIn("*", detail)
-
-    def test_shown_text_is_the_rows_rich_text_joined(self):
-        for markdown in ("*seeded-b* admits _privileged_ ~pods~", "`cluster-admin` on **seeded-c**", "[logs](https://x/1) say so"):
-            row = sp.blocks_report("h", rows=[markdown])[2]["elements"][0]["elements"]
-            self.assertEqual(sp.shown_text(markdown), "".join(e["text"] for e in row))
-        self.assertEqual(sp.shown_text("*seeded-b* admits _privileged_ ~pods~"), "seeded-b admits privileged pods")
-        self.assertLessEqual(len(sp.shown_text("x " * sp.ROW_TEXT_MAX)), sp.ROW_TEXT_MAX)
 
     def test_names_gap_reads_a_negation_as_no_gap(self):
         self.assertTrue(sp.names_gap("seeded-c could not be scanned"))

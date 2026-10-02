@@ -121,9 +121,7 @@ is listed, a "See all N" button when the issue counts more than it shows, and a 
 button to the ledger; nothing folds) and posts it once through `slack_blocks_post`
 to the relay's `chat.postMessage`, because `hermes send` takes text only. A click on
 a choice button runs as the clicker's turn in the thread, carrying the button's
-label. The fix button's value names the first finding as the card shows it ("Fix
-the first one: <finding>"), but the click runtime does not send a value, so the
-turn is the bare label. The leg posts the text headline
+label, which is also its value. The leg posts the text headline
 through `hermes send` instead when there is no relay, when the report carries a
 truncation notice (the blocks have no place for it), when the issue was not read, is
 closed or does not parse, when Slack refuses the message for any reason, since

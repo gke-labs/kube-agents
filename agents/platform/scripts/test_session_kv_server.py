@@ -3614,7 +3614,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         actions = blocks[4]["elements"]
         self.assertEqual(actions[0]["action_id"], "kage_audit.choice.0")
         self.assertEqual(actions[0]["style"], "primary")
-        self.assertEqual(actions[0]["value"], "Fix it: cluster-admin bound to default")
+        self.assertEqual(actions[0]["value"], "Fix it")
         self.assertEqual(actions[1]["value"], "See all 7")
         self.assertEqual(actions[-1]["url"], self.LEDGER)
         self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.COMPOSED)])

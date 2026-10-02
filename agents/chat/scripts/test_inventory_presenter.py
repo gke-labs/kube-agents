@@ -1133,53 +1133,18 @@ class BlocksTest(unittest.TestCase):
         report = "Posture.\n\n1. **A (major)**\n   x\n2. **B**\n   y\n3. **C**\n   z\n"
         self.assertEqual(self._headline(report), ("I found 3 things to look at.", "Two are worth fixing first:"))
 
-    def test_the_primary_button_names_the_first_finding_in_its_value(self):
-        # The label is what the card shows; the value is the turn a session with no thread context reads.
+    def test_the_primary_button_value_is_its_label(self):
+        # A click posts the label in the card's thread; the row it means is on the card.
         blocks, _ = inventory_presenter.blocks(REPORT)
         primary = blocks[-1]["elements"][0]
-        self.assertEqual(
-            (primary["text"]["text"], primary["value"]),
-            ("Fix the first one", "Fix the first one: seeded-b and seeded-c admit privileged pods"),
-        )
+        self.assertEqual((primary["text"]["text"], primary["value"]), ("Fix the first one", "Fix the first one"))
         self.assertIn("seeded-b and seeded-c admit privileged pods", str(blocks[2]))
 
-    def test_a_single_row_names_it_under_fix_it(self):
+    def test_a_single_row_is_fix_it(self):
         report = "# Scan\n\nI scanned 1 cluster.\n\n1. **`kube-system` has no **NetworkPolicy****\n   Add one.\n"
         blocks, _ = inventory_presenter.blocks(report)
         primary = blocks[-1]["elements"][0]
-        self.assertEqual((primary["text"]["text"], primary["value"]), ("Fix it", "Fix it: kube-system has no NetworkPolicy"))
-
-    def test_the_value_names_the_row_as_the_card_shows_it(self):
-        report = "# Scan\n\nI scanned 1 cluster.\n\n1. **On *seeded-b*, _privileged_ ~pods~ run**\n   Fix.\n"
-        blocks, _ = inventory_presenter.blocks(report)
-        value = blocks[-1]["elements"][0]["value"]
-        self.assertEqual(value, "Fix it: On seeded-b, privileged pods run")
-        shown = ["".join(e["text"] for e in section["elements"]) for section in blocks[2]["elements"]]
-        self.assertTrue(any(value.removeprefix("Fix it: ") in line for line in shown), shown)
-
-    def test_the_value_is_the_first_row_exactly_as_the_card_shows_it(self):
-        long_title = "seeded-b admits privileged pods " + "word " * 70
-        cases = {
-            "severity": REPORT,
-            "markup": "Scan.\n\n1. **`kube-system` on *seeded-b* has ~no~ [policy](https://example.com/p) (major)**\n   x\n"
-            "2. **B**\n   y\n",
-            "clipped": f"Scan.\n\n1. **{long_title}(critical)**\n   x\n2. **B**\n   y\n",
-            # Clipped as markdown, so the link's URL counts against the clip; clipping
-            # the plain text instead leaves more of the title than the card shows.
-            "clipped link": f"Scan.\n\n1. **[seeded-b](https://example.com/{'p' * 60}) admits {long_title}**\n   x\n"
-            "2. **B**\n   y\n",
-        }
-        for name, report in cases.items():
-            with self.subTest(name):
-                blocks, _ = inventory_presenter.blocks(report)
-                primary = blocks[-1]["elements"][0]
-                elements = blocks[2]["elements"][0]["elements"]
-                if elements[0].get("style") == {"code": True} and elements[1] == {"type": "text", "text": " "}:
-                    elements = elements[2:]
-                first_line = "".join(e["text"] for e in elements).split("\n", 1)[0]
-                self.assertEqual(primary["value"], f"{primary['text']['text']}: {first_line}")
-                if name.startswith("clipped"):
-                    self.assertTrue(first_line.endswith("…"), first_line)
+        self.assertEqual((primary["text"]["text"], primary["value"]), ("Fix it", "Fix it"))
 
     def test_a_gap_the_posture_names_is_its_own_line_under_the_headline(self):
         report = self._probe(GAP_POSTURE)

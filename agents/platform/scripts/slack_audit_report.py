@@ -39,9 +39,8 @@ could not scan, that goes on a line of its own under the headline ("1 cluster
 unreachable.") and the coverage is dropped unless it reads "<n> of <m>",
 since "across 3 clusters" would vouch for all three. The line's single "<n>
 new" count follows it ("2 are new since the last run."), then the top two
-findings and a "Fix the first one" button whose value names the first of
-them, a "See all N" button when the issue counts more, and the
-ledger link. The relayed line itself is not on the card, so it goes in the
+findings and a "Fix the first one" button, a "See all N" button when the
+issue counts more, and the ledger link. The relayed line itself is not on the card, so it goes in the
 headline's thread (:func:`needs_fold`), where its resolved count and
 remediation pull requests stay readable. Finding titles are model-written and editable
 on the forge, as is the issue title, and the relayed line is model-written
@@ -68,7 +67,6 @@ from slack_presenter import (
     fallback_text,
     gap_parts,
     severity_row,
-    shown_text,
 )
 
 #: Any link Hermes' text path would post (``SlackAdapter.format_message``): its
@@ -191,12 +189,11 @@ URGENT_SEVERITIES = frozenset({"critical", "major"})
 #: Counts written as words in a lead; past the last, the digits.
 COUNT_WORDS = {2: "two", 3: "three"}
 
-#: The Block Kit report: the primary button's turn names the top finding, the
-#: link button opens the ledger.
+#: The Block Kit report: a choice button's click posts its label, the link
+#: button opens the ledger.
 ACTION_ID_PREFIX = "kage_audit"
 FIX_FIRST = "Fix the first one"
 FIX_ONLY = "Fix it"
-FIX_TURN = "{label}: {finding}"
 SEE_ALL = "See all {count}"
 LEDGER_BUTTON = "Ledger issue #{number} ↗"
 
@@ -539,10 +536,7 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
     top = _rows(parsed.findings[:TOP_FINDINGS])
     choices: list = []
     if top:
-        label = FIX_FIRST if len(top) > 1 else FIX_ONLY
-        # The row as the card shows it, so the click's turn names only what was seen.
-        first = shown_text(top[0]["text"])
-        choices.append((label, FIX_TURN.format(label=label, finding=first)))
+        choices.append(FIX_FIRST if len(top) > 1 else FIX_ONLY)
     if parsed.count > len(top):
         choices.append(SEE_ALL.format(count=parsed.count))
     links = [(LEDGER_BUTTON.format(number=ref.number), ref.url)]

@@ -30,9 +30,7 @@ led by their severity as inline code (a bullet when they have none).
 Reports (:func:`blocks_report`): a headline, the top findings as one group
 between dividers, then the choice buttons and the link buttons. Block Kit has no bordered box a message
 can draw, so the dividers stand in for a border. :func:`names_gap` and
-:func:`as_line` find and set out a report's line saying what was not scanned,
-and :func:`shown_text` is a row's text as the card shows it, for a choice
-whose value names that row.
+:func:`as_line` find and set out a report's line saying what was not scanned.
 
 Reactions (:func:`arrival_reaction`, :func:`settle_reaction`): the first
 reaction says what kind of ask arrived, chosen by keyword before any model
@@ -560,11 +558,6 @@ def as_line(clause: str) -> str:
     return clause[:1].upper() + clause[1:] if LOWER_WORD.match(clause) else clause
 
 
-def shown_text(markdown: str) -> str:
-    """A row's text as its rich_text line shows it: the same clip and spans, the elements' text joined."""
-    return "".join(element["text"] for element in _rich_elements(_clip(markdown.strip(), ROW_TEXT_MAX)))
-
-
 def _escape(text: str) -> str:
     for raw, escaped in MRKDWN_ESCAPES:
         text = text.replace(raw, escaped)
@@ -854,11 +847,9 @@ def blocks_report(
     under its row, clipped like it; ``rows`` sit between two dividers, with no
     header above them. The first choice is the primary button and the links
     follow the choices. A choice is clipped to the button label before it
-    becomes the value too, so a click posts only what the button showed. A
-    choice may instead be a ``(label, turn)`` pair, whose value is ``turn``:
-    the label, ": ", and a line the message shows (:func:`shown_text`), the
-    only shape of value a click handler that reads it sends. Any part left empty, a row with
-    no text and no severity included, is omitted.
+    becomes the value too, so a click posts only what the button showed.
+    Any part left empty, a row with no text and no severity included, is
+    omitted.
     """
     rows = _shown(rows)
     blocks: list[dict] = []
@@ -883,8 +874,8 @@ def blocks_report(
         blocks.append({"type": "rich_text", "elements": [
             {"type": "rich_text_section", "elements": [{"type": "text", "text": after_line}]}]})
     choice_buttons = [
-        _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=turn or label)
-        for i, (label, turn) in enumerate(_choice_pairs(choices))
+        _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
+        for i, label in enumerate(_choice_labels(choices))
     ]
     if choice_buttons:
         choice_buttons[0]["style"] = PRIMARY_STYLE
@@ -896,14 +887,9 @@ def blocks_report(
     return blocks
 
 
-def _choice_pairs(choices: Iterable[Any]) -> list[tuple[str, str]]:
-    """``(label, turn)`` per non-empty choice: a string's turn is empty, a pair's is its second item."""
-    pairs = []
-    for choice in choices or ():
-        label, turn = choice if isinstance(choice, tuple) else (choice, "")
-        if str(label).strip():
-            pairs.append((_clip(str(label), BUTTON_TEXT_MAX), str(turn or "")))
-    return pairs
+def _choice_labels(choices: Iterable[Any]) -> list[str]:
+    """Each non-empty choice clipped to a button label."""
+    return [_clip(str(choice), BUTTON_TEXT_MAX) for choice in choices or () if str(choice).strip()]
 
 
 # --- link-button ack -------------------------------------------------------

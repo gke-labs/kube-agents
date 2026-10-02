@@ -52,10 +52,8 @@ how a text reader asks for the rest. When the roll-up was the last of them,
 posts itself when it can: the headline, lead and top rows with no count
 above them, then a primary "Fix the first one" button and, when the total is
 more than the rows shown, a "See all N" button, both answered as the
-clicker's turn. The primary button's value names the first row as the card
-shows it ("Fix the first one: <finding>"); the click runtime sends the
-label, not the value, so the turn is "Fix the first one". The closing
-lines are left out too: "See all N" asks for the rest.
+clicker's turn: a click posts the button's label in the card's thread.
+The closing lines are left out too: "See all N" asks for the rest.
 
 The report is model-written to the format in
 ``agents/platform/governance/inventory_prioritize_sop.md`` (Step 6). A report
@@ -64,7 +62,7 @@ that does not parse to that shape is returned unchanged.
 
 import re
 
-from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row, shown_text
+from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
 
 TOP_COUNT = 2
 #: The most items the SOP lists (Step 5) unless every one is critical: a longer
@@ -110,8 +108,6 @@ CARD_NEUTRAL_LEAD_TEMPLATE = "Start with these {count}:"
 CARD_NEUTRAL_LEAD_ONE = "Start with this one:"
 FIX_FIRST = "Fix the first one"
 FIX_ONLY = "Fix it"
-#: The primary button's value: its label naming the first row, as the click's turn.
-FIX_TURN = "{label}: {finding}"
 SEE_ALL = "See all {count}"
 #: Counts written as words in a lead; past the last, the digits.
 COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten"}
@@ -759,9 +755,7 @@ def blocks(report: str) -> tuple[list[dict], str] | None:
     headline, note, detail = card_headline(shape, closing_gaps=True)
     top = _rows(shape.top)
     label = FIX_FIRST if len(shape.top) > 1 else FIX_ONLY
-    # The row as the card shows it, so the click's turn names only what was seen.
-    first = shown_text(shape.top[0][1])
-    choices: list = [(label, FIX_TURN.format(label=label, finding=first))]
+    choices: list = [label]
     if shape.total > len(shape.top):
         choices.append(SEE_ALL.format(count=shape.total))
     built = blocks_report(

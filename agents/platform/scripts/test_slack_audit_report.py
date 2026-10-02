@@ -755,9 +755,7 @@ class BlocksFromIssueTest(unittest.TestCase):
         self.assertNotIn("2 critical", str(blocks[2]))
         fix, see_all, link = blocks[4]["elements"]
         self.assertEqual(fix["text"]["text"], "Fix the first one")
-        self.assertEqual(
-            fix["value"], "Fix the first one: seeded-b, seeded-c: cluster-admin bound to the default service account"
-        )
+        self.assertEqual(fix["value"], "Fix the first one")
         self.assertEqual((fix["action_id"], fix["style"]), ("kage_audit.choice.0", "primary"))
         self.assertEqual((see_all["text"]["text"], see_all["value"]), ("See all 7", "See all 7"))
         self.assertNotIn("style", see_all)
@@ -778,36 +776,13 @@ class BlocksFromIssueTest(unittest.TestCase):
                 self.assertNotIn("container", [b["type"] for b in blocks])
                 self.assertNotIn("Workload Identity", str(blocks))
 
-    def test_the_turn_comes_from_the_finding(self):
-        body = BODY.replace("seeded-b, seeded-c: `cluster-admin` bound to the default service account", "privileged pods")
-        blocks, _ = sar.blocks_from_issue(dict(ISSUE, body=body), REF, REPORT)
-        self.assertEqual(blocks[4]["elements"][0]["value"], "Fix the first one: privileged pods")
-
-    def test_a_long_finding_turns_as_the_card_clips_it(self):
-        body = "### Critical (2)\n\n" + finding("word " * 60, "w") + finding("second", "s")
-        blocks, _ = sar.blocks_from_issue(dict(ISSUE, body=body), REF, REPORT)
-        value = blocks[4]["elements"][0]["value"]
-        self.assertTrue(value.endswith("…"), value)
-        shown = blocks[2]["elements"][0]["elements"][-1]["text"]
-        self.assertEqual(value, "Fix the first one: " + shown)
-
-    def test_the_turn_names_a_line_the_card_shows(self):
-        for title in ("seeded-c: `default` SA bound to `cluster-admin`", "word " * 60, "*seeded-b* admits _privileged_ ~pods~"):
+    def test_the_fix_value_is_its_label_whatever_the_finding(self):
+        for title in ("privileged pods", "word " * 60, "*seeded-b* admits _privileged_ ~pods~"):
             with self.subTest(title=title[:20]):
                 body = "### Critical (2)\n\n" + finding(title, "a") + finding("second", "b")
                 blocks, _ = sar.blocks_from_issue(dict(ISSUE, body=body), REF, REPORT)
-                value = blocks[4]["elements"][0]["value"]
-                named = value.removeprefix("Fix the first one: ")
-                self.assertNotEqual(named, value)
-                lines = [
-                    "".join(e.get("text", "") for e in section["elements"])
-                    for block in blocks
-                    if block["type"] == "rich_text"
-                    for section in block["elements"]
-                ]
-                self.assertTrue(any(named in line for line in lines), (named, lines))
-                self.assertNotIn("\n", named)
-                self.assertFalse(set("*_~`") & set(named), named)
+                fix = blocks[4]["elements"][0]
+                self.assertEqual(fix["value"], fix["text"]["text"])
 
     def test_every_finding_shown_needs_no_see_all(self):
         issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 2 findings (2 critical)")
@@ -849,7 +824,7 @@ class BlocksFromIssueTest(unittest.TestCase):
         blocks, text = sar.blocks_from_issue(dict(ISSUE, body=body), REF, REPORT)
         self.assertNotIn("evil.example", str(blocks) + text)
         self.assertNotIn("<!", str(blocks) + text)
-        self.assertEqual(blocks[4]["elements"][0]["value"], "Fix it: see the fix !channel")
+        self.assertEqual(blocks[4]["elements"][0]["value"], "Fix it")
 
     def test_held_and_crlf_rows(self):
         body = (
