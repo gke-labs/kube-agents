@@ -282,7 +282,7 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                           | **All Methods** (GKE)                            |
 | **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                               | **All Methods**                                  |
 | **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                      | **Methods 0 & 1**                                |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                                                                                                             | **Methods 0, 1, & 2**                            |
+| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                      | **Methods 0, 1, & 2**                            |
 | **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                              | **All Methods**                                  |
 | **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation.                                                                                                                                                      | **Methods 0 & 1**                                |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                              | **All Methods**                                  |
@@ -316,7 +316,7 @@ and GitHub minter workloads).
 - **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
 - Drive it through [`lifecycle.sh`](terraform/examples/full-install/lifecycle.sh) rather than bare
   `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete and any Pub/Sub
-  topic or subscription that already exists, `destroy` handles the four teardown asymmetries a bare
+  topic or subscription that already exists, `destroy` handles the teardown asymmetries a bare
   `terraform destroy` trips over, and `plan` reports what an apply would change while creating
   nothing.
 - The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
@@ -962,8 +962,9 @@ cd terraform/examples/full-install
 KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh destroy
 ```
 
-`destroy` handles the four asymmetries a bare `terraform destroy` trips over: it deletes the
-PlatformAgent CR up front (force-clearing a wedged finalizer), purges the backups a BackupPlan
+`destroy` handles the asymmetries a bare `terraform destroy` trips over: it deletes the
+PlatformAgent CR up front (force-clearing a wedged finalizer), uninstalls the Helm releases with the
+`helm` CLI on a cluster the install did not create, purges the backups a BackupPlan
 still owns, clears the cluster's deletion protection, and forgets the undeletable Cloud KMS
 resources from state so their key versions are never scheduled for destruction — the next
 `lifecycle.sh apply` adopts them back automatically.

@@ -857,21 +857,22 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                                                              | Handled by                                                                                                                                   |
-| ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s                                    | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                   | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
-| A `BackupPlan` cannot be deleted while it owns backups                                                 | `tf-destroy` purges the plan's backups first                                                                                                 |
-| `deletion_protection = true` cannot be overridden by a destroy alone                                   | `tf-destroy` applies it as `false`, then destroys                                                                                            |
-| A Pub/Sub topic or subscription that already exists makes the create 409                               | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
-| The stockout and drift topics, subscriptions and sinks survive a partial teardown and 409 the same way | `tf-apply` imports whichever of them exist by name when their flags are on (`adopt_kms`, alongside the KMS resources)                        |
+| Asymmetry                                                                                              | Handled by                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s                                    | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                                                                                                                                                        |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace                                   | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                                                                                                                                                      |
+| A `BackupPlan` cannot be deleted while it owns backups                                                 | `tf-destroy` purges the plan's backups first                                                                                                                                                                                                                                       |
+| `deletion_protection = true` cannot be overridden by a destroy alone                                   | `tf-destroy` applies it as `false`, then destroys                                                                                                                                                                                                                                  |
+| The helm provider reports a release destroyed when it cannot reach the cluster                         | On a cluster this composition did not create, `tf-destroy` uninstalls the releases this state installed with the `helm` CLI first, and stops if `helm` cannot list or uninstall them; skipped with a warning when `helm` is missing or the cluster's credentials cannot be fetched |
+| A Pub/Sub topic or subscription that already exists makes the create 409                               | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install                                                                                                                                       |
+| The stockout and drift topics, subscriptions and sinks survive a partial teardown and 409 the same way | `tf-apply` imports whichever of them exist by name when their flags are on (`adopt_kms`, alongside the KMS resources)                                                                                                                                                              |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`
 does it up front anyway, which turns the hook into a no-op. Disable it with
 `platformAgent.cleanupHook.enabled=false`.
 
-Running `terraform destroy` directly still works, but you own the four steps
+Running `terraform destroy` directly still works, but you own the destroy steps
 above yourself — starting with `kubectl delete platformagent <name> -n
 kubeagents-system --wait` while the operator is still running, and setting
 `deletion_protection = false` and applying before the cluster can be removed.
