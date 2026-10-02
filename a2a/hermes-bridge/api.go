@@ -35,8 +35,8 @@ import (
 // The subprocess executor stays as a fallback (Config.Executor); what this
 // one does not do, by design of the stopgap it is: steer a running turn (the
 // fixed route keeps refusing steers), or bring a kanban card's completion
-// back to the thread (the API server has no push channel, so the notifier
-// wakes the session instead; the subprocess loses it the same way). Both are
+// back to the thread (the API server has no push channel, so it never
+// reaches the A2A task; the subprocess loses it the same way). Both are
 // named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
@@ -350,9 +350,9 @@ func newAPIClient() *http.Client {
 
 // apiExecutorValid reports whether cfg names a usable API executor: the
 // name, a URL and the key the server needs before it honours the session
-// headers. The daemon's environment carries API_SERVER_KEY into the sidecar
-// (the agent container's env is copied), so an empty key is a misdeclared
-// sidecar, refused at start rather than one 403 per task.
+// headers. The daemon picks this executor with no key only when told to
+// (BRIDGE_EXECUTOR=api), so an empty key here is a misdeclared sidecar,
+// refused at start rather than one 401 per task.
 func apiExecutorValid(cfg *Config) error {
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return fmt.Errorf("executor %q needs APIKey (the pod's API_SERVER_KEY): the API server refuses the session headers without it", ExecutorAPI)

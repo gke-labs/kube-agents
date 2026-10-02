@@ -852,8 +852,10 @@ is _not_ a security sandbox — see the
 profile in the pod, not just `default` — so it carries only what is identical for every profile
 _and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode`,
 `display.platforms`, `terminal.*` (where the shell runs: one sandbox per Pod, reached the same way by every
-profile) and, when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
-corrupted database is found only after the sessions in it are unreadable). The reasoning is that as long as a
+profile), when the agent Pod has a runtime class, `database.journal_mode` (one data volume per Pod, and a
+corrupted database is found only after the sessions in it are unreadable) and, when the A2A bridge sidecar is
+declared, one `hooks.outbound` entry that posts tool calls to the bridge's loopback trace endpoint (one endpoint per
+Pod, signed with a key from the A2A credentials Secret). The reasoning is that as long as a
 human can reach the agent (`platforms`) and the agent can reason (`model`), anything else it breaks it can be
 talked into fixing.
 

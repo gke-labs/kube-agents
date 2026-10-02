@@ -13,20 +13,22 @@ package hermesbridge
 // hands each child the entry through hermes's managed scope: a per-task
 // directory holding the operator's managed config.yaml and .env with a
 // hooks.outbound entry added, named by HERMES_MANAGED_DIR in the child's
-// environment. Only the bridge's children carry the hook, so a kanban
-// worker or cron tick under the same profile never POSTs anywhere, and a
-// pod with no bridge has nothing to POST at.
+// environment. Under the subprocess executor only the bridge's children
+// carry the hook, so a kanban worker or cron tick under the same profile
+// never POSTs anywhere, and a pod with no bridge has nothing to POST at.
+// The API executor's turns run in the gateway process, so the operator
+// renders one pod-wide entry instead, signed with the shared ActivitySecret,
+// and a delivery is attributed by its session_id (runForSignature).
 //
-// Correlation is the signature. Nothing in the delivery names the A2A task:
-// hermes's own task_id is the kanban card or a fresh UUID, cwd and profile
-// are shared by every process under the profile, and the URL does not expand
-// environment variables. So each child gets a random key in its environment
-// under ActivitySecretEnv, and a delivery belongs to whichever in-flight task's
-// key verifies its signature - at most Concurrency keys to try. Only the
-// bridge's children carry the hook (it rides each child's own managed
-// scope), so a kanban worker or cron tick under the same profile never
-// delivers; an unsigned or unmatched delivery that does arrive is answered
-// 204 and dropped.
+// Under the subprocess executor, correlation is the signature. Nothing in
+// the delivery names the A2A task: hermes's own task_id is the kanban card or
+// a fresh UUID, cwd and profile are shared by every process under the
+// profile, and the URL does not expand environment variables. So each child
+// gets a random key in its environment under ActivitySecretEnv, and a
+// delivery belongs to whichever in-flight task's key verifies its signature -
+// at most Concurrency keys to try. A child drops the pod-wide entry from the
+// scope it is given, so it never signs a delivery twice; an unsigned or
+// unmatched delivery that does arrive is answered 204 and dropped.
 //
 // Trust boundary, stated: everything in the pod is reachable from the
 // persona's own terminal tool, its environment included. The trace is "as

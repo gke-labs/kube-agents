@@ -73,6 +73,10 @@ const (
 	// environment carries from the agent container's; the API executor's
 	// bearer token.
 	apiServerKeyEnv = "API_SERVER_KEY"
+	// executorEnv names the executor. Unset, the daemon picks the API
+	// executor when the key is present and the subprocess executor when it
+	// is not (bridgeExecutor).
+	executorEnv = "BRIDGE_EXECUTOR"
 )
 
 // errUsage is what realMain returns when NATS_URL is missing, so run can
@@ -142,7 +146,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		// The executor (a2a/hermes-bridge/api.go): a turn in the
 		// conversation's session through the pod's API server by default,
 		// BRIDGE_EXECUTOR=cli for the subprocess per task.
-		Executor:       envOr("BRIDGE_EXECUTOR", hermesbridge.ExecutorAPI),
+		Executor:       bridgeExecutor(log),
 		APIURL:         envOr("BRIDGE_API_URL", hermesbridge.DefaultAPIURL),
 		APIModel:       envOr("BRIDGE_API_MODEL", hermesbridge.DefaultAPIModel),
 		APIKey:         os.Getenv(apiServerKeyEnv),
@@ -191,6 +195,24 @@ func progressInterval(log *slog.Logger, seconds int) time.Duration {
 		return time.Duration(defaultProgressIntervalSeconds) * time.Second
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// bridgeExecutor is BRIDGE_EXECUTOR when set. Unset, it is the API executor
+// when the sidecar carries the pod's API server key, and the subprocess
+// executor, with a warning, when it does not: a sidecar declared before the
+// API executor existed has no key, and refusing to start would take the
+// agent pod down on an image bump. An explicit BRIDGE_EXECUTOR=api with no
+// key is still refused at start.
+func bridgeExecutor(log *slog.Logger) string {
+	if v := os.Getenv(executorEnv); v != "" {
+		return v
+	}
+	if strings.TrimSpace(os.Getenv(apiServerKeyEnv)) == "" {
+		log.Warn("no API server key in the environment; running each task as a subprocess",
+			"key_env", apiServerKeyEnv, "executor", hermesbridge.ExecutorCLI)
+		return hermesbridge.ExecutorCLI
+	}
+	return hermesbridge.ExecutorAPI
 }
 
 // activityListen maps the environment's spelling of "off" to the Config's.

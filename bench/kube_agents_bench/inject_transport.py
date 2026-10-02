@@ -333,9 +333,10 @@ REASON_BUS_SUBSCRIBE_FAILED = "bus-subscribe-failed"
 # reserves for both). A quota storm is the install's, not the persona's: the
 # turn never got an answer to grade.
 REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
-# The bridge's api executor never reached the pod's Hermes API server: the
-# connection was still refused after the bridge's startup retry window. No
-# turn ran, so there is nothing to grade.
+# The bridge's api executor got no response from the pod's Hermes API server:
+# the connection was still refused after the bridge's startup retry window,
+# or the request failed in transport. No answer came back, so there is
+# nothing to grade.
 REASON_HERMES_API_UNREACHABLE = "hermes-api-unreachable"
 INFRASTRUCTURE_REASONS = frozenset(
     {

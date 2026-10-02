@@ -35,7 +35,9 @@ operator reads out of the entry is `BRIDGE_CONCURRENCY`, to size the TASKS consu
 ([sizing](#sizing-against-the-eval-harness)); that read is the bridge's only operator
 code and retires with it. The sidecar
 mounts the same data volume, runs as the pod's KSA (model auth via Workload Identity for
-free), and gets `NATS_URL` plus creds from the a2a creds Secret.
+free), and gets `NATS_URL` plus creds from the a2a creds Secret. The `api` executor also needs
+the pod's `API_SERVER_KEY` and, for the tool trace, `A2A_ACTIVITY_SECRET`
+([Executors](#executors)).
 
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`
@@ -215,9 +217,13 @@ up to `BRIDGE_CONCURRENCY`, and a task waiting for its session's turn holds a wo
 
 The sidecar starts with the agent container, so the bridge can be consuming before the API
 server listens. A refused connection is retried every second for two minutes; it never reached
-the server, so the retry cannot run a turn twice. The bridge refuses to start under `api`
-without `API_SERVER_KEY`, since the server ignores the session headers without one; the
-sidecar has it because the deploy copies the agent container's env into it.
+the server, so the retry cannot run a turn twice. The server ignores the session headers
+without `API_SERVER_KEY`, so the executor needs it. `hack/ci-deploy.sh` copies the agent
+container's env into the sidecar, which carries it; a hand-declared sidecar must set it, and
+`A2A_ACTIVITY_SECRET` from the `bridge-activity-key` entry of the a2a creds Secret for the tool
+trace. With `BRIDGE_EXECUTOR` unset and no key, the bridge logs a warning and runs the `cli`
+executor, so a sidecar declared before `api` existed keeps working; `BRIDGE_EXECUTOR=api` with
+no key is refused at start.
 
 Two things the `api` executor does not do. A kanban card the persona creates completes after
 the turn has answered, and the API server has no channel to push that completion back, so it
@@ -320,6 +326,8 @@ server's. The failures name themselves in the status message:
 | `hermes-api-failed`      | any other non-2xx answer; the message carries the status, session and a body tail | persona            |
 | `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice               | persona            |
 | `hermes-api-read-failed` | the response body broke off mid-read                                              | persona            |
+| `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice | graded (unlisted)  |
+| `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise  | graded (unlisted)  |
 
 ## Sizing against the eval harness
 
@@ -367,12 +375,13 @@ its child exits, the ones a previous incarnation left (its direct subdirectories
 bridge's own marker file, whatever their name, nothing else in it and never the directory
 itself) removed when the bridge starts, and
 none written at all when the source exists but cannot be read, since a child on a hook-only
-scope would run without the operator's pins). The
-hook therefore exists only in processes the bridge spawned: a kanban worker or cron tick
-under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
-and nothing about the profile's shipped config or the image changes for it.
+scope would run without the operator's pins). Under
+`cli` the hook therefore exists only in processes the bridge spawned: a kanban worker or cron
+tick under the same profile never POSTs anywhere, a pod with no bridge has nothing to POST at,
+and nothing about the profile's shipped config or the image changes for it. The `api`
+executor needs a pod-wide entry instead, described at the end of this section.
 
-Nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
+Under `cli`, nothing in a delivery names the A2A task: hermes's own `task_id` is the kanban card or a
 fresh UUID, `cwd` and `profile` are shared by every process under the profile, and the URL
 does not expand environment variables. So the bridge gives each child a random key in its
 environment under `A2A_ACTIVITY_SECRET` (and the door's URL under `A2A_ACTIVITY_URL`, for
@@ -445,11 +454,13 @@ and it is what tells a stuck task from a slow one from outside the pod.
 
 Under the `api` executor there is no child to hand a key or a scope to: the turn runs in
 the long-lived gateway process, which serves the chat platforms, cron and kanban dispatch too.
-So the operator renders the entry in the pod's managed config instead, when the CR is in
-`mode: next` and declares the bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`):
+So the operator renders the entry in the pod's managed config instead, when the CR renders
+the agent's A2A surface (`mode: next`, or a mode this operator build does not recognize) and
+declares the bridge sidecar (a sidecar whose env sets `BRIDGE_CONCURRENCY`):
 `hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
-`http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, which both
-containers read from the `bridge-activity-key` entry of the a2a creds Secret. Every hermes
+`http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the `bridge-activity-key` entry of the a2a creds
+Secret. The operator puts it in the agent container's env; the sidecar needs it in its own
+(`hack/ci-deploy.sh`'s patch adds it). Every hermes
 process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
 it counts for the task whose session id matches and which holds that session's turn at the
 moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which
@@ -462,7 +473,8 @@ Trust boundary, stated: everything in the pod is reachable from the persona's ow
 tool, its environment included. The shared key widens that under `api`: any process holding
 the agent's environment can sign a delivery naming another conversation's session id while
 that session has a turn in flight, and so add entries to that task's trace. The trace is
-informational, read by the eval harness and by debug views, and nothing authorizes on it. The trace is "as reported by the executor's process", the
+informational, read by the eval harness and by debug views, and nothing authorizes on it.
+The trace is "as reported by the executor's process", the
 worker adapter's posture too; the key rejects cross-talk, not adversaries.
 
 ## Supervision
