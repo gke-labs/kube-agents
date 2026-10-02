@@ -2056,7 +2056,7 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("completion message", str(ctx.exception))
 
     def test_an_upstream_rename_of_platform_str_fails_loudly(self):
-        # The completion call reads n.platform_str, which no anchor pins, and
+        # The completion call reads n.platform_str, which only the pinned binding guards, and
         # evaluates it before completion_text reads the flag: renamed upstream,
         # every completed event would raise AttributeError with the flag off.
         renamed = UPSTREAM_NOTIFIER.replace("self.platform_str =", "self.platform_name =")

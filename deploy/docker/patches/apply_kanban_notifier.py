@@ -259,8 +259,9 @@ COMPLETION_CALL = (
 )
 
 #: The completion call reads ``n.platform_str`` ahead of the flag, and no
-#: other anchor holds it. Pinned unchanged, so a rename, or a value that is no
-#: longer the lower-cased platform name, fails the build.
+#: other anchor holds it. Pinned unchanged, so an upstream that stops binding
+#: platform_str here fails the build instead of raising AttributeError on every
+#: completion.
 PLATFORM_BINDING = '        self.platform_str = (sub["platform"] or "").lower()\n'
 
 COMPLETION_PATCHED = (
@@ -354,8 +355,9 @@ TRAILER = (
     ")\n"
 )
 
-#: Text that only exists after a successful run. All five anchors are
-#: destroyed by their own replacement, so a re-run would already fail on
+#: Text that only exists after a successful run. All five edited anchors
+#: are destroyed by their own replacement (the platform_str pin is not, which is
+#: why these run first), so a re-run would already fail on
 #: "found 0" — but that message blames upstream drift for what is actually a
 #: duplicated build step, and before the old delivery applier grew this guard a
 #: second pass exited 0 and left a second hook call and a second trailer import
