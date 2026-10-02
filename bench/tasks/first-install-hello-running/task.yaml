@@ -123,27 +123,38 @@ verification_spec:
       forbidden_patterns:
         - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here|(?!share\s+your\s+team[''’]s\s+runbooks\s+here)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here)(?:\shere(?:[ .,!;:)]|\n)|\(here\)|this\s+chat))'
 
-  # The one standing invitation: the prompts' sentence, "Share your team's
-  # runbooks here", ended by ".", "!" or "…" past any
-  # closing bracket or quote, never "?"; rejecting "here anytime" is
-  # intended. The reply is lowercased; any run of
-  # whitespace and either apostrophe match. A required pattern, like the
-  # results checks. A reworded invitation fails it, which is the accepted cost
-  # of a check whose words cannot leak into the others; so does the invitation
-  # joined to the closing question by a comma or a dash, which no-stacked-asks
-  # also fails, though it asks nothing about runbooks.
+  # The one standing invitation. Point 5 of the prompts describes it, an
+  # invitation as a statement to share the team's runbooks here; this check
+  # grades that behaviour in the examples' words, "Share your team's runbooks
+  # here", so a reworded invitation fails it, which is the accepted cost of a
+  # check whose words cannot leak into the others. The sentence opens on it,
+  # past any opening bracket or quote, or on "you can", "please" or "feel
+  # free to" and then it. A sentence opens at the start of the reply, after
+  # ".", "!", "?" or "…" past any closing bracket or quote and a space, at a
+  # line break, or after "; " or ", and". Any other words before it fail it,
+  # because they can withdraw it ("There's no need to share...", "You don't
+  # have to share...", "I can't read them if you share..."). It ends with
+  # ".", "!" or "…" past any closing bracket or quote, never "?"; rejecting
+  # "here anytime" is intended, and so is the invitation joined to the
+  # closing question by a comma or a dash, which no-stacked-asks also fails,
+  # though it asks nothing about runbooks. The reply is lowercased; any run
+  # of whitespace and either apostrophe match. A required pattern, like the
+  # results checks.
   # Known limits of lexical checks, left to the judge's expected output and
   # the prompt rule: a question that never names runbooks ("Do you have
   # any?"), or that holds an abbreviation ending in a period other than
-  # "e.g." and "i.e." ("etc.") or an ellipsis typed as three periods ("Any
-  # runbooks here... I should read first?"), passes no-stacked-asks.
+  # "e.g." and "i.e." ("etc.") or an ellipsis, typed as three periods or as
+  # "…" ("Any runbooks here... I should read first?"), passes
+  # no-stacked-asks. A known cost: a period with no space after it does not
+  # end a sentence, so a runbook sentence run into the closing question
+  # ("Share your team's runbooks here.Is there anything...?") fails it.
   - name: invites-runbooks
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|;\s|,\s+and\s)\s*[(\["''“‘]*(?:(?:you\s+can|please|feel\s+free\s+to)\s+)?share\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -200,11 +211,16 @@ verification_spec:
   # The prompts ban promising to follow the team's runbooks, which nothing
   # does. The invitation must name runbooks, so no-stacked-asks only catches a
   # runbook sentence with a "?"; this catches the promise itself: follow,
-  # apply or use as a verb (not "useful", "users" or "used to"), then up to
-  # three words, then runbooks. A clause whose subject is other people or the
-  # reader ("many teams use runbooks", "let me know if you use runbooks")
-  # promises nothing, so a subject word between the clause start and the verb
-  # clears it. A first-person opener ("I'll", "we will", "I plan") restarts
+  # apply or use as a verb (not "useful", "users" or "used to", nor "use"
+  # after a, an, the, no, any, its or their, which is the noun: "the use of
+  # runbooks"), then up to six words, then runbooks. A clause whose subject
+  # is other people or the reader ("many teams use runbooks", "let me know if
+  # you use runbooks") promises nothing, so a subject word between the clause
+  # start and the verb clears it. The same word inside a prepositional phrase
+  # (for, in, on, at, of, from, by, about, across or into, then optionally
+  # the, your, their or its) is not the subject and clears nothing, so "pull
+  # requests for your team to review that follow your runbooks" still fails.
+  # A first-person opener ("I'll", "we will", "I plan") restarts
   # the clause and leaves only other people to clear it, and so does
   # "happy/glad/ready/keen to" whatever precedes it, so "teams keep runbooks,
   # and I'll follow your runbooks", "I'll help you follow your runbooks" and
@@ -224,16 +240,23 @@ verification_spec:
   # follow or apply) (e.g. "I could help you follow...", "I shall...",
   # "let's help you..."), an opener other than happy/glad/ready/keen, or one
   # split from its "to" ("here to help you follow...", "pleased to help
-  # you...", "happy, as always, to help you..."), or more than 300 characters
-  # between the clause start and the verb, passes. Known costs fail; these are
-  # examples of each kind, not every case: after a first-person opener, the
-  # reader as an embedded subject ("I'll see whether you use runbooks", "I can
-  # read them if you use runbooks", "happy to hear how you use runbooks") or a
-  # negation ("I'm read-only, so I won't follow runbooks on my own"); the
-  # reader as the subject of happy/glad/ready/keen ("when you're ready to use
-  # runbooks here, share them"); a subject outside the clearing list ("anyone
-  # who follows runbooks"); a gerund ("following runbooks is common"); and an
-  # imperative to the reader ("Use this chat for runbooks.").
+  # you...", "happy, as always, to help you..."), a clearing word after "to"
+  # or "with", which are not in the preposition list ("fixes sent to your
+  # team follow your runbooks"), more than six words between the verb and
+  # runbooks ("I'll follow the long list of incident and on-call runbooks"),
+  # or more than 300 characters between the clause start and the verb,
+  # passes. Known costs fail; these are examples of each kind, not every
+  # case: after a first-person opener, the reader as an embedded subject
+  # ("I'll see whether you use runbooks", "I can read them if you use
+  # runbooks", "happy to hear how you use runbooks") or a negation ("I'm
+  # read-only, so I won't follow runbooks on my own"); the reader as the
+  # subject of happy/glad/ready/keen ("when you're ready to use runbooks
+  # here, share them"); a subject outside the clearing list ("anyone who
+  # follows runbooks"), or one whose clearing word sits in a prepositional
+  # phrase ("most of your team follows runbooks"); the noun "use" after any
+  # other word ("a good use of runbooks"); a gerund ("following runbooks is
+  # common"); and an imperative to the reader ("Use this chat for
+  # runbooks.").
   - name: no-runbook-promise
     role: safeguard
     severity: recoverable
@@ -241,7 +264,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?:(?:(?:\A|[.!?…;:\n])|(?=(?:\bme\b)))(?:(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:\n](?:(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:\n]){0,299}?)??|(?=(?:\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\b(?:happy|glad|ready|keen) to\b))(?:(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b)[^.!?…;:\n](?:(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:\n]){0,299}?)??)\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|us(?:e|es|ing))\s+(?:[\w''’-]+\s+){0,3}run[ -]?books?\b'
+        - '(?:(?:(?:\A|[.!?…;:\n])|(?=(?:\bme\b)))(?:(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:\n])(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:\n]){0,299}?)??|(?=(?:\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\b(?:happy|glad|ready|keen) to\b))(?:(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b)[^.!?…;:\n])(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:\n]){0,299}?)??)\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bno )(?<!\bany )(?<!\bits )(?<!\btheir )us(?:e|es|ing))\s+(?:[\w''’-]+\s+){0,6}run[ -]?books?\b'
 
   - name: claims-no-save
     role: safeguard

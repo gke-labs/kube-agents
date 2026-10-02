@@ -27,6 +27,7 @@ CASES = {
 PROFILE_GREETING = "Hi Alex,"
 FALLBACK_GREETING = "Hi there,"
 INVITATION = " Share your team's runbooks here."
+POINT4 = " Fixes come as pull requests for your team to review."
 TIMEOUT_SEC = 5.0
 
 
@@ -118,6 +119,33 @@ def test_a_reworded_invitation_fails_the_invitation_check(case, invitation):
 )
 def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(case, invitation):
     assert _failing(case, _example(case).replace(INVITATION, invitation)) == []
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "invitation",
+    [
+        " You can share your team's runbooks here.",
+        " Please share your team's runbooks here.",
+        " Feel free to share your team's runbooks here.",
+    ],
+)
+def test_a_listed_lead_in_still_counts_as_the_invitation(case, invitation):
+    assert "invites-runbooks" not in _failing(case, _example(case).replace(INVITATION, invitation))
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "invitation",
+    [
+        " There's no need to share your team's runbooks here.",
+        " You don't have to share your team's runbooks here.",
+        " I can't read them if you share your team's runbooks here.",
+    ],
+)
+def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, invitation):
+    # The sentence must open on the invitation; words before it can turn it into its opposite.
+    assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -286,12 +314,35 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " Glad to help you apply your runbooks.",
         " I'm happy to help you follow your runbooks.",
         " I'd be glad to walk you through applying your runbooks.",
+        " I'll follow all of your team's runbooks.",
+        " I'll apply every one of your runbooks.",
+        " I'll follow your team's incident and on-call runbooks.",
+        " I'll make use of your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
     example = _example(case)
     reply = example.replace(INVITATION, INVITATION + promise)
     assert "no-runbook-promise" in _failing(case, reply)
+
+
+# A clearing word inside a prepositional phrase ("for your team", "in your clusters") is not the clause's subject,
+# so a promise appended to the example's own sentences still fails.
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        " Fixes come as pull requests for your team to review that follow your runbooks.",
+        " Fixes come as pull requests for your team to review and will follow your runbooks.",
+        " Pull requests for your team to review follow your runbooks.",
+        " Nothing in your clusters changes, and every fix will apply your runbooks.",
+        " Any fix for the team will use your runbooks.",
+    ],
+)
+def test_a_promise_after_a_prepositional_team_fails_the_promise_safeguard(case, sentence):
+    example = _example(case)
+    assert POINT4 in example
+    assert "no-runbook-promise" in _failing(case, example.replace(POINT4, sentence))
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -310,6 +361,8 @@ def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise)
         " If your team already follows runbooks, share them here.",
         " SREs use runbooks.",
         " Engineers on your team follow runbooks.",
+        " The use of runbooks is up to your team.",
+        " I make no use of runbooks on my own.",
     ],
 )
 def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case, aside):
@@ -332,6 +385,8 @@ def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case
         " I could help you follow your runbooks.",
         " Here to help you follow your runbooks.",
         " Happy, as always, to help you follow your runbooks.",
+        " I'll follow the long list of incident and on-call runbooks.",
+        " Fixes sent to your team follow your runbooks.",
         " I'll" + " x" * 150 + " follow your runbooks.",
         " Also," + " x" * 150 + " follow your runbooks.",
     ],
@@ -365,6 +420,8 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " When you're ready to use runbooks here, share them.",
         " Anyone who follows runbooks will like this.",
         " Following runbooks is common.",
+        " That's a good use of runbooks.",
+        " Most of your team follows runbooks.",
     ],
 )
 def test_the_promise_safeguards_known_costs_fail_it(case, aside):
