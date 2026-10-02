@@ -158,7 +158,8 @@ def _normalize(text: str) -> str:
 # A footnote marker before a `;`, `,` or `.` inside the line is folded too,
 # since a declared frame's values are separated by `;`; so is a wrap the
 # agent kept from the prompt's template around a value (`<unavailable>`,
-# `"unaffected"`), and whitespace before a `:` or `;`. A pattern anchored
+# `"unaffected"`), whitespace before a `:` or `;` or missing after one, and
+# invisible format characters anywhere. A pattern anchored
 # with ``^...$`` then spells a declared line once rather than once per
 # rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
 # edges. Other interior punctuation is untouched. Opt-in, because a case
@@ -219,8 +220,17 @@ _VALUE_WRAP = re.compile(
     re.M,
 )
 # Whitespace the agent put before a frame's separator (`seeded-a :`,
-# `zonal ;`): the separator is the frame's, so the space is decoration.
+# `zonal ;`), or left out after it before a word (`seeded-a:control`,
+# `zonal;api`): the separator is the frame's, so the spacing around it is
+# decoration. A `:` before anything but a letter (`12:30`, `https://`) is
+# left alone.
 _SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
+_SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z])")
+# Invisible format characters a model or a pasted document carries (a
+# zero-width space or joiner, a word joiner, a byte-order mark, a variation
+# selector, a soft hyphen): not whitespace to Python, not a word character,
+# and not a value. Removed before anything else reads the line.
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\ufe0e\ufe0f\u00ad]")
 
 
 def _fold_trail_markers(line: str) -> str:
@@ -247,7 +257,7 @@ def _fold_line_decoration(line: str) -> str:
     # other link is kept as its text, so a linked value stays a value; then
     # the lead, the quoted name, and the trail once more with the full
     # closer class.
-    footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(line))
+    footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(_INVISIBLE.sub("", line)))
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
     unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
@@ -255,7 +265,8 @@ def _fold_line_decoration(line: str) -> str:
     # the line's end is read as the wrap it is) and again after it (so a
     # wrap followed by a stop is read once the stop is gone).
     trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", unquoted))
-    return _SEPARATOR_SPACE.sub("", _VALUE_WRAP.sub(r"\1", trailed))
+    spaced = _SEPARATOR_SPACE.sub("", _VALUE_WRAP.sub(r"\1", trailed))
+    return _SEPARATOR_NO_SPACE.sub(r"\1 ", spaced)
 
 
 def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
@@ -268,7 +279,11 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     regex runs. The fold, when asked for, means a line-anchored pattern
     matches the line however the agent listed, linked or quoted it.
     """
-    lines = (_normalize(line) for line in text.splitlines())
+    # `_normalize` deletes underscores as Markdown emphasis; under the fold
+    # they become hyphens instead, so a kubeconfig context
+    # (`gke_<project>_<location>_<name>`) keeps the boundary before its
+    # cluster name and `_word_` emphasis folds as decoration.
+    lines = (_normalize(line.replace("_", "-") if fold_decoration else line) for line in text.splitlines())
     if fold_decoration:
         lines = (_fold_line_decoration(line) for line in lines)
     return "\n".join(lines)

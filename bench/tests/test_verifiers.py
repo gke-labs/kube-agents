@@ -414,6 +414,16 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
         "\n".join(_zonal_line(c).replace(f"{c}:", f"{c} :") for c in _SLOTS),
         "\n".join(_zonal_line(c).replace("zonal;", "zonal ;").replace("unavailable;", "unavailable ;") for c in _SLOTS),
         "\n".join("**" + c + "** : " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(f"{c}: ", f"{c}:").replace("zonal; ", "zonal;") for c in _SLOTS),
+        # Invisible format characters at a value's end, before a separator,
+        # and at the line's start.
+        "\n".join(_zonal_line(c) + "\u200b" for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("zonal;", "zonal\u200b;") for c in _SLOTS),
+        "\n".join("\ufeff" + _zonal_line(c) for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unaffected", "unaffected\u2060") for c in _SLOTS),
+        # A location after the slot, in the forms GKE spells them.
+        "\n".join(_zonal_line(f"{c}-europe-west4") for c in _SLOTS),
+        "\n".join(_zonal_line(f"{c}-northamerica-northeast1-a") for c in _SLOTS),
         # A citation on a value other than the last.
         "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1];") for c in _SLOTS),
         "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1](https://cloud.google.com/kubernetes-engine/docs);") for c in _SLOTS),
@@ -541,11 +551,12 @@ def test_a_cluster_that_merely_starts_with_a_slot_name_is_neither_a_slot_nor_a_w
     # A fifth, regional cluster named seeded-canary beside four right lines:
     # not a slot line, so not forbidden; and a seeded-alpha line does not
     # stand in for slot a.
-    extra = "seeded-canary: control plane is regional; API during its upgrade: available; running pods: unaffected"
-    for objective in _ZONAL_OBJECTIVES:
-        assert _zonal_case_grades(objective, _RIGHT_REPORT + "\n" + extra), objective
-    three = "\n".join(_zonal_line(c) for c in _SLOTS if c != "seeded-a")
-    assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", three + "\n" + _zonal_line("seeded-alpha"))
+    for name in ("seeded-canary", "seeded-a-canary", "seeded-a-v2", "unseeded-a"):
+        extra = f"{name}: control plane is regional; API during its upgrade: available; running pods: unaffected"
+        for objective in _ZONAL_OBJECTIVES:
+            assert _zonal_case_grades(objective, _RIGHT_REPORT + "\n" + extra), (name, objective)
+        three = "\n".join(_zonal_line(c) for c in _SLOTS if c != "seeded-a")
+        assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", three + "\n" + _zonal_line(name)), name
 
 
 def test_zonal_case_refuses_one_joint_line_for_all_slots():
@@ -572,6 +583,9 @@ def test_zonal_case_needs_a_line_for_each_of_the_four_slots():
         "seeded-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
         "seeded-alpha: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
         "seeded-batch-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-v2: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "unseeded-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
     ],
 )
 def test_zonal_case_refuses_what_is_not_a_declared_seeded_line(text):

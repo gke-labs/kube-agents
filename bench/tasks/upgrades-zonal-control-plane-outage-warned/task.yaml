@@ -17,6 +17,11 @@
 # for a negation or a generic statement: a value is one of two words, and
 # the line names the cluster it is about.
 #
+# The slot names the patterns anchor on (`seeded-a` to `seeded-d`) are the
+# default-prefix renderings of bench/tf/fleet's slots, as in every sibling
+# case that names a slot: a fleet applied with another prefix renames them,
+# and the patterns here, like the siblings', read the default.
+#
 # Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
 # write). Eligible tier: nightly.
 #
@@ -103,9 +108,11 @@ verification_spec:
   # What the case does allow around the slot name is naming rather than
   # decoration: a qualified id (a project, a location, a kubeconfig context
   # or a resource path joined to the name by the characters a name may hold)
-  # or a parenthetical after it, and the slot letter has to end the slot's
-  # name (`seeded-b-us-central1-a` is slot b; `seeded-batch-a` and
-  # `seeded-canary` are not slots). The slot has to be one of a, b, c and d,
+  # or a parenthetical after it. The slot's name is bounded on both sides:
+  # what precedes `seeded-` is nothing or a `-`, `_` or `/` (a project, a
+  # context, a path), and what follows the letter is nothing, a parenthetical
+  # or a `-<location>` (`seeded-b-us-central1-a` is slot b; `seeded-batch-a`,
+  # `seeded-canary`, `seeded-a-canary` and `unseeded-a` are not slots). The slot has to be one of a, b, c and d,
   # the four `bench/tf/fleet` declares, and the first objective needs a line
   # for each. The host cluster or "clusters in general" does not pass. Each value objective also forbids a declared
   # frame whose value slot holds anything but the right word, as the exact
@@ -130,7 +137,7 @@ verification_spec:
       # One pattern, four lookaheads: a declared frame for each of the four
       # slots, in any order, anywhere in the report.
       any_of_patterns:
-        - '(?ms)\A(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-a(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-b(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-c(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-d(?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)'
+        - '(?ms)\A(?=.*^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-a(?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-b(?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-c(?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)(?=.*^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-d(?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$)'
 
   - name: the-declared-lines-say-the-control-plane-is-zonal
     role: objective
@@ -147,11 +154,11 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is zonal; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
+        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-[a-d](?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is zonal; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
       # A declared frame whose first value is anything but "zonal" is the
       # wrong read, whatever the other lines say.
       forbidden_patterns:
-        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is (?!zonal;)[^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
+        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-[a-d](?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is (?!zonal;)[^;\n]+; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
 
   - name: the-declared-lines-say-the-api-goes-away
     role: objective
@@ -168,9 +175,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: unavailable; running pods: [^\n]+$'
+        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-[a-d](?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: unavailable; running pods: [^\n]+$'
       forbidden_patterns:
-        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: (?!unavailable;)[^;\n]+; running pods: [^\n]+$'
+        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-[a-d](?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: (?!unavailable;)[^;\n]+; running pods: [^\n]+$'
 
   # The distinction that makes the warning useful: the nodes and their pods
   # are not what goes away. A report that says "the cluster is down" without
@@ -190,9 +197,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: unaffected$'
+        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-[a-d](?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: unaffected$'
       forbidden_patterns:
-        - '(?m)^(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*seeded-[a-d](?![a-z0-9])[a-z0-9/._-]*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: (?!unaffected$)[^\n]+$'
+        - '(?m)^(?:(?:(?!seeded-[a-d](?![a-z0-9]))[a-z0-9/._-])*[-_/])?seeded-[a-d](?![a-z0-9])(?:-[a-z]+-[a-z]+\d+(?:-[a-z])?)?(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: (?!unaffected$)[^\n]+$'
 
   - name: no-invented-cves
     role: objective
