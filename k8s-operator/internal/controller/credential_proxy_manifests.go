@@ -495,8 +495,9 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 	if a2aSessionClusterViewEnabled(agent) {
 		// The session pods, under the cluster-view flag: the same selector
 		// the session fence and the bus fence name, on the credentialed port
-		// only. TokenReview plus the session audience is what keeps this
-		// peer to the session role; this is the layer that lets it connect.
+		// only. TokenReview, the session audience and the session-callers
+		// binding keep this peer to the session role; this is the layer
+		// that lets it connect.
 		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 			labelPartOf:                   a2aPartOf,
 			"app.kubernetes.io/component": a2aSessionComponent,
