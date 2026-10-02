@@ -737,6 +737,10 @@ _REPLAY_CARD_UNREAD_REASON = (
     "failed, or no card carried the run's key), so its status and comments "
     "are unknown"
 )
+_REPLAY_DECOY_UNREAD_REASON = (
+    "the replay's decoy card could not be read (the prompt was not a "
+    "session: fresh replay, or no card carried the decoy's key), so its status is unknown"
+)
 
 
 @VERIFIERS.register("replay_card")
@@ -752,6 +756,9 @@ class ReplayCardVerifier(BaseVerifier):
     ``status_in`` / ``status_not_in``: the card's final status must be one of
     the first and none of the second. ``comment_phrases``: each must appear,
     case-insensitively, in at least one of the card's comments.
+    ``decoy_status_in``: a fresh-session replay's decoy card, blocked on the
+    same question, must end in one of these; ``tool_called`` passes on an
+    unblock of the decoy, and this does not.
 
     Fails closed: no entry (not a replay) or an entry whose card was not read
     is ``status="error"``.
@@ -761,11 +768,12 @@ class ReplayCardVerifier(BaseVerifier):
     status_in: list[str] = Field(default_factory=list)
     status_not_in: list[str] = Field(default_factory=list)
     comment_phrases: list[str] = Field(default_factory=list)
+    decoy_status_in: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _asserts_something(self) -> ReplayCardVerifier:
-        if not (self.status_in or self.status_not_in or self.comment_phrases):
-            raise ValueError("replay_card needs status_in, status_not_in or comment_phrases")
+        if not (self.status_in or self.status_not_in or self.comment_phrases or self.decoy_status_in):
+            raise ValueError("replay_card needs status_in, status_not_in, comment_phrases or decoy_status_in")
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
@@ -798,6 +806,12 @@ class ReplayCardVerifier(BaseVerifier):
         missing = [p for p in self.comment_phrases if not any(p.casefold() in c.casefold() for c in comments)]
         if missing:
             problems.append(f"no comment contains {missing} ({len(comments)} comment(s))")
+        if self.decoy_status_in:
+            decoy = settled.get("decoy_status")
+            if not isinstance(decoy, str):
+                return error(_REPLAY_DECOY_UNREAD_REASON)
+            if decoy not in self.decoy_status_in:
+                problems.append(f"decoy card status {decoy!r} is not one of {self.decoy_status_in}")
         if problems:
             return VerificationResult(
                 success=False, elapsed_time=time.monotonic() - start, reason="; ".join(problems)

@@ -69,24 +69,31 @@ def _save(state):
 
 
 class _Conn:
-    # The one query the archive script makes: a key's live cards, newest first.
+    # A key's cards, newest first, live only when the query says so; or the
+    # plant's backdating of a card, recorded as it was asked.
     def execute(self, sql, params):
+        if sql.startswith("UPDATE"):
+            state = _load()
+            state["tasks"][params[1]]["backdated"] = params[0]
+            _save(state)
+            return []
         assert "idempotency_key" in sql, sql
         tasks = _load()["tasks"]
+        live = "!= 'archived'" in sql
         return [(tid,) for tid in sorted(tasks, reverse=True)
-                if tasks[tid]["key"] == params[0] and tasks[tid]["status"] != "archived"]
+                if tasks[tid]["key"] == params[0] and not (live and tasks[tid]["status"] == "archived")]
 
 
 def connect():
     return _Conn()
 
 
-def create_task(conn, *, title, body=None, created_by=None, idempotency_key=None):
+def create_task(conn, *, title, body=None, created_by=None, priority=0, idempotency_key=None):
     state = _load()
     task_id = "t_%08d" % (len(state["tasks"]) + 1)
     state["tasks"][task_id] = {"title": title, "body": body, "created_by": created_by,
                                "status": "ready", "assignee": None, "key": idempotency_key,
-                               "comments": []}
+                               "priority": priority, "comments": []}
     _save(state)
     return task_id
 
@@ -447,6 +454,176 @@ def test_archive_is_best_effort() -> None:
     assert settled == card_wake.Settled("ready", ())
     assert not settled.archived
 
+
+
+# --- A typed answer in a fresh session (session: fresh) -----------------------
+
+FRESH_PROMPT = PROMPT + "session: fresh\n"
+
+# A stand-in for the image's Slack adapter: the formatter's contract, not its rendering.
+_FAKE_SLACK_ADAPTER = """
+class SlackAdapter:
+    async def _format_thread_context(self, messages, *, thread_ts, current_ts, team_id, channel_id):
+        assert self._is_sender_authorized() and channel_id and thread_ts
+        bot = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        lines = []
+        for msg in messages:
+            if msg.get("user") == bot:
+                lines.append("[assistant] " + msg["text"])
+            else:
+                lines.append(await self._resolve_user_name(msg["user"]) + ": " + msg["text"])
+        if not lines:
+            return "", ""
+        return "[Thread context]\\n" + "\\n".join(lines) + "\\n[End of thread context]\\n\\n", lines[0]
+"""
+
+
+def _with_slack_adapter(root: Path) -> Path:
+    adapter = root / "plugins" / "platforms" / "slack"
+    adapter.mkdir(parents=True)
+    (adapter / "adapter.py").write_text(_FAKE_SLACK_ADAPTER)
+    return root
+
+
+def _context_shell(root: Path, tmp_path: Path):
+    def shell(command: str, timeout: float) -> str:
+        tokens = shlex.split(command)
+        assert tokens[tokens.index("-c") + 1] == card_wake._CONTEXT_SCRIPT
+        args = tokens[tokens.index("-c") + 2 :]
+        args[1], args[2] = str(root), str(SCRIPTS)
+        return _run(card_wake._CONTEXT_SCRIPT, args, tmp_path)
+
+    return shell
+
+
+def test_parse_reads_a_fresh_session() -> None:
+    assert card_wake.parse(FRESH_PROMPT).fresh
+    assert not card_wake.parse(PROMPT).fresh
+
+
+def test_a_session_other_than_fresh_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="session"):
+        card_wake.parse(PROMPT + "session: same\n")
+
+
+def test_a_fresh_plant_files_a_decoy_that_lists_first_and_reads_newer(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    planted = _plant(_shell_for(hermes_root, tmp_path, FRESH_PROMPT), FRESH_PROMPT)
+
+    tasks = _board(tmp_path)["tasks"]
+    decoy, card = tasks[planted.decoy], tasks[planted.card]
+    assert decoy["key"] == card_wake.decoy_key(KEY)
+    assert decoy["status"] == "blocked"
+    assert decoy["priority"] > card["priority"]
+    assert card["backdated"] > 0 and "backdated" not in decoy
+    assert (decoy["title"], decoy["body"]) == (card["title"], card["body"])
+    blocks = [e["payload"] for e in _board(tmp_path)["events"] if e["task_id"] == planted.decoy]
+    assert blocks == [{"reason": REASON, "kind": "needs_input"}]
+
+
+def test_an_ordinary_plant_files_no_decoy(hermes_root: Path, tmp_path: Path) -> None:
+    planted = _plant(_shell_for(hermes_root, tmp_path))
+
+    assert planted.decoy is None
+    [card] = _board(tmp_path)["tasks"].values()
+    assert "backdated" not in card
+
+
+def test_archive_reads_the_decoy_beside_the_card_and_archives_both(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    shell = _shell_for(hermes_root, tmp_path, FRESH_PROMPT)
+    _plant(shell, FRESH_PROMPT)
+
+    settled = card_wake.archive(shell, KEY, timeout=30)
+
+    assert settled == card_wake.Settled("blocked", (), decoy_status="blocked")
+    assert settled.as_metadata()["decoy_status"] == "blocked"
+    assert {t["status"] for t in _board(tmp_path)["tasks"].values()} == {"archived"}
+
+
+def test_a_decoy_the_agent_archived_reads_as_archived(hermes_root: Path, tmp_path: Path) -> None:
+    """An agent mistake, so a fail for ``decoy_status_in``, not a card that could not be read."""
+    shell = _shell_for(hermes_root, tmp_path, FRESH_PROMPT)
+    planted = _plant(shell, FRESH_PROMPT)
+    _run(
+        "import sys; sys.path.insert(0, sys.argv[1]); from hermes_cli import kanban_db as kb;"
+        " kb.archive_task(None, sys.argv[2])",
+        [str(hermes_root), planted.decoy],
+        tmp_path,
+    )
+
+    assert card_wake.archive(shell, KEY, timeout=30).decoy_status == "archived"
+
+
+def test_a_fresh_plant_that_filed_no_decoy_is_broken() -> None:
+    swept: list[str] = []
+    planted = json.dumps({"card": "t_1", "decoy": None, "wake": "[kanban] Task t_1 blocked.", "posted": 0})
+
+    def shell(command: str, timeout: float) -> str:
+        if "create_task" in command:
+            return f"{card_wake.REPLAY_PRESENT}\n{planted}"
+        swept.append(command)
+        return f'{card_wake.REPLAY_PRESENT}\n{{"archived": true, "cards": [], "error": null}}'
+
+    with pytest.raises(card_wake.ReplayBroken, match="decoy"):
+        card_wake.plant(shell, card_wake.parse(FRESH_PROMPT), timeout=30, key=KEY)
+    assert swept == [card_wake.archive_command(KEY)]
+
+
+def test_the_thread_holds_the_ask_the_question_and_a_posted_wake_reply() -> None:
+    replay = card_wake.parse(FRESH_PROMPT)
+    post = {"text": "Which should I look at? (Question from card t_1.)", "blocks": []}
+    planted = card_wake.Planted("t_1", "wake", 1, KEY, post, "t_2")
+
+    messages = card_wake.thread_messages(replay, planted, "seeded-a or seeded-b?")
+
+    assert [(m["user"], m["text"]) for m in messages] == [
+        (card_wake.STUB_USER, replay.title),
+        (card_wake.STUB_BOT, post["text"]),
+        (card_wake.STUB_BOT, "seeded-a or seeded-b?"),
+    ]
+    assert [m["ts"] for m in messages] == sorted(m["ts"] for m in messages)
+
+
+def test_the_thread_leaves_out_a_silent_wake_reply_and_a_post_the_image_never_made() -> None:
+    replay = card_wake.parse(FRESH_PROMPT)
+    planted = card_wake.Planted("t_1", "wake", 0, KEY, None, "t_2")
+
+    assert [m["text"] for m in card_wake.thread_messages(replay, planted, "")] == [replay.title]
+
+
+def test_the_fresh_answer_is_the_adapters_thread_context_then_the_attributed_answer(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    shell = _context_shell(_with_slack_adapter(hermes_root), tmp_path)
+    replay = card_wake.parse(FRESH_PROMPT)
+    post = {"text": "Which should I look at? (Question from card t_1.)", "blocks": []}
+    messages = card_wake.thread_messages(replay, card_wake.Planted("t_1", "w", 1, KEY, post, "t_2"), "")
+
+    prompt = card_wake.fresh_answer(shell, messages, "seeded-b", timeout=30)
+
+    assert prompt == (
+        f"[Thread context]\n{card_wake.STUB_USER_NAME}: {replay.title}\n[assistant] {post['text']}\n"
+        "[End of thread context]\n\n\n\n[New message]\n"
+        f"[{card_wake.STUB_USER_NAME} | Slack user <@{card_wake.STUB_USER}>] seeded-b"
+    )
+
+
+def test_an_image_without_the_slack_adapter_breaks_the_fresh_answer(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    shell = _context_shell(hermes_root, tmp_path)
+    messages = card_wake.thread_messages(card_wake.parse(FRESH_PROMPT), card_wake.Planted("t_1", "w", 0), "")
+
+    with pytest.raises(card_wake.ReplayBroken, match="ModuleNotFoundError"):
+        card_wake.fresh_answer(shell, messages, "seeded-b", timeout=30)
+
+
+def test_a_fresh_answer_whose_exec_gave_out_is_infrastructure() -> None:
+    with pytest.raises(card_wake.ReplayUnavailable):
+        card_wake.fresh_answer(lambda command, timeout: "", [], "seeded-b", timeout=30)
 
 def test_parse_reads_a_failure_prompt() -> None:
     assert card_wake.parse(FAILURE_PROMPT) == card_wake.Failure(

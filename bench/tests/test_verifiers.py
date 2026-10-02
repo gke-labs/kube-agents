@@ -285,6 +285,27 @@ def test_replay_card_errors_when_the_cards_status_was_not_read(status):
     assert "unknown" in res.reason
 
 
+
+def test_replay_card_passes_on_a_decoy_left_blocked():
+    _stash_settled({"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}], "decoy_status": "blocked"})
+    res = _replay_card(status_not_in=["blocked"], decoy_status_in=["blocked"]).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_replay_card_fails_on_an_unblocked_decoy():
+    """The front door answered the wrong card: ``tool_called`` alone would pass this."""
+    _stash_settled({"status": "blocked", "comments": [], "decoy_status": "ready"})
+    res = _replay_card(decoy_status_in=["blocked"]).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "decoy" in res.reason and "'ready'" in res.reason
+
+
+def test_replay_card_errors_when_the_decoy_was_not_read():
+    _stash_settled({"status": "ready", "comments": []})
+    res = _replay_card(status_not_in=["blocked"], decoy_status_in=["blocked"]).verify(5.0)
+    assert res.status == "error"
+    assert "decoy" in res.reason
+
 def test_replay_card_must_assert_something():
     with pytest.raises(ValidationError):
         _replay_card()

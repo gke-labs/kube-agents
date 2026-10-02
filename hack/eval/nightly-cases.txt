@@ -518,3 +518,9 @@
 # already posted, then routes the typed answer to the card. Plants its own
 # card through card_wake.py; reads no cluster.
 ./tasks/chat-question-wake-stays-silent/task.yaml
+
+# A typed answer from a person with no session in the thread: the new session
+# reads the thread's context and must answer the card the thread shows, not a
+# second card blocked on the same question. Plants its own cards through
+# card_wake.py; reads no cluster.
+./tasks/chat-question-typed-answer-fresh-session/task.yaml
