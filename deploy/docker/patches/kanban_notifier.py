@@ -351,8 +351,9 @@ def handoff_with_result(delivered: object, task: object) -> str:
     Fails to ``delivered`` unchanged rather than raising. This runs on the
     delivery path: a completion notification that loses its report is bad, and
     one that raises, rewinds the cursor and re-sends forever is worse. A status
-    line that gives way to the report is logged at DEBUG, so a fact a worker put
-    only in ``summary`` can still be found.
+    line that gives way to the report stays on the card (``kanban_show``), so a
+    fact a worker put only in ``summary`` can still be found; the swap is logged
+    at DEBUG.
     """
     text = "" if delivered is None else str(delivered)
     try:
