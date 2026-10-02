@@ -166,8 +166,18 @@ with an admin role the broker's allowlist is the only control and `kubectl get s
 data, as
 [credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
 says of the platform agent. A session holds at most `CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS` broker commands at once (default 2; the operator's `spec.deployment.env` reaches it), so a conversation cannot take the whole command pool from the platform agent's shell. Operator-level for the reason above: the pod executes model output, and
-widening its fence is a property of who deployed the operator. It is a demo aid until
-declarative profiles carry a session's identity and tools, and it goes when they do.
+widening its fence is a property of who deployed the operator. Under the flag a session reads clusters with the platform agent's broker scope, and the only gate
+between a person and that read is the gateway's ingress allowlist. That differs from the design of
+record ([architecture 02](../architecture/02-agent-personas.md) §2.4,
+[03](../architecture/03-security-model.md) §4a, and "Sessions by default" in
+`spec-chatops-gateway.md`), where a session reaches cluster data only through a gateway-minted
+child task and the gateway checks the target agent's `AllowedUsers` against the requester first.
+Today the two gates admit the same people, because the ingress allowlist is the only human-to-agent
+check the gateway enforces. It is a demo aid with two retirement triggers, whichever lands first:
+declarative profiles carrying a session's identity and tools, and gateway-side `AllowedUsers`
+enforcement ([architecture 07](../architecture/07-implementation-roadmap.md)); once the gateway
+refuses a person for the platform agent, a session with this view would read its clusters anyway,
+so the flag goes before that enforcement ships.
 
 ## Per-feature overrides - sketched, not built
 
