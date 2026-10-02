@@ -74,12 +74,13 @@ owner: maintainers
 # and being zonal, which is the slots' shape (bench/tf/fleet/variables.tf's
 # `zone`), not a role. The four roles below are one per slot, and they are
 # how the first objective tells a cluster the agent missed from a cluster the
-# project does not have: the runner writes a kubeconfig per role before the
-# run, and a role it could not resolve makes that objective an `error` about
-# the environment (its `fixture_roles`), never a `fail` charged to the agent.
-# Healing one of these defects does not quiet the case; replacing or
-# retiring the slot's cluster does, which is what a reader of this list is
-# checking.
+# project does not have: the runner writes a credential per seeded cluster it
+# reaches (`clusters/<slot>.kubeconfig`) before it confirms any role, and a
+# slot without one makes that objective an `error` about the environment
+# (its `fixture_roles`), never a `fail` charged to the agent. Whether these
+# four defects are planted is not read: healing one does not quiet the case;
+# replacing or retiring the slot's cluster does, which is what a reader of
+# this list is checking.
 fixtures:
   - crashloop-workload
   - version-laggard
@@ -114,9 +115,10 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
-      # One role per slot (the case's `fixtures:` says why): a slot whose
-      # cluster the runner could not reach before the run is an `error` here,
-      # not a line the agent failed to write.
+      # One role per slot (the case's `fixtures:` says why), each resolved
+      # to its slot's own credential: a slot whose cluster the runner could
+      # not reach before the run is an `error` here, not a line the agent
+      # failed to write.
       fixture_roles:
         - crashloop-workload
         - version-laggard

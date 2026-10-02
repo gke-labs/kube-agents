@@ -210,6 +210,12 @@ def test_line_patterns_see_a_line_without_its_decoration(line):
         "seeded-a: control plane is zonal [^note]",
         "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs)",
         "seeded-a: control plane is zonal [1].",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs).",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs),",
+        'seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs)"',
+        "| seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs) |",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters).",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters) [1](https://cloud.google.com/docs).",
         "seeded-a: control plane is zonal [^1]\u201d",
         "seeded-a: control plane is zonal.[1]",
         "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)",
@@ -301,26 +307,26 @@ def _zonal_case_fixtures() -> list[str]:
     return list(yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))["fixtures"])
 
 
-def _fleet_dir(roles: list[str]) -> str:
-    """A runner-shaped kubeconfig directory: one file per reached role."""
-    root = tempfile.mkdtemp(prefix="zonal-fleet-")
+def _write_fleet_dir(root: Path, roles: list[str]) -> None:
+    """A runner-shaped kubeconfig directory: the per-slot credential for the
+    slot carrying each role (what `fixture_roles` reads), and no role files,
+    since whether a role was planted is not the question."""
+    (root / "clusters").mkdir(exist_ok=True)
     for role in roles:
-        (Path(root) / f"{role}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
-    return root
+        (root / "clusters" / f"{fleet.slot_of_role(role)}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
 
 
-_ZONAL_FLEET = _fleet_dir(_zonal_case_fixtures())
-
-
-def _zonal_case_verdict(objective: str, text: str, fleet_dir: str = _ZONAL_FLEET):
+def _zonal_case_verdict(objective: str, text: str, reached: list[str] | None = None):
     # parse_node rather than a hand-built ReportContainsVerifier, for the
     # reason the sibling block gives: a clause the shipped entry grows later
-    # must not be silently dropped here. The fleet directory stands in for
-    # the runner's: every slot's role reached, unless a test says otherwise.
+    # must not be silently dropped here. A fresh directory per call stands in
+    # for the runner's: every slot reached, unless a test says otherwise.
     v = parse_node(_zonal_case_check(objective))
     _stash(text)
-    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: fleet_dir}):
-        return v.verify(5.0)
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures() if reached is None else reached)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
 
 
 def _zonal_case_grades(objective: str, text: str) -> bool:
@@ -382,8 +388,10 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
         "\n".join(_zonal_line(f"gke_haoxuw-gke-dev_us-central1-a_{c}") for c in _SLOTS),
         "\n".join(_zonal_line(f"projects/haoxuw-gke-dev/locations/us-central1-a/clusters/{c}") for c in _SLOTS),
         "\n".join("\u26a0\ufe0f " + _zonal_line(c) for c in _SLOTS),
-        # The last value linked to its source.
+        # The last value linked to its source, and a linked footnote marker
+        # with a stop after it.
         "\n".join(_zonal_line(c).replace("running pods: unaffected", "running pods: [unaffected](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)") for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " [1](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)." for c in _SLOTS),
     ],
 )
 def test_zonal_case_accepts_the_declared_lines_as_rendered(objective, text):
@@ -404,11 +412,11 @@ def test_zonal_case_fixtures_name_one_role_per_slot():
 def test_zonal_case_errors_rather_than_fails_when_a_slot_was_not_reached():
     roles = _zonal_case_fixtures()
     missing = roles[-1]
-    three_slot = _fleet_dir([r for r in roles if r != missing])
+    three_slot = [r for r in roles if r != missing]
     three_lines = "\n".join(_zonal_line(c) for c in _SLOTS[:-1])
     res = _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", three_lines, three_slot)
     assert res.status == "error"
-    assert missing in res.reason
+    assert missing in res.reason and f"slot {fleet.slot_of_role(missing)!r}" in res.reason
     # The value objectives read the lines that are there.
     for objective in _ZONAL_OBJECTIVES[1:]:
         assert _zonal_case_verdict(objective, three_lines, three_slot).status == "pass"
@@ -416,16 +424,50 @@ def test_zonal_case_errors_rather_than_fails_when_a_slot_was_not_reached():
     assert _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", three_lines).status == "fail"
 
 
+def test_fixture_roles_read_the_slot_credential_not_the_role_file(tmp_path):
+    # A reached cluster whose fixture was never planted has a slot credential
+    # and no role file: the check grades. The reverse cannot happen (a role
+    # file is a copy of the slot's), so a missing slot credential is the one
+    # thing that errors.
+    _stash("seeded-a: fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
+    (tmp_path / "clusters").mkdir()
+    (tmp_path / "clusters" / "a.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        assert v.verify(5.0).status == "pass"
+    (tmp_path / "clusters" / "a.kubeconfig").unlink()
+    (tmp_path / "crashloop-workload.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert "slot 'a'" in res.reason and "crashloop-workload" in res.reason
+
+
 def test_report_contains_fixture_roles_need_the_runners_directory():
     _stash("seeded-a: fine")
     v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
-    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: _fleet_dir(["crashloop-workload"])}):
-        assert v.verify(5.0).status == "pass"
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop(fleet.FLEET_KUBECONFIG_DIR_ENV, None)
         res = v.verify(5.0)
     assert res.status == "error"
-    assert "crashloop-workload" in res.reason
+    assert fleet.FLEET_KUBECONFIG_DIR_ENV in res.reason
+
+
+def test_a_malformed_fixture_roles_entry_is_a_spec_load_error_not_a_run_time_one():
+    # The fleet verifier's contract for `fixture_role`, applied per entry.
+    with pytest.raises(ValidationError, match="lowercase-hyphen"):
+        parse_node({"type": "report_contains", "fixture_roles": ["Crashloop-Workload"], "required_phrases": ["x"]})
+    with pytest.raises(ValidationError, match="lowercase-hyphen"):
+        parse_node({"type": "report_contains", "fixture_roles": ["../escape"], "required_phrases": ["x"]})
+
+
+def test_a_role_the_catalogue_does_not_know_errors_by_name(tmp_path):
+    _stash("fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["no-such-role"], required_phrases=["fine"])
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert "no-such-role" in res.reason and "catalogue" in res.reason
 
 
 def test_zonal_case_patterns_name_exactly_the_catalogues_slots():

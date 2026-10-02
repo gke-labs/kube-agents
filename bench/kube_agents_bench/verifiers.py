@@ -70,6 +70,7 @@ from kube_agents_bench.fleet import (
     FleetRoleUnresolved,
     confirmed_subjects,
     kubeconfig_for_role,
+    slot_kubeconfig_for_role,
 )
 
 __all__ = [
@@ -91,8 +92,8 @@ _NO_TRANSCRIPT_REASON = (
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
 )
-_UNREACHED_ROLE_REASON = (
-    "a cluster this check's patterns require a line about was not reached before the run, "
+_UNREACHED_SLOT_REASON = (
+    "a seeded cluster this check's patterns require a line about was not reached before the run, "
     "so a missing line about it is the environment's gap, not the agent's miss"
 )
 _NO_WORKER_CALLS_REASON = (
@@ -197,22 +198,31 @@ _QUOTED_FIRST_NAME = re.compile(r"^([\w/._-]+(?:\s*\([^)\n]*\))?)[\"\u201c\u201d
 _MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)\]\([^)\n]*\)")
 
 
-def _fold_trail(line: str) -> str:
-    # Markers and closers interleave ("unaffected [1]."), so a closer strip
-    # that spares brackets alternates with the marker strip until the line
-    # stops changing; the full closer class runs once at the end.
+def _fold_trail_markers(line: str) -> str:
+    # Markers and closers interleave ("unaffected [1].", "[1](url),"), so a
+    # closer strip that spares brackets alternates with the marker strip
+    # until the line stops changing. Brackets are spared so a link that is a
+    # value ("[unaffected](url).") keeps its closing parenthesis for the
+    # unwrap that follows.
     for _ in range(_TRAIL_FOLD_PASSES):
         folded = _LINE_TRAIL_FOOTNOTE.sub("", _LINE_TRAIL_CLOSER.sub("", line))
         if folded == line:
             break
         line = folded
-    return _LINE_TRAIL_DECORATION.sub("", line)
+    return line
+
+
+def _fold_trail(line: str) -> str:
+    return _LINE_TRAIL_DECORATION.sub("", _fold_trail_markers(line))
 
 
 def _fold_line_decoration(line: str) -> str:
-    # Footnote markers first, so a linked marker is folded as a marker; then
-    # every other link is kept as its text, so a linked value stays a value.
-    footnoted = _LINE_TRAIL_FOOTNOTE.sub("", line)
+    # Trailing markers and closers first, whatever order they come in, so a
+    # linked marker is folded as a marker however the line ends; then every
+    # other link is kept as its text, so a linked value stays a value; then
+    # the lead, the quoted name, and the trail once more with the full
+    # closer class.
+    footnoted = _fold_trail_markers(line)
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
     unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
@@ -290,12 +300,29 @@ class ReportContainsVerifier(BaseVerifier):
     # spelled once. Off by default: a case may forbid the decoration itself.
     fold_decoration: bool = False
     # The seeded-fleet roles whose clusters the patterns require a line
-    # about, one per slot. A role the runner resolved no kubeconfig for
-    # before the run marks a slot absent from the project: the check returns
-    # ``error`` for the environment instead of charging the agent with a
-    # line about a cluster it could not see.
+    # about, one per slot. Each is resolved to its slot's own credential
+    # (``clusters/<slot>.kubeconfig``, which the runner writes for every
+    # seeded cluster it reached, before and apart from confirming the roles
+    # on it); a slot the runner did not reach makes the check an ``error``
+    # for the environment instead of charging the agent with a line about a
+    # cluster it could not see. Whether the role's fixture is planted is not
+    # read here.
     fixture_roles: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
+
+    @field_validator("fixture_roles")
+    @classmethod
+    def _roles_are_names(cls, roles: list[str]) -> list[str]:
+        # The same contract as the fleet verifier's `fixture_role`: the name
+        # reaches the catalogue and a path, so a bad one fails at spec load,
+        # before the run, not as an environment error after it.
+        for role in roles:
+            if not ROLE_PATTERN.fullmatch(role):
+                raise ValueError(
+                    f"fixture_roles entry {role!r} must be a lowercase-hyphen name "
+                    "(it names a catalogue role and a slot's file); see bench/tf/fleet/fixtures.json"
+                )
+        return roles
 
     @field_validator("forbidden_patterns", "any_of_patterns")
     @classmethod
@@ -308,13 +335,13 @@ class ReportContainsVerifier(BaseVerifier):
         start = time.monotonic()
         for role in self.fixture_roles:
             try:
-                kubeconfig_for_role(role)
+                slot_kubeconfig_for_role(role)
             except FleetRoleUnresolved as exc:
                 return VerificationResult(
                     success=False,
                     status="error",
                     elapsed_time=time.monotonic() - start,
-                    reason=f"{_UNREACHED_ROLE_REASON}: {exc}",
+                    reason=f"{_UNREACHED_SLOT_REASON}: {exc}",
                 )
         snap = transcript.get()
         if snap is None:

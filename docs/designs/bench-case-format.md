@@ -87,11 +87,13 @@ role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.
 the contract for why.
 
 A case whose spec reads live cluster state must declare it. `fixtures: []` is the
-declaration for a case that plants its own state, and for a case that depends on a slot's
-shape rather than on a plant (every seeded cluster is zonal, say), which says so in a
-comment beside the empty list rather than borrowing a role from that slot — `gpu-stress-test-diagnosis` brings up
+declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
-finding, because a grep that returns one case for a role has to mean one case uses it.
+finding, because a grep that returns one case for a role has to mean one case uses it. A
+case that depends on a slot's shape rather than on a plant (every seeded cluster is zonal,
+say) names one role per slot it reads and grounds the objective that needs every slot with
+`report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
+slots; the grep then still finds it when a slot's cluster is replaced.
 
 `owner` is who answers for the case when it flakes: a GitHub login written without the at
 sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
@@ -181,9 +183,10 @@ negates the last word stays, so it reads as a wrong value), so a pattern anchore
 spells a declared line once and should keep `\n` out of its gaps, for what no substring can
 express: a banned word whose negated uses are legitimate, and a required claim whose
 subject and verb an adverb or a tense can separate; its `fixture_roles` names the seeded-fleet
-roles whose clusters the patterns require a line about, and a role the runner resolved no
-kubeconfig for returns `status: "error"`, the slot being absent from the project rather than
-missed by the agent), `tool_called` (calls in the
+roles whose clusters the patterns require a line about, each resolved to its slot's own
+credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
+before any role on it is confirmed), and a slot the runner did not reach returns
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
