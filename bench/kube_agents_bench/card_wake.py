@@ -285,7 +285,7 @@ try:
         raise RuntimeError("the notifier built no wake for card %s" % card)
     out.update(wake=wake.synth, posted=len(adapter.posts))
     if adapter.posts:
-        out["post"] = {"text": adapter.posts[0].get("text") or "", "blocks": adapter.posts[0].get("blocks") or []}
+        out["post"] = {key: adapter.posts[0].get(key) or default for key, default in (("text", ""), ("blocks", []), ("attachments", []))}
     if DECOY_KEY:
         # Filed after the planted card, so it is the newer of two cards blocked on one question.
         decoy = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR,
@@ -445,7 +445,7 @@ class Failure:
 class Planted:
     """What the plant left on the board: the card, its wake, how many posts the stub took, and the run's key.
 
-    ``post`` is the first post's ``text`` and ``blocks``, ``None`` when the
+    ``post`` is the first post's ``text``, ``blocks`` and ``attachments``, ``None`` when the
     stub took none; ``decoy`` is the fresh-session replay's decoy card.
     """
 

@@ -86,6 +86,11 @@ def _buttons(blocks: list) -> list:
     return [e for b in blocks if b.get("type") == "actions" for e in b["elements"]]
 
 
+def _shown(message: dict) -> list:
+    """The blocks a post or update sends: its own, then those beside its side bar."""
+    return [*message.get("blocks", []), *(b for a in message.get("attachments", []) for b in a["blocks"])]
+
+
 def check_caller(root: Path) -> None:
     path = root / CALLER
     if not path.is_file() or CALLER_IMPORT not in path.read_text():
@@ -120,7 +125,7 @@ async def _drive(module) -> None:
     await module.pr_opened(adapter, sub, OPENED)
     if len(adapter.posts) != 1:
         raise _fail(f"the PR moment posted {len(adapter.posts)} times, expected once")
-    urls = [b.get("url") for b in _buttons(adapter.posts[0]["blocks"])]
+    urls = [b.get("url") for b in _buttons(_shown(adapter.posts[0]))]
     if urls != [PR, PR + "/files"] or adapter.posts[0]["thread_ts"] != THREAD:
         raise _fail(f"the PR moment was {adapter.posts[0]!r}")
 
@@ -131,7 +136,7 @@ async def _drive(module) -> None:
     await module.needs_you(adapter, sub, {"kind": "needs_input", "reason": QUESTION}, BLOCKED_ID)
     if len(adapter.posts) != 1:
         raise _fail(f"the question posted {len(adapter.posts)} times, expected once")
-    labels = [b["text"]["text"] for b in _buttons(adapter.posts[0]["blocks"])]
+    labels = [b["text"]["text"] for b in _buttons(_shown(adapter.posts[0]))]
     if labels != CHOICES:
         raise _fail(f"the question's buttons were {labels!r}")
     if f"\n{module.QUESTION_CARD_NOTE.format(card=sub['task_id'])}\n" not in adapter.posts[0]["text"]:
@@ -142,12 +147,12 @@ async def _drive(module) -> None:
     if module.wake_text(sub, [_Event(BLOCKED_ID + 1, BLOCKED)], {BLOCKED}, WAKE) != WAKE:
         raise _fail("the wake for another blocked event carries the note")
     await module.settle_question(adapter, sub)
-    if len(adapter.updates) != 1 or _buttons(adapter.updates[0]["blocks"]):
+    if len(adapter.updates) != 1 or _buttons(_shown(adapter.updates[0])):
         raise _fail(f"settling the question sent {adapter.updates!r}")
 
     adapter = _StubAdapter()
     await module.needs_you(adapter, {**sub, "thread_id": ""}, {"kind": "needs_input", "reason": QUESTION})
-    if len(adapter.posts) != 1 or _buttons(adapter.posts[0]["blocks"]):
+    if len(adapter.posts) != 1 or _buttons(_shown(adapter.posts[0])):
         raise _fail("a question with no thread to answer in got buttons")
     os.environ.pop(FLAG_ENV, None)
 

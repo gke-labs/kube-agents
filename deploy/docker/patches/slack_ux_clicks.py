@@ -60,7 +60,10 @@ The rewrite sends back the blocks Slack echoed in the payload, clamped as
 upstream clamps every ``chat.update``: Slack stores ``< > &`` escaped, so an
 echoed text can come back longer than the send path budgeted for. A section or
 context text past ``SECTION_TEXT_MAX`` is clipped and the message is cut to
-``MESSAGE_BLOCKS_MAX`` blocks, keeping the answered note last.
+``MESSAGE_BLOCKS_MAX`` blocks, keeping the answered note last. A message with a
+side bar (``slack_presenter.with_side_bar``) echoes its blocks split between
+its own and its attachment's; the rewrite reads both and puts them back beside
+the same colour, since ``chat.update`` keeps an attachment it is not sent.
 
 An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
 answered by typing: someone replies ``apply Option B`` in the thread, the agent
@@ -346,6 +349,13 @@ def _answered_text(note: str, message: dict, question: bool = False) -> str:
     return _presenter._clip(f"{note}\n\n{original}", SLACK_TEXT_MAX) if original else note
 
 
+def _rewrite(message: dict, answered: Any, note: str) -> dict:
+    """The ``blocks``, and ``attachments`` for a message with a side bar, that answer ``message``."""
+    blocks = answered_blocks(_presenter.message_blocks(message), answered, note)
+    color = _presenter.side_bar_color(message)
+    return _presenter.with_side_bar(blocks, color) if color else {"blocks": blocks}
+
+
 def _shown_text(action: dict) -> str:
     """The clicked button's text as Slack displayed it, with Slack's entities decoded."""
     text = action.get("text") or {}
@@ -415,7 +425,7 @@ def _turn(label: str, value: Any, message: dict) -> str:
     want = _comparable(named)
     if not want or "\n" in named:
         return label
-    shown = next((line for line in _shown_lines(message.get("blocks")) if _comparable(line) == want), None)
+    shown = next((line for line in _shown_lines(_presenter.message_blocks(message)) if _comparable(line) == want), None)
     return label if shown is None else label + TURN_JOIN + " ".join(shown.split())
 
 
@@ -640,7 +650,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         try:
             await client.chat_update(
                 channel=channel_id, ts=msg_ts, text=_answered_text(ANSWERED_IN_THREAD, message),
-                blocks=answered_blocks(message.get("blocks"), _answered_by, ANSWERED_IN_THREAD),
+                **_rewrite(message, _answered_by, ANSWERED_IN_THREAD),
             )
         except Exception as exc:  # noqa: BLE001 — the click is dropped either way
             logger.warning("slack_ux_clicks: could not mark %s answered in the thread: %s", msg_ts, exc)
@@ -654,7 +664,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         await client.chat_update(
             channel=channel_id, ts=msg_ts,
             text=_answered_text(note, message, not action_id.startswith(INCIDENT_CHOICE_PREFIX)),
-            blocks=answered_blocks(message.get("blocks"), _answered_by, note),
+            **_rewrite(message, _answered_by, note),
         )
         if key in _answered:
             _rewritten[key] = None

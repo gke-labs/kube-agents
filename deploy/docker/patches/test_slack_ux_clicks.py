@@ -539,6 +539,26 @@ class RuntimeTest(unittest.TestCase):
         )
         self.assertEqual(adapter.acks, 1)
 
+    def test_a_message_with_a_side_bar_is_answered_beside_the_same_bar(self):
+        # Slack echoes the colour without its "#"; chat.update keeps an attachment it is not sent.
+        body, action = _choice()
+        headline, *rest = body["message"]["blocks"]
+        body["message"].update(blocks=[headline], attachments=[{"id": 1, "color": "ECB22E", "blocks": rest}])
+        adapter = _Adapter()
+        self._answer(adapter, body, action)
+        update = adapter.log[0][1]
+        self.assertEqual(update["blocks"], [headline])
+        [attachment] = update["attachments"]
+        self.assertEqual(attachment["color"], "#ECB22E")
+        actions = [b for b in attachment["blocks"] if b["type"] == "actions"]
+        self.assertEqual([[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]])
+        self.assertEqual(attachment["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
+
+    def test_a_message_without_a_side_bar_is_sent_no_attachments(self):
+        adapter = _Adapter()
+        self._answer(adapter, *_choice())
+        self.assertNotIn("attachments", adapter.log[0][1])
+
     def test_a_click_on_a_cards_question_names_the_card(self):
         moments = SimpleNamespace(
             question_card=lambda channel, ts: "t_e0c1" if (channel, ts) == (CHANNEL, MESSAGE_TS) else None
