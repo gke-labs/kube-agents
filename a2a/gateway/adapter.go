@@ -167,6 +167,17 @@ type TaskObserver interface {
 	CancelPublished(conversation, taskID string)
 }
 
+// DeliverableObserver is told the text a completed task delivered, once,
+// before the relay posts it. The relay posts a result in chat-sized chunks
+// (g.post, discordChunk), so an adapter whose caller is a program cannot
+// rebuild the deliverable from the posts it sees; this hands it over whole,
+// and the heal path hands over the artifact the stream carries. Optional,
+// like the observers above: the gateway asserts for it on the adapter it
+// drives, and the side-door composite forwards it to the owning door.
+type DeliverableObserver interface {
+	TaskDelivered(conversation, taskID, result string)
+}
+
 // InboundObserver is the optional extension an Adapter implements when it has
 // to know what became of a message it handed over, rather than only what the
 // conversation received. Every chat backend ignores both: a human reads the

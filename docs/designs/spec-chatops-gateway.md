@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, and the console adapter); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door); the operator renders the gateway Deployment, its env and the `A2A_SPAWN_SESSIONS` arming under `mode: next` (`platformagent_a2a_manifests.go`) plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects, but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription) - and not yet the Slack adapter's env or the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); not yet the gateway-minted child task and the session's grant to request one, the `chat` profile's skills, or the default flip
 
 ## Purpose
 
@@ -1169,6 +1169,118 @@ one notice, and the rest are silent until the conversation has room again. A NAT
 or a NATS pod not yet rolled onto the new one, refuses the adapter's subscription
 asynchronously; the adapter logs that with the remedy rather than boot-failing,
 because the chat backend beside it is still good.
+
+## The A2A door (added 9/24)
+
+The gateway's ingress for an agent caller: an A2A client (Antigravity, an ADK agent, the MCP
+bridge that fronts Claude, `curl`) that speaks the A2A protocol over HTTP. A second side door
+beside the inject door, built on the same contract, and differing in what it speaks rather
+than in what it may do. This section is the door as `a2a/gateway/a2adoor.go` implements it.
+
+**A side door, again.** The inject door's reasoning holds unchanged. The door holds no bus
+credential, mints no id the bus sees and writes no `authority` block; a verified caller's
+message becomes an `InboundMessage` into `handleInbound`, and from there the turn is a chat
+turn - routed by the same matcher, subject to the same first-event grace, relayed back through
+the same `post`/`edit`. It sits beside the mux with the inject door, under the composite that
+forwards the gateway's probe and observers by conversation prefix, and it is not counted by the
+one-real-backend guard for the reason the inject door is not. Either door alone starts a
+gateway; with both doors and no real backend the default attribution is the inject door's, and
+every message through either stamps its own backend.
+
+**Wire.** JSON-RPC 2.0 over HTTP at `/a2a`, and the agent card at
+`/.well-known/agent-card.json`. Four methods:
+
+- `message/send` is a turn. The door answers with the A2A `Task` once the submission is on the
+  bus (`TaskObserver.TaskAccepted`, the inject door's rule: a caller is never handed an id whose
+  terminal cannot come), or with the gateway's reply as an A2A `Message` when the turn started
+  no task (a status answer, a steer, a refusal). `configuration.blocking: true` holds the call
+  until the task's terminal, bounded, which is the one-call `curl` demo. `message.taskId` names
+  a running task of the caller's own and lands the text on its conversation, where the gateway
+  treats it as a steer. `message.messageId` is the dedupe key: a retry after a dropped
+  connection is answered with the task the first attempt started, and starts nothing.
+- `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
+  caller started is not found rather than forbidden, so the door confirms no id it will not
+  serve.
+- `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
+  the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
+  on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
+  when the task is canceled; the client polls `tasks/get` for that terminal as for any other.
+- `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
+  next, as SSE frames from the same observer hooks.
+
+Only text parts are accepted. A data or file part has no home on a chat turn, so it is refused
+at the door in the protocol's own terms rather than dropped.
+
+**The Task object** is assembled from what the relay posted on the door's conversation, which
+is what a chat user would have read. The rolling progress line (`startTask`'s placeholder, which
+the relay edits) is `status.message`; the state is `submitted` from `TaskStarted`, `working` from
+the first edit, and the terminal state from `TaskTerminal`, whose reason - the executor's
+terminal status message, verbatim, which is `reason: <token>` on a failure - replaces the line
+on a terminal that carries one. Every other post under the task is an agent message in
+`history`, after the caller's own; every message inside the Task carries the binding's
+`kind: "message"`, which the bus payload's own message struct does not. On a completed terminal
+the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
+the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
+hands over the artifact the stream carries), so the chunks stay history and the artifact is
+never inferred from a post's position. The door keeps up to 4 MiB of it; a longer deliverable
+is cut at a rune boundary with `metadata.resultTruncatedFrom` carrying the original length, so a
+client can fall back to `history`, which carries the chunks whole. Everything the door keeps per
+task (the caller's text, the posts, the deliverable) is summed across tasks under a 64 MiB budget;
+past it the oldest tasks are gone whole, the protocol's `not found`, as under the task-count cap.
+A turn's reply is assembled from a per-conversation log bounded in bytes too, and a reply whose
+head fell off it says so in `metadata.postsEvicted`. A completed task the relay
+handed nothing for (a non-text result) renders no artifact. `metadata.terminalSource` carries whose word the terminal
+is, for the reason the inject door's read route carries it. A2A clients read exactly `status`,
+`artifacts` and `history`, so nothing here is invented for them. Not mapped yet: an executor's
+non-final `input-required` reaches `history` as the relay's ask line, not `status.state`, which
+stays `working`; no executor in this tree publishes it, and the streaming change carries status
+events through as they come.
+
+**Conversation.** `a2a:<caller>:<contextId>`, kind `dm`. The caller is part of the key so two
+callers naming the same `contextId` do not share a conversation; a caller that sends none is
+minted one and reads it back on the `Task`. `Roster` is the caller alone, complete;
+`openDirect` returns the caller's last conversation, as on the inject door.
+
+**Identity, first version: the eval class.** The caller names itself - the `X-A2A-Caller` header,
+or `message.metadata.caller` for a client that cannot set headers - and is resolved through the
+door's **own** principal map at the prefixed key `a2a:<caller>`, whose value must be an eval
+identity. The three refusals are the inject door's, and for the same reason: the door takes its
+caller from the request, so the map is the only thing between a token holder and a principal of
+their choosing. An unmapped or unnamed caller is refused with a JSON-RPC error and starts nothing;
+nothing is defaulted. `verifiedBy` is `a2a-bearer`, its own value, so an external agent's
+submission and an eval harness's are distinguishable downstream even though both resolve into
+the eval namespace today.
+
+That is the demo answer and not the product answer. The developer class (an ID token for the
+person whose harness is calling, audience this install's door, principal the same email the
+Google Chat adapter carries) and the unattended class (an organisation's service identity,
+read-only against protected targets) arrive as verifiers beside this map, never as entries in
+it, and each gets its own `verifiedBy`. Validating a token at the door is not the per-user
+token brokerage the permission model declined: the door holds an audience and an allowlist,
+never a refresh token.
+
+**The card is the catalog.** One skill per destination this door routes to, which today is the
+gateway's default addressee. When profiles land the list is rendered from `DIRECTORY` and the
+caller's entitlements, per caller, and it is the same list the router's capability catalog is
+built from. The card is the one unauthenticated route, because discovery reads it to learn which
+security scheme to present; it discloses the endpoint URL, the scheme and the default
+destination's name, none of which a 401 hides.
+
+**Posture.** Every RPC request carries a bearer token (`A2A_DOOR_TOKEN`, required whenever
+`A2A_DOOR_LISTEN` is set, no unauthenticated mode); the caller map is its own file
+(`A2A_DOOR_PRINCIPAL_MAP`); the card advertises `A2A_DOOR_PUBLIC_URL` when set, and otherwise
+the address the card was fetched from (the request's host, or the forwarded host and scheme
+behind a proxy), since behind a port-forward or an ingress the listen address is reachable by
+nobody. The operator renders the door the way
+it renders the inject door, under its own operator-level flag (`A2A_AGENT_DOOR=true`, never a
+CRD field): a loopback bind on its own port, its own one-entry map admitting one caller, a
+token Secret minted once, a ClusterIP Service for the port-forward, and the gateway fence
+under the door's own name, so each door comes and goes with its own flag. The render counts
+the door as a backend the way it counts the inject door (`a2aGatewayBackend`): a `mode: next`
+install with no `discord-bot` Secret and this door armed gets its gateway rather than the
+`NoChatBackend` condition, which is what the gateway's own start-up check already accepts. The
+identity classes above are what will let it be rendered on an install a customer reaches; until
+then it is a dev and eval door like the other.
 
 ## What stage 2 builds from this doc
 

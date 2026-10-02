@@ -376,6 +376,56 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
+    """A3 on the A2A door: the inject door's sibling for an agent caller, held
+    to the same two properties by the same two seams.
+
+    The door resolves a caller the request names through a door-scoped map
+    into the eval namespace, so it may not exist on an install that did not
+    ask for it (an operator flag, not a CRD field) and may not assert a
+    principal a real backend's sender could hold.
+    """
+
+    _GATED_FUNCTIONS = (
+        ("buildA2AGatewayDeployment", "the gateway's door env, port, mount and volume"),
+        ("applyA2AAgentDoor", "the door's Service, principal map and token Secret"),
+        ("reconcileA2ANetworkFences", "the gateway fence the door renders"),
+    )
+
+    def test_A3_the_a2a_door_renders_only_under_the_operator_flag(self) -> None:
+        source = h.text("a2a_door_render")
+        for name, what in self._GATED_FUNCTIONS:
+            body = h.go_function_body(source, name)
+            self.assertIn(
+                "a2aAgentDoorEnabled()",
+                body,
+                f"{name} renders {what} without consulting the door flag",
+            )
+
+    def test_A3_the_a2a_door_flag_is_not_a_field_a_customer_can_set(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_render"), "a2aAgentDoorEnabled")
+        self.assertIn("os.Getenv(a2aAgentDoorEnvVar)", body)
+        self.assertNotIn("agent.Spec", body)
+        self.assertNotIn("Spec.Mode", body)
+        self.assertIn('== "true"', body)
+
+    def test_A3_the_a2a_door_cannot_assert_a_cloud_principal(self) -> None:
+        body = h.go_function_body(h.text("a2a_door_identity"), "resolveA2APrincipal")
+        self.assertIn("a2aPrincipalPrefix + authorID", body)
+        self.assertRegex(
+            body,
+            r"!strings\.HasPrefix\(principal, injectEvalPrincipalPrefix\)",
+            "the door no longer refuses a principal outside the eval namespace",
+        )
+        self.assertNotIn("return injectEvalPrincipalPrefix", body)
+        self.assertRegex(
+            body,
+            r'!strings\.HasPrefix\(principal, injectEvalPrincipalPrefix\) \{[^}]*return ""',
+            "the refusal of a principal outside the eval namespace no longer returns the "
+            "empty string",
+        )
+
+
 RBAC_GROUP = "rbac.authorization.k8s.io"
 
 # The ClusterRoles the operator is allowed to hold `bind` over, and why each is
