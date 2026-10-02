@@ -140,7 +140,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(merged[0]["deliver"], "all")
 
     def test_deliberately_removed_job_is_not_resurrected(self):
-        """bootstrap_delivery._cleanup removes its jobs on purpose."""
+        """bootstrap_delivery._retire_jobs removes its jobs on purpose."""
         merged, _, summary = cron_jobs_sync.reconcile(
             [job("bootstrap-inventory-scan")], [], {"bootstrap-inventory-scan"}
         )
@@ -246,7 +246,7 @@ class SyncFileTests(unittest.TestCase):
         cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
         self.assertEqual([j["id"] for j in self.read(self.runtime)["jobs"]], ["scan", "keep"])
 
-        # Runtime removes it, as _cleanup does.
+        # Runtime removes it, as _retire_jobs does.
         self.write(self.runtime, {"jobs": [job("keep")]})
         cron_jobs_sync.sync(self.image, self.runtime, self.ledger)
         self.assertEqual([j["id"] for j in self.read(self.runtime)["jobs"]], ["keep"])

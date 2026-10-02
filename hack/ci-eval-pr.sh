@@ -2372,6 +2372,11 @@ unit_cost_hint() {
     # run_wait, 900s), and the agent turn is a board read. 340-520s a
     # repetition on 2026-09-28.
     bootstrap-discovery-fanout) echo 600 ;;
+    # Tofu too: the plant files one card and waits for its worker to run the
+    # prioritization SOP and end its run (up to the stack's run_wait, 900s),
+    # and the agent turn is a board read. Unmeasured; priced below the band
+    # above because one card's worker is the whole of the wait.
+    bootstrap-inventory-ranking-delivery) echo 600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2817,6 +2822,31 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   export AGENT_DELEGATION_TIMEOUT
   local start end dir run_task
   run_task="$(unit_task_path "${task}" "${name}")"
+  # When the first unit on this case's audit stream began, and which audit it
+  # is, for pull_request_opened's accepts_stream_pull_request
+  # (bench/kube_agents_bench/verifiers.py). A fleet audit opens its remediation
+  # pull request once and later runs on the stream find it open and leave it,
+  # whichever case they are, and nothing here may close it between units
+  # (docs/ci-pool-projects.md 5.3). Written once, by the first unit to get
+  # here, under the stream lock that serializes them; a pull request older
+  # than it is not this job's, and one the stamp admits must sit on the
+  # audit's remediation branch in this job's GitOps repository
+  # (EVAL_STREAM_REPO), so a sibling job's pull request on the same audit in
+  # another pool repository is not this one's. A case with no
+  # `ledger_issue_contains` audit key has no stream and gets none of them.
+  # The repository takes the deploy's precedence, as the inject lane's does:
+  # a developer's EVAL_GITOPS_REPO is where the agent was told to write.
+  if [ -n "${audit_id}" ]; then
+    local window="${STATE_DIR}/stream-${audit_id}.window" stream_repo="${EVAL_LEDGER_REPO:-}"
+    if [ -n "${EVAL_GITOPS_REPO:-}" ] && [ "${EVAL_GITOPS_REPO}" != "none" ]; then
+      stream_repo="${EVAL_GITOPS_REPO}"
+    fi
+    [ -s "${window}" ] || date -u +%s > "${window}"
+    EVAL_STREAM_STARTED_AT="$(cat "${window}")"
+    export EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM="${audit_id}" EVAL_STREAM_REPO="${stream_repo}"
+  else
+    unset EVAL_STREAM_STARTED_AT EVAL_AUDIT_STREAM EVAL_STREAM_REPO
+  fi
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"

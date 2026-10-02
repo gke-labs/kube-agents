@@ -28,7 +28,10 @@ cross-pod, which RWO only allows with same-node scheduling games. Not worth it f
 component we intend to delete.
 
 The `sidecars` field takes ordinary `corev1.Container` entries, so the operator renders
-the bridge without any operator code change and reconcile never fights us. The sidecar
+the bridge as it renders any sidecar and reconcile never fights us. The one thing the
+operator reads out of the entry is `BRIDGE_CONCURRENCY`, to size the TASKS consumer reserve
+([sizing](#sizing-against-the-eval-harness)); that read is the bridge's only operator
+code and retires with it. The sidecar
 mounts the same data volume, runs as the pod's KSA (model auth via Workload Identity for
 free), and gets `NATS_URL` plus creds from the a2a creds Secret.
 
@@ -243,11 +246,14 @@ keeps a bind over a backlog of abandoned submissions from opening a consumer per
 speed, and the replay that remains is paced: at most `BRIDGE_CONCURRENCY` of them are in hand
 at once, each held until its ephemeral's five-second threshold has run after it returned, so the
 look-ahead holds that many live consumer slots at most, plus whatever the server has not yet
-reaped at the window's edge. The operator's reserve counts twice the default
-`BRIDGE_CONCURRENCY` of 2 (its tail factor), since the operator leaves the variable unset; a
-bridge started with a higher value, as the eval's sidecar is, can hold more look-ahead consumers
-than the reserve counts. Twice `BRIDGE_CONCURRENCY` is the bound the bridge's own test holds the
-stream to. A run the durable's cancel has already
+reaped at the window's edge. The operator's reserve counts this look-ahead row, and the asks
+row beside it, per worker at the `BRIDGE_CONCURRENCY` the sidecar's own env entry declares, read
+at render time, with the bridge's default of 2 standing in for an entry that is absent or that
+the render cannot read as a count (a `valueFrom`, or a reference to one); a sidecar started with
+a higher value, as the eval's is, widens the reserve with it, and a value the stream's floor
+cannot hold at the CR's `maxSessions` is refused at provision, with the CR `Degraded` and both
+inputs named, rather than left to outgrow the reserve. Twice `BRIDGE_CONCURRENCY` is the bound
+the bridge's own test holds the stream to. A run the durable's cancel has already
 ended takes no slot at all. `working` is published only after that read, so a cancelled
 run never shows it. It is
 a read, not a consume: the durable still delivers the cancel to the handler afterwards, and
@@ -277,7 +283,10 @@ infrastructure in the harness's classification. Size the parallelism against bot
 at or above the parallelism, and the number of submissions a run can have outstanding at once,
 the units in flight plus anything abandoned and not yet cancelled, well under the queue
 capacity. `hack/ci-deploy.sh` declares that sidecar under `EVAL_MODE_NEXT=1` and sets
-`BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`.
+`BRIDGE_CONCURRENCY` to the run's `EVAL_TASK_PARALLELISM`. The operator reads that value from
+the sidecar entry and sizes the TASKS consumer reserve from it, so a concurrency the stream
+cannot hold is a refused provision and a `Degraded` CR, not a silent shortfall; the read is
+the only operator code the bridge has, and it retires with the bridge.
 
 ## Activity: the persona's tool calls, and a heartbeat
 

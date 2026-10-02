@@ -281,6 +281,21 @@ class StageTest(unittest.TestCase):
         self.assertEqual(staged, [])
         self.assertIsNone(directory)
 
+    def test_an_unreadable_path_is_dropped_and_the_next_one_still_staged(self):
+        def read_bytes(path, *, max_bytes, **kwargs):
+            if path == "/opt/data/scratch":
+                raise sandbox_exec.SandboxReadFailed(f"{path} is not a readable regular file")
+            return b"# findings\n"
+
+        sandbox_exec.read_bytes = read_bytes
+        with self.assertLogs(sandbox_artifact_patch.LOGGER, "WARNING") as logs:
+            staged, directory = sandbox_artifact_patch._stage(
+                ["/opt/data/scratch", "/opt/data/report.md"]
+            )
+        self.addCleanup(sandbox_artifact_patch._cleanup, staged, directory)
+        self.assertEqual([os.path.basename(path) for path in staged], ["report.md"])
+        self.assertIn("/opt/data/scratch is not staged", logs.output[0])
+
     def test_cleanup_removes_the_files_and_the_translations(self):
         self.fake_read({"/opt/data/report.md": b"body"})
         staged, directory = sandbox_artifact_patch._stage(["/opt/data/report.md"])

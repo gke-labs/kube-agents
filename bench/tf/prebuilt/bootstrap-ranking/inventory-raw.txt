@@ -1,0 +1,55 @@
+# GKE Environment Discovery Report
+
+This is the first-time environment scan for project `onboarding-demo-prod`: one cluster, four
+workloads, six findings.
+
+## GKE Fleet Discovery
+
+| Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
+| :----------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
+| prod-east | us-east1 | RUNNING | 1.33.4-gke.1245000 | default-pool / e2-standard-4 (3 nodes) | disabled | Cloud Logging only | kubectl apply from CI |
+
+## Workloads Inventory
+
+| Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
+| :------ | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
+| prod-east | payments | checkout | Deployment | 3/3 | yes/yes | Burstable | none | yes |
+| prod-east | payments | cart | Deployment | 2/2 | yes/no | Burstable | none | yes |
+| prod-east | web | frontend | Deployment | 3/3 | yes/no | Burstable | none | yes |
+| prod-east | data | orders-db | StatefulSet | 1/1 | yes/yes | requests only, no memory limit | none | yes |
+
+## Prioritized SRE Remediation Plan
+
+### Priority 1 — Security & Identity Hardening
+
+- `payments/checkout` mounts a static service account key for a project-editor service account from
+  the Secret `checkout-gcp-key`. Anyone who can read that Secret holds editor on the project. Move
+  the workload to Workload Identity and delete the key. (severity: high)
+- Workload Identity is disabled on `prod-east`, which is why workloads there authenticate with
+  exported keys. Enable it on the cluster and its node pool. (severity: high)
+
+### Priority 2 — Workload Reliability & Probes
+
+- `payments/cart` has no readinessProbe, so a replica still warming up receives traffic. Add one.
+  (severity: medium)
+- `web/frontend` has no readinessProbe either. Add one. (severity: medium)
+- `data/orders-db` sets memory requests but no memory limit, so it can take memory from its
+  neighbours until the node evicts them. Set a limit. (severity: medium)
+
+### Priority 3 — Observability & Telemetry
+
+- Managed Service for Prometheus is not enabled on `prod-east`; nothing collects workload metrics.
+  Enable it. (severity: low)
+
+## Machine-Readable Findings
+
+```findings
+{"check": "sa-key-in-secret", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "payments", "object": "checkout", "title": "checkout mounts a static project-editor service account key from a Secret", "detail": "Secret checkout-gcp-key holds a JSON key for a service account with roles/editor, mounted at /var/secrets/google", "severity_hint": "high"}
+{"check": "workload-identity-off", "project": "onboarding-demo-prod", "cluster": "prod-east", "object": "prod-east", "title": "Workload Identity is not enabled on the cluster", "detail": "workloadIdentityConfig is absent from the cluster", "severity_hint": "high"}
+{"check": "probes-readiness", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "payments", "object": "cart", "title": "cart Deployment has no readinessProbe", "detail": "2 replicas, no readinessProbe on any container", "severity_hint": "medium"}
+{"check": "probes-readiness", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "web", "object": "frontend", "title": "frontend Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "medium"}
+{"check": "no-memory-limit", "project": "onboarding-demo-prod", "cluster": "prod-east", "namespace": "data", "object": "orders-db", "title": "orders-db StatefulSet has no memory limit", "detail": "resources.requests.memory is 2Gi, resources.limits.memory is unset", "severity_hint": "medium"}
+{"check": "managed-prometheus", "project": "onboarding-demo-prod", "cluster": "prod-east", "object": "prod-east", "title": "Managed Service for Prometheus is not enabled", "detail": "monitoringConfig.managedPrometheusConfig.enabled is false", "severity_hint": "low"}
+```
+
+scanned=1 clusters, 4 workloads findings=6 elapsed=412s
