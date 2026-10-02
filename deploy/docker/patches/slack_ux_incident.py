@@ -41,8 +41,11 @@ gateway restart leaves a thread open to a second edit. A report with no
 ``block_kit`` cannot render or that would hold a block outside
 ``FOLD_CHILD_TYPES``, or any failure to edit, also falls back to that reply,
 and a refused fold logs why. The fold stops at the report's first divider
-outside a code fence, read as ``block_kit`` reads one, so a closing ``---``
+outside a code fence, by ``block_kit``'s fence rule, so a closing ``---``
 and a note after it do not refuse it; the message ``text`` still carries them.
+Lists are not modelled: under a list item ``block_kit`` reads an indented
+fence or divider as list content, so such a report can fall back to the
+threaded reply or fold where Slack draws no divider.
 """
 
 from __future__ import annotations
@@ -255,7 +258,10 @@ def _load_block_kit() -> Any:
 
 
 def _block_kit_fence(line: str, fence: str | None) -> str | None:
-    """The fence open after ``line`` as ``render_blocks`` reads it: any line starting with the opener closes it."""
+    """The fence open after ``line`` by ``render_blocks``' fence rule: any line starting with the opener closes it.
+
+    List content is not modelled; see the module docstring.
+    """
     if fence is None:
         match = BLOCK_KIT_FENCE.match(line)
         return match.group(1) if match else None
