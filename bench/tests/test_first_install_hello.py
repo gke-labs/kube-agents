@@ -210,6 +210,28 @@ def test_a_results_clause_in_the_invitations_sentence_still_counts(reading):
 
 
 @pytest.mark.parametrize(
+    "results",
+    [
+        " I'll post what I find here\nwhen it's done.",
+        " I'll post what I find\nhere when it's done.",
+        " I'll post what I find in this\nchat when it's done.",
+    ],
+)
+def test_a_line_break_inside_the_results_sentence_still_says_where_results_go(results):
+    # The forbidden patterns run on the reply line by line, so the break stays
+    # a "\n" where main's collapsed reply had a space.
+    reply = (
+        "Hi there, I'm kube-agents 👋 I'm taking a first look at your GKE fleet."
+        " I'm only reading, so nothing in your clusters changes."
+        + results
+        + " Fixes come as pull requests for your team to review."
+        + INVITATION
+        + " Is there anything you want me to look at first?"
+    )
+    assert "says-results-come-to-this-chat" not in _failing("first-install-hello-running", reply)
+
+
+@pytest.mark.parametrize(
     "opener",
     [
         " Here's the plan: I'm taking a first look at your GKE fleet.",

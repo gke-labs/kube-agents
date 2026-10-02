@@ -117,9 +117,11 @@ verification_spec:
     check:
       type: report_contains
       # main's list: a space before "here" and a mark after it, so neither
-      # "there" nor "here's" or "here?" counts.
+      # "there" nor "here's" or "here?" counts. A line break counts as the
+      # space or the mark: main matched a reply collapsed to one line, and
+      # these patterns run line by line.
       forbidden_patterns:
-        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)(?: here[ .,!;:)]|\(here\)|this chat))'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)(?:\shere(?:[ .,!;:)]|\n)|\(here\)|this\s+chat))'
 
   # The one standing invitation: the prompts' sentence, "Share your team's
   # runbooks here anytime" ("any time" too), ended by ".", "!" or "…" past any
