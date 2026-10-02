@@ -128,13 +128,14 @@ class _GitHub:
     `pulls` is one list served for every repository, or a dict by repository.
     """
 
-    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None, branches=None, label_errors=None):
+    def __init__(self, pulls=None, mint_error=None, close_errors=None, odd_bodies=None, slug=BOT_SLUG, delete_errors=None, branches=None, label_errors=None, default="main"):
         self.calls = []
         self.pulls = pulls if pulls is not None else []
-        # Branch names the repository holds besides its default `main`, as
+        # Branch names the repository holds besides its default, as
         # GET /branches lists them; by default exactly the heads of `pulls`
         # in the repository itself.
         self.branches = branches
+        self.default = default
         # Keyed by pull-request number: what POST /issues/<n>/labels raises.
         self.label_errors = label_errors or {}
         self.mint_error = mint_error
@@ -192,9 +193,9 @@ class _GitHub:
             else:
                 names = list(self.branches)
             page = int(key.rsplit("page=", 1)[1])
-            return io.BytesIO(json.dumps([{"name": n} for n in ["main"] + names] if page == 1 else []).encode())
+            return io.BytesIO(json.dumps([{"name": n} for n in [self.default] + names] if page == 1 else []).encode())
         if key.startswith("GET /repos/") and key.count("/") == 3:
-            return io.BytesIO(json.dumps({"default_branch": "main"}).encode())
+            return io.BytesIO(json.dumps({"default_branch": self.default}).encode())
         if key.startswith("DELETE /repos/") and "/git/refs/heads/" in key:
             branch = urllib.parse.unquote(key.split("/git/refs/heads/", 1)[1])
             failure = _next(self.delete_errors.get(branch))
@@ -551,6 +552,20 @@ class ClosingTest(unittest.TestCase):
         github = _GitHub(pulls=[agent_pull(number=9, author="a-human", branch="fix-payments-api-oom", head_repo="fork/kube-agents-evals-7-infra")], branches=["fix-payments-api-oom"])
         run_repo(github)
         self.assertEqual(github.keys("DELETE "), ["DELETE /repos/%s/git/refs/heads/fix-payments-api-oom" % REPO])
+
+    def test_the_base_branch_of_someone_elses_open_pull_request_stays(self):
+        # GitHub closes a pull request whose base is deleted; the sweep must
+        # not close a human's by taking its base branch.
+        pull = agent_pull(number=9, author="a-human", branch="feature/x")
+        pull["base"] = {"ref": "release/1.2"}
+        github = _GitHub(pulls=[pull], branches=["feature/x", "release/1.2", "orphan"])
+        run_repo(github)
+        self.assertEqual(github.keys("DELETE "), ["DELETE /repos/%s/git/refs/heads/orphan" % REPO])
+
+    def test_the_default_branch_is_read_not_assumed(self):
+        github = _GitHub(pulls=[], branches=["main"], default="trunk")
+        self.assertEqual(run_repo(github), 0)
+        self.assertEqual(github.keys("DELETE "), ["DELETE /repos/%s/git/refs/heads/main" % REPO])
 
     def test_a_branch_whose_close_failed_this_run_is_not_deleted_from_under_it(self):
         github = _GitHub(pulls=[agent_pull()], close_errors={1: _http_error(409)}, branches=["platform-agent/fix-the-thing"])

@@ -91,6 +91,8 @@ BOT_LOGIN_SUFFIX = "[bot]"
 #: of its own is not seen here; the reset deletes it whatever it is called.
 #: ``bench/tests/test_github_writes.py`` pins the literal to forge.py's.
 AGENT_BRANCH_PREFIX = "platform-agent/"
+#: The ``ref`` prefix the refs listing returns.
+REFS_HEADS_PREFIX = "refs/heads/"
 
 GITHUB_API_ROOT = "https://api.github.com"
 #: GitHub's page cap, and a bound on pages walked. The listing is read newest
@@ -291,31 +293,26 @@ class GitHubClient:
                 break
         return heads
 
-    def branches_except_default(self, repo: str) -> list[str] | None:
-        """Every branch name but the default's, or None when the credential
-        cannot list branches (``contents: read``)."""
-        status, payload = self.get(f"/repos/{repo}")
+    def branches_under(self, repo: str, prefix: str) -> list[str] | None:
+        """Branch names under ``prefix`` in the repository itself, in one
+        server-side listing, or None when the credential cannot list refs
+        (``contents: read``)."""
+        status, payload = self.get(
+            f"/repos/{repo}/git/matching-refs/heads/{urllib.parse.quote(prefix, safe='/')}"
+        )
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
             return None
-        self._refuse(status, repo, "the repository lookup", "metadata: read")
-        default = str((payload or {}).get("default_branch") or "") if isinstance(payload, dict) else ""
-        names: list[str] = []
-        for page in range(1, MAX_PAGES + 1):
-            status, batch = self.get(f"/repos/{repo}/branches?per_page={PAGE_SIZE}&page={page}")
-            if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
-                return None
-            self._refuse(status, repo, "the branch listing", "contents: read")
-            if not isinstance(batch, list):
-                raise GitHubUnreadable(
-                    f"GitHub answered the branch listing for {repo} with a body that is "
-                    "not a list; this check could not be evaluated"
-                )
-            for branch in batch:
-                name = str((branch or {}).get("name") or "") if isinstance(branch, dict) else ""
-                if name and name != default:
-                    names.append(name)
-            if len(batch) < PAGE_SIZE:
-                break
+        self._refuse(status, repo, "the branch listing", "contents: read")
+        if not isinstance(payload, list):
+            raise GitHubUnreadable(
+                f"GitHub answered the branch listing for {repo} with a body that is "
+                "not a list; this check could not be evaluated"
+            )
+        names = []
+        for ref in payload:
+            name = str((ref or {}).get("ref") or "") if isinstance(ref, dict) else ""
+            if name.startswith(REFS_HEADS_PREFIX + prefix):
+                names.append(name[len(REFS_HEADS_PREFIX) :])
         return names
 
     def branch_tip_date(self, repo: str, branch: str) -> datetime | None:
@@ -403,8 +400,8 @@ def find_writes(
     API carries no push time, so the head's committer date is what there
     is). A branch counts when it is under ``AGENT_BRANCH_PREFIX`` (the one
     mark a branch carries: the agent's commits resolve to no GitHub login),
-    is not the default, heads no pull request at all, and its tip was
-    committed in the window (``tip committed``). Raises
+    heads no pull request at all, and its tip was committed in the window
+    (``tip committed``). Raises
     :class:`GitHubUnreadable` when the pull-request listing cannot be read;
     a branch listing the credential cannot make is a note, not an error.
     """
@@ -444,10 +441,10 @@ def find_writes(
                 url=str(pull.get("html_url") or ""),
             )
         )
-    branches = client.branches_except_default(repo)
+    branches = client.branches_under(repo, AGENT_BRANCH_PREFIX)
     if branches is None:
         report.notes.append(
-            f"branches were not observed: the token cannot list branches on {repo} "
+            f"branches were not observed: the token cannot list refs on {repo} "
             "(needs `contents: read`), so a branch pushed without a pull request would "
             "not be seen"
         )
@@ -460,7 +457,7 @@ def find_writes(
     # pull request from an earlier lease is old, and its branch is not an
     # orphan.
     heads_with_pulls = client.all_pull_heads(repo)
-    orphans = [b for b in branches if b.startswith(AGENT_BRANCH_PREFIX) and b not in heads_with_pulls]
+    orphans = [b for b in branches if b not in heads_with_pulls]
     for branch in orphans[:BRANCH_INSPECTION_CAP]:
         tip = client.branch_tip_date(repo, branch)
         if tip is None:

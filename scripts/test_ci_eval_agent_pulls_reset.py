@@ -225,6 +225,19 @@ class ResetTest(unittest.TestCase):
         self.assertFalse(record["clean"])
         self.assertIn("branch release was not deleted", err)
 
+    def test_the_base_branch_of_a_humans_open_pull_request_stays(self):
+        # GitHub closes a pull request whose base branch is deleted, which
+        # would make the reset close what it promised to keep and then fail
+        # its own read-back on the head branch left behind.
+        github = FakeGitHub(
+            pulls=[dict(pull(9, author="a-human", branch="feature/x"), base={"ref": "release/1.2"})],
+            branches=["feature/x", "release/1.2", "fix-payments-api-oom"],
+        )
+        record, _, _ = run_reset(github)
+        self.assertEqual(sorted(record["kept_branches"]), ["feature/x", "release/1.2"])
+        self.assertEqual(record["deleted"], ["fix-payments-api-oom"])
+        self.assertTrue(record["clean"])
+
     def test_every_branch_but_the_default_goes_whatever_its_name(self):
         github = FakeGitHub(branches=["fix-payments-api-oom", "feature/add-seeded-c", "platform-agent/orphan"], default="main")
         record, _, _ = run_reset(github)

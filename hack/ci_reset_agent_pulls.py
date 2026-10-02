@@ -119,10 +119,8 @@ def is_agent_pull_request(pull: dict, repo: str) -> bool:
     the sweep does, and one App serves the pool, so any App bot that opened a
     pull request in a pool repository is the eval agent (#2133's rule).
     """
-    head = pull.get("head") or {}
-    head_repo = str((head.get("repo") or {}).get("full_name") or "")
     author = str((pull.get("user") or {}).get("login") or "")
-    return author.endswith(BOT_LOGIN_SUFFIX) and head_repo.lower() == repo.lower()
+    return author.endswith(BOT_LOGIN_SUFFIX) and _head_in_repo(pull, repo)
 
 
 def is_audit_pull_request(pull: dict) -> bool:
@@ -195,6 +193,16 @@ def _head_in_repo(pull: dict, repo: str) -> bool:
     return str((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower()
 
 
+def _branches_in_use(pull: dict, repo: str) -> set[str]:
+    """The branches an open pull request that stays still needs here: its head
+    when that is in the repository itself, and its base always (GitHub closes
+    a pull request whose base branch is deleted)."""
+    names = {str((pull.get("base") or {}).get("ref") or "")}
+    if _head_in_repo(pull, repo):
+        names.add(_head_ref(pull))
+    return {name for name in names if name}
+
+
 def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -> dict:
     """What a call reports, before anything is read: the caller writes it on
     every exit, so the reset that faulted is the one with a record too."""
@@ -240,8 +248,7 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
         if pull.get("number") not in agent_numbers:
             record["kept_open"].append(pull.get("number"))
             print(f"  #{pull.get('number', '?')} left open, not the agent's ({_head_ref(pull)})")
-            if _head_in_repo(pull, repo):
-                heads_in_use.add(_head_ref(pull))
+            heads_in_use |= _branches_in_use(pull, repo)
     for pull in agent_pulls:
         number = pull["number"]
         ref = _head_ref(pull)
@@ -261,7 +268,7 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
         except CALL_FAULTS as exc:
             print(f"  #{number} did not close ({describe(exc)})", file=sys.stderr)
             record["unclosed"].append(number)
-            heads_in_use.add(ref)
+            heads_in_use |= _branches_in_use(pull, repo)
             continue
         record["closed"].append(number)
     default = default_branch(repo, token)
@@ -293,7 +300,9 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
     # what the unit's agent would find.
     after_pulls = open_pulls(repo, token)
     still_agent = [pull["number"] for pull in after_pulls if is_agent_pull_request(pull, repo)]
-    heads_after = {_head_ref(pull) for pull in after_pulls if _head_in_repo(pull, repo)}
+    heads_after: set[str] = set()
+    for pull in after_pulls:
+        heads_after |= _branches_in_use(pull, repo)
     still_branches = [name for name in branches(repo, token) if name != default and name not in heads_after]
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)

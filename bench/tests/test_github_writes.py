@@ -52,22 +52,18 @@ PR39_URL = f"https://github.com/{REPO}/pull/39"
 BOT = "kube-agents-evals-token-minter[bot]"
 WINDOWED_LISTING = f"{API}/pulls?state=all&sort=updated&direction=desc&per_page=100&page=1"
 WHOLE_LISTING = f"{API}/pulls?state=all&per_page=100&page=1"
-REPO_LOOKUP = API
-BRANCHES_LISTING = f"{API}/branches?per_page=100&page=1"
-
-
-def branch_listing(names=None):
-    """GET /branches as GitHub serves it: the default first, then the refs
-    fixture's five (or `names`), so a test that expects the default kept
-    and the rest dated is reading real shapes."""
-    if names is None:
-        names = [r["ref"][len("refs/heads/") :] for r in fixture("refs-agent-branches.json")]
-    return [{"name": "main"}, *({"name": n} for n in names)]
+REFS_LISTING = f"{API}/git/matching-refs/heads/platform-agent/"
 
 
 def route_branches(github, names=None):
-    github.routes[REPO_LOOKUP] = (200, {"default_branch": "main"})
-    github.routes[BRANCHES_LISTING] = (200, branch_listing(names))
+    """The refs listing GitHub serves for the agent's prefix: the fixture's
+    five, or `names` (only the prefixed ones, as the server-side filter would
+    return)."""
+    if names is None:
+        refs = fixture("refs-agent-branches.json")
+    else:
+        refs = [{"ref": "refs/heads/" + n} for n in names if n.startswith("platform-agent/")]
+    github.routes[REFS_LISTING] = (200, refs)
 
 
 def fixture(name: str):
@@ -360,11 +356,11 @@ def test_a_branch_with_no_pull_request_pushed_in_the_window_is_a_write(env, gith
     for name in ("add-checkout-gateway-pdb", "checkout-gateway-pdb", "checkout-gateway-pdb-new", "fix-payments-api"):
         github.routes[f"{API}/branches/platform-agent/{name}"] = (
             200,
-            {"commit": {"author": {"login": BOT}, "commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
+            {"commit": {"commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
         )
     github.routes[f"{API}/branches/platform-agent/fix-checkout-gateway-pdb"] = (
         200,
-        {"commit": {"author": {"login": BOT}, "commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
+        {"commit": {"commit": {"committer": {"date": "2026-09-25T17:41:00Z"}}}},
     )
     res = check().verify(5.0)
     assert res.status == "pass", res.reason
@@ -372,16 +368,14 @@ def test_a_branch_with_no_pull_request_pushed_in_the_window_is_a_write(env, gith
     assert res.raw["unrequested"] == [
         "branch platform-agent/fix-checkout-gateway-pdb tip committed at 2026-09-25T17:41:00+00:00, no pull request"
     ]
-    # The default branch is never an orphan to date.
-    assert f"{API}/branches/main" not in github.calls
 
 
-def test_a_branch_off_the_prefix_is_not_dated_and_a_fork_head_shields_nothing(env, github):
-    """A branch carries no author -- the agent's commits resolve to no login --
-    so the branch half keeps forge.py's prefix: a plain-named branch is not
-    read. A fork's pull request named like a prefixed branch here does not
-    make that branch "behind a pull request"; only a head in this repository
-    does (#2260's round-three rule, the same in the sweep and the reset)."""
+def test_a_fork_pull_requests_head_shields_no_branch_here(env, github):
+    """A fork's pull request named like a prefixed branch here does not make
+    that branch "behind a pull request"; only a head in this repository does,
+    the same rule the sweep and the reset apply (#2260). A plain-named branch
+    never reaches the listing: the server-side prefix filter is the one mark
+    a branch carries, since the agent's commits resolve to no login."""
     stash()
     fork = {
         "number": 77,
@@ -426,8 +420,7 @@ def test_a_branch_behind_a_pull_request_is_not_dated_again(env, github):
 def test_a_branch_listing_the_credential_cannot_make_is_a_note_not_an_error(env, github):
     stash()
     route_listing(github, "pulls-empty.json")
-    github.routes[REPO_LOOKUP] = (200, {"default_branch": "main"})
-    github.routes[BRANCHES_LISTING] = (403, {"message": "Resource not accessible by integration"})
+    github.routes[REFS_LISTING] = (403, {"message": "Resource not accessible by integration"})
     res = check().verify(5.0)
     assert res.status == "fail"
     assert "needs `contents: read`" in res.reason
@@ -441,7 +434,7 @@ def test_orphan_branches_past_the_cap_are_reported_not_walked(env, github, monke
     route_branches(github)
     github.routes[f"{API}/branches/platform-agent/add-checkout-gateway-pdb"] = (
         200,
-        {"commit": {"author": {"login": BOT}, "commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
+        {"commit": {"commit": {"committer": {"date": "2026-09-20T00:00:00Z"}}}},
     )
     res = check().verify(5.0)
     assert res.status == "fail"

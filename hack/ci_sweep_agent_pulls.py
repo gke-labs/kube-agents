@@ -545,11 +545,14 @@ def close_agent_pulls(repo, authorization, bot_login, dry_run=False, budget=None
         deferred = set()
         for pull in pulls:
             if not is_agent_pull_request(pull, repo, bot_login):
-                # Only a head in this repository keeps a branch here: a fork's
-                # head shares a name with nothing the branch pass could reach.
+                # Only a head in this repository keeps a branch here (a fork's
+                # head shares a name with nothing the branch pass could reach),
+                # and the base always: GitHub closes a pull request whose base
+                # branch is deleted.
                 head = pull.get("head") or {}
                 if str((head.get("repo") or {}).get("full_name") or "").lower() == repo.lower():
                     still_open.add(str(head.get("ref") or ""))
+                still_open.add(str((pull.get("base") or {}).get("ref") or ""))
                 continue
             number = pull["number"]
             ref = pull["head"]["ref"]

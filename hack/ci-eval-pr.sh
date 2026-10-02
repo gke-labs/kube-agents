@@ -3024,7 +3024,8 @@ launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before e
     done
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
-    # in the second phase the pause is the write-settle instead.
+    # in the second phase the pause is the lane's writer pause instead (the
+    # settle on the inject lane, this stagger on the api lane).
     sleep "${pause}"
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
