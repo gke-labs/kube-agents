@@ -572,7 +572,8 @@ class PlanTest(_RuntimeCase):
     def test_a_terminal_event_never_creates_a_row(self):
         adapter = _Adapter()
         _run(runtime.settle_row(adapter, _sub(), "completed"))
-        self.assertEqual(adapter.calls, [])
+        self.assertEqual(self._kinds(adapter), ["setStatus"], "no plan posted, only the session cleared")
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
 
     def test_a_kind_that_moves_nothing_leaves_the_row(self):
         adapter = _Adapter()
@@ -726,6 +727,32 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "block_loop_detected"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
         self.assertIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_settle_after_a_restart_clears_the_working_status_once(self):
+        # setUp's reload is the restart: Slack still shows the Working… the old process set.
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.calls, [("setStatus", "closed")])
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        self.assertEqual(adapter.calls, [("setStatus", "closed")], "sent once")
+
+    def test_a_wait_after_a_restart_suspends_and_its_answer_settles(self):
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_a_restart_leaves_running_and_retried_cards_alone(self):
+        adapter = _Adapter()
+        for kind in ("crashed", "timed_out", "unblocked", "heartbeat", "commented"):
+            _run(runtime.settle_row(adapter, _sub(), kind))
+        self.assertEqual(adapter.calls, [])
+
+    def test_a_settle_after_a_restart_leaves_a_running_turn_working(self):
+        adapter = _Adapter()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["processing"])
 
     def test_archiving_a_card_whose_plan_never_posted_frees_the_thread(self):
         adapter = _Adapter(_Client(fail={"post"}))

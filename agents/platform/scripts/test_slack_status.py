@@ -113,6 +113,16 @@ class PlanTest(unittest.TestCase):
         rows = [_row(lines=["a", "b"]), _row("t_b", "check seeded-b", status=s.TASK_ERROR)]
         self.assertEqual(s.plan_text("is it up?", rows), "is it up?\n◌ check payments · b\n✗ check seeded-b")
 
+    def test_text_escapes_slack_markup(self):
+        # The text field is parsed: an unescaped "<!here>" broadcasts and a "<url|label>" relabels a link.
+        rows = [_row(title="R&D: roll back", lines=["see <!here> <https://evil.example|docs>"])]
+        self.assertEqual(
+            s.plan_text(None, rows),
+            "R&amp;D: roll back\n◌ R&amp;D: roll back · see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
+        )
+        blocks = s.plan_blocks(None, rows)
+        self.assertEqual(blocks[0]["title"], "R&D: roll back", "blocks carry rich text, which Slack does not parse")
+
 
 class SessionTest(unittest.TestCase):
     def test_status(self):
