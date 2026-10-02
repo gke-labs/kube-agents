@@ -336,13 +336,14 @@ type Config struct {
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when the inject side door is the only way in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) is the only way
+// in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //
-// The door is deliberately not one of the answers. It can be armed beside
-// any one backend, so "which backend is this gateway" and "is the door open"
-// are two questions, and collapsing them is what would make the door
+// The doors are deliberately not among the answers. Either can be armed
+// beside any one backend, so "which backend is this gateway" and "is a door
+// open" are two questions, and collapsing them is what would make a door
 // exclusive again.
 func (c *Config) Backend() string {
 	switch {

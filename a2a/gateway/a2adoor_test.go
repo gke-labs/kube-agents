@@ -84,7 +84,6 @@ func startA2ARigWith(t *testing.T, stack func(*A2ADoor) Adapter) *a2aRig {
 	door, err := NewA2ADoor(ln.Addr().String(), a2aTestToken, A2ADoorOptions{
 		PublicURL:        a2aTestPublicURL,
 		DefaultAddressee: "platform",
-		FirstEventGrace:  a2aTestGrace,
 	})
 	if err != nil {
 		t.Fatalf("NewA2ADoor: %v", err)
@@ -469,6 +468,116 @@ func TestA2AConversationTaskLogIsBounded(t *testing.T) {
 	}
 }
 
+// TestA2ALiveConversationsAgeOutOfTheCapExemption: a conversation whose
+// active task never terminates (an addressee with no executor) is exempt
+// from eviction only until the gateway's task deadline; past it the record
+// is idle and the cap holds, so a caller minting fresh contextIds cannot
+// grow the door without bound.
+func TestA2ALiveConversationsAgeOutOfTheCapExemption(t *testing.T) {
+	d := bareDoor(t)
+	d.taskDeadline = time.Minute
+	stale := a2aConversationKey(a2aTestCaller, "stale")
+	fresh := a2aConversationKey(a2aTestCaller, "fresh")
+	d.TaskStarted(stale, "task-stale")
+	d.TaskStarted(fresh, "task-fresh")
+	d.mu.Lock()
+	d.tasks["task-stale"].created = time.Now().Add(-2 * time.Minute)
+	freshConv := d.conversations[fresh]
+	for i := 0; i < a2aMaxConversations+8; i++ {
+		d.conversationLocked(a2aConversationKey(a2aTestCaller, fmt.Sprintf("n-%d", i)))
+	}
+	_, staleKept := d.conversations[stale]
+	freshKept := d.conversations[fresh] == freshConv
+	n := len(d.conversations)
+	d.mu.Unlock()
+	if staleKept {
+		t.Error("a conversation whose active task is past the task deadline survived the cap")
+	}
+	if !freshKept {
+		t.Error("a conversation with a fresh active task was evicted")
+	}
+	if n != a2aMaxConversations {
+		t.Errorf("%d conversations held, want the cap %d", n, a2aMaxConversations)
+	}
+	// And an active task that fell off the task cap no longer pins its
+	// conversation either.
+	d.mu.Lock()
+	delete(d.tasks, "task-fresh")
+	live := d.liveLocked(freshConv)
+	d.mu.Unlock()
+	if live {
+		t.Error("a conversation whose active task is no longer held counts as live")
+	}
+}
+
+// TestA2AResultArtifactBoundIsMarked: a deliverable past a2aMaxResultBytes
+// is cut and the Task says so; one under it is kept whole, bytes for bytes.
+func TestA2AResultArtifactBoundIsMarked(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "big")
+	d.TaskStarted(key, "task-big")
+	big := strings.Repeat("x", a2aMaxResultBytes+10)
+	d.TaskDelivered(key, "task-big", big)
+	d.TaskTerminal(key, "task-big", lib.StateCompleted, TerminalFromExecutor, "")
+	obj := d.taskObject("task-big")
+	if got := obj.Metadata["resultTruncatedFrom"]; got != len(big) {
+		t.Errorf("resultTruncatedFrom = %v, want %d", got, len(big))
+	}
+	if len(obj.Artifacts) != 1 || len(joinTextParts(obj.Artifacts[0].Parts)) > a2aMaxResultBytes+len("…") {
+		t.Errorf("the cut artifact is not bounded: %d artifacts", len(obj.Artifacts))
+	}
+	d.TaskStarted(key, "task-100k")
+	whole := strings.Repeat("y", 100*1024)
+	d.TaskDelivered(key, "task-100k", whole)
+	d.TaskTerminal(key, "task-100k", lib.StateCompleted, TerminalFromExecutor, "")
+	obj = d.taskObject("task-100k")
+	if _, cut := obj.Metadata["resultTruncatedFrom"]; cut || len(obj.Artifacts) != 1 || joinTextParts(obj.Artifacts[0].Parts) != whole {
+		t.Errorf("a 100 KiB deliverable was not kept whole (cut=%v)", cut)
+	}
+}
+
+// TestA2ASecondClaimDoesNotWipeTheFirstTurnsReply: the first waiter reads
+// the posts past the offset it saw at its claim, so a second claim that
+// wins the wakeup race cannot erase the reply before it is read.
+func TestA2ASecondClaimDoesNotWipeTheFirstTurnsReply(t *testing.T) {
+	d := bareDoor(t)
+	key := a2aConversationKey(a2aTestCaller, "ctx-1")
+	user := lib.Message{Role: a2aRoleUser, Parts: textParts("status?"), MessageID: "m-1", ContextID: "ctx-1"}
+	prior1, ok := d.claimTurn(context.Background(), key, a2aTestCaller, "ctx-1", user, time.Now().Add(a2aSubmitWait))
+	if !ok {
+		t.Fatal("claim 1")
+	}
+	if _, err := d.Post(key, "✏️ steering sent"); err != nil {
+		t.Fatal(err)
+	}
+	d.TurnFinished(key)
+	// The second claim lands before the first waiter runs.
+	if _, ok := d.claimTurn(context.Background(), key, a2aTestCaller, "ctx-1", user, time.Now().Add(a2aSubmitWait)); !ok {
+		t.Fatal("claim 2")
+	}
+	taskID, reply, rerr := d.awaitTurn(context.Background(), key, prior1, time.Now().Add(time.Second))
+	if rerr != nil || taskID != "" || reply == nil || !strings.Contains(joinTextParts(reply.Parts), "steering sent") {
+		t.Fatalf("the first waiter got task=%q reply=%+v err=%+v, want its own turn's post", taskID, reply, rerr)
+	}
+}
+
+// TestA2ATextPartWithAFilePayloadIsRefused: a kind: text part carrying a
+// file or data member is refused like a file part, not accepted with the
+// payload dropped from the turn and kept in history.
+func TestA2ATextPartWithAFilePayloadIsRefused(t *testing.T) {
+	r := startA2ARig(t)
+	params := sendParams("hi", "m-1", "", false)
+	params["message"].(map[string]any)["parts"] = []map[string]any{{"kind": "text", "text": "hi", "file": map[string]any{"bytes": "QUJD"}}}
+	resp := r.rpc(t, a2aTestCaller, a2aMethodSend, params)
+	if resp.Error == nil || resp.Error.Code != a2aErrContentTypeNotSupp {
+		t.Fatalf("a text part with a file member was not refused: %+v", resp)
+	}
+	params["message"].(map[string]any)["parts"] = []map[string]any{{"kind": "text", "text": "hi", "data": map[string]any{"k": "v"}}}
+	if resp := r.rpc(t, a2aTestCaller, a2aMethodSend, params); resp.Error == nil || resp.Error.Code != a2aErrContentTypeNotSupp {
+		t.Fatalf("a text part with a data member was not refused: %+v", resp)
+	}
+}
+
 // TestA2ACardIsServedWithoutAToken: discovery reads the card before it knows
 // which scheme to present, so the card is the one unauthenticated route, and
 // it says the endpoint wants a bearer token.
@@ -727,6 +836,14 @@ func TestA2ACancelPublishesAKindCancel(t *testing.T) {
 	}
 	if len(cancelEnv.Authority) == 0 {
 		t.Error("the cancel carries no authority block")
+	}
+	// A retry by the owner (a lost response, a client timeout) is answered
+	// with the task, not -32002: the cancel is on the bus already.
+	again := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID})
+	if again.Error != nil {
+		t.Errorf("a retried cancel was refused: %d %s", again.Error.Code, again.Error.Message)
+	} else if taskOf(t, again).ID != task.ID {
+		t.Errorf("the retried cancel answered with another task")
 	}
 	// Another caller cannot cancel it.
 	other := r.rpc(t, a2aTestOtherCaller, a2aMethodCancel, map[string]any{"id": task.ID})

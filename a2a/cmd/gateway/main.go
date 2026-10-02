@@ -168,7 +168,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		door, err := gateway.NewA2ADoor(cfg.A2ADoorListen, cfg.A2ADoorToken, gateway.A2ADoorOptions{
 			PublicURL:        cfg.A2ADoorPublicURL,
 			DefaultAddressee: cfg.DefaultAddressee,
-			FirstEventGrace:  cfg.FirstEventGrace,
+			TaskDeadline:     cfg.TaskDeadline,
 			Logger:           log,
 		})
 		if err != nil {

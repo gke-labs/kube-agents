@@ -92,15 +92,19 @@ const (
 	a2aMaxTextRunes      = injectMaxTextRunes
 	a2aMaxBodyBytes      = injectMaxBodyBytes
 
-	// Bounds on what the door remembers. Tasks and conversations evict
-	// oldest-first; a client that wants a task after eviction is told it is
+	// Bounds on what the door remembers. Tasks evict oldest-first;
+	// conversations evict the oldest idle one (see conversationLocked); a client that wants a task after eviction is told it is
 	// not found, which is the protocol's own answer for a task the server
 	// no longer holds.
 	a2aMaxTasks         = 4096
 	a2aMaxConversations = 1024
-	a2aMaxPostsPerTask  = 256
-	a2aMaxTurnPosts     = 64
-	a2aMaxSubmissions   = injectSeenCap
+	// a2aMaxResultBytes bounds the artifact the door keeps. A longer
+	// deliverable is cut at a rune boundary and the Task says so in
+	// metadata.resultTruncatedFrom; history still carries the chunks whole.
+	a2aMaxResultBytes  = 4 << 20
+	a2aMaxPostsPerTask = 256
+	a2aMaxTurnPosts    = 64
+	a2aMaxSubmissions  = injectSeenCap
 
 	// a2aSubmitWait bounds how long message/send waits for the gateway to
 	// say what it did with the message - the same bound as the inject door,
@@ -151,8 +155,14 @@ type a2aTask struct {
 	// it arrived, so an empty result is distinguishable from none.
 	result    string
 	delivered bool
-	created   time.Time
-	updated   time.Time
+	// resultCutFrom is the deliverable's length when it exceeded
+	// a2aMaxResultBytes; zero when it was kept whole.
+	resultCutFrom int
+	// cancelPublished: a cancel for this task reached the bus, so a retried
+	// tasks/cancel is answered with the task, not refused.
+	cancelPublished bool
+	created         time.Time
+	updated         time.Time
 }
 
 // a2aConversation is one caller's context: the turn accounting message/send
@@ -179,13 +189,14 @@ type a2aConversation struct {
 	// is told when its position was evicted past.
 	active *a2aTask
 	tasks  injectIDLog
-	// turnPosts is every post the gateway made during the turn in flight,
-	// whatever task it was filed under, reset when a turn is claimed. It is
+	// turnPosts is every post the gateway made while a turn was in flight,
+	// whatever task it was filed under, as an append-only log read from an
+	// offset (the next claim cannot wipe a reply its waiter has not read). It is
 	// what a turn that started no task answers with: a steer's
 	// acknowledgement, a status answer, a cancel's notice, a refusal. Posts
 	// under a running task are also that task's, so a follow-up on it is
 	// answered from here while the task keeps them in its history.
-	turnPosts []a2aPost
+	turnPosts a2aPostLog
 	// pending is the inbound message of the turn in flight, which
 	// TaskStarted copies onto the task it mints.
 	pending lib.Message
@@ -194,7 +205,33 @@ type a2aConversation struct {
 // a2aPrior is a conversation's counters read before a turn is handed over,
 // so the wait for its answer cannot mistake an earlier turn's for it.
 type a2aPrior struct {
-	turns, drops, cancels, tasks int
+	turns, drops, cancels, tasks, posts int
+}
+
+// a2aPostLog is the turn posts' append-only log, injectIDLog's shape.
+type a2aPostLog struct {
+	posts []a2aPost
+	total int
+}
+
+func (l *a2aPostLog) add(p a2aPost) {
+	l.posts = append(l.posts, p)
+	l.total++
+	if len(l.posts) > a2aMaxTurnPosts {
+		l.posts = l.posts[len(l.posts)-a2aMaxTurnPosts:]
+	}
+}
+
+// since returns the posts past offset and whether some were evicted.
+func (l *a2aPostLog) since(offset int) ([]a2aPost, bool) {
+	if l.total <= offset {
+		return nil, false
+	}
+	idx := offset - (l.total - len(l.posts))
+	if idx < 0 {
+		return l.posts, true
+	}
+	return l.posts[idx:], false
 }
 
 // a2aOutcome is what a submission resolved to, kept by caller and message id
@@ -215,8 +252,11 @@ type A2ADoor struct {
 	agentName        string
 	agentVersion     string
 	defaultAddressee string
-	firstEventGrace  time.Duration
-	log              *slog.Logger
+	// taskDeadline is the gateway's own; a conversation whose active task
+	// is older than it no longer counts as live for the cap (see
+	// conversationLocked).
+	taskDeadline time.Duration
+	log          *slog.Logger
 
 	mu            sync.Mutex
 	conversations map[string]*a2aConversation
@@ -258,9 +298,10 @@ type A2ADoorOptions struct {
 	// AgentName and AgentVersion are the card's; empty takes defaults.
 	AgentName    string
 	AgentVersion string
-	// FirstEventGrace is the gateway's, reported to callers.
-	FirstEventGrace time.Duration
-	Logger          *slog.Logger
+	// TaskDeadline is the gateway's task deadline (A2A_TASK_DEADLINE_SECONDS);
+	// zero takes the config default. See A2ADoor.taskDeadline.
+	TaskDeadline time.Duration
+	Logger       *slog.Logger
 }
 
 // NewA2ADoor builds the door. The token is required here as well as in
@@ -271,7 +312,7 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		return nil, fmt.Errorf("the A2A door needs a listen address")
 	}
 	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("the A2A door needs a bearer token: it authenticates every request, and the NetworkPolicy in front of it does not govern the port-forward path")
+		return nil, fmt.Errorf("the A2A door needs a bearer token: it authenticates every RPC request (the agent card is the one unauthenticated route), and the NetworkPolicy in front of it does not govern the port-forward path")
 	}
 	log := o.Logger
 	if log == nil {
@@ -289,6 +330,10 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 	if version == "" {
 		version = "0.1.0"
 	}
+	deadline := o.TaskDeadline
+	if deadline <= 0 {
+		deadline = defaultTaskDeadline
+	}
 	return &A2ADoor{
 		listen:           listen,
 		token:            token,
@@ -296,7 +341,7 @@ func NewA2ADoor(listen, token string, o A2ADoorOptions) (*A2ADoor, error) {
 		agentName:        name,
 		agentVersion:     version,
 		defaultAddressee: o.DefaultAddressee,
-		firstEventGrace:  o.FirstEventGrace,
+		taskDeadline:     deadline,
 		log:              log,
 		conversations:    map[string]*a2aConversation{},
 		tasks:            map[string]*a2aTask{},
@@ -584,7 +629,7 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 			&rpcError{Code: rpcInternalError, Message: "the first message/send with this messageId aborted before its turn answered"})
 	}
 
-	user := lib.Message{Role: a2aRoleUser, Parts: msg.Parts, MessageID: messageID, ContextID: contextID, TaskID: msg.TaskID}
+	user := lib.Message{Role: a2aRoleUser, Parts: textParts(text), MessageID: messageID, ContextID: contextID, TaskID: msg.TaskID}
 	deadline := time.Now().Add(a2aSubmitWait)
 	prior, ok := d.claimTurn(turnCtx, key, caller, contextID, user, deadline)
 	if !ok {
@@ -604,8 +649,15 @@ func (d *A2ADoor) send(r *http.Request, handler func(InboundMessage), req rpcReq
 	taskID, reply, rerr := d.awaitTurn(turnCtx, key, prior, deadline)
 	d.completeOutcome(outcome, taskID, reply, rerr)
 	if rerr != nil {
-		d.log.Info("a2a: the door started nothing for a message/send",
-			"conversation", key, "messageId", messageID, "code", rerr.Code, "note", rerr.Message)
+		if r.Context().Err() != nil {
+			// Handed over, then the client left: the turn runs on and may
+			// start a task nobody is watching, which is not "nothing".
+			d.log.Info("a2a: the caller went away before the turn answered; the turn runs on",
+				"conversation", key, "messageId", messageID)
+		} else {
+			d.log.Info("a2a: the door started nothing for a message/send",
+				"conversation", key, "messageId", messageID, "code", rerr.Code, "note", rerr.Message)
+		}
 		return rpcFail(req.ID, rerr.Code, rerr.Message, nil)
 	}
 	if taskID == "" {
@@ -689,6 +741,11 @@ func (d *A2ADoor) cancel(r *http.Request, handler func(InboundMessage), req rpcR
 	if task.terminal {
 		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)
 	}
+	if task.cancelPublished {
+		// A retry (a lost response, a client timeout during the claim):
+		// the cancel is on the bus already, which is what this call asks.
+		return rpcOK(req.ID, d.taskObject(params.ID))
+	}
 	key, contextID := task.key, task.contextID
 	messageID := a2aInboundIDPrefix + randHex(messageIDHexWidth)
 	user := lib.Message{Role: a2aRoleUser, Parts: textParts("stop"), MessageID: messageID, ContextID: contextID, TaskID: params.ID}
@@ -745,8 +802,7 @@ func (d *A2ADoor) claimTurn(ctx context.Context, key, caller, contextID string, 
 			}
 			conv.busy = true
 			conv.pending = user
-			conv.turnPosts = nil
-			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: conv.tasks.total}
+			prior := a2aPrior{turns: conv.turns, drops: conv.drops, cancels: conv.cancels, tasks: conv.tasks.total, posts: conv.turnPosts.total}
 			d.mu.Unlock()
 			return prior, true
 		}
@@ -803,8 +859,8 @@ func (d *A2ADoor) awaitTurn(ctx context.Context, key string, prior a2aPrior, dea
 				return "", nil, &rpcError{Code: a2aErrAuthenticationFail,
 					Message: "the door's principal map does not carry this caller; nothing was started"}
 			}
-			if len(conv.turnPosts) > 0 {
-				reply := d.messageObjectLocked(conv, conv.turnPosts)
+			if posts, _ := conv.turnPosts.since(prior.posts); len(posts) > 0 {
+				reply := d.messageObjectLocked(conv, posts)
 				d.mu.Unlock()
 				return "", reply, nil
 			}
@@ -815,6 +871,10 @@ func (d *A2ADoor) awaitTurn(ctx context.Context, key string, prior a2aPrior, dea
 		wait := d.notify
 		d.mu.Unlock()
 		if !d.sleep(ctx, wait, deadline) {
+			if ctx.Err() != nil {
+				return "", nil, &rpcError{Code: rpcInternalError,
+					Message: "the caller went away before the turn answered; the turn runs on"}
+			}
 			return "", nil, &rpcError{Code: rpcInternalError,
 				Message: fmt.Sprintf("the gateway did nothing this door could see inside %s", a2aSubmitWait)}
 		}
@@ -833,8 +893,8 @@ func (d *A2ADoor) awaitCancel(ctx context.Context, key string, prior a2aPrior, d
 		}
 		if conv.turns > prior.turns {
 			note := "the turn ended without a cancel reaching the bus"
-			if len(conv.turnPosts) > 0 {
-				note += ": " + conv.turnPosts[len(conv.turnPosts)-1].text
+			if posts, _ := conv.turnPosts.since(prior.posts); len(posts) > 0 {
+				note += ": " + posts[len(posts)-1].text
 			}
 			d.mu.Unlock()
 			return false, note
@@ -920,20 +980,19 @@ func (d *A2ADoor) conversationLocked(key string) *a2aConversation {
 		return conv
 	}
 	if len(d.convOrder) >= a2aMaxConversations {
-		// Evict the oldest IDLE conversation: one with no turn in flight
-		// and no task the relay is posting under. A live one evicted here
-		// would be re-minted with zeroed counters on the next touch, and a
-		// waiter that read its counts before the eviction would classify
-		// from the new incarnation as though nothing had moved, the
-		// one-turn guard would admit a second message, and the relay's
-		// posts would find no task to attach to. Live conversations are
-		// bounded by the turns and tasks in flight, which the gateway caps
-		// itself (A2A_MAX_SESSIONS, the per-conversation serial queue), so
-		// when every record is live the cap is left behind rather than
-		// broken.
+		// Evict the oldest IDLE conversation (liveLocked says which are
+		// not). A live one evicted here would be re-minted with zeroed
+		// counters on the next touch: a waiter that read its counts before
+		// the eviction would classify from the new incarnation as though
+		// nothing had moved, the one-turn guard would admit a second
+		// message, and the relay's posts would find no task to attach to.
+		// Live is bounded: a turn ends inside turnTimeout, and an active
+		// task counts only until the gateway's task deadline, so the live
+		// set is at most the arrival rate over one deadline, after which
+		// the cap holds again.
 		for i, candidate := range d.convOrder {
 			old := d.conversations[candidate]
-			if old != nil && (old.busy || old.active != nil) {
+			if old != nil && d.liveLocked(old) {
 				continue
 			}
 			d.convOrder = append(d.convOrder[:i], d.convOrder[i+1:]...)
@@ -948,6 +1007,27 @@ func (d *A2ADoor) conversationLocked(key string) *a2aConversation {
 	d.conversations[key] = conv
 	d.convOrder = append(d.convOrder, key)
 	return conv
+}
+
+// liveLocked reports whether a conversation is exempt from eviction: a turn
+// in flight, or an active task the door still holds that is younger than
+// the gateway's task deadline. A task the relay never terminated (an
+// addressee with no executor) ages out of that exemption rather than
+// pinning its conversation for the life of the process; one that fell off
+// the task cap is let go at once. Caller holds d.mu.
+func (d *A2ADoor) liveLocked(conv *a2aConversation) bool {
+	if conv.busy {
+		return true
+	}
+	task := conv.active
+	if task == nil {
+		return false
+	}
+	if d.tasks[task.id] != task || time.Since(task.created) > d.taskDeadline {
+		conv.active = nil
+		return false
+	}
+	return true
 }
 
 func (d *A2ADoor) noteDirectLocked(caller, key string) {
@@ -994,10 +1074,7 @@ func (d *A2ADoor) Post(conversation, text string) (string, error) {
 		task.updated = time.Now()
 	}
 	if conv.busy {
-		conv.turnPosts = append(conv.turnPosts, post)
-		if len(conv.turnPosts) > a2aMaxTurnPosts {
-			conv.turnPosts = conv.turnPosts[1:]
-		}
+		conv.turnPosts.add(post)
 	}
 	d.wakeLocked()
 	return id, nil
@@ -1130,7 +1207,11 @@ func (d *A2ADoor) TaskDelivered(conversation, taskID, result string) {
 		d.tasks[taskID] = task
 		d.taskOrder = append(d.taskOrder, taskID)
 	}
-	task.result = truncateRunes(result, injectMaxEntryBytes)
+	if len(result) > a2aMaxResultBytes {
+		task.resultCutFrom = len(result)
+		result = truncateRunes(result, a2aMaxResultBytes)
+	}
+	task.result = result
 	task.delivered = true
 	task.updated = time.Now()
 	d.wakeLocked()
@@ -1141,6 +1222,9 @@ func (d *A2ADoor) CancelPublished(conversation, taskID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.conversationLocked(conversation).cancels++
+	if task, ok := d.tasks[taskID]; ok {
+		task.cancelPublished = true
+	}
 	d.wakeLocked()
 }
 
@@ -1209,6 +1293,9 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: textParts(task.result)}}
 	}
 	metadata := map[string]any{"backend": a2aBackend}
+	if task.resultCutFrom > 0 {
+		metadata["resultTruncatedFrom"] = task.resultCutFrom
+	}
 	if task.terminal {
 		metadata["terminalSource"] = string(task.source)
 	}

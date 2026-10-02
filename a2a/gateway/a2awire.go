@@ -10,8 +10,9 @@ import (
 // protocol puts on it, and the agent card. Only the fields the door reads or
 // writes are modelled. Below `payload` the bus already speaks standard A2A
 // (spec-a2a-payloads.md's layering rule), which is why the door can reuse
-// lib.Message, lib.Part, lib.Artifact and lib.TaskStatus as they are and
-// needs only the request/response envelopes, the Task object, and the card.
+// lib.Part and lib.Artifact as they are; Message and TaskStatus get door-side
+// twins below that add the binding's kind discriminator, and the door needs
+// only those, the request/response envelopes, the Task object, and the card.
 
 const (
 	// a2aProtocolVersion is the A2A protocol version the card advertises.
@@ -207,11 +208,13 @@ type a2aScheme struct {
 
 // textOf joins the text parts of a message, which is all the gateway routes
 // on: a data or file part has no home on a chat turn and is refused at the
-// door rather than silently dropped.
+// door rather than silently dropped. A text part carrying a data or file
+// member is refused the same way: nothing but text reaches the bus, so
+// accepting it would retain and echo a payload that was never delivered.
 func textOf(parts []lib.Part) (string, bool) {
 	text := ""
 	for _, p := range parts {
-		if p.Kind != a2aPartKindText {
+		if p.Kind != a2aPartKindText || len(p.Data) > 0 || p.File != nil {
 			return "", false
 		}
 		if text != "" && p.Text != "" {

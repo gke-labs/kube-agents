@@ -1222,8 +1222,10 @@ on a terminal that carries one. Every other post under the task is an agent mess
 the task's one artifact, named `result` as the bus names it, is the deliverable the relay hands
 the door whole before it posts it in chat-sized chunks (`DeliverableObserver`; the heal path
 hands over the artifact the stream carries), so the chunks stay history and the artifact is
-never inferred from a post's position. A completed task the relay handed nothing for (a
-non-text result) renders no artifact. `metadata.terminalSource` carries whose word the terminal
+never inferred from a post's position. The door keeps up to 4 MiB of it; a longer deliverable
+is cut at a rune boundary and `metadata.resultTruncatedFrom` carries the original length, so a
+client can fall back to `history`, which carries the chunks whole. A completed task the relay
+handed nothing for (a non-text result) renders no artifact. `metadata.terminalSource` carries whose word the terminal
 is, for the reason the inject door's read route carries it. A2A clients read exactly `status`,
 `artifacts` and `history`, so nothing here is invented for them. Not mapped yet: an executor's
 non-final `input-required` reaches `history` as the relay's ask line, not `status.state`, which
