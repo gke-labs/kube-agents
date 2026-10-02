@@ -4792,7 +4792,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Seven reads answer it instead of twenty-three:
+	// cost for a no-op. Eight reads answer it instead of twenty-three:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
 	//     earlier pass ran to completion rather than dying partway,
@@ -4833,7 +4833,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first five are Owns kinds and free; the two Secret reads
+	// property. The first six are Owns kinds and free; the two Secret reads
 	// are uncached and happen only when the free six all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
