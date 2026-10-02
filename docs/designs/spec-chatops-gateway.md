@@ -318,7 +318,9 @@ long-lived sessions. Four operations:
 
 **Spawn.** First message in a conversation creates the pod: the demo's reference worker
 shape (no ambient k8s credentials, scratch on emptyDir, 250m/512Mi requests; egress
-fenced (8/31) to DNS, the bus, and LiteLLM - the deployment spec owns the policy),
+fenced (8/31) to DNS, the bus, and LiteLLM, except, under the operator's
+`A2A_SESSION_CLUSTER_VIEW` flag, the credential broker (`spec-mode-switch.md`) - the
+deployment spec owns the policy),
 running the headless harness behind a thin shim that bridges bus envelopes to the CLI's
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
 the install's own LiteLLM, in-namespace, with no _cloud_ credential at all - the spawned
