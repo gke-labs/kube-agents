@@ -585,7 +585,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     (a leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
     skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe,
     a substitution and a backtick stay. A pattern reads the rendering, so a
-    command chained behind another is not on any line it sees.
+    command chained behind another is not on any line it sees. The command
+    as typed is on the trajectory already, tagged with the worker's profile
+    (:mod:`kube_agents_bench.worker_trajectory` reads each worker session's
+    tool calls after the log scrape; ``tool_called`` grades them); reading
+    the ``terminal`` calls from there instead of the card log is the change
+    that closes the gap, and this verifier does not make it yet.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
