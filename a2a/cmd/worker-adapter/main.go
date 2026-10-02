@@ -67,11 +67,12 @@ const (
 	// read-only gate, and the prompt tells the model what the fence is so a
 	// refusal is reported rather than retried.
 	envClusterView          = "A2A_CLUSTER_VIEW"
-	clusterViewAllowedTools = defaultAllowedTools + ",Bash"
+	clusterViewAllowedTools = defaultAllowedTools + ",Bash(kubectl:*),Bash(gcloud:*)"
 	defaultDisallowedTools  = "Bash,Edit,NotebookEdit"
 	clusterViewDisallowed   = "Edit,NotebookEdit"
 	clusterViewPrompt       = "You have read-only `kubectl` and `gcloud` on PATH. They run through a credential broker " +
-		"that permits read verbs only: inspect and report, never change anything. A refused command prints " +
+		"that permits read verbs only: inspect and report, never change anything. Bash may run only kubectl and gcloud " +
+		"commands, one per call, with no pipes or other programs; read the output yourself. A refused command prints " +
 		"`policy rule: <rule>` on stderr; report the refusal instead of retrying or working around it."
 
 	// defaultModelBaseURL is the install's inference gateway. defaultModelAPIKey

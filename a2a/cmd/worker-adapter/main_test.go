@@ -126,8 +126,15 @@ func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
 	}
 	t.Setenv("A2A_CLUSTER_VIEW", "true")
 	allowed, disallowed, prompt = flags(harnessCommand())
-	if !strings.Contains(allowed, "Bash") || strings.Contains(disallowed, "Bash") {
+	if !strings.Contains(allowed, "Bash(kubectl:*)") || !strings.Contains(allowed, "Bash(gcloud:*)") || strings.Contains(disallowed, "Bash") {
 		t.Fatalf("view on: allowed=%q disallowed=%q", allowed, disallowed)
+	}
+	// Confined to the two shims: a bare Bash would let the harness run node,
+	// python3 or a loop against the keyless inference gateway the fence admits.
+	for _, tool := range strings.Split(allowed, ",") {
+		if tool == "Bash" {
+			t.Fatalf("view on allows bare Bash: %q", allowed)
+		}
 	}
 	for _, still := range []string{"Edit", "NotebookEdit"} {
 		if !strings.Contains(disallowed, still) {
