@@ -299,6 +299,13 @@ REQUIRED_APIS = {
 }
 
 HOST_CLUSTER = "platform-agent-host"
+# seeded-d is deliberately absent. Pool projects applied before bench/tf/fleet
+# grew slot d do not have it, so listing it would make the hourly pool-state
+# scan report every one of them drifted and hold the presubmit gate DEGRADED
+# until the fleet is re-applied across the pool. The weekly reconcile
+# (hack/fleet_reconcile.py --all) creates it in each project it applies to,
+# since a new cluster plans as a create; add it here once that has reached
+# every project.
 EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
 
 # The two states scripts/installer/installer_common.sh accepts in
@@ -822,19 +829,23 @@ _GH_TRANSPORT_LINE = re.compile(r'^(?:Get|Post|Put|Patch|Delete) "https?://[^"]*
 
 # hack/fleet-kubeconfigs.sh reports a cluster it could not reach and a fleet
 # that is not what the catalog describes through the same "unresolved" count,
-# and only its warning text separates them. These four are the second kind: the
+# and only its warning text separates them. These five are the second kind: the
 # cluster list came back and what it held was wrong, which is a finding about
-# the project rather than about this run's credential. Their sources are
-# hack/fleet-kubeconfigs.sh lines 406, 411, 215 and 224.
+# the project rather than about this run's credential. Their sources are the
+# WARNING lines in _fleet_match_slots and write_fleet_kubeconfigs that do not
+# name a cluster it failed to open. The last is a slot no labelled cluster
+# resolved to while others did: a project applied before the catalog declared
+# the slot, or a slot whose cluster lost its labels.
 _FLEET_LOOKED_AND_FOUND_WRONG = re.compile(
     r"carries no clusters labelled"
     r"|none resolved to a catalog slot"
     r"|matches no slot the catalog declares"
-    r"|more than one labelled seeded cluster",
+    r"|more than one labelled seeded cluster"
+    r"|has no labelled seeded cluster for slot",
     re.I,
 )
 
-# ...except that a refused `clusters list` produces the first of those four
+# ...except that a refused `clusters list` produces the first of those five
 # anyway. hack/fleet-kubeconfigs.sh:370-373 sets `listing=""` when the call is
 # refused, which drives `labelled=0` and emits the byte-identical "carries no
 # clusters labelled" warning at :406 -- so read on its own, that string would
@@ -851,12 +862,12 @@ _FLEET_COULD_NOT_LOOK = re.compile(r"could not list clusters in", re.I)
 # Sources: the three per-cluster WARNING lines in hack/fleet-kubeconfigs.sh.
 #
 # One of these, or _FLEET_COULD_NOT_LOOK, must be present before an unresolved
-# role may be excused. Excusing on the *absence* of a "looked and found wrong"
-# warning instead reads absence of evidence as evidence, and there is a path
-# that produces neither: a slot whose cluster kept its name and lost its labels
-# never enters the listing, so no per-cluster warning names it, `labelled`
-# stays non-zero so :406 is silent, something else resolves so :411 is silent,
-# and its roles increment `unresolved` with nothing printed at all.
+# role may be excused: excusing on the *absence* of a "looked and found wrong"
+# warning reads absence of evidence as evidence. Presence is not enough on its
+# own either, because the notes describe the whole run rather than one slot: an
+# unreachable seeded-c prints one of these while slot d is simply missing. So
+# the script names a slot no labelled cluster resolved to, and that warning is
+# in the list above, where it fails the check whatever else went unreached.
 _FLEET_UNREACHABLE = re.compile(
     r"no credentials for seeded cluster|could not create a temporary file|kubeconfig could not be rewritten to",
     re.I,
@@ -1690,7 +1701,7 @@ def _host_cluster_node_members(project_id: str, project_number: str) -> Tuple[Li
     Read off the cluster rather than assumed. A pool created with
     --service-account runs as that account, and asserting the Compute default SA
     against such a cluster would report a failure the project does not have. The
-    seeded trio is deliberately not consulted: it runs its own
+    seeded fleet is deliberately not consulted: it runs its own
     seeded-fleet-nodes account and pulls no kube-agents image.
 
     One listing carries every cluster's pools, so no location is needed -- the
@@ -1947,9 +1958,9 @@ def check_artifact_registry(project_id: str, project_number: str, location: str 
 
 
 def check_gke_and_state(project_id: str) -> CheckResult:
-    """Verify the host cluster, its CMEK state, the trio's names, and the state bucket.
+    """Verify the host cluster, its CMEK state, the seeded clusters' names, and the state bucket.
 
-    Names and encryption only. Whether the trio holds the planted fixtures is
+    Names and encryption only. Whether those clusters hold the planted fixtures is
     check_seeded_fleet_fixtures() below, and the two are far apart: an apply
     that created the clusters and died before the Kubernetes provider ran
     satisfies every assertion here.
@@ -2037,7 +2048,7 @@ def check_gke_and_state(project_id: str) -> CheckResult:
     if not passed:
         message = "GKE/state resources missing"
     elif clusters_checked and bucket_checked:
-        message = f"All 4 clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
+        message = f"All {len(EXPECTED_CLUSTERS)} clusters ({', '.join(sorted(EXPECTED_CLUSTERS))}), CMEK, and state bucket present"
     else:
         verified = []
         unchecked = []
@@ -2053,8 +2064,8 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
     """Run hack/fleet-kubeconfigs.sh against the project and require every role.
 
     A cluster that exists is not a fixture that was planted, and the gap is not
-    hypothetical: an apply that created the trio and failed before the
-    Kubernetes provider ran leaves three clusters that answer every API call
+    hypothetical: an apply that created the clusters and failed before the
+    Kubernetes provider ran leaves clusters that answer every API call
     and hold none of the objects. check_gke_and_state() passes that project.
     Nothing then contradicts it until a lease draws the project, runs a fleet
     scenario, and every check on it reports `status: error` -- by which point

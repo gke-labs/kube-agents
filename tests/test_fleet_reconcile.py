@@ -54,6 +54,7 @@ def _plan(*changes):
 UPDATE_ONLY = _plan((["update"], "google_container_cluster.seeded_b"))
 CREATE_AND_UPDATE = _plan((["create"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"), (["no-op"], "google_service_account.fleet_reader"))
 REPLACE = _plan((["delete", "create"], "google_container_node_pool.seeded_a_idle"), (["update"], "google_container_cluster.seeded_b"))
+REPLACE_NO_SURGE = _plan((["delete", "create"], "google_container_node_pool.no_surge_pool"), (["update"], "google_container_cluster.seeded_b"))
 DELETE = _plan((["delete"], "google_compute_disk.orphan"))
 FORGET = _plan((["forget"], "google_compute_disk.orphan"), (["update"], "google_container_cluster.seeded_b"))
 KNOWN = {P7, P8}
@@ -155,7 +156,7 @@ class PlanInspectionTest(unittest.TestCase):
         tofu = _Tofu({P7: UPDATE_ONLY})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
         self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
-        self.assertEqual(detail, "0 to add, 1 to change, 0 refused")
+        self.assertEqual(detail, "0 to add, 1 to change, 0 to replace, 0 refused")
         self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"])
         self.assertEqual(tofu.calls[3][-1], tofu.calls[2][-1], "apply takes the plan file show inspected")
         self.assertIn("-var=project_id=%s" % P7, tofu.calls[1])
@@ -181,7 +182,7 @@ class PlanInspectionTest(unittest.TestCase):
         # The orphan disk a cleanup deleted comes back; that is the point.
         tofu = _Tofu({P7: CREATE_AND_UPDATE})
         outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
-        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 refused"))
+        self.assertEqual((outcome, detail), (reconcile.OUTCOME_APPLIED, "1 to add, 1 to change, 0 to replace, 0 refused"))
 
     def test_a_replace_is_refused_and_named_before_anything_is_applied(self):
         tofu = _Tofu({P7: REPLACE})
@@ -189,6 +190,15 @@ class PlanInspectionTest(unittest.TestCase):
         self.assertEqual(outcome, reconcile.OUTCOME_REFUSED)
         self.assertIn("delete+create google_container_node_pool.seeded_a_idle", detail)
         self.assertNotIn("apply", tofu.verbs())
+
+    def test_the_no_surge_pool_replace_is_applied_and_counted(self):
+        # The one replacement the stack asks for on purpose: the pool is replaced
+        # at a minor roll because an in-place update waits out its budget.
+        tofu = _Tofu({P7: REPLACE_NO_SURGE})
+        outcome, detail = reconcile.reconcile_project(P7, runner=tofu)
+        self.assertEqual(outcome, reconcile.OUTCOME_APPLIED)
+        self.assertIn("1 to replace", detail)
+        self.assertIn("apply", tofu.verbs())
 
     def test_a_delete_is_refused(self):
         tofu = _Tofu({P7: DELETE})
