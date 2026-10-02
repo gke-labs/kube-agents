@@ -3,8 +3,12 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -202,6 +206,83 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyDeferred
 	}
 }
 
+// TestPlatformAgentReconciler_Reconcile_ConflictOnBothStatusAndBusCredentialsReadyRequeuesCleanly verifies
+// that when a primary status update (such as updateStatusReady) encounters a 409 conflict AND the deferred
+// syncBusCredentialsReady also encounters a 409 conflict on the same stale ResourceVersion, Reconcile
+// requeues cleanly without returning an error and without logging a stack trace (#2281).
+func TestPlatformAgentReconciler_Reconcile_ConflictOnBothStatusAndBusCredentialsReadyRequeuesCleanly(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	conflictErr := platformAgentConflictError(agent.Name)
+
+	ssa := fakeServerSideApplyInterceptors()
+	statusWrites := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: ssa.Patch,
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if subResourceName == "status" {
+					if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+						statusWrites++
+						return conflictErr
+					}
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+	}
+
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+
+	// 1st Reconcile: adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1: %v", err)
+	}
+
+	logged.Reset()
+	statusWrites = 0
+	// 2nd Reconcile: primary status write AND deferred syncBusCredentialsReady both hit 409 conflict
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile returned error on 409 conflict: %v; want nil error with clean requeue", err)
+	}
+	if !result.Requeue {
+		t.Errorf("Reconcile result.Requeue = false; want true on 409 conflict")
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("Reconcile result.RequeueAfter = %v; want 0 (rate-limited requeue via workqueue)", result.RequeueAfter)
+	}
+	if statusWrites < 2 {
+		t.Errorf("statusWrites = %d; want at least 2 status writes to verify both primary and deferred conflict paths", statusWrites)
+	}
+	if strings.Contains(logged.String(), "could not write BusCredentialsReady") {
+		t.Errorf("logged error 'could not write BusCredentialsReady' with stack trace; want it silenced when pass already requeuing on conflict:\n%s", logged.String())
+	}
+	if !strings.Contains(logged.String(), "Conflict writing BusCredentialsReady; pass already requeuing on conflict") {
+		t.Errorf("did not log info 'Conflict writing BusCredentialsReady; pass already requeuing on conflict':\n%s", logged.String())
+	}
+	if !strings.Contains(logged.String(), "PlatformAgent update conflict; requeuing cleanly") {
+		t.Errorf("did not log info 'PlatformAgent update conflict; requeuing cleanly':\n%s", logged.String())
+	}
+}
+
 // TestPlatformAgentReconciler_Reconcile_ConflictOnOwnedObjectNotSwallowed verifies
 // that 409 Conflict errors on owned objects (e.g. Deployments, ConfigMaps, Secrets)
 // are NOT swallowed by the PlatformAgent conflict net and continue to propagate to
@@ -231,8 +312,8 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnOwnedObjectNotSwallowed(t *
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-				// Inject 409 conflict on owned deployment SSA patch
-				if obj.GetObjectKind().GroupVersionKind().Kind == "Deployment" || obj.GetName() == "test-agent" {
+				// Inject 409 conflict specifically on owned deployment SSA patch
+				if _, ok := obj.(*appsv1.Deployment); ok {
 					return ownedConflictErr
 				}
 				return ssa.Patch(ctx, c, obj, patch, opts...)

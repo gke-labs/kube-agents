@@ -579,10 +579,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					retErr = err
 					return
 				}
-				// The reconcile is already failing and will requeue. Losing
-				// this write is not what to report about that pass, but it is
-				// not nothing either: the condition is a pass behind.
-				log.Error(err, "could not write BusCredentialsReady")
+				// The reconcile is already failing and will requeue. If the
+				// failure is already a PlatformAgent conflict being requeued cleanly,
+				// a subsequent conflict writing BusCredentialsReady is the same race
+				// and should not log an Error with a stack trace.
+				if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+					log.Info("Conflict writing BusCredentialsReady; pass already requeuing on conflict", "error", err)
+				} else {
+					log.Error(err, "could not write BusCredentialsReady")
+				}
 			}
 		}()
 	}
