@@ -9,6 +9,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -22,11 +23,48 @@ import (
 )
 
 func platformAgentConflictError(name string) error {
+	// The apiserver constructs 409 Conflict StatusDetails with Group matching the CRD group
+	// ("kubeagents.x-k8s.io") and Kind matching the CRD plural resource ("platformagents").
+	// We pin these literals explicitly here rather than referencing platformAgentGroupResource
+	// to ensure positive tests fail if the reconciler's matcher drifts from the apiserver wire shape (#2281).
 	return errors.NewConflict(
-		platformAgentGroupResource,
+		schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "platformagents"},
 		name,
 		fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again"),
 	)
+}
+
+// TestIsPlatformAgentConflict_WireShape verifies that isPlatformAgentConflict correctly
+// matches a 409 Conflict constructed with the apiserver wire shape literals
+// (Group: "kubeagents.x-k8s.io", Resource: "platformagents") and rejects singular kind
+// or group mismatches, pinning the "platformagents" plural literal against drift (#2281).
+func TestIsPlatformAgentConflict_WireShape(t *testing.T) {
+	wireConflict := errors.NewConflict(
+		schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "platformagents"},
+		"test-agent",
+		fmt.Errorf("conflict"),
+	)
+	if !isPlatformAgentConflict(wireConflict) {
+		t.Errorf("isPlatformAgentConflict(wireConflict) = false; want true for apiserver wire shape")
+	}
+
+	singularConflict := errors.NewConflict(
+		schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "platformagent"},
+		"test-agent",
+		fmt.Errorf("conflict"),
+	)
+	if isPlatformAgentConflict(singularConflict) {
+		t.Errorf("isPlatformAgentConflict(singularConflict) = true; want false for singular kind mismatch")
+	}
+
+	otherGroupConflict := errors.NewConflict(
+		schema.GroupResource{Group: "other.example.com", Resource: "platformagents"},
+		"test-agent",
+		fmt.Errorf("conflict"),
+	)
+	if isPlatformAgentConflict(otherGroupConflict) {
+		t.Errorf("isPlatformAgentConflict(otherGroupConflict) = true; want false for group mismatch")
+	}
 }
 
 // TestPlatformAgentReconciler_Reconcile_ConflictOnStatusUpdateRequeuesCleanly verifies
@@ -280,6 +318,80 @@ func TestPlatformAgentReconciler_Reconcile_ConflictOnBothStatusAndBusCredentials
 	}
 	if !strings.Contains(logged.String(), "PlatformAgent update conflict; requeuing cleanly") {
 		t.Errorf("did not log info 'PlatformAgent update conflict; requeuing cleanly':\n%s", logged.String())
+	}
+}
+
+// TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyWhenPassFailsOnNonConflictLogsError verifies
+// that when a primary reconcile step fails with a non-conflict error (such as a ServiceAccount patch failure)
+// and the deferred syncBusCredentialsReady also encounters a 409 conflict, Reconcile preserves log.Error
+// with stack trace ("could not write BusCredentialsReady") and does not quiet the log (#2281).
+func TestPlatformAgentReconciler_Reconcile_ConflictOnBusCredentialsReadyWhenPassFailsOnNonConflictLogsError(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	conflictErr := platformAgentConflictError(agent.Name)
+	saErr := fmt.Errorf("simulated non-conflict service account error")
+
+	ssa := fakeServerSideApplyInterceptors()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, sandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, ok := obj.(*corev1.ServiceAccount); ok {
+					return saErr
+				}
+				return ssa.Patch(ctx, c, obj, patch, opts...)
+			},
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if subResourceName == "status" {
+					if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+						return conflictErr
+					}
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+	}
+
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+
+	// 1st Reconcile: adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1: %v", err)
+	}
+
+	logged.Reset()
+	// 2nd Reconcile: primary error is ServiceAccount failure (non-conflict), deferred syncBusCredentialsReady hits 409 conflict
+	_, err := r.Reconcile(ctx, req)
+	if err == nil {
+		t.Fatalf("Reconcile returned nil error; want primary ServiceAccount error preserved")
+	}
+	if !strings.Contains(err.Error(), "simulated non-conflict service account error") {
+		t.Errorf("Reconcile err = %v; want simulated non-conflict service account error", err)
+	}
+	if !strings.Contains(logged.String(), "could not write BusCredentialsReady") {
+		t.Errorf("did not log error 'could not write BusCredentialsReady':\n%s", logged.String())
+	}
+	if strings.Contains(logged.String(), "Conflict writing BusCredentialsReady; pass already requeuing on conflict") {
+		t.Errorf("logged info 'Conflict writing BusCredentialsReady; pass already requeuing on conflict'; want log.Error preserved on non-conflict failure:\n%s", logged.String())
+	}
+	if strings.Contains(logged.String(), "PlatformAgent update conflict; requeuing cleanly") {
+		t.Errorf("logged 'PlatformAgent update conflict; requeuing cleanly'; want non-conflict failure not requeued cleanly:\n%s", logged.String())
 	}
 }
 
