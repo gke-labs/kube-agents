@@ -179,7 +179,7 @@ kanban:
   # the image patches that key in (deploy/docker/patches/kanban_notifier.py).
   #
   # `completed` is deliberately absent. The notifier has already delivered the
-  # worker's own status line and its full `result` to the thread by the time it
+  # worker's full `result` to the thread by the time it
   # wakes anyone, so the woken turn just re-reads the card and paraphrases a
   # message the user is looking at — 5.9s and 32,460 input tokens on task
   # t_c31a1f00, for nothing. Worse than nothing, now: the answer the notifier

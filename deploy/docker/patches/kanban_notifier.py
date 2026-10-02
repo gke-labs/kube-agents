@@ -176,9 +176,11 @@ __all__ = [
 #: alongside it.
 RESULT_LIMIT = 30000
 
-#: Separates the status line from the report. A blank line is enough: the
-#: status line is already on its own line under the ``✔ … done — <title>``
-#: header, so the result reads as the body of the same message.
+#: How much of a dropped status line the log keeps.
+SUMMARY_LOG_CHARS = 200
+
+#: Separates the ``✔ … done — <title>`` header from the report. A blank line
+#: is enough: the result reads as the body of the same message.
 SEPARATOR = "\n\n"
 
 CLIPPED_TAIL = (
@@ -197,7 +199,7 @@ def result_block(
     result: object,
     limit: int = RESULT_LIMIT,
 ) -> str:
-    """Return the text to append to a completion message, or ``""`` for none.
+    """Return the report that replaces the status line, or ``""`` for none.
 
     ``delivered`` is the handoff the message already carries (the clipped
     status line). When the result is contained in it there is nothing new to
@@ -347,15 +349,22 @@ def handoff_with_result(delivered: object, task: object) -> str:
     that vanished between the claim and the send.
 
     Fails to ``delivered`` unchanged rather than raising. This runs on the
-    delivery path: a completion notification that loses its report is bad, one
-    that raises, rewinds the cursor and re-sends forever is worse, and one that
-    drops the status line it already had is worse again.
+    delivery path: a completion notification that loses its report is bad, and
+    one that raises, rewinds the cursor and re-sends forever is worse. A status
+    line that gives way to the report is logged at DEBUG, so a fact a worker put
+    only in ``summary`` can still be found.
     """
     text = "" if delivered is None else str(delivered)
     try:
         result = getattr(task, "result", None)
         _log_result_shape(task, result)
         block = result_block(text, result)
+        if block and text.strip():
+            logger.debug(
+                "[kanban] card %s: sending its result without the status line %r.",
+                getattr(task, "id", "<unknown>"),
+                text.strip()[:SUMMARY_LOG_CHARS],
+            )
         return block or text
     except Exception:  # pragma: no cover - defensive
         return text
@@ -368,9 +377,10 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # When a card reaches a terminal state the notifier does two separate things
 # for the same event:
 #
-# 1. ``adapter.send(...)`` posts the completion line — the worker's own summary,
-#    plus whatever :func:`handoff_with_result` added to it — straight into the
-#    originating chat thread. The user has the answer at this point.
+# 1. ``adapter.send(...)`` posts the completion line — the card's ``result``
+#    when it has one (:func:`handoff_with_result`), otherwise the worker's
+#    summary — straight into the originating chat thread. The user has the
+#    answer at this point.
 # 2. ``adapter.handle_message(...)`` then injects a synthetic ``MessageEvent``
 #    to *wake the agent that created the card*, which costs a full model turn.
 #
@@ -383,7 +393,7 @@ def handoff_with_result(delivered: object, task: object) -> str:
 #                    "review_requested", "changes_requested", "block_loop_detected")
 #
 # There is no config key for it anywhere in Hermes. For the Chat Agent front
-# door that makes ``completed`` pure overhead: the summary has already been
+# door that makes ``completed`` pure overhead: the answer has already been
 # delivered, so the woken turn re-reads the card with ``kanban_show`` and
 # paraphrases a message the user is already looking at. Measured on task
 # ``t_c31a1f00`` (2026-08-05): **5.9 s and 32,460 input tokens** for that third
