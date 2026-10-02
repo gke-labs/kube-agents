@@ -480,7 +480,11 @@ function reduceMessage(
   // tab really did just send can replay as non-live. Genuinely old history
   // (from before this page connected) has a ts before any pending turn's
   // send time, so it still can't match. FIFO within a conversation, so two
-  // identical texts attach in order.
+  // identical texts attach in order, but the oldest turn that has not gone
+  // stale wins over a stale one: a stale turn may be one the gateway dropped
+  // or answered with a notice, and the same words sent again must attach to
+  // the resend, not to it. Only when every match is stale (a queue of slow
+  // turns) does the oldest stale one take it.
   const match =
     authority.conversation !== undefined
       ? pendingMatch(state.pending, authority.conversation, text, live, tsMs(env))
@@ -515,7 +519,14 @@ function reduceMessage(
 }
 
 function pendingMatch(pending: PendingTurn[], conversation: string, text: string, live: boolean, ts: number): number {
-  return pending.findIndex((p) => p.conversation === conversation && p.texts.includes(text) && (live || p.at < ts));
+  let stale = -1;
+  for (let i = 0; i < pending.length; i++) {
+    const p = pending[i];
+    if (p.conversation !== conversation || !p.texts.includes(text) || !(live || p.at < ts)) continue;
+    if (!p.stale) return i;
+    if (stale < 0) stale = i;
+  }
+  return stale;
 }
 
 function reduceStatusUpdate(

@@ -933,6 +933,42 @@ describe("console turns the gateway never makes a task of", () => {
   });
 });
 
+describe("choosing among matching pending turns", () => {
+  const up: UiState = { ...initialState, connection: "up" };
+
+  it("repro: a resend after a queue-full drop attaches to the resend, not the dropped turn", () => {
+    let state = reduce(up, { type: "consoleSent", messageId: "m-drop", text: "yes", conversation: "console:abc", at: SENT_AT });
+    state = reduce(state, {
+      type: "notice",
+      frame: { messageId: "c-x-1", text: "⚠️ 8 messages are already waiting in this conversation, so new ones are dropped until it catches up", edit: false },
+      conversation: "console:abc",
+      at: SENT_AT + 10,
+    });
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    state = reduce(state, { type: "consoleSent", messageId: "m-again", text: "yes", conversation: "console:abc", at: SENT_AT + 60_000 });
+    state = consoleTurn(state, "task-9", "yes");
+    state = reduce(state, { type: "tick", now: SENT_AT + 60_000 + PENDING_STALE_MS + 1 });
+    const byId = new Map(state.chat.map((c) => [c.id, c]));
+    expect(byId.get("pending:m-again")).toMatchObject({ kind: "user", taskId: "task-9" });
+    expect(byId.get("pending:m-again")?.note).toBeUndefined();
+    expect(byId.get("pending:m-drop")).toMatchObject({ kind: "pending" });
+    expect(byId.get("pending:m-drop")?.note).toMatch(/^no task on the bus/);
+    expect(state.pending.map((p) => p.messageId)).toEqual(["m-drop"]);
+  });
+
+  it("attaches FIFO when every match is stale (a queue of slow turns)", () => {
+    let state = sent(up, "m-1", "go");
+    state = sent(state, "m-2", "go");
+    state = reduce(state, { type: "tick", now: SENT_AT + PENDING_STALE_MS + 1 });
+    state = consoleTurn(state, "task-1", "go");
+    state = consoleTurn(state, "task-2", "go");
+    expect(state.chat.map((c) => [c.id, c.taskId])).toEqual([
+      ["pending:m-1", "task-1"],
+      ["pending:m-2", "task-2"],
+    ]);
+  });
+});
+
 describe("console notices and local lines", () => {
   it("renders a notice as a gateway line and replaces it on edit", () => {
     let state = reduce(initialState, {
