@@ -478,6 +478,18 @@ class RuntimeTest(unittest.TestCase):
     def test_a_link_url_keeps_its_parentheses(self):
         url = "https://console.cloud.google.com/logs/query;query=(severity>=ERROR)"
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
+        self.assertEqual(triage["links"][1], ("Cloud Logs", url.replace(">", "%3E")))
+
+    def test_a_link_that_gets_a_button_is_in_the_fallback_text_too(self):
+        url = "https://console.cloud.google.com/logs/query;query=a|b<c>d"
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
+        encoded = "https://console.cloud.google.com/logs/query;query=a%7Cb%3Cc%3Ed"
+        self.assertEqual(triage["links"][1], ("Cloud Logs", encoded))
+        self.assertIn(f"<{encoded}|Cloud Logs>", runtime.fallback_text(triage))
+
+    def test_an_already_encoded_url_is_not_encoded_again(self):
+        url = "https://console.cloud.google.com/logs/query;query=severity%3E%3DERROR"
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
         self.assertEqual(triage["links"][1], ("Cloud Logs", url))
 
     def test_a_decorated_heading_still_gives_the_headline(self):
