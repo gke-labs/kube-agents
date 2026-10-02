@@ -54,6 +54,9 @@ __all__ = [
     "confirmed_subjects",
     "kubeconfig_for_role",
     "provisioned_project",
+    "FleetSlotUnreached",
+    "slot_of_role",
+    "slot_kubeconfig_for_role",
 ]
 
 # Set by hack/fleet-kubeconfigs.sh, exported by hack/ci-eval-pr.sh.
@@ -190,12 +193,22 @@ def slot_of_role(role: str, directory: str | os.PathLike[str] | None = None) -> 
             f"no seeded-fleet kubeconfigs: {FLEET_KUBECONFIG_DIR_ENV} is unset, so the runner "
             f"resolved no seeded cluster before the run (hack/fleet-kubeconfigs.sh did not run)"
         )
-    slot = _context(root).get(_SLOT_KEY_FORMAT.format(role=role))
+    context = _context(root)
+    slot = context.get(_SLOT_KEY_FORMAT.format(role=role))
     if slot:
         return slot
+    if not context:
+        raise FleetRoleUnresolved(
+            f"the runner recorded nothing in {root}/{_CONTEXT_FILE}: hack/fleet-kubeconfigs.sh never ran there"
+        )
+    if not any(key.startswith(_SLOT_KEY_FORMAT.format(role="")) for key in context):
+        raise FleetRoleUnresolved(
+            f"{root}/{_CONTEXT_FILE} has no slot record at all: the runner that wrote this directory "
+            f"predates the `slot.<role>=` lines (re-run hack/fleet-kubeconfigs.sh from this checkout)"
+        )
     raise FleetRoleUnresolved(
         f"the runner recorded no slot for fixture role {role!r} in {root}/{_CONTEXT_FILE}: the role is "
-        f"not in the catalogue (bench/tf/fleet/fixtures.json) the runner read, or the runner never ran there"
+        f"not in the catalogue (bench/tf/fleet/fixtures.json) the runner read"
     )
 
 

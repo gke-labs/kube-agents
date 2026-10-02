@@ -225,8 +225,10 @@ _VALUE_WRAP = re.compile(
 # decoration. A `:` before anything but a letter (`12:30`, `https://`) is
 # left alone.
 _SEPARATOR_SPACE = re.compile(r"[ \t]+(?=[:;])")
-_INNER_UNDERSCORE = re.compile(r"(?<=\w)_(?=\w)")
-_SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z])")
+# A letter or digit on both sides, not `\w`, which includes `_` itself and
+# would rewrite the inner underscore of a doubled `__bold__` marker.
+_INNER_UNDERSCORE = re.compile(r"(?<=[a-z0-9])_(?=[a-z0-9])")
+_SEPARATOR_NO_SPACE = re.compile(r"([:;])(?=[a-z\"'\u201c\u2018<])")
 # Invisible format characters a model or a pasted document carries (a
 # zero-width space or joiner, a word joiner, a byte-order mark, a variation
 # selector, a soft hyphen): not whitespace to Python, not a word character,
@@ -262,12 +264,14 @@ def _fold_line_decoration(line: str) -> str:
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
     unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
-    # The value wrap comes off before the trail fold (so a closing quote at
-    # the line's end is read as the wrap it is) and again after it (so a
-    # wrap followed by a stop is read once the stop is gone).
-    trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", unquoted))
-    spaced = _SEPARATOR_SPACE.sub("", _VALUE_WRAP.sub(r"\1", trailed))
-    return _SEPARATOR_NO_SPACE.sub(r"\1 ", spaced)
+    # The separator's spacing is settled first, so a wrap glued to its
+    # separator (`pods:"unaffected"`) has the whitespace the wrap fold opens
+    # on; the value wrap then comes off before the trail fold (so a closing
+    # quote at the line's end is read as the wrap it is) and again after it
+    # (so a wrap followed by a stop is read once the stop is gone).
+    spaced = _SEPARATOR_NO_SPACE.sub(r"\1 ", _SEPARATOR_SPACE.sub("", unquoted))
+    trailed = _fold_trail(_VALUE_WRAP.sub(r"\1", spaced))
+    return _VALUE_WRAP.sub(r"\1", trailed)
 
 
 def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:

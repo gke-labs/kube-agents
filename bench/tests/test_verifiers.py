@@ -299,23 +299,27 @@ _ZONAL_CASE = TASKS / "upgrades-zonal-control-plane-outage-warned" / "task.yaml"
 
 
 def _zonal_case_check(objective: str) -> dict:
-    spec = yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))
-    for entry in spec["verification_spec"]:
+    for entry in _ZONAL_SPEC["verification_spec"]:
         if entry["name"] == objective:
             return entry["check"]
     raise AssertionError(f"{objective} not in {_ZONAL_CASE}")
 
 
+_ZONAL_SPEC = yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))
+
+
 def _zonal_case_fixtures() -> list[str]:
-    return list(yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))["fixtures"])
+    return list(_ZONAL_SPEC["fixtures"])
 
 
 _FLEET_CATALOG = TASKS.parent / "tf" / "fleet" / "fixtures.json"
 
 
-# Parsed once; the sibling suite's `_catalog()` reads the same file for the
-# runner's side of the contract.
-_CATALOG_ROLES = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))["roles"]
+# Read once in this module (the sibling suite reads the same file for the
+# runner's side of the contract); the slot letters below come from the same
+# parse.
+_CATALOG = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+_CATALOG_ROLES = _CATALOG["roles"]
 
 
 def _catalog_roles() -> dict:
@@ -367,7 +371,7 @@ def _zonal_line(cluster: str, cp="zonal", api="unavailable", pods="unaffected") 
 
 # The slot set is the fleet catalogue's, read rather than copied: a slot the
 # fleet gains or loses must change this list and the case together.
-_SLOT_LETTERS = tuple(json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))["cluster_slots"])
+_SLOT_LETTERS = tuple(_CATALOG["cluster_slots"])
 _SLOTS = tuple(f"seeded-{s}" for s in _SLOT_LETTERS)
 _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
 
@@ -431,6 +435,11 @@ _RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
         "\n".join(_zonal_line(f"{c}-northamerica-northeast1-a") for c in _SLOTS),
         # Underscore emphasis, and a name in parentheses or braces.
         "\n".join("_" + _zonal_line(c) + "_" for c in _SLOTS),
+        "\n".join("__" + _zonal_line(c) + "__" for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("is zonal;", "is __zonal__;") for c in _SLOTS),
+        # A quoted or bracketed value glued to its separator.
+        "\n".join(_zonal_line(c).replace(": unaffected", ':"unaffected"') for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(": unavailable;", ":<unavailable>;") for c in _SLOTS),
         "\n".join(_zonal_line(f"({c})") for c in _SLOTS),
         "\n".join(_zonal_line(f"{{{c}}}") for c in _SLOTS),
         # A citation on a value other than the last.
@@ -452,7 +461,9 @@ def test_zonal_case_fixtures_name_one_role_per_slot():
     catalog = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
     roles = _zonal_case_fixtures()
     assert sorted(catalog["roles"][r]["cluster_slot"] for r in roles) == sorted(_SLOT_LETTERS)
-    assert _zonal_case_check("every-seeded-cluster-has-a-declared-line")["fixture_roles"] == roles
+    # Every declared-line objective names the same list as `fixtures:`.
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_check(objective)["fixture_roles"] == roles, objective
 
 
 def test_zonal_case_errors_rather_than_fails_when_a_slot_was_not_reached():
@@ -523,6 +534,18 @@ def test_a_role_the_runner_recorded_no_slot_for_errors_by_name(tmp_path):
     assert res.status == "error"
     assert res.reason.startswith(verifiers._UNRESOLVED_ROLES_REASON)
     assert "no-such-role" in res.reason and "catalogue" in res.reason
+
+
+def test_a_directory_an_older_runner_wrote_names_the_missing_record(tmp_path):
+    # `project=` and the slot lines are there, the `slot.<role>=` record is
+    # not: the runner predates it, and the reason says so rather than
+    # offering a case-authoring error or an absent runner.
+    (tmp_path / ".fleet-context").write_text("project=kube-agents-evals\ncluster.a=seeded-a\nlocation.a=us-central1-a\n", encoding="utf-8")
+    with pytest.raises(fleet.FleetRoleUnresolved, match="predates"):
+        fleet.slot_of_role("crashloop-workload", tmp_path)
+    (tmp_path / ".fleet-context").write_text("", encoding="utf-8")
+    with pytest.raises(fleet.FleetRoleUnresolved, match="never ran"):
+        fleet.slot_of_role("crashloop-workload", tmp_path)
 
 
 def test_zonal_case_patterns_name_exactly_the_catalogues_slots():
