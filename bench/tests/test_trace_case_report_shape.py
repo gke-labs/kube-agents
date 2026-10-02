@@ -87,7 +87,9 @@ PASTED_BREAKDOWN_REPORT = (
 # a table or a list: ordinary Markdown for a per-trace section, which puts
 # the share two to four lines below the id. The table headers that say
 # neither total nor duration are the ones only the data row's own shape (a
-# duration in seconds and a share on one line) can satisfy.
+# decimal number or a unit-suffixed duration and a share on one line) can
+# satisfy; the last two put the unit in the header and a bare number in
+# the cell, as a table conventionally does.
 HEADING_BREAKDOWN_REPORTS = [
     "### Trace 0384e171d360c91c96df3124562dcc59\n\n"
     "| Total duration | Spans | Slowest span | Share |\n|---|---|---|---|\n"
@@ -104,6 +106,12 @@ HEADING_BREAKDOWN_REPORTS = [
     "**Trace `0384e171d360c91c96df3124562dcc59`**\n\n"
     "| Seconds | Spans | Slowest span | Share |\n|:--|:--|:--|:--|\n"
     "| 2.590 seconds | 1 | `api.model-default` (2590 ms) | 100.0% |",
+    "### trace 0384e171d360c91c96df3124562dcc59\n\n"
+    "| latency (s) | spans | slowest span | share |\n|---|---|---|---|\n"
+    "| 2.590 | 1 | api.model-default | 100.0% |",
+    "#### 0384e171d360c91c96df3124562dcc59\n"
+    "| Time (s) | Spans | Slowest | % of trace |\n|---|---|---|---|\n"
+    "| 2.59 | 1 | api.model-default | 100% |",
 ]
 
 # A failure that happens to carry a seconds-and-share line but no id the
