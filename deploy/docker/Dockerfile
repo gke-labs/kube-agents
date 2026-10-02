@@ -1841,8 +1841,9 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 #     AGENTS.md, CAPABILITIES.md, governance/, cron/ and config.yaml sit beside
 #     skills/ and are force-synced into the platform profile on every boot by
 #     entrypoint step 2.6, and the cluster template's personas are re-copied into
-#     every cluster-* profile by its continuation. A rewritten SOUL.md is more
-#     load-bearing than any single SKILL.md.
+#     every cluster-* profile by its continuation, which also back-fills every
+#     key its config.yaml adds. A rewritten SOUL.md is more load-bearing than any
+#     single SKILL.md.
 #   - /opt/hermes/plugins (barriered by the stage's first RUN; listed for
 #     what it covers). It is the only path Hermes resolves plugins from, holding
 #     Python imported into the agent's own process — a strictly stronger capability
@@ -2038,6 +2039,14 @@ RUN set -eu; \
 # than its own because the chain is at the layer ceiling. It fails the build when
 # the copy stops working, and only warns when Hermes resolves ssh without the copy,
 # because the copy still agrees then and a failure would block the Hermes bump.
+#
+# It also asks that Hermes for the context-file cap each profile's shipped
+# config.yaml gives it, on the unknown-window path (no context_length), and fails
+# the build if that profile's SOUL.md is longer. Hermes keeps only the head and
+# tail of a file over the cap, so a persona that outgrows it, or a renamed or
+# ignored context_file_max_chars, would otherwise drop the middle of the prompt
+# with nothing but a log line. Each check runs in a scratch HERMES_HOME holding a
+# copy of the template's config.yaml, so Hermes writes nothing into the template.
 RUN set -eu; \
     if [ -e /opt/credential-proxy ]; then \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
@@ -2049,7 +2058,21 @@ RUN set -eu; \
         exit 1; \
       fi; \
     done; \
-    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check
+    /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check; \
+    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template; do \
+      config_dir="${profile%%:*}"; soul="${profile#*:}/SOUL.md"; \
+      scratch="$(mktemp -d)"; \
+      cp "${config_dir}/config.yaml" "${scratch}/config.yaml"; \
+      HERMES_HOME="${scratch}" /opt/hermes/.venv/bin/python3 -c "\
+import pathlib, sys; \
+from agent.prompt_builder import _get_context_file_max_chars; \
+soul, config = sys.argv[1], sys.argv[2]; \
+size = len(pathlib.Path(soul).read_text(encoding='utf-8').strip()); \
+cap = _get_context_file_max_chars(); \
+assert size <= cap, '%s is %d chars, over the %d-char context-file cap Hermes takes from %s, so the prompt would carry it truncated' % (soul, size, cap, config)" \
+        "${soul}" "${config_dir}/config.yaml"; \
+      rm -rf "${scratch}"; \
+    done
 
 USER 10000:10000
 

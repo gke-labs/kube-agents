@@ -831,12 +831,12 @@ by an overlay merged into an image-built base at startup. The `default` profile 
 takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
 read-only **managed scope** pinned over it.
 
-| Profile                                                       | Delivery                                                                                                                                                   | Who owns the file                                      |
-| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| `default`                                                     | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes`          | Agent owns the file, operator the pins                 |
-| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                       | Image owns the base, operator the overlay              |
-| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global | Agent owns the file, operator the overlay and the pins |
-| `cluster-*`                                                   | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists                                                   | Image owns the base, operator the overlay              |
+| Profile                                                       | Delivery                                                                                                                                                                   | Who owns the file                                      |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `default`                                                     | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes`                          | Agent owns the file, operator the pins                 |
+| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                                       | Image owns the base, operator the overlay              |
+| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global                 | Agent owns the file, operator the overlay and the pins |
+| `cluster-*`                                                   | Image-built base, copied when the profile is scaffolded and back-filled at startup + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay              |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
@@ -967,12 +967,19 @@ alone. Its overlay merges after that back-fill as it always did. Everything else
 that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
 force-syncs either way.
 
+A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
+stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
+it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
+template declares and the live file has lost are restored at the next start, and `cluster_identity`
+and every value the file already holds are left alone, except the retired `memory.provider` key,
+which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+
 One value inside both of these files does follow the image: the `User-Agent` header that the
 remote MCP servers' `args` carry (see [the config reference](/kube-agents/reference/config/)). The
 back-fill recurses only through mappings and that value lives in a list, so it would otherwise stay
 as the image that scaffolded the profile spelled it for the life of the volume. At every start the
 entrypoint sets it to the image template's in each cluster profile's `config.yaml`, and in the
-platform profile's when it is the front door, and changes nothing else in the file.
+platform profile's when it is the front door, and the repair changes nothing else in the file.
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
