@@ -45,7 +45,8 @@ again.
 An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
 answered by typing: someone replies ``apply Option B`` in the thread, the agent
 applies it, and the buttons are still there. So before such a click counts,
-the thread is read once, and if a person the adapter would answer (its own
+the thread is read once, plus the cached thread-root lookup the adapter's
+channel gate makes, and if a person the adapter would answer (its own
 interactive authorization, the check the clicker passed, and its channel gate
 with the mention rule the click skips) has replied with one of the call to
 action's forms (``apply``, ``apply Option B``, ``apply B``, any of them ending
@@ -58,7 +59,9 @@ apply would run on top of it. The buttons appear when the alert is edited
 into its triage, so that edit's time, which the click's payload carries, is
 the start; a reply typed during the diagnosis does not count. The match is a
 heuristic: the agent reads a typed reply as free text, so this guesses what it
-will apply. A read, or one of the adapter's checks, that fails runs the click
+will apply. Those checks are made when the button is clicked, not when the
+reply was typed, so a channel or user setting changed in between is read as it
+stands at the click. A read, or one of the adapter's checks, that fails runs the click
 as if nothing had been typed. Other choice buttons are not checked.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
@@ -359,8 +362,10 @@ async def _applied_by_typing(
     options: frozenset[tuple[str, str]], is_dm: bool,
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
-    One read; a read or an adapter check that fails answers no, so the click runs as it would
-    without the check. The channel gate is asked only of a reply that passes everything else."""
+    One read, plus the cached thread-root lookup the adapter's channel gate makes; a read or an
+    adapter check that fails answers no, so the click runs as it would without the check. The
+    channel gate is asked only of a reply that passes everything else, and at click time, not as
+    it stood when the reply was typed."""
     try:
         response = await client.conversations_replies(
             channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
