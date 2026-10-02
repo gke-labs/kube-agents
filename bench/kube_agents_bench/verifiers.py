@@ -86,6 +86,7 @@ __all__ = [
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
     "ReplayCardVerifier",
+    "ReplyIsSilentVerifier",
     "ReportContainsVerifier",
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
