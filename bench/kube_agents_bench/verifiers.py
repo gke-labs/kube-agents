@@ -418,6 +418,17 @@ class ToolCalledVerifier(BaseVerifier):
         ok = count >= self.minimum_calls
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
         if self.agent is not None and not matched_agent:
+            if snap.worker_capture_gaps:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        f"no worker trajectory entries matched agent selector {self.agent!r} "
+                        f"(seen agents: {seen_agents}), but the capture was incomplete, "
+                        f"so this check could not be evaluated: {'; '.join(snap.worker_capture_gaps)}"
+                    ),
+                )
             reason = (
                 f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
                 f"{agent_str} (minimum {self.minimum_calls};"
