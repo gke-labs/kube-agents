@@ -129,11 +129,26 @@ echo
 echo "== 3. who may log in =="
 check "the agent's key works" "agent" "$("${SSH[@]}" whoami 2>&1)"
 # sshd's own default, which is the home. It is not where the agent works: Hermes
-# is sent TERMINAL_CWD=/opt/data by the operator, because this home is the
-# container's ephemeral overlay and everything written here is gone on the next
-# pod recycle. The image cannot enforce that — asserted here so the two halves of
-# the arrangement are visible together.
+# is sent TERMINAL_CWD=/opt/data by the operator, because this home is root-owned
+# and on the container's ephemeral overlay. The image cannot enforce that —
+# asserted here so the two halves of the arrangement are visible together.
 check "the session starts in the agent's home" "/home/agent" "$("${SSH[@]}" pwd 2>&1)"
+# Every session shares this home, so anything one could leave in it that bash or
+# python3 loads unasked would run in every later one: a startup file, a ~/bin
+# that Debian's stock .profile puts first on PATH, a usercustomize or .pth file
+# in the user site-packages. deploy/sandbox/Dockerfile has the list. The home is
+# root-owned and empty instead, and these are the routes it closes.
+check "the home is root's and only root may write it" "755 root root" \
+  "$("${SSH[@]}" 'stat -c "%a %U %G" ~' 2>&1)"
+check "and holds nothing but .ssh and .hermes" "nothing else" \
+  "$("${SSH[@]}" 'ls -A ~ | grep -vxE "[.]ssh|[.]hermes" || echo nothing else' 2>&1)"
+for startup in .bashrc .bash_profile .bash_login .profile; do
+  check "the model cannot write ~/$startup" "Permission denied" \
+    "$("${SSH[@]}" "echo 'echo planted' > ~/$startup" 2>&1)"
+done
+check "nor create ~/bin" "Permission denied" "$("${SSH[@]}" 'mkdir ~/bin' 2>&1)"
+check "nor the Python user site-packages" "Permission denied" \
+  "$("${SSH[@]}" 'mkdir -p "$(python3 -m site --user-site)"' 2>&1)"
 check "the data volume is writable" "ok" \
   "$("${SSH[@]}" 'touch /opt/data/probe && echo ok' 2>&1)"
 # One path, two directories: /opt/data is also the agent pod's Hermes home, and
@@ -156,8 +171,8 @@ check "AllowUsers refuses another account holding the same key" "Permission deni
 echo
 echo "== 3b. the hermes principal =="
 # The account trusted agent-pod code connects as. It exists so that a caller
-# reaching in for a cluster command does not run as the login whose home the
-# model owns; see deploy/sandbox/Dockerfile.
+# reaching in for a cluster command does not run as the login the model's own
+# commands run as; see deploy/sandbox/Dockerfile.
 HERMES_SSH=(ssh "${SSH_OPTS[@]}" hermes@127.0.0.1)
 check "the same key opens a hermes session" "hermes" "$("${HERMES_SSH[@]}" whoami 2>&1)"
 check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
@@ -165,18 +180,17 @@ check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
 check "hermes gets the wrapper PATH too" "/opt/credential-proxy/bin/kubectl" \
   "$("${HERMES_SSH[@]}" 'command -v kubectl' 2>&1)"
 
-# The property the whole account exists for. Bash sources ~/.bashrc for a
-# non-interactive `ssh host cmd`, so a shim planted by the model in its own home
-# would be executed by an agent-pod caller and its output returned as a trusted
-# tool result. Written above Debian's non-interactive guard, because below it
-# the guard hides the problem rather than fixing it.
+# The property the whole account exists for: nothing the model leaves behind
+# changes what an agent-pod caller sees. The first route found was a shim on
+# PATH from ~/.bashrc, which bash sources for a non-interactive `ssh host cmd`,
+# and its output would have come back as a trusted tool result. The home is
+# root-owned now, so the plant itself fails (section 3 checks the refusals), and
+# the shim reaches neither account.
 "${SSH[@]}" 'mkdir -p ~/bin && printf "#!/bin/sh\necho FORGED\n" > ~/bin/kubectl && chmod +x ~/bin/kubectl' >/dev/null 2>&1
-"${SSH[@]}" 'printf "export PATH=$HOME/bin:\$PATH\n%s" "$(cat ~/.bashrc)" > ~/.bashrc.new && mv ~/.bashrc.new ~/.bashrc' >/dev/null 2>&1
-check_absent "a shim planted in the agent's home does not reach a hermes session" "FORGED" \
+"${SSH[@]}" 'printf "export PATH=\$HOME/bin:\$PATH\n" > ~/.bashrc' >/dev/null 2>&1
+check_absent "a shim the model tries to plant in its home does not reach a hermes session" "FORGED" \
   "$("${HERMES_SSH[@]}" 'kubectl version' 2>&1)"
-# Same command as the agent proves the planted shim actually works, so the check
-# above is testing isolation rather than a typo in the setup.
-check "the planted shim does run for the agent itself" "FORGED" \
+check_absent "nor a later agent session" "FORGED" \
   "$("${SSH[@]}" 'kubectl version' 2>&1)"
 
 # The model must not be able to reach hermes' authorized_keys, either by writing
@@ -235,8 +249,19 @@ print(\" \".join(bad) or \"clean\")
 # Generated on the host so the private half never has to be copied back out of
 # the container: the model only needs the public half to authorise it.
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
+check "the agent's authorized_keys is root's" "644 root" \
+  "$("${SSH[@]}" 'stat -c "%a %U" ~/.ssh/authorized_keys' 2>&1)"
+# The directory as well as the file. Replacing a file takes write on the
+# directory rather than on the file, so with an agent-owned .ssh the model could
+# move the root-owned file aside and write its own in its place, and the append
+# below would still be refused. Moved straight back if it ever succeeds, so the
+# rest of the run keeps a working login.
+check "the agent's .ssh is root's" "755 root" \
+  "$("${SSH[@]}" 'stat -c "%a %U" ~/.ssh' 2>&1)"
+check "the model cannot move authorized_keys aside" "Permission denied" \
+  "$("${SSH[@]}" 'mv ~/.ssh/authorized_keys ~/.ssh/aside && mv ~/.ssh/aside ~/.ssh/authorized_keys && echo moved' 2>&1)"
 "${SSH[@]}" "printf '%s\n' '$(cat "$WORK/rogue.pub")' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
-check "the model can authorise a new key for its own account" "agent" \
+check "the model cannot authorise a new key for its own account" "Permission denied" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" agent@127.0.0.1 whoami 2>&1)"
 # Asserted as a refusal rather than as the absence of "hermes" in the output:
 # sshd's own denial names the account it refused ("hermes@127.0.0.1: Permission
@@ -244,10 +269,6 @@ check "the model can authorise a new key for its own account" "agent" \
 # behaves.
 check "the same key does not open a hermes session" "Permission denied" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" hermes@127.0.0.1 whoami 2>&1)"
-
-# Undo the sabotage: later sections use the agent session and would otherwise
-# run against a hijacked PATH.
-"${SSH[@]}" 'rm -rf ~/bin && sed -i "1{/^export PATH=/d}" ~/.bashrc && sed -i "/sandbox-smoke-rogue/d" ~/.ssh/authorized_keys' >/dev/null 2>&1
 
 echo
 echo "== 3c. the host keys are not the model's =="
@@ -407,13 +428,13 @@ check "and the wrapper says which directory it could not create" \
 
 # _quote_cwd_for_cd emits a bare `~` and rewrites `~/x` through $HOME, so the
 # target is a shell word and has to be expanded on this side. A wrapper that
-# took it for a literal path would create a directory named '$HOME'.
+# took it for a literal path would name '$HOME' in its message below instead.
 check "a bare ~ cwd resolves to this pod's home" "/home/agent" \
   "$(hermes_ssh '~' 'pwd' 2>&1)"
-check "a \$HOME-relative cwd with a space stays one word" "/home/agent/smoke ws" \
+# The home is root-owned, so the wrapper cannot create this one and the command
+# exits 126 as above. The path in its message is what shows the word expanded.
+check "a \$HOME-relative cwd with a space stays one word" "could not create /home/agent/smoke ws" \
   "$(hermes_ssh "\$HOME/'smoke ws'" 'pwd' 2>&1)"
-check_absent "and nothing created a directory named for the variable" '$HOME' \
-  "$("${SSH[@]}" 'ls -a / ~' 2>&1)"
 
 # Everything that is not a Hermes wrapper has to pass through untouched. tar
 # over the connection is how file sync moves whole directories in both
@@ -711,8 +732,9 @@ echo "== 6. a restart must not change the host key or lose the model's work =="
 # has never seen and refuses one that changed. A regenerated host key is not a
 # prompt, it is every later command failing until known_hosts is cleared by hand.
 # Two files, one on each side of the durability line: /opt/data/probe was
-# written in section 3 and this one goes in the home the shell would default to.
-"${SSH[@]}" 'touch ~/ephemeral-probe' >/dev/null 2>&1
+# written in section 3 and this one goes on the container's own disk, where the
+# home the shell would default to also is.
+"${SSH[@]}" 'touch /tmp/ephemeral-probe' >/dev/null 2>&1
 before=$(ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null | awk '{print $3}')
 start_sandbox || exit 1
 after=$(ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null | awk '{print $3}')
@@ -725,8 +747,8 @@ check_absent "the second start reused the volume's keys" "generating ed25519" \
 # model's work on the wrong side of this line.
 check "the model's files on the data volume survived the recycle" "probe" \
   "$("${SSH[@]}" 'ls /opt/data' 2>&1)"
-check_absent "the ones in the home did not" "ephemeral-probe" \
-  "$("${SSH[@]}" 'ls -a ~' 2>&1)"
+check_absent "the ones on the container's disk did not" "ephemeral-probe" \
+  "$("${SSH[@]}" 'ls -a /tmp' 2>&1)"
 # The other side of that line, and the reason step 1a replaces rather than merges:
 # the skills, SOPs and shared scripts are image-owned, so the edit section 4b made
 # to forge.py has to be gone. Merging would leave a script deleted from the image

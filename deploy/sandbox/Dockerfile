@@ -264,11 +264,12 @@ RUN apt-get update && \
 # authoritative skills come from /opt/defaults/skills (see the note further
 # down), and what Hermes pushes here is the wrong profile's tree anyway.
 #
-# The other half is a mount, and it is the half that makes this hold. The mode
-# here binds the directory; it does not bind the NAME. /home/agent is owned by
-# uid 1000, and removing a directory takes write on the parent rather than on
-# the directory, so `rmdir ~/.hermes && mkdir ~/.hermes` returns a writable one
-# to the model and the sync resumes on the next command. The operator mounts an
+# The mode binds the directory; it does not bind the NAME. Removing a directory
+# takes write on the parent rather than on the directory, so while /home/agent
+# was owned by uid 1000, `rmdir ~/.hermes && mkdir ~/.hermes` returned a writable
+# one to the model and the sync resumed on the next command. The home is
+# root-owned now (below), which stops that rmdir, and a mount is the second
+# layer, the one that also holds against root. The operator mounts an
 # empty read-only volume over this path (shellSandboxHermesHomePath in
 # k8s-operator/internal/controller/shell_sandbox_manifests.go), which makes the
 # rmdir EBUSY. A build of this image run outside that StatefulSet keeps the mode
@@ -280,22 +281,43 @@ RUN apt-get update && \
 # logs a warning; and sync_back returns early on `not self._pushed_hashes and
 # not self._synced_files` without opening a connection at all. The cost is that
 # warning, once per sync cycle.
-RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 agent && \
+#
+# /home/agent is root-owned and holds no dotfiles: --no-create-home skips
+# /etc/skel, and uid 1000 can create nothing in it. Every session in this pod
+# runs as `agent` and shares the home for as long as the container lives, and
+# several programs load code from it unasked. bash reads ~/.bashrc for the
+# `bash -c` that sshd starts ForceCommand with, before session-command.sh runs.
+# A login shell reads ~/.bash_profile, ~/.bash_login or ~/.profile, and
+# Debian's stock .profile puts ~/bin first on PATH. python3 imports
+# usercustomize and runs .pth files from the user site-packages under ~/.local.
+# With an agent-owned home, one session could plant any of these, and every
+# later session ran it. An environment variable can switch off some of these,
+# but not the first, and no list of them is complete. A home the model cannot
+# write covers all of them.
+#
+# .ssh is root-owned for the same reason, and so is the authorized_keys the
+# entrypoint installs there: an agent-owned file let the model authorise a key
+# of its own. sshd's StrictModes accepts root ownership at every level.
+# Nothing that runs here needs to write the home. Hermes works in
+# TERMINAL_CWD=/opt/data and /tmp, the credential-proxy client writes under
+# $HERMES_HOME, and vcs_client.py points HOME at a scratch directory of its own.
+RUN useradd --no-create-home --home-dir /home/agent --shell /bin/bash --uid 1000 agent && \
     usermod -p '*' agent && \
-    install -d -m 0700 -o agent -g agent /home/agent/.ssh && \
+    install -d -m 0755 -o root -g root /home/agent && \
+    install -d -m 0755 -o root -g root /home/agent/.ssh && \
     install -d -m 0555 -o root -g root /home/agent/.hermes && \
     install -d -m 0755 /run/sshd && \
     install -d -m 0755 -o agent -g agent /opt/data && \
     install -d -m 0700 -o root -g root /var/lib/sandbox-sshd
 
 # The second principal, for trusted code in the agent pod reaching in to run a
-# cluster command. It exists because `agent` cannot be used for that: `agent`
-# owns its own home directory, bash sources ~/.bashrc for a non-interactive
-# `ssh host cmd`, and the model can therefore choose what an agent-pod caller
-# sees — shadow a binary on PATH, and the forged output comes back as a trusted
-# tool result. Debian's stock guard at the top of .bashrc returns early for
-# non-interactive shells and hides this; the model owns the file and can delete
-# the guard.
+# cluster command. It exists because `agent` cannot be used for that. A caller
+# logged in as `agent` is the same uid as every process the model starts, and
+# works in directories the model owns (/opt/data, /tmp), so the model can choose
+# what that caller sees, and the forged output comes back as a trusted tool
+# result. The first such route was ~/.bashrc, which bash sources for a
+# non-interactive `ssh host cmd`. The home is root-owned now (above), but the
+# account split does not depend on every such route being found.
 #
 # Both principals are authorised by the same key. A second keypair would buy
 # nothing: the private half lives only in the agent pod, which the model has no

@@ -1180,10 +1180,11 @@ is not the answer either: the check is opt-in and an empty value skips it entire
 which drops the guardrail rather than moving it.
 
 The operator therefore writes it out, in `buildPodTemplateSpec` and only when the
-sandbox is enabled, naming the sandbox's two writable directories: `/opt/data`, and
-`/home/agent` for the commands that land in the home. Since the sandbox's data volume
-now carries the `/opt/data` path itself, the interesting half of that is the home — but
-the value is written rather than left to the image default so the policy is visible in
+sandbox is enabled, naming `/opt/data` and `/home/agent`. The home was writable when
+this was written and is root-owned now (see
+[The agent home is root-owned](#the-agent-home-is-root-owned)), so a write there
+passes this check and then fails on the directory's mode. The value is written rather
+than left to the image default so the policy is visible in
 the pod spec rather than inherited from a base image two repositories away. It gives up
 no isolation. With `backend: ssh` the file tools cannot reach the agent pod's
 filesystem at all, so the roots they are checked against should describe the filesystem
@@ -1203,20 +1204,44 @@ The sandbox has three directories that matter and only one of them keeps anythin
 | Path                    | Backing                        | Owner    | What it is                      |
 | ----------------------- | ------------------------------ | -------- | ------------------------------- |
 | `/opt/data`             | `data` PVC                     | uid 1000 | the model's work                |
-| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home                |
+| `/home/agent`           | the container's ephemeral disk | root     | the login's home                |
 | `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home    |
 | `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                   |
 | `/opt/vcs/libexec`      | the image                      | root     | what the trusted principal runs |
 
-**The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
-it for a non-interactive `ssh host cmd`, and the model can delete Debian's
-non-interactive guard — so a shim planted there is executed for anything that logs in as
-`agent`. Putting that file on a volume would make the hijack outlive a pod recycle. It
-does not, and that is the arrangement working.
+#### The agent home is root-owned
 
-**A durable home was the other option and it loses more than it gains.** The interesting
-files under a home are the dotfiles, and those are exactly what the previous paragraph
-wants thrown away. The model's actual output has somewhere better to be.
+Every session in the pod logs in as `agent` and shares `/home/agent` for as long as the
+container lives. Several programs load code from a home without being asked:
+
+- bash reads `~/.bashrc` for the `bash -c` that sshd starts the `ForceCommand` with,
+  before `session-command.sh` runs.
+- A login shell (`bash -l`, which Hermes uses for its session snapshot) reads
+  `~/.bash_profile`, `~/.bash_login` or `~/.profile`, and Debian's stock `.profile` puts
+  `~/bin` first on `PATH`.
+- python3 imports `usercustomize` and runs `.pth` files from the user site-packages under
+  `~/.local`, ahead of the `/opt/defaults/scripts` entry shared scripts append to
+  `sys.path`.
+
+When `agent` owned the home, a session could plant any of these, and every later session
+in the pod ran it until the container restarted. So the image creates the home root-owned
+and `0755`, with no skeleton files, and `.ssh` and the `authorized_keys` in it root-owned
+too. sshd's `StrictModes` accepts root ownership at every level, and nothing that runs in
+the sandbox needs to write the home: Hermes works in `TERMINAL_CWD` and `/tmp`, the
+credential-proxy client writes under `$HERMES_HOME`, and `vcs_client.py` points `HOME` at
+a scratch directory of its own.
+
+Environment variables were the other option: `PYTHONNOUSERSITE=1` in the `SetEnv` drop-in,
+and `--norc --noprofile` for the session's bash. They cannot reach the first route, which
+runs before anything this image controls sets an option, and any such list is only as
+complete as the routes someone thought of. A directory the model cannot write covers every
+loader at once. `deploy/sandbox/smoke-test.sh` sections 3 and 3b check that a session
+cannot create a startup file, `~/bin` or the user site-packages directory, or add a key.
+
+The home is still on the container's disk, but nothing the model writes can land in it.
+The model's actual output has somewhere better to be.
+
+#### The working directory and the data volume
 
 **Which leaves `TERMINAL_CWD`.** Hermes' `ssh` backend defaults its working directory to
 `~` (`tools/terminal_tool.py`), so with an ephemeral home and nothing pointing elsewhere,
@@ -2077,13 +2102,16 @@ whatever it needs to, on a different machine. The only thing that machine change
 the model's code is now on it too, which means trusted execution there needs a principal
 the model cannot influence. It does not have one today.
 
-`terminal.ssh_user` is `agent`, uid 1000 — the user whose shell the model drives, whose
-home directory it writes to, and who owns `/home/agent/.bashrc`. Bash sources `.bashrc`
-for a non-interactive `ssh host cmd`, so an agent-side caller that reaches into the
-sandbox as `agent` executes the model's startup file before its own command. The stock
-Debian guard at the top of that file returns early for non-interactive shells and hides
-this, but the model owns the file and can delete the guard; moving an `export` above it
-is enough to prove the mechanism, and the environment does cross.
+`terminal.ssh_user` is `agent`, uid 1000 — the user whose shell the model drives. When
+this was written, it also owned `/home/agent/.bashrc`, and bash sources `.bashrc` for a
+non-interactive `ssh host cmd`, so an agent-side caller that reached into the sandbox as
+`agent` executed the model's startup file before its own command. The stock Debian guard
+at the top of that file returned early for non-interactive shells and hid this, but the
+model owned the file and could delete the guard; moving an `export` above it was enough
+to prove the mechanism, and the environment did cross. The home is root-owned now
+([The agent home is root-owned](#the-agent-home-is-root-owned)), but the caller would
+still share a uid with every process the model starts and work in directories the model
+owns, so the principal stays separate.
 
 The consequence is not that the model gains a capability. It already has a shell in the
 sandbox and can run `kubectl` there whenever it likes. The consequence is that it can
@@ -2880,8 +2908,9 @@ anyway is in [The Session KV store](#the-session-kv-store).
 - **The SSH helper reaches the sandbox, and the commands behind it now run.**
   `agents/platform/scripts/sandbox_exec.py` routes every credentialed call site that
   runs in the agent pod (the `gitops_workspace._read_state_key` kubectl fallback aside),
-  and the `hermes` account, its authorised key and the `.bashrc` isolation are covered
-  by `make docker-smoke-sandbox`. When the helper landed, a routed `gcloud` or `kubectl`
+  and the `hermes` account, its authorised key and the root-owned home that closes the
+  `.bashrc` route are covered by `make docker-smoke-sandbox`. When the helper landed, a
+  routed `gcloud` or `kubectl`
   stopped at `CREDENTIAL_PROXY_URL is not configured`, so the connection was proven and
   the command behind it was not; since then `stall-watch`, a shipped roster entry, runs `gcloud container clusters
 get-credentials` and `kubectl` behind it on every tick, and `github_token_refresh.py`'s
