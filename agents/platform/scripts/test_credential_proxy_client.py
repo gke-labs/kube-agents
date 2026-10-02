@@ -26,6 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import credential_proxy_client
 
+try:
+    import tools.terminal_hints as terminal_hints
+    HAS_HERMES = True
+except ImportError:
+    terminal_hints = None  # type: ignore[assignment]
+    HAS_HERMES = False
+
 
 class RecordingResponse(io.BytesIO):
     """Stand-in for the urlopen context manager the client reads."""
@@ -1265,19 +1272,13 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         self.assertIn("kubectl delete is not permitted.", err)
         self.assertIn("policy rule: kubernetes.read-only", err)
 
+    @unittest.skipUnless(HAS_HERMES, "needs hermes-agent runtime (tools.terminal_hints) importable")
     def test_exit_77_receives_no_runtime_execution_hint(self):
         # Hermes Agent's tools.terminal_hints defines hints for failed commands.
         # Exit 126 was annotated with:
         #   "Exit 126: the file was found but is not executable — `chmod +x` it..."
         # Exit 77 must not trigger any runtime hint on the refusal output.
-        try:
-            import importlib
-            terminal_hints = importlib.import_module("tools.terminal_hints")
-        except ImportError:
-            raise unittest.SkipTest(
-                "tools.terminal_hints is provided by the hermes-agent runtime and not vendored in kube-agents"
-            )
-
+        assert terminal_hints is not None
         output = "Command blocked for security reasons.\npolicy rule: kubernetes.read-only\n"
         hint = terminal_hints.annotate_failure("kubectl delete pod mypod", 77, output)
         self.assertIsNone(
