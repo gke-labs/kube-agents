@@ -83,7 +83,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 2. **Get a working copy.** The pod is not a git checkout. `submit_suggestion.py prepare` brings the GitOps repository down onto this filesystem, stands you on the remediation branch, and prints one JSON line:
 
    ```bash
-   "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+   python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \
      --repo "<owner>/<repo>" \
      --branch "platform-agent/remediate-stockout-<workload_name>"
    ```
@@ -329,7 +329,7 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 - **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
 EOF
 
-"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
+python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --repo "<owner>/<repo>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE stockout for <workload_name>" \

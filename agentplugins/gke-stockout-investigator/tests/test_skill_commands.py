@@ -81,6 +81,8 @@ class SkillCommandsTest(unittest.TestCase):
     def test_a_command_that_runs_no_variable_is_not_caught(self):
         for command in (
             "./skills/submit-suggestion/scripts/submit_suggestion.py prepare \\",
+            'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \\',
+            'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \\',
             'V="$HERMES_HOME"/skills/version-control/scripts/vcs.py',
             'python3 "$V" proposal list --repo <owner>/<repo>',
             "SHA=$(/opt/vcs/libexec/git rev-parse HEAD)",
