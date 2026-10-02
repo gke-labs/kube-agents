@@ -396,6 +396,23 @@ class ToolCalledVerifier(BaseVerifier):
                 for entry in entries
                 if entry.get("agent") and re.fullmatch(self.agent, entry["agent"])
             ]
+            if not entries:
+                seen_agents = sorted(
+                    {
+                        str(e.get("agent"))
+                        for e in snap.trajectory
+                        if isinstance(e, dict) and e.get("agent")
+                    }
+                )
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        f"no worker trajectory entries matched agent selector {self.agent!r}"
+                        f" (seen agents: {seen_agents})"
+                    ),
+                )
         wanted = set(self.tool_names)
         calls = [
             entry

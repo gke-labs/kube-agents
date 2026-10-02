@@ -1389,6 +1389,28 @@ def test_tool_called_workers_scope_filters_by_agent():
     assert no_cluster.status == "fail" and no_cluster.raw == {"matching_calls": 0}
 
 
+def test_tool_called_agent_selector_matching_no_worker_is_error():
+    multi_agent_trajectory = [
+        {"name": "kanban_create", "args": {}, "status": "completed"},
+        {
+            "name": "mcp__gke__get_k8s_resource",
+            "args": {"name": "payments-api"},
+            "status": "completed",
+            "agent": "cluster-seeded-a-east",
+        },
+    ]
+    transcript.set("done", multi_agent_trajectory)
+    res = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["mcp__gke__get_k8s_resource"],
+        scope="workers",
+        agent="platform",
+    ).verify(5.0)
+    assert res.status == "error"
+    assert "no worker trajectory entries matched agent selector 'platform'" in res.reason
+    assert "cluster-seeded-a-east" in res.reason
+
+
 def test_tool_called_all_scope_counts_both():
     transcript.set("done", _WORKER_TAGGED)
     v = ToolCalledVerifier(
