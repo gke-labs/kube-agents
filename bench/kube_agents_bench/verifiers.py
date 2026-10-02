@@ -660,7 +660,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     The harness reads each delegated card's worker log before purging it and
     stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
     this verifier matches Python regular expressions against those strings,
-    ``re.search`` on each command verbatim.
+    ``re.search`` on each command verbatim. That line is hermes's one-line
+    rendering of the command (``summarize_shell_command`` in its
+    ``agent/display.py``), not the text as typed: a newline becomes a space,
+    a chain joined by ``;``, ``&&`` or ``||`` arrives as its first command
+    (a leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
+    skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe,
+    a substitution and a backtick stay. A pattern reads the rendering, so a
+    command chained behind another is not on any line it sees.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -672,7 +679,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     shell join, pipe, substitution or redirection) grades what the worker did,
     not what it read. Write the exemption as narrowly as that; a forbidden command
     behind an exempt one on the same line is a bypass the exemption must not
-    admit.
+    admit, and a collapsed chain (a line ending `` + N command(s)``) is such a
+    line.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
