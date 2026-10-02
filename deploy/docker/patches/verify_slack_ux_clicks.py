@@ -55,8 +55,9 @@ RUNTIME_MEMBERS = (
     "_begin_interaction", "_slack_allowed_channels", "_slack_disable_dms", "_get_client",
     "_handle_slack_message",
 )
-#: The marker that makes the message handler skip the mention requirement for a click's turn.
-FORCE_MARKER = 'event.get("_hermes_force_process")'
+#: The event key whose ``.get()`` makes the message handler skip the mention
+#: requirement for a click's turn. Matched in the AST, so quoting does not matter.
+FORCE_MARKER = "_hermes_force_process"
 BEGIN_INTERACTION = "_begin_interaction"
 BEGIN_POSITIONAL = ("self", "ack", "body", "action", "kind")
 #: What ``_begin_interaction`` returns, unpacked positionally by ``answer()``.
@@ -219,15 +220,26 @@ def check_members(tree: ast.Module) -> None:
         raise _fail(f"{BEGIN_INTERACTION} returns {returned!r}, slack_ux_clicks unpacks {BEGIN_RETURNS!r}")
 
 
+def _reads_force_marker(tree: ast.AST) -> bool:
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == FORCE_MARKER
+        for node in ast.walk(tree)
+    )
+
+
 def check_adapter(root: Path) -> None:
     path = root / ADAPTER
     if not path.is_file():
         raise _fail(f"{path} does not exist")
-    source = path.read_text()
-    tree = ast.parse(source)
+    tree = ast.parse(path.read_text())
     check_members(tree)
-    if FORCE_MARKER not in source:
-        raise _fail(f"{ADAPTER} no longer reads {FORCE_MARKER}, which a click's message relies on")
+    if not _reads_force_marker(tree):
+        raise _fail(f"{ADAPTER} no longer reads .get({FORCE_MARKER!r}), which a click's message relies on")
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == METHOD]
     if len(methods) != 1:
         raise _fail(f"{ADAPTER} has {len(methods)} def {METHOD}(), expected 1")

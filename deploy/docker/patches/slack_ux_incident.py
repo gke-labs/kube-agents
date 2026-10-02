@@ -30,10 +30,10 @@ show options the stored row does not have and erase the first from Slack; a
 thread that already has a row gets the reply upstream posts. That row is a
 best-effort write after the send, so this process also remembers the alerts
 it edited and never edits one twice; only a failed write followed by a
-gateway restart leaves a thread open to a second edit. A report with no "What's wrong" sentence, an
-option named but not parsed, a fold ``block_kit`` cannot render or that would hold
-a block outside ``FOLD_CHILD_TYPES``, or any failure
-to edit, also falls back to that reply.
+gateway restart leaves a thread open to a second edit. A report with no
+"What's wrong" sentence, an option named but not parsed, a fold
+``block_kit`` cannot render or that would hold a block outside
+``FOLD_CHILD_TYPES``, or any failure to edit, also falls back to that reply.
 """
 
 from __future__ import annotations
