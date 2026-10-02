@@ -4217,10 +4217,10 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// An allowlist, not a denylist: this env reaches the agent sandbox, so a
 	// variable earns a place here only if an arbitrary value for it cannot
-	// redirect state, grant access, or change what code runs. Telemetry
-	// destinations qualify, and so do the alert ceilings — they bound how many
-	// notifications the session server posts in a day and nothing else. A
-	// path, a credential or an image reference would not.
+	// redirect state, grant access, or run code the image does not already
+	// ship. Telemetry destinations qualify, and so do the alert ceilings —
+	// they bound how many notifications the session server posts in a day
+	// and nothing else. A path, a credential or an image reference would not.
 	//
 	// EOD_EXCLUDE_NAMESPACES is the end-of-day recap's only tunable. It
 	// narrows what its listing prints and reaches nothing the notifier does: no
