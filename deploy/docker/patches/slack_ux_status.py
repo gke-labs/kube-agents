@@ -285,8 +285,8 @@ async def set_thread_status(
         wanted != _status.SESSION_PROCESSING or now - sent[1] < SESSION_REFRESH_SECONDS
     ):
         return
-    client = adapter._get_client(chat_id, team_id=team_id)
     try:
+        client = adapter._get_client(chat_id, team_id=team_id)
         await status_method(client)(channel_id=chat_id, thread_ts=thread_ts, status=wanted)
     except Exception as exc:  # noqa: BLE001 — upstream debug-logs its own failures too
         logger.debug("[Slack] agents.sessions.setStatus %s: %s", fail_label, exc)
@@ -406,20 +406,23 @@ async def _session(adapter: Any, key: tuple, plan: _Plan) -> None:
     :func:`set_thread_status` skips an unchanged status against what
     Slack last accepted, so a refused one is retried and one a Planning Agent
     turn changed is restored. The legacy setter has no such check and costs a
-    call per note, beside the note's own edit.
+    call per note, beside the note's own edit. A plan that never posted set no
+    status, so it sends none.
     """
+    if not plan.ts:
+        return
     chat_id, thread_ts = key
     wanted = _plan_session(chat_id, thread_ts)
     setter = getattr(adapter, "_set_thread_status", None)
     if setter is None:
         return
-    phrase = ""
-    if wanted == _status.SESSION_PROCESSING:
-        # Hermes's own phrase: the Agent Sessions path maps it to ``processing``,
-        # and the legacy thread status, which takes free text, shows it as is.
-        default_text = getattr(adapter, "_default_status_text", None)
-        phrase = default_text(None) if callable(default_text) else _status.SESSION_PROCESSING
     try:
+        phrase = ""
+        if wanted == _status.SESSION_PROCESSING:
+            # Hermes's own phrase: the Agent Sessions path maps it to ``processing``,
+            # and the legacy thread status, which takes free text, shows it as is.
+            default_text = getattr(adapter, "_default_status_text", None)
+            phrase = default_text(None) if callable(default_text) else _status.SESSION_PROCESSING
         await setter(chat_id, plan.team_id, thread_ts, phrase, PLAN_STATUS_LABEL)
     except Exception as exc:  # noqa: BLE001 — cosmetic
         logger.debug("slack_ux_status: setting the plan's session status failed: %s", exc)
@@ -509,9 +512,11 @@ async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
     Its session closes unless a card waits on the user. A row still running
     there lost its terminal event, or its card is quiet; the thread's next
     note starts a new plan rather than reopening this one. A posted plan with
-    a row still running or waiting, or a card still rolling, joins :data:`_lapsed`,
-    where that card's events still settle its row (:func:`settle_row`) and a
-    card waiting on the user keeps the session ``suspended``.
+    a row still running or waiting, or any plan with a card still rolling, joins
+    :data:`_lapsed`, where that card's events still settle its row
+    (:func:`settle_row`), a card waiting on the user keeps the session
+    ``suspended``, and a rolling card's dashboard move still reaches its
+    rolling message (:func:`_deliver_move`), the plan never posted included.
     """
     if time.monotonic() - plan.touched < PLAN_HOLD_SECONDS:
         return
@@ -525,10 +530,9 @@ async def _lapse(adapter: Any, key: tuple, plan: _Plan) -> None:
         key[0], key[1], int(PLAN_HOLD_SECONDS),
     )
     _plans.pop(key, None)
-    if plan.ts and _held(plan):
+    if (plan.ts or plan.rolling) and _held(plan):
         await _set_aside(adapter, key, plan)
-    if plan.ts:
-        await _session(adapter, key, plan)
+    await _session(adapter, key, plan)
 
 
 async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -561,7 +565,9 @@ async def _set_aside(adapter: Any, key: tuple, plan: _Plan) -> None:
         logger.info(
             "slack_ux_status: evicting the set-aside plans in %s/%s; resending its session", *old_key,
         )
-        await _session(adapter, old_key, evicted[-1])
+        posted = next((old for old in reversed(evicted) if old.ts), None)
+        if posted is not None:
+            await _session(adapter, old_key, posted)
 
 
 async def _keep(adapter: Any, key: tuple, plan: _Plan) -> None:
@@ -798,7 +804,9 @@ async def settle_row(adapter: Any, sub: dict, kind: str) -> None:
     if sender is not None:
         await _session(adapter, key, sender)
     elif plan is None and not _lapsed.get(key):
-        await _settle_orphan(adapter, sub, key, status, done)
+        # An archive with no row in this process is cleanup of a card that
+        # finished long ago, not a settle: the thread may hold another card.
+        await _settle_orphan(adapter, sub, key, status, done and kind != ARCHIVED_KIND)
 
 
 async def _settle_orphan(adapter: Any, sub: dict, key: tuple, status: str | None, done: bool) -> None:

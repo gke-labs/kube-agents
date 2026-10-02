@@ -20,6 +20,10 @@ Four things are checked:
    busy-input onboarding hint is gated on ``drop_notice``, and
    ``SlackAdapter.send`` and ``SlackAdapter.edit_message`` pass their content
    through ``system_text``, after the DM target and the outbound check.
+   Every name a hook reads is bound where it runs (``patchlib.unbound``):
+   most are evaluated with the flag off too, so an upstream rename of
+   ``content`` or ``turn_ctx`` would otherwise raise ``NameError`` on every
+   cron delivery, Slack send or heartbeat.
 2. The notices themselves. Each interrupting notice is read out of the patched
    source, rendered, and handed to ``system_text``: with the flag on it must
    come back reworded. ``system_text`` passes text it does not recognise
@@ -54,6 +58,8 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import patchlib
 
 FLAG_ENV = "KAGE_SLACK_UX"
 ALIAS = "_kage_slack_boilerplate"
@@ -164,6 +170,17 @@ SYSTEM_LEFTOVERS = (
     "⏳", "⚡", "⚠️", "⏱️", "⏩", "↪", "♻", "/stop", "Gateway", "agent", "gateway", "Hermes", "hermes", AUTH_ERROR,
 )
 
+#: Each patched file, and how many hooks the applier put in it: a statement
+#: calling the runtime, or a ``drop_notice`` test with its guard body.
+HOOKS = {
+    DELIVERY: 1, RUN_TURN: 1, RUN_NOTIFICATIONS: 3, RUN_BUSY: 2, RUN_TURN_RUNNER: 1, SLACK_ADAPTER: 2,
+}
+#: Statements with a body of their own; a hook is never one of these.
+COMPOUND = (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith,
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Match,
+)
+
 #: Stands in for the job name the interrupted-cron-job notice interpolates;
 #: its ``action`` is read out of upstream.
 CRON_JOB_NAME = "inventory"
@@ -214,6 +231,45 @@ def _binds_alias(tree: ast.AST) -> bool:
         and any(a.name == "slack_boilerplate" and a.asname == ALIAS for a in stmt.names)
         for stmt in ast.walk(tree)
     )
+
+
+def _reads_alias(node: ast.AST) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == ALIAS and isinstance(n.ctx, ast.Load) for n in ast.walk(node))
+
+
+def _hooks(tree: ast.Module) -> list[ast.AST]:
+    """What the applier inserted: each simple statement reading the alias, and each ``if`` testing it.
+
+    An ``if`` contributes its test, and its body when that ends in a ``return``
+    or ``continue`` (the ``drop_notice`` guards, whose bodies are ours); the
+    busy-input hint's body is upstream's.
+    """
+    hooks: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _reads_alias(node.test):
+            hooks.append(node.test)
+            if isinstance(node.body[-1], ast.Return | ast.Continue):
+                hooks.extend(node.body)
+        elif isinstance(node, ast.stmt) and not isinstance(node, COMPOUND) and _reads_alias(node):
+            hooks.append(node)
+    return hooks
+
+
+def check_bound(root: Path) -> None:
+    """Every name a hook reads is bound where it runs, in each of the six patched files."""
+    for relative, expected in HOOKS.items():
+        tree = _tree(root, relative)
+        hooks = _hooks(tree)
+        found = sum(not isinstance(node, ast.stmt) or _reads_alias(node) for node in hooks)
+        if found != expected:
+            raise _fail(f"{relative} has {found} hooks, expected {expected}")
+        for node in hooks:
+            unbound = patchlib.unbound(tree, node)
+            if unbound:
+                raise _fail(
+                    f"{relative}:{node.lineno} reads {', '.join(unbound)}, which nothing binds there; "
+                    "an upstream rename the anchor did not cover"
+                )
 
 
 def check_delivery(root: Path) -> None:
@@ -588,6 +644,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     notices = check_notices(root)
     replies = check_system(root) + check_locale(root)
     check_error_sites(root)
+    check_bound(root)
     runtime = _load_runtime(root)
     check_action_words(runtime, root)
     drive(runtime, notices, replies)
@@ -596,8 +653,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
         f"goes generic on Slack, {len(notices)} interrupting "
         f"notices and {len(replies)} system replies reworded, exception text kept out of the "
         "steer and auth failure replies where they are built, and both back-online notices, the "
-        "session-database warnings and the busy-input hint kept off Slack; "
-        "flag off and every other platform unchanged"
+        "session-database warnings and the busy-input hint kept off Slack; every name the hooks read "
+        "is bound; flag off and every other platform unchanged"
     )
 
 
