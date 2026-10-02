@@ -2118,6 +2118,9 @@ func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
 	}
 	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
 		t.Fatal("the ack does not name the default addressee")
+	}
+}
+
 // TestNewRefusesTheClusterViewWithoutABrokerURL: told the view is on but not
 // where the broker is, the gateway refuses to start rather than spawn pods
 // whose shim dials nothing.
