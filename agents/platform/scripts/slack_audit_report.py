@@ -598,8 +598,8 @@ def headline_fallback(report: str, ref: LedgerRef) -> str | None:
 
     The ledger line is the report's last, the SOPs' one line; a sentence the
     relay turn put above it is not the headline. A last line that is only the
-    link falls back to the last line above it carrying a count; with none, there is no
-    headline and the report goes out unchanged.
+    link falls back to the audit line above it (:func:`_ledger_line` says
+    which); with none, there is no headline and the report goes out unchanged.
     """
     head = _clip(_ledger_line(report), REPORT_LINE_MAX)
     if not head:

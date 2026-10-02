@@ -640,6 +640,9 @@ CARD_TOTALS = (
     ('If you want I can file tickets for 2 issues: one per cluster.', 2),
     ('I can see 18 issues: the rest are in the ledger.', 20),
     ('You can find 18 issues: in the ledger.', 20),
+    ('I can fix that and 18 issues: will clear.', 20),
+    ('I can patch it but 18 issues: still remain.', 20),
+    ('I can fix this so 18 issues: clear at once.', 20),
     ('Also note that 2 issues block the upgrade.', 2),
     ('I also suggest fixing 2 issues first.', 2),
     ('I also recommend fixing 18 more issues.', 20),
@@ -775,6 +778,14 @@ KNOWN_WRONG_TOTALS = (
     ("2 more clusters returned 403 Forbidden for lack of credentials.", 4, 2),
     # A server's error is a gap only where its clause ends, so "during the scan" keeps it a finding.
     ("2 more clusters returned 500 errors during the scan.", 4, 2),
+    # An offer before a colon is read only from OFFER_LEAD's phrasings and filler words,
+    # so these read as a roll-up and add to the listed findings.
+    ("I'd like to open 2 issues: one per cluster.", 4, 2),
+    ("I could also go ahead and open 2 issues: one per cluster.", 4, 2),
+    ("I can open tickets for each of the 2 issues: one per cluster.", 4, 2),
+    ("I can fix both of these 2 issues: one PR each.", 4, 2),
+    ("I can fix the remaining 2 issues: one PR each.", 4, 2),
+    ("I can open an issue for these 2 issues: one per cluster.", 4, 2),
     # Only clusters, namespaces and projects return a scan's errors, so a node's are a finding.
     ("2 more nodes returned 500 errors.", 4, 2),
     # "there are" and "shows" after "also" count as found whatever the count.

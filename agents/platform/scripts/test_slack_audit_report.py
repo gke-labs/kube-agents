@@ -694,6 +694,12 @@ class LedgerLineTest(unittest.TestCase):
                 self.assertEqual(sar._ledger_line(report), LINE)
                 self.assertTrue(sar.headline_fallback(report, REF).startswith(f"**{LINE}**"))
 
+    def test_an_epilogue_shaped_like_an_audit_line_is_still_taken_for_it(self):
+        # Known limit: a findings total or change count after the audit line wins.
+        for epilogue in ("3 findings resolved since yesterday.", "1 critical finding is still awaiting a fix."):
+            with self.subTest(epilogue=epilogue):
+                self.assertEqual(sar._ledger_line(f"{LINE}\n{epilogue}\nLedger: {LEDGER}"), epilogue)
+
 
 class BalancedClipTest(unittest.TestCase):
     def test_a_short_title_with_a_stray_backtick_is_left_alone(self):

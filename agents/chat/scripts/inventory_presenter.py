@@ -341,7 +341,7 @@ OFFER_MODAL = re.compile(
     re.IGNORECASE,
 )
 OFFER_VERB = frozenset({"fix", "open", "patch", "remediate", "address", "resolve", "handle"})
-#: The verbs that make a count before a colon an offer, with :data:`OFFER_MODAL`
+#: The verbs that make a count before a colon an offer, with :data:`OFFER_LEAD`
 #: before them: "Shall I raise 2 items: ...".
 OFFER_COLON_VERB = OFFER_VERB | {"file", "raise", "create"}
 #: What comes before an offer's verb: a modal, its subject, and "also" or "go
@@ -351,10 +351,14 @@ OFFER_LEAD = re.compile(
     r"\s+(?:(?:i|we|you)\s+)?(?:also\s+|go\s+ahead\s+and\s+)?$",
     re.IGNORECASE,
 )
-#: How far back from a count before a colon :func:`_offered` reads, and how
-#: many words may stand between the offer's verb and the count ("file tickets for").
+#: How far back from a count before a colon :func:`_offered` reads, how many
+#: words may stand between the offer's verb and the count, and the only words
+#: that may ("file tickets for"); "fix that and 18 issues: ..." is no offer.
 OFFER_COLON_LOOKBACK = 64
 OFFER_OBJECT_WORDS = 3
+OFFER_OBJECT_FILLER = frozenset(
+    {"up", "a", "an", "the", "these", "those", "for", "ticket", "tickets", "issue", "issues", "pr", "prs"}
+)
 #: How far back from "also" :data:`OFFER_MODAL` reads.
 OFFER_LOOKBACK = 24
 #: How far back from a count :func:`_loose_rollup` reads, so a long paragraph of
@@ -429,15 +433,18 @@ def _loose_rollup(text: str, listed: int | None = None) -> bool:
 def _offered(text: str, start: int) -> bool:
     """Whether the count at ``start`` is an offer's: :data:`OFFER_LEAD`, then a verb of :data:`OFFER_COLON_VERB`.
 
-    Up to :data:`OFFER_OBJECT_WORDS` words may follow the verb ("open up 2
-    issues", "file tickets for 2 issues"); "I can see 18 issues: ..." is no offer.
+    Up to :data:`OFFER_OBJECT_WORDS` words of :data:`OFFER_OBJECT_FILLER` may
+    follow the verb ("open up 2 issues", "file tickets for 2 issues"); "I can
+    see 18 issues: ..." is no offer.
     """
     clause = CLAUSE_BREAK.split(text[max(0, start - OFFER_COLON_LOOKBACK) : start])[-1]
     words = list(re.finditer(r"[A-Za-z]+", clause))
-    return any(
-        word.group(0).lower() in OFFER_COLON_VERB and OFFER_LEAD.search(clause[: word.start()])
-        for word in words[-(OFFER_OBJECT_WORDS + 1) :]
-    )
+    for word in reversed(words[-(OFFER_OBJECT_WORDS + 1) :]):
+        if word.group(0).lower() in OFFER_COLON_VERB and OFFER_LEAD.search(clause[: word.start()]):
+            return True
+        if word.group(0).lower() not in OFFER_OBJECT_FILLER:
+            return False
+    return False
 
 
 def _marked(text: str) -> bool:
