@@ -5,7 +5,7 @@ Run by ``deploy/docker/Dockerfile`` against the patched ``/opt/hermes`` tree,
 after ``apply_slack_boilerplate.py``, with ``slack_presenter.py`` staged beside
 this script.
 
-Five things are checked:
+Four things are checked:
 
 1. The call sites. Both cron send lanes take ``target_text``, bound from
    ``cron_delivery_text`` over the unwrapped ``content`` and the wrapped
@@ -20,6 +20,10 @@ Five things are checked:
    busy-input onboarding hint is gated on ``drop_notice``, and
    ``SlackAdapter.send`` and ``SlackAdapter.edit_message`` pass their content
    through ``system_text``, after the DM target and the outbound check.
+   Every name a hook reads is bound where it runs (``patchlib.unbound``):
+   most are evaluated with the flag off too, so an upstream rename of
+   ``content`` or ``turn_ctx`` would otherwise raise ``NameError`` on every
+   cron delivery, Slack send or heartbeat.
 2. The notices themselves. Each interrupting notice is read out of the patched
    source, rendered, and handed to ``system_text``: with the flag on it must
    come back reworded. ``system_text`` passes text it does not recognise
@@ -39,14 +43,7 @@ Five things are checked:
    the exception holds. The words a drain reply or the interrupted-cron-job notice
    interpolates are read out of upstream too (``_status_action_gerund()`` and
    the notice's ``action`` binding), and each must be one the runtime rewords.
-4. The names a spliced call reads. Every ``_kage_slack_boilerplate.*``
-   call's arguments are evaluated before the helper reads the flag, so each
-   name they read must be bound where the call sits: a parameter or assignment
-   of an enclosing function, a module-level name, or a builtin. An upstream
-   rename of a local the anchors never mention (``content``, ``turn_ctx``,
-   ``event``, ``ctx``) would otherwise compile and raise ``NameError`` on every
-   call, flag off.
-5. The runtime module, loaded by path: on Slack with the flag on,
+4. The runtime module, loaded by path: on Slack with the flag on,
    ``drop_notice`` is true, so neither back-online notice reaches Slack; flag
    off, and for any platform other than Slack, every helper returns its input
    and ``drop_notice`` is false.
@@ -55,13 +52,14 @@ Five things are checked:
 from __future__ import annotations
 
 import ast
-import builtins
 import importlib.util
 import itertools
 import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import patchlib
 
 FLAG_ENV = "KAGE_SLACK_UX"
 ALIAS = "_kage_slack_boilerplate"
@@ -139,8 +137,6 @@ ERROR_HELPER = f"{ALIAS}.error_reply"
 ERROR_SHAPES = (f"{AUTH_ERROR}\nTraceback line two", AUTH_ERROR + "x" * 600)
 
 SLACK_ADAPTER = "plugins/platforms/slack/adapter.py"
-#: Every file the applier splices a helper call into.
-BOUND_READ_FILES = (DELIVERY, RUN_TURN, RUN_NOTIFICATIONS, RUN_BUSY, RUN_TURN_RUNNER, SLACK_ADAPTER)
 SLACK_CLASS = "SlackAdapter"
 #: Each hooked method, and what the statement just before the hook contains.
 SLACK_METHODS = {"send": "self._dm_target(", "edit_message": "return blocked"}
@@ -172,6 +168,17 @@ SYSTEM_LITERALS = (
 #: Left on a reworded reply, any of these means the rewording missed.
 SYSTEM_LEFTOVERS = (
     "⏳", "⚡", "⚠️", "⏱️", "⏩", "↪", "♻", "/stop", "Gateway", "agent", "gateway", "Hermes", "hermes", AUTH_ERROR,
+)
+
+#: Each patched file, and how many hooks the applier put in it: a statement
+#: calling the runtime, or a ``drop_notice`` test with its guard body.
+HOOKS = {
+    DELIVERY: 1, RUN_TURN: 1, RUN_NOTIFICATIONS: 3, RUN_BUSY: 2, RUN_TURN_RUNNER: 1, SLACK_ADAPTER: 2,
+}
+#: Statements with a body of their own; a hook is never one of these.
+COMPOUND = (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith,
+    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Match,
 )
 
 #: Stands in for the job name the interrupted-cron-job notice interpolates;
@@ -226,61 +233,43 @@ def _binds_alias(tree: ast.AST) -> bool:
     )
 
 
-def _scope_names(body: list[ast.stmt], args: ast.arguments | None = None) -> set[str]:
-    """The names ``body`` binds in its own scope, without descending into nested functions or classes."""
-    names = set()
-    if args is not None:
-        names |= {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
-        names |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
-    stack = list(body)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.Lambda):
-            continue
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        elif isinstance(node, ast.alias):
-            names.add((node.asname or node.name).split(".")[0])
-        stack.extend(ast.iter_child_nodes(node))
-    return names
+def _reads_alias(node: ast.AST) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == ALIAS and isinstance(n.ctx, ast.Load) for n in ast.walk(node))
 
 
-def _unbound_reads(tree: ast.Module) -> tuple[int, list[str]]:
-    """How many spliced calls ``tree`` holds, and each name one reads that nothing binds where it sits."""
-    module = _scope_names(tree.body) | set(dir(builtins))
-    found, unbound = 0, []
+def _hooks(tree: ast.Module) -> list[ast.AST]:
+    """What the applier inserted: each simple statement reading the alias, and each ``if`` testing it.
 
-    def visit(node: ast.AST, bound: set[str]) -> None:
-        nonlocal found
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
-            body = node.body if isinstance(node.body, list) else [node.body]
-            bound = bound | _scope_names(body, node.args)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and _is_helper(node, node.func.attr):
-            found += 1
-            for arg in [*node.args, *(k.value for k in node.keywords)]:
-                local = _scope_names([arg])
-                for name in ast.walk(arg):
-                    if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load) and name.id not in bound | local:
-                        unbound.append(f"{name.id} (line {node.lineno}, {ast.unparse(node.func)})")
-        for child in ast.iter_child_nodes(node):
-            visit(child, bound)
-
-    visit(tree, module)
-    return found, unbound
+    An ``if`` contributes its test, and its body when that ends in a ``return``
+    or ``continue`` (the ``drop_notice`` guards, whose bodies are ours); the
+    busy-input hint's body is upstream's.
+    """
+    hooks: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _reads_alias(node.test):
+            hooks.append(node.test)
+            if isinstance(node.body[-1], ast.Return | ast.Continue):
+                hooks.extend(node.body)
+        elif isinstance(node, ast.stmt) and not isinstance(node, COMPOUND) and _reads_alias(node):
+            hooks.append(node)
+    return hooks
 
 
-def check_bound_reads(root: Path) -> None:
-    for relative in BOUND_READ_FILES:
-        found, unbound = _unbound_reads(_tree(root, relative))
-        if not found:
-            raise _fail(f"{relative} carries no {ALIAS} call")
-        if unbound:
-            raise _fail(f"{relative} passes a {ALIAS} call a name nothing binds there: {', '.join(unbound)}")
+def check_bound(root: Path) -> None:
+    """Every name a hook reads is bound where it runs, in each of the six patched files."""
+    for relative, expected in HOOKS.items():
+        tree = _tree(root, relative)
+        hooks = _hooks(tree)
+        found = sum(not isinstance(node, ast.stmt) or _reads_alias(node) for node in hooks)
+        if found != expected:
+            raise _fail(f"{relative} has {found} hooks, expected {expected}")
+        for node in hooks:
+            unbound = patchlib.unbound(tree, node)
+            if unbound:
+                raise _fail(
+                    f"{relative}:{node.lineno} reads {', '.join(unbound)}, which nothing binds there; "
+                    "an upstream rename the anchor did not cover"
+                )
 
 
 def check_delivery(root: Path) -> None:
@@ -655,7 +644,7 @@ def main(root: Path = Path("/opt/hermes")) -> None:
     notices = check_notices(root)
     replies = check_system(root) + check_locale(root)
     check_error_sites(root)
-    check_bound_reads(root)
+    check_bound(root)
     runtime = _load_runtime(root)
     check_action_words(runtime, root)
     drive(runtime, notices, replies)
@@ -664,8 +653,8 @@ def main(root: Path = Path("/opt/hermes")) -> None:
         f"goes generic on Slack, {len(notices)} interrupting "
         f"notices and {len(replies)} system replies reworded, exception text kept out of the "
         "steer and auth failure replies where they are built, and both back-online notices, the "
-        "session-database warnings and the busy-input hint kept off Slack; "
-        "flag off and every other platform unchanged"
+        "session-database warnings and the busy-input hint kept off Slack; every name the hooks read "
+        "is bound; flag off and every other platform unchanged"
     )
 
 

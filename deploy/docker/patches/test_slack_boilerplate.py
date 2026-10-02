@@ -723,15 +723,27 @@ class ApplierTest(unittest.TestCase):
             verifier.main(self.root.dir)
         self.assertIn("no longer looks up gateway.restart.restarting", str(caught.exception))
 
-    def test_verifier_refuses_a_spliced_call_reading_a_renamed_local(self):
+    def test_verifier_refuses_a_hook_reading_a_renamed_name(self):
         applier.apply(self.root.dir)
-        path = self.root.dir / applier.DELIVERY
-        path.write_text(path.read_text().replace(
-            "def _deliver_result(job, content, targets", "def _deliver_result(job, body, targets"
-        ).replace("delivery_content = content", "delivery_content = body"))
-        with self.assertRaises(SystemExit) as caught:
-            verifier.main(self.root.dir)
-        self.assertIn("content (line", str(caught.exception))
+        for relative, old, new, name in (
+            (applier.RUN_TURN, "self, disp, turn_ctx,", "self, disp, turn,", "turn_ctx"),
+            (applier.DELIVERY, "def _deliver_result(job, content,", "def _deliver_result(job, text,", "content"),
+            (applier.SLACK_ADAPTER, "self, chat_id: str, content: str,", "self, chat_id: str, text: str,", "content"),
+            (applier.RUN_NOTIFICATIONS, "platform_str = platform.value", "platform_name = platform.value",
+             "platform_str"),
+            (applier.RUN_TURN_RUNNER, "def _run_agent(self, ctx, runner)", "def _run_agent(self, turn, runner)", "ctx"),
+            (applier.RUN_BUSY, "def _busy_steer_command(self, event,", "def _busy_steer_command(self, ev,", "event"),
+        ):
+            with self.subTest(relative=relative, name=name):
+                path = self.root.dir / relative
+                patched = path.read_text()
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.check_bound(self.root.dir)
+                self.assertIn(f"reads {name}, which nothing binds", str(caught.exception))
+                path.write_text(patched)
+        verifier.check_bound(self.root.dir)
 
     def test_verifier_refuses_a_dropped_wrapper(self):
         applier.apply(self.root.dir)

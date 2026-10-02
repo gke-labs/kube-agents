@@ -49,6 +49,7 @@ through a file leaves that file untouched rather than half-patched.
 from __future__ import annotations
 
 import ast
+import builtins
 from pathlib import Path
 
 #: The standard tail on an anchor-mismatch message. Says what broke (upstream
@@ -550,3 +551,102 @@ class Patch:
                 )
         self.path.write_text(self.source)
         print(f"{self.prefix} patch: {self.relative} ({summary})")
+
+
+# -- verifier helpers ---------------------------------------------------------
+#
+# An anchor pins the text an edit replaces, not the names the inserted text
+# reads. A free name compiles as a global load, so an upstream rename of a
+# parameter or local an insertion uses passes the applier's anchor and
+# ``commit``'s compile step, and raises ``NameError`` only when the line runs.
+# A verifier runs :func:`unbound` over each node its applier inserted.
+
+
+def module_names(tree: ast.Module) -> set[str]:
+    """Names bound at module level, including under a top-level ``if``, ``try`` or ``with``, and builtins."""
+    names = set(dir(builtins))
+    stack = list(tree.body)
+    while stack:
+        stmt = stack.pop()
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(stmt.name)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in stmt.names)
+        elif isinstance(stmt, (ast.If, ast.Try, ast.With)):
+            for child in ast.iter_child_nodes(stmt):
+                if isinstance(child, ast.stmt):
+                    stack.append(child)
+                elif isinstance(child, ast.excepthandler):
+                    stack.extend(child.body)
+        else:
+            names.update(_stored(stmt))
+    return names
+
+
+def _stored(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
+
+def _own(node: ast.AST) -> set[str]:
+    """Names ``node`` binds for its own reads: an assignment's value runs before its target binds."""
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return _stored(node.value) if node.value is not None else set()
+    return _stored(node)
+
+
+def _binds(stmt: ast.stmt) -> set[str]:
+    """Names ``stmt`` binds on every path through it: none for a branch, which may not have run."""
+    if isinstance(stmt, ast.Assign):
+        return {name for target in stmt.targets for name in _stored(target)}
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        return _stored(stmt.target)
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return {(a.asname or a.name).split(".")[0] for a in stmt.names}
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {stmt.name}
+    return set()
+
+
+def _index(block: object, child: ast.AST) -> int | None:
+    """Where ``child`` sits in ``block``, a statement list, or None."""
+    if isinstance(block, list):
+        for i, stmt in enumerate(block):
+            if stmt is child:
+                return i
+    return None
+
+
+def unbound(tree: ast.Module, node: ast.AST) -> list[str]:
+    """Names ``node``, somewhere in ``tree``, reads that nothing binds before it runs.
+
+    Bound means a module-level name or builtin, a parameter of an enclosing
+    function, the target of an enclosing ``for``, ``with`` or ``except``, a
+    name ``node`` binds ahead of its read (a comprehension variable, not an
+    assignment's own target), or a plain assignment, import or ``def`` ahead
+    of it in an enclosing block outside a class body.
+    """
+    parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    bound = module_names(tree) | _own(node)
+    child = node
+    while id(child) in parents:
+        parent = parents[id(child)]
+        blocks = [getattr(parent, field, None) for field in ("body", "orelse", "finalbody")]
+        at = [(block, i) for block in blocks if (i := _index(block, child)) is not None]
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and (at or child is parent.body):
+            signature = parent.args
+            bound.update(a.arg for a in signature.posonlyargs + signature.args + signature.kwonlyargs)
+            bound.update(a.arg for a in (signature.vararg, signature.kwarg) if a is not None)
+        elif isinstance(parent, (ast.For, ast.AsyncFor)) and _index(parent.body, child) is not None:
+            bound |= _stored(parent.target)
+        elif isinstance(parent, (ast.With, ast.AsyncWith)) and at:
+            bound.update(name for item in parent.items if item.optional_vars for name in _stored(item.optional_vars))
+        elif isinstance(parent, ast.ExceptHandler) and parent.name:
+            bound.add(parent.name)
+        if not isinstance(parent, (ast.Module, ast.ClassDef)):
+            for block, i in at:
+                for earlier in block[:i]:
+                    bound |= _binds(earlier)
+        child = parent
+    return sorted({
+        n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound
+    })
