@@ -157,10 +157,15 @@ A second switch of the same kind: `A2A_SESSION_CLUSTER_VIEW=true` on the operato
 `spec.mode: next`, gives the session pods the gateway spawns a temporary read-only view of the
 clusters. The operator names the session ServiceAccount on the credential broker's allowed
 callers, renders a session audience the broker maps to a role that reaches the exec route for
-`kubectl` and `gcloud` only, opens the broker's ingress and the session pod's egress to each
+`kubectl` and `gcloud` only, binds the two so that ServiceAccount may present only that audience
+and no other caller may present it, opens the broker's ingress and the session pod's egress to each
 other, and tells the gateway, whose spawner projects the audience-bound token and enables the
 worker's shell. The session ServiceAccount gains no RBAC in either state; `kubectl` runs in the
-broker, read-only. Operator-level for the reason above: the pod executes model output, and
+broker, read-only in verbs, and with the broker's permissions: under a `custom` permission set
+with an admin role the broker's allowlist is the only control and `kubectl get secret` returns
+data, as
+[credential isolation](../site/src/content/docs/reference/credential-isolation.md#pod-anatomy)
+says of the platform agent. Operator-level for the reason above: the pod executes model output, and
 widening its fence is a property of who deployed the operator. It is a demo aid until
 declarative profiles carry a session's identity and tools, and it goes when they do.
 
