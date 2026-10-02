@@ -60,7 +60,7 @@ readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
 readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: notification-relay runs without a PodDisruptionBudget on purpose
+title: seeded-intent runs without a PodDisruptionBudget or a NetworkPolicy on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent

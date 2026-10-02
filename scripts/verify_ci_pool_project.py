@@ -356,7 +356,7 @@ GITOPS_INTENT_NOTE_MESSAGE = "Declare seeded-intent's missing PodDisruptionBudge
 # compared to this text.
 GITOPS_INTENT_NOTE_CONTENT = """---
 type: decision
-title: notification-relay runs without a PodDisruptionBudget on purpose
+title: seeded-intent runs without a PodDisruptionBudget or a NetworkPolicy on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
