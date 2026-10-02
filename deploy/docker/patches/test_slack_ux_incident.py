@@ -487,6 +487,16 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(triage["links"][1], ("Cloud Logs", encoded))
         self.assertIn(f"<{encoded}|Cloud Logs>", runtime.fallback_text(triage))
 
+    def test_the_url_limit_is_measured_after_encoding(self):
+        base = "https://console.cloud.google.com/logs/query;query="
+        fits = base + "a" * (runtime.BUTTON_URL_MAX - len(base))
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, fits))
+        self.assertEqual(triage["links"][1], ("Cloud Logs", fits))
+        # At the limit as written, two over once ">" becomes "%3E".
+        pushed = base + ">" + "a" * (runtime.BUTTON_URL_MAX - len(base) - 1)
+        triage = runtime.parse_triage(REPORT.replace(LOGS_URL, pushed))
+        self.assertEqual(triage["links"], [("GKE Workloads", WORKLOADS_URL)])
+
     def test_an_already_encoded_url_is_not_encoded_again(self):
         url = "https://console.cloud.google.com/logs/query;query=severity%3E%3DERROR"
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, url))
