@@ -4259,10 +4259,10 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// them about Slack. It is compared against `FLAG_ON_VALUES` in
 	// `slack_presenter.py`; any other value is off, the image default. It names
 	// no path, URL, credential or image, and no value of it adds a destination
-	// or a credential. Its writes go only to Slack, in the thread they answer,
-	// among them a reaction on an ask, a click's rewrite of the clicked message
-	// and its echo, and an incident alert's edit into its options. Each effect
-	// it switches, one per change that ships it:
+	// or a credential. Its writes go only to Slack, in the channels and threads
+	// the gateway already serves, among them a reaction on an ask, a click's
+	// rewrite of the clicked message and its echo, and an incident alert's edit
+	// into its options. Each effect it switches, one per change that ships it:
 	//
 	//   - Clicks: a click on a choice runs as the clicker's turn under the
 	//     adapter's own authorization, echoed in the same thread.
@@ -4282,6 +4282,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Thread status: less of a delegated card's delivery posts in the
 	//     thread, the thread's cards show as one plan message, and Slack shows
 	//     a session status and title on the thread.
+	//   - Harness messages: the harness's own Slack messages (the
+	//     scheduled-report wrapper, the heartbeat, restart and shutdown
+	//     notices, command and system replies) are reworded or left out.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's

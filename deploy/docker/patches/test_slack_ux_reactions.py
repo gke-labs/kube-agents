@@ -228,6 +228,19 @@ class ApplierTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             verifier.check_adapter(self.root.dir)
 
+    def test_verifier_reads_the_hooks_off_the_adapter_class(self):
+        # Guarded hooks on another class do not guard the adapter's own, which
+        # the runtime calls. Placed before the adapter they catch a module walk
+        # that takes the first match; after it, one that takes the last.
+        applier.apply(self.root.dir)
+        path = self.root.dir / applier.RELATIVE
+        other = path.read_text().replace("class SlackAdapter", "class Other", 1)
+        for name, source in (("other first", other + "\n\n" + UPSTREAM), ("other last", UPSTREAM + "\n\n" + other)):
+            with self.subTest(name):
+                path.write_text(source)
+                with self.assertRaises(SystemExit):
+                    verifier.check_adapter(self.root.dir)
+
     def test_verifier_refuses_unpatched_tree(self):
         with self.assertRaises(SystemExit):
             verifier.main(self.root.dir)
@@ -325,7 +338,10 @@ class RuntimeTest(unittest.TestCase):
         self.addCleanup(cards.stop)
         self.lineage = {}
 
+        self.lineage_reads = 0
+
         async def thread_lineage(chat_id, thread_id):
+            self.lineage_reads += 1
             return self.lineage
 
         lineage = mock.patch.object(runtime, "thread_lineage", thread_lineage)
@@ -652,6 +668,44 @@ class RuntimeTest(unittest.TestCase):
         after = {**_cards("t_a"), **_cards("t_b", creator="t_a"), **_cards("t_c", creator="t_b")}
         self._turn_racing("why?", _cards("t_a"), after, [], adapter)
         self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+
+    def test_a_card_under_a_left_out_cards_follow_up_that_closed_within_the_turn_is_left_out(self):
+        # Ask 1's t_c is running when ask 2 arrives. During ask 2's turn t_c's
+        # worker files t_a, t_a's worker files t_b, and t_a completes, so the
+        # end read shows t_b under t_a and no t_a; the lineage links t_a to t_c.
+        for events in ([], [("t_a", "completed")]):
+            with self.subTest(delivered=bool(events)):
+                runtime._deferred.clear()
+                log = []
+                first = self._turn("fix it", {}, _cards("t_c"), adapter=_Stub("111.001", log))
+                self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c", ("default", "t_b"): "t_a"}
+                second = _Stub("111.002", log)
+                self._turn_racing("why?", _cards("t_c"), {**_cards("t_c"), **_cards("t_b", creator="t_a")}, events, second)
+                self.assertEqual(second.calls, [("eyes", False), ("white_check_mark", False)])
+                # t_b is ask 1's: its follow-up's follow-up, held once t_c completes.
+                self.boards[:] = [_cards("t_b", creator="t_a")]
+                _run(runtime.settle_delegated(first, self._sub("t_c"), "completed"))
+                self.assertNotIn(("111.001", "white_check_mark"), log)
+                _run(runtime.settle_delegated(first, self._sub("t_b"), "completed"))
+                self.assertEqual(log[-1], ("111.001", "white_check_mark"))
+                self.assertEqual([ts for ts, _ in log].count("111.002"), 2)
+
+    def test_an_earlier_asks_follow_up_that_gave_up_within_the_turn_does_not_fail_it(self):
+        # t_c's worker files t_a while "why?" is answered, after the end read's
+        # snapshot, and t_a's give-up is delivered while that read awaits: t_a
+        # is in neither read, so only the lineage shows its creator.
+        adapter = _Stub()
+        self.lineage = {("default", "t_c"): None, ("default", "t_a"): "t_c"}
+        self._turn_racing("why?", _cards("t_c"), _cards("t_c"), [("t_a", "gave_up")], adapter)
+        self.assertEqual(adapter.calls, [("eyes", False), ("white_check_mark", False)])
+        self.assertEqual(self.lineage_reads, 1)
+
+    def test_the_turn_reads_the_lineage_only_for_a_creator_neither_read_shows(self):
+        self._turn("why?", _cards("t_old"), _cards("t_old"))
+        self._turn("fix it", {}, {**_cards("t_a"), **_cards("t_b", creator="t_a")})
+        self.assertEqual(self.lineage_reads, 0)
+        self._turn("fix it", {}, _cards("t_b", creator="t_a"))
+        self.assertEqual(self.lineage_reads, 1)
 
     def test_a_card_the_turns_own_cards_worker_creates_is_its(self):
         adapter = _Stub()

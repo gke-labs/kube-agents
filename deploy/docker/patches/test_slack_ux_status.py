@@ -65,6 +65,10 @@ class SlackAdapter:
     def _get_client(self, chat_id, team_id=None):
         return self.client
 
+    @staticmethod
+    def _default_status_text(started):
+        return "is thinking..."
+
     async def _set_assistant_thread_title(self, channel_id, thread_ts, text, team_id=None):
         self.titled.append((channel_id, thread_ts, text))
 
@@ -221,6 +225,28 @@ class ApplierTest(unittest.TestCase):
                     verifier.main(self.root.dir)
                 self.assertIn("no longer binds", str(caught.exception))
 
+    def test_verifier_refuses_an_adapter_member_in_another_shape(self):
+        reshapes = (
+            ("def _get_client(self, chat_id, team_id=None):", "def _get_client(self, chat_id, team=None):"),
+            ("def _get_client(self, chat_id, team_id=None):", "async def _get_client(self, chat_id, team_id=None):"),
+            ("def _default_status_text(started):", "def _default_status_text():"),
+            ("def _default_status_text(started):", "def _default_status_text(*, started):"),
+            ("    @staticmethod\n    def _default_status_text", "    def _default_status_text"),
+        )
+        env = _flag(None)
+        self.addCleanup(env.stop)
+        path = self.root.dir / applier.RELATIVE
+        for old, new in reshapes:
+            with self.subTest(new):
+                path.write_text(UPSTREAM)
+                applier.apply(self.root.dir)
+                patched = path.read_text()
+                self.assertEqual(patched.count(old), 1)
+                path.write_text(patched.replace(old, new))
+                with self.assertRaises(SystemExit) as caught:
+                    verifier.main(self.root.dir)
+                self.assertIn(new.split("(")[0].split()[-1], str(caught.exception))
+
     def test_verifier_reads_the_adapter_class_only(self):
         applier.apply(self.root.dir)
         path = self.root.dir / applier.RELATIVE
@@ -368,6 +394,12 @@ class SessionTest(_RuntimeCase):
         adapter.client.fail.clear()
         self._status(adapter, PHRASE)
         self.assertEqual(adapter.calls, [("setStatus", "processing")] * 2)
+
+    def test_a_client_getter_in_another_shape_is_logged_not_raised(self):
+        adapter = _Adapter()
+        adapter._get_client = lambda chat_id: adapter.client
+        self._status(adapter, PHRASE)
+        self.assertEqual(adapter.calls, [])
 
     def test_threads_are_tracked_apart(self):
         adapter = _Adapter()
@@ -527,6 +559,12 @@ class PlanTest(_RuntimeCase):
         self.assertFalse(self._note(adapter, 2, "reading metrics"))
         self.assertEqual(self._kinds(adapter), ["post"])
 
+    def test_a_phrase_getter_in_another_shape_keeps_the_note_on_the_plan(self):
+        adapter = _Adapter()
+        adapter._default_status_text = lambda: PHRASE
+        self.assertTrue(self._note(adapter, 1, "reading logs"))
+        self.assertEqual(self._kinds(adapter), ["post"])
+
     def test_a_refused_edit_falls_back_and_restores_the_row(self):
         adapter = _Adapter()
         self._note(adapter, 1, "reading logs")
@@ -572,7 +610,8 @@ class PlanTest(_RuntimeCase):
     def test_a_terminal_event_never_creates_a_row(self):
         adapter = _Adapter()
         _run(runtime.settle_row(adapter, _sub(), "completed"))
-        self.assertEqual(adapter.calls, [])
+        self.assertEqual(self._kinds(adapter), ["setStatus"], "no plan posted, only the session cleared")
+        self.assertNotIn((CHANNEL, THREAD), runtime._plans)
 
     def test_a_kind_that_moves_nothing_leaves_the_row(self):
         adapter = _Adapter()
@@ -727,6 +766,43 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
         self.assertIn((CHANNEL, THREAD), runtime._plans)
 
+    def test_a_settle_after_a_restart_clears_the_working_status_once(self):
+        # setUp's reload is the restart: Slack still shows the Working… the old process set.
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(adapter.calls, [("setStatus", "closed")])
+        _run(runtime.settle_row(adapter, _sub(), "gave_up"))
+        self.assertEqual(adapter.calls, [("setStatus", "closed")], "sent once")
+
+    def test_an_archive_after_a_restart_sends_no_status(self):
+        # A card archived long after it finished; the thread may still hold another, waiting card.
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "archived"))
+        self.assertEqual(adapter.calls, [])
+
+    def test_a_wait_after_a_restart_suspends_and_its_answer_settles(self):
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "blocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["suspended", "closed"])
+
+    def test_a_restart_leaves_running_and_retried_cards_alone(self):
+        adapter = _Adapter()
+        for kind in ("crashed", "timed_out", "unblocked", "heartbeat", "commented"):
+            _run(runtime.settle_row(adapter, _sub(), kind))
+        self.assertEqual(adapter.calls, [])
+
+    def test_a_settle_with_no_thread_sends_no_status(self):
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(thread=""), "completed"))
+        self.assertEqual(adapter.calls, [])
+
+    def test_a_settle_after_a_restart_leaves_a_running_turn_working(self):
+        adapter = _Adapter()
+        _run(adapter._set_thread_status(CHANNEL, TEAM, THREAD, PHRASE, "turn"))
+        _run(runtime.settle_row(adapter, _sub(), "completed"))
+        self.assertEqual(self._sent(adapter), ["processing"])
+
     def test_archiving_a_card_whose_plan_never_posted_frees_the_thread(self):
         adapter = _Adapter(_Client(fail={"post"}))
         self.assertFalse(self._note(adapter, 1, "reading logs"))
@@ -759,6 +835,18 @@ class PlanTest(_RuntimeCase):
         with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
             _run(scenario(adapter))
         self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+
+    def test_a_move_for_a_card_rolling_after_its_never_posted_plan_lapsed_goes_to_its_rolling_message(self):
+        async def scenario(adapter):
+            self.assertFalse(await runtime.deliver_row(adapter, _sub(), 1, "check payments", "reading logs"))
+            await asyncio.sleep(0.2)
+            self.assertNotIn((CHANNEL, THREAD), runtime._plans)
+            self.assertFalse(await runtime.deliver_row(adapter, _sub(), 2, "check payments", "→ ready", "ready"))
+
+        adapter = _Adapter(_Client(fail={"post"}))
+        with mock.patch.object(runtime, "PLAN_HOLD_SECONDS", 0.05):
+            _run(scenario(adapter))
+        self.assertEqual(self._kinds(adapter), ["post"], "a plan that never posted sends no status")
 
     def test_eviction_takes_the_least_active_thread(self):
         adapter = _Adapter()

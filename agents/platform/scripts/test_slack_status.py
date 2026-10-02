@@ -2,6 +2,7 @@
 
 import ast
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,10 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import slack_status as s
+
+#: Slack's cap on a message's text, and how long a title of one that size may take.
+SLACK_MESSAGE_MAX = 40_000
+LINEAR_BUDGET_SECONDS = 1.0
 
 
 def _row(task_id="t_a", title="check payments", lines=(), status=s.TASK_RUNNING):
@@ -108,6 +113,16 @@ class PlanTest(unittest.TestCase):
         rows = [_row(lines=["a", "b"]), _row("t_b", "check seeded-b", status=s.TASK_ERROR)]
         self.assertEqual(s.plan_text("is it up?", rows), "is it up?\n◌ check payments · b\n✗ check seeded-b")
 
+    def test_text_escapes_slack_markup(self):
+        # The text field is parsed: an unescaped "<!here>" broadcasts and a "<url|label>" relabels a link.
+        rows = [_row(title="R&D: roll back", lines=["see <!here> <https://evil.example|docs>"])]
+        self.assertEqual(
+            s.plan_text(None, rows),
+            "R&amp;D: roll back\n◌ R&amp;D: roll back · see &lt;!here&gt; &lt;https://evil.example|docs&gt;",
+        )
+        blocks = s.plan_blocks(None, rows)
+        self.assertEqual(blocks[0]["title"], "R&D: roll back", "blocks carry rich text, which Slack does not parse")
+
 
 class SessionTest(unittest.TestCase):
     def test_status(self):
@@ -118,6 +133,31 @@ class SessionTest(unittest.TestCase):
     def test_title(self):
         self.assertEqual(s.session_title("<@U1> is <#C1|prod> ok: <https://a.b/c>"), "is #prod ok")
         self.assertLessEqual(len(s.session_title("x" * 200)), s.TITLE_MAX)
+
+    def test_a_long_word_after_a_short_one_is_cut_not_dropped(self):
+        self.assertEqual(s.session_title("Restart " + "n" * 90), "Restart " + "n" * 71 + s.ELLIPSIS)
+        self.assertEqual(s.session_title("word " * 40), ("word " * 15).rstrip() + s.ELLIPSIS)
+
+    def test_title_keeps_what_real_markup_gives(self):
+        cases = {
+            "is <@U123> ok with <#C1|ops> and <https://x.example/a|the doc> or <https://y.example>?": (
+                "is ok with #ops and the doc or ?"
+            ),
+            "check <!here> <!subteam^S1|@oncall> kube-system/coredns: now": "check kube-system\u2215coredns, now",
+        }
+        for ask, title in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(s.session_title(ask), title)
+
+    def test_title_stays_linear_on_unclosed_markup(self):
+        # It runs on the gateway's event loop: a pattern that rescans to the end from every
+        # "<" took 29 s on a 40 KB ask of bare "<", stalling every thread.
+        for unit in ("<", "<!", "<@", "<#A|", "<a|"):
+            with self.subTest(unit=unit):
+                ask = unit * (SLACK_MESSAGE_MAX // len(unit))
+                start = time.monotonic()
+                s.session_title(ask)
+                self.assertLess(time.monotonic() - start, LINEAR_BUDGET_SECONDS)
 
 
 if __name__ == "__main__":

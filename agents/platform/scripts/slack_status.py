@@ -13,7 +13,8 @@ the card runs. Slack's task statuses are ``pending``, ``in_progress``,
 ``complete`` and ``error`` and nothing else, so a card waiting on the user is
 ``pending``. The plan carries no Stop button yet: ``/stop`` interrupts only
 the Planning Agent's turn and would leave the cards running. :func:`plan_text`
-is the same plan as plain text, for the message's ``text`` field.
+is the same plan as plain text, for the message's ``text`` field, with ``&``,
+``<`` and ``>`` escaped since Slack parses that field.
 
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
@@ -43,13 +44,17 @@ SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLO
 TITLE_MAX = 80
 TITLE_REPLACEMENTS = ((":", ","), ("·", ","), ("/", "\u2215"))
 ELLIPSIS = "…"
+#: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
+CLIP_MIN_SHARE = 2
 
 #: Slack markup in an ask: a user or channel mention, and a link with or
 #: without its label. Mentions go; a channel keeps its name, a link its label,
 #: and a bare link goes too, since every ``:`` and ``/`` in it would be replaced.
-MENTION = re.compile(r"<[@!][^>]*>")
-CHANNEL = re.compile(r"<#[A-Z0-9]+\|([^>]*)>")
-LINK = re.compile(r"<([^>|]+)(?:\|([^>]*))?>")
+#: No set takes ``<``: Slack never nests it, and a set that did would rescan to the
+#: end of the ask from every unclosed ``<``, quadratic on the gateway's event loop.
+MENTION = re.compile(r"<[@!][^<>]*>")
+CHANNEL = re.compile(r"<#[A-Z0-9]+\|([^<>]*)>")
+LINK = re.compile(r"<([^<>|]+)(?:\|([^<>]*))?>")
 WHITESPACE = re.compile(r"\s+")
 REPEATED_COMMA = re.compile(r"\s*,[\s,]*")
 
@@ -89,6 +94,10 @@ ROW_MARKERS = {
     TASK_ERROR: "✗",
 }
 NOTE_SEPARATOR = " · "
+#: What the text fallback escapes, ``&`` first, as Hermes's ``format_message``
+#: does: Slack parses a message's ``text``, so a card title or note holding
+#: ``<!here>`` would broadcast and ``<url|label>`` would post a link under any label.
+TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 
 #: Size caps. Titles as Hermes clips its own task cards; the last few steps
 #: per row, since the row is a status and the report carries the rest; a
@@ -120,9 +129,11 @@ def _clip(text: str, limit: int) -> str:
     """``text`` cut on a word to ``limit`` characters, ellipsis included."""
     if len(text) <= limit:
         return text
-    cut = text[: limit - len(ELLIPSIS)]
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
+    hard = text[: limit - len(ELLIPSIS)]
+    cut = hard.rsplit(" ", 1)[0]
+    # A long unbroken word would otherwise take everything after the last space with it.
+    if len(cut) * CLIP_MIN_SHARE < len(hard):
+        cut = hard
     return cut.rstrip(" ,") + ELLIPSIS
 
 
@@ -220,7 +231,7 @@ def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:
-    """The plan as plain lines: the title, then a marker, title and latest note per row."""
+    """The plan as plain lines: the title, then a marker, title and latest note per row, escaped."""
     rows = list(rows)[-ROWS_MAX:]
     out = [plan_title(title, rows)]
     for row in rows:
@@ -229,4 +240,7 @@ def plan_text(title: str | None, rows: Sequence[Any]) -> str:
         if notes:
             line += NOTE_SEPARATOR + notes[-1]
         out.append(line)
-    return "\n".join(out)
+    text = "\n".join(out)
+    for raw, escaped in TEXT_ESCAPES:
+        text = text.replace(raw, escaped)
+    return text
