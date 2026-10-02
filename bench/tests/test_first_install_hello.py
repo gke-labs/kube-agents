@@ -93,3 +93,34 @@ def test_a_runbook_question_joined_to_the_closing_one_is_a_stacked_ask(case):
     joined = " Could you share your runbooks here, and " + question[0].lower() + question[1:]
     reply = example[: example.index(INVITATION)] + joined
     assert "no-stacked-asks" in _failing(case, reply)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "ask",
+    [
+        " Do you keep run books I should read first?",
+        " Any runbooks, e.g. the on-call ones, I should read first?",
+        " Any runbooks, i.e. the on-call ones, I should read first?",
+        " Do you keep runbooks in docs/runbooks.md?",
+    ],
+)
+def test_a_runbook_question_after_the_invitation_is_a_stacked_ask(case, ask):
+    example = _example(case)
+    closing = example[example.index(INVITATION) + len(INVITATION) :]
+    reply = example.replace(closing, ask)
+    assert "no-stacked-asks" in _failing(case, reply)
+
+
+def test_the_invitation_alone_does_not_say_where_results_go():
+    reply = (
+        "Hi there, I'm kube-agents 👋 I'm taking a first look at your GKE fleet."
+        " I'm only reading, so nothing in your clusters changes."
+        " Fixes come as pull requests for your team to review."
+        " Share your team's runbooks here anytime."
+        " Is there anything you want me to look at first?"
+    )
+    assert _failing("first-install-hello-running", reply) == [
+        "says-results-will-be-posted",
+        "says-results-come-to-this-chat",
+    ]

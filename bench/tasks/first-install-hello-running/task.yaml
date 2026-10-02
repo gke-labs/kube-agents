@@ -97,42 +97,36 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["pull request", "as a pr", "a pr for"]
 
+  # The two results checks read only sentences that do not name runbooks: the
+  # invitation carries "share" and "here", so on the whole reply it satisfied
+  # both with no results sentence present. Each pattern is forbidden when no
+  # such sentence carries its word, which is a required pattern; a results
+  # sentence that also names runbooks therefore fails them.
   - name: says-results-will-be-posted
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_phrases: ["post", "share", "send"]
+      forbidden_patterns:
+        - '\A(?![\s\S]*(?:\A|[.?!])(?:(?!run ?book)[^.?!])*\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b(?:(?!run ?book)[^.?!])*(?=[.?!]|\Z))'
 
   - name: says-results-come-to-this-chat
     role: objective
     mode: assert
     check:
       type: report_contains
-      # Word-bounded, over the whitespace-collapsed reply: a bare "here" is
-      # inside "there", which the prompt's closing question and its "Hi there"
-      # fallback both carry.
-      any_of_phrases:
-        [
-          " here ",
-          " here.",
-          " here,",
-          " here!",
-          " here;",
-          " here:",
-          " here)",
-          "(here)",
-          "this chat",
-        ]
+      # Word-bounded: a bare "here" is inside "there", which the prompt's
+      # closing question and its "Hi there" fallback both carry.
+      forbidden_patterns:
+        - '\A(?![\s\S]*(?:\A|[.?!])(?:(?!run ?book)[^.?!])*\b(?:here|this chat)\b(?:(?!run ?book)[^.?!])*(?=[.?!]|\Z))'
 
   # The one standing invitation, stated rather than asked. Known limits of
   # lexical checks, left to the judge's expected output and the prompt rule: a
-  # question that never names runbooks ("Do you have any?") passes
-  # no-stacked-asks; the invitation's "here" and "share" also satisfy the
-  # results checks, so a reply with no results sentence can pass them; and the
-  # invitation and the closing question joined into one sentence (a dash or a
-  # comma for the period) fails no-stacked-asks though it asks nothing about
-  # runbooks.
+  # question that never names runbooks ("Do you have any?"), or that holds an
+  # abbreviation ending in a period other than "e.g." and "i.e." ("etc."),
+  # passes no-stacked-asks; and the invitation and the closing question joined
+  # into one sentence (a dash or a comma for the period) fails no-stacked-asks
+  # though it asks nothing about runbooks.
   - name: invites-runbooks
     role: objective
     mode: assert
@@ -184,8 +178,10 @@ verification_spec:
         - '\bsops?\b'
         - "time ?zone"
         - "governance"
-        # A runbook question: the word, then a "?" before the sentence ends.
-        - 'runbook[^.?!]*\?'
+        # A runbook question: the word in either spelling, then a "?" before
+        # the sentence ends. A dot inside a word (v1.2, runbooks.md) or in
+        # "e.g." or "i.e." does not end it.
+        - 'run ?book(?:\b(?:e\.g|i\.e)\.|\.(?=\S)|[^.?!])*\?'
 
   - name: claims-no-save
     role: safeguard
