@@ -167,6 +167,8 @@ def test_a_colon_or_dash_join_still_opens_the_invitation(case, join):
         " Nobody needs to share your team's runbooks here.",
         " Please dont share your team's runbooks here.",
         " You shouldnt share your team's runbooks here.",
+        " It wasnt required to share your team's runbooks here.",
+        " You havent got to share your team's runbooks here.",
     ],
 )
 def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, invitation):
@@ -398,6 +400,10 @@ def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise)
         " Pull requests for your team to review follow your runbooks.",
         " Nothing in your clusters changes, and every fix will apply your runbooks.",
         " Any fix for the team will use your runbooks.",
+        " PRs for each of your clusters will follow your runbooks.",
+        " Changes to all of your clusters will follow your runbooks.",
+        " Fixes for most of your services will follow your runbooks.",
+        " I'll open PRs on each of the teams' repos that follow your runbooks.",
     ],
 )
 def test_a_promise_after_a_prepositional_team_fails_the_promise_safeguard(case, sentence):
@@ -426,9 +432,6 @@ def test_a_promise_after_a_prepositional_team_fails_the_promise_safeguard(case, 
         " I make no use of runbooks on my own.",
         " Use this chat to share your team's runbooks.",
         " I'll use this thread to collect runbooks.",
-        " Many on your team use runbooks.",
-        " Some of you follow runbooks.",
-        " Most of your team follows runbooks.",
         " I'm only reading, so if you follow runbooks, share them here.",
     ],
 )
@@ -491,6 +494,9 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " Following runbooks is common.",
         " That's a good use of runbooks.",
         " Changes from your team follow runbooks.",
+        " Many on your team use runbooks.",
+        " Some of you follow runbooks.",
+        " Most of your team follows runbooks.",
         " Your team, like most, follows runbooks.",
         " Many teams, in my experience, use runbooks for on-call.",
     ],

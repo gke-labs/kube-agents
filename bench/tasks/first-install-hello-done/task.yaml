@@ -151,7 +151,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|nobody|nowhere|without|cannot|unless|here)\b|n[''’]t\b|\b(?:do|does|did|ca|wo|should|need|is|are|would|could|must)nt\b|\b(?:post|shar|send|chat))[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|nobody|nowhere|without|cannot|unless|here)\b|n[''’]t\b|\b(?:do|does|did|ca|wo|should|need|is|are|was|were|has|have|had|would|could|might|must)nt\b|\b(?:post|shar|send|chat))[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -220,9 +220,8 @@ verification_spec:
   # team agrees, fixes will follow your runbooks") clears nothing. The same word inside a prepositional phrase
   # (for, in, on, at, of, from, by, about, across or into, then optionally
   # the, your, their or its) is not the subject and clears nothing, so "pull
-  # requests for your team to review that follow your runbooks" still fails;
-  # after many, some, most, all, few or each it is the subject's head and
-  # clears it ("many on your team use runbooks").
+  # requests for your team to review that follow your runbooks" still fails,
+  # and so does "PRs for each of your clusters will follow your runbooks".
   # A first-person opener ("I'll", "we will", "I plan") restarts
   # the clause and leaves only other people to clear it, and so does
   # "happy/glad/ready/keen to" whatever precedes it, so "teams keep runbooks,
@@ -259,7 +258,8 @@ verification_spec:
   # subject of happy/glad/ready/keen ("when you're ready to use runbooks
   # here, share them"); a subject outside the clearing list ("anyone who
   # follows runbooks"), or one whose clearing word sits in a prepositional
-  # phrase ("changes from your team follow runbooks"), or one set off from
+  # phrase ("changes from your team follow runbooks", "many on your team
+  # use runbooks"), or one set off from
   # the verb by a parenthetical comma ("your team, like most, follows
   # runbooks"); the noun "use" after any
   # other word ("a good use of runbooks"); a gerund ("following runbooks is
@@ -272,7 +272,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?:(?:(?:\A|[.!?…;:,\n])|(?=(?:\bme\b)))(?:(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:,\n])(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:,\n]){0,299}?)??|(?=(?:\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\b(?:happy|glad|ready|keen) to\b))(?:(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b)[^.!?…;:,\n])(?:(?<!\bmany )(?<!\bsome )(?<!\bmost )(?<!\ball )(?<!\bfew )(?<!\beach )\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:,\n]){0,299}?)??)\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bno )(?<!\bany )(?<!\bits )(?<!\btheir )us(?:e|es|ing))\s+(?:(?!to\s)[\w''’-]+\s+){0,6}run[ -]?books?\b'
+        - '(?:(?:(?:\A|[.!?…;:,\n])|(?=(?:\bme\b)))(?:(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b)[^.!?…;:,\n])(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|you|your|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:,\n]){0,299}?)??|(?=(?:\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\b(?:happy|glad|ready|keen) to\b))(?:(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b)[^.!?…;:,\n])(?:\b(?:for|in|on|at|of|from|by|about|across|into) +(?:(?:the|your|their|its) +)?(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|(?!\b(?:teams?|people|they|others|everyone|folks|engineers|sres|orgs)\b|\b(?:i|we)(?:''ll|''d|''m|''ve| will| would| can| am| want| plan| always| use| follow| apply)\b|\bme\b|\b(?:happy|glad|ready|keen) to\b)[^.!?…;:,\n]){0,299}?)??)\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bno )(?<!\bany )(?<!\bits )(?<!\btheir )us(?:e|es|ing))\s+(?:(?!to\s)[\w''’-]+\s+){0,6}run[ -]?books?\b'
 
   - name: claims-no-save
     role: safeguard
