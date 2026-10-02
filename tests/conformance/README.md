@@ -140,6 +140,7 @@ currently fails.
 | A3  | …and `--sort-by`/`--since`/`--selector` still work                         | 1        | `test_A3_the_attached_shorthand_rule_does_not_overreach`                            | the over-broad fix that breaks reads and gets switched off                                                                                                                                                                                               |
 | A3  | a request with no verified principal is refused                            | 2        | `Scenario4NoVerifiedIdentity`                                                       | a session with no principal executed under the agent's own identity, which makes D1 unenforceable                                                                                                                                                        |
 | A3  | the session-inject endpoint authenticates its caller                       | 1        | `test_A3_the_session_inject_endpoint_authenticates_its_caller`                      | **slice 2b 1.8, closed on main**: was `/sessions/{id}/inject`, no auth, full agent turn; the server now requires the key and binds loopback, and the test keeps it that way                                                                              |
+| A3  | an unlisted user's click on a Slack choice button changes nothing          | 1        | `test_A3_an_unlisted_users_click_changes_nothing`                                   | a click from someone the allowlist never named, run as their turn because the handler read the clicker from the payload instead of the adapter's authorization                                                                                           |
 | A3  | the A2A `…supervisor` subject has exactly one writer                       | 1        | `test_A3_the_supervisor_subject_has_exactly_one_writer`                             | a session ending its own task wearing the gateway's `from`, indistinguishable on replay from the supervisor declaring it dead - impersonation asserted by the caller, on the bus (`round_2/a3-decision.md`)                                              |
 | A3  | the supervisor holds no publish on an executor's `…events`                 | 1        | `test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject`           | the pre-split render: every executor's subject two-writer, so a forged supervisor terminal has somewhere to land                                                                                                                                         |
 | A3  | the executor's derived grant does not reach its own `…in`                  | 1        | `test_A3_the_executors_grant_does_not_reach_its_own_in_subject`                     | the per-task wildcard `a2a.tasks.{addressee}.{taskId}.>`, which lets a worker steer and cancel itself as if from the user                                                                                                                                |
@@ -270,12 +271,13 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-114 mutations: 88 KILLED, 24 NOISY, two `must_survive` controls (one on the
+115 mutations: 89 KILLED, 24 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
 handling), zero genuine survivors, zero stale — measured 2026-09-25 against
-this branch on `main` at `525b37e7`; re-run the harness rather than trusting
+this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
+KILLED when it was added on 2026-09-30; re-run the harness rather than trusting
 these numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 112 of the 114: a
+Note that the summary line the harness prints accounts for 113 of the 115: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is

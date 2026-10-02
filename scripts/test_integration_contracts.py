@@ -101,6 +101,8 @@ class SpecToolRegistryTest(unittest.TestCase):
             "kanban_complete",
             "kanban_block",
             "kanban_heartbeat",
+            "kanban_comment",
+            "kanban_unblock",
         },
         "*skill_manage_image_owned*": {"skill_manage"},
     }

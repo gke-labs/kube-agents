@@ -1,4 +1,4 @@
-# The inject lane's exclusions: presubmit cases that do not run when the
+# The inject lane's exclusions: registered cases that do not run when the
 # matrix goes through the A2A gateway's inject door (the harness's
 # AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
 # EVAL_MODE_NEXT=1), because the case's premise needs the chat front door
@@ -11,10 +11,11 @@
 # case. hack/ci-eval-pr.sh reads this file when it builds the matrix and,
 # only under AGENT_TRANSPORT=inject, drops the named cases from TASKS before the fan-out
 # and says so in the log; on the api transport the file changes nothing,
-# and the api lane's roster (presubmit-cases.txt, blocking-roster.txt) is
-# untouched -- an entry here is not a demotion. The same shape as the
-# validator's FIXTURE_NOT_READY: an exclusion with a reason, not a marker on
-# the case (docs/eval-gate-roster.md, "The inject lane").
+# and the api lane's rosters (presubmit-cases.txt, blocking-roster.txt,
+# nightly-cases.txt) are untouched -- an entry here is not a demotion. The
+# same shape as the validator's FIXTURE_NOT_READY: an exclusion with a
+# reason, not a marker on the case (docs/eval-gate-roster.md, "The inject
+# lane").
 #
 # What does NOT belong here: a case whose only problem on the inject lane is
 # a `worker_commands` or `worker_agents` check, or a `tool_called` check on
@@ -35,3 +36,28 @@
 # Returns to the lane when the door routes through the chat profile, or
 # when the case is rewritten for a transport-neutral premise.
 agent-kanban-smoke
+
+# #2039: grades the chat front door's reply to the wake a crashed card sends
+# it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
+# only turn). The inject door addresses `platform` directly, so the wake
+# would reach the specialist, which never receives one, and no front door
+# answers it. Returns to the lane when the door routes through the chat
+# profile.
+chat-voice-retry-says-it-is-retried
+# #2039: the same for the wake a card sends on its last attempt.
+chat-voice-final-attempt-is-not-retried
+
+# #2039: grades the chat front door's reply to the wake a blocked card sends
+# it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
+# only turn). The inject door addresses `platform` directly, so the wake
+# would reach the specialist, which never receives one, and no front door
+# answers it. Returns to the lane when the door routes through the chat
+# profile.
+chat-voice-failure-leads-with-fact
+
+# #2039: grades the chat front door's silence on the wake a card sends when
+# its question is already posted (bench/kube_agents_bench/card_wake.py
+# replays that wake as the run's first turn). The inject door addresses
+# `platform` directly, so no front door answers the wake. Returns to the
+# lane when the door routes through the chat profile.
+chat-question-wake-stays-silent
