@@ -1882,17 +1882,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
         author: str,
         lease_repo: str,
         lease_start: datetime | None,
+        started: datetime,
         fault: str | None = None,
     ) -> str | None:
         """Why a pull request is NOT an in-job sibling, or None when it is one.
 
         The first half of the test, from the issues payload; the head's half
         is :meth:`_not_agent_head`, asked once the pulls payload is read.
-        Four answers, each a clause the rejection can carry: no lease window
+        Five answers, each a clause the rejection can carry: no lease window
         in the environment; a repository other than the leased one (nobody's
         sibling, whatever its dates); an author that is not a ``[bot]`` login
         (a person's pull request, whenever opened); created before the window
-        began, less ``max_clock_skew_sec`` -- an earlier lease's leftover.
+        began, less ``max_clock_skew_sec`` -- an earlier lease's leftover;
+        created at or after this run started -- this repetition's own, which
+        the first rule grades on its push, so a pull request this run opened
+        on a branch whose tip it did not move is the #1832 rejection it
+        always was and never "an earlier repetition's".
         The author is tested before the date so a person's pull request is
         named as such whichever side of the window it sits. Open-or-merged
         is the caller's: closed unmerged is rejected before this is asked, and
@@ -1918,6 +1923,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"opened at {created.isoformat()}, {early:.0f}s before this job's "
                 f"lease window began ({lease_start.isoformat()}), so an earlier "
                 "lease's leftover and not an in-job sibling"
+            )
+        if (started - created).total_seconds() <= self.max_clock_skew_sec:
+            return (
+                f"opened at {created.isoformat()}, during this run, so this "
+                "repetition's own pull request, graded on its push and not as an "
+                "in-job sibling"
             )
         return None
 
@@ -1982,7 +1993,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
         # no window, which is the strict reading: nothing passes as a sibling
         # on a clock the check cannot read.
         lease_repo = (os.environ.get(LEASED_REPO_ENV) or "").strip().lower()
-        lease_start = _parse_github_time(os.environ.get(LEASE_START_ENV))
+        lease_raw = (os.environ.get(LEASE_START_ENV) or "").strip()
+        lease_start = _parse_github_time(lease_raw)
 
         seen: list[tuple[str, str, int]] = []
         for owner, repo, number in _PULL_URL_RE.findall(snap.final_message):
@@ -2007,6 +2019,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
         # would widen the window onto every leftover, so one outside the
         # bounds is read as no window, with the reason.
         window_fault: str | None = None
+        if lease_raw and lease_start is None:
+            window_fault = (
+                f"{LEASE_START_ENV}={lease_raw!r} is not an ISO-8601 stamp, so it is "
+                "read as no window"
+            )
+        elif lease_start is not None and "T" not in lease_raw.upper():
+            # A bare date parses as midnight and sits inside the day's bound;
+            # the script never writes one, so the shape itself is refused.
+            window_fault = (
+                f"{LEASE_START_ENV}={lease_raw!r} carries no time of day, which the "
+                "script never writes, so it is read as no window"
+            )
+            lease_start = None
         if lease_start is not None:
             ahead = (lease_start - started).total_seconds()
             if ahead > skew:
@@ -2118,7 +2143,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # PR_BOT_LOGIN_SUFFIX. Missing reads as nobody, which is no bot.
             author = str((payload.get("user") or {}).get("login") or "")
             not_sibling = self._not_in_job(
-                owner, repo, created, author, lease_repo, lease_start, window_fault
+                owner, repo, created, author, lease_repo, lease_start, started, window_fault
             )
             # Creation is not the only way a run owns a pull request: the
             # submit-suggestion skill derives the branch from the change, so a
@@ -2184,16 +2209,19 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 )
                 continue
             # Which rule is passing. Written and pushed during this run is the
-            # first, whatever the pull request is called; a stale write or
-            # head the sibling rule excused is the second; one only the
-            # widened stream window admitted is the third, and needs the
-            # stream's branch in the job's repository, since the stamp bounds
-            # when and the branch is what makes it the stream's rather than
-            # another case's in the same repository.
+            # first, whatever the pull request is called. For a case on an
+            # audit stream with the option, the stream rule decides every
+            # other candidate, ahead of the sibling rule: it is the narrower
+            # of the two (the stamp bounds when, the branch is what makes the
+            # pull request the stream's rather than another case's in the
+            # same repository), and inside a Prow job the lease window always
+            # encloses the stream's, so the sibling rule alone would admit a
+            # superset and the branch guard would never run. Otherwise a
+            # stale write or head the sibling rule excused is the second.
             written_in_run = (started - touched).total_seconds() <= skew
             pushed_in_run = not pushed or (started - pushed).total_seconds() <= skew
             own = written_in_run and pushed_in_run
-            if stream_branch and not_sibling and not own:
+            if stream_branch and not own:
                 if f"{owner}/{repo}".lower() != _stream_repo():
                     rejected.append(
                         f"{slug}: last written or pushed to before this run "
@@ -2222,6 +2250,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     f"{rule}: {slug} was {'opened' if touched == created else 'updated'} "
                     f"at {touched.isoformat()}, during this run, and carries {files}"
                 )
+            elif stream_branch:
+                rule = PR_RULE_STREAM_PULL_REQUEST
+                reason = (
+                    f"{rule}: {slug} was {'opened' if touched == created else 'updated'} "
+                    f"at {touched.isoformat()}, by an earlier run on this audit stream "
+                    f"(found already open; {since_what} at {since.isoformat()}), and "
+                    f"carries {files}"
+                )
             elif not_sibling is None:
                 rule = PR_RULE_IN_JOB_SIBLING
                 reason = (
@@ -2235,13 +2271,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     + ")"
                 )
             else:
-                rule = PR_RULE_STREAM_PULL_REQUEST
-                reason = (
-                    f"{rule}: {slug} was {'opened' if touched == created else 'updated'} "
-                    f"at {touched.isoformat()}, by an earlier run on this audit stream "
-                    f"(found already open; {since_what} at {since.isoformat()}), and "
-                    f"carries {files}"
-                )
+                # Unreachable by construction: a stale candidate is either the
+                # stream's (above) or the sibling rule's, or was rejected.
+                raise AssertionError(f"{slug}: stale candidate passed under no rule")
             if self.reuses_spent_branch:
                 try:
                     rejection, unevaluable = self._spent_before(

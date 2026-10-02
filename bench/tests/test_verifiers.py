@@ -2369,6 +2369,35 @@ def test_another_audits_branch_is_not_this_streams(token, github, stream):
     assert _pr_check(accepts_stream_pull_request=True).verify(5.0).status == "fail"
 
 
+def test_another_audits_branch_is_not_this_streams_inside_a_lease_window_either(token, github, stream, lease):
+    """The stream rule decides a stream case's stale candidates ahead of the
+    sibling rule: inside a Prow job the lease window encloses the stream's,
+    so the sibling rule alone would admit another audit's branch and the
+    branch guard would never run."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(
+        github,
+        "2026-08-21T08:19:50Z",
+        head_ref="platform-agent/fix-compliance-audit-netpol-0123abcd",
+    )
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "not one this audit stream's `finish` names" in res.reason
+
+
+def test_the_streams_own_pull_request_is_recorded_as_the_streams_inside_a_lease_window(token, github, stream, lease):
+    """And the stream's own happy case names its rule in the record, not the
+    sibling's, so the two can be counted apart."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T08:20:00Z"))
+    _pr_head_routes(github, "2026-08-21T08:19:50Z", head_ref=f"platform-agent/fix-{_STREAM_AUDIT}-netpol-0123abcd")
+    res = _pr_check(accepts_stream_pull_request=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.reason.startswith("stream-pull-request: ")
+    assert res.raw["rule"] == "stream-pull-request"
+
+
 def test_this_runs_own_pull_request_needs_no_stream_branch(token, github, stream):
     """The branch only gates what the widened window admits."""
     _stash_pr_report()
@@ -3222,16 +3251,16 @@ def test_a_lease_window_older_than_a_job_is_no_window(token, github, lease, monk
     assert "longer than any one job's lease (24h), so not this job's window" in res.reason
 
 
-def test_a_date_only_lease_stamp_is_bounded_too(token, github, lease, monkeypatch):
-    """`2026-08-19` parses as midnight UTC; two days before the run it is past
-    the bound and reads as none, where a day-wide window would have passed
-    the day's leftovers."""
+def test_a_date_only_lease_stamp_is_refused_whatever_the_day(token, github, lease, monkeypatch):
+    """`2026-08-19` parses as midnight UTC, two days before the run and past
+    the bound; it is refused for its shape before the bound is asked, since
+    the script never writes a stamp without a time of day."""
     monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-19")
     _stash_pr_report()
     _sibling_routes(github)
     res = _pr_check().verify(5.0)
     assert res.status == "fail", res.reason
-    assert "longer than any one job's lease" in res.reason
+    assert "carries no time of day, which the script never writes, so it is read as no window" in res.reason
 
 
 def test_a_lease_window_that_begins_after_the_run_is_no_window(token, github, lease, monkeypatch):
@@ -3243,13 +3272,41 @@ def test_a_lease_window_that_begins_after_the_run_is_no_window(token, github, le
     assert "begins after this run started" in res.reason
 
 
+def test_a_pull_request_this_run_opened_on_a_pre_run_tip_is_not_a_sibling(token, github, lease):
+    """A pull request created during this run on a branch whose tip this run
+    did not move: #1832's rejection, not "an earlier repetition's". The
+    sibling rule is for rep 1's pull request, created before this run."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload("2026-08-21T09:00:30Z"))
+    _pr_head_routes(github, "2026-08-21T08:29:50Z")
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "this run wrote to a pull request an earlier one pushed the fix to" in res.reason
+    assert "opened at 2026-08-21T09:00:30+00:00, during this run, so this repetition's own pull request" in res.reason
+
+
+def test_a_same_day_date_only_lease_stamp_is_no_window(token, github, lease, monkeypatch):
+    """`2026-08-21` on a run that started at 09:00 that day parses as midnight,
+    nine hours before the run and inside the day's bound; the shape is refused
+    instead, since the script never writes a stamp without a time of day."""
+    monkeypatch.setenv(verifiers.LEASE_START_ENV, "2026-08-21")
+    _stash_pr_report()
+    _sibling_routes(github)
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "carries no time of day, which the script never writes, so it is read as no window" in res.reason
+
+
 def test_an_unreadable_window_start_is_no_window(token, github, lease, monkeypatch):
     """The strict reading: nothing passes as a sibling on a clock the check
     cannot parse."""
     monkeypatch.setenv(verifiers.LEASE_START_ENV, "yesterday-ish")
     _stash_pr_report()
     _sibling_routes(github)
-    assert _pr_check().verify(5.0).status == "fail"
+    res = _pr_check().verify(5.0)
+    assert res.status == "fail", res.reason
+    # ...and the reason names the value, not the two variables' absence.
+    assert "EVAL_LEASE_STARTED_AT='yesterday-ish' is not an ISO-8601 stamp, so it is read as no window" in res.reason
 
 
 def test_the_leased_repository_is_matched_case_insensitively(token, github, lease, monkeypatch):
