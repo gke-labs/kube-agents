@@ -6968,6 +6968,81 @@ class AudienceRoleTest(unittest.TestCase):
         self.assertEqual([self.SHELL, self.CHAT], captured["body"]["spec"]["audiences"])
 
 
+class SessionCallerBindingTest(unittest.TestCase):
+    """The session ServiceAccount and the session audience go together.
+
+    The role comes from the audience, and a pod picks the audience it projects.
+    Without a binding, a pod running as the session ServiceAccount that
+    projected the shell audience would get the shell role; the binding refuses
+    that, and refuses the session audience to anyone else.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    SESSION = "kubeagents-credential-proxy-session"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    SESSION_SA = "system:serviceaccount:kubeagents-system:agent-a2a-session"
+
+    def _authenticator(self, session_callers=frozenset({SESSION_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.SESSION: credential_proxy.CALLER_ROLE_SESSION,
+            },
+            allowed_callers=frozenset({self.AGENT, self.SESSION_SA}),
+            session_callers=session_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_a_session_caller_presenting_the_shell_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only the session audience"
+        ):
+            self._authenticator()._principal_from(self._review(self.SESSION_SA, self.SHELL))
+
+    def test_a_session_caller_presenting_the_chat_audience_is_refused(self):
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            self._authenticator()._principal_from(self._review(self.SESSION_SA, self.CHAT))
+
+    def test_a_session_caller_presenting_the_session_audience_is_the_session_role(self):
+        principal = self._authenticator()._principal_from(
+            self._review(self.SESSION_SA, self.SESSION)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
+
+    def test_another_caller_presenting_the_session_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for session callers"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.SESSION))
+
+    def test_the_shell_caller_keeps_the_shell_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.AGENT, self.SHELL))
+        self.assertEqual(credential_proxy.CALLER_ROLE_SHELL, principal.role)
+
+    def test_with_no_session_callers_named_the_audience_alone_decides(self):
+        # The upgrade case: a broker rendered by an operator that names no
+        # session callers behaves as it did before the binding existed.
+        principal = self._authenticator(frozenset())._principal_from(
+            self._review(self.AGENT, self.SESSION)
+        )
+        self.assertEqual(credential_proxy.CALLER_ROLE_SESSION, principal.role)
+
+
 class RequiredRoleTest(unittest.TestCase):
     """Which side of the split each route belongs to.
 
@@ -7374,6 +7449,36 @@ class BuildAuthenticatorTest(unittest.TestCase):
                         authenticator = credential_proxy.build_authenticator()
                 self.assertNotIn(credential_proxy.CALLER_ROLE_SESSION, authenticator.audience_roles.values())
                 self.assertTrue(any("CREDENTIAL_PROXY_SESSION_AUDIENCE" in line for line in logs.output))
+
+    def test_the_session_callers_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent,system:serviceaccount:ns:agent-a2a-session",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+            "CREDENTIAL_PROXY_SESSION_CALLERS": " system:serviceaccount:ns:agent-a2a-session , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            frozenset({"system:serviceaccount:ns:agent-a2a-session"}),
+            authenticator.session_callers,
+        )
+
+    def test_a_session_audience_without_session_callers_warns(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.session_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_SESSION_CALLERS" in line for line in logs.output))
 
 
 class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):

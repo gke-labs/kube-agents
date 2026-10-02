@@ -1031,6 +1031,14 @@ class ServiceAccountAuthenticator:
     the answer rather than guessed from the request. A projected token carries
     exactly one audience, so exactly one can come back; more than one is a
     disagreement with that assumption rather than a wider grant, and is refused.
+
+    ``session_callers`` binds the session role to its ServiceAccounts in both
+    directions, because a pod chooses the audience it projects. A caller named
+    there may present only the session audience, so a session pod that
+    projected the shell audience does not get the shell role; and when the set
+    is non-empty, the session audience is refused to anyone not named in it.
+    Empty leaves the audience alone deciding, which is the pre-binding
+    behaviour an older operator's rendering still gets.
     """
 
     authenticates = True
@@ -1045,6 +1053,7 @@ class ServiceAccountAuthenticator:
         token_file: str,
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
+        session_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -1054,6 +1063,7 @@ class ServiceAccountAuthenticator:
             raise ValueError("the Kubernetes API server address is not configured")
         self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
+        self.session_callers = session_callers
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -1180,12 +1190,17 @@ class ServiceAccountAuthenticator:
         username = user.get("username") or ""
         if username not in self.allowed_callers:
             raise AuthenticationError("the authenticated caller is not permitted")
+        role = self.audience_roles[matched[0]]
+        if username in self.session_callers and role != CALLER_ROLE_SESSION:
+            raise AuthenticationError("a session caller may present only the session audience")
+        if role == CALLER_ROLE_SESSION and self.session_callers and username not in self.session_callers:
+            raise AuthenticationError("the session audience is only for session callers")
         groups = user.get("groups") or []
         return Principal(
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
-            role=self.audience_roles[matched[0]],
+            role=role,
         )
 
 
@@ -1229,6 +1244,13 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
     # set-to-the-default have to be distinguishable, and after os.getenv applies
     # a default they are not.
     chat_audience = os.getenv("CREDENTIAL_PROXY_CHAT_AUDIENCE", "").strip()
+    # The ServiceAccounts the session role is bound to. Read raw like the
+    # audiences: unset is the older operator's rendering, and means no binding.
+    session_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_SESSION_CALLERS", "").split(",")
+        if caller.strip()
+    )
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -1258,6 +1280,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif session_audience:
             audience_roles[session_audience] = CALLER_ROLE_SESSION
+            if not session_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_SESSION_AUDIENCE is set but CREDENTIAL_PROXY_SESSION_CALLERS "
+                    "is not; any allowed caller presenting the session audience gets the session "
+                    "role, and nothing keeps a session caller off the other audiences"
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -1277,6 +1305,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
+        session_callers=session_callers,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(
