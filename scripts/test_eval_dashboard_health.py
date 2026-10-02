@@ -1267,6 +1267,35 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual(result["periodics"], {})
         self.assertEqual(result["periodics_read"], [self.WEEKLY, self.SWEEP])
         self.assertFalse(any("reconcile" in line or "sweep" in line for line in result["evidence"]))
+        # What each read job's latest build did, for the recovery message.
+        self.assertEqual(sorted(result["periodics_runs"]), [self.WEEKLY, self.SWEEP])
+        self.assertEqual(result["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {}, "runs": 0})
+
+        self.assertEqual(result["periodics_runs"][self.SWEEP]["passed"], True)
+        self.assertIsNone(result["periodics_runs"][self.SWEEP]["summary"], "no report, no summary")
+
+    def test_the_sweeps_single_failed_build_is_no_note_and_its_streak_carries(self):
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        # A previous health.json without counts yet (the first tick after the
+        # counts ship); a tick with none at all is the test below.
+        first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev={})
+        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
+        second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
+        self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
+        self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
+        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=True, build="102")}, prev=second, now=T0 + timedelta(minutes=30))
+        self.assertEqual(third["periodics_streaks"][self.SWEEP], {"build": "102", "projects": {}, "runs": 0}, "a clean build clears every count")
+        self.assertEqual(third["periodics"], {})
+
+    def test_a_tick_without_the_previous_health_json_does_not_hide_a_failing_sweep(self):
+        # The counts live in the previous health.json; without it they start
+        # over, so on that tick the thresholds are off and a failed build is a
+        # note (the poster keys on the verdict and does not re-announce).
+        fail = {"projects": 1, "closed": 0, "failed": 1, "left_for_next_run": 0, "outcomes": {"kube-agents-evals-3": {"error": "HTTP 401 Unauthorized"}}}
+        blind = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev=None)
+        self.assertIn(self.SWEEP, blind["periodics"])
+        self.assertEqual(blind["periodics_streaks"][self.SWEEP]["runs"], 1)
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
         stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})

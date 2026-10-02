@@ -424,20 +424,25 @@ def reconcile_named(projects, server, owner, lease=True, runner=tofu_runner, dry
             # during the release still leaves this project's apply on record.
             _record(p, outcomes, runner, dry_run)
 
-        outcome = boskos_pool.acquire_and_hold(
-            server,
-            owner,
-            HOLD_STATE,
-            lambda project=project: boskos_pool.acquire(server, owner, HOLD_STATE, name=project),
-            visit,
-            release_failures,
-            heartbeat=True,
-        )
+        try:
+            outcome = boskos_pool.acquire_and_hold(
+                server,
+                owner,
+                HOLD_STATE,
+                lambda project=project: boskos_pool.acquire(server, owner, HOLD_STATE, name=project),
+                visit,
+                release_failures,
+                heartbeat=True,
+            )
+        finally:
+            # Merged in a finally, as the pool walk's: a release that failed
+            # before a termination unwound the hold is on the record the run
+            # writes on its way out, and an interrupted project keeps its outcome.
+            if project in release_failures:
+                _merge_release_failure(outcomes, project, release_failures[project])
         if outcome is boskos_pool.NOT_ACQUIRED:
             outcomes[project] = (OUTCOME_BUSY, REASON_BUSY)
             _line(project, outcomes[project])
-        elif project in release_failures:
-            outcomes[project] = (OUTCOME_FAILED, release_failures[project])
             _line(project, outcomes[project])
     return outcomes
 
@@ -457,11 +462,27 @@ def reconcile_pool(server, owner, size, runner=tofu_runner, dry_run=False, known
         else:
             _record(project, outcomes, runner, dry_run)
 
-    _, release_failures = boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True)
-    for project, reason in release_failures.items():
-        outcomes[project] = (OUTCOME_FAILED, reason)
-        _line(project, outcomes[project])
+    # Merged in a finally, so a release that failed before a termination
+    # unwound the walk is on the record the run writes on its way out.
+    release_failures = {}
+    try:
+        boskos_pool.walk(server, owner, HOLD_STATE, size, visit, heartbeat=True, release_failures=release_failures)
+    finally:
+        for project, reason in release_failures.items():
+            _merge_release_failure(outcomes, project, reason)
     return outcomes
+
+
+def _merge_release_failure(outcomes, project, reason):
+    """A project the termination landed in keeps its interrupted outcome (and
+    its force-unlock hint); the release failure joins its reason. Any other
+    outcome becomes the failure."""
+    outcome, detail = outcomes.get(project) or (None, None)
+    if outcome == OUTCOME_INTERRUPTED:
+        outcomes[project] = (OUTCOME_INTERRUPTED, "%s; %s" % (detail, reason))
+    else:
+        outcomes[project] = (OUTCOME_FAILED, reason)
+    _line(project, outcomes[project])
 
 
 def main(argv=None):
@@ -582,7 +603,7 @@ def _run(args, outcomes, error):
         # in included; the summary says how far the run got.
         report(outcomes)
         interrupted = sorted(p for p, (o, _) in outcomes.items() if o == OUTCOME_INTERRUPTED)
-        message = "terminated (%s) after %d project(s)%s; held projects were released" % (
+        message = "terminated (%s) after %d project(s)%s; held projects were released unless named above" % (
             exc, len(outcomes), "; interrupted in %s" % ", ".join(interrupted) if interrupted else ""
         )
         error.append(message)

@@ -236,6 +236,49 @@ AUDITS: dict[str, AuditSpec] = {
             "scaledown-blocked",
             "terminal-pods",
             "idle-namespace",
+            # Reads as the odd one out, and is: `underrequest` is §3.1's other
+            # half and belongs beside it. It sits at §3.11, after the
+            # original ten, because this tuple is the SOP's heading order, and
+            # inserting a §3.2 would renumber
+            # nine sections that the SOP's prose refers to by
+            # number — churn no check can verify afterwards. §3.1 and §3.11
+            # cross-reference each other instead.
+            "underrequest",
+            "unsized-workload",
+            "idle-workload",
+            "registry-no-cleanup",
+        ),
+        # §3.4–3.6 and §3.14 read GCP objects that belong to a project, not to
+        # a cluster; the SOP's §3 project-scoped rule puts them on their own
+        # `project/<id>` entry.
+        scopes=(
+            (
+                "cluster",
+                # A membership test for which scope a slug belongs to, so
+                # `underrequest` sits next to its pair here rather than last
+                # the way the roster above has to order it.
+                (
+                    "overrequest",
+                    "underrequest",
+                    "unsized-workload",
+                    "orphan-pv",
+                    "unconsumed-pvc",
+                    "idle-nodepool",
+                    "scaledown-blocked",
+                    "terminal-pods",
+                    "idle-namespace",
+                    "idle-workload",
+                ),
+            ),
+            (
+                "project",
+                (
+                    "unattached-disk",
+                    "idle-address",
+                    "orphan-lb",
+                    "registry-no-cleanup",
+                ),
+            ),
         ),
     ),
     "fleet-consistency-drift": AuditSpec(
@@ -300,6 +343,29 @@ AUDITS: dict[str, AuditSpec] = {
             "autoscaler-out-of-resources",
             "dangling-compute-class",
         ),
+        # §4's manifest note: the `project/<id>` entry carries the two
+        # project-scoped checks. `reservation-mismatch-risk` sits under both
+        # kinds because the SOP gives it a cluster form and a project
+        # idle-capacity form.
+        scopes=(
+            (
+                "cluster",
+                (
+                    "ccc-missing-fallbacks",
+                    "ccc-no-ondemand-floor",
+                    "ccc-large-vm-scarcity",
+                    "ccc-priority-starvation",
+                    "ccc-mixed-disk-generations",
+                    "ccc-hyperdisk-incompatible",
+                    "spot-scarcity-risk",
+                    "single-zone-nodepool",
+                    "reservation-mismatch-risk",
+                    "autoscaler-out-of-resources",
+                    "dangling-compute-class",
+                ),
+            ),
+            ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
+        ),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
         "GCP Networking Fabric & VPC IPAM Audit",
@@ -339,8 +405,10 @@ COLLECTOR_AUDITS = frozenset(
         "ai-security-audit",
         "compliance-audit",
         "fleet-consistency-drift",
+        "fleet-wide-cost-analysis",
         "obtainability-audit",
         "security-patch-orchestrator",
+        "stockout-prevention",
     }
 )
 
@@ -529,7 +597,20 @@ DELTA_RE = re.compile(
 # 5: `collect.py` makes the same rename for the obtainability, compliance and
 # ai-security streams, which until then published the bare names their
 # documents wrote.
-ID_SCHEME = 5
+#
+# 6: `fleet_waste.py` and `fleet_stockout.py` make the same rename for the cost
+# and stockout streams, and the stockout collector also re-spells three objects:
+# a quota finding names its region (`Quota/<region>:<metric>`) and an
+# autoscaler finding its message id (`ScaleUpError/<message-id>`) and an
+# idle reservation its zone (`Reservation/<zone>:<name>`), and the
+# cost collector names a project-scoped resource's location
+# (`Disk/<zone>:<name>`, likewise for addresses, forwarding rules, target
+# pools, backend services and repositories), whose names are unique only per
+# location. The qualified cluster names re-spell through the Scope table as
+# before; these objects cannot, so those rows leave the ledger unheld on the
+# first run, and `resolved` is withheld for that run rather than reporting
+# them fixed.
+ID_SCHEME = 6
 # Joins a qualified cluster name's `<project>/<location>/<name>` segments.
 QUALIFIED_TARGET_SEPARATOR = "/"
 # `<project>/<location>/<name>`: the segments of a qualified cluster name.
@@ -887,6 +968,14 @@ TARGET_KIND_PROJECT = "project"
 TARGET_KIND_SUBNET = "subnet"
 PROJECT_TARGET_PREFIX = "project/"
 TARGET_KINDS = frozenset({TARGET_KIND_CLUSTER, TARGET_KIND_PROJECT, TARGET_KIND_SUBNET})
+# Set by the cost and stockout collectors on a `project/<id>` entry whose
+# `gcloud container clusters list` completed and came back empty, or was
+# refused because that project's own Kubernetes Engine API is off -- no
+# cluster can exist there -- and never on any other failed or zone-incomplete
+# list. Carried verbatim onto that project's `scope.clusters` entry. It is
+# what tells a fleet with no clusters apart from a run that lost them
+# (`_unenumerated_kind_gaps`).
+CLUSTERS_LISTED_KEY = "clusters_listed"
 # The one manifest `outcome` under which the collector vouches for a cluster's
 # `checks_run`; every other outcome leaves the cluster to the manual fallback —
 # except `out-of-scope`, the collector saying the target is not this audit's,
@@ -959,7 +1048,7 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # these are findings a collector fully corroborated whose *fix* has a failure
 # mode the collector cannot rule out.
 #
-# One marker so far. A cost collector sets `service-fronted` on an idle
+# Two markers. A cost collector sets `service-fronted` on an idle
 # controller some Service selects, because that remediation is
 # `spec.replicas: 0` and the Service loses its endpoints with the pods. The
 # check measures CPU and memory; nothing in it measures a caller. On
@@ -968,7 +1057,14 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # thousands of packets a week. `/remediate <id>` is unaffected and is the
 # point: a person who reads the finding and asks for it by name has supplied
 # the judgement the collector could not.
-NO_SWEEP_TRIAGE = frozenset({"service-fronted"})
+#
+# The stockout collector sets `new-computeclass` on a §3.11 out-of-resources
+# finding whose affected pool no existing ComputeClass owns, and on one it
+# cannot place. That fix is a new class plus the workload that selects it:
+# two files, where a finding carries one `remediation.path`, so the sweep's
+# pull request would land a class nothing selects. `/remediate` opens the same
+# one-file pull request, for a person who knows to add the selector to it.
+NO_SWEEP_TRIAGE = frozenset({"service-fronted", "new-computeclass"})
 
 # `authorAssociation` values that imply write access, and therefore the standing
 # to issue `/remediate`.
@@ -1445,6 +1541,25 @@ def target_kind(name: str) -> str:
     return TARGET_KIND_SUBNET if "/" in name else TARGET_KIND_CLUSTER
 
 
+def scoped_target_kind(spec: "AuditSpec", name: str) -> str:
+    """`target_kind`, read against the kinds `spec` actually partitions by.
+
+    A qualified cluster, `<project>/<location>/<name>`, has the subnet's shape,
+    and the two cannot be told apart by the name alone. A stream that declares
+    no `subnet` scope has no subnet targets to confuse it with, so there the
+    shape is a cluster; reading it as a subnet would fall through to the whole
+    roster and owe every cluster the project-scoped checks too.
+    """
+    kind = target_kind(name)
+    if (
+        kind == TARGET_KIND_SUBNET
+        and name.count(QUALIFIED_TARGET_SEPARATOR) == QUALIFIED_CLUSTER_SEGMENTS - 1
+        and not any(declared == TARGET_KIND_SUBNET for declared, _ in spec.scopes)
+    ):
+        return TARGET_KIND_CLUSTER
+    return kind
+
+
 def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
     """The roster subset `target_name` is answerable for.
 
@@ -1459,7 +1574,7 @@ def audit_target_checks(audit_id: str, target_name: str) -> tuple[str, ...]:
         return ()
     if not spec.scopes:
         return spec.checks
-    kind = target_kind(str(target_name).strip())
+    kind = scoped_target_kind(spec, str(target_name).strip())
     for declared, checks in spec.scopes:
         if declared == kind:
             return checks
@@ -2757,6 +2872,16 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 f"scope.clusters[{i}].limitations",
                 allow_empty=False,
             )
+        if CLUSTERS_LISTED_KEY in cluster:
+            listed = cluster[CLUSTERS_LISTED_KEY]
+            if not name.startswith(PROJECT_TARGET_PREFIX) or isinstance(listed, bool) or listed != 0:
+                raise ValidationError(
+                    f"scope.clusters[{i}].{CLUSTERS_LISTED_KEY}: only a "
+                    f"`{PROJECT_TARGET_PREFIX}<id>` entry carries it, and only as "
+                    "the 0 the collector wrote for a project whose cluster list "
+                    f"completed empty; copy it from the manifest or leave it out. "
+                    f"{_sop_pointer(audit_id)}"
+                )
 
         # Which checks actually ran here, and the command each one ran. This is
         # the field that makes an empty `findings` list mean something: without
@@ -3440,14 +3565,35 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     An empty `scope.clusters` is left alone. That run has bigger problems and
     `validate_findings` already speaks to them; naming every kind here as well
     would bury the real error under a gap per kind.
+
+    So is the cluster kind when every project target carries
+    `CLUSTERS_LISTED_KEY`: each project's cluster list completed and came back
+    empty, so the cluster checks had nothing to run against rather than lost
+    what they should have read. One project without it -- or no project
+    target at all -- and the gap stands.
     """
     spec = AUDITS.get(audit_id)
     if not spec or not spec.scopes or not targets:
         return []
-    seen = {target_kind(str(t.get("name", "")).strip()) for t in targets if isinstance(t, dict)}
+    kinds = [
+        (scoped_target_kind(spec, str(t.get("name", "")).strip()), t) for t in targets if isinstance(t, dict)
+    ]
+    seen = {kind for kind, _ in kinds}
+    projects = [t for kind, t in kinds if kind == TARGET_KIND_PROJECT]
+    listed_empty = bool(projects) and all(
+        t.get(CLUSTERS_LISTED_KEY) == 0 and not isinstance(t.get(CLUSTERS_LISTED_KEY), bool) for t in projects
+    )
+    # A check owed by more than one kind ran wherever a present kind carried
+    # it: stockout's `reservation-mismatch-risk` has a cluster arm beside its
+    # project one, and a run with clusters and no project did not run it
+    # "against nothing".
+    covered = {check for kind, checks in spec.scopes if kind in seen for check in checks}
     gaps = []
     for kind, checks in spec.scopes:
-        if kind in seen:
+        if kind in seen or (kind == TARGET_KIND_CLUSTER and listed_empty):
+            continue
+        checks = tuple(c for c in checks if c not in covered)
+        if not checks:
             continue
         gaps.append(
             f"no {kind} targets were audited — {len(checks)} check(s) ran "
@@ -3717,6 +3863,16 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
             continue
         name = str(cluster.get("name", ""))
         manifest_cluster = manifest_clusters.get(name)
+        # The marker takes the cluster kind out of the coverage count, so it
+        # has to be the collector's word, never the document's: a project
+        # the manifest does not mark empty cannot be claimed as one.
+        if CLUSTERS_LISTED_KEY in cluster and (manifest_cluster or {}).get(CLUSTERS_LISTED_KEY) != cluster[CLUSTERS_LISTED_KEY]:
+            raise ValidationError(
+                f"scope.clusters: {name!r} carries {CLUSTERS_LISTED_KEY}="
+                f"{cluster[CLUSTERS_LISTED_KEY]!r}, but the collector manifest for "
+                f"{audit_id} does not. Carry the marker only where the manifest "
+                "entry has it, verbatim."
+            )
         if not manifest_cluster:
             continue
         claimed = checks_ran(cluster)
@@ -4217,7 +4373,7 @@ def triage_marked_findings(
     declined to make; the cap catches volume; severity catches grade. This
     catches a finding the collector made, meant, and graded, whose
     *remediation* can break something the collector never looked at. See
-    `NO_SWEEP_TRIAGE` for the one marker that qualifies.
+    `NO_SWEEP_TRIAGE` for the markers that qualify.
 
     Read off the manifest rather than the finding, because `needs_triage` is
     not a findings-schema field: the candidate is the only place it exists.
@@ -4494,6 +4650,63 @@ def _note_excerpt(front: dict, text: str, path: str) -> str:
     return clip_text(path, MAX_TITLE_CHARS)
 
 
+def _read_declares(text: str, *, where: str | None) -> tuple[dict | None, list | None, str | None]:
+    """`(frontmatter, declares, reason)`: the note's `declares` list, or why there is none.
+
+    The one ladder every reader of a note walks. `parse_declarations` walks it
+    with `where` set and logs the two shapes the SOP promises a WARNING for
+    (frontmatter that is not YAML, a `declares` that is not a list); the pool
+    verifier walks it with `where` None to print the reason to an operator, so
+    the explanation it gives is this function's and cannot drift from the
+    parser's. `reason` is None when `declares` is a non-empty list, which may
+    still yield nothing once each item is checked.
+    """
+    import yaml
+
+    front_text = split_frontmatter(text)
+    if front_text is None:
+        return None, None, "it has no frontmatter: the first line must be `---` and a `---` or `...` line must close it"
+    try:
+        front = yaml.safe_load(front_text)
+    except (yaml.YAMLError, ValueError, RecursionError) as exc:
+        # The other two are PyYAML's own, raised outside the `YAMLError`
+        # tree: an unquoted `2026-02-30` or `T25:00` is resolved as a
+        # timestamp and built with `datetime`, which raises `ValueError`,
+        # and the pure-Python loader composes nested flow collections
+        # recursively, so a few hundred nested `[` raise `RecursionError`.
+        # Left uncaught either would cost the repository its entry, not the
+        # note its declaration.
+        if where is not None:
+            log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
+        return None, None, f"its frontmatter is not valid YAML ({type(exc).__name__})"
+    if not isinstance(front, dict):
+        return None, None, f"its frontmatter is a YAML {type(front).__name__}, not a mapping, so it is not an OKF note"
+    if OKF_TYPE_KEY not in front:
+        return None, None, f"its frontmatter has no `{OKF_TYPE_KEY}`, so it is not an OKF note"
+    declares = front.get(DECLARES_KEY)
+    if declares is None:
+        return front, None, f"its frontmatter has no `{DECLARES_KEY}` list"
+    if not isinstance(declares, list):
+        if where is not None:
+            log(f"WARNING: {where}: `{DECLARES_KEY}` must be a list of items; none read.")
+        return front, None, f"its `{DECLARES_KEY}` is not a list"
+    if not declares:
+        return front, [], f"its `{DECLARES_KEY}` list is empty"
+    return front, declares, None
+
+
+def explain_empty_declarations(text: str) -> str | None:
+    """Why `parse_declarations` would read no item from `text`, or None when it has items to check.
+
+    For the pool verifier, which prints the reason to an operator: the same
+    ladder `parse_declarations` walks, without its log lines. None means the
+    note has `declares` items, so an empty result from the parser is the
+    items' own doing, and the parser logged a WARNING per item.
+    """
+    _front, _declares, reason = _read_declares(text, where=None)
+    return reason
+
+
 def parse_declarations(
     text: str, *, repo: str, path: str, declarable: frozenset[str]
 ) -> list[dict]:
@@ -4511,31 +4724,9 @@ def parse_declarations(
     warning; a file with no frontmatter, no `type` or no `declares` yields
     nothing and says nothing, because most notes are not declarations.
     """
-    import yaml
-
     where = f"{repo}:{path}"
-    front_text = split_frontmatter(text)
-    if front_text is None:
-        return []
-    try:
-        front = yaml.safe_load(front_text)
-    except (yaml.YAMLError, ValueError, RecursionError) as exc:
-        # The other two are PyYAML's own, raised outside the `YAMLError`
-        # tree: an unquoted `2026-02-30` or `T25:00` is resolved as a
-        # timestamp and built with `datetime`, which raises `ValueError`,
-        # and the pure-Python loader composes nested flow collections
-        # recursively, so a few hundred nested `[` raise `RecursionError`.
-        # Left uncaught either would cost the repository its entry, not the
-        # note its declaration.
-        log(f"WARNING: {where}: frontmatter is not valid YAML ({exc}); no declaration read from it.")
-        return []
-    if not isinstance(front, dict) or OKF_TYPE_KEY not in front:
-        return []
-    declares = front.get(DECLARES_KEY)
-    if declares is None:
-        return []
-    if not isinstance(declares, list):
-        log(f"WARNING: {where}: `{DECLARES_KEY}` must be a list of items; none read.")
+    front, declares, _reason = _read_declares(text, where=where)
+    if not declares:
         return []
     excerpt = _note_excerpt(front, text, path)
     out: list[dict] = []
@@ -4797,6 +4988,15 @@ def search_tree(
 
 def _declaration_key(entry: dict, *, with_cluster: bool) -> tuple:
     """The tuple a declaration and a finding are joined on: the finding id's segments.
+
+    Also called by scripts/verify_ci_pool_project.py (`_note_declaration_problem`),
+    which loads this module by path to read a pool repository's declared-intent
+    note exactly as the audit would. It also reaches `parse_declarations`,
+    `explain_empty_declarations`, `audit_declarable_checks`,
+    `read_intent_paths`, `_under_prefixes`, `DECLARATION_CLUSTER_FIELD` and
+    `INTENT_FILE` (the verifier's `_AUDIT_REPORT_SYMBOLS` is the list);
+    renaming any of them turns that check into "Not checked" on every
+    operator run until the verifier follows.
 
     Each field goes through `_id_segment`, the reduction `derive_finding_id`
     applies, because the ledger's identity is the standard the join has to
@@ -5269,7 +5469,7 @@ def parse_held_ids(body: str | None) -> list[str]:
 def _scope_spellings(body: str, clusters: Iterable[str] = ()) -> dict[str, set[str]]:
     """{bare cluster name: every `<project>/<location>/<name>` it could stand for}.
 
-    Schemes 3 to 5 moved a stream's cluster names from bare to qualified, so a
+    Schemes 3 to 6 moved a stream's cluster names from bare to qualified, so a
     `Where:` line written before the move names a cluster no collector
     candidate spells that way any more. The Scope row beside it has the
     project and location that qualify it; a name audited at two locations has
@@ -5315,7 +5515,7 @@ def _respelled_rows(
     Under another scheme a row naming a bare cluster is also spelled with the
     name qualified from the body's Scope table (`_scope_spellings`), and that
     spelling wins when the collector's `flagged` ids carry it and not the bare
-    one. Schemes 3 to 5 moved a stream's clusters from bare to qualified
+    one. Schemes 3 to 6 moved a stream's clusters from bare to qualified
     names; matched on the bare spelling alone, its first run under the
     collector held nothing, and a clean document closed the ledger over
     findings the collector still flagged. A name two clusters share is
@@ -5361,7 +5561,10 @@ def previous_marker_ids(
     row, so a hold survives an identity-scheme bump instead of matching no
     marker id, dropping out of the bump run's marker and leaving the ledger
     unannounced; held ids with no row — the note and empty tiers write none —
-    are the residual, which the caller reports and which the bump loses.
+    are the residual, which the caller reports and which the bump loses. A
+    row whose object the bump re-spelled (scheme 6's stockout `Quota/` and
+    `ScaleUpError/` rows, and its location-qualified cost rows) re-derives to an id nothing emits, and is lost
+    without being counted.
     `flagged` picks between a row's bare and qualified spellings
     (`_respelled_rows`), qualifying names past the Scope table from `clusters`.
     """
@@ -5412,7 +5615,8 @@ def carried_held_entries(previous_body: str | None, *, exclude: set[str]) -> lis
     the identity its held row had where the previous body had one
     (`parse_held_rows`) and as an id-only row otherwise (`held_row_from_id`).
     Under another identity scheme the rows with a location are re-spelled and
-    ids without one are the residual the bump loses (`previous_marker_ids`).
+    ids without one are the residual the bump loses (`previous_marker_ids`),
+    as are rows whose object the bump re-spelled.
     """
     held_raw = parse_held_ids(previous_body)
     if not held_raw:
@@ -7535,7 +7739,7 @@ def _render_withheld(
     `uncorroborated_findings` for the two Deployments that cost — while a
     finding it flagged and marked `needs_triage` is the opposite case: the
     observation is sound and the *fix* is what nobody has judged. See
-    `NO_SWEEP_TRIAGE` for the three that cost.
+    `NO_SWEEP_TRIAGE` for the markers, and the three findings that cost.
     """
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])
@@ -11515,6 +11719,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"{fid}: impact taken from the collector, which knows which arm "
                 "of the check fired."
             )
+    # The marker lifts a coverage gap only as the collector's word, which only
+    # `cross_check_manifest` can hold the document to; without a manifest it
+    # would be the worker's own claim that the fleet holds no clusters.
+    unbacked = [
+        str(c.get("name"))
+        for c in (data.get("scope") or {}).get("clusters") or []
+        if isinstance(c, dict) and CLUSTERS_LISTED_KEY in c
+    ]
+    if manifest is None and unbacked:
+        raise ValidationError(
+            f"scope.clusters: {', '.join(unbacked)} carries {CLUSTERS_LISTED_KEY}, "
+            "which only the collector manifest can back; pass --manifest-file, or "
+            f"leave {CLUSTERS_LISTED_KEY} out and take the coverage gap."
+        )
     waiver_given = getattr(args, "no_collector_manifest", None)
     waiver = str(waiver_given or "").strip()
     if waiver_given is not None and not waiver:
@@ -11790,7 +12008,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if stale_scheme and delta_known:
         # A scheme bump re-spells every id; the rows were re-derived from their
         # `Where:` lines (`previous_marker_ids`), and only ids with no row —
-        # the note and empty tiers write none — are lost by the bump.
+        # the note and empty tiers write none — are counted here. A bump that
+        # re-spells an object (scheme 6's stockout quota and autoscaler rows)
+        # also loses those rows, which this count does not include.
         _, residual = previous_marker_ids(previous_body)
         if residual:
             log(

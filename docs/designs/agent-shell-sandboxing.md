@@ -748,7 +748,32 @@ ability to author a skill with it. Denying at the source is the narrower cut:
 it is scoped to code the model ran in the sandbox, which is the thing the
 sandbox exists to distrust.
 
-Two things this does not close. Skills are not the only executable content under
+There is a third option that paragraph did not consider, and the image now
+takes it: deny by name inside the tool rather than by path on the tree.
+`deploy/docker/patches/skill_manage_image_owned.py` gates `skill_manage` so a
+write to a skill the image ships for the running profile is refused, while a
+new agent-authored name is accepted, which a filesystem mode cannot tell apart;
+the same module makes the file tools' write guard refuse any target under a
+Hermes home's `skills/` or `scripts/`, because those tools write the sandbox's
+copy of the tree and are where a worker refused by `skill_manage` goes next.
+It closes the write the closed writeback channel left open, the gateway's own
+tool editing a shipped skill between two restarts, which is how a graded run
+came to rewrite its own instructions in gke-labs/kube-agents#1848. It also
+settles a conflict prose could not: upstream's system prompt tells the model to
+fix a skill that has issues with `skill_manage(action='patch')`, so a rule in
+`AGENTS.md` that says the opposite competes with the framework on every turn,
+and the tool refusing is what decides it. It costs
+less than the earlier paragraph priced a read-only tree at: entrypoint step
+2.6a replaces every specialist profile's `skills/` from the image on each
+start, so what `skill_manage` authors there was never durable. The sandbox's
+copy of the same trees is still writable by what runs in the sandbox (a shell
+command, `execute_code`, or a file tool writing through a symlink made there,
+which the gateway-side guard cannot see) for as long as that sandbox pod runs;
+that edit never reaches the gateway and is replaced from the image when the
+sandbox restarts. Leaving that copy root-owned would close it
+(gke-labs/kube-agents#2096).
+
+Two things the sandbox-end closure does not close. Skills are not the only executable content under
 `~/.hermes`, so the guarantee rests on the directory being unwritable rather
 than on an enumeration of paths — a future Hermes that creates the parent
 itself, or syncs to a different root, would reopen it and nothing here would
@@ -1673,10 +1698,11 @@ volume on every start, before sshd is exec'd.
 
 The sync replaces rather than merges. Copying over the top leaves a skill deleted from
 the image, or a script renamed in it, sitting on the volume for as long as the PVC
-lives and looking current. That makes the trees image-owned: the model can edit a
-script it is debugging and the edit is gone at the next restart, which is the same
-contract the agent pod's force-sync gives. Model-written files belong in
-`/opt/data/scratch` and `/opt/data/gitops`, which the sync does not touch.
+lives and looking current. That makes the trees image-owned, and they are not the
+model's to change: the personas forbid it, because an edit made anyway is run by every
+later session in the pod until the next restart. To debug a script, copy it to
+`/opt/data/scratch` and run the copy. Model-written files belong in `/opt/data/scratch`
+and `/opt/data/gitops`, which the sync does not touch.
 
 Extending Hermes' sync to cover governance and scripts was the alternative, and it
 keeps one mechanism instead of two. It was rejected before the measurement above and

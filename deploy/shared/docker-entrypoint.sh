@@ -476,8 +476,13 @@ fi
 # service address is not in this file at all — the operator derives it from the
 # agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
 # when the file is silent. That is why no `api_url` key belongs here.
+#
+# The onboarding prompts are in this list because bootstrap_onboarding reads the PVC
+# copy ahead of the image's, and the first-install-hello eval cases grade the greeting
+# they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
+        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
@@ -1214,9 +1219,13 @@ fi
 # is otherwise frozen at whatever version first created the PVC — a helper script
 # fixed months ago is still the broken one on every upgraded cluster.
 #
-# Skills are wholly image-owned (nothing writes runtime state under them; the
-# cluster overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the
-# same way), so this is a whole-directory REPLACE rather than a copy-over: a
+# Skills are wholly image-owned (nothing durable lives under them: the cluster
+# overlay list in cluster_agent_profile.py:OVERLAY_ITEMS treats them the same
+# way, the image's skill_manage gate refuses a write that would touch a shipped
+# skill and its file tools refuse any write under the tree --
+# deploy/docker/patches/skill_manage_image_owned.py -- and a skill the
+# agent authors under a new name is discarded by this replace, deliberately),
+# so this is a whole-directory REPLACE rather than a copy-over: a
 # skill deleted from the image has to actually disappear, or a retired procedure
 # stays loadable forever. That is also why this still runs for the platform
 # profile even though step 2.6 just listed `skills` in its --items: the

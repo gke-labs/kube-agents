@@ -1773,10 +1773,12 @@ class FixtureDrift(RunHarness):
         self.assertFalse(self.recorded()["fixture_unknown"])
 
 
-def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet reconcile (weekly)", verdict="FAILED", build="100", finished="2026-09-14T13:40:00+00:00", detail=(), dry_run=False, stale_after_h=192):
+def periodic_note(job="ci-kube-agents-fleet-reconcile-all", label="seeded-fleet reconcile (weekly)", verdict="FAILED", build="100", finished="2026-09-14T13:40:00+00:00", detail=(), dry_run=False, stale_after_h=192, summary=None):
+    words = post_health.periodics.WATCHED_BY_JOB[job]
     return {
         "job": job, "label": label, "verdict": verdict, "since": finished, "build": build, "finished_at": finished, "result": "FAILURE" if verdict == "FAILED" else "SUCCESS",
-        "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{job}", "doc": "docs/ci-pool-projects.md, section 6.2",
+        "stale_after_h": stale_after_h, "dry_run": dry_run, "detail": list(detail), "summary": summary, "history_url": f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{job}",
+        "place": words.place, "absence": words.absence, "does": words.does, "effect": words.effect, "runbook": words.runbook,
     }
 
 
@@ -1794,9 +1796,10 @@ class WatchedPeriodics(RunHarness):
         self.tick(failed, T14)
         self.assertEqual(len(self.opener.texts), 1)
         text = self.opener.texts[0]
-        self.assertTrue(text.startswith("🟠 *seeded-fleet reconcile (weekly) failed* — build 100 at 9:40 AM ET."), text)
+        self.assertTrue(text.startswith("🟠 *Eval seeded fleet: planted defects are not being re-applied.*\n`ci-kube-agents-fleet-reconcile-all` runs weekly and re-applies the seeded-fleet stack in every free pool project. Its 9:40 AM ET run (build 100) failed."), text)
         self.assertIn("- kube-agents-evals-3: refused (delete google_container_cluster.seeded_b)", text)
-        self.assertIn("Recovery: docs/ci-pool-projects.md, section 6.2.", text)
+        self.assertIn("Effect: drifted fixtures stay drifted, and the eval cases that assert on them fail. CI eval infrastructure only.", text)
+        self.assertIn("Runbook: https://github.com/gke-labs/kube-agents/blob/main/docs/ci-pool-projects.md#62-the-scheduled-reconcile · Build: ", text)
         self.assertIn(f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{self.WEEKLY}", text)
         self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"})
         self.assertEqual(self.recorded()["state"], "GREEN")
@@ -1810,7 +1813,7 @@ class WatchedPeriodics(RunHarness):
         failed["periodics"][self.WEEKLY]["verdict"] = "STALE"
         self.tick(failed, T14 + timedelta(hours=2))
         self.assertEqual(len(self.opener.texts), 2)
-        self.assertTrue(self.opener.texts[-1].startswith("⚪ *seeded-fleet reconcile (weekly) stopped*"), self.opener.texts[-1])
+        self.assertTrue(self.opener.texts[-1].startswith("⚪ *Eval seeded fleet: seeded-fleet reconcile (weekly) has stopped running.*"), self.opener.texts[-1])
         blind = health("GREEN")
         blind["periodics"], blind["periodics_read"] = {}, []
         self.tick(blind, T14 + timedelta(hours=2, minutes=30))
@@ -1818,8 +1821,9 @@ class WatchedPeriodics(RunHarness):
         self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "STALE"})
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
+        clean["periodics_runs"] = {self.WEEKLY: {"build": "104", "finished_at": "2026-09-14T16:40:00+00:00", "passed": True, "summary": "3 applied, 9 unchanged"}}
         self.tick(clean, T14 + timedelta(hours=3))
-        self.assertEqual(self.opener.texts[-1], "✅ *seeded-fleet reconcile (weekly) passed again* — its latest run finished clean.")
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval seeded fleet: planted defects are being re-applied again.* `ci-kube-agents-fleet-reconcile-all`'s 12:40 PM ET run (build 104): 3 applied, 9 unchanged.")
         self.assertEqual(self.recorded()["periodics_told"], {})
         self.assertEqual(self.gh.writes(), [], "nothing is filed for a periodic")
 
@@ -1835,11 +1839,12 @@ class WatchedPeriodics(RunHarness):
         self.assertEqual(self.recorded()["periodics_told"], {}, "a failed send is retried next tick")
         self.tick(doc, T14 + timedelta(minutes=15))
         self.assertEqual(len(self.opener.texts), 1, "two jobs, one message")
-        self.assertIn("*GitOps pull sweep failed*", self.opener.texts[0])
-        self.assertIn("*seeded-fleet reconcile (weekly) failed*", self.opener.texts[0])
+        self.assertIn("*Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*", self.opener.texts[0])
+        self.assertIn("*Eval seeded fleet: planted defects are not being re-applied.*", self.opener.texts[0])
         self.assertEqual(sorted(self.recorded()["periodics_told"]), sorted([self.WEEKLY, sweep]))
         # A clear for one beside news for the other: the news goes, the clear goes, separately.
         doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", verdict="STALE", stale_after_h=1)}
+        doc["periodics_runs"] = {self.WEEKLY: {"build": "101", "finished_at": "2026-09-14T14:40:00+00:00", "passed": True, "summary": None}}
         self.tick(doc, T14 + timedelta(hours=1))
         self.assertEqual(self.recorded()["periodics_told"], {sweep: "STALE"})
         self.assertEqual(len(self.opener.texts), 3)
@@ -1854,6 +1859,7 @@ class WatchedPeriodics(RunHarness):
         self.assertEqual(len(self.opener.texts), 1)
         clean = health("GREEN")
         clean["periodics"], clean["periodics_read"] = {}, [self.WEEKLY]
+        clean["periodics_runs"] = {self.WEEKLY: {"build": "102", "finished_at": "2026-09-14T14:40:00+00:00", "passed": True, "summary": None}}
         self.tick(clean, T14 + timedelta(hours=1), opener=FakeOpener(statuses=[500]))
         self.assertEqual(self.recorded()["periodics_told"], {self.WEEKLY: "FAILED"}, "the clear that failed to send is not forgotten")
         self.assertEqual(self.recorded()["periodics_clean_seen"], [self.WEEKLY])
@@ -1896,8 +1902,8 @@ class WatchedPeriodics(RunHarness):
         doc["periodics_read"] = [self.WEEKLY]
         self.tick(doc, T14)
         text = self.opener.texts[0]
-        self.assertIn("finish time unreadable", text)
-        self.assertNotIn("has finished nothing", text)
+        self.assertIn("its finished.json gives no time for it", text)
+        self.assertNotIn("nothing has finished", text)
 
     def test_a_stopped_job_is_said_in_grey_with_its_last_run(self):
         stopped = health("GREEN")
@@ -1905,22 +1911,62 @@ class WatchedPeriodics(RunHarness):
         stopped["periodics_read"] = [self.WEEKLY]
         self.tick(stopped, T14)
         text = self.opener.texts[0]
-        self.assertTrue(text.startswith("⚪ *seeded-fleet reconcile (weekly) stopped* — last finished run"), text)
-        self.assertIn("has finished nothing in 192h", text)
+        self.assertTrue(text.startswith("⚪ *Eval seeded fleet: seeded-fleet reconcile (weekly) has stopped running.*\n`ci-kube-agents-fleet-reconcile-all` runs weekly"), text)
+        self.assertIn("Its last finished run was", text)
+        self.assertIn("nothing has finished in 192h", text)
+        self.assertIn("Runbook: https://github.com/gke-labs/kube-agents/blob/main/docs/ci-pool-projects.md#62-the-scheduled-reconcile", text)
+
+    def test_a_failed_sweep_says_what_it_does_how_it_failed_and_what_is_left(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        doc = health("GREEN")
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1, summary="failed in 11 of 11 project(s)", detail=["kube-agents-evals-2: HTTP 403 Forbidden: secondary rate limit", "and 6 more", "3 write(s) left for the next run (the run's write budget)"])}
+        doc["periodics_read"] = [sweep]
+        self.tick(doc, T14)
+        text = self.opener.texts[0]
+        self.assertTrue(text.startswith("🟠 *Eval GitOps repos: leftover pull requests from eval runs are not being cleaned up.*\n`ci-kube-agents-pull-sweep` runs every ten minutes and closes the pull requests the agent opened during eval runs"), text)
+        self.assertIn("Its 9:40 AM ET run (build 100) failed: failed in 11 of 11 project(s).", text)
+        self.assertIn("- 3 write(s) left for the next run (the run's write budget)", text)
+        self.assertIn("Effect: pull requests pile up in those repos, and eval cases that open one can link an old one and fail. CI eval infrastructure only.", text)
+        self.assertIn("#55-the-pull-request-sweep", text)
+        clean = health("GREEN")
+        clean["periodics"], clean["periodics_read"] = {}, [sweep]
+        clean["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": True, "summary": "closed 241 pull request(s) across 12 project(s)"}}
+        self.tick(clean, T14 + timedelta(minutes=15))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* `ci-kube-agents-pull-sweep`'s 9:50 AM ET run (build 101): closed 241 pull request(s) across 12 project(s).")
+
+    def test_a_read_failed_build_under_the_threshold_is_not_a_recovery(self):
+        # The sweep's first failed check writes no note; read and not noted is
+        # not clean, so the told job stays told until a build passes.
+        sweep = "ci-kube-agents-pull-sweep"
+        doc = health("GREEN")
+        doc["periodics"] = {sweep: periodic_note(job=sweep, label="GitOps pull sweep", stale_after_h=1)}
+        doc["periodics_read"] = [sweep]
+        self.tick(doc, T14)
+        quiet = health("GREEN")
+        quiet["periodics"], quiet["periodics_read"] = {}, [sweep]
+        quiet["periodics_runs"] = {sweep: {"build": "101", "finished_at": "2026-09-14T13:50:00+00:00", "passed": False, "summary": "failed in 1 of 9 project(s)"}}
+        self.tick(quiet, T14 + timedelta(minutes=15))
+        self.assertEqual(len(self.opener.texts), 1, "no recovery for a failed build")
+        self.assertEqual(self.recorded()["periodics_told"], {sweep: "FAILED"})
+        passed = health("GREEN")
+        passed["periodics"], passed["periodics_read"] = {}, [sweep]
+        passed["periodics_runs"] = {sweep: {"build": "102", "finished_at": "2026-09-14T14:00:00+00:00", "passed": True, "summary": None}}
+        self.tick(passed, T14 + timedelta(minutes=30))
+        self.assertEqual(self.opener.texts[-1], "✅ *Eval GitOps repos: leftover pull requests from eval runs are being cleaned up again.* `ci-kube-agents-pull-sweep`'s 10:00 AM ET run (build 102) finished clean.")
 
     def test_the_digest_carries_a_line_per_noted_job(self):
         doc = health("GREEN")
         doc["periodics"] = {self.WEEKLY: periodic_note(dry_run=True)}
         doc["periodics_read"] = [self.WEEKLY]
         rendered = post_health.render_digest(doc, T14)
-        self.assertIn("🟠 seeded-fleet reconcile (weekly): build 100 failed 9:40 AM ET;", rendered)
+        self.assertIn("🟠 Eval seeded fleet: planted defects are not being re-applied (build 100 failed 9:40 AM ET);", rendered)
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")
         doc["periodics"] = {self.WEEKLY: periodic_note(verdict="STALE", finished=None)}
         doc["periodics_read"] = [self.WEEKLY]
         rendered = post_health.render_digest(doc, T14)
-        self.assertIn("⚪ seeded-fleet reconcile (weekly): build 100 finished at a time its finished.json does not give.", rendered)
+        self.assertIn("⚪ Eval seeded fleet: seeded-fleet reconcile (weekly) has stopped running; build 100 finished at a time its finished.json does not give.", rendered)
         self.assertNotIn("no finished run on record", rendered)
 # --------------------------------------------------------------------------- #
 # Pool drift (#1967): the hourly pool-state scan's condition

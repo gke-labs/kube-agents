@@ -2764,11 +2764,13 @@ class TestAuditCatalogue(unittest.TestCase):
                         "for Standard/Autopilot",
                     )
 
-    def test_cost_sop_check_3_8_handles_autopilot_when_3_7_skipped(self):
-        """Check 3.8 must specify evaluation for Autopilot where 3.7 is skipped."""
+    def test_cost_sop_check_3_8_goes_with_3_7_on_autopilot(self):
+        """3.8 examines only 3.7's flagged nodes, so the SOP declares both
+        inapplicable on Autopilot, matching what `fleet_waste.py` writes."""
         sop = self.sop_dir() / audit_report.AUDITS["fleet-wide-cost-analysis"].sop
         text = sop.read_text(encoding="utf-8")
-        self.assertIn("Autopilot clusters where 3.7 is skipped", text)
+        self.assertIn("skip 3.7 and 3.8, and declare both", text)
+        self.assertNotIn("Autopilot clusters where 3.7 is skipped", text)
 
     def test_drift_sop_declares_autopilot_non_configurable_facets_inapplicable(self):
         """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
@@ -5774,6 +5776,46 @@ class TestDeclaredIntentSearch(HarnessTestCase):
 
 # --------------------------------------------------------------------------- #
 # Harness-side declaration discovery and matching (the obtainability SOP's §4a)
+
+
+class ExplainEmptyDeclarationsTest(unittest.TestCase):
+    """The reason a note yields no declaration is the parser's own ladder, printed."""
+
+    GOOD = "---\ntype: decision\ndeclares:\n  - check: no-pdb\n    namespace: shop\n    object: Deployment/api\n---\nbody\n"
+
+    def test_each_early_return_names_its_reason_and_items_return_none(self):
+        cases = {
+            "no frontmatter": ("body only\n", "it has no frontmatter"),
+            "unclosed": ("---\ntype: decision\nbody\n", "it has no frontmatter"),
+            "invalid yaml": ("---\ntype: [\n---\n", "not valid YAML ("),
+            "pyyaml value error": ("---\ntype: decision\nreviewed: 2026-02-30\n---\n", "not valid YAML (ValueError)"),
+            "no type": ("---\ndeclares: []\n---\n", "has no `type`"),
+            # A sequence or a scalar parses cleanly and is not a mapping; the
+            # reason names the shape rather than a key the text may contain.
+            "list frontmatter": ("---\n- type: decision\n- declares: []\n---\n", "is a YAML list, not a mapping"),
+            "scalar frontmatter": ("---\njust words\n---\n", "is a YAML str, not a mapping"),
+            "no declares": ("---\ntype: decision\n---\n", "has no `declares` list"),
+            "declares not a list": ("---\ntype: decision\ndeclares: yes\n---\n", "is not a list"),
+            "declares empty": ("---\ntype: decision\ndeclares: []\n---\n", "list is empty"),
+        }
+        for label, (text, expected) in cases.items():
+            with self.subTest(label):
+                reason = audit_report.explain_empty_declarations(text)
+                self.assertIsNotNone(reason, label)
+                self.assertIn(expected, reason)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(
+                        audit_report.parse_declarations(text, repo="acme/fleet", path="k/n.md", declarable=frozenset({"no-pdb"})),
+                        [],
+                    )
+        self.assertIsNone(audit_report.explain_empty_declarations(self.GOOD))
+
+    def test_the_explanation_logs_nothing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.explain_empty_declarations("---\ntype: [\n---\n")
+            audit_report.explain_empty_declarations("---\ntype: decision\ndeclares: yes\n---\n")
+        self.assertEqual(err.getvalue(), "")
 # --------------------------------------------------------------------------- #
 
 
@@ -13290,6 +13332,117 @@ class TestLoadManifest(BaseTestCase):
         )
 
 
+class TestClustersListedMarker(unittest.TestCase):
+    """`clusters_listed: 0` on a project entry: a fleet with no clusters is not
+    a run that lost them.
+
+    Without it, a cost or stockout run over cluster-free projects reported "no
+    cluster targets were audited" and stayed partial on every run, so it could
+    never close a ledger entry. The marker comes from the collector, is carried
+    verbatim onto `scope.clusters`, and lifts the cluster kind's gap only when
+    every project target carries it.
+    """
+
+    STREAMS = ("fleet-wide-cost-analysis", "stockout-prevention")
+    NETWORKING = "gcp-networking-fabric-audit"
+    KEY = audit_report.CLUSTERS_LISTED_KEY
+
+    def _project(self, audit_id, project, **extra):
+        entry = {
+            "name": f"project/{project}",
+            "location": "-",
+            "project": project,
+            "checks_run": list(audit_report.audit_target_checks(audit_id, f"project/{project}")),
+        }
+        entry.update(extra)
+        return entry
+
+    def _gaps(self, audit_id, clusters):
+        return audit_report.coverage_gaps(make_doc(findings=[], audit=audit_id, clusters=clusters))
+
+    def test_every_project_marked_empty_lifts_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [
+                    self._project(audit_id, "acme", **{self.KEY: 0}),
+                    self._project(audit_id, "beta", **{self.KEY: 0}),
+                ]
+                self.assertEqual(self._gaps(audit_id, clusters), [])
+
+    def test_one_unmarked_project_keeps_the_cluster_gap(self):
+        # beta's list failed or timed out: its clusters may exist unaudited.
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                clusters = [self._project(audit_id, "acme", **{self.KEY: 0}), self._project(audit_id, "beta")]
+                gaps = self._gaps(audit_id, clusters)
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_no_marked_project_keeps_the_cluster_gap(self):
+        for audit_id in self.STREAMS:
+            with self.subTest(audit=audit_id):
+                gaps = self._gaps(audit_id, [self._project(audit_id, "acme")])
+                self.assertEqual(len(gaps), 1)
+                self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_the_marker_never_lifts_the_project_gap(self):
+        # A run of clusters alone still owes the project checks.
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme"}
+        gaps = audit_report._unenumerated_kind_gaps(self.STREAMS[0], [cluster])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no project targets were audited", gaps[0])
+
+    def test_a_stream_that_never_emits_it_is_unchanged(self):
+        """Networking is unpartitioned: the key changes nothing it reports."""
+        target = {"name": "project/acme", "location": "-", "project": "acme"}
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [dict(target, **{self.KEY: 0})]),
+            audit_report._unenumerated_kind_gaps(self.NETWORKING, [target]),
+        )
+
+    def test_validation_accepts_the_collectors_zero_on_a_project_entry(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.validate_findings(doc, audit_id)
+
+    def test_validation_rejects_anything_the_collector_would_not_write(self):
+        audit_id = self.STREAMS[0]
+        cluster = {"name": "acme/us-central1/c1", "location": "us-central1", "project": "acme", self.KEY: 0}
+        cases = {
+            "a cluster entry": cluster,
+            "a non-zero count": self._project(audit_id, "acme", **{self.KEY: 3}),
+            "a bool": self._project(audit_id, "acme", **{self.KEY: False}),
+            "a string": self._project(audit_id, "acme", **{self.KEY: "0"}),
+        }
+        for label, entry in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(make_doc(findings=[], audit=audit_id, clusters=[entry]), audit_id)
+                self.assertIn(self.KEY, str(caught.exception))
+
+    def _manifest(self, audit_id, **extra):
+        entry = {
+            "name": "project/acme",
+            "outcome": "collected",
+            "commands": [{"check": c, "rc": 0} for c in audit_report.audit_target_checks(audit_id, "project/acme")],
+        }
+        entry.update(extra)
+        return {"clusters": [entry]}
+
+    def test_the_manifest_must_carry_the_marker_the_document_claims(self):
+        # A worker cannot hand-claim an empty fleet to turn a partial run clean.
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(doc, self._manifest(audit_id))
+        self.assertIn(self.KEY, str(caught.exception))
+
+    def test_a_marker_copied_from_the_manifest_passes(self):
+        audit_id = self.STREAMS[0]
+        doc = make_doc(findings=[], audit=audit_id, clusters=[self._project(audit_id, "acme", **{self.KEY: 0})])
+        audit_report.cross_check_manifest(doc, self._manifest(audit_id, **{self.KEY: 0}))
+
+
 class TestCrossCheckManifest(unittest.TestCase):
     """Manifest-scoped attestation: see `audit_report.cross_check_manifest`."""
 
@@ -14297,6 +14450,28 @@ class TestTriageMarkedFindings(BaseTestCase):
         self.assertEqual(plan.needs_triage, ["fronted"])
         self.assertEqual(plan.uncorroborated, [])
 
+    def test_a_new_compute_class_stockout_is_passed_over_and_an_edit_is_not(self):
+        """§3.11's create case is two files under one path; editing an
+        existing class is one, and stays the sweep's to open."""
+        slug = "autoscaler-out-of-resources"
+        obj = "ScaleUpError/scale.up.error.out.of.resources"
+        manifest = {
+            "clusters": [
+                _ran("c1", slug, candidates=[{**_cand(slug, "c1", obj), "needs_triage": "new-computeclass"}]),
+                _ran("c2", slug, candidates=[{**_cand(slug, "c2", obj), "needs_triage": None}]),
+            ]
+        }
+        remediation = {"kind": "manifest", "note": "n"}
+        findings = [
+            _pub("create", slug, "c1", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/new.yaml"}},
+            _pub("edit", slug, "c2", obj) | {"severity": "critical", "remediation": {**remediation, "path": "cc/burst.yaml"}},
+        ]
+        plan = audit_report.promotion_candidates(
+            findings, {}, triage_marked=audit_report.triage_marked_findings(findings, manifest)
+        )
+        self.assertEqual(plan.promote, ["edit"])
+        self.assertEqual(plan.needs_triage, ["create"])
+
     def test_an_explicit_remediate_still_opens_it(self):
         plan = audit_report.promotion_candidates(
             [manifest_finding("fronted", "b.yaml")],
@@ -14340,8 +14515,9 @@ class TestTriageMarkedFindings(BaseTestCase):
 class TestScopedCoverage(unittest.TestCase):
     """Coverage is measured against what a target owes, not the whole roster.
 
-    No shipped roster declares `scopes` yet, so these run against a copy of
-    the stockout and networking specs partitioned the way their SOPs read: the
+    The shipped cost and stockout rosters declare `scopes`, but these run
+    against a fixed copy of the stockout and networking specs, partitioned the
+    way their SOPs read, so a roster edit does not move them: the
     project entry owes the quota and reservation checks, every cluster owes
     the rest plus the reservation check's cluster form, and a networking
     subnet owes IP exhaustion alone. Rated against the whole roster, a project
@@ -14403,6 +14579,21 @@ class TestScopedCoverage(unittest.TestCase):
         self.assertEqual(audit_report.target_kind("project/acme-prod"), "project")
         self.assertEqual(audit_report.target_kind("acme-prod/us-east4/gke-nodes"), "subnet")
         self.assertEqual(audit_report.target_kind("prod-us-east"), "cluster")
+
+    def test_a_qualified_cluster_is_a_cluster_where_no_subnet_scope_exists(self):
+        qualified = "acme-stage/europe-west1/stage-eu"
+        self.assertEqual(
+            audit_report.audit_target_checks(self.STOCKOUT, qualified),
+            audit_report.audit_target_checks(self.STOCKOUT, "stage-eu"),
+        )
+        gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster(qualified)]))
+        self.assertEqual(gaps, [])
+
+    def test_the_same_shape_stays_a_subnet_where_a_subnet_scope_exists(self):
+        self.assertEqual(
+            audit_report.audit_target_checks(self.NETWORKING, "acme-prod/us-east4/gke-nodes"),
+            ("subnet-ip-exhaustion",),
+        )
 
     def test_a_project_target_owes_only_the_project_scoped_checks(self):
         gaps = audit_report.coverage_gaps(self._doc([self._clean_project(), self._clean_cluster()]))
@@ -14467,8 +14658,9 @@ class TestScopedCoverage(unittest.TestCase):
         """A partitioned stream that meets an unexpected target must not go
         quiet: the safe reading is that the target owes the whole roster and
         shows up as a gap — the alternative, an empty denominator, reports the
-        target as fully audited."""
-        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/us-east4/net")
+        target as fully audited. Two segments, because three are a qualified
+        cluster in a stream with no subnet scope."""
+        owed = audit_report.audit_target_checks(self.STOCKOUT, "acme/net")
         self.assertEqual(owed, audit_report.audit_checks(self.STOCKOUT))
 
     def test_a_kind_with_no_targets_is_a_gap(self):
@@ -14517,6 +14709,14 @@ class TestScopedCoverage(unittest.TestCase):
         )
         self.assertEqual(gaps, [])
 
+    def test_a_check_a_present_kind_carries_is_not_stranded(self):
+        """Stockout with clusters and no project: `reservation-mismatch-risk`
+        ran on its cluster arm, so only the project-only check is stranded."""
+        self.assertEqual(
+            audit_report._unenumerated_kind_gaps("stockout-prevention", [{"name": "acme/us-east4/prod"}]),
+            ["no project targets were audited — 1 check(s) ran against nothing (quota-exhaustion-risk)"],
+        )
+
     def test_an_unpartitioned_stream_never_reports_a_kind_gap(self):
         self.assertEqual(
             audit_report._unenumerated_kind_gaps("compliance-audit", [{"name": "prod-us-east"}]),
@@ -14559,9 +14759,13 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
     def test_every_collector_stream_requires_its_manifest(self):
         import collect
         import fleet_drift
+        import fleet_stockout
+        import fleet_waste
         import patch_readiness
 
-        expected = set(collect.CHECK_TABLES) | {fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID}
+        expected = set(collect.CHECK_TABLES) | {
+            fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
+        }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
 
@@ -14732,6 +14936,24 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("FINDINGS REJECTED", self.err)
         self.assertFalse(self.harness.matching("issue", "create"))
         self.assertFalse(self.harness.matching("issue", "edit"))
+
+    def test_the_clusters_listed_marker_needs_a_manifest(self):
+        # Hand-written, the marker would lift the no-cluster gap on the worker's word alone.
+        audit_id = "fleet-wide-cost-analysis"
+        project = {
+            "name": "project/acme",
+            "location": "-",
+            "project": "acme",
+            "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
+            audit_report.CLUSTERS_LISTED_KEY: 0,
+        }
+        doc = make_doc(findings=[], audit=audit_id, clusters=[project])
+        for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():
+            with self.subTest(case=label):
+                self.harness.replies = {"issue list": "[]"}
+                rc = self.run_finish(doc, ["--dry-run", *extra], audit=audit_id)
+                self.assertEqual(rc, 2)
+                self.assertIn("only the collector manifest can back", self.err)
 
     def test_a_missing_manifest_file_is_rejected(self):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", "/nonexistent.json"])
@@ -17119,8 +17341,9 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     One deviation is deliberate and is recorded in the transcripts rather than
     excused: `ID_SCHEME` went from 2 to 3 when the drift collector began
     qualifying cluster names, from 3 to 4 when the patch-readiness
-    collector did the same, and from 4 to 5 when `collect.py` did it for three
-    more streams, and the stamp is global, so every stream's bodies
+    collector did the same, from 4 to 5 when `collect.py` did it for three
+    more streams, and from 5 to 6 when `fleet_waste.py` and `fleet_stockout.py`
+    did it for cost and stockout, and the stamp is global, so every stream's bodies
     carry the current number. That is the whole of the change here -- five
     lines, one per body -- and this class is what proves it. The compliance
     roster growing from eleven checks to sixteen is recorded the same way: the

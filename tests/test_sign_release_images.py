@@ -10,11 +10,13 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, create_mock_git_repo, get_isolated_test_env
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
     MOCK_TARGET_RELEASE_TAG,
+    commit_required_release_images,
     create_mock_cosign_binary,
 )
 
@@ -23,6 +25,12 @@ _SIGN_RELEASE_IMAGES_SH = _REPO_ROOT / "scripts" / "release" / "sign_release_ima
 
 
 class SignReleaseImagesScriptTest(unittest.TestCase):
+    def setUp(self):
+        # A repository of its own: the script reads the release's image list at
+        # the version's tag, and this checkout carries real tags by these names.
+        self.repo_temp_dir, self.repo_dir, self.git = create_mock_git_repo()
+        self.addCleanup(self.repo_temp_dir.cleanup)
+
     def _run_script(self, args, env=None, bin_dir=None):
         full_env = get_isolated_test_env(overrides=env, bin_dir=bin_dir)
         return subprocess.run(
@@ -30,7 +38,7 @@ class SignReleaseImagesScriptTest(unittest.TestCase):
             capture_output=True,
             text=True,
             env=full_env,
-            cwd=str(_REPO_ROOT),
+            cwd=self.repo_dir,
         )
 
     def test_missing_arguments(self):
@@ -99,8 +107,37 @@ class SignReleaseImagesScriptTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("SIGNING RELEASE CONTAINER IMAGES", proc.stdout)
+            # No tag by this name here, so the list is this checkout's, and it says so.
+            self.assertIn(f"No tag '{MOCK_TARGET_RELEASE_TAG}' in this repository", proc.stderr)
+            self.assertIn("no candidate commit named", proc.stderr)
             for img in MOCK_REQUIRED_RELEASE_IMAGES:
                 self.assertIn(f"Signed ghcr.io/gke-labs/kube-agents/{img}:{MOCK_TARGET_RELEASE_TAG}", proc.stdout)
+            self.assertIn(f"Successfully signed all {len(MOCK_REQUIRED_RELEASE_IMAGES)} container images", proc.stdout)
+        finally:
+            temp_dir.cleanup()
+
+    def test_sign_execution_signs_the_releases_own_list(self):
+        """The release's tag commit lists fewer images than this checkout; those,
+        and only those, are signed (#2211)."""
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        try:
+            bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            create_mock_cosign_binary(bin_dir)
+            release_commit = commit_required_release_images(self.repo_dir, self.git, MOCK_CANDIDATE_RELEASE_IMAGES)
+            self.git("tag", MOCK_TARGET_RELEASE_TAG, release_commit)
+
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true"},
+                bin_dir=str(bin_dir),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"lists at {release_commit[:7]}", proc.stderr)
+            for img in MOCK_CANDIDATE_RELEASE_IMAGES:
+                self.assertIn(f"Signed ghcr.io/gke-labs/kube-agents/{img}:{MOCK_TARGET_RELEASE_TAG}", proc.stdout)
+            for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
+                self.assertNotIn(f"/{img}:", proc.stdout, f"{img} is not in the release's list")
+            self.assertIn(f"Successfully signed all {len(MOCK_CANDIDATE_RELEASE_IMAGES)} container images", proc.stdout)
         finally:
             temp_dir.cleanup()
 

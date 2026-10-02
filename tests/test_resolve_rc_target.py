@@ -24,7 +24,12 @@ from tests.testing.common import (
     create_mock_git_repo,
     get_isolated_test_env,
 )
-from tests.testing.release import create_mock_ghcr_curl_binary
+from tests.testing.release import (
+    MOCK_CANDIDATE_RELEASE_IMAGES,
+    MOCK_REQUIRED_RELEASE_IMAGES,
+    commit_required_release_images,
+    create_mock_ghcr_curl_binary,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "hack" / "resolve-rc-target.sh"
@@ -155,6 +160,22 @@ class ResolveRcTargetTest(unittest.TestCase):
         # The per-image breakdown, so the reader knows whether this is one
         # unpublished image or a publish run that never started.
         self.assertIn("platform-agent", result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_the_refusal_names_the_candidates_own_images(self):
+        """The gate holds the candidate to the list its own common.sh carries,
+        and the per-image breakdown walks that same list -- not this tree's,
+        which on a Prow job at main's head may have grown past it (#2211)."""
+        candidate = commit_required_release_images(self.repo, self.git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        tag = "rc_2609040900_ddddddd"
+        self.git("tag", tag)
+        result = self.run_script(env={"RC_TAG": tag}, manifest_status=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"missing at least one of the required images at {candidate[:7]}", result.stderr)
+        for img in MOCK_CANDIDATE_RELEASE_IMAGES:
+            self.assertIn(f"✗ {img}", result.stderr)
+        for img in set(MOCK_REQUIRED_RELEASE_IMAGES) - set(MOCK_CANDIDATE_RELEASE_IMAGES):
+            self.assertNotIn(f"✗ {img}", result.stderr, f"{img} is not in the candidate's list")
         self.assertEqual(result.stdout.strip(), "")
 
     def test_a_repository_with_no_candidates_says_so(self):

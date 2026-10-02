@@ -57,7 +57,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
 - **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle below:
   1. `./skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
-  2. Enumerate clusters and run the checks per the SOP.
+  2. Read the SOP in full — `start` prints its path as `sop` — then enumerate clusters and run the checks as it says. Do not work the audit out from this skill and a script's `--help`: where the SOP runs a collector, it is the SOP that says how to invoke it and that every candidate in the manifest is a verified finding. A candidate your document leaves out is not published: `finish` reports it under `unpublished_candidates`, and holds it on the ledger if an earlier run already carried it.
   3. `./skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
@@ -372,11 +372,13 @@ says how to read its manifest and what is still yours to write — the upgrade a
 stream, whose `governance/security_patch_orchestrator_sop.md` §3 does the same, and the three
 streams `collect.py` covers: compliance (`governance/compliance_audit_sop.md` §2), obtainability
 (`governance/obtainability_audit_sop.md` §2) and AI security (`governance/ai_security_audit_sop.md`
-§3).
-The compliance collector may also give a cluster `checks_unevaluated`, `{check, reason}` for a check
-whose own read failed: it did not run and is not inapplicable, so it goes in neither `checks_run`
-nor `checks_not_applicable` but in that cluster's `limitations`, which keeps the run partial and
-leaves open every finding that check filed there. `finish` rejects the slug anywhere else.
+§3), the cost stream (`fleet_waste.py`, `governance/fleet_wide_cost_analysis_sop.md` §2) and the
+stockout stream (`fleet_stockout.py`, `governance/stockout_prevention_sop.md` §3).
+The compliance, stockout and cost collectors may also give a target `checks_unevaluated`,
+`{check, reason}` for a check whose own read failed: it did not run and is not inapplicable, so it
+goes in neither `checks_run` nor `checks_not_applicable` but in that target's `limitations`, which
+keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
+slug anywhere else.
 
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
@@ -1216,8 +1218,8 @@ lost rather than that the run did not see the whole fleet, unless a coverage gap
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.
 - **Never reopen a merged remediation pull request.** A persisting finding gets a comment and a
   ledger state, not a resurrection.
-- **Never delete a remediation branch.** The harness closes stale pull requests and leaves the
-  branch: if the finding comes back, the fix is pushed there again.
+- **Never delete a remediation branch**, `remote-branch delete` included. The harness closes stale
+  pull requests and leaves the branch: if the finding comes back, the fix is pushed there again.
 - **Never force-push a protected branch.** `main`, `master`, and `production` are refused.
 - **Never hand-write a body, title, commit message, or timestamp.** They are generated so that the
   diff between two runs is meaningful.

@@ -40,7 +40,6 @@ rules:
       - ""
     resources:
       - endpoints
-      - events
       - limitranges
       - namespaces
       - nodes
@@ -49,6 +48,16 @@ rules:
     verbs:
       - get
       - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - get
+      - list
+      - patch
       - watch
   - apiGroups:
       - ""
@@ -283,9 +292,11 @@ subjects:
     namespace: {{ .Release.Namespace }}
 ---
 # Namespaced counterpart of config/rbac/leader_election_role.yaml: the lease
-# verbs are already in the ClusterRole above, but event emission by the
-# leader-election recorder needs create/patch, which role.yaml only grants
-# read-only. Kept namespaced to match the kustomize install's scope.
+# verbs are already in the ClusterRole above, and so is create/patch on
+# events (the ClusterRole grants it for the PlatformAgent Events the
+# controller records, which also covers the leader-election recorder).
+# Kept namespaced to match the kustomize install's scope, where the
+# leader-election Role is its own object.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

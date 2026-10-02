@@ -274,8 +274,9 @@ class ArrayHygieneTest(unittest.TestCase):
                 )
 
     def test_the_version_control_cases_are_priced_above_the_default(self):
-        # Neither is audit-shaped, so the check above does not reach them, and
-        # both are far above the 200s default: measured on
+        # None is audit-shaped, so the check above does not reach them, and
+        # all are far above the 200s default (each price's comment in
+        # ci-eval-pr.sh has its measurement): measured on
         # `dev-vcs2-20260915a`, the resolver runs 1424s a repetition and is the
         # single most expensive unit in the nightly. Left at the default it
         # launched in the last cost tier of each repetition, which is exactly
@@ -284,6 +285,7 @@ class ArrayHygieneTest(unittest.TestCase):
         for case, floor in (
             ("vcs-issue-resolver-triage", 1300),
             ("vcs-review-feedback-read-back", 600),
+            ("vcs-spent-branch-reuse", 900),
         ):
             with self.subTest(case=case):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {case}")

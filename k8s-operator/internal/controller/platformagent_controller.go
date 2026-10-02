@@ -47,6 +47,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -59,6 +60,12 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
+
+// PlatformAgentControllerName is the name this controller records Events
+// under (main.go hands it to the manager's recorder): the same name it
+// manages fields under, held to that by definition rather than by a second
+// copy of the string.
+const PlatformAgentControllerName = fieldOwner
 
 const (
 	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
@@ -302,6 +309,24 @@ type PlatformAgentReconciler struct {
 	// supply; see rbac_selfcheck.go.
 	RBAC *RBACChecker
 
+	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
+	// is what tests and the golden harness supply (recordEvent).
+	//
+	// The line between a condition and an Event, drawn once here so the two
+	// do not drift. A condition is for a state this reconciler converges on
+	// and re-derives on every pass from what it renders and reads back
+	// (VolumesDropped, BusProvisioned, A2AGateway, BusCredentialsReady): the
+	// pass that owns it writes it, keeps it current and removes it. An Event
+	// is for a fact about the live install that something this reconciler
+	// ran discovered and no later pass can re-derive without running it
+	// again: what the provision Job found on the live TASKS stream
+	// (reportA2AProvisionFindings). VolumesDropped went to a condition when
+	// there was no recorder, and it stays one, because it is also a state the
+	// render re-derives on every pass. An Event costs create;patch on events
+	// in the ClusterRole, which the RBAC self-check names when an image runs
+	// ahead of its role.
+	Recorder record.EventRecorder
+
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
 	// avoids a discovery round-trip on every reconcile of every agent. Only an
@@ -361,6 +386,9 @@ type PlatformAgentReconciler struct {
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
+// events create;patch: the Recorder's writes (see the field); patch is what
+// the recorder uses to bump the count on a repeat of the same Event.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // Full `resourcequotas` verbs exist for the mode-next session-pod quota (the
 // enforcement half of the session cap); everything else only reads quotas.
 // +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
@@ -4114,6 +4142,17 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	}
 	return r.Status().Update(ctx, agent)
+}
+
+// recordEvent writes an Event on obj through the manager's recorder, and
+// nothing when there is none: tests and the golden harness build the
+// reconciler without one, and no pass depends on an Event having been
+// written.
+func (r *PlatformAgentReconciler) recordEvent(obj runtime.Object, eventType, reason, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Event(obj, eventType, reason, message)
 }
 
 // SetupWithManager sets up the controller with the Manager.

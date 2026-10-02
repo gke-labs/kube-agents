@@ -27,6 +27,7 @@ import socket
 import socketserver
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -37,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, TextIO
 
 import api_policy
 import command_policy
@@ -274,10 +275,10 @@ API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
 # Longer than the default 64 because an API path is caller text that has to be
 # readable in the audit line; the same 256 the exec route gives a `cwd`.
 API_RELAY_PATH_LOG_LENGTH = 256
-# The width a principal is logged at. The value comes from the TokenReview,
-# not from the request, and a ServiceAccount username truncated at the default
-# 64 loses exactly its discriminating part; the exec route's audit line uses
-# the same 512 as a literal.
+# The width a principal is logged at, on the exec route's audit records and
+# the relay's lines alike. The value comes from the TokenReview, not from the
+# request, and a ServiceAccount username truncated at the default 64 loses
+# exactly its discriminating part.
 PRINCIPAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
 
@@ -366,6 +367,43 @@ FORGE_CLI_VOCABULARIES = {"gh": FORGE_CLI_SUBCOMMANDS}
 # `gh -R owner/repo pr list` labels `pr` rather than the repository.
 FORGE_CLI_VALUE_FLAGS = {"gh": frozenset({"-R", "--repo"})}
 
+# The broker's log is one JSON object per line (JsonLineFormatter): these are its
+# keys, Cloud Logging's names where it has one. A tool-execution audit record is
+# an ordinary log record carrying an `audit` mapping in `extra`, which the
+# formatter merges in at the top level, so the fields below reach Cloud Logging
+# as jsonPayload keys and the message every existing reader greps for stays.
+AUDIT_EXTRA_KEY = "audit"
+LOG_SEVERITY_KEY = "severity"
+LOG_TIMESTAMP_KEY = "timestamp"
+LOG_LOGGER_KEY = "logger"
+LOG_MESSAGE_KEY = "message"
+LOG_EXCEPTION_KEY = "exception"
+TOOL_EXECUTION_AUDIT_EVENT = "tool_execution_audit"
+# The `status` of a tool-execution audit record: one per outcome the exec route
+# can reach. `completed` says the command ran, whatever its exit code; the
+# code is beside it.
+AUDIT_STATUS_STARTED = "started"
+AUDIT_STATUS_COMPLETED = "completed"
+AUDIT_STATUS_BLOCKED = "blocked"
+AUDIT_STATUS_REJECTED = "rejected"
+AUDIT_STATUS_FAILED = "failed"
+AUDIT_STATUS_ABANDONED = "abandoned"
+AUDIT_STATUS_BUSY = "busy"
+# Rule ids for the refusals the exec route decides itself rather than by a
+# policy rule. The response body and the audit record name the same constant,
+# so the two cannot drift apart.
+RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
+RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
+RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
+RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
+LOG_LEVEL_ENV = "LOG_LEVEL"
+DEFAULT_LOG_LEVEL = "INFO"
+EXIT_STARTUP_FAILURE = 1
+# The record time as Cloud Logging and every log backend parse it without a
+# format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+LOG_MSEC_FORMAT = "%s.%03dZ"
+
 
 def is_valid_repository(repository: Any) -> bool:
     """Return True if ``repository`` is a well-formed ``owner/name`` slug.
@@ -438,10 +476,30 @@ def _redacted_fields(exc) -> dict:
     return {"error": redact_credentials(str(exc)), **fields}
 
 
-class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class HandlerErrorsToLog:
+    """Route an exception that escapes a request handler into the log.
+
+    socketserver's default hook prints a plain-text traceback to stderr, and in
+    the broker's container that is the same log as stdout: one such traceback
+    is several lines that a reader expecting one JSON object per line cannot
+    parse. Mixed in ahead of the server class so this hook is the one found.
+    """
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # The address is the peer's: a socket path on the Unix listener, a
+        # host and port on TCP. Neither is an identifier worth a field; the
+        # exception's type and traceback are what a reader needs.
+        LOGGER.exception("request handler failed type=%s", type(sys.exc_info()[1]).__name__)
+
+
+class ThreadingUnixHTTPServer(HandlerErrorsToLog, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
+
+
+class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
+    """ThreadingHTTPServer for the credentialed and API-relay listeners on TCP."""
 
 
 # ---------------------------------------------------------------------------
@@ -1051,9 +1109,9 @@ class ServiceAccountAuthenticator:
         try:
             # Inside the try: a missing or unreadable ca.crt raises
             # FileNotFoundError here, and an OSError escaping this method is
-            # not an AuthenticationError — it would reach
-            # socketserver.handle_error as a traceback and a dropped
-            # connection, where the caller deserves a 401.
+            # not an AuthenticationError — the handler's read guard would end
+            # the request as a dropped connection with no 401, where the
+            # caller deserves one.
             context = ssl.create_default_context(cafile=self.ca_file or None)
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds, context=context
@@ -1259,6 +1317,17 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_port = 8642
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self) -> None:
+        # The guard the credentialed and metrics handlers carry: a peer that
+        # resets while its request line is read, or while a 401 is on its
+        # way, is a debug line and a closed connection, not a handler fault
+        # for the server's error hook to log with a traceback.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("api request not answered type=%s", type(exc).__name__)
 
     def do_GET(self) -> None:  # noqa: N802
         self._proxy()
@@ -5120,14 +5189,18 @@ def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
     # lines in text-mode consumers.
     #
     # Cs is here for the opposite reason: a lone surrogate does not forge a
-    # record, it deletes one. json.loads turns "\\ud800" into a real lone
-    # surrogate, which no UTF-8 encoder will accept, so the handler raises
-    # UnicodeEncodeError, logging prints "--- Logging error ---" to stderr and
-    # drops the record - while the request it was supposed to describe carries
-    # on and succeeds. An authenticated caller could execute a command and
-    # leave no exec line behind. Verified against a byte-encoding handler; a
-    # StringIO one does not reproduce it, which is why the unit tests below
-    # write through a real UTF-8 encoder.
+    # record, it deletes one under a text formatter. json.loads turns
+    # "\\ud800" into a real lone surrogate, which no UTF-8 encoder will
+    # accept, so a text-formatting handler raises UnicodeEncodeError, logging
+    # prints "--- Logging error ---" to stderr and drops the record - while
+    # the request it was supposed to describe carries on and succeeds. The
+    # deployed JsonLineFormatter escapes a lone surrogate and keeps the record
+    # (FormatterTest in test_credential_proxy_audit_json hands it one); the
+    # strip is what keeps the property under a text formatter a test or a
+    # local run installs.
+    # Verified against a byte-encoding handler; a StringIO one does not
+    # reproduce it, which is why the unit tests below write through a real
+    # UTF-8 encoder.
     filtered = ''.join(
         c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')
     )
@@ -5324,6 +5397,74 @@ def _tool_labels(argv: list[str]) -> tuple[str, str]:
     return tool, LABEL_OTHER
 
 
+class JsonLineFormatter(logging.Formatter):
+    """One JSON object per record, on one line, for Cloud Logging and a SIEM behind it.
+
+    `severity` is the level under Cloud Logging's name, `timestamp` the record's
+    time in UTC, `message` the text every existing reader greps for, and an
+    `audit` mapping passed through `extra` is merged in at the top level so a
+    tool-execution record's fields are queryable as jsonPayload.<field> rather
+    than parsed out of the text. json.dumps escapes every newline a traceback or
+    a caller's text could carry, so the one-record-one-line property the audit
+    trail depends on holds by construction rather than by sanitising each site.
+    """
+
+    converter = time.gmtime
+    default_time_format = LOG_TIME_FORMAT
+    default_msec_format = LOG_MSEC_FORMAT
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            LOG_SEVERITY_KEY: record.levelname,
+            LOG_TIMESTAMP_KEY: self.formatTime(record),
+            LOG_LOGGER_KEY: record.name,
+            LOG_MESSAGE_KEY: record.getMessage(),
+        }
+        audit = getattr(record, AUDIT_EXTRA_KEY, None)
+        if isinstance(audit, Mapping):
+            for key, value in audit.items():
+                payload.setdefault(key, value)
+        if record.exc_info:
+            payload[LOG_EXCEPTION_KEY] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, separators=(",", ":"))
+
+
+def _tool_audit(
+    status: str,
+    request_id: str,
+    principal: str,
+    tool: str,
+    subcommand: str,
+    *,
+    exit_code: int | None = None,
+    duration_ms: int | None = None,
+    rule: str | None = None,
+) -> dict[str, Any]:
+    """The `audit` mapping of one tool-execution record.
+
+    Only identifiers and outcomes: the request id, the verified principal, the
+    tool and subcommand as the metrics label them (a closed vocabulary, never the
+    argv), the outcome and, where there is one, the exit code, the duration and
+    the policy rule. No argument, path, stdin or output is ever here, so there is
+    nothing in the record for a `--token` to leak through.
+    """
+    record: dict[str, Any] = {
+        "event_type": TOOL_EXECUTION_AUDIT_EVENT,
+        "request_id": request_id,
+        "principal": principal,
+        "tool": tool,
+        "subcommand": subcommand,
+        "status": status,
+    }
+    if exit_code is not None:
+        record["exit_code"] = exit_code
+    if duration_ms is not None:
+        record["duration_ms"] = duration_ms
+    if rule:
+        record["rule"] = rule
+    return record
+
+
 def _escape_label_value(value: str) -> str:
     # Every label value today is a static enum or a vocabulary word, none of
     # which carries these characters. Kept because the exposition format's
@@ -5454,8 +5595,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
         # method: a peer that hangs up before the reply is on the wire (a
         # collector's aborted scrape, a probe at a path this listener does not
         # serve, a method it does not implement) is a debug line and a closed
-        # connection, not the traceback the server prints for an exception
-        # out of a handler. The next scrape reads the same counters.
+        # connection, not a handler fault for the server's error hook to log
+        # with a traceback. The next scrape reads the same counters.
         try:
             super().handle_one_request()
         except OSError as exc:
@@ -5480,7 +5621,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         return
 
 
-class MetricsServer(ThreadingHTTPServer):
+class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
     """ThreadingHTTPServer with a ceiling on live connections.
 
     The stdlib server starts one thread per accepted connection with no cap,
@@ -5808,12 +5949,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         # Sanitized here rather than at each of the eight log sites below, and
-        # sanitized at all because it is caller-supplied text going into a
-        # line-oriented formatter. A newline in it ends the record and starts a
-        # new one, so an unsanitized requestId lets the caller write a whole
-        # forged entry into the audit trail - including one naming a
-        # ServiceAccount that made no request. It is never echoed back to the
-        # client, so narrowing it costs nothing.
+        # sanitized at all because it is caller-supplied text going into the
+        # log. The deployed formatter is JSON and escapes a newline, but the
+        # sanitiser is what bounds the length, strips the control characters,
+        # and holds for a text formatter a test or a local run installs: an
+        # unsanitized requestId under one lets the caller write a whole forged
+        # entry into the audit trail - including one naming a ServiceAccount
+        # that made no request. It is never echoed back to the client, so
+        # narrowing it costs nothing.
         #
         # This is one route into the log, not all of them. The access line goes
         # through log_message above, which had the same defect from an
@@ -5827,26 +5970,33 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # this route and for every other authenticated one by _authenticated —
         # is the value they would read. Today it is what the audit trail
         # records and nothing else.
+        # Decided once, before any gate: every outcome below is counted and
+        # audited under the same two labels, and a refused executable is
+        # counted as `other` rather than under its own name.
+        tool_label, subcommand_label = _tool_labels(argv)
+        # PRINCIPAL_LOG_LENGTH rather than the default 64: this value comes
+        # from the TokenReview, not from the request, and a truncated identity
+        # is an audit line that names the wrong ServiceAccount.
+        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
+
+        def audit(status: str, **fields: Any) -> dict[str, Any]:
+            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, **fields)}
+
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
             request_id,
-            # 512 rather than the default 64: this value comes from the
-            # TokenReview, not from the request, and a truncated identity is
-            # an audit line that names the wrong ServiceAccount.
-            _sanitize_for_logging(principal.describe(), max_length=512),
+            principal_label,
             # Logged before the allowlist check below, so at this point it is
             # arbitrary caller text and gets the same treatment as request_id.
             _sanitize_for_logging(argv[0]),
+            extra=audit(AUDIT_STATUS_STARTED),
         )
-        # Decided once, before any gate: every outcome below is counted under
-        # the same two labels, and a refused executable is counted as `other`
-        # rather than under its own name.
-        tool_label, subcommand_label = _tool_labels(argv)
         if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
             LOGGER.warning(
                 "executable blocked request_id=%s executable=%s",
                 request_id,
                 _sanitize_for_logging(argv[0]),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_EXECUTABLE_ALLOWLIST),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -5854,7 +6004,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "executable.allowlist",
+                    "rule": RULE_EXECUTABLE_ALLOWLIST,
                     "message": "Executable is not supported by the credential proxy.",
                 },
             )
@@ -5862,7 +6012,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
-                "command blocked request_id=%s rule=%s", request_id, rule.rule_id
+                "command blocked request_id=%s rule=%s", request_id, rule.rule_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=rule.rule_id),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -5883,31 +6034,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # the lease check because it does not depend on the working directory.
         violation = git_argument_violation(argv)
         if violation is not None:
-            LOGGER.warning("git argument refused request_id=%s", request_id)
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
-            self._json(
-                HTTPStatus.FORBIDDEN,
-                {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.argument.refused",
-                    "message": violation,
-                },
-            )
-            return
-
-        # Not a policy rule: the policy matches on argv alone, and this refusal
-        # turns on the working directory as well.
-        if hasattr(self.executor, "resolve_git_command"):
-            violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
-        else:
-            violation = self.executor.git_lease_violation(argv, cwd)
-            exec_argv = argv
-        if violation is not None:
             LOGGER.warning(
-                "git lease refused request_id=%s cwd=%s",
-                request_id,
-                _sanitize_for_logging(cwd or "", max_length=256),
+                "git argument refused request_id=%s", request_id,
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -5915,32 +6044,71 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "git.workspace.lease",
+                    "rule": RULE_GIT_ARGUMENT_REFUSED,
                     "message": violation,
                 },
             )
-            return
-
-        # Runs after the credential denylist above, so rules like
-        # `kubernetes.token-disclosure` keep their own ids and messages rather
-        # than being reported as read-only refusals. For example, `kubectl create
-        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
-        # be refused by the denylist with that rule id. If the gate ran first, it
-        # would refuse as `kubernetes.read-only`, losing the specific rule.
-        refusal_result = read_only_refusal(argv)
-        if refusal_result is None and exec_argv != argv:
-            refusal_result = read_only_refusal(exec_argv)
-        if refusal_result is not None:
-            refusal, log_hint = refusal_result
-            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
-            LOGGER.warning(
-                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
-            )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
-            self._json(HTTPStatus.FORBIDDEN, refusal)
             return
 
         try:
+            # Not a policy rule: the policy matches on argv alone, and this
+            # refusal turns on the working directory as well. Inside the try
+            # with the command it gates: a cwd no path can hold (an embedded
+            # NUL) raises ValueError out of the resolution below and takes
+            # the containment rejection with the other caller errors, so the
+            # request ends with a response and the trail with a terminal
+            # record rather than an exception out of the handler.
+            try:
+                if hasattr(self.executor, "resolve_git_command"):
+                    violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
+                else:
+                    violation = self.executor.git_lease_violation(argv, cwd)
+                    exec_argv = argv
+            except OSError as exc:
+                # A cwd the broker cannot read -- a directory the agent named
+                # that stat refuses -- is the caller's path to fix, not a
+                # broker fault: the same rejection as a path outside the
+                # workspace, not the 500 an exception out of the command gets.
+                raise ValueError(f"cwd cannot be read: {type(exc).__name__}") from exc
+            if violation is not None:
+                LOGGER.warning(
+                    "git lease refused request_id=%s cwd=%s",
+                    request_id,
+                    _sanitize_for_logging(cwd or "", max_length=256),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_WORKSPACE_LEASE),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": RULE_GIT_WORKSPACE_LEASE,
+                        "message": violation,
+                    },
+                )
+                return
+
+            # Runs after the credential denylist above, so rules like
+            # `kubernetes.token-disclosure` keep their own ids and messages rather
+            # than being reported as read-only refusals. For example, `kubectl create
+            # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+            # be refused by the denylist with that rule id. If the gate ran first, it
+            # would refuse as `kubernetes.read-only`, losing the specific rule.
+            refusal_result = read_only_refusal(argv)
+            if refusal_result is None and exec_argv != argv:
+                refusal_result = read_only_refusal(exec_argv)
+            if refusal_result is not None:
+                refusal, log_hint = refusal_result
+                safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
+                LOGGER.warning(
+                    "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint,
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=refusal["rule"]),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return
+
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
             with self._request_slot():
@@ -5962,6 +6130,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         "disconnected and the command was killed",
                         request_id,
                         result.duration_ms,
+                        extra=audit(AUDIT_STATUS_ABANDONED, duration_ms=result.duration_ms),
                     )
                     # No response is written, so log_request never counts this
                     # request; the invocation and its duration are counted here
@@ -5975,6 +6144,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     result.exit_code,
                     result.duration_ms,
                     result.truncated,
+                    extra=audit(AUDIT_STATUS_COMPLETED, exit_code=result.exit_code, duration_ms=result.duration_ms),
                 )
                 # A non-zero exit is `error` here even though the response is
                 # `completed`: the response reports that the broker ran the
@@ -6007,11 +6177,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command abandoned request_id=%s: the caller disconnected while queued "
                 "for a slot; the command was not started",
                 request_id,
+                extra=audit(AUDIT_STATUS_ABANDONED),
             )
             return
         except CommandSlotUnavailable as exc:
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
-            LOGGER.warning("command queued too long request_id=%s", request_id)
+            LOGGER.warning(
+                "command queued too long request_id=%s", request_id,
+                extra=audit(AUDIT_STATUS_BUSY),
+            )
             self._busy(exc)
             return
         except scoped_sa_pool.PoolRefusal as exc:
@@ -6029,6 +6203,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "scoped service account refused request_id=%s reason=%s",
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
+                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_SCOPED_SA_UNMAPPED_SCOPE),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
@@ -6036,7 +6211,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "gcp.scoped-sa.unmapped-scope",
+                    "rule": RULE_SCOPED_SA_UNMAPPED_SCOPE,
                     "message": str(exc),
                 },
             )
@@ -6051,6 +6226,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command rejected request_id=%s reason=%s",
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
+                extra=audit(AUDIT_STATUS_REJECTED),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -6060,6 +6236,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "command failed request_id=%s type=%s",
                 request_id,
                 type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
             )
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(
@@ -6834,6 +7011,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 body["slack"] = fields
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
+    def handle_one_request(self) -> None:
+        # A peer that resets the connection while its request is being read,
+        # or before an error page is on the wire, is a debug line and a closed
+        # connection, as on the metrics listener; the exception would
+        # otherwise leave the handler and reach the server's error hook. No
+        # audit record is lost: every site logs before its response is
+        # written, and _json guards its own writes.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("request not answered type=%s", type(exc).__name__)
+
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         # send_response calls this for every response this listener writes --
         # the 401 an unauthenticated caller gets, the relay's direct writes and
@@ -6849,11 +7039,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler.log_request passes self.requestline through
         # here verbatim, and this runs on every response - including the 401 an
-        # unauthenticated caller gets. A vertical tab in the request line is
-        # enough to end the record and start another, so an unauthenticated
-        # caller could write a whole audit-shaped line of its own. The request
-        # line's own tokenizer stops at whitespace, which limits the shape of
-        # the forgery and does not prevent it.
+        # unauthenticated caller gets. The deployed formatter is JSON and keeps
+        # a vertical tab in the request line inside the one record; the
+        # sanitiser bounds the length, strips the control characters, and
+        # holds for a text formatter a test or a local run installs, under
+        # which that vertical tab would end the record and let an
+        # unauthenticated caller start an audit-shaped line of its own.
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
@@ -6930,7 +7121,7 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
+    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
     LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
     return server
 
@@ -7118,7 +7309,7 @@ def serve(args: argparse.Namespace) -> None:
             os.umask(previous_umask)
         LOGGER.info("credential proxy listening on unix socket %s", socket_path)
     else:
-        server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)
+        server = ThreadingTCPHTTPServer((args.host, args.port), CredentialProxyHandler)
         LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
     # Last, once the credentialed server holds its socket: a scrape never sees
     # a half-configured broker, and a port collision costs the metrics rather
@@ -7254,9 +7445,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_logging(stream: TextIO = sys.stdout) -> None:
+    """One JSON object per line on `stream`, at the level LOG_LEVEL names.
+
+    The audit trail is this container's primary output, and a SIEM behind Cloud
+    Logging reads its fields rather than parsing them out of text
+    (JsonLineFormatter). The GKE log agent reads stdout and stderr alike, so
+    the stream changes nothing for it. A LOG_LEVEL that names no level logs at
+    INFO with a record saying so, rather than leaving a traceback out of
+    basicConfig before any handler exists.
+    """
+    requested = os.getenv(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL).strip().upper() or DEFAULT_LOG_LEVEL
+    level = requested if isinstance(logging.getLevelName(requested), int) else DEFAULT_LOG_LEVEL
+    json_handler = logging.StreamHandler(stream)
+    json_handler.setFormatter(JsonLineFormatter())
+    logging.basicConfig(level=level, handlers=[json_handler], force=True)
+    if level != requested:
+        LOGGER.warning("%s=%r names no log level; logging at %s", LOG_LEVEL_ENV, requested, level)
+
+
+def main(stream: TextIO = sys.stdout) -> int:
+    """Serve, and log a refusal to start as one record.
+
+    Every refusal `serve` makes before it opens a listener -- an unsupported
+    role or authentication mode, a listener reachable off the Pod with no
+    authenticator, a failed bootstrap command -- would otherwise leave the
+    process through the interpreter's default hook as a plain-text traceback
+    on the same container log the JSON records go to, on every restart of a
+    crash-looping broker. Caught here, it is one ERROR record with the
+    traceback inside it, and the exit status still says the start failed.
+    """
+    configure_logging(stream)
+    try:
+        serve(parse_args())
+    except Exception as exc:
+        LOGGER.exception("credential proxy failed to start type=%s", type(exc).__name__)
+        return EXIT_STARTUP_FAILURE
+    return 0
+
+
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    serve(parse_args())
+    sys.exit(main())

@@ -49,6 +49,27 @@ ALLOW_UNMAPPED="false"
 readonly GITOPS_SEED_FILE="README.md"
 readonly GITOPS_SEED_MESSAGE="Initial commit"
 readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
+# The declared-intent note bench/tasks/obtainability-declared-intent-no-finding
+# reads: the fleet's declared-no-pdb-workload role runs without a budget on
+# purpose, and the case grades that the agent finds this file and says so.
+# The harness reads the frontmatter, not the prose.
+# What `gh api` prints on stderr for a path that is not there; any other failure
+# of the existence read stops the seed rather than writing blind.
+readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
+readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare notification-relay's missing PodDisruptionBudget as intended"
+readonly GITOPS_INTENT_NOTE_CONTENT='---
+type: decision
+title: notification-relay runs without a PodDisruptionBudget on purpose
+declares:
+  - check: no-pdb
+    namespace: seeded-intent
+    object: Deployment/notification-relay
+---
+
+`notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
+it is a stateless relay whose clients retry, and a budget would only slow node drains. The
+obtainability audit lists this posture under Declared intent rather than as a finding.'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -404,6 +425,23 @@ if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
   gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_SEED_FILE}" \
     -f message="${GITOPS_SEED_MESSAGE}" \
     -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
+fi
+
+# The declaration the declared-intent eval case reads. A PUT without `sha` on a
+# path that exists fails, so the read comes first, and only a 404 means
+# "absent": any other failure stops the step, as the branch read above does,
+# rather than PUT over a note that may be there. A note someone edited by
+# hand is left as it is.
+if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
+  :
+elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+  echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
+  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
+    -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \
+    -f content="$(printf '%s\n' "${GITOPS_INTENT_NOTE_CONTENT}" | base64 | tr -d '\n')" >/dev/null
+else
+  echo "ERROR: could not read ${GITOPS_INTENT_NOTE_PATH} in ${GITOPS_REPO} (${GITOPS_INTENT_NOTE_READ_ERROR}); not seeding it blind." >&2
+  exit 1
 fi
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"

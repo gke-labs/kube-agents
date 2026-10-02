@@ -324,6 +324,11 @@ REASON_SPAWN_FAILED = "spawn-failed"
 REASON_BRIDGE_DIED = "bridge-died-without-terminal-event"
 REASON_WORKER_EVICTED = "worker-evicted"
 REASON_BUS_SUBSCRIBE_FAILED = "bus-subscribe-failed"
+# The hermes turn gave up on the model provider's rate limit or billing (its
+# retries exhausted the 429 window; exit 75, EX_TEMPFAIL, the code Hermes
+# reserves for both). A quota storm is the install's, not the persona's: the
+# turn never got an answer to grade.
+REASON_HERMES_RATE_LIMITED = "hermes-rate-limited"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -333,6 +338,7 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_BRIDGE_DIED,
         REASON_WORKER_EVICTED,
         REASON_BUS_SUBSCRIBE_FAILED,
+        REASON_HERMES_RATE_LIMITED,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
