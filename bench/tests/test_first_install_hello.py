@@ -172,6 +172,31 @@ def test_a_negated_or_conditional_invitation_fails_the_invitation_check(case, in
 
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
+    "invitation",
+    [
+        " Here you can post or share your team's runbooks here.",
+        " In this chat, share your team's runbooks here.",
+        " In the chat, share your team's runbooks here.",
+        " Whenever you like, send or share your team's runbooks here.",
+    ],
+)
+def test_a_lead_in_holding_a_results_word_fails_the_invitation_check(case, invitation):
+    # The results checks read the lead-in, so its words could stand in for the results sentence.
+    assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
+
+
+# A known cost the cases' comment names: a negation that only qualifies the invitation still fails it.
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "invitation",
+    [" No pressure, but share your team's runbooks here.", " Not required, but share your team's runbooks here."],
+)
+def test_a_qualifying_negation_before_the_invitation_fails_it(case, invitation):
+    assert "invites-runbooks" in _failing(case, _example(case).replace(INVITATION, invitation))
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
     "invitation", [" Share your team's runbooks here anytime.", " Share your team's runbooks here any time."]
 )
 def test_an_invitation_promising_any_time_fails_the_invitation_check(case, invitation):
@@ -460,6 +485,8 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " Following runbooks is common.",
         " That's a good use of runbooks.",
         " Changes from your team follow runbooks.",
+        " Your team, like most, follows runbooks.",
+        " Many teams, in my experience, use runbooks for on-call.",
     ],
 )
 def test_the_promise_safeguards_known_costs_fail_it(case, aside):

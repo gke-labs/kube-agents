@@ -113,7 +113,12 @@ verification_spec:
   # among them (no, not, n't, never, nor, neither, none, nothing, without,
   # cannot, unless), because a negation can withdraw it ("There's no need to
   # share...", "Please don't share...", "I can't read them if you
-  # share..."). A sentence opens at the start of the reply, after ".", "!",
+  # share..."), and none of the results checks' words (here, chat, or a word
+  # starting post, shar or send), because the results checks read the
+  # lead-in ("Here you can post or share...", "In this chat, share..."). A
+  # negation that only qualifies it ("No pressure, but share...") fails it,
+  # a known cost, and so does a results word in the lead-in of a reply that
+  # also has a results sentence. A sentence opens at the start of the reply, after ".", "!",
   # "?" or "…" past any closing bracket or quote and a space, at a line
   # break, after "; ", ": " or ", and", or at a dash with a space on each
   # side. A longer lead-in fails it, a known cost; a lead-in that withdraws
@@ -142,7 +147,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|without|cannot|unless)\b|n[''’]t\b)[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?(?:\A|[.!?…][)\]"''”’]*\s|\n|[;:]\s|,\s+and\s|\s[-–—]+\s)(?:(?!\b(?:no|not|never|nor|neither|none|nothing|without|cannot|unless|here|chat)\b|n[''’]t\b|\b(?:post|shar|send))[^.!?…\n]){0,40}?\bshare\s+your\s+team[''’]s\s+runbooks\s+here[)\]"''”’]*(?:[.!…](?![.!…)\]"''”’]*\?)|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -249,7 +254,9 @@ verification_spec:
   # subject of happy/glad/ready/keen ("when you're ready to use runbooks
   # here, share them"); a subject outside the clearing list ("anyone who
   # follows runbooks"), or one whose clearing word sits in a prepositional
-  # phrase ("changes from your team follow runbooks"); the noun "use" after any
+  # phrase ("changes from your team follow runbooks"), or one set off from
+  # the verb by a parenthetical comma ("your team, like most, follows
+  # runbooks"); the noun "use" after any
   # other word ("a good use of runbooks"); a gerund ("following runbooks is
   # common"); and an imperative to the reader ("Use this chat for
   # runbooks.").
