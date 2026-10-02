@@ -12,7 +12,9 @@ Two things are checked:
    ``_begin_interaction(ack, body, action, kind)`` returning the eight fields
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_slack_allowed_channels``, ``_slack_disable_dms``, ``_get_client`` and
-   ``_handle_slack_message``. ``_register_bolt_handlers`` still wires the plugin
+   ``_handle_slack_message``, and the adapter file still reads the
+   ``_hermes_force_process`` marker the click's message carries.
+   ``_register_bolt_handlers`` still wires the plugin
    action handlers, and the flag guard calling
    ``_kage_slack_clicks.register(self)`` follows that call directly. The import
    the guard names is bound at module level.
@@ -53,6 +55,8 @@ RUNTIME_MEMBERS = (
     "_begin_interaction", "_slack_allowed_channels", "_slack_disable_dms", "_get_client",
     "_handle_slack_message",
 )
+#: The marker that makes the message handler skip the mention requirement for a click's turn.
+FORCE_MARKER = 'event.get("_hermes_force_process")'
 BEGIN_INTERACTION = "_begin_interaction"
 BEGIN_POSITIONAL = ("self", "ack", "body", "action", "kind")
 #: What ``_begin_interaction`` returns, unpacked positionally by ``answer()``.
@@ -219,8 +223,11 @@ def check_adapter(root: Path) -> None:
     path = root / ADAPTER
     if not path.is_file():
         raise _fail(f"{path} does not exist")
-    tree = ast.parse(path.read_text())
+    source = path.read_text()
+    tree = ast.parse(source)
     check_members(tree)
+    if FORCE_MARKER not in source:
+        raise _fail(f"{ADAPTER} no longer reads {FORCE_MARKER}, which a click's message relies on")
     methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == METHOD]
     if len(methods) != 1:
         raise _fail(f"{ADAPTER} has {len(methods)} def {METHOD}(), expected 1")

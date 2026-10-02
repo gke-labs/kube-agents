@@ -86,7 +86,7 @@ class SlackAdapter:
         return None
 
     async def _handle_slack_message(self, event, payload=None):
-        return None
+        return bool(event.get("_hermes_force_process"))
 
     _slack_disable_dms = _flag_getter("disable_dms")
     _slack_allowed_channels = _channel_set_getter("allowed_channels")
@@ -184,6 +184,7 @@ class ApplierTest(unittest.TestCase):
         for old, new, named in (
             ("def _get_client(", "def _client_for(", "_get_client"),
             ("_slack_disable_dms = ", "_disable_dms = ", "_slack_disable_dms"),
+            ('event.get("_hermes_force_process")', 'event.get("force")', "_hermes_force_process"),
             ("_slack_allowed_channels = ", "_allowed_channels = ", "_slack_allowed_channels"),
             ("def _handle_slack_message(", "def _handle_message(", "_handle_slack_message"),
             ("def _begin_interaction(", "def _start_interaction(", "_begin_interaction"),
