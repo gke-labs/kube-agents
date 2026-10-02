@@ -13,7 +13,8 @@ the card runs. Slack's task statuses are ``pending``, ``in_progress``,
 ``complete`` and ``error`` and nothing else, so a card waiting on the user is
 ``pending``. The plan carries no Stop button yet: ``/stop`` interrupts only
 the Planning Agent's turn and would leave the cards running. :func:`plan_text`
-is the same plan as plain text, for the message's ``text`` field.
+is the same plan as plain text, for the message's ``text`` field, with ``&``,
+``<`` and ``>`` escaped since Slack parses that field.
 
 The session (:func:`session_status`, :func:`session_title`):
 ``agents.sessions.setStatus`` accepts ``processing``, ``suspended`` or
@@ -91,6 +92,10 @@ ROW_MARKERS = {
     TASK_ERROR: "✗",
 }
 NOTE_SEPARATOR = " · "
+#: What the text fallback escapes, ``&`` first, as Hermes's ``format_message``
+#: does: Slack parses a message's ``text``, so a card title or note holding
+#: ``<!here>`` would broadcast and ``<url|label>`` would post a link under any label.
+TEXT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"))
 
 #: Size caps. Titles as Hermes clips its own task cards; the last few steps
 #: per row, since the row is a status and the report carries the rest; a
@@ -222,7 +227,7 @@ def plan_blocks(title: str | None, rows: Sequence[Any]) -> list[dict]:
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:
-    """The plan as plain lines: the title, then a marker, title and latest note per row."""
+    """The plan as plain lines: the title, then a marker, title and latest note per row, escaped."""
     rows = list(rows)[-ROWS_MAX:]
     out = [plan_title(title, rows)]
     for row in rows:
@@ -231,4 +236,7 @@ def plan_text(title: str | None, rows: Sequence[Any]) -> str:
         if notes:
             line += NOTE_SEPARATOR + notes[-1]
         out.append(line)
-    return "\n".join(out)
+    text = "\n".join(out)
+    for raw, escaped in TEXT_ESCAPES:
+        text = text.replace(raw, escaped)
+    return text
