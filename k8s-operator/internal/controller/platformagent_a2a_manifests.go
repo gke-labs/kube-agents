@@ -1866,10 +1866,23 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 // session pod it creates, paired with part-of: a2aPartOf under the STANDARD
 // app.kubernetes.io/component key (the spawner is a client of the cluster, not
 // the operator, so it uses the standard key; operator-rendered pieces carry
-// a2aComponentLabel). Three things select on this pair and must agree: the
-// bus fence's session peer, the session fence's own podSelector, and the
-// gateway's session cap and sweeper, which count and list pods by it.
+// a2aComponentLabel). Everything that selects session pods must agree on this
+// pair: the bus fence's session peer, the session fence's own podSelector,
+// the broker fence's session peer under the cluster-view flag, and the
+// gateway's session cap and sweeper, which count and list pods by it. The
+// operator's selectors all come from a2aSessionPodSelector so they cannot
+// drift apart.
 const a2aSessionComponent = "a2a-session"
+
+// a2aSessionPodSelector is the one spelling of "a session pod" the operator's
+// NetworkPolicies select on. A fresh map per call: callers hand it to a
+// LabelSelector that the API machinery may mutate.
+func a2aSessionPodSelector() map[string]string {
+	return map[string]string{
+		labelPartOf:                   a2aPartOf,
+		"app.kubernetes.io/component": a2aSessionComponent,
+	}
+}
 
 func a2aNATSNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-nats-netpol"
@@ -1986,10 +1999,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 			// cluster-view flag, the broker's CREDENTIAL_PROXY_ALLOWED_CALLERS
 			// and session-callers binding — not this selector.
 			PodSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					labelPartOf:                   a2aPartOf,
-					"app.kubernetes.io/component": a2aSessionComponent,
-				},
+				MatchLabels: a2aSessionPodSelector(),
 			},
 			PolicyTypes: []networkingv1.PolicyType{
 				networkingv1.PolicyTypeIngress,
@@ -2073,10 +2083,7 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					}}},
 					// Session pods, by the spawner's labels (see
 					// a2aSessionComponent above).
-					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-						labelPartOf:                   a2aPartOf,
-						"app.kubernetes.io/component": a2aSessionComponent,
-					}}},
+					{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}},
 					// The provision Job's pods.
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						labelPartOf:       a2aPartOf,

@@ -428,15 +428,25 @@ class C1IsolationIsStructural(unittest.TestCase):
         # satisfy this.
         body = h.go_function_body(fence, "buildA2ASessionNetworkPolicy")
         selector = re.search(
-            r"PodSelector: metav1\.LabelSelector\{\s*MatchLabels: map\[string\]string\{(.+?)\}",
+            r"PodSelector: metav1\.LabelSelector\{\s*MatchLabels: (?:map\[string\]string\{(.+?)\}|(\w+)\(\))",
             body,
             re.DOTALL,
         )
         self.assertIsNotNone(selector, "the session fence no longer has a podSelector")
-
+        if selector.group(1) is not None:
+            literal = selector.group(1)
+        else:
+            # The selector comes from a helper shared with the broker fence's
+            # session peer, so one spelling cannot drift from the other. Read
+            # the helper's body, not its name: the map literal is still the
+            # thing compared, through one more hop.
+            helper = h.go_function_body(fence, selector.group(2))
+            inner = re.search(r"return map\[string\]string\{(.+?)\}", helper, re.DOTALL)
+            self.assertIsNotNone(inner, "the session selector helper %s returns no map literal" % selector.group(2))
+            literal = inner.group(1)
         required = {}
         for key_expr, value_expr in re.findall(
-            r"(\"[^\"]+\"|\w+):\s*(\"[^\"]+\"|\w+),", selector.group(1)
+            r"(\"[^\"]+\"|\w+):\s*(\"[^\"]+\"|\w+),", literal
         ):
             key = key_expr.strip('"') if key_expr.startswith('"') else go_const(fence, key_expr)
             value = value_expr.strip('"') if value_expr.startswith('"') else go_const(fence, value_expr)
@@ -1013,16 +1023,15 @@ class C1IsolationIsStructural(unittest.TestCase):
         TokenReview about. The two env names the operator renders onto the
         gateway and the gateway reads back are the same kind of pair, and a
         drift there is quieter still: the view reads as off and nothing says
-        so. Both pairs are pinned here, with the broker's own default beside
-        them so the docs and the module that enforces the role agree too.
+        so. Both pairs are pinned here. The broker has no constant to pin: it
+        reads CREDENTIAL_PROXY_SESSION_AUDIENCE raw, so the operator's render
+        is the only spelling it ever sees.
         """
         operator = h.text("broker_split_go")
         manifests = h.text("manifests_go")
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
-        broker = h.text("credential_proxy")
-
         def one(pattern: str, text: str, what: str) -> str:
             found = re.findall(pattern, text)
             self.assertEqual(
@@ -1044,11 +1053,6 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the operator tells the broker to accept audience %r and the spawner "
             "projects %r: every session pod's broker call is refused as an "
             "unknown audience on an install whose Go suites are green" % (rendered, projected),
-        )
-        self.assertEqual(
-            one(r'DEFAULT_CREDENTIAL_PROXY_SESSION_AUDIENCE\s*=\s*"([^"]+)"', broker, "the broker's default"),
-            rendered,
-            "the broker documents a different default session audience from the one the operator renders",
         )
         # Both halves use their constant where it matters, so the equality
         # above is about the strings that actually flow.

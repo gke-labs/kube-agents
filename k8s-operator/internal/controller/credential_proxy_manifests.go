@@ -505,10 +505,7 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		// only. TokenReview, the session audience and the session-callers
 		// binding keep this peer to the session role; this is the layer
 		// that lets it connect.
-		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-			labelPartOf:                   a2aPartOf,
-			"app.kubernetes.io/component": a2aSessionComponent,
-		}}})
+		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
 	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
