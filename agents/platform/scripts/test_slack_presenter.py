@@ -219,9 +219,10 @@ class SplitAnswerTest(unittest.TestCase):
             "x " + "`" * BACKTICK_REPEATS,
             "x " + " ".join("`" * n for n in range(1, BACKTICK_REPEATS // 100)),
         ):
-            started = time.monotonic()
-            sp.split_answer(line)
-            self.assertLess(time.monotonic() - started, 0.5)
+            for lay_out in (sp.split_answer, sp._plain):
+                started = time.monotonic()
+                lay_out(line)
+                self.assertLess(time.monotonic() - started, 0.5, lay_out.__name__)
 
     def test_plain_leaves_code_spans_and_globs_alone(self):
         self.assertEqual(sp._plain("`__init__.py` is missing"), "__init__.py is missing")
