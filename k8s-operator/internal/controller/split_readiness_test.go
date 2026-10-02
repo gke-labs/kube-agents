@@ -767,3 +767,86 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 		t.Fatalf("syncA2AConditions did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
 	}
 }
+
+// TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLive verifies
+// that when the live object carries BusProvisioned=True from a completed pass, but the
+// cached object has not yet observed it and a2a.done is false (e.g. Job re-run in flight),
+// syncA2AConditions evaluates wantBusProvisioned against live conditions rather than stale cache,
+// avoids a 409 conflict, makes zero status writes, and adopts the live status/RV.
+func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLive(t *testing.T) {
+	agent := splitReadinessNextAgent()
+	now := metav1.Now()
+	darkMsg := "no chat backend configured; A2A gateway is dark"
+	agent.Status.Conditions = []metav1.Condition{
+		{
+			Type:               a2aGatewayConditionType,
+			Status:             metav1.ConditionFalse,
+			Reason:             a2aGatewayDarkReason,
+			Message:            darkMsg,
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		},
+		{
+			Type:               busProvisionedConditionType,
+			Status:             metav1.ConditionTrue,
+			Reason:             busProvisionedReason,
+			Message:            "provisioned by job a2a-provision-1",
+			ObservedGeneration: agent.Generation,
+			LastTransitionTime: now,
+		},
+	}
+	counter := &statusWriteCounter{}
+	scheme := setupScheme()
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(agent).
+		WithInterceptorFuncs(counter.interceptors()).
+		Build()
+
+	// Cached client simulates an informer cache that has not yet observed the
+	// dark gateway and BusProvisioned status writes:
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := cl.Get(ctx, key, obj, opts...); err != nil {
+				return err
+			}
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				// Pre-write copy: behind store on RV and status conditions.
+				pa.ResourceVersion = "1"
+				pa.Status.Conditions = nil
+			}
+			return nil
+		},
+	})
+
+	r := &PlatformAgentReconciler{Client: cached, APIReader: base, Scheme: scheme}
+	ctx := context.Background()
+
+	staleAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cached.Get(ctx, client.ObjectKeyFromObject(agent), staleAgent); err != nil {
+		t.Fatalf("reading stale agent: %v", err)
+	}
+
+	// a2a.done is false (re-run in flight), but live object has BusProvisioned=True:
+	a2aState := a2aProvisionState{
+		gatewayDark:       true,
+		gatewayDarkReason: darkMsg,
+		done:              false,
+	}
+
+	if err := r.syncA2AConditions(ctx, staleAgent, a2aState); err != nil {
+		t.Fatalf("syncA2AConditions failed: %v", err)
+	}
+
+	if counter.writes != 0 {
+		t.Fatalf("syncA2AConditions made %d status writes on a stale cache pass, want 0: the live object already held matching status", counter.writes)
+	}
+	if !busProvisioned(staleAgent) {
+		t.Fatalf("syncA2AConditions did not adopt live BusProvisioned condition into agent")
+	}
+	if staleAgent.ResourceVersion != agent.ResourceVersion {
+		t.Fatalf("syncA2AConditions did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
+	}
+}
+
