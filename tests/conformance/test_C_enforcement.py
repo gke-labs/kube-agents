@@ -471,9 +471,13 @@ class C1IsolationIsStructural(unittest.TestCase):
 
         - Automount stays off, so the default-audience token -- the one the API
           server accepts -- is never mounted.
-        - The one token that is mounted is a projected token naming the bus
-          audience. The API server refuses it for anything else, so it is not a
-          cluster credential even though it is a Kubernetes one.
+        - Every token that is mounted is a projected token naming an audience
+          that is not the API server's: the bus, and, under the operator's
+          A2A_SESSION_CLUSTER_VIEW flag, the credential broker's session
+          audience. The API server refuses both for anything else, so neither
+          is a cluster credential even though both are Kubernetes ones; the
+          broker token reaches one pod on one port, where TokenReview and the
+          broker's role table decide what it may run.
         - The ServiceAccount it is minted for is bound to nothing, so even a
           token that reached the API server would authenticate as a principal
           holding no permissions.
@@ -508,6 +512,10 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the session pod projects no ServiceAccount token at all; if the "
             "bus credential moved, this test has to move with it",
         )
+        # The audiences a session pod may hold, by constant name: the bus, and
+        # the broker's session audience that the cluster-view flag projects.
+        # Anything else is a token for a destination the fence never admitted.
+        permitted_audiences = ("lib.BusTokenAudience", "credentialProxySessionAudience")
         for projection in projections:
             with self.subTest(projection=projection.strip()[:80]):
                 self.assertIn(
@@ -517,12 +525,17 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "server, which is the credential the fence assumes the pod "
                     "does not have",
                 )
-                self.assertIn(
-                    "lib.BusTokenAudience",
-                    projection,
+                self.assertTrue(
+                    any(audience in projection for audience in permitted_audiences),
                     "the session pod's token names an audience other than the "
-                    "bus, so it reaches something the fence did not account for",
+                    "bus or the broker's session audience, so it reaches "
+                    "something the fence did not account for",
                 )
+        self.assertTrue(
+            any("lib.BusTokenAudience" in projection for projection in projections),
+            "no projection names the bus audience; the session pod lost its bus "
+            "credential, which is not what this test is for",
+        )
 
         # The identity itself. `a2a_spawner` names the ServiceAccount from
         # config; the operator is what decides whether that name has any
@@ -984,6 +997,76 @@ class C1IsolationIsStructural(unittest.TestCase):
     # a SensitiveEnvVars key, pinned to the controller constant by
     # TestPluginCannotOverrideBusEnv rather than by this suite.
     BUS_TOKEN_FILE_ENV = "A2A_BUS_TOKEN_FILE"
+
+    def test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary(
+        self,
+    ) -> None:
+        """The cluster view's contract, which sits astride the same boundary.
+
+        The operator renders `credentialProxySessionAudience` into the broker's
+        CREDENTIAL_PROXY_SESSION_AUDIENCE and the gateway projects its own
+        constant of the same name as the audience of every session pod's
+        broker token; the two modules cannot import each other, and each one's
+        tests compare its constant to itself. A rename on either side ships
+        with both Go suites green and every session pod's `kubectl` answered
+        401, because the token names an audience the broker never asks the
+        TokenReview about. The two env names the operator renders onto the
+        gateway and the gateway reads back are the same kind of pair, and a
+        drift there is quieter still: the view reads as off and nothing says
+        so. Both pairs are pinned here, with the broker's own default beside
+        them so the docs and the module that enforces the role agree too.
+        """
+        operator = h.text("broker_split_go")
+        manifests = h.text("manifests_go")
+        a2a_manifests = h.text("a2a_session_fence")
+        spawner = h.text("a2a_spawner")
+        config = h.text("a2a_gateway_config")
+        broker = h.text("credential_proxy")
+
+        def one(pattern: str, text: str, what: str) -> str:
+            found = re.findall(pattern, text)
+            self.assertEqual(
+                len(found),
+                1,
+                "%s is not a single match (%d); this test compared nothing" % (what, len(found)),
+            )
+            return found[0]
+
+        rendered = one(
+            r'credentialProxySessionAudience\s*=\s*"([^"]+)"', operator, "the operator's session audience"
+        )
+        projected = one(
+            r'credentialProxySessionAudience\s*=\s*"([^"]+)"', spawner, "the spawner's session audience"
+        )
+        self.assertEqual(
+            rendered,
+            projected,
+            "the operator tells the broker to accept audience %r and the spawner "
+            "projects %r: every session pod's broker call is refused as an "
+            "unknown audience on an install whose Go suites are green" % (rendered, projected),
+        )
+        self.assertEqual(
+            one(r'DEFAULT_CREDENTIAL_PROXY_SESSION_AUDIENCE\s*=\s*"([^"]+)"', broker, "the broker's default"),
+            rendered,
+            "the broker documents a different default session audience from the one the operator renders",
+        )
+        # Both halves use their constant where it matters, so the equality
+        # above is about the strings that actually flow.
+        one(
+            r'Name:\s*"CREDENTIAL_PROXY_SESSION_AUDIENCE",\s*Value:\s*credentialProxySessionAudience',
+            manifests,
+            "the broker env render of the session audience",
+        )
+        one(
+            r"Audience:\s+credentialProxySessionAudience,",
+            spawner,
+            "the spawner's projection of the session audience",
+        )
+
+        for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
+            with self.subTest(env=name):
+                one(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
+                one(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
     def test_C1_the_reserved_bus_token_file_env_is_spelled_the_same_in_both_modules(
         self,

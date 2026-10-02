@@ -268,7 +268,14 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
-        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
+    ),
+    # The gateway's env contract with the operator (module a2a reading what
+    # module k8s-operator renders). C1 pins the cluster-view names across the
+    # boundary; the anchors are the two names and a long-standing neighbour.
+    "a2a_gateway_config": Source(
+        "a2a/gateway/config.go",
+        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
     ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of

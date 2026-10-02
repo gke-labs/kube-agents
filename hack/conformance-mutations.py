@@ -1211,6 +1211,43 @@ Mutation(
         "exactly the path the worker reads",
     ),
     Mutation(
+        "C1-session-token-for-a-third-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          credentialProxySessionAudience,",
+         'Audience:          "kubeagents-credential-proxy",'),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "mint the session pod's broker token for the shell's audience instead "
+        "of the session one, which the broker maps to the shell role: git, gh, "
+        "the forge and workspace routes and the API relay. The fence test "
+        "accepts exactly two audiences by constant name, the bus and the "
+        "broker's session audience; a literal third is a destination the "
+        "fence never admitted, and this is the quiet version because the pod "
+        "still holds exactly two tokens at exactly the paths the clients read",
+    ),
+    Mutation(
+        "C1-session-broker-audience-renamed-in-the-spawner",
+        "a2a/gateway/spawn.go",
+        ('credentialProxySessionAudience        = "kubeagents-credential-proxy-session"',
+         'credentialProxySessionAudience        = "kubeagents-credential-proxy-sessions"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "pluralise the audience in the module that projects it. The operator "
+        "keeps telling the broker to accept the singular, the broker's "
+        "TokenReview names the singular, so every session pod's kubectl is "
+        "refused as an unknown audience -- with both Go suites green, because "
+        "each module's test compares its constant to itself",
+    ),
+    Mutation(
+        "C1-cluster-view-env-renamed-on-the-gateway-side",
+        "a2a/gateway/config.go",
+        ('os.Getenv("A2A_SESSION_CLUSTER_VIEW")', 'os.Getenv("A2A_SESSION_VIEW")'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "shorten the flag's name in the module that reads it. The operator "
+        "still renders the long name, so the gateway reads false and spawns "
+        "today's pod on every flag-on install, and nothing says so: the "
+        "quietest drift of the three, which is why it is pinned beside the "
+        "audience",
+    ),
+    Mutation(
         "C1-session-account-gets-rbac",
         "k8s-operator/internal/controller/platformagent_a2a_callout.go",
         ("""\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
