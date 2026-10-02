@@ -36,11 +36,14 @@ The load-bearing properties, in rough order of what they cost if wrong:
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import yaml
@@ -50,7 +53,7 @@ from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
 
-from kube_agents_bench import transcript, verifiers
+from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
     WorkerCommandsVerifier,
@@ -58,6 +61,7 @@ from kube_agents_bench.verifiers import (
     PullRequestOpenedVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
+    _fold_line_decoration,
 )
 
 from conftest import TASKS
@@ -113,6 +117,563 @@ def test_required_phrase_present_passes():
     v = ReportContainsVerifier(type="report_contains", required_phrases=["GCS FUSE"])
     res = v.verify(5.0)
     assert res.status == "pass" and res.success
+
+
+def test_any_of_pattern_binds_subject_to_verb_across_an_adverb():
+    _stash("The API server will be briefly unavailable while the control plane upgrades.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_patterns=[r"api server[^.\n]{0,30}\b(unavailable|unreachable|down)\b"],
+    )
+    res = v.verify(5.0)
+    assert res.status == "pass" and "alternative pattern(s)" in res.reason
+
+
+def test_any_of_pattern_miss_fails_and_names_the_patterns():
+    _stash("In general upgrades cause errors or timeouts somewhere.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_patterns=[r"api server[^.\n]{0,30}\b(unavailable|unreachable|down)\b"],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail" and "none of the alternative patterns matched" in res.reason
+
+
+def test_any_of_pattern_searches_a_line_preserving_text():
+    # The text keeps its newlines, so a pattern may anchor on them and a gap
+    # that excludes \n stays inside one line: a bullet ending without
+    # punctuation does not fuse into its neighbour when the pattern says so.
+    _stash("- the API server\n- unavailable features are listed below")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        any_of_patterns=[r"api server[^.\n]{0,30}\bunavailable\b"],
+    )
+    assert v.verify(5.0).status == "fail"
+    # The fold strips the bullet, so the anchor meets the words themselves.
+    anchored = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^unavailable features"]
+    )
+    assert anchored.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "seeded-a: control plane is zonal",
+        "- seeded-a: control plane is zonal",
+        "  - seeded-a: control plane is zonal",
+        "> - seeded-a: control plane is zonal",
+        "1. seeded-a: control plane is zonal.",
+        "b) seeded-a: control plane is zonal",
+        "\u2022 seeded-a: control plane is zonal",
+        '"seeded-a: control plane is zonal".',
+        "\u201cseeded-a: control plane is zonal\u201d",
+        "**seeded-a: control plane is zonal** \u2705",
+    ],
+)
+def test_line_patterns_see_a_line_without_its_decoration(line):
+    # One pattern anchored at both ends, whatever the agent wrapped the line in.
+    _stash("intro\n" + line + "\noutro")
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[seeded-a](https://console.cloud.google.com/kubernetes/clusters/details/us-central1-a/seeded-a): control plane is zonal",
+        "### seeded-a: control plane is zonal",
+        "| seeded-a: control plane is zonal |",
+        "(1) seeded-a: control plane is zonal",
+        "\u2705 seeded-a: control plane is zonal",
+        "\u26a0\ufe0f seeded-a: control plane is zonal",
+        "- \u26a0\ufe0f seeded-a: control plane is zonal,",
+        "seeded-a: control plane is zonal;",
+        "seeded-a: control plane is zonal\\",
+        "seeded-a: control plane is zonal<br>",
+        "- [ ] seeded-a: control plane is zonal",
+        "- [x] seeded-a: control plane is zonal",
+        "[1] seeded-a: control plane is zonal",
+        "(a) seeded-a: control plane is zonal",
+        "-> seeded-a: control plane is zonal",
+        "|seeded-a: control plane is zonal|",
+        '"seeded-a": control plane is zonal',
+        "\u201cseeded-a\u201d: control plane is zonal",
+        "'seeded-a': control plane is zonal",
+        "[seeded-a]: control plane is zonal",
+        "seeded-a: control plane is zonal [1]",
+        "seeded-a: control plane is zonal [^1]",
+        "seeded-a: control plane is zonal\u00b9",
+        "seeded-a: control plane is zonal (1)",
+        "seeded-a: control plane is zonal [^note]",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs)",
+        "seeded-a: control plane is zonal [1].",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs).",
+        "seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs),",
+        'seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs)"',
+        "| seeded-a: control plane is zonal [1](https://cloud.google.com/kubernetes-engine/docs) |",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters).",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters) [1](https://cloud.google.com/docs).",
+        "seeded-a: control plane is zonal [^1]\u201d",
+        "seeded-a: control plane is zonal.[1]",
+        "seeded-a: control plane is [zonal](https://cloud.google.com/kubernetes-engine/docs/concepts/types-of-clusters)",
+
+        "seeded-a: control plane is zonal\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3\u00b9\u00b2\u00b3",
+        "ii. seeded-a: control plane is zonal",
+        "(iii) seeded-a: control plane is zonal",
+        "\u2460 seeded-a: control plane is zonal",
+        "1\ufe0f\u20e3 seeded-a: control plane is zonal",
+        "#1 seeded-a: control plane is zonal",
+        "1 seeded-a: control plane is zonal",
+    ],
+)
+def test_line_decoration_fold_covers_links_headings_tables_and_marks(line):
+    _stash(line)
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+@pytest.mark.parametrize("mark", ["\U0001F6AB", "\U0001F6D1", "\U0001F44E", "\u274e", "\u26a0\ufe0f", "?", "!", "\u2026"])
+def test_line_decoration_fold_keeps_a_mark_it_does_not_name(mark):
+    # The closer list is an allowlist: a trailing symbol it does not name is
+    # part of the value, so the anchored pattern does not match.
+    _stash(f"seeded-a: control plane is zonal {mark}")
+    v = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, any_of_patterns=[r"(?m)^seeded-a: control plane is zonal$"]
+    )
+    assert v.verify(5.0).status == "fail"
+
+
+def test_footnote_fold_is_linear_on_many_overlapping_markers():
+    # Overlapping alternatives inside a possessive repeat: a line that ends
+    # in many markers and then a word must not backtrack exponentially.
+    line = "seeded-a: control plane is zonal" + " [^1]" * 60 + " x"
+    start = time.monotonic()
+    folded = _fold_line_decoration(line)
+    assert time.monotonic() - start < 1.0
+    assert folded == line
+
+
+def test_line_decoration_fold_keeps_interior_punctuation():
+    _stash("- pool/a (zone-1): 100% used; 3 of 4 pods (75%) ready.")
+    v = ReportContainsVerifier(
+        type="report_contains",
+        fold_decoration=True,
+        any_of_patterns=[r"(?m)^pool/a \(zone-1\): 100% used; 3 of 4 pods \(75%\) ready$"],
+    )
+    assert v.verify(5.0).status == "pass"
+
+
+def test_line_decoration_fold_is_off_unless_asked_for():
+    # first-install-hello-* forbid a bulleted capability list with a pattern
+    # on the bullet itself; the default must leave the bullet in place.
+    _stash("- Audit the fleet\n- Open pull requests")
+    v = ReportContainsVerifier(type="report_contains", forbidden_patterns=[r"(?m)^\s*(?:[-\u2022]|\d+[.)])\s"])
+    assert v.verify(5.0).status == "fail"
+    folded = ReportContainsVerifier(
+        type="report_contains", fold_decoration=True, forbidden_patterns=[r"(?m)^\s*(?:[-\u2022]|\d+[.)])\s"]
+    )
+    assert folded.verify(5.0).status == "pass"
+
+
+def test_any_of_pattern_must_compile():
+    with pytest.raises(Exception):
+        ReportContainsVerifier(type="report_contains", any_of_patterns=["(unclosed"])
+
+
+# --------------------------------------- the zonal control-plane case's lines
+#
+# Read out of the task file, never copied: the declared answer line the case
+# asks for, in the forms a report renders it (plain, bulleted, numbered,
+# quoted, bold-wrapped, with a parenthetical after the name, with the
+# qualified cluster id, with or without a full stop), and the reports that
+# must not satisfy it (a missing cluster, a slot the fleet does not have, a
+# wrong or off-vocabulary value on any seeded line, prose with the same
+# words, the host cluster).
+
+_ZONAL_CASE = TASKS / "upgrades-zonal-control-plane-outage-warned" / "task.yaml"
+
+
+def _zonal_case_check(objective: str) -> dict:
+    for entry in _ZONAL_SPEC["verification_spec"]:
+        if entry["name"] == objective:
+            return entry["check"]
+    raise AssertionError(f"{objective} not in {_ZONAL_CASE}")
+
+
+_ZONAL_SPEC = yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))
+
+
+def _zonal_case_fixtures() -> list[str]:
+    return list(_ZONAL_SPEC["fixtures"])
+
+
+_FLEET_CATALOG = TASKS.parent / "tf" / "fleet" / "fixtures.json"
+
+
+# Read once in this module (the sibling suite reads the same file for the
+# runner's side of the contract); the slot letters below come from the same
+# parse.
+_CATALOG = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+_CATALOG_ROLES = _CATALOG["roles"]
+
+
+def _catalog_roles() -> dict:
+    return _CATALOG_ROLES
+
+
+def _write_fleet_dir(root: Path, reached: list[str]) -> None:
+    """A runner-shaped kubeconfig directory: the context file recording every
+    catalogue role's slot (as the runner does, reached or not), the per-slot
+    credential for the slot carrying each reached role (what `fixture_roles`
+    reads), and no role files, since whether a role was planted is not the
+    question."""
+    (root / "clusters").mkdir(exist_ok=True)
+    roles = _catalog_roles()
+    lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
+    (root / ".fleet-context").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for role in reached:
+        (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+
+
+def _zonal_case_verdict(objective: str, text: str, reached: list[str] | None = None):
+    # parse_node rather than a hand-built ReportContainsVerifier, for the
+    # reason the sibling block gives: a clause the shipped entry grows later
+    # must not be silently dropped here. A fresh directory per call stands in
+    # for the runner's: every slot reached, unless a test says otherwise.
+    v = parse_node(_zonal_case_check(objective))
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="zonal-fleet-") as root:
+        _write_fleet_dir(Path(root), _zonal_case_fixtures() if reached is None else reached)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+def _zonal_case_grades(objective: str, text: str) -> bool:
+    return _zonal_case_verdict(objective, text).status == "pass"
+
+
+_ZONAL_OBJECTIVES = (
+    "every-seeded-cluster-has-a-declared-line",
+    "the-declared-lines-say-the-control-plane-is-zonal",
+    "the-declared-lines-say-the-api-goes-away",
+    "the-declared-lines-separate-workloads-from-the-api",
+)
+
+
+def _zonal_line(cluster: str, cp="zonal", api="unavailable", pods="unaffected") -> str:
+    return f"{cluster}: control plane is {cp}; API during its upgrade: {api}; running pods: {pods}"
+
+
+# The slot set is the fleet catalogue's, read rather than copied: a slot the
+# fleet gains or loses must change this list and the case together.
+_SLOT_LETTERS = tuple(_CATALOG["cluster_slots"])
+_SLOTS = tuple(f"seeded-{s}" for s in _SLOT_LETTERS)
+_RIGHT_REPORT = "\n".join(_zonal_line(c) for c in _SLOTS)
+
+
+@pytest.mark.parametrize("objective", _ZONAL_OBJECTIVES)
+@pytest.mark.parametrize(
+    "text",
+    [
+        _RIGHT_REPORT,
+        "Summary of the plan.\n\n" + _RIGHT_REPORT + "\n\n## Sources\n* docs",
+        "\n".join("- " + _zonal_line(c) for c in _SLOTS),
+        "\n".join(f"{i}. " + _zonal_line(c) + "." for i, c in enumerate(_SLOTS, 1)),
+        "\n".join("+ " + _zonal_line(c) for c in _SLOTS),
+        "\n".join("> " + _zonal_line(c) for c in _SLOTS),
+        "\n".join("**" + _zonal_line(c) + "**" for c in _SLOTS),
+        "\n".join("`" + _zonal_line(c) + "`" for c in _SLOTS),
+        "\n".join('"' + _zonal_line(c) + '"' for c in _SLOTS),
+        "\n".join(_zonal_line(f"{c} (us-central1-a)") for c in _SLOTS),
+        "\n".join(_zonal_line(f"\u201c{c} (us-central1-a)\u201d") for c in _SLOTS),
+        "\n".join(_zonal_line(f"[{c} (us-central1-a)]") for c in _SLOTS),
+        "\n".join("“" + _zonal_line(c) + "”" for c in _SLOTS),
+        "\n".join('"' + _zonal_line(c) + '".' for c in _SLOTS),
+        "- Declared lines:\n" + "\n".join("  - " + _zonal_line(c) for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " ✅" for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " \U0001F44D" for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " \u2714\ufe0f" for c in _SLOTS),
+        # Per-cluster prose that opens with a slot name is neither accepted
+        # nor forbidden: only a whole declared frame is read.
+        "- **seeded-b** (us-central1-a): control plane is 1.32.4, one minor behind the nodes\n" + _RIGHT_REPORT,
+        # The qualified id the agent sometimes uses.
+        "\n".join(_zonal_line(f"haoxuw-gke-dev-{c}-us-central1-a") for c in _SLOTS),
+        "\n".join(f"[{c}](https://console.cloud.google.com/kubernetes/clusters/details/us-central1-a/{c}): " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS),
+        "\n".join("| " + _zonal_line(c) + " |" for c in _SLOTS),
+        # An English list: commas, then a stop. The kubeconfig context and the
+        # GKE resource path as the cluster's name.
+        ",\n".join(_zonal_line(c) for c in _SLOTS) + ".",
+        "\n".join(_zonal_line(f"gke_haoxuw-gke-dev_us-central1-a_{c}") for c in _SLOTS),
+        "\n".join(_zonal_line(f"projects/haoxuw-gke-dev/locations/us-central1-a/clusters/{c}") for c in _SLOTS),
+        "\n".join("\u26a0\ufe0f " + _zonal_line(c) for c in _SLOTS),
+        # The last value linked to its source, and a linked footnote marker
+        # with a stop after it.
+        "\n".join(_zonal_line(c).replace("running pods: unaffected", "running pods: [unaffected](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)") for c in _SLOTS),
+        "\n".join(_zonal_line(c) + " [1](https://cloud.google.com/kubernetes-engine/docs/concepts/cluster-upgrades)." for c in _SLOTS),
+        # The prompt's own delimiters kept around a value or the name, and
+        # whitespace before a separator.
+        "\n".join(_zonal_line(c).replace("is zonal;", "is <zonal>;").replace(": unavailable;", ": <unavailable>;").replace(": unaffected", ": <unaffected>") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(": unaffected", ': "unaffected"').replace("is zonal;", 'is "zonal";') for c in _SLOTS),
+        "\n".join(_zonal_line(f"<{c}>") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(f"{c}:", f"{c} :") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("zonal;", "zonal ;").replace("unavailable;", "unavailable ;") for c in _SLOTS),
+        "\n".join("**" + c + "** : " + _zonal_line(c).split(": ", 1)[1] for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(f"{c}: ", f"{c}:").replace("zonal; ", "zonal;") for c in _SLOTS),
+        # Invisible format characters at a value's end, before a separator,
+        # and at the line's start.
+        "\n".join(_zonal_line(c) + "\u200b" for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("zonal;", "zonal\u200b;") for c in _SLOTS),
+        "\n".join("\ufeff" + _zonal_line(c) for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unaffected", "unaffected\u2060") for c in _SLOTS),
+        # A location after the slot, in the forms GKE spells them.
+        "\n".join(_zonal_line(f"{c}-europe-west4") for c in _SLOTS),
+        "\n".join(_zonal_line(f"{c}-northamerica-northeast1-a") for c in _SLOTS),
+        # Underscore emphasis, and a name in parentheses or braces.
+        "\n".join("_" + _zonal_line(c) + "_" for c in _SLOTS),
+        "\n".join("__" + _zonal_line(c) + "__" for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("is zonal;", "is __zonal__;") for c in _SLOTS),
+        # A quoted or bracketed value glued to its separator.
+        "\n".join(_zonal_line(c).replace(": unaffected", ':"unaffected"') for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace(": unavailable;", ":<unavailable>;") for c in _SLOTS),
+        "\n".join(_zonal_line(f"({c})") for c in _SLOTS),
+        "\n".join(_zonal_line(f"{{{c}}}") for c in _SLOTS),
+        # A citation on a value other than the last.
+        "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1];") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("is zonal;", "is zonal [1](https://cloud.google.com/kubernetes-engine/docs);") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unavailable;", "unavailable [^1];") for c in _SLOTS),
+        "\n".join(_zonal_line(c).replace("unavailable;", "unavailable\u00b9;") for c in _SLOTS),
+    ],
+)
+def test_zonal_case_accepts_the_declared_lines_as_rendered(objective, text):
+    assert _zonal_case_grades(objective, text)
+
+
+def test_zonal_case_fixtures_name_one_role_per_slot():
+    # The roles are slot stand-ins: the runner's kubeconfig per role is how
+    # the first objective tells an unreached slot from a line the agent
+    # missed, so every catalogue slot needs one and the objective names the
+    # same list.
+    catalog = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
+    roles = _zonal_case_fixtures()
+    assert sorted(catalog["roles"][r]["cluster_slot"] for r in roles) == sorted(_SLOT_LETTERS)
+    # Every declared-line objective names the same list as `fixtures:`.
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_check(objective)["fixture_roles"] == roles, objective
+
+
+def test_zonal_case_errors_rather_than_fails_when_a_slot_was_not_reached():
+    roles = _zonal_case_fixtures()
+    missing = roles[-1]
+    three_slot = [r for r in roles if r != missing]
+    three_lines = "\n".join(_zonal_line(c) for c in _SLOTS[:-1])
+    slot = _catalog_roles()[missing]["cluster_slot"]
+    # Every declared-line objective names the four slots, so on a project
+    # missing one each is the environment's error, with the slot named.
+    for objective in _ZONAL_OBJECTIVES:
+        res = _zonal_case_verdict(objective, three_lines, three_slot)
+        assert res.status == "error", objective
+        assert res.reason.startswith(verifiers._UNREACHED_SLOT_REASON), res.reason
+        assert missing in res.reason and f"slot {slot!r}" in res.reason
+    # On a project where nothing was reached, the same, for an empty report.
+    for objective in _ZONAL_OBJECTIVES:
+        assert _zonal_case_verdict(objective, "no seeded clusters in this project", []).status == "error"
+    # With every slot reached, three lines are the agent's miss.
+    assert _zonal_case_verdict("every-seeded-cluster-has-a-declared-line", three_lines).status == "fail"
+
+
+def test_fixture_roles_read_the_slot_credential_not_the_role_file(tmp_path):
+    # A reached cluster whose fixture was never planted has a slot credential
+    # and no role file: the check grades. The reverse cannot happen (a role
+    # file is a copy of the slot's), so a missing slot credential is the one
+    # thing that errors.
+    _stash("seeded-a: fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
+    _write_fleet_dir(tmp_path, ["crashloop-workload"])
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        assert v.verify(5.0).status == "pass"
+    (tmp_path / "clusters" / "a.kubeconfig").unlink()
+    (tmp_path / "crashloop-workload.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(verifiers._UNREACHED_SLOT_REASON)
+    assert "slot 'a'" in res.reason and "crashloop-workload" in res.reason
+
+
+def test_report_contains_fixture_roles_need_the_runners_directory():
+    _stash("seeded-a: fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["crashloop-workload"], required_phrases=["fine"])
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(fleet.FLEET_KUBECONFIG_DIR_ENV, None)
+        res = v.verify(5.0)
+    assert res.status == "error"
+    # Not a reachability claim: nothing was resolved, and the reason says so.
+    assert res.reason.startswith(verifiers._UNRESOLVED_ROLES_REASON)
+    assert fleet.FLEET_KUBECONFIG_DIR_ENV in res.reason
+
+
+def test_a_malformed_fixture_roles_entry_is_a_spec_load_error_not_a_run_time_one():
+    # The fleet verifier's contract for `fixture_role`, applied per entry.
+    with pytest.raises(ValidationError, match="lowercase-hyphen"):
+        parse_node({"type": "report_contains", "fixture_roles": ["Crashloop-Workload"], "required_phrases": ["x"]})
+    with pytest.raises(ValidationError, match="lowercase-hyphen"):
+        parse_node({"type": "report_contains", "fixture_roles": ["../escape"], "required_phrases": ["x"]})
+
+
+def test_a_role_the_runner_recorded_no_slot_for_errors_by_name(tmp_path):
+    _stash("fine")
+    v = ReportContainsVerifier(type="report_contains", fixture_roles=["no-such-role"], required_phrases=["fine"])
+    _write_fleet_dir(tmp_path, ["crashloop-workload"])
+    with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: str(tmp_path)}):
+        res = v.verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(verifiers._UNRESOLVED_ROLES_REASON)
+    assert "no-such-role" in res.reason and "catalogue" in res.reason
+
+
+def test_a_directory_an_older_runner_wrote_names_the_missing_record(tmp_path):
+    # `project=` and the slot lines are there, the `slot.<role>=` record is
+    # not: the runner predates it, and the reason says so rather than
+    # offering a case-authoring error or an absent runner.
+    (tmp_path / ".fleet-context").write_text("project=kube-agents-evals\ncluster.a=seeded-a\nlocation.a=us-central1-a\n", encoding="utf-8")
+    with pytest.raises(fleet.FleetRoleUnresolved, match="predates"):
+        fleet.slot_of_role("crashloop-workload", tmp_path)
+    (tmp_path / ".fleet-context").write_text("", encoding="utf-8")
+    with pytest.raises(fleet.FleetRoleUnresolved, match="never ran"):
+        fleet.slot_of_role("crashloop-workload", tmp_path)
+
+
+def test_zonal_case_patterns_name_exactly_the_catalogues_slots():
+    """The slot class in every pattern and the lookahead count in the first
+    objective are the catalogue's slots, so a fleet change fails here first."""
+    spec = yaml.safe_load(_ZONAL_CASE.read_text(encoding="utf-8"))
+
+    def class_letters(char_class: str) -> set[str]:
+        out: set[str] = set()
+        body = char_class[1:-1]
+        i = 0
+        while i < len(body):
+            if i + 2 < len(body) and body[i + 1] == "-":
+                out.update(chr(c) for c in range(ord(body[i]), ord(body[i + 2]) + 1))
+                i += 3
+            else:
+                out.add(body[i])
+                i += 1
+        return out
+
+    first = _zonal_case_check("every-seeded-cluster-has-a-declared-line")["any_of_patterns"][0]
+    assert first.count("(?=.*") == len(_SLOT_LETTERS)
+    for letter in _SLOT_LETTERS:
+        assert f"seeded-{letter}" in first
+    classes = set()
+    for entry in spec["verification_spec"]:
+        for pattern in entry["check"].get("any_of_patterns", []) + entry["check"].get("forbidden_patterns", []):
+            classes.update(re.findall(r"seeded-(\[[a-z-]+\])", pattern))
+    assert classes, "the patterns name the slots by a character class"
+    for char_class in classes:
+        assert class_letters(char_class) == set(_SLOT_LETTERS), char_class
+
+
+def test_a_cluster_that_merely_starts_with_a_slot_name_is_neither_a_slot_nor_a_wrong_value():
+    # A fifth, regional cluster named seeded-canary beside four right lines:
+    # not a slot line, so not forbidden; and a seeded-alpha line does not
+    # stand in for slot a.
+    for name in ("seeded-canary", "seeded-a-canary", "seeded-a-v2", "unseeded-a", "seeded-a-canary-v2", "seeded-a-old-eu1"):
+        extra = f"{name}: control plane is regional; API during its upgrade: available; running pods: unaffected"
+        for objective in _ZONAL_OBJECTIVES:
+            assert _zonal_case_grades(objective, _RIGHT_REPORT + "\n" + extra), (name, objective)
+        three = "\n".join(_zonal_line(c) for c in _SLOTS if c != "seeded-a")
+        assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", three + "\n" + _zonal_line(name)), name
+
+
+def test_zonal_case_refuses_one_joint_line_for_all_slots():
+    for joint in ("seeded-a/seeded-b/seeded-c/seeded-d", "seeded-a.seeded-b.seeded-c.seeded-d", "seeded-a-seeded-b-seeded-c-seeded-d"):
+        assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", _zonal_line(joint))
+
+
+def test_zonal_case_needs_a_line_for_each_of_the_four_slots():
+    assert not _zonal_case_grades("every-seeded-cluster-has-a-declared-line", _zonal_line("seeded-a"))
+    assert not _zonal_case_grades(
+        "every-seeded-cluster-has-a-declared-line", "\n".join(_zonal_line(c) for c in _SLOTS[:3])
+    )
+    # A slot the fleet does not have proves no read.
+    assert not any(_zonal_case_grades(o, _zonal_line("seeded-e")) for o in _ZONAL_OBJECTIVES)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Prose with the same words, the host cluster, clusters in general.
+        "seeded-a, seeded-b and seeded-c are zonal, so the API during each upgrade is unavailable and running pods are unaffected.",
+        "platform-agent-host: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "zonal clusters: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-alpha: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-batch-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-canary: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-v2: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "unseeded-a: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-canary-v2: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+        "seeded-a-test-run1: control plane is zonal; API during its upgrade: unavailable; running pods: unaffected",
+    ],
+)
+def test_zonal_case_refuses_what_is_not_a_declared_seeded_line(text):
+    assert not any(_zonal_case_grades(o, text) for o in _ZONAL_OBJECTIVES)
+
+
+@pytest.mark.parametrize(
+    "objective,wrong",
+    [
+        ("the-declared-lines-say-the-control-plane-is-zonal", _zonal_line("seeded-c", cp="regional")),
+        ("the-declared-lines-say-the-control-plane-is-zonal", _zonal_line("seeded-c", cp="multi-zonal")),
+        ("the-declared-lines-say-the-api-goes-away", _zonal_line("seeded-c", api="available")),
+        ("the-declared-lines-say-the-api-goes-away", _zonal_line("seeded-c", api="reachable")),
+        ("the-declared-lines-say-the-api-goes-away", _zonal_line("seeded-c", api="briefly unavailable")),
+        ("the-declared-lines-separate-workloads-from-the-api", _zonal_line("seeded-c", pods="affected")),
+        ("the-declared-lines-separate-workloads-from-the-api", _zonal_line("seeded-c", pods="evicted")),
+        ("the-declared-lines-separate-workloads-from-the-api", "“" + _zonal_line("seeded-c", pods="evicted") + "”"),
+    ],
+)
+def test_zonal_case_a_wrong_or_off_vocabulary_value_on_any_seeded_line_fails_its_objective(objective, wrong):
+    three_right = "\n".join(_zonal_line(c) for c in ("seeded-a", "seeded-b", "seeded-d"))
+    assert not _zonal_case_grades(objective, three_right + "\n" + wrong)
+
+
+@pytest.mark.parametrize(
+    "pods",
+    [
+        "not affected",
+        "will be affected",
+        "unaffected, mostly",
+        "unaffected/affected",
+        "unaffected [mostly]",
+        "unaffected [no]",
+        "unaffected?",
+        "unaffected (?)",
+        "unaffected\u2026",
+        "unaffected \u274c",
+        "unaffected ?!",
+        # Marks the fold's closer list does not name stay on the line: a
+        # no-entry sign, a stop sign, a thumbs down, a cross mark, a warning.
+        "unaffected \U0001F6AB",
+        "unaffected \U0001F6D1",
+        "unaffected \U0001F44E",
+        "unaffected \u274e",
+        "unaffected \u26a0\ufe0f",
+        "unaffected \u26d4",
+    ],
+)
+def test_zonal_case_a_hedged_value_is_the_wrong_value(pods):
+    # The forbidding pattern is the exact negation of the accepting one, so
+    # anything in the slot but the bare word fails the fourth objective.
+    three_right = "\n".join(_zonal_line(c) for c in ("seeded-a", "seeded-b", "seeded-d"))
+    report = three_right + "\n" + _zonal_line("seeded-c", pods=pods)
+    assert not _zonal_case_grades("the-declared-lines-separate-workloads-from-the-api", report)
 
 
 def test_required_phrase_matching_is_case_insensitive():

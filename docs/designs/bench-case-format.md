@@ -89,7 +89,11 @@ the contract for why.
 A case whose spec reads live cluster state must declare it. `fixtures: []` is the
 declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
-finding, because a grep that returns one case for a role has to mean one case uses it.
+finding, because a grep that returns one case for a role has to mean one case uses it. A
+case that depends on a slot's shape rather than on a plant (every seeded cluster is zonal,
+say) names one role per slot it reads and grounds the objective that needs every slot with
+`report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
+slots; the grep then still finds it when a slot's cluster is replaced.
 
 `owner` is who answers for the case when it flakes: a GitHub login written without the at
 sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
@@ -171,9 +175,18 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Seven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
-regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express), `tool_called` (calls in the
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`any_of_patterns` are regular expressions searched against a line-preserving text, with each
+line's decoration folded when the check sets `fold_decoration: true` (indentation, bullets,
+numbers, headings, quotes, links, a trailing stop or an affirming mark; a mark that hedges or
+negates the last word stays, so it reads as a wrong value), so a pattern anchored at both ends
+spells a declared line once and should keep `\n` out of its gaps, for what no substring can
+express: a banned word whose negated uses are legitimate, and a required claim whose
+subject and verb an adverb or a tense can separate; its `fixture_roles` names the seeded-fleet
+roles whose clusters the patterns require a line about, each resolved to its slot's own
+credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
+before any role on it is confirmed), and a slot the runner did not reach returns
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier

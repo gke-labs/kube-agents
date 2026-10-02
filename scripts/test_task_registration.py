@@ -653,6 +653,24 @@ class TestTheRulesReject(unittest.TestCase):
         # merged, which turned this into a test that asserted nothing.
         self._only("neither bench/tf/fleet/fixtures.json", fixtures=["no-such-fixture"])
 
+    def test_fixture_roles_on_a_report_check_force_a_fixtures_list_too(self):
+        # `report_contains` is not a cluster-reading type, so before
+        # fixture_roles existed it could name no role; now it can, and the
+        # grep contract (one case per role) needs the list.
+        self._only(
+            "declares no 'fixtures:'",
+            fixtures=DELETE,
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["crashloop-workload"]}),
+        )
+
+    def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
+        problem = self._only(
+            "'fixture_roles:' must be a list of role slugs",
+            fixtures=["crashloop-workload"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": "crashloop-workload"}),
+        )
+        self.assertNotIn("fixture role 'c'", problem)
+
     def test_a_fixture_role_that_is_not_a_string_is_rejected(self):
         self._only("is not a slug string", fixtures=[["rbac-overgrant"]])
 

@@ -297,6 +297,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_phrases",
         "any_of_phrases",
         "forbidden_patterns",
+        "any_of_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field, deliberately: the freshness binding is the assertion and every
@@ -512,6 +513,18 @@ def bench_cases() -> dict[str, pathlib.Path]:
     return {p.parent.name: p for p in sorted(TASKS_DIR.glob("*/task.yaml"))}
 
 
+def _fixture_roles_shape(node: Any, where: str, problems: list[str]) -> None:
+    """`fixture_roles:` is a list of role slugs; a scalar would otherwise be
+    walked character by character and reported as a dozen unknown roles."""
+    if not isinstance(node, dict):
+        return
+    roles = node.get("fixture_roles")
+    if roles is not None and (not isinstance(roles, list) or not all(isinstance(r, str) for r in roles)):
+        problems.append(f"{where}: 'fixture_roles:' must be a list of role slugs")
+    for child in node.get("checks") or []:
+        _fixture_roles_shape(child, where, problems)
+
+
 def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
     """Walk one check subtree, reporting nodes that cannot fail."""
     if not isinstance(node, dict):
@@ -574,12 +587,18 @@ def _check_types(node: Any, found: set[str]) -> None:
 
 
 def _fixture_roles(node: Any, found: set[str]) -> None:
-    """Every `fixture_role:` named anywhere in one check subtree."""
+    """Every `fixture_role:` (and `fixture_roles:` entry) named anywhere in
+    one check subtree."""
     if not isinstance(node, dict):
         return
     role = node.get("fixture_role")
     if isinstance(role, str):
         found.add(role)
+    roles = node.get("fixture_roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if isinstance(role, str):
+                found.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found)
 
@@ -760,6 +779,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 problems.append(f"{where}: entry has no 'check:' subtree")
             else:
                 _check_assertions(entry["check"], where, problems)
+                _fixture_roles_shape(entry["check"], where, problems)
                 _check_types(entry["check"], used_types)
                 _fixture_roles(entry["check"], used_roles)
 
@@ -778,11 +798,18 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     "own 'fixtures:' list does not declare"
                 )
 
-        if fixtures is None and used_types & CLUSTER_READING_TYPES:
+        if fixtures is None and (used_types & CLUSTER_READING_TYPES or used_roles):
+            reading = sorted(used_types & CLUSTER_READING_TYPES)
+            # A report check naming roles opens no cluster; it asks whether
+            # the role's slot was reached. Say which the case does.
+            lead = (
+                "reads live cluster state (" + ", ".join(reading) + ")"
+                if reading
+                else "names seeded-fleet roles (" + ", ".join(sorted(used_roles)) + ")"
+            )
             problems.append(
-                "reads live cluster state ("
-                + ", ".join(sorted(used_types & CLUSTER_READING_TYPES))
-                + ") and declares no 'fixtures:'. List the seeded-fleet roles "
+                lead
+                + " and declares no 'fixtures:'. List the seeded-fleet roles "
                 "it depends on, so the fleet owner replacing a cluster can "
                 "grep for the cases that go quiet, or declare 'fixtures: []' "
                 "for a case that plants its own state"
