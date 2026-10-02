@@ -24,9 +24,13 @@ The mapping from role to cluster is NOT here. It lives in
 ``bench/tf/fleet/fixtures.json`` beside the Terraform that plants the fixtures,
 and at run time ``hack/fleet-kubeconfigs.sh`` is the only thing that reads it:
 for each role it writes ``<dir>/<role>.kubeconfig`` holding credentials for
-whichever cluster of the leased project's fleet carries that role. This module's
-whole job is the last hop -- role name to file path -- which keeps the
-resolution single-sourced and makes this side testable without a cloud.
+whichever cluster of the leased project's fleet carries that role, once the
+role's objects are confirmed there; for each seeded cluster it reached it
+writes ``<dir>/clusters/<slot>.kubeconfig`` first, and it records the slot of
+every catalogue role in ``<dir>/.fleet-context`` (``slot.<role>=<slot>``).
+This module's whole job is the last hop -- role name to file path, by either
+route -- which keeps the resolution single-sourced and makes this side
+testable without a cloud.
 
 The one rule that matters: an unresolvable role RAISES. It never returns None
 and it never returns the ambient kubeconfig. Silently falling back to the
@@ -38,7 +42,6 @@ answers a question nobody asked.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
@@ -69,10 +72,10 @@ _SUFFIX = ".kubeconfig"
 # runner reached, whether or not the roles on it were planted. A role file is
 # a copy of it made only once the role's probes were all seen.
 _SLOT_DIR = "clusters"
-# The catalogue that maps a role to its slot; the runner reads the same file
-# under the same variable.
-FLEET_CATALOG_ENV = "FLEET_CATALOG"
-_DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / "tf" / "fleet" / "fixtures.json"
+# The runner's record of which slot each catalogue role lives on, one
+# `slot.<role>=<slot>` line in the context file, so this module never opens
+# the catalogue itself.
+_SLOT_KEY_FORMAT = "slot.{role}="
 
 # Written by hack/fleet-kubeconfigs.sh as `project=<id>`. The pool of eval
 # projects is leased at random and not every project in it necessarily carries
@@ -95,6 +98,12 @@ class FleetRoleUnresolved(LookupError):
     roles the runner actually provisioned, and the two reasons the list is
     short (the runner never ran, or that cluster was unreachable).
     """
+
+
+class FleetSlotUnreached(FleetRoleUnresolved):
+    """The runner resolved the role's slot and wrote no credential for it:
+    the seeded cluster is missing from the project, not RUNNING, or could not
+    be reached. The one subclass a check may name as "not reached"."""
 
 
 def available_roles(directory: str | os.PathLike[str] | None = None) -> list[str]:
@@ -163,21 +172,32 @@ def confirmed_subjects(
     return frozenset(line.strip() for line in text.splitlines() if line.strip())
 
 
-def slot_of_role(role: str) -> str:
-    """The seeded-fleet slot letter carrying ``role``, from the catalogue.
+def slot_of_role(role: str, directory: str | os.PathLike[str] | None = None) -> str:
+    """The seeded-fleet slot letter carrying ``role``, as the runner recorded
+    it in the context file from the catalogue it read.
 
     Raises:
-        FleetRoleUnresolved: The catalogue cannot be read or names no such role.
+        FleetRoleUnresolved: The runner provisioned nothing, or recorded no
+            slot for this role (it is not in the catalogue the runner read).
     """
-    catalog = Path(os.environ.get(FLEET_CATALOG_ENV) or _DEFAULT_CATALOG)
+    root = directory if directory is not None else os.environ.get(FLEET_KUBECONFIG_DIR_ENV)
+    if not root:
+        raise FleetRoleUnresolved(
+            f"no seeded-fleet kubeconfigs: {FLEET_KUBECONFIG_DIR_ENV} is unset, so the runner "
+            f"resolved no seeded cluster before the run (hack/fleet-kubeconfigs.sh did not run)"
+        )
+    key = _SLOT_KEY_FORMAT.format(role=role)
     try:
-        roles = json.loads(catalog.read_text(encoding="utf-8")).get("roles") or {}
-    except (OSError, ValueError) as exc:
-        raise FleetRoleUnresolved(f"the fleet catalogue {catalog} could not be read ({exc})") from exc
-    slot = (roles.get(role) or {}).get("cluster_slot") if isinstance(roles.get(role), dict) else None
-    if not isinstance(slot, str) or not slot:
-        raise FleetRoleUnresolved(f"fixture role {role!r} is not in the fleet catalogue {catalog}, so no slot carries it")
-    return slot
+        lines = (Path(root) / _CONTEXT_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith(key) and line[len(key):].strip():
+            return line[len(key):].strip()
+    raise FleetRoleUnresolved(
+        f"the runner recorded no slot for fixture role {role!r} in {root}/{_CONTEXT_FILE}: the role is "
+        f"not in the catalogue (bench/tf/fleet/fixtures.json) the runner read, or the runner never ran there"
+    )
 
 
 def slot_kubeconfig_for_role(role: str, directory: str | os.PathLike[str] | None = None) -> str:
@@ -196,18 +216,13 @@ def slot_kubeconfig_for_role(role: str, directory: str | os.PathLike[str] | None
     """
     if not ROLE_PATTERN.fullmatch(role):
         raise FleetRoleUnresolved(f"fixture role {role!r} is not a lowercase-hyphen name, so it cannot name a catalogue entry")
+    slot = slot_of_role(role, directory)
     root = directory if directory is not None else os.environ.get(FLEET_KUBECONFIG_DIR_ENV)
-    if not root:
-        raise FleetRoleUnresolved(
-            f"no seeded-fleet kubeconfigs: {FLEET_KUBECONFIG_DIR_ENV} is unset, so the runner "
-            f"resolved no seeded cluster before the run (hack/fleet-kubeconfigs.sh did not run)"
-        )
-    slot = slot_of_role(role)
     path = Path(root) / _SLOT_DIR / f"{slot}{_SUFFIX}"
     if not path.is_file():
         project = provisioned_project(root)
         where = f"project {project}" if project else "the leased project"
-        raise FleetRoleUnresolved(
+        raise FleetSlotUnreached(
             f"the seeded cluster for slot {slot!r} (the one carrying fixture role {role!r}) was not "
             f"reached before the run: {path.name} is absent from {root}/{_SLOT_DIR}, so in {where} the "
             f"slot is missing, not RUNNING, or its credentials could not be fetched (the runner's "

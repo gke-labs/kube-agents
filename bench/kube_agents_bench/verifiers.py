@@ -68,6 +68,7 @@ from kube_agents_bench import discovery, github_writes, onboarding, transcript
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
+    FleetSlotUnreached,
     confirmed_subjects,
     kubeconfig_for_role,
     slot_kubeconfig_for_role,
@@ -95,6 +96,10 @@ _NO_TRANSCRIPT_REASON = (
 _UNREACHED_SLOT_REASON = (
     "a seeded cluster this check's patterns require a line about was not reached before the run, "
     "so a missing line about it is the environment's gap, not the agent's miss"
+)
+_UNRESOLVED_ROLES_REASON = (
+    "this check's fixture_roles could not be resolved to a seeded cluster, so the lines it "
+    "requires cannot be graded"
 )
 _NO_WORKER_CALLS_REASON = (
     "no delegated worker's tool calls are in the trajectory: either no card was "
@@ -142,21 +147,25 @@ def _normalize(text: str) -> str:
 # A line's decoration, folded before the pattern clauses see it when the
 # check asks for it (``fold_decoration: true``). The lead is any run of
 # non-word characters (bullets, quotes, pipes, arrows, symbols, a checkbox),
-# ordinals (`1.`, `(1)`, `a)`, `ii.`, a circled digit), citation markers
-# (`[1]`) and whitespace, up to the first word character; a Markdown link
-# around a name is kept as its text, and a quote or bracket closing a name
-# goes with the opener the lead took. The trail is any run of non-word
-# characters (a stop, a list's comma or semicolon, quotes, pipes, a
-# hard-break backslash, the affirming marks `_TRAIL_CLOSERS` names), a `<br>`, or
-# a footnote marker (`[1]`, `[^note]`, `(1)`, a superscript digit, a linked
-# `[1](url)`). A pattern anchored with ``^...$`` then spells
-# a declared line once rather than once per rendering -- the reason
-# `_MARKDOWN_NOISE` exists, applied to the line's edges. Interior
-# punctuation is untouched. Opt-in, because a case may forbid the decoration
+# list tokens (`1.`, `(1)`, `a)`, `ii.`, a circled digit, a keycap `1️⃣`,
+# `#1`), citation markers (`[1]`) and whitespace, up to the first word
+# character; a Markdown link around a name is kept as its text, and a quote
+# or bracket closing a name goes with the opener the lead took. The trail is
+# a run of the closers and affirming marks `_TRAIL_CLOSERS` names (a stop, a
+# list's comma or semicolon, quotes, pipes, a hard-break backslash, a check
+# mark), a `<br>`, or a footnote marker (`[1]`, `[^note]`, `(1)`, a
+# superscript digit, a linked `[1](url)`); any other trailing symbol stays.
+# A footnote marker before a `;`, `,` or `.` inside the line is folded too,
+# since a declared frame's values are separated by `;`. A pattern anchored
+# with ``^...$`` then spells a declared line once rather than once per
+# rendering -- the reason `_MARKDOWN_NOISE` exists, applied to the line's
+# edges. Other interior punctuation is untouched. Opt-in, because a case
+# may forbid the decoration
 # itself (a bulleted capability list, say), and that pattern needs the
 # markers left where they are.
 _LINE_LEAD_DECORATION = re.compile(
     r"^(?:\[\s*[x ]?\s*\]|\[\^?\d{1,3}\]|\(?\d{1,3}[.)](?=\s)|\(?[ivx]{1,4}[.)](?=\s)|[a-z][.)](?=\s)"
+    r"|#?\d{1,3}(?:\ufe0f?\u20e3)?(?=\s)"
     r"|[\u2460-\u2473\u24ea-\u24ff\u2776-\u2793]|[^\w\n])+"
 )
 # A footnote marker at the end of a line: `[1]`, `[^1]`, `[^note]` (a named
@@ -166,9 +175,11 @@ _LINE_LEAD_DECORATION = re.compile(
 # matches, and the repeat is possessive: alternatives that overlap inside
 # `(...)+$` backtrack exponentially on a line that ends in many markers and
 # then a word, and this runs on every line of a report.
-_LINE_TRAIL_FOOTNOTE = re.compile(
-    r"(?:\s*(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^(?!\d{1,3}\])[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079]))++\s*$"
-)
+_FOOTNOTE_MARKER = r"(?:\[\^?\d{1,3}\](?:\([^)\n]*\))?|\[\^(?!\d{1,3}\])[\w-]{1,20}\]|\(\d{1,3}\)|[\u00b9\u00b2\u00b3\u2070-\u2079])"
+_LINE_TRAIL_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++\s*$")
+# The same markers before a separator inside the line: a citation on a
+# value other than the last one.
+_LINE_INTERIOR_FOOTNOTE = re.compile(r"(?:\s*" + _FOOTNOTE_MARKER + r")++(?=\s*[;,.])")
 # What a line may end with and still be the same line: whitespace, closing
 # punctuation, quotes, brackets, pipes, a hard-break backslash, a `<br>`, and
 # the marks that affirm (a check, a thumbs up, a green circle, with the
@@ -222,7 +233,7 @@ def _fold_line_decoration(line: str) -> str:
     # other link is kept as its text, so a linked value stays a value; then
     # the lead, the quoted name, and the trail once more with the full
     # closer class.
-    footnoted = _fold_trail_markers(line)
+    footnoted = _LINE_INTERIOR_FOOTNOTE.sub("", _fold_trail_markers(line))
     unlinked = _MARKDOWN_LINK.sub(r"\1", footnoted)
     led = _LINE_LEAD_DECORATION.sub("", unlinked, count=1)
     unquoted = _QUOTED_FIRST_NAME.sub(r"\1", led, count=1)
@@ -296,8 +307,9 @@ class ReportContainsVerifier(BaseVerifier):
     # it out of its gaps.
     any_of_patterns: list[str] = Field(default_factory=list)
     # Fold each line's decoration (bullets, numbers, quotes, links, a trailing
-    # stop or mark) before the pattern clauses run, so a declared line is
-    # spelled once. Off by default: a case may forbid the decoration itself.
+    # stop or an affirming mark; a mark that hedges or negates the last word
+    # stays) before the pattern clauses run, so a declared line is spelled
+    # once. Off by default: a case may forbid the decoration itself.
     fold_decoration: bool = False
     # The seeded-fleet roles whose clusters the patterns require a line
     # about, one per slot. Each is resolved to its slot's own credential
@@ -336,12 +348,13 @@ class ReportContainsVerifier(BaseVerifier):
         for role in self.fixture_roles:
             try:
                 slot_kubeconfig_for_role(role)
+            except FleetSlotUnreached as exc:
+                return VerificationResult(
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNREACHED_SLOT_REASON}: {exc}"
+                )
             except FleetRoleUnresolved as exc:
                 return VerificationResult(
-                    success=False,
-                    status="error",
-                    elapsed_time=time.monotonic() - start,
-                    reason=f"{_UNREACHED_SLOT_REASON}: {exc}",
+                    success=False, status="error", elapsed_time=time.monotonic() - start, reason=f"{_UNRESOLVED_ROLES_REASON}: {exc}"
                 )
         snap = transcript.get()
         if snap is None:

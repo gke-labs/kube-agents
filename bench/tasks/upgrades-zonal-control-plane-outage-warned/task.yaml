@@ -135,6 +135,14 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
+      # The same four slots as the first objective: on a project where the
+      # runner reached no seeded cluster, this is the environment's error too,
+      # not a value the agent got wrong.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
         - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is zonal; api during its upgrade: [^;\n]+; running pods: [^\n]+$'
       # A declared frame whose first value is anything but "zonal" is the
@@ -148,6 +156,14 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
+      # The same four slots as the first objective: on a project where the
+      # runner reached no seeded cluster, this is the environment's error too,
+      # not a value the agent got wrong.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
         - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: unavailable; running pods: [^\n]+$'
       forbidden_patterns:
@@ -162,6 +178,14 @@ verification_spec:
     check:
       type: report_contains
       fold_decoration: true
+      # The same four slots as the first objective: on a project where the
+      # runner reached no seeded cluster, this is the environment's error too,
+      # not a value the agent got wrong.
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
         - '(?m)^(?:(?!seeded-[a-d])[a-z0-9/._-])*seeded-[a-d](?:(?!seeded-[a-d])[a-z0-9/._-])*(?:\s*\([^)\n]*\))?: control plane is [^;\n]+; api during its upgrade: [^;\n]+; running pods: unaffected$'
       forbidden_patterns:

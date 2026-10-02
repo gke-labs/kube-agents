@@ -2138,6 +2138,19 @@ def test_the_runner_records_each_slots_cluster_for_the_state_pass(shell, tmp_pat
     assert not any(line.startswith(("cluster.b=", "cluster.c=")) for line in context)
 
 
+def test_the_runner_records_every_roles_slot_whether_or_not_it_was_reached(shell, tmp_path):
+    """`fixture_roles` on report_contains resolves a role to its slot's own
+    credential without reading the catalog: the runner records the slot of
+    every catalog role in the context file, reached or not, so a check on an
+    unreached slot can say which slot it was."""
+    short = _provision(shell, tmp_path, STUB_CLUSTERS="seeded-a\tus-central1-a\n")
+    context = (short / ".fleet-context").read_text().splitlines()
+    for role, spec in _catalog()["roles"].items():
+        assert f"slot.{role}={spec['cluster_slot']}" in context
+    assert (short / "clusters" / "a.kubeconfig").is_file()
+    assert not (short / "clusters" / "b.kubeconfig").exists()
+
+
 def _state_module():
     import importlib.util
 

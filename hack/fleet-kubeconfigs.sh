@@ -16,8 +16,13 @@
 # names `fixture_role: crashloop-workload`; bench/tf/fleet/fixtures.json says
 # which SLOT of the fleet that role lives on; this script finds the leased
 # project's seeded clusters and matches each cluster to its slot. The catalog is the only
-# place the role->slot mapping exists -- the verifier never re-derives it, it
-# just opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig".
+# place the role->slot mapping exists -- the verifier never re-derives it. It
+# opens "${BENCH_FLEET_KUBECONFIG_DIR}/<role>.kubeconfig" for a check on the
+# role's objects; a check that only needs the role's cluster to have been
+# reached (`fixture_roles` on report_contains) reads the slot this script
+# records for the role in .fleet-context (`slot.<role>=<slot>`) and opens
+# "${BENCH_FLEET_KUBECONFIG_DIR}/clusters/<slot>.kubeconfig", which is written
+# for every reached cluster before any role on it is confirmed.
 #
 # Clusters are DISCOVERED BY LABEL, not composed from a name:
 #
@@ -571,6 +576,9 @@ write_fleet_kubeconfigs() {
 
   while read -r role slot namespace probes; do
     [ -n "$role" ] || continue
+    # The role's slot, recorded whether or not the slot was reached: the
+    # verifier's slot-level resolution reads it rather than the catalog.
+    printf 'slot.%s=%s\n' "$role" "$slot" >>"${dir}/.fleet-context"
     slot_config="${dir}/clusters/${slot}.kubeconfig"
     if [ ! -f "$slot_config" ]; then
       unresolved=$((unresolved + 1))

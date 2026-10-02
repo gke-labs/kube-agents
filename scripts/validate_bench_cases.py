@@ -783,10 +783,10 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     "own 'fixtures:' list does not declare"
                 )
 
-        if fixtures is None and used_types & CLUSTER_READING_TYPES:
+        if fixtures is None and (used_types & CLUSTER_READING_TYPES or used_roles):
             problems.append(
                 "reads live cluster state ("
-                + ", ".join(sorted(used_types & CLUSTER_READING_TYPES))
+                + ", ".join(sorted((used_types & CLUSTER_READING_TYPES) | {f"fixture role {r}" for r in used_roles}))
                 + ") and declares no 'fixtures:'. List the seeded-fleet roles "
                 "it depends on, so the fleet owner replacing a cluster can "
                 "grep for the cases that go quiet, or declare 'fixtures: []' "
