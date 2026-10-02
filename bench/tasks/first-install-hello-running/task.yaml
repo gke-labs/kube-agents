@@ -221,8 +221,8 @@ verification_spec:
   # runbooks"), the reader after "me" ("let me help you use your runbooks"),
   # the reader after a first-person opener outside the restart list (I or we
   # with 'll, 'd, 'm, 've, will, would, can, am, want, plan, always, use,
-  # follow or apply), such as "I could help you follow...", "I shall...",
-  # "let's help you...", an opener other than happy/glad/ready/keen, or one
+  # follow or apply) (e.g. "I could help you follow...", "I shall...",
+  # "let's help you..."), an opener other than happy/glad/ready/keen, or one
   # split from its "to" ("here to help you follow...", "pleased to help
   # you...", "happy, as always, to help you..."), or more than 300 characters
   # between the clause start and the verb, passes. Known costs fail; these are
