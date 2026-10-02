@@ -117,8 +117,8 @@ verification_spec:
   # "will", "'ll" or "being", an adverb between allowed ("will automatically
   # be retried", "will soon try again"), or after "going", "set",
   # "scheduled", "queued" or "about" plus "to". "Automatically try again"
-  # and "soon retry" count after any modal ("it should soon retry"). A bare "to try again" is not listed ("you'll be the
-  # one to try again" hands the retry over). "Restarts it" needs
+  # and "soon retry" count after any modal ("it should soon retry"). A bare "to try again" or "to run again" is not listed
+  # ("you'll be the one to try again", "up to you to run again" hand the retry over). "Restarts it" needs
   # "dispatcher" (the card is about a pod Kubernetes restarts), "another
   # run" a boundary after it ("another runbook"), and "next attempt" a verb
   # after it ("on the next attempt you may want more memory"). A retry noun
@@ -212,7 +212,11 @@ verification_spec:
         - "running again"
         - "will run again"
         - "'ll run again"
-        - "to run again"
+        - "going to run again"
+        - "about to run again"
+        - "set to run again"
+        - "scheduled to run again"
+        - "queued to run again"
         - "going to run it again"
         - "about to run it again"
         - "set to run it again"

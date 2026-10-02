@@ -4483,6 +4483,10 @@ def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message
             (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
             for nonfact in ("Please try again.", "Please run it again.")
         ),
+        *(
+            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
+            for nonfact in ("It's up to you to run again.", "You'll be the one to run again.")
+        ),
         # A hedge or a bare denial states no retry and calls it final.
         *(
             (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
