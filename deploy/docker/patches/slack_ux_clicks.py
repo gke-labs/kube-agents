@@ -23,7 +23,9 @@ With the flag on, :func:`register` adds two listeners:
   authorization; an unlisted user's click is logged and changes nothing, and
   so does one in a channel or DM the adapter would ignore a typed message in.
   Then the message is rewritten with the choice buttons replaced by
-  a line naming who chose what, a short echo ("↳ @user: label") is posted in
+  a line naming who chose what (the same line goes above the message's text,
+  which is kept: an incident report is in that text and nowhere a later read
+  of the thread looks), a short echo ("↳ @user: label") is posted in
   the thread, since a bot token cannot post as the user, and the label is fed
   to the adapter's message handler as that user's message in that thread, the
   path a reaction trigger already takes. That path applies the channel and user checks a typed message gets, so a click
@@ -113,6 +115,9 @@ ANSWERED_IN_THREAD = "✓ answered in the thread"
 #: Slack's most replies one ``conversations.replies`` page returns.
 REPLIES_READ_MAX = 1000
 
+#: Slack truncates a message's ``text`` past this many characters.
+SLACK_TEXT_MAX = 40000
+
 #: ``(channel, ts, kind)`` a click answered.
 _answered: OrderedDict[tuple, None] = OrderedDict()
 _warned_missing = False
@@ -172,6 +177,18 @@ def answered_blocks(blocks: Any, answered: Any, note: str) -> list[dict]:
         out.append(block)
     out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": note}]})
     return out
+
+
+def _answered_text(note: str, message: dict) -> str:
+    """``note`` with the message's own text under it, clipped to ``SLACK_TEXT_MAX``.
+
+    The adapter reads a thread back from ``text`` and top-level blocks, and an
+    incident alert's report is in its ``text`` only, so replacing the text with
+    the note would leave the click's own turn, and every later read of the
+    thread, without the report.
+    """
+    original = str(message.get("text") or "")
+    return _presenter._clip(f"{note}\n\n{original}", SLACK_TEXT_MAX) if original else note
 
 
 def _shown_text(action: dict) -> str:
@@ -273,7 +290,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
         logger.info("slack_ux_clicks: dropping a %s click on %s, already applied in the thread", kind, msg_ts)
         try:
             await client.chat_update(
-                channel=channel_id, ts=msg_ts, text=ANSWERED_IN_THREAD,
+                channel=channel_id, ts=msg_ts, text=_answered_text(ANSWERED_IN_THREAD, message),
                 blocks=answered_blocks(message.get("blocks"), _answered_by, ANSWERED_IN_THREAD),
             )
         except Exception as exc:  # noqa: BLE001 — the click is dropped either way
@@ -284,7 +301,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     note = ANSWERED.format(user=user_id, label=shown)
     try:
         await client.chat_update(
-            channel=channel_id, ts=msg_ts, text=note,
+            channel=channel_id, ts=msg_ts, text=_answered_text(note, message),
             blocks=answered_blocks(message.get("blocks"), _answered_by, note),
         )
     except Exception as exc:  # noqa: BLE001 — the click still answers

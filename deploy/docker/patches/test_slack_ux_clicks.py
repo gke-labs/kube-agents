@@ -409,8 +409,8 @@ class RuntimeTest(unittest.TestCase):
             [[e["action_id"] for e in b["elements"]] for b in actions], [["kage.link.0"]]
         )
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], "✓ <@U1>: Leave it")
-        # The notification text no longer offers the choices the blocks dropped.
-        self.assertEqual(update["text"], "✓ <@U1>: Leave it")
+        # The note leads the text; the message's own text stays under it for a later thread read.
+        self.assertEqual(update["text"], "✓ <@U1>: Leave it\n\nfallback")
         self.assertEqual(echo, {"channel": CHANNEL, "thread_ts": THREAD, "text": "↳ <@U1>: Leave it"})
         self.assertEqual(
             turn,
@@ -595,6 +595,44 @@ class RuntimeTest(unittest.TestCase):
             self._incident(adapter)
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
         self.assertTrue(any("could not read the thread" in line for line in logs.output))
+
+    def test_the_answered_alert_keeps_its_report_for_the_clicks_own_turn(self):
+        report = "*Pod OOMKilled*\nOption A: raise the limit\nOption B: roll back checkout-gateway"
+        adapter = _Adapter()
+        seen = []
+
+        async def turn(event, payload=None):
+            seen.append([entry[1]["text"] for entry in adapter.log if entry[0] == "chat_update"])
+
+        adapter._handle_slack_message = turn
+        body, action = _choice(1, "Apply Option B", prefix=incident.ACTION_PREFIX)
+        body["message"]["text"] = report
+        self._answer(adapter, body, action)
+        self.assertEqual(seen, [[f"✓ <@U1>: Apply Option B\n\n{report}"]])
+
+    def test_typed_apply_keeps_the_report_too(self):
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
+        body, action = _choice(1, "Apply Option A", prefix=incident.ACTION_PREFIX)
+        body["message"]["text"] = "the report"
+        self._answer(adapter, body, action)
+        self.assertEqual(adapter.log[-1][1]["text"], f"{runtime.ANSWERED_IN_THREAD}\n\nthe report")
+
+    def test_answered_text_is_clipped_to_slacks_limit_and_keeps_the_note(self):
+        adapter = _Adapter()
+        body, action = _choice()
+        body["message"]["text"] = "word " * runtime.SLACK_TEXT_MAX
+        self._answer(adapter, body, action)
+        text = adapter.log[0][1]["text"]
+        self.assertLessEqual(len(text), runtime.SLACK_TEXT_MAX)
+        self.assertTrue(text.startswith("✓ <@U1>: Leave it\n\nword word"))
+        self.assertTrue(text.endswith(presenter.ELLIPSIS))
+
+    def test_a_message_with_no_text_is_answered_with_the_note_alone(self):
+        adapter = _Adapter()
+        body, action = _choice()
+        del body["message"]["text"]
+        self._answer(adapter, body, action)
+        self.assertEqual(adapter.log[0][1]["text"], "✓ <@U1>: Leave it")
 
     def test_two_clicks_during_the_thread_read_run_one_turn(self):
         adapter = _Adapter()
