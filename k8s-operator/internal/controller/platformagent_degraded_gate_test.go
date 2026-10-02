@@ -346,4 +346,10 @@ func TestStaleCacheLaggingInformerDoesNotWriteStatusDegraded(t *testing.T) {
 	if counter.writes != 0 {
 		t.Fatalf("updateStatusDegraded made %d status writes on a stale cache pass, want 0: the live object already held matching status", counter.writes)
 	}
+	if staleAgent.Status.Phase != "Degraded" {
+		t.Fatalf("updateStatusDegraded did not adopt live status into agent; phase=%q, want Degraded", staleAgent.Status.Phase)
+	}
+	if staleAgent.ResourceVersion != agent.ResourceVersion {
+		t.Fatalf("updateStatusDegraded did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
+	}
 }
