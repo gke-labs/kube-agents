@@ -337,7 +337,24 @@ state_attr() {
 # override pins the provider at a placeholder for the duration; it is never used to
 # talk to anything, because import performs no Helm operation.
 OVERRIDE_FILE="providers_lifecycle_override.tf"
-drop_override() { rm -f "$OVERRIDE_FILE"; }
+
+# The same import walk has a second casualty. It gives every resource not yet
+# in state an unknown value, data sources included, and the scope resolver
+# module keys its monitored-project lookup's for_each on the metrics-scope
+# read, so the key set is unknown and Terraform refuses every import before it
+# calls the provider ("Invalid for_each argument"), with or without a scope
+# declared. A second override pins that for_each to an empty set, and pins the
+# module's `members` output to {}: the IAM module keys its scope bindings on
+# it, and the same walk leaves it unknown once a Shared VPC host or Metrics
+# Scope is declared. Import reads nothing and plans nothing, so what the
+# selectors resolve to is never consulted while the file exists. Terraform
+# merges *_override.tf per module directory, so the file goes where main.tf
+# sources the module from; neither file needs an init. An override of a block
+# the module no longer defines fails the import loudly, which is what a rename
+# in the module should do here.
+SCOPE_RESOLVER_MODULE_DIR="../../modules/kube-agents-scope-resolver"
+SCOPE_OVERRIDE_FILE="$SCOPE_RESOLVER_MODULE_DIR/scope_resolver_lifecycle_override.tf"
+drop_override() { rm -f "$OVERRIDE_FILE" "$SCOPE_OVERRIDE_FILE"; }
 
 with_override() {
   cat >"$OVERRIDE_FILE" <<'EOF'
@@ -351,7 +368,34 @@ provider "helm" {
   }
 }
 EOF
+  cat >"$SCOPE_OVERRIDE_FILE" <<'EOF'
+# Written by lifecycle.sh for the duration of a terraform import; always removed
+# again. If you are reading this in a committed diff, something went wrong.
+# A plan or apply that merged this file would resolve every selector to
+# nothing and retire its bindings; lifecycle.sh removes it before either runs.
+data "http" "scope_monitored_project" {
+  for_each = toset([])
+}
+
+output "members" {
+  value = {}
+}
+EOF
   trap drop_override EXIT
+}
+
+# Runs an import with both overrides in place. Successful imports stay quiet;
+# a failed one prints Terraform's own error ahead of the warning, because the
+# warning alone cannot say whether the resource, the credentials or the
+# configuration was the problem.
+import_resource() { # <address> <id>
+  local output
+  if output=$(terraform import -input=false "$1" "$2" 2>&1); then
+    return 0
+  fi
+  printf '%s\n' "$output" >&2
+  warn "could not import $1 ($2); the apply will fail with a 409"
+  return 1
 }
 
 # Destroying a google_kms_crypto_key does not delete the key — GCP will not — but
@@ -452,7 +496,7 @@ adopt_kms() {
   # off) and the minter — leaves targets empty, and macOS's bash 3.2 treats an
   # empty array expansion as unbound under `set -u`. The ${arr[@]+...} form
   # expands to nothing instead, so the loop runs zero times and the tail below
-  # still clears any stale provider override and logs what happened.
+  # still clears any stale import override and logs what happened.
   local adopted=0 address kind id
   for target in ${targets[@]+"${targets[@]}"}; do
     IFS=$'\t' read -r address kind id <<<"$target"
@@ -476,15 +520,13 @@ adopt_kms() {
     esac
 
     log "adopting pre-existing resource: $id"
-    [[ -f "$OVERRIDE_FILE" ]] || with_override
+    [[ -f "$OVERRIDE_FILE" && -f "$SCOPE_OVERRIDE_FILE" ]] || with_override
     state_changed
-    if terraform import -input=false "$address" "$id" >/dev/null 2>&1; then
+    if import_resource "$address" "$id"; then
       adopted=$((adopted + 1))
       if [[ "$kind" == "key" ]]; then
         restore_key_versions "$id" "$location" "$project"
       fi
-    else
-      warn "could not import $address ($id); the apply will fail with a 409"
     fi
   done
 
@@ -547,16 +589,14 @@ adopt_pubsub() {
     gcloud pubsub "$kind" describe "${id##*/}" --project "$project" >/dev/null 2>&1 || continue
 
     log "adopting existing Pub/Sub resource: $id"
-    [[ -f "$OVERRIDE_FILE" ]] || with_override
+    [[ -f "$OVERRIDE_FILE" && -f "$SCOPE_OVERRIDE_FILE" ]] || with_override
     state_changed
-    if terraform import -input=false "$address" "$id" >/dev/null 2>&1; then
+    if import_resource "$address" "$id"; then
       adopted=$((adopted + 1))
       # STATE_LIST is a snapshot taken by load_state above, so the
       # subscription's check below would not see the topic this import just
       # added without re-reading it.
       load_state
-    else
-      warn "could not import $address ($id); the apply will fail with a 409"
     fi
   done
 
@@ -1143,6 +1183,9 @@ case "${1:-}" in
     ;;
   plan)
     shift
+    # A lifecycle.sh killed mid-import leaves the overrides behind, and a plan
+    # that merged the scope one would show every selector's bindings retired.
+    drop_override
     # Read-only, and every argument here is what makes it so:
     #
     #   readonly       do not create the state bucket (see ensure_backend)
@@ -1166,6 +1209,9 @@ case "${1:-}" in
     ;;
   apply)
     shift
+    # As under plan: an apply that merged a stale scope override would retire
+    # the bindings of every declared selector.
+    drop_override
     ensure_init
     log "verifying pre-apply safety guards (cluster, IAM, KMS)..."
     guard_cluster_ownership
@@ -1196,6 +1242,7 @@ case "${1:-}" in
     ;;
   destroy)
     shift
+    drop_override
     ensure_init
     # Confirm before the FIRST side effect, not at terraform's own prompt: by
     # the time `terraform destroy` asks, this script has already deleted the

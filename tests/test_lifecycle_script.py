@@ -26,6 +26,42 @@ from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _LIFECYCLE_SH = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
+_FULL_INSTALL = _LIFECYCLE_SH.parent
+
+# The two files lifecycle.sh writes around a `terraform import` and removes
+# afterwards: the helm provider placeholder beside the composition, and the
+# scope resolver pin inside that module's own directory.
+_PROVIDER_OVERRIDE = "providers_lifecycle_override.tf"
+_SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
+_SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
+_OVERRIDE_DATA_RE = re.compile(r'^data "(\w+)" "(\w+)"', re.MULTILINE)
+_OVERRIDE_OUTPUT_RE = re.compile(r'^output "(\w+)"', re.MULTILINE)
+
+
+def _scope_resolver_source():
+    """The path main.tf sources the scope resolver module from, relative to the composition."""
+    match = _SCOPE_RESOLVER_SOURCE_RE.search((_FULL_INSTALL / "main.tf").read_text())
+    assert match, "main.tf no longer sources a scope_resolver module"
+    return match.group(1)
+
+
+def _scratch_composition(root):
+    """A copy of lifecycle.sh in a tree shaped like the checkout's.
+
+    What the script resolves relative to its own directory is there: the
+    install defaults and the endpoint helper three levels up, and the scope
+    resolver module's directory where main.tf sources it, so an import
+    override lands in the scratch tree and never in the checkout's module.
+    """
+    comp = root / "terraform" / "examples" / "full-install"
+    comp.mkdir(parents=True)
+    shutil.copy(_LIFECYCLE_SH, comp / "lifecycle.sh")
+    shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+    helpers = root / "scripts" / "installer"
+    helpers.mkdir(parents=True)
+    shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+    (comp / _scope_resolver_source()).resolve().mkdir(parents=True)
+    return comp
 
 
 class LifecycleScriptGuardTest(unittest.TestCase):
@@ -1456,13 +1492,7 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         Returns the composition directory, the environment, and the file
         every stub call is logged to.
         """
-        comp = root / "terraform" / "examples" / "full-install"
-        comp.mkdir(parents=True)
-        shutil.copy(_LIFECYCLE_SH, comp / "lifecycle.sh")
-        shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
-        helpers = root / "scripts" / "installer"
-        helpers.mkdir(parents=True)
-        shutil.copy(_REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", helpers)
+        comp = _scratch_composition(root)
         bin_dir = create_minimal_tools_bin(root)
         fixture = root / "terraform-output.txt"
         fixture.write_text(output)
@@ -1532,6 +1562,36 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self._assert_hidden(proc.stdout, "~")
         self.assertIn("-auto-approve", self._terraform_call(calls, "apply"))
+
+    def test_plan_apply_and_destroy_remove_a_stale_import_override_first(self):
+        """A lifecycle.sh killed mid-import leaves both override files behind.
+
+        Merged into a plan or apply, the scope one resolves every declared
+        selector to nothing and retires its bindings, so each subcommand
+        removes the pair before terraform reads the configuration.
+        """
+        for args in (["plan"], ["apply", "-auto-approve"], ["destroy", "-auto-approve"]):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as tmp:
+                comp, env, calls = self._sandbox(pathlib.Path(tmp), _UPDATE_PLAN, 0)
+                stale = [
+                    comp / _PROVIDER_OVERRIDE,
+                    comp / _scope_resolver_source() / _SCOPE_OVERRIDE,
+                ]
+                for path in stale:
+                    path.write_text("# left behind by an interrupted import\n")
+                proc = subprocess.run(
+                    [shutil.which("bash"), str(comp / "lifecycle.sh"), *args],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    cwd=str(comp),
+                    timeout=60,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(f"terraform {args[0]}", calls.read_text())
+                for path in stale:
+                    self.assertFalse(path.exists(), f"{path.name} survived {args[0]}")
 
     def _run_with_a_terminal(self, args, stdin_is_terminal=True, answer=None, extra_env=None):
         """Run lifecycle.sh with stdout and stderr on a terminal.
@@ -1650,6 +1710,143 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         self.assertIn("`plan`, `apply` and `destroy` hide helm_release's `metadata` block", proc.stdout)
         self.assertEqual(lines[-1], "default kube-agents/<cluster_name>>. Unset, state stays local as before.")
         self.assertNotIn("set -euo pipefail", proc.stdout)
+
+
+class ImportOverrideTest(unittest.TestCase):
+    """What adopt_kms and adopt_pubsub write around each `terraform import`.
+
+    `terraform import` evaluates the whole configuration with every resource
+    not yet in state unknown, and two things in it refuse that walk: the helm
+    provider built from the cluster's endpoint, and the scope resolver module's
+    monitored-project lookup, whose for_each is keyed on a read the walk never
+    makes. lifecycle.sh writes an override for each, the second into the
+    module's own directory, for the duration of the import, and removes both
+    afterwards whether the import succeeded or not. Every run here uses a
+    scratch copy of the tree, so the module override is written beside a
+    scratch module directory and never into the checkout's.
+    """
+
+    _IMPORT_ERROR = "Error: Invalid for_each argument (stub)"
+
+    def _run(self, func_call, import_rc=0, enable_drift="true", enable_chat="false"):
+        """Run one adoption function against stubs that record each import.
+
+        Returns the process, one line per `terraform import` saying whether
+        each override file existed at that moment, the scope override's text
+        as the last import saw it, and the two paths the files were at.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            comp = _scratch_composition(root)
+            bin_dir = create_minimal_tools_bin(root)
+            bash = shutil.which("bash")
+            imports = root / "imports"
+            captured = root / "captured-scope-override.tf"
+            provider_override = comp / _PROVIDER_OVERRIDE
+            scope_override = (comp / _scope_resolver_source() / _SCOPE_OVERRIDE).resolve()
+            # An empty state; a console that enables the drift trio (three
+            # adopt_kms imports) or Chat (an adopt_pubsub import) and leaves
+            # every other flag at null; an import that records what it saw
+            # and exits as told.
+            (bin_dir / "terraform").write_text(
+                f"#!{bash}\n"
+                'case "$1" in\n'
+                "  state) exit 0 ;;\n"
+                "  console) read -r expr\n"
+                '    case "${expr#var.}" in\n'
+                "      project_id) echo '\"test-project\"' ;;\n"
+                "      location) echo '\"us-central1\"' ;;\n"
+                "      create_cluster) echo '\"false\"' ;;\n"
+                f"      enable_drift_pubsub) echo '{enable_drift}' ;;\n"
+                "      drift_pubsub_topic) echo '\"platform-agent-drift-audit\"' ;;\n"
+                "      drift_pubsub_subscription) echo '\"platform-agent-drift-audit-sub\"' ;;\n"
+                "      drift_pubsub_sink) echo '\"platform-agent-drift-audit-sink\"' ;;\n"
+                f"      enable_google_chat) echo '{enable_chat}' ;;\n"
+                "      chat_topic_name) echo '\"platform-agent-chat-events\"' ;;\n"
+                "      chat_subscription_name) echo '\"platform-agent-chat-events-sub\"' ;;\n"
+                "      *) echo null ;;\n"
+                "    esac ;;\n"
+                "  import)\n"
+                f'    provider=no; [ -f "{provider_override}" ] && provider=yes\n'
+                f'    scope=no; [ -f "{scope_override}" ] && scope=yes\n'
+                f'    echo "import $3 provider=$provider scope=$scope" >> "{imports}"\n'
+                f'    [ -f "{scope_override}" ] && cp "{scope_override}" "{captured}"\n'
+                f'    [ {import_rc} -eq 0 ] || echo "{self._IMPORT_ERROR}" >&2\n'
+                f"    exit {import_rc} ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            # Every describe succeeds: each candidate exists and is adopted.
+            (bin_dir / "gcloud").write_text(f"#!{bash}\nexit 0\n")
+            for stub in ("terraform", "gcloud"):
+                (bin_dir / stub).chmod(0o755)
+            proc = subprocess.run(
+                [bash, "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source ./lifecycle.sh\n{func_call}\n'],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env={"PATH": str(bin_dir), "HOME": str(root)},
+                cwd=str(comp),
+                timeout=60,
+            )
+            seen = imports.read_text().splitlines() if imports.exists() else []
+            text = captured.read_text() if captured.exists() else ""
+            left = [path.name for path in (provider_override, scope_override) if path.exists()]
+            return proc, seen, text, left
+
+    def test_both_overrides_exist_for_every_import_and_neither_survives_it(self):
+        for func_call, expected_imports, summary in (
+            ("adopt_kms", 3, "resource adoption complete: 3 imported"),
+            ("adopt_pubsub", 1, "Pub/Sub adoption complete: 1 imported"),
+        ):
+            with self.subTest(func_call=func_call):
+                proc, seen, _, left = self._run(
+                    func_call, enable_drift="true", enable_chat="true",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(len(seen), expected_imports, seen)
+                for line in seen:
+                    self.assertIn("provider=yes scope=yes", line)
+                self.assertEqual(left, [])
+                self.assertIn(summary, proc.stdout)
+                self.assertEqual(proc.stderr, "")
+
+    def test_a_failed_import_prints_terraforms_error_and_still_removes_both_overrides(self):
+        """The warning alone cannot say why; before this, the error went to /dev/null
+        and the first sign of trouble was the apply's 409."""
+        for func_call in ("adopt_kms", "adopt_pubsub"):
+            with self.subTest(func_call=func_call):
+                proc, seen, _, left = self._run(
+                    func_call, import_rc=1, enable_drift="true", enable_chat="true",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertGreater(len(seen), 0)
+                for line in seen:
+                    self.assertIn("provider=yes scope=yes", line)
+                self.assertEqual(left, [])
+                self.assertIn(self._IMPORT_ERROR, proc.stderr)
+                self.assertIn("could not import module.", proc.stderr)
+                self.assertIn("the apply will fail with a 409", proc.stderr)
+                self.assertNotIn("imported", proc.stdout.replace("0 imported", ""))
+
+    def test_the_scope_override_pins_blocks_the_module_defines(self):
+        """An override of a block the module does not define fails every import
+        with "Missing data resource to override", so a rename in the module
+        has to reach here; this is where it fails first."""
+        _, seen, text, _ = self._run("adopt_kms")
+        self.assertGreater(len(seen), 0)
+        module = (_FULL_INSTALL / _scope_resolver_source()).resolve()
+        module_text = "".join(path.read_text() for path in sorted(module.glob("*.tf")))
+        data_blocks = _OVERRIDE_DATA_RE.findall(text)
+        outputs = _OVERRIDE_OUTPUT_RE.findall(text)
+        self.assertEqual(len(data_blocks), 1, text)
+        self.assertEqual(len(outputs), 1, text)
+        for provider, name in data_blocks:
+            self.assertIn(f'data "{provider}" "{name}"', module_text)
+            self.assertRegex(text, rf'data "{provider}" "{name}" \{{\s*for_each\s*=\s*toset\(\[\]\)')
+        for name in outputs:
+            self.assertIn(f'output "{name}"', module_text)
+            self.assertRegex(text, rf'output "{name}" \{{\s*value\s*=\s*\{{\}}')
 
 
 if __name__ == "__main__":

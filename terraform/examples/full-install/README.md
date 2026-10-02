@@ -355,13 +355,20 @@ neither means what it looks like:
   with "could not evaluate var.project_id". Restore the tfvars the install used
   before either recipe.
 
-  The import itself needs the placeholder Helm provider `adopt-kms` writes for
-  its own imports, and `lifecycle.sh` exposes no generic import subcommand to
-  borrow — so write it yourself. `terraform import` configures every provider
-  before it does anything, and the `helm` provider here is built from
-  `module.gke_cluster.cluster_endpoint`; the override was needed in practice even
-  with the cluster already in state. The filename suffix is what makes Terraform
-  treat it as an override, so keep it:
+  The import itself needs the two overrides `adopt-kms` writes for its own
+  imports, and `lifecycle.sh` exposes no generic import subcommand to borrow —
+  so write them yourself. `terraform import` configures every provider before
+  it does anything, and the `helm` provider here is built from
+  `module.gke_cluster.cluster_endpoint`; that override was needed in practice
+  even with the cluster already in state. The same walk leaves every resource
+  not in state unknown, so the scope resolver module's monitored-project
+  lookup, whose `for_each` is keyed on a read the walk never makes, refuses the
+  import (`Invalid for_each argument`) until it is pinned to an empty set, and
+  the IAM module keys its scope bindings on that module's `members` output,
+  unknown for the same reason once a Shared VPC host or Metrics Scope is
+  declared. The second file pins both, and goes into the module's own
+  directory because Terraform merges override files per module. The filename
+  suffix is what makes Terraform treat each as an override, so keep it:
 
   ```bash
   cat > providers_lifecycle_override.tf <<'EOF'
@@ -372,13 +379,26 @@ neither means what it looks like:
     }
   }
   EOF
+  cat > ../../modules/kube-agents-scope-resolver/scope_resolver_lifecycle_override.tf <<'EOF'
+  data "http" "scope_monitored_project" {
+    for_each = toset([])
+  }
+
+  output "members" {
+    value = {}
+  }
+  EOF
   terraform import 'module.gke_backup_plan[0].google_gke_backup_backup_plan.this' \
     "projects/<project>/locations/<region>/backupPlans/<cluster_name>-backup-plan"
-  rm -f providers_lifecycle_override.tf
+  rm -f providers_lifecycle_override.tf \
+    ../../modules/kube-agents-scope-resolver/scope_resolver_lifecycle_override.tf
   ```
 
-  Remove the override before the next apply — it is never meant to survive an
-  import, which is why `lifecycle.sh` deletes it on an `EXIT` trap.
+  Remove both overrides before the next apply — they are never meant to
+  survive an import, which is why `lifecycle.sh` deletes them on an `EXIT` trap
+  and again at the start of `plan`, `apply` and `destroy`. A plan that merged
+  the scope override would resolve every declared selector to nothing and
+  retire its bindings.
 
 - **A retry that would create a cluster that already exists.** State left by an
   apply that died before the cluster finished creating can hold a managed
