@@ -340,8 +340,9 @@ class _Client:
 class _Adapter:
     def __init__(
         self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
-        unheard=(), ignore_other_user_mentions=False,
+        unheard=(), ignore_other_user_mentions=False, broken=(),
     ):
+        self.broken = set(broken)
         self.ignore_other_user_mentions = ignore_other_user_mentions
         self.authorized = authorized
         self.unlisted = set(unlisted)
@@ -383,13 +384,19 @@ class _Adapter:
 
     def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
         self.asked.append((user_id, channel_id, team_id))
+        if "authorized" in self.broken and user_id != USER:
+            raise RuntimeError("allowlist unreadable")
         return user_id not in self.unlisted
 
     def _slack_message_matches_mention_patterns(self, text):
+        if "patterns" in self.broken:
+            raise RuntimeError("bad pattern")
         return "@kage" in text.lower()
 
     async def _channel_gate_allows(self, **gate):
         self.gated.append(gate)
+        if "gate" in self.broken:
+            raise RuntimeError("gate failed")
         # Upstream's ignore_other_user_mentions rule: un-mentioned and naming someone else is not for us.
         others = set(re.findall(r"<@([UW][A-Z0-9_]+)>", gate["routing_text"])) - {gate["bot_uid"]}
         if self.ignore_other_user_mentions and not gate["is_mentioned"] and others:
@@ -804,7 +811,19 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger, level="WARNING") as logs:
             self._incident(adapter)
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
-        self.assertTrue(any("could not read the thread" in line for line in logs.output))
+        self.assertTrue(any("could not check the thread" in line for line in logs.output))
+
+    def test_a_check_that_raises_runs_the_click_as_if_nothing_was_typed(self):
+        for broken in ("authorized", "patterns", "gate"):
+            with self.subTest(broken=broken):
+                importlib.reload(runtime)
+                adapter = _Adapter(
+                    replies=[{"type": "message", "user": "U2", "text": "apply B", "ts": "223.000"}], broken={broken},
+                )
+                with self.assertLogs(runtime.logger, level="WARNING") as logs:
+                    self._incident(adapter)
+                self._runs(adapter)
+                self.assertTrue(any("could not check the thread" in line for line in logs.output))
 
     def test_the_answered_alert_keeps_its_report_for_the_clicks_own_turn(self):
         report = "*Pod OOMKilled*\nOption A: raise the limit\nOption B: roll back checkout-gateway"

@@ -55,7 +55,8 @@ thread" and the click is dropped. The buttons appear when the alert is edited
 into its triage, so that edit's time, which the click's payload carries, is
 the start; a reply typed during the diagnosis does not count. The match is a
 heuristic: the agent reads a typed reply as free text, so this guesses what it
-will apply. A read that fails runs the click as if nothing had been typed.
+will apply. A read, or one of the adapter's checks, that fails runs the click as if
+nothing had been typed.
 Other choice buttons are not checked.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
@@ -330,28 +331,26 @@ async def _applied_by_typing(
     options: frozenset[tuple[str, str]],
 ) -> bool:
     """Whether a person the adapter would answer typed an apply in the thread after ``since``.
-    One read; a read that fails answers no, so the click runs as it would without the check.
-    The channel gate is asked only of a reply that passes everything else."""
+    One read; a read or an adapter check that fails answers no, so the click runs as it would
+    without the check. The channel gate is asked only of a reply that passes everything else."""
     try:
         response = await client.conversations_replies(
             channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
         )
-        replies = response.get("messages") or []
+        for reply in response.get("messages") or []:
+            if (
+                isinstance(reply, dict)
+                and reply.get("user")
+                and not reply.get("bot_id")
+                and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
+                and _after(reply.get("ts"), since)
+                and _typed_apply(str(reply.get("text") or ""), options)
+                and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
+                and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts)
+            ):
+                return True
     except Exception as exc:  # noqa: BLE001 — the click still answers
-        logger.warning("slack_ux_clicks: could not read the thread of %s; running the click: %s", thread_ts, exc)
-        return False
-    for reply in replies:
-        if (
-            isinstance(reply, dict)
-            and reply.get("user")
-            and not reply.get("bot_id")
-            and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
-            and _after(reply.get("ts"), since)
-            and _typed_apply(str(reply.get("text") or ""), options)
-            and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
-            and await _gateway_hears(adapter, reply, channel_id, team_id, thread_ts)
-        ):
-            return True
+        logger.warning("slack_ux_clicks: could not check the thread of %s; running the click: %s", thread_ts, exc)
     return False
 
 
