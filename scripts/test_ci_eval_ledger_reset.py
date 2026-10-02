@@ -45,7 +45,7 @@ REPO = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-evals-token-minter[bot]"
 
-# The ten ledger-writing cases and the audit id each grades under; a case
+# The eleven ledger-writing cases and the audit id each grades under; a case
 # that writes no ledger has none.
 AUDIT_IDS = {
     "ai-security-planted-model-audit": "ai-security-audit",
@@ -56,6 +56,7 @@ AUDIT_IDS = {
     "obtainability-planted-pdb": "obtainability-audit",
     "obtainability-planted-orphan-service": "obtainability-audit",
     "stockout-pinned-pool": "stockout-prevention",
+    "upgrades-audit-reports-upgrade-blocked": "security-patch-orchestrator",
     "upgrades-master-behind-offered-elsewhere": "security-patch-orchestrator",
     "upgrade-readiness-lagging-cluster": "security-patch-orchestrator",
 }
@@ -623,7 +624,7 @@ class CallSiteTest(unittest.TestCase):
 
     def test_the_lock_deadline_scales_by_the_cases_that_share_a_stream(self):
         # Against the real task files: the two consistency cases share
-        # fleet-consistency-drift, the two patch cases share
+        # fleet-consistency-drift, the three patch cases share
         # security-patch-orchestrator, every other stream has one case, and a
         # case that writes no ledger (or an empty id) keeps the single-unit
         # figure.
@@ -643,7 +644,7 @@ class CallSiteTest(unittest.TestCase):
         )
         result = run_bash(body)
         got = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(got, {"drift": "2", "compliance": "1", "patch": "2", "none": "1", "unknown": "1"}, result.stderr)
+        self.assertEqual(got, {"drift": "2", "compliance": "1", "patch": "3", "none": "1", "unknown": "1"}, result.stderr)
         self.assertEqual(result.stderr, "")
 
     def test_a_stream_deadline_covers_its_stack_bearing_cases_infra_queue(self):

@@ -118,8 +118,12 @@
 # it forty-three (129) of fifty-seven (171), +6: two front-door turns, no
 # fixture. chat-voice-ack-names-target makes it forty-four (132) of
 # fifty-eight (174), +3 more: one front-door turn plus the card round trip.
-# bootstrap-inventory-ranking-delivery (the last entry below) makes it
-# forty-five (135) of fifty-nine (177), +3 more at its 600s hint.
+# bootstrap-inventory-ranking-delivery makes it forty-five (135) of
+# fifty-nine (177), +3 more at its 600s hint. One case joined this file
+# after that line without a tally: forty-six (138) of sixty (180).
+# 2026-10-02 adds upgrades-audit-reports-upgrade-blocked: one case, three
+# units at the 900s hint the full audits take (hack/ci-eval-pr.sh prices and
+# ceilings it with its siblings), so forty-seven (141) of sixty-one (183).
 # Whether the worst night fits is a question about the whole matrix, and the
 # six measured nights (2026-09-16 to 09-21, oss-test-infra#2707's table)
 # answer it plainly: 1734-2693 serial minutes of work at a realised
@@ -513,3 +517,10 @@
 # extracts in the sandbox. Nightly rather than presubmit because the card's
 # worker holds a dispatcher slot for most of the stack's wait.
 ./tasks/bootstrap-inventory-ranking-delivery/task.yaml
+
+# The weekly upgrade audit's check 3.11 (upgrade-blocked), graded in the
+# ledger: the audit runs, and its issue names seeded-b's drain-blocking budget
+# as the reason its upgrade would not complete. Nightly from its first merge:
+# the ledger objectives need an install with a GitHub ledger (a token minter
+# and a registered GitOps repository), which the eval fleet's has.
+./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml

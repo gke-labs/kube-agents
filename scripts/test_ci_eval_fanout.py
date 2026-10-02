@@ -169,6 +169,7 @@ class DelegationCeilingTest(unittest.TestCase):
             "upgrade-readiness-lagging-cluster",
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
+            "upgrades-audit-reports-upgrade-blocked",
         ):
             with self.subTest(unit=name):
                 self.assertEqual(self.ceiling(name, "2700"), "3000")
