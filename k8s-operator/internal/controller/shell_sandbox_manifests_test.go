@@ -1021,18 +1021,6 @@ func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	if got != want {
 		t.Errorf("write safe root = %q, want %q", got, want)
 	}
-	// The home must NOT be included: durable work is pinned to shellSandboxDataPath,
-	// and write attempts naming /home/agent/... should fail fast at the gateway prefix check
-	// rather than writing to non-durable container scratch space (and see #2180/#2245 for
-	// making the sandbox home root-owned in the image).
-	for _, p := range strings.Split(got, ":") {
-		if p == shellSandboxHomePath {
-			t.Errorf("write safe root entry %q includes the sandbox home; expected only %q", p, shellSandboxDataPath)
-		}
-		if p != shellSandboxDataPath {
-			t.Errorf("write safe root entry %q is not a sandbox data path", p)
-		}
-	}
 }
 
 // TERMINAL_CWD is the difference between the model's work surviving a pod recycle

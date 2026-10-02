@@ -1192,9 +1192,8 @@ than left to the image default so the policy is visible in the pod spec rather t
 inherited from a base image two repositories away. It gives up no isolation. With
 `backend: ssh` the file tools cannot reach the agent pod's filesystem at all, so the
 roots they are checked against should describe the filesystem they actually write to.
-`TestSandboxRepointsTheWriteSafeRoot` asserts the variable is absent with the sandbox
-off, is exactly `shellSandboxDataPath` with it on, and names nothing that does not
-resolve in the sandbox.
+`TestSandboxRepointsTheWriteSafeRoot` asserts the variable is exactly
+`shellSandboxDataPath` on the agent container.
 
 One thing this does not cover: the credential denylist that sits alongside the check
 (`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.docker`) is still expressed against the

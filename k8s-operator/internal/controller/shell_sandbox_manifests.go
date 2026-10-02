@@ -121,12 +121,13 @@ const (
 
 	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It
 	// is on the container filesystem and does not survive a restart. That is
-	// deliberate: durable work goes to the data volume, which is what
-	// TERMINAL_CWD points at; the home is not a durable or supported write
-	// destination (see #2180/#2245 for making it root-owned in the image).
-	// HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec names only the data volume
-	// (#2284); write attempts naming the home are refused upfront by the gateway's
-	// path prefix check.
+	// deliberate: the model owns ~/.bashrc, bash sources it for a non-interactive
+	// `ssh host cmd`, and a hijack planted there should not outlive the pod.
+	// Durable work goes to the data volume, which is what TERMINAL_CWD points at;
+	// the home is not a durable or supported write destination (see #2180/#2245
+	// for making it root-owned in the image). HERMES_WRITE_SAFE_ROOT in
+	// buildPodTemplateSpec names only the data volume (#2284); write attempts
+	// naming the home are refused upfront by the gateway's path prefix check.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// Hermes' ssh backend keeps a file sync over ~/.hermes: it pushes at connect
