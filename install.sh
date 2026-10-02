@@ -1715,12 +1715,30 @@ note_stale_network_policy_acceptance() {
 #
 # repeat_on names the routes that accept the flag: --agent-namespace is taken
 # by install.sh, upgrade.sh and --menu; --enable-gke-backup-plan is install.sh-only.
+#
+# Pass empty_is_unrecorded=true for a key the generator resolves against a
+# shipped default that is true. write_tfvars_from_state reads every boolean as
+# ${KEY:-<default>}, so a bare `ENABLE_DRIFT_DETECTOR=` line provisions on the
+# next run exactly as a silent file does -- while is_truthy below reads that
+# same "" as off and returns before printing. The two readers would then
+# disagree about what an empty value means, and the one shape the turning-off
+# warning exists for is the shape it cannot see. Only a key whose default is
+# true is affected, which is why this is opt-in: for a default-false key an
+# empty line really does resolve to off, and the comparison is already right.
+# The "records no KEY" wording the else branch prints is accurate for it --
+# the line is there, the value is not, and "Set KEY=... in install.env" is
+# still the remedy.
 warn_flag_beats_unrecorded_file_value() {
-  local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}"
+  local file="$1" key="$2" flag="$3" value="$4" consequence="$5" compare_as_bool="${6:-false}" repeat_on="${7:-every later install.sh run}" empty_is_unrecorded="${8:-false}"
   [ -n "$value" ] || return 0
+  local recorded="" file_records_key="false"
   if install_env_records_key "$file" "$key"; then
-    local recorded
     recorded="$(recorded_install_env_value "$file" "$key")"
+    if [ "$empty_is_unrecorded" != "true" ] || [ -n "$recorded" ]; then
+      file_records_key="true"
+    fi
+  fi
+  if [ "$file_records_key" = "true" ]; then
     if [ "$compare_as_bool" = "true" ]; then
       if is_truthy "$recorded"; then
         is_truthy "$value" && return 0
@@ -1933,11 +1951,18 @@ bootstrap_install_env_file() {
     else
       drift_detector_consequence="This key writes both drift tfvars keys, so a later run without it re-reads ${drift_detector_restorer}, writes neither, and the apply destroys the Log Router sink, the drift-audit topic and its subscription along with the audit records retained there; the front door applies with -auto-approve, so nobody is shown that plan first."
     fi
+    # The trailing true is empty_is_unrecorded, and it is what keeps this call
+    # agreeing with the cascade above: that reads the recorded value with -n,
+    # so a bare ENABLE_DRIFT_DETECTOR= line falls through to the default arm
+    # and is already being warned about as a reversal. Without it the helper
+    # would read the same "" as a recorded `false`, agree with the flag and
+    # print nothing.
     warn_flag_beats_unrecorded_file_value "$destination" ENABLE_DRIFT_DETECTOR --enable-drift-detector \
       "$drift_detector_chosen" \
       "$drift_detector_consequence" \
       true \
-      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file and from whatever the calling shell still exports, so the file is the only remedy that does not depend on which shell runs the upgrade"
+      "every later install.sh run -- and upgrade.sh takes no such flag, regenerating tfvars from the file and from whatever the calling shell still exports, so the file is the only remedy that does not depend on which shell runs the upgrade" \
+      true
     # Gateway redaction: a flag turns it on for this run, and the next
     # upgrade.sh or --menu apply regenerates from the file.
     warn_flag_beats_unrecorded_file_value "$destination" LITELLM_REDACTION_ENABLED --litellm-redaction \

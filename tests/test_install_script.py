@@ -7249,6 +7249,53 @@ class DomainScopedFlagsTest(unittest.TestCase):
             # and promising its loss is a claim the apply does not support.
             self.assertIn("if a run since the detector became the default", combined)
 
+    def test_turning_it_off_over_a_blank_line_warns_the_same_way(self):
+        """A file line with no value is the silent file's other spelling, and
+        the two readers of it have to agree.
+
+        write_tfvars_from_state takes the key as ${ENABLE_DRIFT_DETECTOR:-...},
+        so `ENABLE_DRIFT_DETECTOR=` resolves to the default and the next run
+        provisions the sink, topic and subscription -- the same reversal the
+        test above pins for a file that omits the key. install_env_records_key
+        answers yes for a key assigned empty, though, so without
+        empty_is_unrecorded the guard read that "" as a recorded `false`,
+        agreed with the flag and printed nothing: the one shape of the
+        turning-off case it could not see.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\nENABLE_DRIFT_DETECTOR=\n")
+            proc = self._parse(
+                "--enable-drift-detector=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("applies to this run only", combined)
+            # Not "records ENABLE_DRIFT_DETECTOR=", which is what the recorded
+            # branch would print and would name an empty value as the reason.
+            self.assertIn("records no ENABLE_DRIFT_DETECTOR", combined)
+            self.assertIn("the shipped ENABLE_DRIFT_DETECTOR default (true)", combined)
+            self.assertIn("Set ENABLE_DRIFT_DETECTOR=false in", combined)
+
+    def test_a_blank_line_for_a_default_false_key_is_still_read_as_off(self):
+        """empty_is_unrecorded is opt-in, and this is what it must not change.
+
+        ENABLE_GKE_BACKUP_PLAN defaults to false, so a blank line really does
+        resolve to off and a --enable-gke-backup-plan=false agrees with it.
+        Warning there would report a reversal that cannot happen.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = pathlib.Path(tmp) / "existing.env"
+            destination.write_text("PROJECT_ID=p\nENABLE_GKE_BACKUP_PLAN=\n")
+            proc = self._parse(
+                "--enable-gke-backup-plan=false",
+                f'bootstrap_install_env_file "{destination}" v1.2.3',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn("ENABLE_GKE_BACKUP_PLAN", combined)
+
     def test_turning_it_on_over_a_silent_file_says_nothing_now(self):
         """The other half of the swap: the arm that used to warn and must not.
 
