@@ -263,9 +263,11 @@ function stringField(obj: unknown, key: string): string | undefined {
 
 /**
  * The two fields the page reads from the gateway's authority block. The
- * block is advisory (any publisher could invent one), so the page displays
- * these and never decides anything on them. Everything else in it is
- * pseudonymous hashes the page has no use for.
+ * block is advisory (any publisher could invent one). The page displays
+ * both, and decides one thing on `conversation`: which of this tab's pending
+ * console turns a submission attaches to (model.ts). A forged block can only
+ * mislabel a line in this tab, and only TASKS writers can publish one.
+ * Everything else in it is pseudonymous hashes the page has no use for.
  */
 export function authorityOf(env: Envelope): AuthorityView {
   const a = env.authority;

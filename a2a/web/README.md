@@ -1,6 +1,6 @@
 # a2a/web - the console
 
-A status dashboard and a chat pane over the a2a bus. The top strip and the dashboard panels show what the bus knows: sessions and their liveness, recent tasks and why they failed, conversations by backend, blackboard topics, stream capacity and protocol anomalies. The chat pane at the bottom talks to the chatops gateway through its console door, the same way a Discord or Google Chat user would.
+A status dashboard and a chat pane over the a2a bus. The top strip and the dashboard panels show what the bus knows: sessions and their liveness, recent tasks and why they failed, conversations by backend, blackboard topics, stream capacity and protocol anomalies. The chat pane at the bottom talks to the chatops gateway through its console door, the same way a Discord or Google Chat user would, `/session` included. Only the page's own commands stay local.
 
 The page connects to the bus's websocket listener as the `console` NATS user. That user has the read grants the old `web` view had, plus one publish (`chat.console.*.in`) and one subscribe (`chat.console.*.out`). It can't write anywhere on `a2a.>`, and the verify button in the footer shows the server refusing it. Answers never come back on the console subjects. They arrive through the TASKS stream like every other backend's.
 
@@ -26,7 +26,7 @@ npm install --legacy-peer-deps && npm run dev
 # or pass it in the URL: /?ws=ws://localhost:9222&user=console&pass=...
 ```
 
-Type into the chat pane. The turn shows as pending, the gateway's `⏳ submitted…` notice arrives, and the pending line attaches to the task once the submission shows up on TASKS. `/help` lists the local commands. None of them is ever published.
+Type into the chat pane. A turn shows as pending and attaches in place once its submission shows up on TASKS; a `delegate` turn attaches to the stripped task the gateway submits. A stop word, a bare `/session` and `/session off` never become a task, so they show as sent at once and the gateway answers with a notice. A turn with no task after 30s gets a note saying so: status questions and refused turns get a gateway notice instead of a task, and if no notice came, the gateway may be slow or may have dropped it. After 10 minutes a pending turn stops waiting. `/help` lists the local commands, which are never published; any other slash line is sent.
 
 The read-only view still works with `user=web` and the install's `web-password`. It has no input box.
 
@@ -48,7 +48,7 @@ node dev/seed.mjs --live         # terminal 2: history + a task every ~20s
 npm run dev                      # terminal 3, user console, password dev-console
 ```
 
-With no gateway running, a sent turn stays pending and gets a note after 30s saying no submission showed up.
+With no gateway running, a sent turn stays pending and gets the 30s note.
 
 ## Tests
 

@@ -24,6 +24,13 @@
  * Connecting as `web` still works for the read-only view: no `.out`
  * subscription, no input box, and the pollers work exactly the same - only
  * the console link is unavailable.
+ *
+ * A publish made while the link is down is lost without an error. nats.ws
+ * does not throw: it buffers the bytes in its outbound queue, and every dial
+ * attempt starts with `resetOutbound()` (in `prepare()`), which empties that
+ * queue and rejects the pongs a pending `flush()` is waiting on. So the page
+ * refuses to send while the link is down, and races each send's flush to
+ * report a turn that was published just as the socket died.
  */
 import { connect, millis, type NatsConnection, type StreamInfo, type Subscription } from "nats.ws";
 import {
