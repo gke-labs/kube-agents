@@ -17,9 +17,11 @@ links on the report's 🔗 line as link buttons, and the whole report in a
 collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``,
 the renderer the threaded reply goes through when the adapter sends rich
 blocks. The message's ``text`` is the headline, the choices and then the
-whole report: when the adapter reads the thread back for a later turn it
-takes ``text`` and top-level blocks, never a fold's, so the agent still sees
-the report it is asked to apply.
+whole report, because the adapter reads a thread back from ``text`` and
+top-level blocks, never a fold's. That holds on a cold read of the thread
+only: a session already open on it fetches just the newer replies, which
+skips the edited alert, and a typed ``apply`` there finds the report through
+the ``incidents`` row below.
 
 A button's text is ``apply Option B: <title>`` (``apply: <title>`` for the
 single-fix shape), so a click, which ``slack_ux_clicks`` sends as the
@@ -278,7 +280,7 @@ def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
 
 
 def fallback_text(triage: dict) -> str:
-    """The edited message's ``text``: the headline, the links and the choices, as mrkdwn."""
+    """The headline, the links and the choices, as mrkdwn; :func:`message_text` starts with it."""
     return _presenter.fallback_text(
         triage["headline"], links=triage["links"], choices=[label for label, _ in triage["choices"]]
     )

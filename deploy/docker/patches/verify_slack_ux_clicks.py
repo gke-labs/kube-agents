@@ -56,6 +56,8 @@ RUNTIME_MEMBERS = (
     "_begin_interaction", "_slack_allowed_channels", "_slack_disable_dms", "_get_client",
     "_handle_slack_message", "_client_for",
 )
+#: The members the runtime awaits; every other one it calls plainly.
+ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message")
 #: The event key whose ``.get()`` makes the message handler skip the mention
 #: requirement for a click's turn. Matched in the AST, so quoting does not matter.
 FORCE_MARKER = "_hermes_force_process"
@@ -192,7 +194,7 @@ def check_members(tree: ast.Module) -> None:
     members = _members(classes[0])
     missing = [name for name in RUNTIME_MEMBERS if name not in members]
     if missing:
-        raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which slack_ux_clicks calls")
+        raise _fail(f"{ADAPTER_CLASS} no longer has {', '.join(missing)}, which the runtime calls")
     for name, calls in CALL_SHAPES.items():
         args = _method_args(tree, members[name])
         if args is None:
@@ -203,6 +205,14 @@ def check_members(tree: ast.Module) -> None:
                     f"{ADAPTER_CLASS}.{name} no longer accepts {positional} positional argument(s)"
                     f" and {keywords!r}, as the runtime calls it"
                 )
+    for name in RUNTIME_MEMBERS:
+        member = members[name]
+        if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        awaited = name in ASYNC_MEMBERS
+        if isinstance(member, ast.AsyncFunctionDef) != awaited:
+            state, use = ("no longer", "awaits") if awaited else ("now", "calls")
+            raise _fail(f"{ADAPTER_CLASS}.{name} is {state} async; the runtime {use} it")
     begin = members[BEGIN_INTERACTION]
     if not isinstance(begin, (ast.FunctionDef, ast.AsyncFunctionDef)) or begin.decorator_list:
         raise _fail(f"{ADAPTER_CLASS}.{BEGIN_INTERACTION} is no longer a method")
