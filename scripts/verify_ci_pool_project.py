@@ -309,6 +309,9 @@ REQUIRED_APIS = {
     "aiplatform.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
+    # The observability nightly case reads the install's traces through the
+    # broker's relay; the composition enables this for the same reason.
+    "cloudtrace.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
 }
@@ -666,6 +669,7 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",

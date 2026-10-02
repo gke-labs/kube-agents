@@ -39,11 +39,14 @@ DESIGN_ALLOWLIST = [
     "roles/logging.viewer",
     "roles/iam.securityReviewer",
 ]
-# Kept in the host project on purpose (§6): actAs, the MCP server's check, quota.
+# Kept in the host project on purpose (§6): actAs, the MCP server's check,
+# quota, and the Trace role, whose Trace-console writes travel with its reads
+# and whose only consumer reads the host project's own traces.
 HOST_ONLY_ROLES = [
     "roles/iam.serviceAccountUser",
     "roles/mcp.toolUser",
     "roles/serviceusage.serviceUsageConsumer",
+    "roles/cloudtrace.user",
 ]
 # The allowlist entries that carry container.clusters.list AND .get; a scoped
 # project bound with neither cannot be listed or have a profile created.

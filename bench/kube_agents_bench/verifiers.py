@@ -151,14 +151,17 @@ class ReportContainsVerifier(BaseVerifier):
     Substring matching, deliberately: the task author chose the phrase (a
     planted defect's name, a required noun), so an exact match is fair.
     Anything fuzzier belongs to the judge, not to a blocking check.
-    ``forbidden_patterns`` is the one regex exception, for the shape a
-    substring cannot express: a banned word whose negated uses are
-    legitimate ("no guarantee"). Each is ``re.search``ed against a
-    line-preserving variant of the same normalization — newlines survive,
-    so a Markdown bullet or heading with no terminal punctuation is its own
-    segment and a pattern may anchor on ``\\n``; the flat collapse would
-    otherwise fuse a negated bullet into its unnegated neighbour before the
-    regex runs.
+    ``forbidden_patterns`` and ``required_patterns`` are the regex
+    exception, for the shape a substring cannot express: a banned word whose
+    negated uses are legitimate ("no guarantee"), or a value only the work
+    produces (a 32-hex trace id) where the words around it are the prompt's
+    own and a report of failure would carry them too. Each is
+    ``re.search``ed against a line-preserving variant of the same
+    normalization — newlines survive, so a Markdown bullet or heading with
+    no terminal punctuation is its own segment and a pattern may anchor on
+    ``\\n``; the flat collapse would otherwise fuse a negated bullet into
+    its unnegated neighbour before the regex runs. The text is lowercased
+    before the regex runs, so a pattern spells its letters in lower case.
 
     Both sides are normalized first, by ``_normalize`` above: lowercased,
     Markdown emphasis dropped, whitespace runs collapsed. These are the
@@ -187,11 +190,13 @@ class ReportContainsVerifier(BaseVerifier):
     # would punish a correct report for choosing the other name.
     any_of_phrases: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    # Each must match somewhere in the report.
+    required_patterns: list[str] = Field(default_factory=list)
     scope: Literal["final", "full"] = "final"
 
-    @field_validator("forbidden_patterns")
+    @field_validator("required_patterns", "forbidden_patterns")
     @classmethod
-    def _forbidden_patterns_compile(cls, patterns: list[str]) -> list[str]:
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
             re.compile(pattern)
         return patterns
@@ -208,15 +213,15 @@ class ReportContainsVerifier(BaseVerifier):
             )
         raw = snap.final_message if self.scope == "final" else snap.output
         text = _normalize(raw)
+        lines = _normalize_lines(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        pattern_hits = [
-            p for p in self.forbidden_patterns if re.search(p, _normalize_lines(raw))
-        ]
+        pattern_hits = [p for p in self.forbidden_patterns if re.search(p, lines)]
+        pattern_missing = [p for p in self.required_patterns if not re.search(p, lines)]
         any_of_miss = bool(self.any_of_phrases) and not any(
             _normalize(p) in text for p in self.any_of_phrases
         )
-        if missing or present or pattern_hits or any_of_miss:
+        if missing or present or pattern_hits or pattern_missing or any_of_miss:
             parts = []
             if missing:
                 parts.append(f"required phrases absent from the report: {missing}")
@@ -225,6 +230,10 @@ class ReportContainsVerifier(BaseVerifier):
             if pattern_hits:
                 parts.append(
                     f"forbidden patterns matched in the report: {pattern_hits}"
+                )
+            if pattern_missing:
+                parts.append(
+                    f"required patterns absent from the report: {pattern_missing}"
                 )
             if any_of_miss:
                 parts.append(
@@ -247,6 +256,10 @@ class ReportContainsVerifier(BaseVerifier):
         if self.forbidden_patterns:
             satisfied.append(
                 f"none of {len(self.forbidden_patterns)} forbidden pattern(s)"
+            )
+        if self.required_patterns:
+            satisfied.append(
+                f"all {len(self.required_patterns)} required pattern(s)"
             )
         if self.any_of_phrases:
             satisfied.append(
@@ -565,10 +578,32 @@ class WorkerCommandsVerifier(BaseVerifier):
     The harness reads each delegated card's worker log before purging it and
     stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
     this verifier matches Python regular expressions against those strings,
-    ``re.search`` on each command verbatim.
+    ``re.search`` on each command verbatim. That line is hermes's one-line
+    rendering of the command (``summarize_shell_command`` in its
+    ``agent/display.py``), not the text as typed: a newline becomes a space,
+    a chain joined by ``;``, ``&&`` or ``||`` arrives as its first command
+    (a leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
+    skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe,
+    a substitution and a backtick stay. A pattern reads the rendering, so a
+    command chained behind another is not on any line it sees. The command
+    as typed is on the trajectory already, tagged with the worker's profile
+    (:mod:`kube_agents_bench.worker_trajectory` reads each worker session's
+    tool calls after the log scrape; ``tool_called`` grades them); reading
+    the ``terminal`` calls from there instead of the card log is the change
+    that closes the gap, and this verifier does not make it yet.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
+    ``exempt_patterns``: a command matching one is left out before either
+    list runs, and the reason says how many were. For a command that can
+    fetch and send nothing but carries a forbidden word as its argument: a
+    worker told the helper holds no token may ``grep`` for the word before
+    running it, and a case that exempts a plain ``grep`` (one invocation, no
+    shell join, pipe, substitution or redirection) grades what the worker did,
+    not what it read. Write the exemption as narrowly as that; a forbidden command
+    behind an exempt one on the same line is a bypass the exemption must not
+    admit, and a collapsed chain (a line ending `` + N command(s)``) is such a
+    line.
 
     Limits, stated so a case is not written against them: only terminal
     commands are visible, not MCP tool calls; only delegated workers' logs
@@ -580,8 +615,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     type: Literal["worker_commands"]
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
+    exempt_patterns: list[str] = Field(default_factory=list)
 
-    @field_validator("required_patterns", "forbidden_patterns")
+    @field_validator("required_patterns", "forbidden_patterns", "exempt_patterns")
     @classmethod
     def _patterns_compile(cls, patterns: list[str]) -> list[str]:
         for pattern in patterns:
@@ -605,7 +641,11 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason=_NO_WORKER_COMMANDS_REASON,
             )
-        commands = [row.get("command", "") for row in snap.worker_commands]
+        typed = [row.get("command", "") for row in snap.worker_commands]
+        commands = [
+            c for c in typed if not any(re.search(p, c) for p in self.exempt_patterns)
+        ]
+        exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
         missing = [
             p for p in self.required_patterns
             if not any(re.search(p, c) for c in commands)
@@ -618,7 +658,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
-                    f"across {len(commands)} command(s)"
+                    f"across {len(commands)} command(s){exempted}"
                 )
             if hits:
                 shown = "; ".join(
@@ -635,7 +675,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
+                f"{len(commands)} worker command(s){exempted}: all {len(self.required_patterns)} "
                 f"required pattern(s) matched, none of {len(self.forbidden_patterns)} forbidden"
             ),
         )

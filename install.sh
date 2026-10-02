@@ -4200,7 +4200,7 @@ run_menu_system() {
       4)
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
-          "read-only — auditing and observability, no GCP write capability (Default)" \
+          "read-only — auditing and observability: read roles, no write to infrastructure (Default)" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
@@ -5279,7 +5279,9 @@ main() {
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
     # RBAC stays read-only in every set, and the GitOps pull-request path works in
     # every set, so neither belongs in these labels. read-only leads because it is
-    # the documented default and the only set that enforces no cloud-plane writes.
+    # the documented default and the only set that keeps writes to infrastructure
+    # out at IAM; what its roles carry beyond reads (the Trace role's console
+    # permissions) is on the canonical page, not restated in the label.
     # See docs/site/src/content/docs/reference/security-and-iam.md.
     # The "(Default)" tag follows the option enter keeps — the seeded one on a
     # re-run — for the reason the gVisor prompt below gives: a static tag on
@@ -5292,7 +5294,7 @@ main() {
       perm_tag_custom=" (Default)"
     fi
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
-      "read-only — auditing and observability, no GCP write capability${perm_tag_ro}" \
+      "read-only — auditing and observability: read roles, no write to infrastructure${perm_tag_ro}" \
       "custom — exactly the roles you list, no built-in bundle${perm_tag_custom}" \
       perm_choice
 

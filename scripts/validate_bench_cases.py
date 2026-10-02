@@ -197,6 +197,16 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "observability-trace-latency-brokered": (
+        "#2244: needs the pool host clusters to export traces; 33 of the 35 "
+        "have no managed OpenTelemetry collection scope, so the operator's "
+        "telemetry discovery resolves to None, the agent runs with "
+        "OTEL_SDK_DISABLED=true and Cloud Trace in those projects is empty, "
+        "which the case reports as an empty window and fails on the report "
+        "check (a fixture gap, not a red). The scope was set by hand on "
+        "2026-10-02; the case moves to the nightly once the first leases "
+        "after it show traces landing"
+    ),
     "gitops-drift-noise-filtered-triage": (
         "#911: needs an audit ingress on the eval install -- a drift-audit "
         "topic, a subscription and a detector enabled to pull from it, none of "
@@ -257,6 +267,13 @@ KNOWN_NO_DOMAIN = {
         "question graded on the persona's Sources contract; it reads no "
         "fleet and no domains.yaml row describes knowledge retrieval"
     ),
+    "observability-trace-latency-brokered": (
+        "the agent's own observability skill: its trace latency helper run to "
+        "completion through the credential broker's relay, graded on the report "
+        "and on the route the worker took (no access token fetched or pasted); "
+        "it reads the install's own traces, not a fleet, and no domains.yaml "
+        "row describes the agent observing itself"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -297,6 +314,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_phrases",
         "any_of_phrases",
         "forbidden_patterns",
+        "required_patterns",
     ),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field, deliberately: the freshness binding is the assertion and every

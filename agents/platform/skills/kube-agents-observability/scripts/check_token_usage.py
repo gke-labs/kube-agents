@@ -1,117 +1,106 @@
+#!/usr/bin/env python3
+"""Sum the LiteLLM token counters over the last day, read through the credential broker's relay."""
+
+from __future__ import annotations
+
 import argparse
 import json
-import subprocess
-import urllib.error
+import sys
 import urllib.parse
-import urllib.request
 
-from datetime import datetime, timedelta, timezone
+import google_api
 
-# Parse arguments
-parser = argparse.ArgumentParser(description="Query token usage delta for GKE Managed Service for Prometheus metrics")
-parser.add_argument("--project-id", required=True, help="Google Cloud Project ID")
-args = parser.parse_args()
-
-project_id = args.project_id
-
-# Calculate time range
-end_time = datetime.now(timezone.utc)
-start_time = end_time - timedelta(hours=24)
-end_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-start_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-
-try:
-    token = subprocess.check_output(['gcloud', 'auth', 'application-default', 'print-access-token']).decode().strip()
-except FileNotFoundError:
-    print("Error: The 'gcloud' command-line tool was not found on your system. Please install the Google Cloud SDK.")
-    exit(1)
-except subprocess.CalledProcessError as e:
-    print(f"Error retrieving active access token: {e}")
-    exit(1)
+TIME_SERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
+INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_tokens_metric_total/counter"
+OUTPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_output_tokens_metric_total/counter"
+CACHED_INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_cached_tokens_metric_total/counter"
+# The window is summed on the server. `timeSeries.list` with an aggregation
+# answers the question directly: ALIGN_DELTA turns each cumulative series
+# into its increase over one alignment period the width of the window, with
+# counter resets handled where the series is kept, and REDUCE_SUM adds every
+# series into one, so the reply is one series with one point whatever the
+# install's label cardinality. Read at the FULL view instead, the list pages
+# in points, and a day of points from a few hundred series ran past any page
+# cap a reader could hold; the broker forwards `aggregation.*` as it does
+# every other query key, and fleet_waste.py sends the same keys today.
+ALIGNMENT_PERIOD_PARAM = "aggregation.alignmentPeriod"
+PER_SERIES_ALIGNER_PARAM = "aggregation.perSeriesAligner"
+CROSS_SERIES_REDUCER_PARAM = "aggregation.crossSeriesReducer"
+ALIGN_DELTA = "ALIGN_DELTA"
+REDUCE_SUM = "REDUCE_SUM"
+SECONDS_PER_HOUR = 3600
 
 
-def get_token_delta(metric_name):
-    # Filter for the specific metric
-    filter_str = f'metric.type="{metric_name}"'
-    params = {
-        "filter": filter_str,
-        "interval.startTime": start_str,
-        "interval.endTime": end_str
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Query token usage delta for GKE Managed Service for Prometheus metrics"
+    )
+    parser.add_argument("--project-id", required=True, help="Google Cloud Project ID")
+    return parser.parse_args(argv)
+
+
+def parse_value(pt) -> float:
+    """A point's value; int64Value arrives as a string in the REST API."""
+    val_obj = pt.get("value") or {}
+    val = val_obj.get("doubleValue")
+    if val is None:
+        try:
+            val = int(val_obj.get("int64Value", "0"))
+        except ValueError:
+            val = 0
+    return val
+
+
+def aggregation_params(hours: int) -> dict:
+    """The query keys that make Monitoring sum the counters' increase over the window."""
+    return {
+        ALIGNMENT_PERIOD_PARAM: f"{hours * SECONDS_PER_HOUR}s",
+        PER_SERIES_ALIGNER_PARAM: ALIGN_DELTA,
+        CROSS_SERIES_REDUCER_PARAM: REDUCE_SUM,
     }
-    query_string = urllib.parse.urlencode(params)
-    url = f"https://monitoring.googleapis.com/v3/projects/{project_id}/timeSeries?{query_string}"
 
-    
-    # Construct urllib Request
-    req = urllib.request.Request(url)
-    req.add_header('Authorization', f'Bearer {token}')
-    req.add_header('Accept', 'application/json')
-    
-    # Execute request and load response
+
+def summed_points(series: list) -> float:
+    """Every point of every series returned, added.
+
+    After the reducer there is one series with one point; an aligned delta is
+    additive, so a reply that split the window or the series into more than
+    one still sums to the increase over the window.
+    """
+    return sum(parse_value(pt) for ts in series for pt in ts.get("points", []))
+
+
+def get_token_delta(session, project_id: str, metric_name: str, start_str: str, end_str: str, hours: int) -> float:
+    params = {
+        "filter": f'metric.type="{metric_name}"',
+        "interval.startTime": start_str,
+        "interval.endTime": end_str,
+        **aggregation_params(hours),
+    }
+    url = TIME_SERIES_URL.format(project=urllib.parse.quote(project_id, safe=""))
+    return summed_points(google_api.get_paginated(session, url, params=params, items_key="timeSeries", whole=True))
+
+
+def main(argv=None, session=None) -> int:
+    args = parse_args(argv)
+    hours = google_api.DEFAULT_WINDOW_HOURS
+    start_str, end_str = google_api.window(hours)
     try:
-        # Set a 10s timeout to prevent hanging indefinitely
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        print(f"HTTP Error {e.code} querying metric {metric_name}: {e.read().decode('utf-8')}")
-        return 0
-    except urllib.error.URLError as e:
-        print(f"Failed to connect to Monitoring API for metric {metric_name}: {e.reason}")
-        return 0
-    
-    # Helper to parse point value supporting float and integer formats
-    def parse_value(pt):
-        val_obj = pt.get('value') or {}
-        val = val_obj.get('doubleValue')
-        if val is None:
-            # Fallback to int64Value which is returned as string in REST API
-            val_str = val_obj.get('int64Value', '0')
+        session = session or google_api.open_session()
+        usage = {
+            metric_key: get_token_delta(session, args.project_id, metric, start_str, end_str, hours)
+            for metric_key, metric in (
+                ("input_tokens", INPUT_TOKENS_METRIC),
+                ("output_tokens", OUTPUT_TOKENS_METRIC),
+                ("cached_input_tokens", CACHED_INPUT_TOKENS_METRIC),
+            )
+        }
+    except google_api.RelayError as exc:
+        print(f"Error querying the Monitoring API: {exc}", file=sys.stderr)
+        return google_api.EXIT_READ_FAILED
+    print(json.dumps(usage, indent=google_api.JSON_INDENT))
+    return 0
 
-            try:
-                val = int(val_str)
-            except ValueError:
-                val = 0
-        return val
 
-    # Calculate the delta across all time series (pods)
-    total_delta = 0
-    for ts in data.get('timeSeries', []):
-        points = ts.get('points', [])
-        if not points:
-            continue
-            
-        if len(points) >= 2:
-
-            # Sort by time ascending with safety fallback if endTime is missing
-            try:
-                points.sort(key=lambda x: (x.get('interval') or {}).get('endTime', ''))
-            except (AttributeError, KeyError):
-                pass
-
-                
-            ts_delta = 0
-            prev_val = None
-            for pt in points:
-                val = parse_value(pt)
-                if prev_val is not None:
-                    diff = val - prev_val
-                    if diff >= 0:
-                        ts_delta += diff
-                    else:
-                        # Counter reset (prev_val -> 0 -> val)
-                        ts_delta += val
-                prev_val = val
-            total_delta += ts_delta
-            
-    return total_delta
-
-# Fetch the specific metrics
-input_tokens = get_token_delta("prometheus.googleapis.com/litellm_input_tokens_metric_total/counter")
-output_tokens = get_token_delta("prometheus.googleapis.com/litellm_output_tokens_metric_total/counter")
-cached_input_tokens = get_token_delta("prometheus.googleapis.com/litellm_input_cached_tokens_metric_total/counter")
-
-print(json.dumps({
-    "input_tokens": input_tokens,
-    "output_tokens": output_tokens,
-    "cached_input_tokens": cached_input_tokens
-}, indent=2))
+if __name__ == "__main__":
+    raise SystemExit(main())

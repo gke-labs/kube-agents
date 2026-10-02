@@ -52,6 +52,7 @@ READ_ONLY_ROLES = [
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
@@ -71,6 +72,16 @@ FORBIDDEN_ROLES = {
     "roles/owner",
     "roles/editor",
     "roles/iam.serviceAccountTokenCreator",
+}
+
+# Roles whose grant buys nothing unless the composition also enables the API
+# they read: the observability helpers reach these three services through the
+# credential broker's relay, and a fresh install with the role bound and the
+# API off answers every read with SERVICE_DISABLED.
+ROLE_APIS = {
+    "roles/cloudtrace.user": "cloudtrace.googleapis.com",
+    "roles/monitoring.viewer": "monitoring.googleapis.com",
+    "roles/logging.viewer": "logging.googleapis.com",
 }
 
 # Values a human or a stale vars.sh might plausibly carry. Everything here that
@@ -327,6 +338,18 @@ class TerraformRoleBundlesTest(unittest.TestCase):
             "read_only_roles", self.lists, "the read-only role bundle moved or was renamed"
         )
         self.assertEqual(READ_ONLY_ROLES, self.lists["read_only_roles"])
+
+    def test_every_read_role_has_its_api_enabled(self):
+        self.assertIn("base_apis", self.lists, "the composition's API list moved or was renamed")
+        for role, api in ROLE_APIS.items():
+            if role not in self.lists["read_only_roles"]:
+                continue
+            with self.subTest(role=role):
+                self.assertIn(
+                    api,
+                    self.lists["base_apis"],
+                    f"local.read_only_roles grants {role} but local.base_apis does not enable {api}",
+                )
 
     def test_no_role_bundle_in_the_composition_grants_a_forbidden_role(self):
         for name, roles in self.lists.items():

@@ -171,9 +171,11 @@ fixture role, named by `fixture_role:` rather than by cluster.
 Seven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
-`report_contains` (phrases in the agent's answer; its `forbidden_patterns` are
-regular expressions, for a banned word whose negated uses are legitimate and
-which no substring can express), `tool_called` (calls in the
+`report_contains` (phrases in the agent's answer; its `forbidden_patterns` and
+`required_patterns` are regular expressions, for what no substring can express: a
+banned word whose negated uses are legitimate, or a value only the work produces,
+such as a 32-hex trace id, where the words around it are the prompt's own and a
+report of failure would echo them), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
@@ -183,7 +185,10 @@ passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), and `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from each card's worker log before the harness
-purges it), and `worker_agents` (regular expressions every one of which must match the
+purges it; its `exempt_patterns` leave a command out before the required and
+forbidden lists run, for a command that can fetch and send nothing but carries a
+forbidden word as its argument, such as a plain `grep` for it), and `worker_agents`
+(regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries).
 
@@ -222,7 +227,11 @@ required phrase that was never reported and false-fails a forbidden one that onl
 in quoted material. `worker_commands` reads the route a worker took through its terminal
 commands, not its MCP tool calls, and only for cards the run delegated — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. What it reads is the one-line rendering hermes writes to the card log, not the command
+as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
+command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
+chained behind another; the command as typed is on the trajectory, tagged with the worker's
+profile, and reading it from there is the verifier change that closes that gap. `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
