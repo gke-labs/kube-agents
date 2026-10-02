@@ -3,6 +3,7 @@
 import ast
 import sys
 import time
+import unicodedata
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,35 @@ SLACK_MESSAGE_MAX = 40_000
 LINEAR_BUDGET_SECONDS = 1.0
 #: Characters agents.sessions.rename answered invalid_name for, one per call, on a live
 #: workspace (2026-10-02). Each one alone refuses the whole title.
-RENAME_REFUSED = "/:·…∕—–‒―−•→×<>#@\\*~`%;[]{}+$^‘’²½Ⅳ\u00a0"
-#: The outermost Unicode code point of the Basic Multilingual Plane, and its surrogate block.
-BMP_END = 0xFFFF
+RENAME_REFUSED = (
+    "/:·…∕—–‒―−•→×<>#@\\*~`%;[]{}+$^‘’²½Ⅳ\u00a0"
+    "ªºʰ𝐀©®™⌘←∑°§¶€£¥ﬁǅ〜、。！？¿¡«»⬆〒🀄⌚⏰⭐〽ㅋ\u0e33\u200d\u200b\U0001f1ef"
+)
+#: Words and symbols it accepted on the same workspace, each of which a title keeps as is.
+RENAME_ACCEPTED = (
+    "नमस्ते",
+    "ไม\u0e48",
+    "q\u0303",
+    "क\u093c",
+    "ب\u064b",
+    "ラーメン",
+    "々",
+    "ʻ",
+    "ꙮ",
+    "ᄀ",
+    "٣",
+    "𠀀",
+    "✅",
+    "🚨",
+    "⚠\ufe0f",
+    "★",
+    "✓",
+    "👍\U0001f3fd",
+    "1\ufe0f\u20e3",
+)
+#: Code points the every-character check walks: the Basic Multilingual Plane and the two
+#: supplementary planes that hold letters and emoji, less the surrogate block.
+CHECKED_END = 0x2FFFF
 SURROGATES = range(0xD800, 0xE000)
 
 
@@ -160,13 +187,20 @@ class SessionTest(unittest.TestCase):
             with self.subTest(char=f"U+{ord(refused):04X}"):
                 self.assertNotIn(refused, s.session_title(f"pods {refused} restarts"))
 
-    def test_every_title_character_is_one_slack_accepts(self):
-        for code in range(BMP_END + 1):
-            if code in SURROGATES:
-                continue
-            title = s.session_title(f"a{chr(code)}b")
-            with self.subTest(char=f"U+{code:04X}"):
-                self.assertTrue(all(c.isalpha() or c.isdecimal() or c in s.TITLE_KEPT for c in title), title)
+    def test_what_slack_accepted_is_kept(self):
+        for accepted in RENAME_ACCEPTED:
+            with self.subTest(word=accepted):
+                self.assertEqual(s.session_title(f"pods {accepted} ok"), f"pods {accepted} ok")
+
+    def test_no_title_character_has_a_compatibility_form(self):
+        # Every letter Slack refused has one (ª, ﬁ, 𝐀, ำ). This checks the output against
+        # that pattern, not against the rule that built it.
+        survivors = set()
+        for code in range(CHECKED_END + 1):
+            if code not in SURROGATES:
+                survivors.update(s.session_title(f"a{chr(code)}b"))
+        compatibility = sorted(c for c in survivors if unicodedata.normalize("NFKC", c) != c)
+        self.assertEqual(compatibility, [])
 
     def test_dashes_ellipses_and_quotes_become_ascii(self):
         cases = {
@@ -177,6 +211,9 @@ class SessionTest(unittest.TestCase):
             "cpu at 90% × 3": "cpu at 90 percent x 3",
             "café": "café",
             "cafe\u0301": "café",
+            "x² ﬁle": "x2 file",
+            "are pods ok、yes。": "are pods ok, yes.",
+            "👨\u200d👩 🇯🇵 team": "👨👩 team",
         }
         for ask, title in cases.items():
             with self.subTest(ask=ask):

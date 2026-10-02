@@ -108,14 +108,15 @@ def _run(coro):
 class _Client:
     """A Slack client that records the calls this patch makes."""
 
-    def __init__(self, fail=()):
+    def __init__(self, fail=(), error="refused"):
         self.calls = []
         self.fail = set(fail)
+        self.error = error
 
     async def _record(self, name, value):
         self.calls.append((name, value))
         if name in self.fail:
-            raise RuntimeError(f"{name} refused")
+            raise RuntimeError(f"{name} {self.error}")
         return {"ok": True, "ts": PLAN_TS}
 
     async def agents_sessions_setStatus(self, **kw):
@@ -451,12 +452,23 @@ class SessionTest(_RuntimeCase):
         self._status(adapter, PHRASE)
         self.assertNotIn((CHANNEL, THREAD), runtime._titles)
 
-    def test_a_refused_rename_is_a_warning(self):
-        adapter = _Adapter(_Client(fail={"rename"}))
+    def test_a_refused_rename_is_a_warning_once(self):
+        adapter = _Adapter(_Client(fail={"rename"}, error="invalid_name"))
         runtime.note_ask(CHANNEL, THREAD, "scale it")
-        with self.assertLogs(runtime.logger, "WARNING") as logs:
+        with self.assertLogs(runtime.logger, "DEBUG") as logs:
             self._status(adapter, PHRASE)
-        self.assertIn("agents.sessions.rename refused", logs.output[0])
+            self._status(adapter, "")
+            self._status(adapter, PHRASE)
+        warnings = [line for line in logs.output if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1, logs.output)
+        self.assertIn("agents.sessions.rename refused", warnings[0])
+
+    def test_a_rename_that_fails_otherwise_is_debug(self):
+        adapter = _Adapter(_Client(fail={"rename"}, error="not_found"))
+        runtime.note_ask(CHANNEL, THREAD, "scale it")
+        with self.assertLogs(runtime.logger, "DEBUG") as logs:
+            self._status(adapter, PHRASE)
+        self.assertFalse([line for line in logs.output if line.startswith("WARNING")], logs.output)
 
     def test_a_refused_rename_keeps_the_first_ask_for_the_next_session(self):
         adapter = _Adapter(_Client(fail={"rename"}))

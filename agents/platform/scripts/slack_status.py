@@ -21,9 +21,10 @@ The session (:func:`session_status`, :func:`session_title`):
 ``closed`` and refuses free text with ``invalid_arguments``, which is what
 Hermes's thread status sends it. ``agents.sessions.rename`` refuses a whole
 title with ``invalid_name`` when it runs over 80 characters or holds a single
-character outside a narrow set: letters, digits, spaces and a little ASCII
-punctuation. ``:``, ``/``, ``#``, ``%``, the ellipsis and every dash but ``-``
-are refused.
+character outside a narrow set: letters, digits, combining marks, spaces, a
+little ASCII punctuation and the common emoji blocks. ``:``, ``/``, ``#``,
+``%``, the ellipsis, every dash but ``-`` and compatibility forms such as
+``²`` or ``ﬁ`` are refused.
 """
 
 from __future__ import annotations
@@ -42,10 +43,15 @@ SESSION_SUSPENDED = "suspended"
 SESSION_CLOSED = "closed"
 SESSION_STATUSES = frozenset({SESSION_PROCESSING, SESSION_SUSPENDED, SESSION_CLOSED})
 
-#: ``agents.sessions.rename`` limits, measured against Slack: a letter or a
-#: decimal digit in any script passes, and of everything else only
-#: :data:`TITLE_KEPT`. A refused character an ask is likely to hold becomes an
-#: ASCII stand-in from :data:`TITLE_REPLACEMENTS`; any other becomes a space.
+#: ``agents.sessions.rename`` limits, measured against Slack: a letter, a
+#: decimal digit or a combining mark in any script passes, as does a symbol in
+#: :data:`TITLE_EMOJI`, and of everything else only :data:`TITLE_KEPT`. The
+#: limit counts code points. A letter with a compatibility decomposition (``ª``,
+#: ``ﬁ``, ``𝐀``, Thai ``ำ``) is refused, so the title is NFKC-normalized first,
+#: which also turns ``…`` into ``...`` and ``²`` into ``2``. A refused character
+#: an ask is likely to hold becomes an ASCII stand-in from
+#: :data:`TITLE_REPLACEMENTS`; a format character such as a zero-width joiner
+#: is dropped, and any other becomes a space.
 #: A slash between two words becomes a hyphen (:data:`SLASH_IN_NAME`), so
 #: ``kube-system/coredns`` stays one name rather than two alternatives; one that
 #: leads a path like ``/metrics`` becomes a space. A clipped title ends on
@@ -71,7 +77,18 @@ TITLE_REPLACEMENTS = {
     "}": ")",
     "%": " percent",
     "×": "x",
+    "、": ",",
+    "。": ".",
+    "«": '"',
+    "»": '"',
 }
+#: The symbol blocks Slack accepts, as inclusive code point ranges: Miscellaneous
+#: Symbols and Dingbats (``⚠``, ``✅``), and the emoji planes from Miscellaneous
+#: Symbols and Pictographs to Symbols and Pictographs Extended-A (``😀``, skin
+#: tones). Regional indicators (flags) sit below them and are refused, as are
+#: ``⭐``, ``⏰`` and ``🀄``.
+TITLE_EMOJI = ((0x2600, 0x27BF), (0x1F300, 0x1FAFF))
+TITLE_EMOJI_CATEGORIES = frozenset({"So", "Sk"})
 TITLE_ELLIPSIS = "..."
 ELLIPSIS = "…"
 #: A word-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
@@ -169,10 +186,13 @@ def _clip(text: str, limit: int, ellipsis: str = ELLIPSIS) -> str:
 
 
 def _title_char(char: str) -> str:
-    """``char`` if ``agents.sessions.rename`` accepts it, else its stand-in or a space."""
-    if char.isalpha() or char.isdecimal() or char in TITLE_KEPT:
+    """``char`` if ``agents.sessions.rename`` accepts it, else its stand-in, nothing or a space."""
+    category = unicodedata.category(char)
+    if char.isalpha() or char.isdecimal() or char in TITLE_KEPT or category.startswith("M"):
         return char
-    return TITLE_REPLACEMENTS.get(char, " ")
+    if category in TITLE_EMOJI_CATEGORIES and any(low <= ord(char) <= high for low, high in TITLE_EMOJI):
+        return char
+    return TITLE_REPLACEMENTS.get(char, "" if category == "Cf" else " ")
 
 
 def session_title(text: Any) -> str:
@@ -180,14 +200,14 @@ def session_title(text: Any) -> str:
 
     Mentions and bare links are dropped, a channel keeps its name and a link its label, each
     refused character is replaced, and the result is clipped on a word to :data:`TITLE_MAX`,
-    ending on :data:`TITLE_ELLIPSIS`. NFC first, so an accent typed as a combining mark stays
-    on its letter.
+    ending on :data:`TITLE_ELLIPSIS`. NFKC first, so a compatibility form becomes the plain
+    character Slack accepts and an accent typed as a combining mark joins its letter.
     """
     title = MENTION.sub(" ", str(text or ""))
     title = CHANNEL.sub(r"\1", title)
     title = LINK.sub(lambda m: m.group(2) or " ", title)
     title = SLASH_IN_NAME.sub("-", title)
-    title = "".join(map(_title_char, unicodedata.normalize("NFC", title)))
+    title = "".join(map(_title_char, unicodedata.normalize("NFKC", title)))
     title = WHITESPACE.sub(" ", title)
     title = REPEATED_COMMA.sub(", ", title).strip(" ,")
     return _clip(title, TITLE_MAX, TITLE_ELLIPSIS)

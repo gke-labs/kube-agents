@@ -27,8 +27,9 @@ free text and is left to upstream.
 **The session title.** Upstream titles only DM threads. With the flag on, a
 channel thread's first ask becomes its session title, set right after a
 ``processing`` lands: ``agents.sessions.rename`` refuses a thread with no
-session yet. A refused rename is logged at warning and keeps the ask for the
-next ``processing`` sent; once the title is set, a follow-up ask in the thread
+session yet. A failed rename keeps the ask for the next ``processing`` sent;
+Slack's ``invalid_name`` refusal is logged at warning, once per thread and
+title, and any other failure at debug; once the title is set, a follow-up ask in the thread
 keeps it.
 
 **One plan per thread.** ``kanban_progress_lines`` rolls each card's progress
@@ -159,6 +160,9 @@ MOVE_KINDS = {"review": "review_requested"}
 #: Bounds on the in-process maps, oldest evicted first.
 SESSIONS_MAX = 512
 ASKS_MAX = 512
+#: The error ``agents.sessions.rename`` answers for a title holding a character
+#: it refuses, as opposed to a thread with no session yet or a network fault.
+RENAME_REFUSED_ERROR = "invalid_name"
 PLANS_MAX = 256
 #: Set-aside plans kept per thread. :func:`_set_aside` drops the oldest quiet
 #: one with no card waiting first; one dropped stops settling its rows and
@@ -214,6 +218,8 @@ _sessions: OrderedDict[tuple, tuple] = OrderedDict()
 _asks: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> the title set on the thread``, which the plan shows too.
 _titles: OrderedDict[tuple, str] = OrderedDict()
+#: ``(channel, thread) -> the title Slack refused``, so a retry every refresh warns once.
+_refused_titles: OrderedDict[tuple, str] = OrderedDict()
 #: ``(channel, thread) -> _Plan``.
 _plans: OrderedDict[tuple, _Plan] = OrderedDict()
 #: ``(channel, thread) -> [_Plan]`` the lapse set aside with a row still
@@ -303,11 +309,17 @@ async def set_thread_status(
             await title_method(client)(channel_id=chat_id, thread_ts=thread_ts, title=title)
         except Exception as exc:  # noqa: BLE001 — a title is cosmetic
             # The ask stays, so the next processing sent retries it and a
-            # follow-up ask does not take its place. A warning, since a refusal
-            # usually means session_title let through a character Slack rejects.
-            logger.warning(
-                "slack_ux_status: agents.sessions.rename refused the title in %s/%s: %s", chat_id, thread_ts, exc,
-            )
+            # follow-up ask does not take its place. A refusal is a warning,
+            # since it means session_title let through a character Slack
+            # rejects; the retry every refresh would otherwise repeat it.
+            if RENAME_REFUSED_ERROR in str(exc) and _refused_titles.get(key) != title:
+                _remember(_refused_titles, key, title, ASKS_MAX)
+                logger.warning(
+                    "slack_ux_status: agents.sessions.rename refused the title in %s/%s: %s",
+                    chat_id, thread_ts, exc,
+                )
+            else:
+                logger.debug("slack_ux_status: agents.sessions.rename failed in %s/%s: %s", chat_id, thread_ts, exc)
             return
         _remember(_titles, key, title, ASKS_MAX)
     _asks.pop(key, None)
