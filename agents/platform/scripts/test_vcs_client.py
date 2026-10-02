@@ -61,6 +61,47 @@ class ForgeCallTest(unittest.TestCase):
                 {"verb": "capabilities", "repository": "acme/infra"},
             )
 
+    def base_branch_against(self, answer=None, *, raises=None, endpoint="http://127.0.0.1:1"):
+        """`base_branch("acme/infra")` against a broker that answers or refuses so."""
+        seen = []
+
+        def fake_call(verb, payload):
+            seen.append((verb, payload))
+            if raises:
+                raise raises
+            return answer
+
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": endpoint}), mock.patch.object(
+            vcs_client, "call", fake_call
+        ):
+            return vcs_client.base_branch("acme/infra"), seen
+
+    def test_base_branch_is_what_capabilities_answers(self):
+        base, seen = self.base_branch_against({"forge": "github", "baseBranch": "release"})
+        self.assertEqual(base, "release")
+        self.assertEqual(seen, [("capabilities", {"repository": "acme/infra"})])
+
+    def test_base_branch_is_none_when_nothing_is_pinned_or_the_broker_predates_the_field(self):
+        for answer in ({"forge": "github", "baseBranch": None}, {"forge": "github"}):
+            with self.subTest(answer=answer):
+                self.assertIsNone(self.base_branch_against(answer)[0])
+
+    def test_base_branch_is_none_on_a_broker_without_the_route(self):
+        unsupported = vcs_client.VcsError("old", code=vcs_client.BROKER_ROUTE_UNSUPPORTED)
+        self.assertIsNone(self.base_branch_against(raises=unsupported)[0])
+
+    def test_base_branch_is_none_with_no_broker_in_this_environment(self):
+        base, seen = self.base_branch_against({"baseBranch": "release"}, endpoint="")
+        self.assertIsNone(base)
+        self.assertEqual(seen, [])
+
+    def test_base_branch_raises_a_broker_that_is_there_and_refusing(self):
+        # Not read as "pins nothing": a caller that fell back to the remote's
+        # default here would cut a proposal the broker then refuses.
+        refused = vcs_client.VcsError("down", code="FORGE_UNAVAILABLE")
+        with self.assertRaises(vcs_client.VcsError):
+            self.base_branch_against(raises=refused)
+
     def test_a_broker_refusal_keeps_its_code(self):
         error = vcs_client.credential_proxy_client.WorkspaceRequestError(
             "refused", payload={"error": "no", "code": "PROTECTED_BRANCH", "detail": "d"}
@@ -257,6 +298,9 @@ class WorkingCopyTest(unittest.TestCase):
         git(self.origin, "commit", "--quiet", "-m", "seed")
         self.head = git(self.origin, "rev-parse", "HEAD").stdout.strip()
         self.published: list[dict] = []
+        # The `baseBranch` the fake's `clone` answers with. Absent is a broker
+        # older than the field.
+        self.clone_extra: dict = {}
         root = base / "root"
         for attribute, value in (("ROOT", root), ("SESSIONS", root / ".sessions"), ("LOCAL_GIT", REAL_GIT), ("call", self.call)):
             patch = mock.patch.object(vcs_client, attribute, value)
@@ -270,7 +314,8 @@ class WorkingCopyTest(unittest.TestCase):
             git(self.origin, "bundle", "create", str(bundle), "HEAD", "main")
             blob = bundle.read_bytes()
             return {"forge": "local", "repo": "acme/infra", "branch": "main", "revision": self.head,
-                    "size": len(blob), "bundleBase64": base64.b64encode(blob).decode("ascii")}
+                    "size": len(blob), "bundleBase64": base64.b64encode(blob).decode("ascii"),
+                    **self.clone_extra}
         if verb == "publish":
             self.published.append(payload)
             return {"forge": "local", "repo": "acme/infra", "branch": payload["branch"], "revision": self._tip_of(payload)}
@@ -305,6 +350,36 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertEqual(self.published[0]["baseRevision"], self.head)
         removed = vcs_client.discard("acme/infra")
         self.assertFalse(Path(removed["removed"]).exists())
+
+    def _record(self) -> dict:
+        return json.loads((vcs_client.SESSIONS / "local__acme__infra__main.json").read_text())
+
+    def test_clone_carries_the_pinned_base_into_the_record_and_the_answer(self):
+        self.clone_extra = {"baseBranch": "release"}
+        cloned = vcs_client.clone("acme/infra")
+        self.assertEqual(cloned["baseBranch"], "release")
+        self.assertEqual(self._record()["baseBranch"], "release")
+
+    def test_a_clone_from_a_broker_older_than_the_field_has_no_base(self):
+        cloned = vcs_client.clone("acme/infra")
+        self.assertIsNone(cloned["baseBranch"])
+        self.assertIsNone(self._record()["baseBranch"])
+        # And everything defaults as it did: the target is the cloned branch.
+        vcs_client.branch("acme/infra", "fix/one")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("change a", spec="acme/infra")
+        vcs_client.publish("acme/infra")
+        self.assertEqual(self.published[0]["target"], "main")
+
+    def test_publish_defaults_its_target_to_the_pinned_base(self):
+        self.clone_extra = {"baseBranch": "release"}
+        cloned = vcs_client.clone("acme/infra")
+        vcs_client.branch("acme/infra", "fix/one")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("change a", spec="acme/infra")
+        vcs_client.publish("acme/infra")
+        self.assertEqual(self.published[0]["target"], "release")
+        self.assertEqual(self.published[0]["clonedFrom"], "main")
 
     def test_a_branch_that_was_not_switched_to_is_not_reported_as_created(self):
         """`created` says what happened, not what the argv asked for.
@@ -601,6 +676,17 @@ class WorkingCopyTest(unittest.TestCase):
         )
 
     def test_advance_still_refuses_a_target_that_is_the_branch_itself(self):
+        cloned = vcs_client.clone("acme/infra")
+        (Path(cloned["path"]) / "a.txt").write_text("b\n")
+        vcs_client.commit("no target of its own", spec="acme/infra")
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.publish("acme/infra", advance=True)
+        self.assertIn("branch and target are both", str(caught.exception))
+        self.assertEqual(self.published, [])
+
+    def test_advance_does_not_default_its_target_to_the_pinned_base(self):
+        # The open proposal may target another branch; only the caller knows.
+        self.clone_extra = {"baseBranch": "release"}
         cloned = vcs_client.clone("acme/infra")
         (Path(cloned["path"]) / "a.txt").write_text("b\n")
         vcs_client.commit("no target of its own", spec="acme/infra")

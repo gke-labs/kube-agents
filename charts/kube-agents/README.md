@@ -494,6 +494,16 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `charts/kube-agents/crds/` first. Enabling `githubMinter` when forges are
   declared and none is GitHub fails the render, since minty issues GitHub App
   tokens only.
+  `platformAgent.integration.baseBranch` names the branch every pull request
+  onto the gitops repository must target, enforced by the credential broker;
+  empty means the repository's own default branch. It applies only to a
+  gitops repository declared here (a `repositories` entry with role `gitops`,
+  or `github.gitRepo`). A repository registered only in the ConfigMap is not
+  pinned, and setting `baseBranch` with none declared is refused at admission
+  or, with the webhook off, leaves the PlatformAgent Degraded. On a live
+  install the render fails unless the installed CRD has the field. The
+  [PlatformAgent CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/)
+  describes what the broker does with it.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install

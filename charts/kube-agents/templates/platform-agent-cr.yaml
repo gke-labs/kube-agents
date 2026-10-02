@@ -315,13 +315,16 @@ spec:
   {{- end }}
   {{- end }}
   {{- $listed := and (or $forges $repos) (not $asAlias) }}
+  {{- $baseBranch := $integ.baseBranch | default "" }}
   {{- /*
   Anything else needs the list fields, which a CRD from before them would
   prune the same way. `lookup` sees the installed CRD on a live install and
   sees nothing under `helm template`, so the guard fires exactly where the
-  pruning would happen.
+  pruning would happen. baseBranch has no alias to fall back on, and a CRD
+  that prunes it leaves the broker enforcing no base with nothing to say so,
+  so it gets the same guard.
   */}}
-  {{- if $listed }}
+  {{- if or $listed $baseBranch }}
   {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
   {{- if $crd }}
   {{- $props := dict }}
@@ -330,12 +333,15 @@ spec:
   {{- $props = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "integration" "properties" (dict) . }}
   {{- end }}
   {{- end }}
-  {{- if not (hasKey $props "forges") }}
+  {{- if and $listed (not (hasKey $props "forges")) }}
   {{- fail "platformAgent.integration.forges needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- if and $baseBranch (not (hasKey $props "baseBranch")) }}
+  {{- fail "platformAgent.integration.baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
   {{- end }}
-  {{- if or (and $asAlias (or $aliasOrg $aliasRepo)) $listed $githubSet $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
+  {{- end }}
+  {{- if or (and $asAlias (or $aliasOrg $aliasRepo)) $listed $githubSet $baseBranch $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
   integration:
     {{- if and $asAlias (or $aliasOrg $aliasRepo) }}
     github:
@@ -382,6 +388,9 @@ spec:
       {{- if $integ.github.gitRepo }}
       gitRepo: {{ $integ.github.gitRepo | quote }}
       {{- end }}
+    {{- end }}
+    {{- with $baseBranch }}
+    baseBranch: {{ . | quote }}
     {{- end }}
     {{- if $integ.googleChat.enabled }}
     googleChat:

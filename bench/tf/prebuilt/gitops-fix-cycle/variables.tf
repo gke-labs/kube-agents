@@ -129,12 +129,11 @@ variable "gitops_token_file" {
   default     = "~/.config/gitops-pilot/github-token"
 }
 
-# Pilot-only fallback. The agent resolves its PR base from GITOPS_BASE_BRANCH
-# or, when unset, from the remote's advertised default branch. On an operator
-# whose sandbox env allowlist does not carry GITOPS_BASE_BRANCH (releases before
-# the change in gke-labs/kube-agents#1307), the run branch can be made the
-# repository default for the run and restored on destroy instead. One run at a
-# time. Requires "administration" permission on the token.
+# Pilot-only. With no spec.integration.baseBranch on the PlatformAgent, the
+# agent's PR base is the remote's default branch, so the run branch can be made
+# the repository default for the run and restored on destroy. The pilot sets no
+# baseBranch, so this switch is how the run branch becomes the base. One run at
+# a time. Requires "administration" permission on the token.
 variable "gitops_switch_default_branch" {
   type        = bool
   description = "Make the run branch the repository's default branch for the run, restoring gitops_restore_default_branch on destroy."

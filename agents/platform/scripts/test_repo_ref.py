@@ -347,5 +347,49 @@ class KnownHostsTest(unittest.TestCase):
         self.assertFalse(ref.host_stated)
 
 
+
+class PinnedBaseTest(unittest.TestCase):
+    """The branch a proposal onto a repository must target, or None."""
+
+    def test_the_pinned_repository_answers_its_base(self):
+        for repository in (
+            "acme/infra",
+            "Acme/Infra",
+            "https://github.com/acme/infra.git",
+            "git@github.com:acme/infra.git",
+        ):
+            with self.subTest(repository=repository):
+                self.assertEqual(
+                    "gitops-base",
+                    repo_ref.pinned_base(repository, "gitops-base", "acme/infra"),
+                )
+
+    def test_the_ref_prefix_goes_and_the_case_stays(self):
+        for configured in ("refs/heads/Release/Q3", " Release/Q3 "):
+            with self.subTest(configured=configured):
+                self.assertEqual(
+                    "Release/Q3", repo_ref.pinned_base("acme/infra", configured, "acme/infra")
+                )
+
+    def test_only_the_fully_qualified_prefix_is_stripped(self):
+        # `heads/x` is a branch of its own that anyone may push, and a forge
+        # takes a base as the name it was given, so it is not read as `x`.
+        self.assertEqual("release", repo_ref.short_branch("refs/heads/release"))
+        self.assertEqual("heads/release", repo_ref.short_branch("heads/release"))
+        self.assertEqual("heads/release", repo_ref.short_branch("refs/heads/heads/release"))
+
+    def test_anything_else_answers_none(self):
+        for repository, branch, pinned in (
+            ("acme/other", "gitops-base", "acme/infra"),
+            ("acme/infra", "", "acme/infra"),
+            ("acme/infra", "gitops-base", ""),
+            ("acme/infra", "refs/heads/", "acme/infra"),
+            ("not a repository", "gitops-base", "acme/infra"),
+            (None, "gitops-base", "acme/infra"),
+            ("acme/infra", "gitops-base", "not a repository"),
+        ):
+            with self.subTest(repository=repository, branch=branch, pinned=pinned):
+                self.assertIsNone(repo_ref.pinned_base(repository, branch, pinned))
+
 if __name__ == "__main__":
     unittest.main()

@@ -122,9 +122,14 @@ class VcsError(RuntimeError):
 #: shape a missing route has and the shape nothing else on these routes wears.
 BROKER_ROUTE_UNSUPPORTED = "BROKER_ROUTE_UNSUPPORTED"
 
+#: Where the broker listens. Unset outside the shell sandbox, which is how a
+#: caller that only wants a hint from the broker tells "no broker here" from a
+#: broker that refused.
+BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
+
 
 def call(verb: str, payload: dict) -> dict:
-    endpoint = os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
+    endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
     if not endpoint:
         raise VcsError(
             "CREDENTIAL_PROXY_URL is not set, so there is no broker to ask. "
@@ -539,6 +544,28 @@ def capabilities(repository: str | None = None) -> dict:
     return call("capabilities", {"repository": spec})
 
 
+def base_branch(repository: str) -> str | None:
+    """The branch the broker pins every proposal onto `repository` to, or None.
+
+    The broker answers this from its own configuration, which the operator
+    renders and nothing in this container can change, so it is the one source
+    of a base this side may trust. None means the caller keeps its own answer
+    (the repository's default branch): the broker pins nothing for this
+    repository, it is older than the field or the verb, or there is no broker
+    in this environment at all. Any other refusal is raised, because a broker
+    that is there and failing is not one that pins nothing.
+    """
+    if not os.environ.get(BROKER_ENDPOINT_VAR, "").strip():
+        return None
+    try:
+        answer = call("capabilities", {"repository": repository})
+    except VcsError as exc:
+        if exc.code == BROKER_ROUTE_UNSUPPORTED:
+            return None
+        raise
+    return answer.get("baseBranch") or None
+
+
 def _refuse_to_discard(destination: Path, *, force: bool) -> None:
     """Stop a re-clone from deleting work that was never published.
 
@@ -750,6 +777,10 @@ def clone(
         "repo": answer["repo"],
         "spec": repository,
         "branch": answer["branch"],
+        # The branch the broker pins proposals onto this repository to, or None
+        # when it pins nothing (or is older than the field). `publish` and
+        # `proposal create` default their target to it.
+        "baseBranch": answer.get("baseBranch") or None,
         # What this copy is for, and what its directory is named after.
         "key": key,
         # What `publish` proves its revisions descend from. Recorded at clone
@@ -764,6 +795,7 @@ def clone(
         "forge": answer["forge"],
         "repo": answer["repo"],
         "branch": answer["branch"],
+        "baseBranch": answer.get("baseBranch") or None,
         "revision": answer["revision"],
         "path": str(destination),
         "files": len(tracked),
@@ -955,16 +987,21 @@ def publish(
     branch — without ever checking the objects out. So the revision identifiers
     on the forge are the ones `log` printed here.
 
+    The default `target` is the branch the broker pins this repository's
+    proposals to when it pins one (`baseBranch` from `clone`), else the branch
+    the copy was cloned from.
+
     `advance` says this copy was cloned *of* a proposal branch in order to add
     to it, which is the one reason to publish the branch the copy came down on.
     It needs an explicit `target` beside it — the branch the proposal merges
-    into — because the default target is the cloned branch itself.
+    into. The pinned base is not its default: the proposal may have been opened
+    onto another branch, and only the caller knows which.
     """
     session = resolve_session(spec, key=key)
     tree = tree_of(session)
     branch = current_branch(session)
     base = base_for(session, branch)
-    target = target or session["branch"]
+    target = target or (None if advance else session.get("baseBranch")) or session["branch"]
     count = unpublished_revisions(session, branch)
     if count == 0:
         raise VcsError(

@@ -25,6 +25,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitops_workspace  # noqa: E402
+import vcs_client  # noqa: E402
 
 LEASE = "compliance-audit"
 
@@ -40,6 +41,12 @@ class WorkspaceTestCase(unittest.TestCase):
         # but clearing keeps a rename or a reused fixture from leaking an answer.
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
+        # No broker unless a test stands one up: the base lookup asks the
+        # broker whenever CREDENTIAL_PROXY_URL names one, and a developer who
+        # exports it would otherwise send these tests over the network.
+        env = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""})
+        env.start()
+        self.addCleanup(env.stop)
         # What the remote advertises, in the shape `git symbolic-ref --short`
         # prints it. Tests that model a `master` fleet reassign this.
         self.origin_head = "origin/main"
@@ -525,23 +532,118 @@ class TestResolveBaseBranch(WorkspaceTestCase):
         self.origin_head = "origin/master"
         self.assertEqual(self.resolve(), "master")
 
-    def test_an_operator_override_beats_the_remote(self):
-        # A repository whose default branch is not the branch the fleet deploys
-        # from. Nothing observable here would say so.
-        self.origin_head = "origin/main"
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release"}):
-            self.assertEqual(self.resolve(), "release")
+    def broker(self, pinned=None, *, raises=None):
+        """Stand up a broker that pins `pinned` (repository -> base).
 
-    def test_credential_proxy_base_branch_override_beats_gitops_base_and_remote(self):
-        self.origin_head = "origin/main"
-        with patch.dict(
-            os.environ,
-            {
-                "CREDENTIAL_PROXY_BASE_BRANCH": "custom-cred-base",
-                "GITOPS_BASE_BRANCH": "gitops-base",
-            },
+        Answers `capabilities` the way the credential broker does: a
+        `baseBranch` per repository, None for one it pins nothing for. With
+        `pinned=None` the field is absent, which is the answer of a broker
+        older than it. `raises` is a refusal every call gets instead.
+        """
+        asked = []
+
+        def call(verb, payload):
+            self.assertEqual(verb, "capabilities")
+            asked.append(payload["repository"])
+            if raises:
+                raise raises
+            answer = {"forge": "github", "repo": payload["repository"], "verbs": []}
+            if pinned is not None:
+                answer["baseBranch"] = pinned.get(payload["repository"])
+            return answer
+
+        for patcher in (
+            patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}),
+            patch.object(vcs_client, "call", call),
         ):
-            self.assertEqual(self.resolve(), "custom-cred-base")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return asked
+
+    def resolve_repo(self, repository="acme/fleet"):
+        return gitops_workspace.resolve_base_branch(self.tmp_path, self.runner, repository)
+
+    def test_the_base_the_broker_pins_wins_over_the_remote(self):
+        # A repository whose default branch is not the branch the fleet deploys
+        # from. Nothing observable here would say so; the operator's
+        # configuration, answered by the broker, does.
+        self.origin_head = "origin/main"
+        asked = self.broker({"acme/fleet": "release"})
+        self.assertEqual(self.resolve_repo(), "release")
+        self.assertEqual(asked, ["acme/fleet"])
+        self.assertFalse([c for c in self.calls if c[1:2] == ["symbolic-ref"]])
+
+    def test_the_pinned_base_wins_with_no_clone_yet(self):
+        self.broker({"acme/fleet": "release"})
+        self.assertEqual(
+            gitops_workspace.resolve_base_branch(None, self.runner, "acme/fleet"),
+            "release",
+        )
+
+    def test_a_base_exported_in_the_sandbox_is_ignored(self):
+        # The agent owns this environment. The variables a session once
+        # exported to steer the base are not read, with a broker or without.
+        exported = {"GITOPS_BASE_BRANCH": "main", "CREDENTIAL_PROXY_BASE_BRANCH": "main"}
+        self.origin_head = "origin/master"
+        with patch.dict(os.environ, exported):
+            self.assertEqual(self.resolve_repo(), "master")
+            self.assertEqual(self.resolve(), "master")
+        gitops_workspace.forget_base_branch()
+        self.broker({"acme/fleet": "release"})
+        with patch.dict(os.environ, exported):
+            self.assertEqual(self.resolve_repo(), "release")
+
+    def test_a_repository_the_broker_does_not_pin_reads_its_remote(self):
+        # Per repository: a context repository is never put on the GitOps
+        # repository's branch.
+        self.origin_head = "origin/trunk"
+        self.broker({"acme/fleet": "release"})
+        self.assertEqual(self.resolve_repo("acme/context"), "trunk")
+
+    def test_a_broker_older_than_the_field_falls_back_to_the_remote(self):
+        self.origin_head = "origin/master"
+        self.broker()
+        self.assertEqual(self.resolve_repo(), "master")
+
+    def test_a_broker_without_the_route_falls_back_to_the_remote(self):
+        self.origin_head = "origin/master"
+        self.broker(
+            raises=vcs_client.VcsError(
+                "old", code=vcs_client.BROKER_ROUTE_UNSUPPORTED
+            )
+        )
+        self.assertEqual(self.resolve_repo(), "master")
+
+    def test_no_broker_falls_back_to_the_remote_then_main(self):
+        self.origin_head = "origin/master"
+        self.assertEqual(self.resolve_repo(), "master")
+        gitops_workspace.forget_base_branch()
+        self.origin_head = ""
+        self.assertEqual(self.resolve_repo(), "main")
+        self.assertEqual(
+            gitops_workspace.resolve_base_branch(None, self.runner, "acme/fleet"), "main"
+        )
+
+    def test_a_broker_that_refuses_is_not_read_as_pinning_nothing(self):
+        self.broker(raises=vcs_client.VcsError("down", code="FORGE_UNAVAILABLE"))
+        with self.assertRaises(vcs_client.VcsError):
+            self.resolve_repo()
+
+    def test_the_broker_is_asked_once_per_repository(self):
+        asked = self.broker({"acme/fleet": "release"})
+        self.resolve_repo()
+        self.resolve_repo()
+        self.resolve_repo("acme/context")
+        self.resolve_repo("acme/context")
+        self.assertEqual(asked, ["acme/fleet", "acme/context"])
+
+    def test_ensure_workspace_checks_out_the_pinned_base(self):
+        self.origin_head = "origin/main"
+        self.broker({"acme/fleet": "release"})
+        self.ensure()
+        self.assertIn(
+            ["git", "checkout", "-B", "release", "origin/release"], self.calls
+        )
 
     def test_no_clone_yet_falls_back_without_running_git(self):
         self.assertEqual(

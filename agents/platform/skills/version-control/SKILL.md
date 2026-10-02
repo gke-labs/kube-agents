@@ -223,6 +223,19 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   turning it away for now: wait, then do the same. A forge without `proposal-list`
   does not list `remote-branch delete` in `capabilities` and refuses it
   `FORGE_UNSUPPORTED`.
+- **A repository can have a configured base, and proposals go onto it.** When
+  the operator configured one, `clone` and `capabilities` answer it as
+  `baseBranch` (it is `null` otherwise), a `clone` with no `--branch` comes
+  down on it, and `publish` and `proposal create` default their target to it.
+  It comes from the broker; nothing in your environment changes it.
+  `TARGET_NOT_BASE` means you named another target for a new proposal (or for
+  the first `publish` of a branch): the message names the configured base —
+  use that branch as the target, or drop `--target`, and do not retry with
+  some other branch. `BASE_BRANCH_MISSING` means the configured base does not
+  exist on the repository; that is for an operator to fix, so report it rather
+  than cloning another branch to propose onto. A later round onto a proposal
+  that is already open (`publish --advance`) keeps whatever target that
+  proposal has.
 - **A forge refusal names the code and the next move; do what it says.**
   `FORGE_RATE_LIMITED` means wait and then use fewer, wider calls.
   `FORGE_UNAUTHENTICATED`, `FORGE_FORBIDDEN` and `FORGE_REJECTED` will answer

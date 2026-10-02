@@ -1047,6 +1047,17 @@ func TestGitIntegrationAdmission(t *testing.T) {
 			},
 			path: "spec.integration",
 		},
+		{
+			name: "a base branch with a gitops repository is admitted",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, BaseBranch: "release", Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "kube-agents", Role: "gitops"}}},
+		},
+		{
+			name: "a base branch with no gitops repository is refused",
+			spec: agentv1alpha1.IntegrationSpec{Forges: gh, BaseBranch: "release", Repositories: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: "managed"}}},
+			path: "spec.integration.baseBranch",
+		},
 	}
 
 	for _, tc := range cases {

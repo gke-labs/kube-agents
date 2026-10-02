@@ -143,12 +143,6 @@ def check_branch(branch_name: str, base_branch: str | None = None) -> str:
 
     short = _short_branch(branch)
     protected = set(PROTECTED_BRANCHES)
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
-    )
-    if override:
-        protected.add(_short_branch(override))
     if base_branch:
         protected.add(_short_branch(base_branch))
     if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
@@ -538,7 +532,10 @@ def handle_prepare(args) -> int:
         # same repository gets a tree of its own rather than colliding here.
         cloned = vcs_client.clone(repo, force=args.force, key=branch)
         with _nothing_left_behind(repo, branch):
-            base = cloned["branch"]
+            # The base the broker pins this repository to when it pins one --
+            # the branch a clone with no branch named comes down on then anyway
+            # -- else the remote's default, which is what the copy is on.
+            base = cloned.get("baseBranch") or cloned["branch"]
             if spent:
                 # After the clone, not before it: the question is whether the base
                 # this copy is standing on already contains the old tip, and that is
@@ -708,8 +705,16 @@ def handle_submit(args) -> int:
 
     # What the change merges into. From the open proposal when there is one,
     # because that is where it already says it is going and moving it is not
-    # this script's call; from the branch the copy came down on otherwise.
-    base = args.base or (proposal or {}).get("target") or session["branch"]
+    # this script's call; otherwise the base the broker pins this repository
+    # to, else the branch the copy came down on. A `--base` other than the
+    # pinned one is the broker's to refuse (`TARGET_NOT_BASE`), before the
+    # publish lands anything.
+    base = (
+        args.base
+        or (proposal or {}).get("target")
+        or session.get("baseBranch")
+        or session["branch"]
+    )
     if args.base and proposal and args.base != proposal.get("target"):
         # Said for the same reason `--title` above is: the publish honours it
         # and the proposal does not. `proposal-update` carries a title, a body
@@ -997,7 +1002,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--base", default=None,
         help="The branch this merges into (default: the open proposal's, else "
-             "the branch the copy was taken of)",
+             "the base the broker pins, else the branch the copy was taken of)",
     )
 
     for command in (prepare, submit):

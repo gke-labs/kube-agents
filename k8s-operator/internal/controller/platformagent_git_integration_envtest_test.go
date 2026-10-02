@@ -82,6 +82,34 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 				{Forge: "github", Repository: "infra2", Role: "gitops"}},
 		}, "at most one repository may have role gitops"},
 	}
+	// baseBranch is held to the branch names the broker's
+	// providers/validate.validate_branch accepts: the pattern and the length
+	// for the characters and the leading one, the CEL rules for HEAD and the
+	// sequences git refuses.
+	gitops := []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "infra", Role: "gitops"}}
+	for name, tc := range map[string]struct{ base, message string }{
+		"base-leading-dash":   {"-main", "spec.integration.baseBranch"},
+		"base-space":          {"my branch", "spec.integration.baseBranch"},
+		"base-leading-under":  {"_release", "spec.integration.baseBranch"},
+		"base-at":             {"release@2026", "spec.integration.baseBranch"},
+		"base-too-long":       {strings.Repeat("a", 201), "spec.integration.baseBranch"},
+		"base-head":           {"HEAD", "may not be HEAD"},
+		"base-dotdot":         {"a..b", "no '..'"},
+		"base-slash-dot":      {"a/.b", "no '..'"},
+		"base-double-slash":   {"a//b", "no '..'"},
+		"base-lock-component": {"a.lock/b", "no '..'"},
+		"base-lock":           {"main.lock", "may not end in"},
+		"base-trailing-slash": {"main/", "may not end in"},
+		"base-trailing-dot":   {"main.", "may not end in"},
+		"base-ref-under":      {"refs/heads/_release", "after refs/heads/"},
+		"base-ref-head":       {"refs/heads/HEAD", "after refs/heads/"},
+		"base-ref-empty":      {"refs/heads/", "may not end in"},
+	} {
+		refused[name] = struct {
+			integration agentv1alpha1.IntegrationSpec
+			message     string
+		}{agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: gitops, BaseBranch: tc.base}, tc.message}
+	}
 	for name, tc := range refused {
 		err := cl.Create(ctx, newAgent(name, tc.integration))
 		if !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), tc.message) {
@@ -96,6 +124,10 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 			{Forge: "github", Repository: "kubernetes/kubernetes", Role: "context"}}},
 		"forge-only": {Forges: gh},
 		"alias":      {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
+		"base":       {Forges: gh, Repositories: gitops, BaseBranch: "release/2026"},
+		"base-max":   {Forges: gh, Repositories: gitops, BaseBranch: strings.Repeat("a", 200)},
+		"base-ref":   {Forges: gh, Repositories: gitops, BaseBranch: "refs/heads/main"},
+		"base-alias": {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}, BaseBranch: "main"},
 	} {
 		if err := cl.Create(ctx, newAgent(name, integration)); err != nil {
 			t.Errorf("creating a PlatformAgent (%s) = %v, want it admitted", name, err)

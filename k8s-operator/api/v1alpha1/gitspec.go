@@ -46,6 +46,9 @@ type ResolvedIntegration struct {
 	// FromDeprecatedAlias records that this came from `spec.integration.github`,
 	// so an error can name the field the administrator actually wrote.
 	FromDeprecatedAlias bool
+	// BaseBranch is `spec.integration.baseBranch`, trimmed: the branch every
+	// pull request onto the GitOps repository must target, or empty.
+	BaseBranch string
 }
 
 // ResolvedForge is one declared forge.
@@ -90,10 +93,12 @@ const deprecatedAliasForgeName = "github"
 //
 // It returns (nil, nil) when nothing is declared, which is a valid
 // PlatformAgent: repositories can be registered in the gitops-state ConfigMap
-// instead. It returns an error only when both spellings are set, because there
-// is no precedence rule that would not surprise somebody. Everything else —
-// an unknown provider, a repository naming no declared forge — resolves, and
-// Problems reports it, so admission can say which field is wrong.
+// instead. A base branch with no forge declaration still resolves, so that
+// Problems can report it. It returns an error only when both spellings are
+// set, because there is no precedence rule that would not surprise somebody.
+// Everything else — an unknown provider, a repository naming no declared
+// forge — resolves, and Problems reports it, so admission can say which field
+// is wrong.
 func (in *IntegrationSpec) ResolveGit() (*ResolvedIntegration, error) {
 	if in == nil {
 		return nil, nil
@@ -102,17 +107,23 @@ func (in *IntegrationSpec) ResolveGit() (*ResolvedIntegration, error) {
 	// spellings to the CRD's CEL rule, whose has() is true for it, and the
 	// two have to agree.
 	listed := in.Forges != nil || in.Repositories != nil
+	var resolved *ResolvedIntegration
+	baseBranch := strings.TrimSpace(in.BaseBranch)
 	switch {
 	case listed && in.GitHub != nil:
 		return nil, fmt.Errorf("set integration.forges and integration.repositories, or integration.github, not both; " +
 			"integration.github is a deprecated alias for one forge with provider " + GitProviderGitHub)
 	case in.GitHub != nil:
-		return resolveDeprecatedAlias(in.GitHub), nil
+		resolved = resolveDeprecatedAlias(in.GitHub)
 	case listed:
-		return resolveLists(in.Forges, in.Repositories), nil
+		resolved = resolveLists(in.Forges, in.Repositories)
+	case baseBranch != "":
+		resolved = &ResolvedIntegration{}
 	default:
 		return nil, nil
 	}
+	resolved.BaseBranch = baseBranch
+	return resolved, nil
 }
 
 func resolveDeprecatedAlias(github *GitHubSpec) *ResolvedIntegration {
@@ -446,6 +457,7 @@ const (
 	gitRepoRoleField      = "role"
 	gitHubOrgField        = "org"
 	gitHubRepoField       = "gitRepo"
+	baseBranchField       = "baseBranch"
 	noIndex               = -1
 	noRepositorySentinelQ = `"` + NoRepositorySentinel + `"`
 )
@@ -633,6 +645,16 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 		if !rejected[r] {
 			seen[key] = r.Index
 		}
+	}
+
+	// The base is enforced on the GitOps repository and nothing else, so with
+	// none declared it would do nothing; say so rather than leave the
+	// administrator believing pull requests are pinned. A GitOps repository
+	// that is declared but refused has its own problem, which is the one to fix.
+	if ri.BaseBranch != "" && ri.GitOps() == nil {
+		add(IntegrationFieldPath{List: baseBranchField, Index: noIndex}, ri.BaseBranch,
+			fmt.Errorf("baseBranch applies to the GitOps repository only, and none is declared; "+
+				"declare a repository with role %s (or github.gitRepo), or remove baseBranch", RepositoryRoleGitOps))
 	}
 	return problems, rejected
 }

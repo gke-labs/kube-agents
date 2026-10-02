@@ -203,13 +203,16 @@ changes reach that branch only through a pull request against it (b-0011-gitops 
 that sentence at task_version 2; b-0022b-gitops has it from its first version; see the
 direct-push finding below for why).
 
-The PR base. `submit-suggestion` resolves it as `CREDENTIAL_PROXY_BASE_BRANCH`, else
-`GITOPS_BASE_BRANCH`, else the remote's advertised default branch (`git remote set-head
-origin --auto`), else `main` (`agents/platform/scripts/gitops_workspace.py`; content mode
-reads the same pair in `content_workspace.py`). The agent used directory mode in the
-measured runs. The pilot makes that the run branch in **default-branch mode** (pilot only; used
-for runs 14 onward): the stack makes the run branch the repository's default branch for
-the run and restores the original on destroy. Works because the skill re-asks the remote
+The PR base. `submit-suggestion prepare` takes it from the credential broker's clone: the
+GitOps repository's `spec.integration.baseBranch` when the PlatformAgent sets one, else the
+remote's default branch, and a round onto an open proposal keeps that proposal's target. With a
+base set, the broker refuses a proposal onto any other branch of that repository
+([version control](version-control-support.md#the-shape)). Directory mode
+(`agents/platform/scripts/gitops_workspace.py`), which the agent used in the measured runs,
+resolves the same way: the broker's base, else the remote's advertised default, else `main`.
+The pilot sets no base and makes the run branch the default instead, in **default-branch mode**
+(pilot only; used for runs 14 onward): the stack makes the run branch the repository's default
+branch for the run and restores the original on destroy. Works because `prepare` clones afresh
 before every PR; one run at a time.
 
 Runs 1 to 13 used **env mode** instead: `GITOPS_BASE_BRANCH` set on the PlatformAgent's
@@ -218,9 +221,9 @@ into the agent container (each change rolled the agent pod, whose cold start too
 to over 10 minutes). That mode is gone: on the shell-sandbox layout every command the
 agent runs executes in `platform-agent-shell-0`, whose environment is built from scratch
 and does not take `spec.deployment.env` (`docs/designs/agent-shell-sandboxing.md`), so the
-variable reaches the gateway container and never the process that opens the PR. The
-per-run base is the credential broker's to enforce (#1498; its direct-push half landed as
-#1669, the base-branch half is #1848).
+variable reaches the gateway container and never the process that opens the PR. A per-run
+base now goes in `spec.integration.baseBranch`, which the operator renders into the credential
+broker and never into the sandbox; the pilot has not moved to it.
 
 Both modes were advisory from the agent's point of view: in run 7 a session ran
 `export GITOPS_BASE_BRANCH=main` and opened a PR against `main`. See Findings.

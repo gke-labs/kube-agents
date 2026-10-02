@@ -551,16 +551,61 @@ same caller can open a proposal with `proposal-create` first — but the bar is 
 pull request under the install's own name, visible on the forge, and the
 default-branch and protected-branch refusals do not depend on it. In addition to
 the remote's default branch, the broker enforces protected branch policy on
-`/v1/vcs/publish`: `main`, `master`, `production`, any operator-configured base
-override (`CREDENTIAL_PROXY_BASE_BRANCH` / `GITOPS_BASE_BRANCH`), and any `run/**`
-branch are strictly refused without a pull request (`PROTECTED_BRANCH`, status 409).
+`/v1/vcs/publish`: `main`, `master`, `production`, the base branch set in the
+broker's own configuration, and any `run/**` branch are strictly refused without
+a pull request (`PROTECTED_BRANCH`, status 409).
 `/v1/vcs/branch-delete` refuses to remove any of them, whatever proposals exist:
-outside `platform-agent/` as `BRANCH_NOT_OURS`, inside it (a default branch or
-base override under the prefix) as `PROTECTED_BRANCH`.
+outside `platform-agent/` as `BRANCH_NOT_OURS`, inside it (a default or
+configured base branch under the prefix) as `PROTECTED_BRANCH`.
 Across the broker's other write doors, protected branch policy is enforced under
 their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
 with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
 execution door (`/v1/exec`) refuses with HTTP 403 `SECURITY_POLICY_BLOCKED`.
+
+The branch a proposal must target is configuration the agent cannot reach.
+`spec.integration.baseBranch` on the PlatformAgent names it, for the GitOps
+repository only. The operator renders it into the broker container's environment
+as `CREDENTIAL_PROXY_BASE_BRANCH`, beside `CREDENTIAL_PROXY_BASE_REPOSITORY`, the
+GitOps repository's `owner/name`. `spec.deployment.env` can never set the
+repository variable, and its branch variable gives way to the field's. Nothing
+reaches the agent container or the sandbox, and the sandbox's environment is
+never consulted: the skills ask the broker for the base, so a branch name an
+agent exports changes nothing. Without a GitOps repository
+the field pins nothing and the operator renders neither variable. With no
+`baseBranch` set, a `CREDENTIAL_PROXY_BASE_BRANCH` in `spec.deployment.env`, or
+failing that a `GITOPS_BASE_BRANCH`, still reaches the broker and joins the
+protected branches above, but pins no target, because nothing names its
+repository. Once the operator renders the base, the broker no longer reads
+`GITOPS_BASE_BRANCH`. For the GitOps repository, matched by slug without regard
+to case, every door that chooses a target holds it to the base and compares
+branch names exactly: the base is accepted as `<base>` or `refs/heads/<base>`,
+and `heads/<base>` is another branch.
+`proposal-create` refuses any other target with `TARGET_NOT_BASE` (409) before it
+calls the forge, and so does `proposal-update` when its request carries a target.
+A first-round `publish` refuses one too, before the bundle is read. A publish with
+`advance` does not: it adds a round to a proposal that already exists, no verb
+can retarget that proposal, and refusing would only strand follow-ups on a
+proposal a person opened onto another branch. A `clone` that names no branch
+checks out the base instead of the remote's default, and refuses a base the
+remote does not hold with `BASE_BRANCH_MISSING` rather than a git failure. The
+content door's `open` uses the base as the workspace base when the caller names
+none, and refuses a missing one with `workspace.base-branch-missing` (409),
+shallow opens included.
+`clone` and `capabilities` answer `baseBranch` so the client can default to it.
+The command execution door refuses, as rule `github.pr-base`, a `gh pr create` or
+`gh pr new` that names the GitOps repository with a missing or different
+`--base`, one that names no repository (the broker cannot tell which one it
+targets), a `gh pr edit` that moves the base, and any `gh pr create`, `new` or
+`edit` that names a repository the install does not manage. It reduces `-R` to
+`owner/name` the way `gh` does, dropping any host prefix rather than matching
+it and comparing names without regard to case, and on `gh pr edit` it also reads a pull
+request URL or `owner/name#number` given as the selector, because `gh` takes the
+repository from the selector over `-R`. Refusing
+unmanaged names also covers the old name of a renamed or transferred GitOps
+repository, which the forge would otherwise redirect. That check is interim: it
+lasts only as long as `/v1/exec` accepts `gh`. With no base configured, and for
+every other repository the install manages, the doors behave as they did: a clone takes the remote's
+default branch and a proposal may target any branch.
 
 The scratch repository is never checked out. It is fetched into and pushed from,
 and nothing materialises a working tree, so a `.gitattributes`, a hook, or a
@@ -787,8 +832,8 @@ another for no property gained.
 
 | Verb                                 | Request                                                              | Response                                                                 |
 | ------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing}`               |
-| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64}`                    |
+| `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, missing, baseBranch}`   |
+| `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`        |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                        |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                             |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                          |
@@ -804,6 +849,10 @@ another for no property gained.
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                 |
 | `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                     |
 | `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                    |
+
+`baseBranch` is the repository's configured base, or null when it has none.
+Where it is set, `proposal-create`'s `target`, and a first-round `publish`'s,
+must name it; [The shape](#the-shape) has the rule and the doors that hold it.
 
 The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
@@ -882,8 +931,9 @@ repository has.
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
 `BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
-`TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `BRANCH_NOT_OURS`,
-`OPEN_PROPOSAL`, `BRANCH_MOVED`, `NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
+`TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
+`BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
+`NOT_SPENT` and `DELETE_REFUSED`, 502 `GIT_FAILED` and
 `FORGE_CALL_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
@@ -1911,6 +1961,10 @@ the list does not yet hold is added at the front rather than the end. The skills
 refuse to guess among several entries, so once a `managed` repository sits beside the GitOps one,
 a caller names its target with `--repo`.
 
+Beside the two lists sits one scalar, `baseBranch`: the branch every proposal onto the `gitops`
+repository must target, empty for the repository's own default. It reaches the broker and nothing
+else, and [The shape](#the-shape) says which doors hold it.
+
 The two lists are separate because the relation between them is many-to-one: a forge carries a
 host and a credential once, however many repositories sit on it, and a second instance of the
 same provider — gitlab.com beside a self-managed GitLab — is a second forge entry with its own
@@ -2497,6 +2551,11 @@ take. `publish`, `proposal create`, `issue create` and `branch-delete` are reach
 to any agent that can reach the read verbs, so an install that wants an agent to read history
 without being able to write to a forge has no way to say so. A read-only mode is
 the smallest thing that would fix it, and it is not designed here.
+
+A configured base pins the target for the GitOps repository only; a proposal
+onto any other repository may still target any branch. A proposal opened before
+the base was configured keeps the target it was opened with, because no verb
+retargets a proposal.
 
 Until GitLab and Bitbucket ship, this is a forge-neutral design with one forge
 in it — and an abstraction with one implementation is a hypothesis. The measure

@@ -146,7 +146,7 @@
    "--state",
    "all",
    "--json",
-   "number,headRefName,state,mergedAt,closedAt,url,body,labels",
+   "number,headRefName,baseRefName,state,mergedAt,closedAt,url,body,labels",
    "--limit",
    "1000"
   ],

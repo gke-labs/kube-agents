@@ -103,9 +103,15 @@ name, which is why the name has to describe the change.
 }
 ```
 
-`base` is what the change merges into: the repository's own default branch, not
-a hardcoded `main` — or, when a pull request for this branch is already open,
-whatever that one is already targeting.
+`base` is what the change merges into: the branch the operator configured for
+this repository when there is one (the broker refuses a pull request onto any
+other), else the repository's own default branch, not a hardcoded `main` — or,
+when a pull request for this branch is already open, whatever that one is
+already targeting. It comes from the broker, never from your environment:
+exporting `GITOPS_BASE_BRANCH` or any other variable does not change it.
+If `prepare` is refused with `BASE_BRANCH_MISSING`, the configured base named
+in the message does not exist on the repository. That is for an operator to
+fix; report it and stop rather than naming another branch.
 
 `started_from` and `proposal` are two halves of one answer — whether this is new
 work or another round on a change already under review. `prepare` asks the forge
@@ -248,7 +254,11 @@ is not the `base` Step 1 reported. It may not name the branch you are
 submitting: a head branch that is its own base carries nothing for anyone to
 review, and `prepare`, `submit` and the broker each refuse it. That covers the
 repository whose trunk is called something other than `main` — the name is read
-from the remote, not from a list.
+from the remote, not from a list. On a repository with a configured base, a new
+pull request may only target that base: a `--base` naming anything else is
+refused with `TARGET_NOT_BASE` before anything is published, and the message
+names the configured base. Drop `--base` (or pass the branch the message names)
+and submit again; do not try another target.
 
 The script returns the clean, live pull request URL. If a pull request for this
 branch is already open, it updates that one's title and body in place and

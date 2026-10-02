@@ -44,6 +44,7 @@ import content_workspace  # noqa: E402
 import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import vcs_client  # noqa: E402
 import workspace_paths  # noqa: E402
 
 # `BaseTestCase` empties the set so the suite's thousand compliance-audit runs
@@ -447,7 +448,6 @@ class Recorder:
         # what a caller asserts about a body should not change with how the
         # body reaches `gh`. See `bodies_for` for why the seam exists at all.
         self.bodies: list[str | None] = []
-        self.envs: list[dict | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # `git diff --cached --quiet` is the harness's commit classifier: rc 0
@@ -464,11 +464,9 @@ class Recorder:
         # names none should carry. None leaves listings exactly as replied.
         self.listed_body = None
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None, env=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
-        # The environment the call named, None when it inherited the process's.
-        self.envs.append(env)
         self.bodies.append(self._read_body(cmd, stdin))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
@@ -610,10 +608,9 @@ class BaseTestCase(unittest.TestCase):
         self.err = ""
         # Both of these outlive a single test. `_WORKSPACE` is a module global
         # that `ensure_workspace` sets and nothing clears, and the base-branch
-        # answer is memoised per workspace inside `gitops_workspace`; a
-        # developer with GITOPS_BASE_BRANCH exported would move it again.
-        # Leaving any of the three alone makes a test's result depend on which
-        # tests ran before it.
+        # answer is memoised per workspace inside `gitops_workspace`.
+        # Leaving either alone makes a test's result depend on which tests ran
+        # before it.
         audit_report.set_workspace(None)
         self.addCleanup(audit_report.set_workspace, None)
         # Same reason, one global further: the mode a run resolved outlives the
@@ -633,7 +630,6 @@ class BaseTestCase(unittest.TestCase):
         env = patch.dict(
             os.environ,
             {
-                "GITOPS_BASE_BRANCH": "",
                 "CREDENTIAL_PROXY_URL": "",
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
             },
@@ -2885,13 +2881,18 @@ class TestProtectedBranches(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
                     audit_report.assert_pushable(branch)
 
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "custom-gitops-base"}):
-            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                audit_report.assert_pushable("custom-gitops-base")
-
-        with patch.dict(os.environ, {"CREDENTIAL_PROXY_BASE_BRANCH": "custom-broker-base"}):
-            with self.assertRaisesRegex(ValueError, "CRITICAL SECURITY REFUSAL"):
-                audit_report.assert_pushable("custom-broker-base")
+    def test_the_sandbox_environment_does_not_widen_the_protected_set(self):
+        # The agent owns this environment, so a variable in it is not the
+        # operator's configuration. The broker protects the configured base
+        # on its own side, from configuration the agent cannot reach.
+        env = {
+            "GITOPS_BASE_BRANCH": "custom-gitops-base",
+            "CREDENTIAL_PROXY_BASE_BRANCH": "custom-gitops-base",
+        }
+        with patch.dict(os.environ, env):
+            self.assertEqual(
+                audit_report.assert_pushable("custom-gitops-base"), "custom-gitops-base"
+            )
 
     def test_remediation_branch_is_pushable(self):
         # The audit report branch is gone; the only branch the harness ever
@@ -6686,32 +6687,6 @@ class TestDeclaredIntentDiscovery(DiscoveryTestCase):
         self.assertTrue(leased.is_dir())
         self.assertEqual(self.temp_dirs(), [])
 
-    def test_the_copies_run_without_the_gitops_base_branch_override(self):
-        # `resolve_base_branch` consults the override before the remote's
-        # HEAD, and a directory-mode clone with no `--ref` asks it which
-        # branch to check out, so a context repository copied with the
-        # variable in the environment was read at the GitOps repository's
-        # branch, not its own default. Every copy the search makes runs
-        # without the two variables and with the rest of the environment.
-        self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
-        self.context("acme/terraform-live")
-        leased = self.tmp_path / "leased" / "acme__terraform-live"
-        self.write(leased, "intent.md", note([declaration()]))
-        self.harness.replies["--repo acme/terraform-live"] = self.copy_reply(
-            leased, mode="directory", depthIgnored=True
-        )
-        override = {"GITOPS_BASE_BRANCH": "release", "CREDENTIAL_PROXY_BASE_BRANCH": "release"}
-        with patch.dict(os.environ, {**override, "LIVE_1576_MARKER": "kept"}):
-            payload = self.start()
-        self.assertIn(f"acme/terraform-live@{SEARCH_SHA}", payload["declared_intent_searched"])
-        clones = [i for i, c in enumerate(self.harness.calls) if str(audit_report.CLONE_SCRIPT) in c]
-        self.assertTrue(clones)
-        for index in clones:
-            env = self.harness.envs[index]
-            self.assertIsNotNone(env, "the copy inherited the process environment")
-            self.assertEqual(sorted(set(env) & set(override)), [])
-            self.assertEqual(env.get("LIVE_1576_MARKER"), "kept")
-
     def test_a_copy_the_harness_cannot_call_searched_is_left_out_with_a_warning(self):
         self.harness.replies["rev-parse HEAD"] = SEARCH_SHA + "\n"
         self.context("acme/terraform-live")
@@ -9208,7 +9183,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
         }
         self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
 
-    def open_it(self):
+    def open_it(self, existing=None):
         with contextlib.redirect_stderr(io.StringIO()):
             return audit_report.open_remediation_pr(
                 "acme/fleet",
@@ -9217,7 +9192,7 @@ class TestRemediationBaseBranch(HarnessTestCase):
                 snapshot=self.snapshot,
                 root=self.workspace,
                 issue_number=42,
-                existing=None,
+                existing=existing,
                 generated_at=NOW,
             )
 
@@ -9234,15 +9209,81 @@ class TestRemediationBaseBranch(HarnessTestCase):
         )
         self.assertEqual(self.base_used(), "master")
 
-    def test_the_env_override_wins_over_origin_head(self):
+    def pin(self, base, repository="acme/fleet"):
+        """Stand in for a broker that pins `repository`'s proposals to `base`."""
+        asked = []
+
+        def capabilities(verb, payload):
+            self.assertEqual(verb, "capabilities")
+            asked.append(payload["repository"])
+            pinned = base if payload["repository"] == repository else None
+            return {"forge": "github", "repo": payload["repository"], "baseBranch": pinned}
+
+        for patcher in (
+            patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}),
+            patch.object(vcs_client, "call", capabilities),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return asked
+
+    def test_the_base_the_broker_pins_wins_over_origin_head(self):
         # An operator whose GitOps flow merges into a long-running release
-        # trunk sets GITOPS_BASE_BRANCH; origin/HEAD still says main, and the
-        # override is the whole point.
+        # trunk configures it on the PlatformAgent; origin/HEAD still says
+        # main, and the broker refuses `gh pr create --base main`.
         self.harness.origin_head = "origin/main"
-        with patch.dict(os.environ, {"GITOPS_BASE_BRANCH": "release-1.29"}):
-            self.open_it()
+        asked = self.pin("release-1.29")
+        self.open_it()
+        self.assertEqual(asked, ["acme/fleet"])
         self.assertIn(["git", "fetch", "origin", "release-1.29"], self.harness.calls)
         self.assertEqual(self.base_used(), "release-1.29")
+
+    def existing_pr(self, state, base):
+        found = pr(9, audit_report.group_branch_for(AUDIT, self.group), state=state)
+        found["baseRefName"] = base
+        return found
+
+    def test_an_open_pull_request_is_recut_from_the_base_it_targets(self):
+        # The pull request was opened onto main before the operator pinned
+        # release. Recut from release, its diff would carry every commit
+        # release has that main lacks, while it still targets main.
+        self.harness.origin_head = "origin/master"
+        self.pin("release")
+        self.open_it(existing=self.existing_pr("OPEN", "main"))
+        self.assertIn(["git", "fetch", "origin", "main"], self.harness.calls)
+        self.assertTrue(
+            any(c[:2] == ["git", "checkout"] and "origin/main" in c for c in self.harness.calls)
+        )
+        self.assertNotIn(["git", "fetch", "origin", "release"], self.harness.calls)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        self.assertTrue(
+            any("--title" in c for c in self.harness.gh_calls("pr", "edit"))
+        )
+
+    def test_a_closed_pull_request_does_not_choose_the_base(self):
+        # A closed pull request is not refreshed, so the new one goes onto the
+        # pinned base like any other.
+        self.harness.origin_head = "origin/master"
+        self.pin("release")
+        self.open_it(existing=self.existing_pr("CLOSED", "main"))
+        self.assertIn(["git", "fetch", "origin", "release"], self.harness.calls)
+        self.assertEqual(self.base_used(), "release")
+
+    def test_a_pin_on_another_repository_leaves_this_one_on_its_default(self):
+        self.harness.origin_head = "origin/master"
+        self.pin("release-1.29", repository="acme/other")
+        self.open_it()
+        self.assertEqual(self.base_used(), "master")
+
+    def test_the_sandbox_environment_does_not_choose_the_base(self):
+        # The variable a sandbox session once exported to steer this. It is
+        # the agent's to set, so it is not read; origin/HEAD answers.
+        self.harness.origin_head = "origin/master"
+        env = {"GITOPS_BASE_BRANCH": "main", "CREDENTIAL_PROXY_BASE_BRANCH": "main"}
+        with patch.dict(os.environ, env):
+            self.open_it()
+        self.assertIn(["git", "fetch", "origin", "master"], self.harness.calls)
+        self.assertEqual(self.base_used(), "master")
 
     def test_a_clone_with_no_origin_head_repairs_it_then_falls_back(self):
         # `git symbolic-ref` exits 1 on a clone that never recorded origin/HEAD
@@ -13115,11 +13156,17 @@ class ContentModeTestCase(BaseTestCase):
         def unavailable(endpoint, verb, payload):
             raise credential_proxy_client.WorkspaceUnavailable("not enabled")
 
-        patcher = patch.object(
-            credential_proxy_client, "_workspace_call", unavailable
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # The broker is up and pins nothing: the directory-mode reset asks it
+        # for this repository's base before falling back to origin/HEAD.
+        def capabilities(endpoint, verb, payload):
+            return {"forge": "github", "repo": payload["repository"], "baseBranch": None}
+
+        for patcher in (
+            patch.object(credential_proxy_client, "_workspace_call", unavailable),
+            patch.object(credential_proxy_client, "vcs_call", capabilities),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         payload = self.start()
         self.assertEqual(payload["mode"], "directory")

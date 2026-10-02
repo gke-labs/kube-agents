@@ -480,6 +480,43 @@ class ChartGitIntegrationTest(unittest.TestCase):
         for key in ("github", "forges", "repositories"):
             self.assertNotIn(key, integration)
 
+    def test_the_base_branch_renders_beside_either_spelling(self):
+        """baseBranch pins the GitOps repository however it is declared: as
+        the lists, as a declaration folded into the alias, or as the alias
+        itself."""
+        base = f"{_P}baseBranch=release/2026"
+        cases = {
+            "lists": (
+                *_forge(0, name="github", namespace="gke-labs"),
+                *_repo(0, forge="github", repository="infra", role="gitops"),
+                *_repo(1, forge="github", repository="app", role="managed"),
+            ),
+            "folded": (
+                *_forge(0, name="github", namespace="gke-labs"),
+                *_repo(0, forge="github", repository="infra", role="gitops"),
+            ),
+            "alias": (f"{_P}github.gitRepo=gke-labs/infra",),
+        }
+        for name, sets in cases.items():
+            with self.subTest(name):
+                self.assertEqual(
+                    _integration(*sets, base).get("baseBranch"), "release/2026"
+                )
+
+    def test_a_base_branch_alone_still_reaches_the_cr(self):
+        """With no GitOps repository the operator reports the base as an
+        integration problem; dropping it here would hide the mistake."""
+        self.assertEqual(
+            _integration(f"{_P}baseBranch=main"), {"baseBranch": "main"}
+        )
+
+    def test_no_base_branch_renders_no_key(self):
+        integration = _integration(
+            *_forge(0, name="github", namespace="gke-labs"),
+            *_repo(0, forge="github", repository="infra", role="gitops"),
+        )
+        self.assertNotIn("baseBranch", integration)
+
     def test_an_unregistered_provider_fails_the_render(self):
         """The CRD's enum would reject it at apply; the chart names the values
         key while the administrator is still looking at their values file."""

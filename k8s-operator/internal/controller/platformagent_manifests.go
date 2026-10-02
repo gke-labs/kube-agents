@@ -106,6 +106,13 @@ const (
 	// refusal of a metrics port equal to it compares against the number the
 	// operator renders rather than the runtime's own default.
 	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyBaseBranchEnv and credentialProxyBaseRepositoryEnv carry
+	// spec.integration.baseBranch to the broker, with the owner/name path of
+	// the GitOps repository it applies to. The broker refuses a pull request
+	// onto that repository targeting any other branch; it enforces nothing
+	// unless both are set.
+	credentialProxyBaseBranchEnv     = "CREDENTIAL_PROXY_BASE_BRANCH"     // #nosec G101 -- Environment variable name, not hardcoded credentials
+	credentialProxyBaseRepositoryEnv = "CREDENTIAL_PROXY_BASE_REPOSITORY" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -4087,10 +4094,40 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 			}
 		}
 	}
+	// Rendered here, in the broker's managed env and nowhere else: the broker
+	// is what enforces the base, and the agent and the shell sandbox get no
+	// copy they could be mistaken for the authority over.
+	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// credentialProxyBaseEnv is the pair of variables that pin pull requests onto
+// the GitOps repository to spec.integration.baseBranch, or nothing when no base
+// is set or no GitOps repository is accepted. Only an accepted repository
+// counts, as for the gitops-state seed: with the webhook off, a refused one
+// would otherwise name a repository the agent was never given.
+func credentialProxyBaseEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Integration == nil {
+		return nil
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil || resolved == nil || resolved.BaseBranch == "" {
+		return nil
+	}
+	for _, repo := range resolved.Accepted(agentv1alpha1.RepositoryRoleGitOps) {
+		ref, err := repo.Resolve()
+		if err != nil {
+			continue
+		}
+		return []corev1.EnvVar{
+			{Name: credentialProxyBaseBranchEnv, Value: resolved.BaseBranch},
+			{Name: credentialProxyBaseRepositoryEnv, Value: ref.Path},
+		}
+	}
+	return nil
 }
 
 func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
@@ -4169,6 +4206,18 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// pool this line is the only thing reserving it.
 		"CREDENTIAL_PROXY_SCOPED_SA_POOL",
 		"CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE",
+		// The repository the pull-request base pins. The broker enforces a
+		// base only when this is set, so a plugin that could set it would
+		// turn the pin on for a repository and branch of its own choosing.
+		// It is only in `managed` when spec.integration.baseBranch is set, so
+		// on an install without one this line is the only thing reserving it.
+		// CREDENTIAL_PROXY_BASE_BRANCH is not listed: with baseBranch set and
+		// a gitops repository accepted it is managed, so the operator's value wins and the broker reads it
+		// ahead of GITOPS_BASE_BRANCH, which it then no longer reads. Otherwise,
+		// a spec.deployment.env CREDENTIAL_PROXY_BASE_BRANCH or
+		// GITOPS_BASE_BRANCH passes through, and the broker reads it as a
+		// protected branch only.
+		credentialProxyBaseRepositoryEnv,
 		"CREDENTIAL_PROXY_STATE_DIR",
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",

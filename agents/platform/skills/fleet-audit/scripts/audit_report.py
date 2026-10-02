@@ -936,17 +936,6 @@ CLONE_TMP_PREFIX = "declared-intent-"
 CLONE_LEASE_SUFFIX = "-declared-intent"
 CLONE_MODE_CONTENT = "content"
 CLONE_MODE_DIRECTORY = "directory"
-# The GitOps base-branch override, which `gitops_workspace.resolve_base_branch`
-# consults before the remote's HEAD, names the branch the fleet deploys from
-# in that one repository. The sibling script inherits the environment, and a
-# directory-mode clone with no `--ref` asks that function which branch to
-# check out, so a context repository copied with the override in place was
-# read at the GitOps repository's branch, not its own default, and one with
-# no branch of that name failed to clone every run. Every copy the search
-# makes runs without the two variables: a pinned entry passes `--ref` and
-# never consulted them, and in content mode the broker resolves the default
-# branch per repository and never reads the agent container's environment.
-BASE_BRANCH_OVERRIDE_VARS = ("CREDENTIAL_PROXY_BASE_BRANCH", "GITOPS_BASE_BRANCH")
 
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
@@ -2363,17 +2352,17 @@ def report_finding_titles(envelope: dict | None) -> dict[str, str]:
     }
 
 
-def base_branch() -> str:
-    """The branch remediation pull requests target: this repository's own default.
+def base_branch(repo: str) -> str:
+    """The branch remediation pull requests onto `repo` target.
 
     Not the constant `main` it used to be. A GitOps repository on `master`, or
     one whose fleet configuration lives on a long-running `production` trunk,
     made every audit fetch a ref that is not there — `checkout -B <branch>
     origin/main` then failed, and the whole remediation half of the run died
     after the findings had already been written. Resolution lives in
-    `gitops_workspace` so that `submit-suggestion` gets the same answer; see
-    `resolve_base_branch` for the order (`CREDENTIAL_PROXY_BASE_BRANCH` /
-    `GITOPS_BASE_BRANCH`, then `origin/HEAD`, then `main`).
+    `gitops_workspace`; see `resolve_base_branch` for the order (the base the
+    broker pins `repo` to, then `origin/HEAD`, then `main`). The broker refuses
+    `gh pr create` onto any branch but the pinned one, so the pin has to win.
 
     Answering `main` with no workspace is deliberate, not a fallback that got
     forgotten: `resolve_base_branch` cannot ask a clone that does not exist yet,
@@ -2382,7 +2371,7 @@ def base_branch() -> str:
     """
     import gitops_workspace
 
-    return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner)
+    return gitops_workspace.resolve_base_branch(workspace(), _workspace_runner, repo)
 
 
 def assert_pushable(branch: str) -> str:
@@ -2392,18 +2381,7 @@ def assert_pushable(branch: str) -> str:
         short = short[len("refs/heads/"):]
     elif short.startswith("heads/"):
         short = short[len("heads/"):]
-    protected = set(PROTECTED_BRANCHES)
-    override = (
-        os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip().lower()
-        or os.environ.get("GITOPS_BASE_BRANCH", "").strip().lower()
-    )
-    if override:
-        if override.startswith("refs/heads/"):
-            override = override[len("refs/heads/"):]
-        elif override.startswith("heads/"):
-            override = override[len("heads/"):]
-        protected.add(override)
-    if short in protected or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
+    if short in PROTECTED_BRANCHES or any(short.startswith(p) for p in PROTECTED_BRANCH_PREFIXES):
         raise ValueError(
             f"CRITICAL SECURITY REFUSAL: Force-pushing to protected branch "
             f"'{branch}' is strictly blocked by GKE SRE guardrails!"
@@ -8905,7 +8883,6 @@ def run_cmd(
     capture: bool = True,
     cwd: str | Path | None = None,
     stdin: str | None = None,
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one subprocess, always from a known directory.
 
@@ -8921,9 +8898,6 @@ def run_cmd(
     fd 0 for an argv that named `-` as an input file, so `--body-file -` carries
     a pull-request body across the container boundary that a
     `--body-file /some/path` could only cross while the two shared a volume.
-
-    `env` replaces the child's environment when given; None inherits this
-    process's, as `subprocess.run` does.
     """
     target = Path(cwd) if cwd is not None else _WORKSPACE
     where = f" (in {target})" if target is not None else ""
@@ -8936,7 +8910,6 @@ def run_cmd(
             capture_output=capture,
             cwd=str(target) if target is not None else None,
             input=stdin,
-            env=env,
         )
     except subprocess.CalledProcessError as exc:
         log(f"FAILED ({exc.returncode}): {' '.join(cmd)}")
@@ -9378,7 +9351,8 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     human made, and asking for it here costs nothing over the request already
     being sent. `closedAt` is there for the other half of the same rule: a
     `/remediate` only overrules a human close if it was written after it, and
-    that comparison needs a time on both sides.
+    that comparison needs a time on both sides. `baseRefName` is there so a
+    refresh of an open pull request is cut from the branch it targets.
     """
     res = gh(
         [
@@ -9393,7 +9367,7 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
             "--state",
             "all",
             "--json",
-            "number,headRefName,state,mergedAt,closedAt,url,body,labels",
+            "number,headRefName,baseRefName,state,mergedAt,closedAt,url,body,labels",
             "--limit",
             str(MAX_PR_PAGE),
         ],
@@ -9589,14 +9563,19 @@ class _GroupPush(NamedTuple):
 
 
 def _land_group_via_clone(
+    repo: str,
     audit_id: str,
     group: list[dict],
     branch: str,
     paths: list[str],
     snapshot: dict[str, bytes],
     root: Path,
+    base: str | None = None,
 ) -> _GroupPush:
     """Cut the branch in the leased clone, stage the files, commit, force-push.
+
+    `base` is the branch an open pull request for `branch` already targets.
+    Without one, the branch is cut from the repository's base branch.
 
     `finish` owns the working tree while it runs: the checkout is forced, and
     the caller re-materialises the files from `snapshot` afterwards, because a
@@ -9605,7 +9584,7 @@ def _land_group_via_clone(
     untracked. Do not leave unrelated uncommitted work in the tree during an
     audit.
     """
-    base = base_branch()
+    base = base or base_branch(repo)
 
     git(["fetch", "origin", base])
     git(["checkout", "--force", "-B", branch, f"origin/{base}"])
@@ -9719,10 +9698,20 @@ def open_remediation_pr(
     """
     branch = assert_pushable(group_branch_for(audit_id, group))
     paths = group_paths(group)
+    # The clone recuts the branch, so an open pull request's branch is cut from
+    # the base it targets. Cut from a newly configured base instead, its diff
+    # would carry every commit the new base has that the old one lacks.
+    open_base = (
+        str(existing.get("baseRefName") or "")
+        if existing and str(existing.get("state", "")).upper() == "OPEN"
+        else ""
+    )
     landed = (
         _land_group_via_broker(repo, audit_id, group, branch, paths, snapshot)
         if content_mode()
-        else _land_group_via_clone(audit_id, group, branch, paths, snapshot, root)
+        else _land_group_via_clone(
+            repo, audit_id, group, branch, paths, snapshot, root, base=open_base or None
+        )
     )
     if not landed.proposable:
         return None
@@ -10469,8 +10458,7 @@ def _clone_step(
         cmd.append(f"--prefix={prefix}")
     if force:
         cmd.append("--force")
-    env = {k: v for k, v in os.environ.items() if k not in BASE_BRANCH_OVERRIDE_VARS}
-    result = run_cmd(cmd, check=False, env=env)
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         at = f" at {ref}" if ref else ""
         log(f"WARNING: {slug}: clone{at} exited {result.returncode}; not searched.")

@@ -85,6 +85,10 @@ class Broker:
         self.calls: list[tuple[str, dict]] = []
         self.answers: dict[str, dict] = {}
         self.fail: dict[str, str] = {}
+        # The base the operator configured for this repository, or None. The
+        # refusals it brings are the broker's own: a clone with no branch named
+        # comes down on it, and a new proposal may target nothing else.
+        self.base_branch: str | None = None
 
     def __call__(self, verb: str, payload: dict) -> dict:
         self.calls.append((verb, payload))
@@ -93,6 +97,10 @@ class Broker:
         if verb == "clone":
             return self._clone(payload)
         if verb == "publish":
+            if not payload.get("advance"):
+                # A later round adds to a proposal that already exists; only
+                # the first publish starts one, so only it is held to the base.
+                self._refuse_off_base(payload["target"])
             return {
                 "forge": "local",
                 "repo": "acme/infra",
@@ -106,11 +114,33 @@ class Broker:
                 "proposalNoun": "change proposal",
                 "verbs": ["clone", "publish"],
                 "missing": [],
+                "baseBranch": self.base_branch,
             }
+        if verb == "proposal-create":
+            self._refuse_off_base(payload["target"])
         return self.answers.get(verb, {"forge": "local", "repo": "acme/infra"})
 
+    def _refuse_off_base(self, target: str) -> None:
+        if self.base_branch is not None and target != self.base_branch:
+            raise vcs.VcsError(
+                f"acme/infra takes proposals onto {self.base_branch} only, the base "
+                f"branch this install is configured with, and {target} is not it. "
+                f"Use {self.base_branch} as the target.",
+                code="TARGET_NOT_BASE",
+            )
+
     def _clone(self, payload: dict) -> dict:
-        branch = payload.get("branch") or self.branch
+        branch = payload.get("branch")
+        if branch is None and self.base_branch is not None:
+            if git(self.origin, "rev-parse", "--verify", "--quiet",
+                   f"refs/heads/{self.base_branch}", check=False).returncode != 0:
+                raise vcs.VcsError(
+                    f"acme/infra has no branch {self.base_branch}, the base branch "
+                    "this install is configured with.",
+                    code="BASE_BRANCH_MISSING",
+                )
+            branch = self.base_branch
+        branch = branch or self.branch
         bundle = self.origin.parent / "served.bundle"
         git(self.origin, "bundle", "create", str(bundle), "HEAD", branch)
         blob = bundle.read_bytes()
@@ -121,6 +151,7 @@ class Broker:
             "revision": git(self.origin, "rev-parse", branch).stdout.strip(),
             "size": len(blob),
             "bundleBase64": base64.b64encode(blob).decode("ascii"),
+            "baseBranch": self.base_branch,
         }
 
     def _tip_of(self, payload: dict) -> str:
@@ -858,6 +889,74 @@ class CollaborationTest(VcsTestCase):
         code, answer = self.run_vcs("issue", "view", "4")
         self.assertEqual(code, 1)
         self.assertIn("pull request", answer["error"])
+
+
+class ConfiguredBaseTest(VcsTestCase):
+    """A repository the operator pinned to `release`, as the broker reports it."""
+
+    def setUp(self):
+        super().setUp()
+        git(self.origin, "branch", "release", "main")
+        git(self.origin, "branch", "fix/under-review", "main")
+        self.broker.base_branch = "release"
+
+    def start_a_change(self) -> None:
+        self.clone()
+        self.run_vcs("branch", "fix/replicas")
+        (self.tree() / "inventory/clusters.yaml").write_text("replicas: 5\n")
+        self.run_vcs("commit", "-m", "raise it")
+
+    def test_a_clone_comes_down_on_the_base_and_says_which_it_is(self):
+        answer = self.clone()
+        self.assertEqual(answer["branch"], "release")
+        self.assertEqual(answer["baseBranch"], "release")
+
+    def test_with_nothing_configured_the_base_is_null(self):
+        self.broker.base_branch = None
+        answer = self.clone()
+        self.assertEqual(answer["branch"], "main")
+        self.assertIsNone(answer["baseBranch"])
+
+    def test_capabilities_answers_the_base_with_no_copy(self):
+        code, answer = self.run_vcs("capabilities", "--repo", "local.test/acme/infra")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(answer["baseBranch"], "release")
+
+    def test_publish_and_proposal_create_default_to_the_base(self):
+        self.start_a_change()
+        code, answer = self.run_vcs("publish")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("publish")["target"], "release")
+        code, answer = self.run_vcs("proposal", "create", "--title", "Raise replicas")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("proposal-create")["target"], "release")
+
+    def test_another_target_for_a_new_proposal_is_refused_naming_the_base(self):
+        self.start_a_change()
+        for argv in (
+            ("publish", "--target", "main"),
+            ("proposal", "create", "--title", "t", "--target", "main"),
+        ):
+            with self.subTest(argv=argv):
+                code, answer = self.run_vcs(*argv)
+                self.assertEqual(code, 1)
+                self.assertEqual(answer["code"], "TARGET_NOT_BASE")
+                self.assertIn("release", answer["error"])
+
+    def test_a_later_round_keeps_the_target_its_proposal_already_has(self):
+        self.clone("--branch", "fix/under-review")
+        (self.tree() / "inventory/clusters.yaml").write_text("replicas: 6\n")
+        self.run_vcs("commit", "-m", "another round")
+        code, answer = self.run_vcs("publish", "--target", "main", "--advance")
+        self.assertEqual(code, 0, answer)
+        self.assertEqual(self.broker.payload("publish")["target"], "main")
+
+    def test_a_base_the_remote_does_not_have_is_refused_by_name(self):
+        self.broker.base_branch = "nope"
+        code, answer = self.run_vcs("clone", "local.test/acme/infra")
+        self.assertEqual(code, 1)
+        self.assertEqual(answer["code"], "BASE_BRANCH_MISSING")
+        self.assertIn("nope", answer["error"])
 
 
 # ---------------------------------------------------------------------------

@@ -1728,6 +1728,88 @@ class ShallowAndBranchOpenTest(unittest.TestCase):
             store.open("acme/fleet", "main", "--upload-pack=/bin/sh")
 
 
+class PinnedBaseOpenTest(unittest.TestCase):
+    """`open` with no base named, on a repository whose base is pinned."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, responses=None, base_branch="gitops-base", base_repository="Acme/Fleet"):
+        self.runner = RecordingRunner(responses)
+        return ContentWorkspaceStore(
+            self.base / "trees",
+            self.agent,
+            self.runner,
+            base_branch=base_branch,
+            base_repository=base_repository,
+        )
+
+    def test_no_base_named_opens_on_the_pinned_base(self):
+        workspace = self.store(base_branch="refs/heads/gitops-base").open("acme/fleet")
+        self.assertEqual("gitops-base", workspace.base)
+        self.assertEqual("origin/gitops-base", workspace.started_from)
+        resolved = [argv for argv, _ in self.runner.calls if argv[1] == "rev-parse"]
+        self.assertIn(["git", "rev-parse", "--verify", "origin/gitops-base"], resolved)
+
+        # Paired ordinary use: a base the caller names is still the base.
+        named = self.store().open("acme/fleet", "release")
+        self.assertEqual("release", named.base)
+
+    def test_a_repository_the_pin_does_not_name_opens_as_before(self):
+        # The fake answers `origin/HEAD` with nothing, so the default is the
+        # local HEAD's answer, which is also nothing, and then `main`.
+        for kwargs in (
+            {"base_repository": "acme/other"},
+            {"base_repository": ""},
+            {"base_branch": "", "base_repository": "acme/fleet"},
+        ):
+            with self.subTest(**kwargs), mock.patch.dict(os.environ, {}, clear=True):
+                workspace = self.store(**kwargs).open("acme/fleet")
+                self.assertEqual("main", workspace.base)
+
+    def test_a_pinned_base_the_remote_lacks_is_refused_with_a_code(self):
+        store = self.store({"refs/remotes/origin/gitops-base": FakeResult(exit_code=1)})
+        with self.assertRaises(ContentWorkspaceError) as caught:
+            store.open("acme/fleet")
+        self.assertEqual(409, caught.exception.status)
+        self.assertEqual("workspace.base-branch-missing", caught.exception.code)
+        self.assertIn("gitops-base", str(caught.exception))
+        # Nothing is left behind for a handle nobody holds.
+        self.assertEqual([], list((self.base / "trees").iterdir()))
+
+    def test_a_shallow_open_of_a_pinned_base_the_remote_lacks_is_refused_with_a_code(self):
+        # A shallow clone names the base with --branch, and git fails it for a
+        # missing branch, so the remote is asked before anything is cloned.
+        store = self.store({"ls-remote": FakeResult(exit_code=2)})
+        with self.assertRaises(ContentWorkspaceError) as caught:
+            store.open("acme/fleet", depth=1)
+        self.assertEqual(409, caught.exception.status)
+        self.assertEqual("workspace.base-branch-missing", caught.exception.code)
+        self.assertIn("gitops-base", str(caught.exception))
+        self.assertEqual(
+            ["git", "ls-remote", "--exit-code", "--heads",
+             "https://github.com/acme/fleet.git", "refs/heads/gitops-base"],
+            self.runner.calls[0][0],
+        )
+        self.assertNotIn("clone", self.runner.subcommands)
+        self.assertEqual([], list((self.base / "trees").iterdir()))
+
+        # Paired ordinary use: a base the remote has, or a probe that could not
+        # ask, goes on to the shallow clone of the base.
+        for exit_code in (0, 128):
+            with self.subTest(exit_code=exit_code):
+                store = self.store({"ls-remote": FakeResult(exit_code=exit_code)})
+                workspace = store.open("acme/fleet", depth=1)
+                self.assertEqual("gitops-base", workspace.base)
+                clone = next(argv for argv, _ in self.runner.calls if argv[1] == "clone")
+                self.assertIn("--branch", clone)
+                self.assertIn("gitops-base", clone)
+
+
 class GrepTest(unittest.TestCase):
     """`git grep` over a real tree, because the argv is the whole control."""
 

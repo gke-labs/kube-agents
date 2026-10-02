@@ -1289,6 +1289,214 @@ class RepositoryVerbTest(unittest.TestCase):
             self.assertTrue(path.name.startswith("clone-"))
 
 
+class PinnedBaseRepositoryTest(unittest.TestCase):
+    """`clone` and `publish` on a repository with a pinned base.
+
+    The base is a branch other than the remote's default, carrying a commit
+    `main` does not, so landing on it and landing on `main` look different.
+    The repository half of the pin is spelled in another case, because the
+    forge matches owner and name that way and the broker has to as well.
+    """
+
+    clone_locally = RepositoryVerbTest.clone_locally
+    bundle_of = RepositoryVerbTest.bundle_of
+    commit_in = RepositoryVerbTest.commit_in
+    remote_tip = RepositoryVerbTest.remote_tip
+
+    BASE = "gitops-base"
+    REPOSITORY = "local.test/acme/infra"
+
+    def setUp(self):
+        RepositoryVerbTest.setUp(self)
+        git(self.seed, "checkout", "--quiet", "-b", self.BASE)
+        self.base_tip = self.commit_in(self.seed, "base.txt", "base\n", "on the base")
+        git(self.seed, "push", "--quiet", "origin", self.BASE)
+        git(self.seed, "checkout", "--quiet", "main")
+        self.pin(self.BASE, "Acme/Infra")
+
+    def pin(self, branch: str, repository: str) -> None:
+        self.broker.base_branch = branch
+        self.broker.base_repository = repository
+
+    def remote_has(self, branch: str) -> bool:
+        found = git(self.origin, "rev-parse", "--verify", "--quiet",
+                    f"refs/heads/{branch}", check=False)
+        return found.returncode == 0
+
+    def topic_bundle(self) -> tuple[str, str, dict]:
+        """A copy cut from the clone, one commit on `topic`, and its bundle."""
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        tip = self.commit_in(work, "a.txt", "a\n", "a")
+        return tip, self.bundle_of(work, "topic", answer["revision"]), answer
+
+    # -- clone -----------------------------------------------------------
+
+    def test_a_clone_naming_no_branch_lands_on_the_pinned_base(self):
+        work, answer = self.clone_locally()
+        self.assertEqual(answer["branch"], self.BASE)
+        self.assertEqual(answer["revision"], self.base_tip)
+        self.assertEqual(answer["baseBranch"], self.BASE)
+        self.assertEqual((work / "base.txt").read_text(), "base\n")
+
+    def test_the_pin_s_ref_prefix_is_not_part_of_the_branch(self):
+        self.pin(f"refs/heads/{self.BASE}", "acme/infra")
+        answer = self.broker.clone({"repository": self.REPOSITORY})
+        self.assertEqual(answer["branch"], self.BASE)
+        self.assertEqual(answer["baseBranch"], self.BASE)
+
+    def test_a_clone_naming_a_branch_still_gets_that_branch(self):
+        answer = self.broker.clone({"repository": self.REPOSITORY, "branch": "main"})
+        self.assertEqual(answer["branch"], "main")
+        self.assertEqual(answer["revision"], self.origin_head)
+        # The pin is still reported: it is what the copy's proposal targets.
+        self.assertEqual(answer["baseBranch"], self.BASE)
+
+    def test_a_repository_the_pin_does_not_name_clones_as_before(self):
+        self.pin(self.BASE, "acme/other")
+        answer = self.broker.clone({"repository": self.REPOSITORY})
+        self.assertEqual(answer["branch"], "main")
+        self.assertEqual(answer["revision"], self.origin_head)
+        self.assertIsNone(answer["baseBranch"])
+
+    def test_nothing_pinned_clones_as_before(self):
+        # A base with no repository is the older, protection-only setting.
+        for branch, repository in (("", ""), (self.BASE, ""), ("", "acme/infra")):
+            with self.subTest(branch=branch, repository=repository):
+                self.pin(branch, repository)
+                answer = self.broker.clone({"repository": self.REPOSITORY})
+                self.assertEqual(answer["branch"], "main")
+                self.assertIsNone(answer["baseBranch"])
+
+    def test_a_pinned_base_the_remote_lacks_is_refused_by_name(self):
+        self.pin("platform-agent/trunk", "acme/infra")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.clone({"repository": self.REPOSITORY})
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "BASE_BRANCH_MISSING")
+        self.assertIn("platform-agent/trunk", str(caught.exception))
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+        # Paired ordinary use: naming a branch that does exist is not refused.
+        answer = self.broker.clone({"repository": self.REPOSITORY, "branch": "main"})
+        self.assertEqual(answer["branch"], "main")
+
+    # -- publish ---------------------------------------------------------
+
+    def test_a_first_publish_onto_another_target_is_refused_before_anything_moves(self):
+        _, bundle, answer = self.topic_bundle()
+        refreshed = list(self.refreshed)
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": self.REPOSITORY,
+                    "branch": "topic",
+                    "target": "main",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": bundle,
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "TARGET_NOT_BASE")
+        self.assertIn(self.BASE, str(caught.exception))
+        self.assertIn("acme/infra", str(caught.exception))
+        self.assertFalse(self.remote_has("topic"))
+        # Refused from the request alone: no credential was made current for it.
+        self.assertEqual(self.refreshed, refreshed)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_the_target_is_compared_exactly(self):
+        # Git branch names are case-sensitive: `Gitops-Base` is another branch.
+        _, bundle, answer = self.topic_bundle()
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.publish(
+                {
+                    "repository": self.REPOSITORY,
+                    "branch": "topic",
+                    "target": "Gitops-Base",
+                    "baseRevision": answer["revision"],
+                    "bundleBase64": bundle,
+                }
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "TARGET_NOT_BASE")
+
+    def test_a_first_publish_onto_the_pinned_base_is_accepted(self):
+        tip, bundle, answer = self.topic_bundle()
+        self.broker.publish(
+            {
+                "repository": self.REPOSITORY,
+                "branch": "topic",
+                "target": f"refs/heads/{self.BASE}",
+                "baseRevision": answer["revision"],
+                "bundleBase64": bundle,
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), tip)
+
+    def test_a_first_publish_onto_another_target_is_accepted_when_nothing_is_pinned(self):
+        self.pin(self.BASE, "")
+        tip, bundle, answer = self.topic_bundle()
+        self.broker.publish(
+            {
+                "repository": self.REPOSITORY,
+                "branch": "topic",
+                "target": "main",
+                "baseRevision": answer["revision"],
+                "bundleBase64": bundle,
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), tip)
+
+    def test_a_later_round_onto_an_open_proposal_keeps_its_own_target(self):
+        # A proposal a person opened onto `main` before the pin existed. No
+        # verb can move it, so refusing its next round would strand it.
+        forge = ProposingLocalForge(self.forges, self.refreshed, open_sources={"topic"})
+        self.broker.registry.hosts["local.test"] = forge
+        git(self.seed, "push", "--quiet", "origin", f"{self.BASE}:topic")
+        work, answer = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "topic")
+        second = self.commit_in(work, "b.txt", "b\n", "another round")
+        self.broker.publish(
+            {
+                "repository": self.REPOSITORY,
+                "branch": "topic",
+                "target": "main",
+                "clonedFrom": "topic",
+                "advance": True,
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "topic", answer["revision"]),
+            }
+        )
+        self.assertEqual(self.remote_tip("topic"), second)
+
+    def test_the_pinned_base_is_still_a_branch_no_publish_may_move(self):
+        # The pin adds a target rule; it does not replace the older meaning of
+        # the base as a protected branch. Each refusal is the first one the
+        # request reaches.
+        work, answer = self.clone_locally()
+        self.commit_in(work, "README.md", "straight onto the base\n", "no branch")
+        bundle = self.bundle_of(work, self.BASE, answer["revision"])
+        for target, advance, code in (
+            ("main", False, "TARGET_NOT_BASE"),
+            (self.BASE, False, "TARGET_IS_BRANCH"),
+            ("main", True, "PROTECTED_BRANCH"),
+        ):
+            with self.subTest(target=target, advance=advance):
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.broker.publish(
+                        {
+                            "repository": self.REPOSITORY,
+                            "branch": self.BASE,
+                            "target": target,
+                            "advance": advance,
+                            "baseRevision": answer["revision"],
+                            "bundleBase64": bundle,
+                        }
+                    )
+                self.assertEqual(caught.exception.fields.get("code"), code)
+        self.assertEqual(self.remote_tip(self.BASE), self.base_tip)
+
+
 # ---------------------------------------------------------------------------
 # capabilities
 # ---------------------------------------------------------------------------
@@ -1760,6 +1968,28 @@ class CapabilitiesTest(unittest.TestCase):
         broker.capabilities({"repository": "acme/infra"})
         self.assertEqual(minted, [])
 
+    def test_capabilities_names_the_pinned_base_of_that_repository_only(self):
+        self.broker.base_branch = "refs/heads/gitops-base"
+        self.broker.base_repository = "acme/infra"
+        for repository, expected in (
+            ("acme/infra", "gitops-base"),
+            ("https://github.com/ACME/infra", "gitops-base"),
+            ("acme/other", None),
+            ("https://git.example/acme/infra", None),
+        ):
+            with self.subTest(repository=repository):
+                answer = self.broker.capabilities({"repository": repository})
+                self.assertIn("baseBranch", answer)
+                self.assertEqual(answer["baseBranch"], expected)
+
+    def test_capabilities_names_no_base_when_nothing_is_pinned(self):
+        for branch, repository in (("", ""), ("gitops-base", ""), ("", "acme/infra")):
+            with self.subTest(branch=branch, repository=repository):
+                self.broker.base_branch = branch
+                self.broker.base_repository = repository
+                answer = self.broker.capabilities({"repository": "acme/infra"})
+                self.assertIsNone(answer["baseBranch"])
+
 
 # ---------------------------------------------------------------------------
 # the collaboration verbs
@@ -1940,6 +2170,84 @@ class CollaborationTest(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(WorkspaceError):
                 broker.proposal_create({"repository": "acme/infra", **payload})
         self.assertEqual(recorder.calls, [])
+
+    def pinned(self, *answers) -> tuple[VcsBroker, Recorder]:
+        broker, recorder = self.broker(*answers)
+        broker.base_branch = "gitops-base"
+        broker.base_repository = "acme/infra"
+        return broker, recorder
+
+    def test_proposal_create_refuses_a_target_that_is_not_the_pinned_base(self):
+        broker, recorder = self.pinned()
+        # `heads/gitops-base` is a branch of its own, and the forge would open
+        # the proposal on it rather than on the base.
+        for target in ("main", "Gitops-Base", "refs/heads/main", "heads/gitops-base"):
+            with self.subTest(target=target), self.assertRaises(WorkspaceError) as caught:
+                broker.proposal_create(
+                    {"repository": "acme/infra", "source": "fix/a", "target": target, "title": "t"}
+                )
+            self.assertEqual(caught.exception.status, 409)
+            self.assertEqual(caught.exception.fields.get("code"), "TARGET_NOT_BASE")
+            # The client keeps only the text and the code, so the base is in the text.
+            self.assertIn("gitops-base", str(caught.exception))
+            self.assertIn("acme/infra", str(caught.exception))
+        self.assertEqual(recorder.calls, [])
+        self.assertEqual(self.minted, [])
+
+    def test_proposal_create_still_validates_the_target_first(self):
+        broker, recorder = self.pinned()
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_create(
+                {"repository": "acme/infra", "source": "fix/a", "target": "..", "title": "t"}
+            )
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(recorder.calls, [])
+
+    def test_proposal_create_onto_the_pinned_base_reaches_the_forge(self):
+        # As the bare name, whichever spelling it came in as: the forge opens
+        # the proposal on the name it is sent.
+        for target in ("gitops-base", "refs/heads/gitops-base"):
+            with self.subTest(target=target):
+                broker, recorder = self.pinned({"number": 3, "state": "open"})
+                broker.proposal_create(
+                    {"repository": "acme/infra", "source": "fix/a", "target": target, "title": "t"}
+                )
+                self.assertEqual(recorder.body["base"], "gitops-base")
+
+    def test_proposal_create_on_a_repository_the_pin_does_not_name_is_unchanged(self):
+        broker, recorder = self.pinned({"number": 3, "state": "open"})
+        broker.proposal_create(
+            {"repository": "acme/other", "source": "fix/a", "target": "main", "title": "t"}
+        )
+        self.assertEqual(recorder.body["base"], "main")
+
+    def test_proposal_create_with_nothing_pinned_is_unchanged(self):
+        broker, recorder = self.broker({"number": 3, "state": "open"})
+        broker.base_branch = "gitops-base"
+        broker.proposal_create(
+            {"repository": "acme/infra", "source": "fix/a", "target": "main", "title": "t"}
+        )
+        self.assertEqual(recorder.body["base"], "main")
+
+    def test_proposal_update_refuses_a_target_that_is_not_the_pinned_base(self):
+        broker, recorder = self.pinned()
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_update(
+                {"repository": "acme/infra", "number": 9, "title": "new", "target": "main"}
+            )
+        self.assertEqual(caught.exception.fields.get("code"), "TARGET_NOT_BASE")
+        self.assertIn("gitops-base", str(caught.exception))
+        self.assertEqual(recorder.calls, [])
+
+        # Paired ordinary use: an update naming no target, or the base, goes through.
+        for extra in ({}, {"target": "gitops-base"}):
+            with self.subTest(extra=extra):
+                broker, recorder = self.pinned({"number": 9, "state": "open"})
+                answer = broker.proposal_update(
+                    {"repository": "acme/infra", "number": 9, "title": "new", **extra}
+                )
+                self.assertEqual(answer["proposal"]["number"], 9)
+                self.assertEqual(recorder.calls[-1][3], "PATCH")
 
     def test_issue_list_drops_the_proposals_github_mixes_in(self):
         broker, recorder = self.broker(

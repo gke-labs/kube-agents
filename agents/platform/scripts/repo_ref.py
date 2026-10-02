@@ -109,6 +109,12 @@ KNOWN_HOSTS = frozenset({GITHUB_CANONICAL_HOST})
 #: Matches `forge.RepoUnparseable`, whose reason codes are operator-facing.
 REASON_UNPARSEABLE = "GIT_REPO_UNPARSEABLE"
 
+#: The one spelling of a branch, besides the bare name, that is stripped before
+#: it is compared: `refs/heads/x` names the branch `x`. `heads/x` is not read as
+#: `x`, because a forge sends a base on as the name it was given, and `heads/x`
+#: is a branch anyone may push.
+BRANCH_REF_PREFIXES = ("refs/heads/",)
+
 
 class RepoRefError(ValueError):
     """A value that does not name a repository, with a machine-readable reason.
@@ -316,3 +322,39 @@ def is_github_slug(value: object) -> bool:
         and ref.segments[0].lower() not in GITHUB_HOSTS
         and value == ref.path
     )
+
+
+def short_branch(name: str) -> str:
+    """`refs/heads/x` names the branch `x`; compare it as `x`."""
+    short = name.strip()
+    for prefix in BRANCH_REF_PREFIXES:
+        if short.startswith(prefix):
+            return short[len(prefix):]
+    return short
+
+
+def pinned_base(
+    repository: object, base_branch: str, base_repository: str
+) -> str | None:
+    """The branch every proposal onto `repository` must target, or None.
+
+    The operator renders both halves into the credential broker's environment
+    from the PlatformAgent's `spec.integration.baseBranch`: the branch, and the
+    GitOps repository it applies to. The base is pinned for that one
+    repository. Every other repository, and every install that configures
+    nothing, answers None, which leaves the remote's own default in charge.
+
+    Here rather than in one of the doors because three of them ask it --
+    `credential_proxy`'s exec route, `vcs_broker` and `content_workspace` --
+    and this module is the one all three can import without pulling anything
+    in. The repository is matched case-insensitively, as forges match owner
+    and name. The branch is returned with its ref prefix stripped and its case
+    kept, because git branch names are case-sensitive and the callers compare
+    against it exactly.
+    """
+    branch = short_branch(base_branch or "")
+    pinned = try_parse(base_repository) if base_repository else None
+    ref = try_parse(repository)
+    if not branch or pinned is None or ref is None:
+        return None
+    return branch if ref.path.casefold() == pinned.path.casefold() else None

@@ -67,6 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+import repo_ref
 import workspace_paths
 
 LOGGER = logging.getLogger("credential-proxy")
@@ -136,8 +137,15 @@ WORKSPACE_GIT_SUBCOMMANDS = frozenset(
         "clean",
         "check-ref-format",
         "symbolic-ref",
+        "ls-remote",
     }
 )
+
+# `git ls-remote --exit-code` exits 2 when the remote has no ref matching the
+# pattern, and with another non-zero code when it could not ask at all.
+LS_REMOTE_NO_MATCH_EXIT_CODE = 2
+# The fully qualified spelling of a branch, which is what `ls-remote` is asked for.
+BRANCH_REF_PREFIX = "refs/heads/"
 
 _HANDLE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 # The same grammar unanchored, for taking handles back out of git's stderr.
@@ -205,6 +213,26 @@ class Conflict(ContentWorkspaceError):
 class GitFailed(ContentWorkspaceError):
     status = 502
     code = "workspace.git-failed"
+
+
+class BaseBranchMissing(ContentWorkspaceError):
+    """The repository's pinned base is not a branch on its remote.
+
+    409 rather than the 502 a failed `rev-parse` would reach the caller as: the
+    configuration names a branch the remote does not have, and every retry
+    gets the same answer until one of the two changes.
+    """
+
+    status = 409
+    code = "workspace.base-branch-missing"
+
+
+def _base_branch_missing(repo: str, pinned: str) -> BaseBranchMissing:
+    return BaseBranchMissing(
+        f"{repo} has no branch '{pinned}', the base branch this install is "
+        "configured with; proposals onto this repository can only target that "
+        "branch, so it has to exist on the remote first"
+    )
 
 
 def _limit(name: str, default: int) -> int:
@@ -647,6 +675,7 @@ class ContentWorkspaceStore:
         base_branch: str = "",
         credential_for: CredentialFor | None = None,
         clock: Callable[[], float] = time.monotonic,
+        base_repository: str = "",
     ) -> None:
         # Resolved, because `assert_disjoint_roots` resolves both sides and
         # `_redact` matches this value against paths git prints -- which git
@@ -674,6 +703,10 @@ class ContentWorkspaceStore:
             or os.environ.get("CREDENTIAL_PROXY_BASE_BRANCH", "").strip()
             or os.environ.get("GITOPS_BASE_BRANCH", "").strip()
         )
+        # The repository `base_branch` is the proposal base of. Together they
+        # make that branch the default base `open` gives the repository; see
+        # `repo_ref.pinned_base`.
+        self.base_repository = base_repository.strip()
         self._credential_for = credential_for
         # Monotonic, and injected so a test can drive the idle clock.
         self._clock = clock
@@ -877,7 +910,7 @@ class ContentWorkspaceStore:
             if isinstance(workspace_or_dir, Workspace)
             else Path(workspace_or_dir)
         )
-        # `config` is handed on only when there is something in it. The two
+        # `config` is handed on only when there is something in it. The three
         # verbs that talk to the remote are the only ones that ever have any,
         # and a runner that takes `(argv, cwd)` -- every recorded one in the
         # tests, and the executor before it learned the argument -- keeps
@@ -963,6 +996,11 @@ class ContentWorkspaceStore:
         `branch`, because a single-branch clone cannot see whether the working
         branch exists on the remote and would answer from the base instead
         while reporting that it had looked.
+
+        With no `base` named, a repository with a pinned base opens on that
+        base rather than on the remote's default, since the base is the only
+        branch a proposal from this workspace will be accepted onto. A pinned
+        base the remote does not have is refused by name.
         """
         if not isinstance(repo, str) or not is_owner_name(repo):
             raise ContentWorkspaceError("repo must be owner/name")
@@ -982,6 +1020,13 @@ class ContentWorkspaceStore:
         # symmetric, and one day a caller will thread it somewhere unprefixed.
         if base is not None:
             base = check_branch_name(base)
+        pinned = None
+        if base is None:
+            pinned = repo_ref.pinned_base(repo, self.base_branch, self.base_repository)
+            if pinned is not None:
+                # Configuration rather than the caller's, but it reaches the
+                # same argv, so it takes the same check.
+                base = pinned = check_branch_name(pinned)
         caller = check_caller_label(caller)
         with self._lock:
             # Reclaim before counting: the entries a dead worker left are what
@@ -1022,8 +1067,9 @@ class ContentWorkspaceStore:
             # Which credential, if any, this clone presents is decided by the
             # broker from the repository's registered role: a read-only token
             # for a context repository, nothing added for anything else. It is
-            # applied to this clone and to the fetch in `commit`, and to no
-            # other git this store runs -- everything else is local.
+            # applied to this clone, the probe before it and the fetch in
+            # `commit`, and to no other git this store runs -- everything else
+            # is local.
             credential = self._credential(repo)
             remote_config = tuple(credential.git_config(repo)) if credential else ()
             # The URL is composed here from a validated `owner/name`, never taken
@@ -1037,6 +1083,21 @@ class ContentWorkspaceStore:
             # container. Observed against a real install: a private repository with
             # no credential available left one directory per attempt.
             try:
+                # A shallow clone fetches the pinned base by name, and git fails
+                # that clone for a branch the remote lacks before the check
+                # after it can say so. Asked first, so the answer is the 409.
+                if depth is not None and pinned is not None:
+                    probe = self._git(
+                        tree,
+                        [
+                            "ls-remote", "--exit-code", "--heads", url,
+                            f"{BRANCH_REF_PREFIX}{pinned}",
+                        ],
+                        check=False,
+                        config=remote_config,
+                    )
+                    if getattr(probe, "exit_code", 1) == LS_REMOTE_NO_MATCH_EXIT_CODE:
+                        raise _base_branch_missing(repo, pinned)
                 argv = ["clone", "--quiet"]
                 if depth is not None:
                     argv += ["--depth", str(depth), "--single-branch"]
@@ -1064,6 +1125,8 @@ class ContentWorkspaceStore:
                     caller=caller,
                 )
                 workspace.default_branch = self._default_branch(workspace)
+                if pinned is not None and not self._remote_branch_exists(workspace, pinned):
+                    raise _base_branch_missing(repo, pinned)
                 workspace.base = base or workspace.default_branch
                 workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
                 workspace.started_from = f"origin/{workspace.base}"

@@ -680,6 +680,24 @@ func TestProblemsNameTheFieldAtFault(t *testing.T) {
 		{name: "alias repository path", spec: &IntegrationSpec{GitHub: &GitHubSpec{
 			GitRepo: "git@gitlab.com:group/project.git"}},
 			want: []string{"github.gitRepo"}},
+		{name: "base branch on a gitops repository", spec: &IntegrationSpec{Forges: gh, BaseBranch: "release",
+			Repositories: []RepositorySpec{repo("github", "infra", RepositoryRoleGitOps)}}},
+		{name: "base branch on the alias", spec: &IntegrationSpec{BaseBranch: "release",
+			GitHub: &GitHubSpec{Org: "gke-labs", GitRepo: "infra"}}},
+		// The base pins the GitOps repository and nothing else.
+		{name: "base branch with only a managed repository", spec: &IntegrationSpec{Forges: gh, BaseBranch: "release",
+			Repositories: []RepositorySpec{repo("github", "apps", RepositoryRoleManaged)}},
+			want: []string{"baseBranch"}},
+		{name: "base branch with nothing else declared", spec: &IntegrationSpec{BaseBranch: "release"},
+			want: []string{"baseBranch"}},
+		{name: "base branch on the alias with no repository", spec: &IntegrationSpec{BaseBranch: "release",
+			GitHub: &GitHubSpec{Org: "gke-labs", GitRepo: NoRepositorySentinel}},
+			want: []string{"baseBranch"}},
+		// A declared but refused GitOps repository is the problem to fix; the
+		// base is not reported on top of it.
+		{name: "base branch on a refused gitops repository", spec: &IntegrationSpec{Forges: gh, BaseBranch: "release",
+			Repositories: []RepositorySpec{repo("github", "group/subgroup/project", RepositoryRoleGitOps)}},
+			want: []string{"repositories[0].repository"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

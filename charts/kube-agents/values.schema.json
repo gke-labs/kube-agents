@@ -832,6 +832,9 @@
                 }
               }
             },
+            "baseBranch": {
+              "type": "string"
+            },
             "github": {
               "type": "object",
               "additionalProperties": false,

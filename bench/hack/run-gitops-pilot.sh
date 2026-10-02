@@ -367,13 +367,15 @@ fi
 
 # 2. agent base branch ------------------------------------------------------
 # The stack makes the run branch the repository's default branch for the run
-# and restores it on destroy; the agent's submit-suggestion re-asks the remote
-# for its default before each PR (decision 3 in the pilot notes). One run at a
-# time (the stack refuses to switch when the default already points at a
-# run/** branch), and BENCH_NO_TEARDOWN=true leaves the repository's default on
-# the run branch until the destroy is run by hand. Pilot-only: the per-run
-# base is the credential broker's to enforce (#1498; its direct-push half
-# landed as #1669, the base-branch half is #1848). Runs 1 to 13 set
+# and restores it on destroy; with no base configured, the broker clone that
+# submit-suggestion takes before each PR checks out the remote's default
+# (decision 3 in the pilot notes). One run at a time (the stack refuses to
+# switch when the default already points at a run/** branch), and
+# BENCH_NO_TEARDOWN=true leaves the repository's default on the run branch
+# until the destroy is run by hand. Pilot-only: a per-run base can now be set
+# as spec.integration.baseBranch on the PlatformAgent, which the operator
+# renders into the credential broker and the broker enforces; the pilot does
+# not set it. Runs 1 to 13 set
 # GITOPS_BASE_BRANCH on the PlatformAgent instead, on a 0.4.0 install whose
 # operator copied it into the agent container; on the shell-sandbox layout
 # every command runs in platform-agent-shell-0, whose environment does not

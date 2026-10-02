@@ -986,6 +986,13 @@ platformAgent:
     #     namespace: other-org    # qualifies a bare name, overriding the forge's namespace
     #     role: context           # read-only reference material
     repositories: []
+    # The branch every pull request onto the GitOps repository must target
+    # (the gitops repository above, or github.gitRepo). The credential broker
+    # refuses a proposal onto any other branch, and a clone that names no
+    # branch checks this one out. Empty means the repository's own default
+    # branch. Needs the PlatformAgent CRD from this chart: helm upgrade does
+    # not update CRDs, so apply charts/kube-agents/crds/ first.
+    baseBranch: ""
     # Deprecated: use `forges` and `repositories` above. Kept so existing values files keep working.
     github:
       # Target GitHub Organization where the GitHub App is installed (optional).
