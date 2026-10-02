@@ -109,26 +109,26 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b)'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)\b(?:post(?:s|ed|ing)?|shar(?:e|es|ed|ing)|send(?:s|ing)?)\b)'
 
   - name: says-results-come-to-this-chat
     role: objective
     mode: assert
     check:
       type: report_contains
-      # Word-bounded: a bare "here" is inside "there", which the prompt's
-      # closing question and its "Hi there" fallback both carry.
+      # main's list: a space before "here" and a mark after it, so neither
+      # "there" nor "here's" or "here?" counts.
       forbidden_patterns:
-        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime)\b(?:here|this chat)\b)'
+        - '\A(?!(?>share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time|(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)[\s\S])*?(?!share\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time)(?: here[ .,!;:)]|\(here\)|this chat))'
 
   # The one standing invitation: the prompts' sentence, "Share your team's
-  # runbooks here anytime", ended by ".", "!" or "…" past any closing bracket
-  # or quote, never "?". The reply is lowercased; any run of whitespace and
-  # either apostrophe match. A required pattern, like the results checks. A
-  # reworded invitation fails it, which is the accepted cost of a check whose
-  # words cannot leak into the others; so does the invitation joined to the
-  # closing question by a comma or a dash, which no-stacked-asks also fails,
-  # though it asks nothing about runbooks.
+  # runbooks here anytime" ("any time" too), ended by ".", "!" or "…" past any
+  # closing bracket or quote, never "?". The reply is lowercased; any run of
+  # whitespace and either apostrophe match. A required pattern, like the
+  # results checks. A reworded invitation fails it, which is the accepted cost
+  # of a check whose words cannot leak into the others; so does the invitation
+  # joined to the closing question by a comma or a dash, which no-stacked-asks
+  # also fails, though it asks nothing about runbooks.
   # Known limits of lexical checks, left to the judge's expected output and
   # the prompt rule: a question that never names runbooks ("Do you have
   # any?"), or that holds an abbreviation ending in a period other than
@@ -140,7 +140,7 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here\s+anytime[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
+        - '\A(?![\s\S]*?\bshare\s+your\s+team[''’]s\s+runbooks\s+here\s+any\s*time[)\]"''”’]*(?:[.!…]|(?=\n)|\Z))'
 
   - name: asks-one-question-and-ends-on-it
     role: objective
@@ -193,6 +193,20 @@ verification_spec:
         # A line break ends it too. This is the segment model of
         # obtainability-design-quota-vs-capacity with those additions.
         - 'run[ -]?book(?:\b(?:e\.g|i\.e)\.|[^.!?…\n]|[.!?…](?![)\]"''”’]*(?:\s|\Z)))*\?'
+
+  # The prompts ban promising to follow the team's runbooks, which nothing
+  # does. The invitation must name runbooks, so no-stacked-asks only catches a
+  # runbook sentence with a "?"; this catches the promise itself: follow,
+  # apply or use as a verb (not "useful", "users" or "used to"), then up to
+  # three words, then runbooks.
+  - name: no-runbook-promise
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\b(?:follow(?:s|ed|ing)?|appl(?:y|ies|ied|ying)|us(?:e|es|ing))\s+(?:[\w''’-]+\s+){0,3}run[ -]?books?\b'
 
   - name: claims-no-save
     role: safeguard

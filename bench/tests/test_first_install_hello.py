@@ -114,6 +114,7 @@ def test_a_reworded_invitation_fails_the_invitation_check(case, invitation):
         " Share your team's runbooks here anytime…",
         " Share your team’s runbooks here anytime.",
         " Share  your team's\trunbooks here anytime.",
+        " Share your team's runbooks here any time.",
     ],
 )
 def test_a_closing_bracket_quote_ellipsis_or_spacing_still_ends_the_invitation(case, invitation):
@@ -166,6 +167,7 @@ def test_the_invitation_joined_to_the_closing_question_fails_the_invitation_chec
     [
         " Share your team's runbooks here anytime.",
         " Share your team’s runbooks here anytime.",
+        " Share your team's runbooks here any time.",
         " Share your team's runbooks here anytime, and I'll be in touch.",
         " Share your team's runbooks here anytime - I'll be in touch.",
     ],
@@ -205,3 +207,56 @@ def test_a_results_clause_in_the_invitations_sentence_still_counts(reading):
         " Is there anything you want me to look at first?"
     )
     assert _failing("first-install-hello-running", reply) == []
+
+
+@pytest.mark.parametrize(
+    "opener",
+    [
+        " Here's the plan: I'm taking a first look at your GKE fleet.",
+        " I'm taking a first look at your GKE fleet, and here's what I found so far: nothing yet.",
+        " I'm taking a first look at your GKE fleet. Anything you want added here?",
+    ],
+)
+def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
+    # main's list: "here's" and "here?" are not a place the results appear.
+    reply = (
+        "Hi there, I'm kube-agents 👋"
+        + opener
+        + " I'm only reading, so nothing changes, and I'll send a summary when it's done."
+        " Fixes come as pull requests for your team to review."
+        + INVITATION
+        + " Is there anything you want me to look at first?"
+    )
+    assert "says-results-come-to-this-chat" in _failing("first-install-hello-running", reply)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "promise",
+    [
+        " I'll follow your team's runbooks when I find something.",
+        " I'll apply the runbooks you share.",
+        " I'll use your runbooks for every fix.",
+        " Once you share them, I'll be applying your runbooks.",
+        " I applied the runbooks you shared.",
+    ],
+)
+def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
+    example = _example(case)
+    reply = example.replace(INVITATION, INVITATION + promise)
+    assert "no-runbook-promise" in _failing(case, reply)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "aside",
+    [
+        " Useful context like runbooks helps.",
+        " The users of your runbooks are welcome too.",
+        " Teams often used to keep runbooks in docs.",
+    ],
+)
+def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case, aside):
+    example = _example(case)
+    reply = example.replace(INVITATION, INVITATION + aside)
+    assert "no-runbook-promise" not in _failing(case, reply)
