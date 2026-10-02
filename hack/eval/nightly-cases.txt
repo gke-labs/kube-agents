@@ -349,6 +349,17 @@
 # the presubmit file's fourteen). deployer: noop, read-only over the seeded fleet.
 ./tasks/compliance-declared-intent-no-finding/task.yaml
 
+# The compliance stream's other posture (#1408): 2.7 default-sa-automount,
+# declared per workload and fixed per namespace. seeded-token holds a declared
+# workload and an undeclared sibling; the case runs the compliance audit and
+# grades the ledger: the declared workload under Declared intent, the sibling
+# still a finding with a manual fix naming the declared one. Red on main's
+# images (both published as findings), three greens on the branch's, on a dev
+# install. One case, three units: this file's share is forty-eight cases
+# (144 units) of a sixty-two-case, 186-unit matrix (with the presubmit file's
+# fourteen). deployer: noop, read-only over the seeded fleet.
+./tasks/compliance-declared-token-shields-siblings/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
 # Nine cases; each carries the blocker that kept it parked. None was
 # activatable as a presubmit seat then and none is now; what changed is

@@ -195,6 +195,110 @@ resource "kubernetes_deployment_v1" "notification_relay" {
   }
 }
 
+# Compliance SOP 2.7's posture, declared and undeclared side by side. Both
+# Deployments run on the namespace's default ServiceAccount with the token
+# mounted. token-reader is declared on purpose by the pool repository's
+# knowledge/ note; token-sidecar is declared nowhere and is a finding. The
+# 2.7 fix is one file on the shared `default` ServiceAccount, which would
+# take the declared workload's token too, so the audit must keep
+# token-sidecar's fix manual. One replica each, behind the default-deny
+# policy below, so neither adds any other stream's finding.
+resource "kubernetes_namespace_v1" "seeded_token" {
+  metadata {
+    name   = "seeded-token"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+# The namespace's auto-created default ServiceAccount, adopted so the catalog
+# can probe it: the 2.7 fix the shield must keep off it is
+# automountServiceAccountToken: false here, and the case's safeguard reads
+# this object back.
+resource "kubernetes_default_service_account_v1" "seeded_token" {
+  metadata {
+    name      = "default"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  automount_service_account_token = true
+}
+
+resource "kubernetes_deployment_v1" "token_reader" {
+  metadata {
+    name      = "token-reader"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "token-reader" }
+    }
+    template {
+      metadata {
+        labels = { app = "token-reader" }
+      }
+      spec {
+        # The declared posture: the default ServiceAccount, token mounted.
+        service_account_name            = "default"
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "app"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_deployment_v1" "token_sidecar" {
+  metadata {
+    name      = "token-sidecar"
+    namespace = kubernetes_namespace_v1.seeded_token.metadata[0].name
+  }
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { app = "token-sidecar" }
+    }
+    template {
+      metadata {
+        labels = { app = "token-sidecar" }
+      }
+      spec {
+        # The same shape, declared nowhere: a 2.7 finding whose fix stays manual.
+        service_account_name            = "default"
+        automount_service_account_token = true
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "app"
+          image = "registry.k8s.io/pause:3.9"
+          resources {
+            requests = { cpu = "10m", memory = "16Mi" }
+            limits   = { memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
 # Defect (security): the classic over-grant -- cluster-admin bound to a
 # namespace's default ServiceAccount. Asserted by compliance-rbac-overgrant.
 # A ClusterRoleBinding, not a RoleBinding, deliberately: the compliance
@@ -465,6 +569,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     debug       = kubernetes_namespace_v1.seeded_debug.metadata[0].name
     capacity    = kubernetes_namespace_v1.seeded_capacity.metadata[0].name
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
+    token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.

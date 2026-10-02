@@ -1936,7 +1936,7 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
                 self.assertIn(item["check"], audit.audit_declarable_checks(stream))
 
     def test_a_note_missing_one_of_the_two_declarations_fails(self):
-        # The fixture rests on two postures in one note; a note that declares
+        # The fixture rests on three postures in one note; a note that declares
         # only the budget leaves the compliance case failing on that project.
         good = checker.GITOPS_INTENT_NOTE_CONTENT
         only_pdb = good.replace("  - check: netpol-missing\n    namespace: seeded-intent\n    object: Namespace/seeded-intent\n", "")
