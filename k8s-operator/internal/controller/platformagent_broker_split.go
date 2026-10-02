@@ -66,6 +66,17 @@ const (
 	// had and nothing checked. credential_proxy.py's ROUTE_ROLES is the table.
 	credentialProxyChatAudience = "kubeagents-credential-proxy-chat" // #nosec G101 -- Token audience name, not a credential
 
+	// credentialProxyA2AChatAudience is the third audience: the A2A gateway's
+	// relay token, minted for it when the operator arms the gateway's Google
+	// Chat backend under mode: next. Its own audience because the broker
+	// confers roles by audience and the a2a-chat role must not be reachable
+	// from the legacy chat caller: that caller is the LLM-driven Hermes pod,
+	// and a shared role would let a prompt-injected agent pull and ack the
+	// A2A gateway's events (spec-chatops-gateway.md, "The Google Chat
+	// adapter"). credential_proxy.py refuses to confer the role when this
+	// equals either audience above.
+	credentialProxyA2AChatAudience = "kubeagents-credential-proxy-a2a-chat" // #nosec G101 -- Token audience name, not a credential
+
 	// credentialProxyTokenMountPath is where the agent container finds the
 	// token it presents to the broker.
 	credentialProxyTokenMountPath = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- Mount path, not a credential
@@ -119,7 +130,8 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // allowedBrokerCallers is the value of CREDENTIAL_PROXY_ALLOWED_CALLERS: the
 // TokenReview usernames the broker will serve.
 //
-// Two of them. The sandbox's is the caller that matters — the shell is where
+// Two of them on every install, a third when the next stack takes Chat. The
+// sandbox's is the caller that matters — the shell is where
 // every credentialed command runs, so a broker that served only the agent's
 // identity would answer 401 to all of them. The agent's is there because the
 // gateway's chat relays go through the same listener from the agent Pod.
@@ -129,12 +141,21 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // namespace mints. What it does not give is a way to tell them apart — the
 // sandbox runs as its own ServiceAccount, but the gateway shares the agent's
 // with the broker, so a username alone cannot say which Pod called. That is
-// what credentialProxyChatAudience is for.
+// what credentialProxyChatAudience is for. The A2A gateway runs as a
+// ServiceAccount of its own, so unlike the first two it is told apart by
+// name as well as by audience.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
-	return strings.Join([]string{
+	callers := []string{
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
-	}, ",")
+	}
+	// The A2A gateway, only while it is a caller: its Google Chat adapter
+	// pulls the relay hosted here, and a next install that gives it no Chat
+	// backend has no reason to widen the broker's callers by one.
+	if a2aChatArmed(agent) {
+		callers = append(callers, fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, a2aGatewayName(agent)))
+	}
+	return strings.Join(callers, ",")
 }
 
 // buildAgentCredentialProxyTokenVolume projects the token the agent presents to

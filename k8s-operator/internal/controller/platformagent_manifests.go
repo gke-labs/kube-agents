@@ -91,6 +91,12 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// The Chat consumers' broker env: the project id both carry, the legacy
+	// consumer's subscription name, and the fully qualified subscription
+	// form both consumers' env carries.
+	googleChatProjectIDEnvVar          = "GOOGLE_CHAT_PROJECT_ID"
+	legacyGoogleChatSubscriptionEnvVar = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
+	googleChatSubscriptionFormat       = "projects/%s/subscriptions/%s"
 	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
 	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
 	// collector is admitted to a listener that serves counters and nothing
@@ -635,7 +641,11 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// records where it started rather than testing `lines` for emptiness.
 	platformStart := len(lines)
 
-	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+	// legacyChatConsumer rather than the enabled flag: under next the A2A
+	// gateway takes Chat and the Hermes platform is off, so its pins would
+	// pin a platform that does not run. The two predicates are complements;
+	// see a2aChatArmed.
+	if gchat := integration.GoogleChat; legacyChatConsumer(agent) {
 		add("GOOGLE_CHAT_RELAY_URL", credentialProxyBaseURL(agent))
 		add("GOOGLE_CHAT_PROJECT_ID", gchat.ProjectID)
 		add("GOOGLE_CHAT_SUBSCRIPTION_NAME", fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName))
@@ -1868,13 +1878,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
-			if gchat.Enabled != nil {
-				cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
-				if *gchat.Enabled {
-					// Rebrand the Google Chat "thinking" marker card from the
-					// upstream default ("Hermes is thinking…") to our product name.
-					cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
-				}
+			// The platform is on only while Hermes is the Chat consumer;
+			// under next the A2A gateway is, and this platform would pull
+			// the same subscription beside it.
+			cfg.Platforms.GoogleChat.Enabled = legacyChatConsumer(agent)
+			if cfg.Platforms.GoogleChat.Enabled {
+				// Rebrand the Google Chat "thinking" marker card from the
+				// upstream default ("Hermes is thinking…") to our product name.
+				cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
 			}
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
@@ -2637,7 +2648,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
-		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
+		// The legacy relay env; under next the A2A gateway carries Chat
+		// instead, see a2aChatArmed.
+		if gchat := integration.GoogleChat; legacyChatConsumer(agent) {
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "GOOGLE_CHAT_RELAY_URL",
@@ -4068,8 +4081,22 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		)
 	}
 	if integration := agent.Spec.Integration; integration != nil {
-		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
-			envVars = append(envVars, corev1.EnvVar{Name: "GOOGLE_CHAT_PROJECT_ID", Value: gchat.ProjectID}, corev1.EnvVar{Name: "GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName)})
+		if gchat := integration.GoogleChat; googleChatEnabled(agent) {
+			subscription := fmt.Sprintf(googleChatSubscriptionFormat, gchat.ProjectID, gchat.SubscriptionName)
+			envVars = append(envVars, corev1.EnvVar{Name: googleChatProjectIDEnvVar, Value: gchat.ProjectID})
+			if a2aChatArmed(agent) {
+				// The next stack takes Chat: the install's one subscription
+				// goes to the A2A relay instance and the legacy instance is
+				// not built, so one consumer pulls it. The audience is what
+				// the broker confers the a2a-chat role by; the legacy chat
+				// caller's audience must not reach the A2A event routes.
+				envVars = append(envVars,
+					corev1.EnvVar{Name: a2aGoogleChatSubscriptionEnvVar, Value: subscription},
+					corev1.EnvVar{Name: credentialProxyA2AChatAudienceEnvVar, Value: credentialProxyA2AChatAudience},
+				)
+			} else {
+				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
+			}
 		}
 		if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
 			envVars = append(envVars,
@@ -4117,13 +4144,18 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// audience would collapse the two roles into one, which is how the
 		// broker spells "no split".
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE",
-		// The A2A gateway's audience and subscription are reserved before the
-		// operator renders them, for the same reason: one that could set the
+		// The A2A gateway's audience and subscription are reserved for the
+		// same reason: one that could set the
 		// audience would decide who holds the a2a-chat role, and one that
 		// could set the subscription would arm a second Chat consumer on
 		// whatever the broker's credential can pull.
 		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
+		// And the legacy subscription name by name, not only as a managed
+		// name: under next with Chat the render no longer sets it, and a
+		// CR that could would arm a second relay instance beside the A2A
+		// one, or, naming the same subscription, refuse the broker's start.
+		legacyGoogleChatSubscriptionEnvVar,
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container
