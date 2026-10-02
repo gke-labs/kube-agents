@@ -189,7 +189,11 @@ func harnessCommand() []string {
 			allowed = clusterViewAllowedTools
 		}
 	}
-	if clusterView {
+	// The view is only on when Bash is actually allowed: an override that
+	// leaves it out keeps Bash disallowed and gets no prompt telling the
+	// model to use it.
+	bashView := clusterView && allowsBash(allowed)
+	if bashView {
 		disallowed = clusterViewDisallowed
 	}
 	argv := []string{
@@ -203,13 +207,25 @@ func harnessCommand() []string {
 		"--allowedTools", allowed,
 		"--disallowedTools", disallowed,
 	}
-	if clusterView {
+	if bashView {
 		argv = append(argv, "--append-system-prompt", clusterViewPrompt)
 	}
 	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
 		argv = append(argv, strings.Fields(extra)...)
 	}
 	return argv
+}
+
+// allowsBash reports whether a harness --allowedTools value names Bash, bare
+// or as a pattern such as Bash(kubectl:*). The harness takes the list comma-
+// or space-separated.
+func allowsBash(allowed string) bool {
+	for _, tool := range strings.FieldsFunc(allowed, func(r rune) bool { return r == ',' || r == ' ' }) {
+		if tool == "Bash" || strings.HasPrefix(tool, "Bash(") {
+			return true
+		}
+	}
+	return false
 }
 
 // busTokenFile is where the adapter reads its bus credential, or "" for the

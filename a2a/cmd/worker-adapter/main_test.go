@@ -137,6 +137,22 @@ func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
 	if prompt != clusterViewPrompt || !strings.Contains(prompt, "policy rule") {
 		t.Fatalf("view on prompt = %q", prompt)
 	}
+	// An A2A_ALLOWED_TOOLS override without Bash wins over the view: Bash
+	// stays disallowed, and the prompt that tells the model to use it is
+	// not appended.
+	t.Setenv("A2A_ALLOWED_TOOLS", "Read,Grep")
+	allowed, disallowed, prompt = flags(harnessCommand())
+	if allowed != "Read,Grep" || !strings.Contains(disallowed, "Bash") || prompt != "" {
+		t.Fatalf("view on, override without Bash: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
+	}
+	// One that names Bash, bare or as a pattern, gets the view.
+	for _, override := range []string{"Read,Bash", "Read Bash(kubectl:*)"} {
+		t.Setenv("A2A_ALLOWED_TOOLS", override)
+		allowed, disallowed, prompt = flags(harnessCommand())
+		if allowed != override || strings.Contains(disallowed, "Bash") || prompt != clusterViewPrompt {
+			t.Fatalf("view on, override %q: allowed=%q disallowed=%q prompt=%q", override, allowed, disallowed, prompt)
+		}
+	}
 }
 
 // originSeq is the join between the two halves the origin-sequence fix already
