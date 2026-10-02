@@ -539,6 +539,16 @@ class RuntimeTest(unittest.TestCase):
         spoofed = "https://console.cloud.google.com@evil.example/"
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, spoofed))
         self.assertEqual([label for label, _ in triage["links"]], ["GKE Workloads"])
+        for spoofed in ("https://u@evil.example/", "https://console.cloud.google.com@evil.example/"):
+            # First on the line, so the link after it is numbered from the filtered list.
+            triage = runtime.parse_triage(REPORT.replace(WORKLOADS_URL, spoofed))
+            self.assertEqual(triage["links"], [("Cloud Logs", LOGS_URL)])
+            blocks = runtime.blocks_triage(triage, [])
+            self.assertNotIn("evil.example", json.dumps(blocks))
+            self.assertNotIn("evil.example", runtime.fallback_text(triage))
+            link_action = f"{runtime.ACTION_PREFIX}.{presenter.LINK_ACTION}."
+            ids = [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+            self.assertEqual([i for i in ids if i.startswith(link_action)], [link_action + "0"])
         plain = "https://console.cloud.google.com/logs/query"
         triage = runtime.parse_triage(REPORT.replace(LOGS_URL, plain))
         self.assertEqual(triage["links"][1], ("Cloud Logs", plain))

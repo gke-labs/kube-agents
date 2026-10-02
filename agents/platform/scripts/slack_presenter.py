@@ -130,9 +130,9 @@ ELLIPSIS = "…"
 
 #: Action ids: ``<prefix>.link.<n>`` and ``<prefix>.choice.<n>``, which callers build
 #: from these. Link buttons open their url client-side and Slack still sends a
-#: block_actions request, which :func:`ack_link_click` acknowledges once a caller
-#: registers it for :data:`LINK_ACTION_ID_PATTERN`; a choice click is answered as
-#: the clicker's reply (the gateway's ``slack_ux_clicks``).
+#: block_actions request, which :func:`ack_link_click` acknowledges once the gateway's
+#: ``slack_ux_clicks`` registers it for :data:`LINK_ACTION_ID_PATTERN`; a choice click
+#: is answered there as the clicker's reply.
 LINK_ACTION = "link"
 CHOICE_ACTION = "choice"
 LINK_ACTION_ID_PATTERN = re.compile(r"\.link\.\d+$")
@@ -468,6 +468,7 @@ def _safe_link_url(url: str) -> bool:
 
 
 def _button(label: str, action_id: str, *, url: str | None = None, value: str | None = None) -> dict:
+    """A Block Kit button; callers drop an unsafe url first, and the check here is the backstop."""
     button: dict = {
         "type": "button",
         "text": {"type": "plain_text", "text": _clip(label, BUTTON_TEXT_MAX), "emoji": True},
