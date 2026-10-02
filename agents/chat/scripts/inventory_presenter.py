@@ -53,10 +53,9 @@ posts itself when it can: the headline, lead and top rows with no count
 above them, then a primary "Fix the first one" button and, when the total is
 more than the rows shown, a "See all N" button, both answered as the
 clicker's turn. The primary button's value names the first row as the card
-shows it ("Fix the first one: <finding>"), so a click handler that sends the
-value as the turn tells the agent which finding without its reading the
-thread. The closing lines are left out too: "See all N" asks for the
-rest.
+shows it ("Fix the first one: <finding>"); the click runtime sends the
+label, not the value, so the turn is "Fix the first one". The closing
+lines are left out too: "See all N" asks for the rest.
 
 The report is model-written to the format in
 ``agents/platform/governance/inventory_prioritize_sop.md`` (Step 6). A report

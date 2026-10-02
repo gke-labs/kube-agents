@@ -37,6 +37,7 @@ GAP_PARTS_REPEATS = 160_000
 #: seconds while each term was looked up in a list of the restated ones.
 RESTATED_REPEATS = 15_000
 FAST_SECONDS = 5
+RELAY_URL = "http://127.0.0.1:8765"
 
 REPORT = """# GKE Environment Scan
 
@@ -1460,14 +1461,17 @@ class DeliveryFlagTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _run(self, flag, platform="slack", origin=None):
-        env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
+    def _run(self, flag, platform="slack", relay=None):
+        env = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL")}
         if flag is not None:
             env["KAGE_SLACK_UX"] = flag
+        if relay is not None:
+            env["SLACK_RELAY_URL"] = relay
+        origin = {"platform": platform, "chat_id": "C1"} if platform else {}
         buf = io.StringIO()
         with (
             mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(bootstrap_delivery, "_origin_platform", origin or (lambda: platform)),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
             contextlib.redirect_stdout(buf),
         ):
             rc = bootstrap_delivery.main(self.d)
@@ -1488,19 +1492,24 @@ class DeliveryFlagTest(unittest.TestCase):
         # A Slack origin with a chat id, so only the missing relay stops the blocks.
         import slack_blocks_post
 
-        origin = {"platform": "slack", "chat_id": "C1"}
-        with (
-            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
-            mock.patch.object(slack_blocks_post, "post") as poster,
-        ):
+        with mock.patch.object(slack_blocks_post, "post") as poster:
             self.assertEqual(self._run("1"), PRESENTED)
         poster.assert_not_called()
 
     def test_google_chat_is_verbatim_with_the_flag_on(self):
-        self.assertEqual(self._run("1", platform="google_chat"), REPORT)
+        # A relay is set, so only the platform keeps the blocks off a Google Chat origin.
+        import slack_blocks_post
+
+        with mock.patch.object(slack_blocks_post, "post") as poster:
+            self.assertEqual(self._run("1", platform="google_chat", relay=RELAY_URL), REPORT)
+        poster.assert_not_called()
 
     def test_a_missing_origin_is_verbatim_with_the_flag_on(self):
-        self.assertEqual(self._run("1", platform=None), REPORT)
+        import slack_blocks_post
+
+        with mock.patch.object(slack_blocks_post, "post") as poster:
+            self.assertEqual(self._run("1", platform=None, relay=RELAY_URL), REPORT)
+        poster.assert_not_called()
 
     def test_presenter_failure_delivers_verbatim(self):
         boom = mock.patch.object(inventory_presenter, "present", side_effect=ValueError("boom"))
@@ -1524,7 +1533,7 @@ class BlocksDeliveryTest(unittest.TestCase):
 
     def _run(self, post, flag="1", origin=ORIGIN):
         env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
-        env.update({"KAGE_SLACK_UX": flag, "SLACK_RELAY_URL": "http://127.0.0.1:8765"})
+        env.update({"KAGE_SLACK_UX": flag, "SLACK_RELAY_URL": RELAY_URL})
         out, err = io.StringIO(), io.StringIO()
         with (
             mock.patch.dict(os.environ, env, clear=True),

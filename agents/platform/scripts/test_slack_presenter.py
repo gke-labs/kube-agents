@@ -367,8 +367,8 @@ class ButtonsTest(unittest.TestCase):
         self.assertIsNone(sp.LINK_ACTION_ID_PATTERN.search(button["action_id"]))
 
     def test_a_long_choice_posts_only_what_its_button_shows(self):
-        # The click handler posts the value as the user's turn, so a value
-        # longer than the label would send words the user never saw.
+        # A value longer than the label would carry words the user never saw
+        # to any handler that reads it.
         choice = "look at: " + "word " * 40 + "HIDDEN-TAIL"
         actions = [b for b in sp.blocks_report("h", choices=[choice], action_id_prefix="kage") if b["type"] == "actions"]
         (button,) = actions[0]["elements"]

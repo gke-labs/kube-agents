@@ -38,6 +38,8 @@ class PostTest(unittest.TestCase):
         env = patch.dict(os.environ, {sbp.RELAY_ENV: RELAY})
         env.start()
         self.addCleanup(env.stop)
+        # A pod's token file would add an auth header the request assertions do not expect.
+        os.environ.pop("CREDENTIAL_PROXY_TOKEN_FILE", None)
 
     def _post(self, answer, thread_ts=""):
         effect = answer if isinstance(answer, Exception) else None
