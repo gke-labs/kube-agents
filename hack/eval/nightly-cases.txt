@@ -540,10 +540,3 @@
 # names the read-only or refused write. `deployer: noop`, no fixture,
 # `validated: false` until its first observed runs; the 200s default hint.
 ./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
-
-# The observability skill's trace latency analyzer, run to completion through
-# the credential broker's relay and graded on the report (a trace and its
-# slowest span) and on the worker's commands (no access token fetched or
-# pasted). Reads the install's own traces in the eval project; no fleet.
-# `validated: false` until its first observed runs.
-./tasks/observability-trace-latency-brokered/task.yaml

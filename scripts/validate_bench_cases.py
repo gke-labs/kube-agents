@@ -197,6 +197,16 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "observability-trace-latency-brokered": (
+        "#2244: needs the pool host clusters to export traces; 33 of the 35 "
+        "have no managed OpenTelemetry collection scope, so the operator's "
+        "telemetry discovery resolves to None, the agent runs with "
+        "OTEL_SDK_DISABLED=true and Cloud Trace in those projects is empty, "
+        "which the case reports as an empty window and fails on the report "
+        "check (a fixture gap, not a red). The scope was set by hand on "
+        "2026-10-02; the case moves to the nightly once the first leases "
+        "after it show traces landing"
+    ),
     "gitops-drift-noise-filtered-triage": (
         "#911: needs an audit ingress on the eval install -- a drift-audit "
         "topic, a subscription and a detector enabled to pull from it, none of "
