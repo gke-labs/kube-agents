@@ -246,7 +246,7 @@ gcloud storage cp gs://<bucket>/<prefix>/default.tfstate#<generation> \
 
 If the state is gone entirely, import the cluster back before anything else —
 `terraform import 'module.gke_cluster.google_container_cluster.<autopilot|standard>[0]' projects/<project>/locations/<location>/clusters/<cluster_name>`,
-with the provider override the BackupPlan recipe below uses — and then re-run
+with the two overrides the BackupPlan recipe below writes — and then re-run
 `lifecycle.sh apply` against the same tfvars: KMS adoption is automatic, and
 `terraform import` covers the rest. Without that import the apply is refused up
 front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))

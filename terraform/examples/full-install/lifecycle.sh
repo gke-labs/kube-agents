@@ -51,8 +51,9 @@
 #   ./lifecycle.sh adopt-kms
 #
 # `plan` reports what an apply would change and touches nothing — no state lock,
-# no state bucket creation, no adoption imports. Pass -detailed-exitcode to get
-# 0 for "in sync" and 2 for "there are changes".
+# no state bucket creation, no adoption imports — beyond removing the two
+# override files an interrupted import of this script's own left behind. Pass
+# -detailed-exitcode to get 0 for "in sync" and 2 for "there are changes".
 #
 # `plan`, `apply` and `destroy` hide helm_release's `metadata` block, which
 # may contain secrets, from Terraform's output; an `apply` that will ask for
@@ -125,6 +126,12 @@ fi
 # project do not collide. Without the variable nothing here runs and local
 # state behaves exactly as before.
 BACKEND_OVERRIDE_FILE="backend_override.tf"
+
+# The second import-time override, written into the scope resolver module's
+# directory — the path main.tf sources the module from — for the duration of
+# each terraform import; with_override below says why and what it pins.
+readonly SCOPE_RESOLVER_MODULE_DIR="../../modules/kube-agents-scope-resolver"
+readonly SCOPE_OVERRIDE_FILE="$SCOPE_RESOLVER_MODULE_DIR/scope_resolver_lifecycle_override.tf"
 
 # State addresses the guards below read. The cluster has three spellings:
 # one per mode, plus the index-less autopilot address a state predating the
@@ -351,9 +358,8 @@ OVERRIDE_FILE="providers_lifecycle_override.tf"
 # merges *_override.tf per module directory, so the file goes where main.tf
 # sources the module from; neither file needs an init. An override of a block
 # the module no longer defines fails the import loudly, which is what a rename
-# in the module should do here.
-SCOPE_RESOLVER_MODULE_DIR="../../modules/kube-agents-scope-resolver"
-SCOPE_OVERRIDE_FILE="$SCOPE_RESOLVER_MODULE_DIR/scope_resolver_lifecycle_override.tf"
+# in the module should do here. SCOPE_OVERRIDE_FILE, above with the other
+# paths, is where it goes.
 drop_override() { rm -f "$OVERRIDE_FILE" "$SCOPE_OVERRIDE_FILE"; }
 
 with_override() {
@@ -659,6 +665,9 @@ guard_cluster_ownership() {
   warn "If the cluster is somebody else's to install onto, set create_cluster = false."
   warn "If this state created it and lost it, import it back first (the mode's address from ${CLUSTER_ADDRESSES[0]%%.google*}):"
   warn "  terraform import 'module.gke_cluster.google_container_cluster.<autopilot|standard>[0]' projects/$project/locations/$location/clusters/$cluster"
+  warn "with the two override files this script writes for its own imports in place first ($OVERRIDE_FILE and"
+  warn "$SCOPE_OVERRIDE_FILE; README.md's BackupPlan import recipe writes both), or the import is refused"
+  warn "on the helm provider's unknown endpoint and the scope resolver's for_each before it reaches the cluster."
   warn "Through install.sh, run uninstall.sh or clear the state under gs://<bucket>/$(state_prefix)/ and re-run"
   warn "install.sh, which derives create_cluster from the state and adopts the cluster."
   exit 1
@@ -1286,7 +1295,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,68p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

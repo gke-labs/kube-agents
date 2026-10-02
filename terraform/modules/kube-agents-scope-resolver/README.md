@@ -60,6 +60,11 @@ is the scope's exclude list. `members` maps each selector's snapshot name (`shar
 `metricsScopes/<scope>`) to the sorted project IDs it reaches, the shape `kube-agents-iam` takes and
 the one the reconcile's `fleet_scope.json` `containers` array can be read beside.
 
+[`lifecycle.sh`](../../examples/full-install/lifecycle.sh) in the full-install composition writes a
+gitignored override into this directory for the duration of each `terraform import`, pinning
+`data.http.scope_monitored_project` and the `members` output by name; its unit tests fail on a
+rename of either, and the composition's README says why the file exists.
+
 ## Tests
 
 `tests/*.tftest.hcl` plan the module with both providers mocked and every HTTP read overridden, so

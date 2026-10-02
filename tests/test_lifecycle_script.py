@@ -36,6 +36,12 @@ _SCOPE_OVERRIDE = "scope_resolver_lifecycle_override.tf"
 _SCOPE_RESOLVER_SOURCE_RE = re.compile(r'module "scope_resolver" \{\s*source\s*=\s*"([^"]+)"')
 _OVERRIDE_DATA_RE = re.compile(r'^data "(\w+)" "(\w+)"', re.MULTILINE)
 _OVERRIDE_OUTPUT_RE = re.compile(r'^output "(\w+)"', re.MULTILINE)
+# The README's hand-run import recipe writes the scope override itself: the
+# path it writes to, and the heredoc body up to the terminator.
+_README_SCOPE_OVERRIDE_RE = re.compile(
+    r"^\s*cat > (\S+" + re.escape(_SCOPE_OVERRIDE) + r") <<'EOF'\n(.*?)^\s*EOF$",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def _scope_resolver_source():
@@ -1847,6 +1853,28 @@ class ImportOverrideTest(unittest.TestCase):
         for name in outputs:
             self.assertIn(f'output "{name}"', module_text)
             self.assertRegex(text, rf'output "{name}" \{{\s*value\s*=\s*\{{\}}')
+
+    def test_the_readme_recipe_writes_the_scope_override_the_script_writes(self):
+        """The README's BackupPlan import recipe carries its own copy of the
+        override, because lifecycle.sh exposes no import subcommand to borrow.
+        A rename that reaches the script's heredoc has to reach the recipe too,
+        or the next operator who follows it gets "Missing data resource to
+        override" from a document that was correct when written."""
+        _, seen, text, _ = self._run("adopt_kms")
+        self.assertGreater(len(seen), 0)
+        readme = (_FULL_INSTALL / "README.md").read_text()
+        recipes = _README_SCOPE_OVERRIDE_RE.findall(readme)
+        self.assertEqual(len(recipes), 1, "the README writes the scope override once, in the BackupPlan recipe")
+        path, body = recipes[0]
+        self.assertEqual(
+            pathlib.PurePosixPath(path),
+            pathlib.PurePosixPath(_scope_resolver_source()) / _SCOPE_OVERRIDE,
+        )
+        body = "\n".join(line.strip() for line in body.splitlines())
+        self.assertEqual(_OVERRIDE_DATA_RE.findall(body), _OVERRIDE_DATA_RE.findall(text))
+        self.assertEqual(_OVERRIDE_OUTPUT_RE.findall(body), _OVERRIDE_OUTPUT_RE.findall(text))
+        self.assertIn("for_each = toset([])", body)
+        self.assertIn("value = {}", body)
 
 
 if __name__ == "__main__":
