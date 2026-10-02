@@ -1,7 +1,9 @@
 // Package hermesbridge is the stand-in executor for tasks addressed to the
-// platform profile: it consumes a2a.tasks.{profile}.*.in, runs one
-// `hermes -p {profile} chat -Q -q <prompt>` per task, and publishes the payload
-// spec's lifecycle events with the output as the result artifact. It is
+// platform profile: it consumes a2a.tasks.{profile}.*.in, answers each task
+// as a turn on the pod's Hermes API server (one session per contextId) or,
+// on the cli executor, by one `hermes -p {profile} chat -Q -q <prompt>` per
+// task, and publishes the payload spec's lifecycle events with the answer as
+// the result artifact. It is
 // scaffolding for the Hermes-first world - when the stage-3 dispatcher and
 // the W4 worker adapter land, the bridge retires. Design:
 // a2a/docs/hermes-bridge.md.
@@ -92,11 +94,37 @@ type Config struct {
 	NATSURL string
 	// Profile is the addressee token the bridge executes for ("platform").
 	Profile string
-	// Command is the invocation prefix; the task prompt is appended as the
-	// final argument. Default: ["hermes", "-p", <profile>, "chat", "-Q", "-q"].
+	// Executor is how a task runs: ExecutorAPI posts it as a turn in the
+	// conversation's Hermes session through the pod's API server;
+	// ExecutorCLI spawns Command per task (api.go has the why). The zero
+	// value is ExecutorCLI, so a bridge under test calls no server it did
+	// not ask for; the daemon defaults to ExecutorAPI.
+	Executor string
+	// APIURL, APIKey and APIModel are the API executor's endpoint, bearer
+	// token (the pod's API_SERVER_KEY, which the server needs before it
+	// honours the session headers) and model name. URL and model default
+	// to DefaultAPIURL and DefaultAPIModel; the key has no default.
+	APIURL   string
+	APIKey   string
+	APIModel string
+	// APIConnectRetry is how long a refused connection to the API server is
+	// retried before the task ends hermes-api-unreachable; zero is
+	// DefaultAPIConnectRetry.
+	APIConnectRetry time.Duration
+	// ActivitySecret signs the API executor's hook deliveries: the pod's
+	// managed config carries one hooks.outbound entry for the whole
+	// gateway with secret_env A2A_ACTIVITY_SECRET, and the door attributes
+	// a delivery to a task by the session id in its payload. Empty leaves
+	// the API executor's tasks without a trace (the CLI executor's children
+	// carry their own per-task key either way).
+	ActivitySecret string
+	// Command is the CLI executor's invocation prefix; the task prompt is
+	// appended as the final argument. Default: ["hermes", "-p", <profile>,
+	// "chat", "-Q", "-q"].
 	Command []string
-	// Concurrency caps simultaneous hermes subprocesses (default 2, the
-	// platform profile's concurrency in the profiles spec).
+	// Concurrency caps simultaneous tasks, hermes subprocesses or API
+	// requests (default 2, the platform profile's concurrency in the
+	// profiles spec).
 	Concurrency int
 	// TaskDeadline is the per-invocation wall-clock ceiling (default 7200s,
 	// matching the platform profile's activeDeadlineSeconds).
@@ -147,6 +175,18 @@ func (c *Config) defaults() {
 		// box around the answer - stdout is the response.
 		c.Command = []string{"hermes", "-p", c.Profile, "chat", "-Q", "-q"}
 	}
+	if c.Executor == "" {
+		c.Executor = ExecutorCLI
+	}
+	if c.APIURL == "" {
+		c.APIURL = DefaultAPIURL
+	}
+	if c.APIConnectRetry <= 0 {
+		c.APIConnectRetry = DefaultAPIConnectRetry
+	}
+	if c.APIModel == "" {
+		c.APIModel = DefaultAPIModel
+	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = 2
 	}
@@ -193,6 +233,9 @@ type taskRun struct {
 	state      runState
 	proc       *exec.Cmd
 	killTimers []*time.Timer
+	// cancelReq ends the API executor's request (api.go); nil outside one.
+	// Under mu like proc, which it is the counterpart of.
+	cancelReq context.CancelFunc
 
 	canceled    atomic.Bool
 	deadlineHit atomic.Bool
@@ -224,6 +267,9 @@ type Bridge struct {
 	queue chan *taskRun
 	wg    sync.WaitGroup
 
+	// turns serializes the API executor's turns per Hermes session (api.go).
+	turns sessionTurns
+
 	// closing marks shutdown, so a worker whose subprocess died to the
 	// shutdown SIGKILL reports bridge-shutdown, not a bogus exit code.
 	closing atomic.Bool
@@ -254,6 +300,8 @@ type Bridge struct {
 	// racing the timer.
 	holdReplaySlot func(release func())
 
+	// apiClient is the API executor's HTTP client (api.go).
+	apiClient *http.Client
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server
@@ -268,6 +316,15 @@ type Bridge struct {
 // New connects and sweeps but does not consume yet; Run does.
 func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	cfg.defaults()
+	switch cfg.Executor {
+	case ExecutorAPI:
+		if err := apiExecutorValid(&cfg); err != nil {
+			return nil, err
+		}
+	case ExecutorCLI:
+	default:
+		return nil, fmt.Errorf("unknown executor %q: %q or %q", cfg.Executor, ExecutorAPI, ExecutorCLI)
+	}
 	b := &Bridge{
 		cfg: cfg,
 		from: lib.Party{
@@ -278,6 +335,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		tasks:       make(map[string]*taskRun),
 		queue:       make(chan *taskRun, taskQueueCapacity),
 		replaySlots: make(chan struct{}, cfg.Concurrency),
+		apiClient:   newAPIClient(),
 	}
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
@@ -343,7 +401,19 @@ func (b *Bridge) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile)
+	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
+	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && b.cfg.ActivitySecret == "" {
+		// The door is open but nothing can be attributed through it: the
+		// pod's hook signs with a secret this bridge was not given.
+		b.cfg.Logger.Warn("activity door open with no ActivitySecret: API tasks carry no tool trace",
+			"env", ActivitySecretEnv)
+	}
+	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && !activityHookReaches(b.activityLn.Addr()) {
+		// The pod's hook posts to one address, and the operator renders it
+		// only for a door there; a door elsewhere hears nothing.
+		b.cfg.Logger.Warn("activity door not where the pod-wide hook posts: API tasks carry no tool trace",
+			"listen", b.activityLn.Addr().String(), "hook", DefaultActivityListen)
+	}
 	<-ctx.Done()
 	b.closing.Store(true)
 	sub.Stop()
@@ -370,6 +440,9 @@ func (b *Bridge) shutdownTasks() {
 		r.mu.Lock()
 		if r.state == stateRunning && r.proc != nil && r.proc.Process != nil {
 			_ = syscall.Kill(-r.proc.Process.Pid, syscall.SIGKILL)
+		}
+		if r.state == stateRunning && r.cancelReq != nil {
+			r.cancelReq()
 		}
 		r.mu.Unlock()
 		b.finalize(r, lib.StateFailed, shutdownReason, nil)
@@ -479,6 +552,9 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {
 		b.killGroup(run, run.proc.Process.Pid)
 	}
+	if run.state == stateRunning && run.cancelReq != nil {
+		run.cancelReq()
+	}
 	run.mu.Unlock()
 	if pending {
 		// Not yet spawned: terminal now; the worker skips done runs.
@@ -552,10 +628,12 @@ func (b *Bridge) refuseSteer(ctx context.Context, run *taskRun, steer *lib.Envel
 		return
 	}
 	state := lib.StateWorking
-	if run.state == statePending {
+	if run.state == statePending || (b.cfg.Executor == ExecutorAPI && run.act.Load() == nil) {
+		// Queued, or on the API executor still waiting for its session's
+		// turn: working has not been published.
 		state = lib.StateSubmitted
 	}
-	msg := "steering received but not absorbed: the Hermes CLI runs one-shot and cannot " +
+	msg := "steering received but not absorbed: the bridge sends a task's instruction to Hermes once and cannot " +
 		"accept mid-run input. The task continues on its original instruction; cancel if that is wrong."
 	if err := b.publishStatusMessage(ctx, run, state, false, msg); err != nil {
 		b.cfg.Logger.Error("steer refusal publish failed", "task", steer.TaskID, "err", err)
@@ -745,6 +823,10 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
+	if b.cfg.Executor == ExecutorAPI {
+		b.runTaskAPI(ctx, run)
+		return
+	}
 	taskID := run.origin.TaskID
 	prompt, ok := promptFromMessage(run.origin.Payload)
 	if !ok {

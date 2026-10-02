@@ -44,6 +44,7 @@ func TestRunMapsUsageErrorToExitUsage(t *testing.T) {
 func TestRunMapsDialFailureToExitFailure(t *testing.T) {
 	t.Setenv("NATS_URL", unreachableNATSURL)
 	t.Setenv("NATS_USER", "")
+	t.Setenv(apiServerKeyEnv, "loopback-key")
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	err := realMain(context.Background(), log)
 	if !errors.Is(err, nats.ErrNoServers) {
@@ -54,6 +55,51 @@ func TestRunMapsDialFailureToExitFailure(t *testing.T) {
 	}
 	if got := run(); got != exitFailure {
 		t.Errorf("run() = %d, want %d", got, exitFailure)
+	}
+}
+
+// The API executor needs the pod's key before the server honours the session
+// headers. Named explicitly with no key, it fails at start, before the bus is
+// dialled, rather than once per task. Left unset with no key, the daemon runs
+// the subprocess executor instead, so a sidecar declared before the API
+// executor existed keeps working on an image bump.
+func TestRunAPIExecutorWithoutKey(t *testing.T) {
+	t.Setenv("NATS_URL", unreachableNATSURL)
+	t.Setenv("NATS_USER", "")
+	t.Setenv(apiServerKeyEnv, "")
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	t.Setenv(executorEnv, "api")
+	err := realMain(context.Background(), log)
+	if err == nil || errors.Is(err, nats.ErrNoServers) || !strings.Contains(err.Error(), "APIKey") {
+		t.Fatalf("realMain with %s=api and no %s returned %v, want the missing-key refusal before any dial", executorEnv, apiServerKeyEnv, err)
+	}
+	for _, executor := range []string{"cli", ""} {
+		t.Setenv(executorEnv, executor)
+		if err := realMain(context.Background(), log); !errors.Is(err, nats.ErrNoServers) {
+			t.Fatalf("realMain with %s=%q and no key returned %v, want the dial failure", executorEnv, executor, err)
+		}
+	}
+}
+
+func TestBridgeExecutorDefault(t *testing.T) {
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+	for _, tc := range []struct{ executor, key, want string }{
+		{"", "loopback-key", "api"},
+		{"", "", "cli"},
+		{"", "  ", "cli"},
+		{"cli", "loopback-key", "cli"},
+		{"api", "", "api"},
+	} {
+		t.Setenv(executorEnv, tc.executor)
+		t.Setenv(apiServerKeyEnv, tc.key)
+		logs.Reset()
+		if got := bridgeExecutor(log); got != tc.want {
+			t.Errorf("bridgeExecutor(%s=%q, key=%q) = %q, want %q", executorEnv, tc.executor, tc.key, got, tc.want)
+		}
+		if warned := strings.Contains(logs.String(), `"level":"WARN"`); warned != (tc.executor == "" && tc.want == "cli") {
+			t.Errorf("bridgeExecutor(%s=%q, key=%q) warned=%v; want a warning only on the keyless fallback", executorEnv, tc.executor, tc.key, warned)
+		}
 	}
 }
 
