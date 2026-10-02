@@ -26,6 +26,7 @@ import contextlib
 import os
 import pathlib
 import posixpath
+import re
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,15 @@ ABSENT_FILE = "test_absent.py"
 #: The old way to narrow a run, which the per-file sweep must refuse rather
 #: than accept and ignore.
 DIRS_OVERRIDE = "PYTHON_TEST_DIRS=tests/"
+#: The refusal's own example of narrowing a run, as make prints it: the
+#: variable and a double-quoted shell expression.
+EXAMPLE_PATTERN = re.compile(r'PYTHON_TEST_FILES="[^"]*"')
+#: Where the example's glob looks, and two files for it to match. The shape
+#: that broke needs the glob to expand to more than one path to show itself.
+EXAMPLE_DIR = "tests"
+EXAMPLE_FILES = ("test_a.py", "test_b.py")
+#: Expands a shell assignment and prints the value it assigned.
+EXPAND_ASSIGNMENT = 'eval "$1" && printf %s "$PYTHON_TEST_FILES"'
 #: The two fixture files `fixture_files` writes: one test that passes and one
 #: that fails, side by side in one directory, so a case can show that the
 #: failing one does not take its sibling down with it.
@@ -148,18 +158,30 @@ sweep-lists:
 """
 
 
-def _run_make(args):
-    return run_make(args, timeout=SWEEP_TIMEOUT_SECONDS)
+def _run_make(args, cwd=None):
+    return run_make(args, timeout=SWEEP_TIMEOUT_SECONDS, cwd=cwd)
 
 
-def _with_wrapper(makefile, target, args):
+def _with_wrapper(makefile, target, args, cwd=None):
+    """Run `target` from a wrapper makefile that includes the repository's.
+
+    From another `cwd`, both that include and the Makefile's own `include
+    tags.env` are resolved relative to the working directory, so `-I` points
+    them at the repository.
+    """
     with tempfile.NamedTemporaryFile("w", suffix=".mk", delete=False) as wrapper:
         wrapper.write(makefile)
         wrapper_path = wrapper.name
     try:
-        return _run_make(["-f", wrapper_path, target, *args])
+        return _run_make(["-I", str(REPO_ROOT), "-f", wrapper_path, target, *args], cwd=cwd)
     finally:
         os.unlink(wrapper_path)
+
+
+def _failed(stdout):
+    """What the probe's marker line says `$failed` held; None if it never printed."""
+    marker = [ln for ln in stdout.splitlines() if ln.startswith(FAILED_MARKER)]
+    return marker[-1][len(FAILED_MARKER) :].strip("[]") if marker else None
 
 
 def sweep(files, jobs, makefile=PROBE_MAKEFILE):
@@ -169,9 +191,23 @@ def sweep(files, jobs, makefile=PROBE_MAKEFILE):
         "sweep-probe",
         [f"PYTHON_TEST_FILES={' '.join(files)}", f"PYTHON_TEST_JOBS={jobs}"],
     )
-    marker = [ln for ln in done.stdout.splitlines() if ln.startswith(FAILED_MARKER)]
-    failed = marker[-1][len(FAILED_MARKER) :].strip("[]") if marker else None
-    return done, failed
+    return done, _failed(done.stdout)
+
+
+def _refuse_dirs_override(green):
+    """`make test-python` with the old override typed in, over one green file.
+
+    One green file so that, were the guard missing, the run would end in a
+    second on a passing sweep rather than after a run of the whole tree.
+    """
+    return _run_make(
+        [
+            "test-python",
+            DIRS_OVERRIDE,
+            f"PYTHON_TEST_FILES={green}",
+            "PYTHON_TEST_IMPORTS=",
+        ]
+    )
 
 
 def _block(stdout, path):
@@ -268,21 +304,48 @@ class DerivedDirectoriesTest(unittest.TestCase):
         # whole list while the sweep, which reads only PYTHON_TEST_FILES, ran
         # every file: the caller asked for one directory and paid for the
         # tree. Make refuses it at parse time, before any target runs, naming
-        # the variable that does narrow a run. PYTHON_TEST_FILES is set to one
-        # green file so that, were the guard missing, this would fail in a
-        # second on a passing sweep rather than after a run of the whole tree.
+        # the variable that does narrow a run.
         with fixture_files() as (green, _):
-            done = _run_make(
-                [
-                    "test-python",
-                    DIRS_OVERRIDE,
-                    f"PYTHON_TEST_FILES={green}",
-                    "PYTHON_TEST_IMPORTS=",
-                ]
-            )
+            done = _refuse_dirs_override(green)
         self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
         self.assertIn("PYTHON_TEST_FILES", done.stderr)
         self.assertNotIn("==> ", done.stdout)
+
+    def test_the_refusals_example_runs_when_pasted_into_make(self):
+        # The refusal is read by someone about to type the next command, and
+        # its example has to survive being pasted into it. `$(ls ...)` did
+        # not: with two or more matches and a pipe for stdout, ls prints one
+        # path per line, the variable arrives holding newlines, and make ends a
+        # recipe command at each one -- the first line of test-python became an
+        # unterminated `if [ -z "tests/test_a.py` and the target stopped on a
+        # shell syntax error that named neither variable. So the example is
+        # read back out of the refusal, expanded by a shell in a directory
+        # where its glob matches two files, and handed to the macro as the one
+        # argument the pasted command line would hand it.
+        with fixture_files() as (green, _):
+            example = EXAMPLE_PATTERN.search(_refuse_dirs_override(green).stderr)
+        self.assertIsNotNone(example, "the refusal no longer shows an example")
+        with tempfile.TemporaryDirectory() as out:
+            os.mkdir(os.path.join(out, EXAMPLE_DIR))
+            for name in EXAMPLE_FILES:
+                pathlib.Path(out, EXAMPLE_DIR, name).write_text(GREEN_SOURCE)
+            value = subprocess.run(
+                ["sh", "-c", EXPAND_ASSIGNMENT, "_", example.group(0)],
+                cwd=out,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            done = _with_wrapper(
+                PROBE_MAKEFILE,
+                "sweep-probe",
+                [f"PYTHON_TEST_FILES={value}", f"PYTHON_TEST_JOBS={max(JOB_COUNTS)}"],
+                cwd=out,
+            )
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertEqual("", _failed(done.stdout), done.stdout)
+        for name in EXAMPLE_FILES:
+            self.assertIn(f"==> {posixpath.join(EXAMPLE_DIR, name)}", done.stdout)
 
 
 class TestPythonExitStatusTest(unittest.TestCase):

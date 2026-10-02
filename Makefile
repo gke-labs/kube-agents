@@ -220,9 +220,14 @@ PYTHON_TEST_DIRS := $(sort $(dir $(PYTHON_TEST_FILES)))
 # both targets ran the full tree: the caller asks for one directory and
 # silently pays for every file. Refused instead, naming the variable that does
 # narrow a run. `file` is the origin the assignment above gives it; a command
-# line, an `override`, or `make -e` reads as anything else.
+# line, an `override`, or `make -e` reads as anything else. The example says
+# `echo`, not `ls`: pasted into the next make, `ls` with two or more matches
+# and a pipe for stdout prints one path per line, the variable arrives holding
+# newlines, and make ends a recipe command at each one -- the first line of
+# test-python became an unterminated `if [ -z "tests/test_a.py` and the target
+# stopped on a shell syntax error that named neither variable.
 ifneq ($(origin PYTHON_TEST_DIRS),file)
-$(error PYTHON_TEST_DIRS is derived from PYTHON_TEST_FILES and the sweep does not read it; narrow a run with PYTHON_TEST_FILES instead, for example PYTHON_TEST_FILES="$$(ls tests/test_*.py)")
+$(error PYTHON_TEST_DIRS is derived from PYTHON_TEST_FILES and the sweep does not read it; narrow a run with PYTHON_TEST_FILES instead, for example PYTHON_TEST_FILES="$$(echo tests/test_*.py)")
 endif
 
 # What both callers of the sweep below -- test-python and coverage -- export as
