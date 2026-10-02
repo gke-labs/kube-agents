@@ -429,8 +429,23 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
-func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, retErr error) {
+func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
+
+	// Optimistic concurrency conflicts (409 Conflict) on PlatformAgent updates
+	// (spec, finalizer, or status updates) occur when owned-object watch events
+	// race ahead of the status watch stream or when concurrent reconcile passes
+	// update the CR. Instead of letting controller-runtime log an unhandled
+	// Reconciler error and apply exponential backoff, requeue immediately so
+	// the informer cache catches up and the next pass reconciles against the
+	// fresh ResourceVersion (#2281).
+	defer func() {
+		if errors.IsConflict(retErr) {
+			log.Info("PlatformAgent update conflict; requeuing cleanly", "name", req.Name, "namespace", req.Namespace)
+			result = ctrl.Result{Requeue: true}
+			retErr = nil
+		}
+	}()
 
 	instance := &agentv1alpha1.PlatformAgent{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
@@ -540,7 +555,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				// The reconcile is already failing and will requeue. Losing
 				// this write is not what to report about that pass, but it is
 				// not nothing either: the condition is a pass behind.
-				log.Error(err, "could not write BusCredentialsReady")
+				if errors.IsConflict(err) {
+					log.V(1).Info("Conflict writing BusCredentialsReady; reconcile will requeue", "error", err)
+				} else {
+					log.Error(err, "could not write BusCredentialsReady")
+				}
 			}
 		}()
 	}
