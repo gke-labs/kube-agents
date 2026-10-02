@@ -306,6 +306,15 @@ class RuntimeTest(unittest.TestCase):
         with mock.patch.object(runtime, "_load_block_kit", return_value=empty):
             self.assertIs(self.wrap(adapter), adapter)
 
+    def test_a_fold_with_a_block_slack_has_not_kept_in_one_keeps_the_reply(self):
+        adapter = _Adapter()
+        with_table = SimpleNamespace(
+            render_blocks=lambda md, mrkdwn_fn=None: [*_render_blocks(md, mrkdwn_fn), {"type": "table", "rows": []}],
+            sanitize_blocks=lambda b: b,
+        )
+        with mock.patch.object(runtime, "_load_block_kit", return_value=with_table):
+            self.assertIs(self.wrap(adapter), adapter)
+
     def test_a_click_sends_apply_option_as_the_clicker(self):
         adapter = _Adapter()
         self.deliver(adapter)

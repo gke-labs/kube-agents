@@ -31,7 +31,8 @@ thread that already has a row gets the reply upstream posts. That row is a
 best-effort write after the send, so this process also remembers the alerts
 it edited and never edits one twice; only a failed write followed by a
 gateway restart leaves a thread open to a second edit. A report with no "What's wrong" sentence, an
-option named but not parsed, a fold ``block_kit`` cannot render, or any failure
+option named but not parsed, a fold ``block_kit`` cannot render or that would hold
+a block outside ``FOLD_CHILD_TYPES``, or any failure
 to edit, also falls back to that reply.
 """
 
@@ -84,6 +85,11 @@ BUTTON_URL_MAX = 3000
 #: A report longer than this keeps the threaded reply; triage reports are a
 #: few hundred words, and Slack's limit on a container's content is not published.
 FOLD_TEXT_MAX = 12000
+#: The block types Slack has been seen to keep inside a collapsible
+#: ``container`` (read back from ``conversations.replies`` on a live alert).
+#: The plugin also renders ``table`` and ``divider``; a fold holding one keeps
+#: the threaded reply until a live run shows Slack accepts it there.
+FOLD_CHILD_TYPES = frozenset({"header", "section", "rich_text"})
 
 HEADING = re.compile(r"^ {0,3}#{1,6} +(.+?)[ #]*$")
 WHATS_WRONG = re.compile(r"what(?:['’]s| is) wrong", re.IGNORECASE)
@@ -233,7 +239,10 @@ def _load_block_kit() -> Any:
 def render_fold(report: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     """``report`` as the blocks the adapter's own send would render, or None if it cannot."""
     block_kit = _load_block_kit()
-    return block_kit.sanitize_blocks(block_kit.render_blocks(report, mrkdwn_fn=mrkdwn_fn))
+    blocks = block_kit.sanitize_blocks(block_kit.render_blocks(report, mrkdwn_fn=mrkdwn_fn))
+    if not blocks or any(block.get("type") not in FOLD_CHILD_TYPES for block in blocks):
+        return None
+    return blocks
 
 
 def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
