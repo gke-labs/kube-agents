@@ -841,8 +841,10 @@ What `finish` does with it:
 - **Anything less is no search, and the postures are withheld.** A union of the worker's list and
   `start`'s that misses a repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
   declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
-  shares its slug with the `min == max` posture, and adds one `coverage_gaps` sentence naming each
-  withheld entry and the repositories not searched. The faults publish; `declared[]` entries publish.
+  shares its slug with the `min == max` posture and nothing on this side tells them apart, and adds
+  one `coverage_gaps` sentence naming each withheld entry and the repositories not searched. The
+  faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
+  object tells it apart; `declared[]` entries publish.
   `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
   pull request is retired, and the withheld ids enter no delta block and no remediation pull
   request. The ledger names the withheld postures under _Declared intent not searched_ below the
