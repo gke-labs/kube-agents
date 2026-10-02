@@ -1010,8 +1010,9 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 1 {
-		t.Fatalf("expected exactly one ingress rule, got %d: %+v", len(np.Spec.Ingress), np.Spec.Ingress)
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
+			len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
 	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 4222 || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
@@ -1052,6 +1053,18 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 			t.Errorf("peer %d = %+v, want %v", i, peer.PodSelector, want)
 		}
 	}
+
+	// 9222 has exactly one pod-network peer, the console server. Anything
+	// wider makes the websocket an in-cluster door, which it is not.
+	ws := np.Spec.Ingress[1]
+	if len(ws.Ports) != 1 || ws.Ports[0].Port.IntVal != 9222 || *ws.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("second ingress rule is not exactly TCP 9222: %+v", ws.Ports)
+	}
+	if len(ws.From) != 1 || ws.From[0].IPBlock != nil || ws.From[0].NamespaceSelector != nil ||
+		ws.From[0].PodSelector == nil ||
+		!reflect.DeepEqual(ws.From[0].PodSelector.MatchLabels, map[string]string{"app": "test-agent-a2a-console"}) {
+		t.Errorf("9222 peers = %+v, want exactly the same-namespace pod selector app=test-agent-a2a-console", ws.From)
+	}
 }
 
 // The bus fence rides the mode switch exactly like the rest of the next
@@ -1075,6 +1088,7 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 		"gateway": {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
 		"worker":  {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
 		"callout": {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
+		"console": {a2aConsoleImageEnvVar, a2aConsoleImage, "a2a-console"},
 	}
 	for label, r := range resolvers {
 		t.Run(label, func(t *testing.T) {
@@ -1138,7 +1152,7 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 // TestNoPublicRegistryWhenMirrored states for the agent Deployment.
 func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	const mirror = "mirror.corp.internal:5000/kube-agents"
-	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, operatorImageEnvVar} {
+	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, a2aConsoleImageEnvVar, operatorImageEnvVar} {
 		t.Setenv(v, "")
 	}
 	t.Setenv(platformAgentImageEnvVar, mirror+"/platform-agent:0.3.0")
@@ -1159,6 +1173,10 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
+	}
+	console := buildA2AConsoleDeployment(agent).Spec.Template.Spec.Containers[0]
+	if console.Image != mirror+"/a2a-console:0.3.0" {
+		t.Errorf("console image %q does not follow the agent image's mirror", console.Image)
 	}
 }
 
@@ -1427,15 +1445,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 25 {
-		t.Fatalf("default quota = %d, want 25 (cap 10 + headroom 15)", pods.Value())
+	if pods.Value() != 26 {
+		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 17 {
-		t.Fatalf("tuned quota = %d, want 17 (cap 2 + headroom 15)", pods.Value())
+	if pods.Value() != 18 {
+		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
 	}
 }
 
@@ -1560,6 +1578,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
+	console := buildA2AConsoleDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1570,6 +1589,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
 		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
 		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
+		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1639,6 +1659,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
 	callout := buildA2ACalloutDeployment(agent)
+	console := buildA2AConsoleDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1685,6 +1706,13 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// ends it would not announce itself. The callout writes nothing, so
 		// traversable is enough.
 		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// Dockerfile.console ends on the same distroless static nonroot base
+		// as the gateway and the callout: WorkingDir /home/nonroot, User
+		// nonroot, and this pod imposes UID 1000. The server opens its static
+		// dir and credential file by absolute path and writes nothing, so
+		// traversable is enough.
+		{render: "console", builder: "buildA2AConsoleDeployment", container: "console", spec: console.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -1974,12 +2002,12 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
-// early exit. The exit reads seven sentinels and returns when all are absent,
+// early exit. The exit reads eight sentinels and returns when all are absent,
 // which is only sound while nothing it deletes can outlive them: the
 // StatefulSet is deleted last, the gateway Deployment first, the callout
 // keys and config Secrets are the deletable objects the render creates first,
 // the two fences are what the guardrail path writes on a refusal, and the
-// inject fence is what a hand-deleted pair leaves of them.
+// inject and console fences are what a hand-deleted pair leaves of them.
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere holds that soundness
 // one object at a time; this one holds it across a pass that dies partway, and
 // TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall across one that
@@ -2519,11 +2547,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsEightReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2547,21 +2575,22 @@ func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Seven sentinel Gets and nothing else: no per-object walk, and in
+	// Eight sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
 	// The literal moved 3 -> 4 when the callout keys Secret joined the
-	// sentinels, 4 -> 6 when the two fences did (#2197), and 6 -> 7 when the
+	// sentinels, 4 -> 6 when the two fences did (#2197), 6 -> 7 when the
 	// inject door's fence did, for the hand-deleted pair that leaves it
-	// standing alone; the fences are Owns kinds, so those three reads come
-	// from the cache and only the two Secrets are uncached. Raising it is a
+	// standing alone, and 7 -> 8 when the console fence did, for the same
+	// reason; the fences are Owns kinds, so those four reads come from the
+	// cache and only the two Secrets are uncached. Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 7 {
-		t.Errorf("Gets = %d, want 7 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 8 {
+		t.Errorf("Gets = %d, want 8 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -2574,10 +2603,10 @@ func TestCleanupA2ACostsSevenReadsWhenThereIsNothingToClean(t *testing.T) {
 // TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
 // half of the optimisation the test above prices.
 //
-// cleanupA2A answers "is there anything to tear down?" from seven objects: the
-// NATS StatefulSet, the gateway Deployment, the NATS, session and inject
-// fences, and the callout keys and NATS config Secrets. That is sound only
-// while every render that leaves residue leaves at least one of the seven, and
+// cleanupA2A answers "is there anything to tear down?" from eight objects: the
+// NATS StatefulSet, the gateway Deployment, the NATS, session, inject and
+// console fences, and the callout keys and NATS config Secrets. That is sound
+// only while every render that leaves residue leaves at least one of the eight, and
 // the case that breaks it is not a full render -- it is a render that died
 // partway. Miss it and an A2A object stays alive on a today install, which is
 // the darkness property.
@@ -3727,6 +3756,7 @@ func TestARefusalDoesNotSuspendTheA2AFences(t *testing.T) {
 			for _, fence := range []types.NamespacedName{
 				{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
 				{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
+				{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace},
 			} {
 				err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{})
 				if !tc.expected {
@@ -3926,6 +3956,41 @@ func TestARefusedFirstReconcileDropsTheA2AFencesOnTheFlipToToday(t *testing.T) {
 // require the inject fence gone and the namespace clean.
 func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	// The console fence is deleted with the pair so the inject fence stands
+	// alone; TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip is the
+	// same hand without the inject flag.
+	handDeletedFenceFlip(t, true,
+		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+			return types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
+		},
+		func(agent *agentv1alpha1.PlatformAgent) []types.NamespacedName {
+			return []types.NamespacedName{{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}
+		})
+}
+
+// TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip is the hand above on
+// an install whose operator runs without the inject flag. The console fence is
+// the third fence reconcileA2ANetworkFences writes, so deleting the NATS and
+// session fences leaves it alone, and only cleanupA2A's early exit listing it
+// gets the today walk to remove it.
+func TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip(t *testing.T) {
+	handDeletedFenceFlip(t, false,
+		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+			return types.NamespacedName{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}
+		}, nil)
+}
+
+// handDeletedFenceFlip refuses a next CR, deletes the NATS and session fences
+// (and alsoDelete) through the client with no reconcile in between, flips the
+// CR to today, and requires the sole fence left standing gone and the
+// namespace clean.
+func handDeletedFenceFlip(t *testing.T, injectOn bool,
+	soleFence func(*agentv1alpha1.PlatformAgent) types.NamespacedName,
+	alsoDelete func(*agentv1alpha1.PlatformAgent) []types.NamespacedName) {
+	t.Helper()
+	if injectOn {
+		t.Setenv(a2aInjectBackendEnvVar, "true")
+	}
 	scheme := setupScheme()
 	agent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
 		a.Spec.Mode = ptr.To(string(ModeNext))
@@ -3969,8 +4034,13 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 		{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace},
 		{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace},
 	}
-	inject := types.NamespacedName{Name: a2aInjectName(agent), Namespace: agent.Namespace}
-	for _, fence := range append(append([]types.NamespacedName{}, pair...), inject) {
+	sole := soleFence(agent)
+	var extra []types.NamespacedName
+	if alsoDelete != nil {
+		extra = alsoDelete(agent)
+	}
+	handDeleted := append(append([]types.NamespacedName{}, pair...), extra...)
+	for _, fence := range append(append([]types.NamespacedName{}, handDeleted...), sole) {
 		if err := cl.Get(ctx, fence, &networkingv1.NetworkPolicy{}); err != nil {
 			t.Fatalf("%s was not rendered on the refusal, so the hand has nothing to delete: %v", fence.Name, err)
 		}
@@ -3979,7 +4049,7 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 	// The hand. No Reconcile between this and the flip: that is the window
 	// the finding names, and running one here would re-apply the pair and
 	// turn this into the door row of the test above.
-	for _, fence := range pair {
+	for _, fence := range handDeleted {
 		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: fence.Name, Namespace: fence.Namespace},
 		}); err != nil {
@@ -3987,8 +4057,8 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 		}
 	}
 	if n := countA2ALabelled(ctx, t, cl); n != 1 {
-		t.Fatalf("%d A2A-labelled objects remain after the hand-delete, want 1 (the inject fence alone); "+
-			"this is not the shape the test names", n)
+		t.Fatalf("%d A2A-labelled objects remain after the hand-delete, want 1 (%s alone); "+
+			"this is not the shape the test names", n, sole.Name)
 	}
 
 	fresh := &agentv1alpha1.PlatformAgent{}
@@ -4009,9 +4079,9 @@ func TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip(t *testing.T) {
 		t.Fatalf("the flipped CR is still refused (%s); cleanupA2A never ran and this proves nothing", reason)
 	}
 
-	if err := cl.Get(ctx, inject, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
+	if err := cl.Get(ctx, sole, &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {
 		t.Errorf("%s survived the flip to today (err=%v): with the pair deleted by hand it was the only "+
-			"A2A object standing, and cleanupA2A's early exit does not key on it", inject.Name, err)
+			"A2A object standing, and cleanupA2A's early exit does not key on it", sole.Name, err)
 	}
 	var leftovers []string
 	sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
@@ -5280,6 +5350,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
 		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
+		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 	} {
 		for _, ref := range a2aPodSpecEnvSecretRefs(spec) {
 			if ref.secret == credsSecret && (ref.key == a2aSysPasswordKey || ref.key == "*") {

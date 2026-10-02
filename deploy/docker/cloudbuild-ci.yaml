@@ -1,6 +1,6 @@
 # CI-only build of the four core first-party images (platform-agent,
 # credential-proxy, agent-sandbox, k8s-operator) in a single Cloud Build, plus,
-# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the three A2A images of
+# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the four A2A images of
 # the next stack and the Hermes bridge sidecar (the `a2a` and `a2a-bridge`
 # steps at the end, no-ops otherwise).
 #
@@ -166,8 +166,8 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
-  # The next stack's three first-party images (a2a/Dockerfile.gateway,
-  # .authcallout, .worker), built only when hack/ci-deploy.sh runs under
+  # The next stack's four first-party images (a2a/Dockerfile.gateway,
+  # .authcallout, .worker, .console), built only when hack/ci-deploy.sh runs under
   # EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
@@ -176,8 +176,8 @@ steps:
   # overrides; without them the operator would derive the same references
   # from its own image, which is this build's, so the overrides keep the
   # deploy's inputs explicit rather than change them. Context is the a2a/ module root, as each
-  # Dockerfile's header says. One step rather than three: they share the Go
-  # module download layer, which the daemon serves to the second and third.
+  # Dockerfile's header says. One step rather than four: they share the Go
+  # module download layer, which the daemon serves to the ones after the first.
   # Nothing here depends on the platform image, so the step starts at once,
   # like sandbox and operator; the bridge, which does, is the step after.
   - id: a2a
@@ -201,6 +201,7 @@ steps:
         build_and_push gateway "$_A2A_GATEWAY_URI"
         build_and_push authcallout "$_A2A_CALLOUT_URI"
         build_and_push worker "$_A2A_WORKER_URI"
+        build_and_push console "$_A2A_CONSOLE_URI"
 
   # The Hermes bridge sidecar (a2a/Dockerfile.hermes-bridge), under the same
   # flag and the same no-op rule. It is FROM the platform-agent image of THIS
@@ -210,7 +211,7 @@ steps:
   # the inspect below, which fails the build if that tag is not in this daemon
   # rather than letting the builder resolve it from the registry, where the
   # same tag from an earlier run of the same commit could stand in. A step of
-  # its own rather than a tail on the a2a step, so the three images above are
+  # its own rather than a tail on the a2a step, so the four images above are
   # not held behind the platform build; it also waits for a2a so its builder
   # stage finds the Go module download layer already in the daemon. The
   # `images:` list pushes the platform image once every step is done, so the
@@ -270,8 +271,9 @@ substitutions:
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
   # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
-  # sets all four together under EVAL_MODE_NEXT=1.
+  # sets all five together under EVAL_MODE_NEXT=1.
   _A2A_GATEWAY_URI: ""
   _A2A_CALLOUT_URI: ""
   _A2A_WORKER_URI: ""
+  _A2A_CONSOLE_URI: ""
   _A2A_BRIDGE_URI: ""

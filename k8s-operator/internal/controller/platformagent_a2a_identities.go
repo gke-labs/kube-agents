@@ -126,6 +126,13 @@ const (
 	// the container above.
 	a2aBridgeUser = "bridge"
 
+	// a2aConsoleConfUser is the static user the console server logs in as.
+	// The operator renders it into the server's env too, and
+	// TestTheConsoleServerLogsInAsTheConsoleIdentity holds the two together.
+	// It lives in this file because tests/conformance resolves each
+	// identity's user name out of this file and no other.
+	a2aConsoleConfUser = "console"
+
 	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a
 	// credential: it selects the inbox prefix the client pins, and the grants
 	// come from the callout's answer about the ServiceAccount, not from this.
@@ -711,7 +718,7 @@ func webIdentity() a2aIdentity {
 // bucket sizes wait for one.
 func consoleIdentity() a2aIdentity {
 	return a2aIdentity{
-		user:    "console",
+		user:    a2aConsoleConfUser,
 		account: a2aAccountApp,
 		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
 			"which is the gateway's console adapter's inbound subject. STATIC for\n" +

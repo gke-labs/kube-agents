@@ -11,17 +11,17 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout and
-the Hermes bridge sidecar, and each is in the tables below. The first-party ones (`a2a-gateway`,
-`a2a-worker`, `a2a-authcallout`, `hermes-bridge`) are built and tagged with the rest of the
-release. The operator derives the three it renders from its own image (`OPERATOR_IMAGE`, which
+The A2A `next` stack pulls NATS, nats-box, the gateway, the session worker, the auth callout, the
+console server and the Hermes bridge sidecar, and each is in the tables below. The first-party
+ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`, `a2a-console`, `hermes-bridge`) are built
+and tagged with the rest of the release. The operator derives the four it renders from its own image (`OPERATOR_IMAGE`, which
 the chart sets beside `PLATFORM_AGENT_IMAGE`) when it carries a tag, else from the agent image it
 resolves for itself:
 the same registry and tag, so an install at a release pulls them at that release and a mirrored
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;
-`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE` and `A2A_CALLOUT_IMAGE` on the operator override one at a
-time. The bridge is
+`A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE` and `A2A_CONSOLE_IMAGE` on the
+operator override one at a time. The bridge is
 built from the `platform-agent` image of the same commit and is declared on the `PlatformAgent`
 as a sidecar rather than rendered by the operator, so it has no operator override: the sidecar's
 image is whatever the resource names. NATS and nats-box are ordinary third-party pins, in the
@@ -31,7 +31,7 @@ the copies by hand.
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
-`a2a/Dockerfile.gateway`, `a2a/Dockerfile.worker` and `a2a/Dockerfile.hermes-bridge` alongside
+`a2a/Dockerfile.console`, `a2a/Dockerfile.gateway`, `a2a/Dockerfile.worker` and `a2a/Dockerfile.hermes-bridge` alongside
 every other builder, so a build in a mirrored environment can resolve them like any other.
 
 Several images keep a second copy of their pin elsewhere in the tree — a chart value, a Dockerfile
@@ -56,9 +56,10 @@ Tagged with the release version; `:latest` on every push to `main`.
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
 | `gke-stockout-investigator` | `ghcr.io/gke-labs/kube-agents/gke-stockout-investigator` | release tag | — | The gke-stockout-investigator AgentPlugin. |
-| `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way. |
+| `a2a-gateway` | `ghcr.io/gke-labs/kube-agents/a2a-gateway` | release tag | `A2A_GATEWAY_IMAGE` | The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way. |
 | `a2a-worker` | `ghcr.io/gke-labs/kube-agents/a2a-worker` | release tag | `A2A_WORKER_IMAGE` | The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. |
 | `a2a-authcallout` | `ghcr.io/gke-labs/kube-agents/a2a-authcallout` | release tag | `A2A_CALLOUT_IMAGE` | The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install. |
+| `a2a-console` | `ghcr.io/gke-labs/kube-agents/a2a-console` | release tag | `A2A_CONSOLE_IMAGE` | The console server Deployment the operator renders under spec.mode: next, and nothing on a default install. |
 | `hermes-bridge` | `ghcr.io/gke-labs/kube-agents/hermes-bridge` | release tag | — | The hermes-bridge sidecar a spec.mode: next install declares on spec.deployment.sidecars beside the agent container. The operator renders no bridge of its own, so there is no operator override; the sidecar's image is the CR's. |
 
 ### Pulled by an install, built elsewhere
@@ -89,10 +90,10 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
-| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.worker and a2a/Dockerfile.hermes-bridge builder stages. |
-| `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage. |
+| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.worker, a2a/Dockerfile.hermes-bridge and a2a/Dockerfile.console builder stages. |
+| `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
-| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile, a2a/Dockerfile.authcallout and a2a/Dockerfile.gateway runtime stages. |
+| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway and a2a/Dockerfile.console runtime stages. |
 | `busybox` | `docker.io/library/busybox` | `musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37` | — | agentplugins/*/Dockerfile base images. |
 
 <!-- prettier-ignore-end -->
@@ -265,7 +266,7 @@ when a prefix is in effect:
 `CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives the broker image from the agent image
 by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
 on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
-`a2a-authcallout`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
+`a2a-authcallout`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
 no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.

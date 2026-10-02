@@ -1,89 +1,135 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useReducer } from "react";
-import { reduce, initialState } from "./model.ts";
-import { startBus, type BusHandle } from "./bus.ts";
+import { useCallback, useEffect, useReducer, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { reduce, initialState, type UiState } from "./model.ts";
+import { durablesFor, startBus, type BusHandle } from "./bus.ts";
 import {
-  DEFAULT_USER,
-  DEFAULT_WS_URL,
+  READ_ONLY_USER,
+  clearConfig,
+  fetchServedConfig,
   loadConfig,
+  loadConversation,
   saveConfig,
+  saveConversation,
   scrubPasswordFromUrl,
   type BusConfig,
 } from "./config.ts";
+import NotConnected from "./NotConnected.tsx";
+import { mintConversation } from "./console.ts";
+import { commandEffect, type Command } from "./commands.ts";
+import { BAND_STEP, bandFromPointer, clampBand, loadBand, saveBand } from "./band.ts";
+import StatusStrip, { type PanelFocus, type PanelKey } from "./StatusStrip.tsx";
+import Dashboard from "./Dashboard.tsx";
+import SessionTranscript from "./SessionTranscript.tsx";
 import Chat from "./Chat.tsx";
-import Rail from "./Rail.tsx";
 import "./styles.css";
 
+const PERCENT = 100;
 /**
- * First load with no credentials shows this instead of a dead page. The
- * password is the install's `web-password` key; the recipe to fetch it and
- * start the port-forward is in the README and repeated here so the form is
- * self-explanatory in front of an audience.
+ * Shown, and the box left alone, when Enter is pressed while the bus link is
+ * down. Refusing here rather than publishing keeps the turn from being
+ * silently dropped by nats.ws's own reconnect bookkeeping (bus.ts's file
+ * doc comment) with no record it ever happened.
  */
-function ConnectForm({
-  error,
-  onConnect,
-}: {
-  error: string | null;
-  onConnect: (config: BusConfig) => void;
-}) {
-  const params = new URLSearchParams(window.location.search);
-  const [url, setUrl] = useState(params.get("ws") ?? DEFAULT_WS_URL);
-  const [pass, setPass] = useState("");
+const LINK_DOWN_SEND_NOTE = "not sent: the bus link is down. Your text is still in the box.";
 
-  return (
-    <form
-      className="connect-form"
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (pass !== "") onConnect({ url, user: DEFAULT_USER, pass });
-      }}
-    >
-      <h1>a2a bus</h1>
-      <p className="connect-hint">
-        kubectl port-forward the NATS websocket port, then paste the install&apos;s
-        <code> web-password</code>.
-      </p>
-      <label>
-        websocket url
-        <input value={url} onChange={(e) => setUrl(e.target.value)} />
-      </label>
-      <label>
-        web password
-        <input
-          type="password"
-          value={pass}
-          onChange={(e) => setPass(e.target.value)}
-          autoFocus
-        />
-      </label>
-      <button type="submit">connect</button>
-      {error && <p className="connect-error">{error}</p>}
-    </form>
-  );
+/**
+ * Where the page is in finding its bus. `remember` is false for a config the
+ * console server handed over: the server is the source of truth, and the
+ * credential shouldn't outlive the tab in storage when it doesn't have to.
+ * `unconfigured`'s `namedUser` is set only when the URL asked for a specific
+ * user and gave no password for it: that request must not be answered by
+ * quietly asking the server for a different user's credential instead.
+ */
+type Stage =
+  | { kind: "looking" }
+  | { kind: "ready"; config: BusConfig; remember: boolean }
+  | { kind: "unconfigured"; error: string | null; namedUser: string | null };
+
+/**
+ * Pure, like loadConfig: it runs as a useState initializer, which StrictMode
+ * calls twice, and Retry calls it again to re-check the same way.
+ *
+ * A URL or stored config wins outright. Short of that, a `?user=` with no
+ * password is a request to connect as that user by hand - falling through to
+ * `/config.json` here would silently authenticate as the server's `console`
+ * user instead, which is a different (and more capable) identity than the
+ * one asked for. Only a bare load, naming no user at all, goes looking.
+ */
+function initialStage(): Stage {
+  const config = loadConfig();
+  if (config) return { kind: "ready", config, remember: true };
+  const namedUser = new URLSearchParams(window.location.search).get("user");
+  return namedUser !== null ? { kind: "unconfigured", error: null, namedUser } : { kind: "looking" };
+}
+
+/**
+ * An error's own message.  `String(error)` prefixes "Error: ", which hides the
+ * server's "503:" from NotConnected's missing-credential check.
+ */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export default function App() {
   const [state, dispatch] = useReducer(reduce, initialState);
-  const [config, setConfig] = useState<BusConfig | null>(loadConfig);
-  const [connectError, setConnectError] = useState<string | null>(null);
+  const [stage, setStage] = useState<Stage>(initialStage);
   const [probePending, setProbePending] = useState(false);
+  const [conversation, setConversation] = useState<string>(() => loadConversation() ?? mintConversation());
+  const [session, setSession] = useState<string | null>(null);
+  const [focus, setFocus] = useState<PanelFocus | null>(null);
+  const [band, setBand] = useState(loadBand);
   const busHandleRef = useRef<BusHandle | null>(null);
+  const mainRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+  // The pollers and the command handler read the latest state without
+  // restarting the bus on every render.
+  const stateRef = useRef<UiState>(state);
+  stateRef.current = state;
+  const conversationRef = useRef(conversation);
+  conversationRef.current = conversation;
 
-  // Effect, not the state initializer: this mutates history, and StrictMode
-  // double-invokes initializers.
+  const config = stage.kind === "ready" ? stage.config : null;
+  const canSend = config !== null && config.user !== READ_ONLY_USER;
+
   useEffect(scrubPasswordFromUrl, []);
+  useEffect(() => saveConversation(conversation), [conversation]);
+  useEffect(() => saveBand(band), [band]);
 
   useEffect(() => {
-    if (!config) return;
+    if (stage.kind !== "looking") return;
+    let cancelled = false;
+    fetchServedConfig().then(
+      (served) => {
+        if (cancelled) return;
+        setStage(
+          served
+            ? { kind: "ready", config: served, remember: false }
+            : { kind: "unconfigured", error: null, namedUser: null },
+        );
+      },
+      (error: unknown) => {
+        if (!cancelled) setStage({ kind: "unconfigured", error: errorText(error), namedUser: null });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [stage]);
+
+  useEffect(() => {
+    if (stage.kind !== "ready") return;
+    const { config: target, remember } = stage;
     // StrictMode runs this effect twice in dev, and cleanup fires before the
-    // first `startBus` resolves — without this flag the first connection is
+    // first `startBus` resolves - without this flag the first connection is
     // never closed and every envelope gets dispatched twice.
     let cancelled = false;
+    const opts = {
+      conversation: target.user !== READ_ONLY_USER ? conversationRef.current : undefined,
+      durables: () => durablesFor(stateRef.current.agents.values()),
+    };
 
     void (async () => {
       try {
-        const handle = await startBus(config, dispatch);
+        const handle = await startBus(target, dispatch, opts);
         if (cancelled) {
           void handle.close().catch(() => {
             /* already going away */
@@ -91,12 +137,19 @@ export default function App() {
           return;
         }
         busHandleRef.current = handle;
-        saveConfig(config);
+        // A /new typed while startBus was dialing changed the conversation
+        // after opts captured it.
+        if (opts.conversation !== undefined && conversationRef.current !== opts.conversation) {
+          handle.setConversation(conversationRef.current);
+        }
+        if (remember) saveConfig(target);
       } catch (error) {
         console.error("Failed to connect to bus:", error);
         if (!cancelled) {
-          setConnectError(String(error));
-          setConfig(null);
+          // No retry on reload with the same bad config. Retry goes back to
+          // the server, which is what fixing a port-forward wants.
+          clearConfig();
+          setStage({ kind: "unconfigured", error: errorText(error), namedUser: null });
         }
       }
     })();
@@ -108,7 +161,9 @@ export default function App() {
       });
       busHandleRef.current = null;
     };
-  }, [config]);
+  }, [stage]);
+
+  const local = useCallback((text: string) => dispatch({ type: "local", text, at: Date.now() }), []);
 
   const handleProbe = useCallback(() => {
     if (!busHandleRef.current || probePending) return;
@@ -122,23 +177,121 @@ export default function App() {
       .finally(() => setProbePending(false));
   }, [probePending]);
 
-  if (!config) {
-    return <ConnectForm error={connectError} onConnect={setConfig} />;
+  const handleSend = useCallback(
+    (text: string): boolean => {
+      const handle = busHandleRef.current;
+      if (handle === null) {
+        local(`not sent: not connected to the bus yet. "${text}"`);
+        return false;
+      }
+      // Refuse rather than publish while the link is down: nats.ws buffers a
+      // publish made mid-reconnect and then drops it on the next dial
+      // attempt (bus.ts's file doc comment), so a send here would look
+      // pending and then vanish with no record. Chat only clears the box
+      // when this returns true, so the text survives to be sent again.
+      if (stateRef.current.connection !== "up") {
+        local(LINK_DOWN_SEND_NOTE);
+        return false;
+      }
+      handle.send(text);
+      return true;
+    },
+    [local],
+  );
+
+  const handleCommand = useCallback(
+    (command: Command) => {
+      const effect = commandEffect(command, stateRef.current);
+      switch (effect.kind) {
+        case "local":
+          local(effect.text);
+          return;
+        case "clear":
+          dispatch({ type: "clear" });
+          return;
+        case "replay":
+          setSession(effect.session);
+          return;
+        case "new": {
+          const next = mintConversation();
+          setConversation(next);
+          busHandleRef.current?.setConversation(next);
+          local(`new conversation ${next}. The next message starts a fresh session.`);
+          return;
+        }
+      }
+    },
+    [local],
+  );
+
+  const handleFocus = useCallback((key: PanelKey) => {
+    setSession(null);
+    setFocus((f) => ({ key, seq: (f?.seq ?? 0) + 1 }));
+  }, []);
+
+  const bandFrom = (e: PointerEvent<HTMLDivElement>) => {
+    const box = mainRef.current?.getBoundingClientRect();
+    if (box) setBand(bandFromPointer(e.clientY, box.top, box.height));
+  };
+
+  const bandKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "ArrowUp") setBand((b) => clampBand(b - BAND_STEP));
+    else if (e.key === "ArrowDown") setBand((b) => clampBand(b + BAND_STEP));
+    else return;
+    e.preventDefault();
+  };
+
+  // A same-origin fetch of a small file. Nothing to show for the moment it
+  // takes.
+  if (stage.kind === "looking") return null;
+  if (stage.kind === "unconfigured") {
+    // initialStage(), not a bare `{ kind: "looking" }`: it re-reads the URL,
+    // so a namedUser screen stays put on Retry instead of quietly falling
+    // through to the served credential the URL asked to avoid.
+    return <NotConnected error={stage.error} namedUser={stage.namedUser} onRetry={() => setStage(initialStage())} />;
   }
 
   return (
     <div className="app">
-      <div className="app-topology">
-        <Rail state={state} />
-      </div>
-      <div className="app-chat">
-        <Chat
-          entries={state.chat}
-          user={config.user}
-          probe={state.probe}
-          probePending={probePending}
-          onProbe={handleProbe}
+      <StatusStrip state={state} onFocus={handleFocus} />
+      <div className="app-main" ref={mainRef}>
+        <div className="app-body" style={{ flexBasis: `${band * PERCENT}%` }}>
+          {session === null ? (
+            <Dashboard state={state} focus={focus} onSession={setSession} />
+          ) : (
+            <SessionTranscript state={state} session={session} onBack={() => setSession(null)} />
+          )}
+        </div>
+        <div
+          className="app-band"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="resize the dashboard and the chat"
+          aria-valuenow={Math.round(band * PERCENT)}
+          tabIndex={0}
+          onPointerDown={(e) => {
+            dragging.current = true;
+            e.currentTarget.setPointerCapture(e.pointerId);
+          }}
+          onPointerMove={(e) => dragging.current && bandFrom(e)}
+          onPointerUp={(e) => {
+            dragging.current = false;
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }}
+          onKeyDown={bandKey}
         />
+        <div className="app-chat">
+          <Chat
+            entries={state.chat}
+            user={stage.config.user}
+            conversation={canSend ? conversation : undefined}
+            probe={state.probe}
+            probePending={probePending}
+            onProbe={handleProbe}
+            onSend={canSend ? handleSend : undefined}
+            onCommand={canSend ? handleCommand : undefined}
+          />
+        </div>
       </div>
     </div>
   );
