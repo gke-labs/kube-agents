@@ -146,6 +146,7 @@ ADDED_AFTER_THE_MOVE = [
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
+    "autoops-controller-stall-triage",  # the stall watch on the inject path
 ]
 
 # Admitted after the split, each by a pull request that cited the record

@@ -13,7 +13,7 @@ not the product.
 flowchart TB
     subgraph SOURCES["📡 Signal Sources"]
         direction LR
-        CLUSTER["☸️<br/><b>GKE Cluster</b><br/>Warning events"]
+        CLUSTER["☸️<br/><b>GKE Cluster</b><br/>Warning events, controller status"]
         DRIFT["🌀<br/><b>Live state + audit log</b><br/>Out-of-band changes"]
         CAP["📉<br/><b>Capacity signal</b><br/>Stockout / quota"]
         CLUSTER ~~~ DRIFT ~~~ CAP
@@ -24,7 +24,8 @@ flowchart TB
         WATCH["👀<br/><b>Event Watcher</b><br/>Filters noise, dedups"]
         DDET["🧭<br/><b>Drift Detector</b><br/>audit sub → managedFields"]
         PSUB["📨<br/><b>Pub/Sub Consumer</b><br/>Pulls capacity alerts"]
-        WATCH ~~~ DDET ~~~ PSUB
+        STALLW["🧭<br/><b>Stall Watch</b><br/>Cron sweep, ledger"]
+        WATCH ~~~ DDET ~~~ PSUB ~~~ STALLW
     end
 
     subgraph SPINE["🔒 The shared path · does not change when domains do"]
@@ -48,12 +49,14 @@ flowchart TB
     end
 
     CLUSTER -->|warning events| WATCH
+    CLUSTER -->|controller status| STALLW
     DRIFT -->|change + attribution| DDET
     CAP -->|alert| PSUB
 
     WATCH -->|inject · kind: k8s-event| SESS
     DDET -->|inject · kind: gitops-drift| SESS
     PSUB -->|inject · kind: capacity| SESS
+    STALLW -->|inject · kind: controller-stall| SESS
 
     FIX -.->|PR link| CHAT
 
@@ -70,7 +73,7 @@ flowchart TB
 
     class CLUSTER live;
     class DRIFT,CAP,DDET,PSUB newdom;
-    class WATCH ingest;
+    class WATCH,STALLW ingest;
     class SESS sess;
     class STORE store;
     class GW gw;
@@ -155,7 +158,8 @@ inject envelope with its own `kind`.
 > detector sends its own `kind: gitops-drift` envelope with its own fields, and the inject route
 > dispatches on `kind` rather than reconciling the two. So the pattern a third domain now follows is
 > "add a kind and a branch", which works and does not scale — a shared envelope is still owed, and is
-> now a refactor of two producers rather than a design decision about one.
+> now a refactor of the producers rather than a design decision about one: the stall watch added a
+> kind and a branch too.
 
 ---
 
@@ -327,8 +331,8 @@ the prompt is _what to decide and how to say it_.
 > **Honest state:** this is what the second domain actually cost. `_build_agent_query()` is hardcoded
 > k8s-event-shaped, so drift got a second query builder and a second card body rather than a plugged-in
 > prompt, dispatched on `kind` at the top of the function. Making it pluggable is still the same piece
-> of work as generalizing the envelope, and there are now two implementations to fold in rather than
-> one to parameterize.
+> of work as generalizing the envelope. The stall watch added its own builder and body the same way,
+> so there are several implementations to fold in rather than one to parameterize.
 
 ---
 
@@ -400,13 +404,21 @@ The GKE-events path is live end to end:
 - **Human-in-the-loop** — an engineer approves in-thread; nothing reaches production without it.
 - **Remediation** — the approved fix ships as a GitOps PR.
 
+The controller-stall path is live on the same spine. `stall-watch`, a cron script on the Platform
+Agent's roster, finds controllers that stopped making progress without erroring — a state that
+raises no event on the watcher's list — and sends a `controller-stall` inject per namespace with a
+new stall. From the session onward it is the path above: the alert, the card to that cluster's
+Cluster Agent (which runs `gke-stall-detection`), the triage in the alert's thread, the approval and
+the PR ([design](../../../docs/designs/stall-watch-inject.md)).
+
 ## Plugging in a new domain
 
 Each new domain adds a source, an adapter, a skill, and a judgment prompt. In order:
 
 1. **A signal** — something that fires on its own.
 2. **An adapter** — detects the signal, filters its own noise, emits the inject envelope with a new `kind`.
-3. **A skill** — the diagnostic procedure, registered in `agents/platform/skills/`.
+3. **A skill** — the diagnostic procedure, registered in `agents/cluster/skills/` when a Cluster Agent
+   runs it on one cluster (as both live triage paths do), or in `agents/platform/skills/`.
 4. **A judgment prompt** — what to decide, what shape the answer takes, what the approval words are.
 
 Sessions, thread routing, follow-up memory, chat delivery, the approval gate, and PR generation are not
@@ -421,6 +433,7 @@ fix lands as a reviewed change. Each of these is an adapter, a skill, and a judg
 | ---------------------------- | ----------------------------------------- | --------- |
 | **Incident triage**          | Warning event on a workload               | **Live**  |
 | **Drift detection**          | Out-of-band change in the audit log       | Candidate |
+| **Controller stalls**        | Controller stopped without erroring       | **Live**  |
 | **Obtainability governance** | Stockout investigator                     | Candidate |
 | **Shadow infrastructure**    | Unmanaged resource found in inventory     | Candidate |
 | **Policy propagation**       | Policy missing on a cluster in the fleet  | Candidate |
@@ -488,7 +501,8 @@ Rows grounded in events, logs, RBAC, and networking config are within reach toda
 
 Stated plainly, because they scope the next milestone:
 
-- **The inject envelope is k8s-shaped**, and so is `_build_agent_query()`. The second domain generalizes both.
+- **The inject envelope is k8s-shaped**, and so is `_build_agent_query()`. The drift and stall domains
+  each added a kind and a branch beside it rather than generalizing either.
 - **No incident corpus yet** — the `incidents` table has the data but not the keys, outcomes, or retention.
 - **No metric or quota tooling** — two of the five cross-domain CUJ rows are blocked on it.
 - **Judgment has no regression harness** — judgment is the differentiator, so it needs an eval suite.
