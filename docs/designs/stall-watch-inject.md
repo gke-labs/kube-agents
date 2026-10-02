@@ -8,8 +8,8 @@ report lands and whether a reply to it can be acted on.
 
 > **Status:** partly implemented. The Session KV server accepts and triages `controller-stall`
 > injects, and `autoops-controller-stall-triage` covers that path. The stall watch still files its
-> own Cluster Agent cards; the producer half of §2 and §3.1–§3.3 describe the change that moves it
-> onto the inject path.
+> own Cluster Agent cards: wherever this design says what the watch does (the producer half of §2,
+> §3.1–§3.3, the producer tests in §6, the risks in §7), it describes the change still to land.
 
 ## 1. Why
 
