@@ -429,13 +429,16 @@ class FallbackTextTest(unittest.TestCase):
         self.assertEqual(sp.fallback_text("It is *down* now"), "It is *down* now")
         self.assertEqual(sp.fallback_text("~gone~ and _soft_ stuff"), "~gone~ and _soft_ stuff")
         self.assertEqual(sp.fallback_text("Remove *.log,*.tmp"), "Remove *.log,*.tmp")
+        self.assertEqual(sp.fallback_text("Scale to ~3 pods."), "Scale to ~3 pods.")
         for headline in ("__init__.py is missing.", "Scale replicas 2*3 → 6", "DB_HOST is unset"):
             self.assertEqual(sp.fallback_text(headline), f"*{headline}*")
 
     def test_a_command_a_code_span_kept_reaches_the_fallback_whole(self):
-        headline, _body = sp.split_answer("Run `rm -rf ~/x*` here.")
-        self.assertEqual(headline, "Run rm -rf ~/x* here.")
-        self.assertEqual(sp.fallback_text(headline), "Run rm -rf ~/x* here.")
+        for answer, kept in (("Run `rm -rf ~/x*` here.", "Run rm -rf ~/x* here."),
+                             ("Delete `*.tmp` now.", "Delete *.tmp now.")):
+            headline, _body = sp.split_answer(answer)
+            self.assertEqual(headline, kept)
+            self.assertEqual(sp.fallback_text(headline), kept)
 
 
 class LinkAckTest(unittest.TestCase):
