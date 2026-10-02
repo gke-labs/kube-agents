@@ -559,7 +559,7 @@ STALL_LEDGER_OBJECT_KIND = "controllers"
 STALL_UNKNOWN_FIELD = "unknown"
 STALL_HEURISTICS = frozenset({"generation-lag", "stale-condition", "repeating-warnings", "dangling-reference"})
 # stall_report.format_duration's shapes: `<1m`, `14m`, `3h07m`, `2d4h`.
-_STALL_DURATION_RE = re.compile(r"<1m|\d+m|\d+h\d{2}m|\d+d\d+h")
+_STALL_DURATION_RE = re.compile(r"<1m|\d+m|\d+h\d{2}m|\d+d\d+h", re.ASCII)
 
 # A Cluster Agent profile name as cluster_agent_profile.profile_name forms it.
 # An assignee that does not match is dropped and the query falls back to
@@ -1901,13 +1901,15 @@ def _stall_rows(payload: Dict[str, Any]) -> list[Dict[str, str]]:
     raw = payload.get("objects")
     rows = []
     for item in raw if isinstance(raw, list) else []:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not isinstance(item.get("object"), str):
             continue
         obj = _defang_drift_field(item.get("object")).strip()
         if not obj:
             continue
         heuristic = item.get("heuristic")
-        stalled_for = item.get("stalled_for")
+        # Through the defang first for its length cut: the pattern bounds the
+        # alphabet, not the length, and a cut value fails it.
+        stalled_for = _defang_drift_field(item.get("stalled_for")) if isinstance(item.get("stalled_for"), str) else None
         rows.append({
             "object": obj,
             "heuristic": heuristic if isinstance(heuristic, str) and heuristic in STALL_HEURISTICS else STALL_UNKNOWN_FIELD,
@@ -2050,8 +2052,9 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
     event path's wording only when the payload carries no usable name.
     """
     cluster = _stall_field(payload, "cluster")
-    assignee = payload.get("assignee")
-    if isinstance(assignee, str) and _STALL_ASSIGNEE_RE.fullmatch(assignee):
+    # Defanged first for its length cut, as `stalled_for` is in `_stall_rows`.
+    assignee = _defang_drift_field(payload.get("assignee")) if isinstance(payload.get("assignee"), str) else ""
+    if _STALL_ASSIGNEE_RE.fullmatch(assignee):
         assignee_line = (
             f"- `assignee`: `{assignee}`, the Cluster Agent the stall watch resolved for **{cluster}**. If your "
             f"`[SPECIALIST AGENTS AVAILABLE NOW]` block does not list it, call `list_agents` once to refresh.\n"
@@ -3081,10 +3084,13 @@ def _inject_stall(
     act on. The event path defaults those fields instead; it has to, since a
     Kubernetes event can arrive without them.
     """
+    # Typed before the defang, which would turn a list or a number into
+    # non-empty text that passes the emptiness test below.
+    typed = isinstance(payload.get("namespace"), str) and isinstance(payload.get("cluster"), str)
     namespace = _stall_field(payload, "namespace")
     cluster = _stall_field(payload, "cluster")
     names = _stall_object_names(_stall_rows(payload))
-    if not (namespace and cluster and names):
+    if not (typed and namespace and cluster and names):
         raise HTTPException(
             status_code=400,
             detail="a controller-stall record needs `cluster`, `namespace` and at least one entry in `objects`",
@@ -3128,8 +3134,9 @@ def inject_message(
     Three producers reach this route and they send different records. The event
     watcher sends a Kubernetes event, stamped `k8s-event` or
     `k8s-event-followup`; the drift detector sends `kind: gitops-drift` and an
-    audit-log record of a change someone made; the stall watch sends
-    `kind: controller-stall` and the objects it saw stop making progress. The
+    audit-log record of a change someone made; a stall producer
+    (docs/designs/stall-watch-inject.md) sends `kind: controller-stall` and the
+    objects it saw stop making progress. The
     dispatch is an equality test against `INJECT_KIND_DRIFT` and
     `INJECT_KIND_STALL`, not a match against the watcher's kinds, so everything
     else — those two, a kind a future producer invents, or no kind at all —
