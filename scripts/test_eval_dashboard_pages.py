@@ -213,15 +213,20 @@ def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms:
     virtual time the page is given; timers fire inside it, so a budget past
     PAGE.refreshMs runs the poll too. A bare view anchor (#gate) is refused
     on every budget: the Brief's view anchors reach Chrome's launch URL
-    from no call. A test that needs the bare-anchor path sets the hash
-    from inside the page with bare_anchor_page."""
-    anchor = fragment.lstrip("#")
+    from no call. The guard reads the URL it is about to launch, not the
+    ``fragment`` argument, so a `#` inside ``query`` and a percent-encoded
+    anchor (#%67ate), both of which Chrome reads as the anchor, are refused
+    too. A test that needs the bare-anchor path sets the hash from inside
+    the page with bare_anchor_page."""
+    url = page.as_uri() + (f"?{query}" if query else "") + fragment
+    launched = urllib.parse.urlparse(url).fragment
+    anchor = urllib.parse.unquote(launched)
     if anchor in BRIEF_VIEW_ANCHORS:
         raise ValueError(
-            f"{fragment}: a bare view anchor on Chrome's launch URL is the shape in every stall of headless Chrome "
-            f"on CI (#2227, #2278) and is refused on every budget; use #view={anchor}, or bare_anchor_page(page, {anchor!r})"
+            f"#{launched}: a bare view anchor on Chrome's launch URL is the shape in every stall of headless Chrome "
+            f"on CI (#2227, #2278) and is refused on every budget, however it reaches the URL; "
+            f"use #view={anchor}, or bare_anchor_page(page, {anchor!r})"
         )
-    url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
         [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
         capture_output=True, text=True, timeout=90, check=False,
@@ -705,6 +710,41 @@ class DomHtmlGuardTest(unittest.TestCase):
                 dom_html(self.index, fragment="#gate")  # the default budget, by default
         self.assertEqual(run.call_count, 0, "a refused call never reaches Chrome")
 
+    def test_the_guard_reads_the_launch_url_not_the_fragment_argument(self):
+        # The anchor can reach the launch URL without being the `fragment`
+        # argument: a `#` inside `query` is a fragment to Chrome, and a
+        # percent-encoded view id is decoded by Chrome's anchor step and by
+        # pages.js alike. Both are refused, by the decoded fragment of the
+        # URL about to be launched, and neither reaches the mocked Chrome.
+        # The encoded `#` a urlencode'd query carries (%23) is not a
+        # fragment and stays admitted, as does the view= form.
+        refused = [
+            {"query": "cases=cluster-agent-crashloop-debug#gate"},
+            {"query": "cases=cluster-agent-crashloop-debug#agent", "budget_ms": TWO_POLLS_BUDGET_MS},
+            {"fragment": "#%67ate"},
+            {"fragment": "#a%67ent"},
+            {"query": "cases=x#%67ate"},
+        ]
+        admitted = [
+            {"query": urllib.parse.urlencode({"cases": "x#gate"})},
+            {"fragment": "#view=gate"},
+            {"query": urllib.parse.urlencode({"cases": "x#gate"}), "fragment": "#view=agent"},
+        ]
+        with self.no_chrome() as run:
+            for call in refused:
+                with self.subTest(call=call):
+                    with self.assertRaises(ValueError) as error:
+                        dom_html(self.index, **call)
+                    self.assertIn("bare_anchor_page(page, ", str(error.exception))
+            self.assertEqual(run.call_count, 0, "a refused call never reaches Chrome")
+            for call in admitted:
+                with self.subTest(call=call):
+                    dom_html(self.index, **call)
+        self.assertEqual(run.call_count, len(admitted))
+        for call, invocation in zip(admitted, run.call_args_list):
+            launched = urllib.parse.urlparse(invocation.args[0][-1]).fragment
+            self.assertNotIn(urllib.parse.unquote(launched), BRIEF_VIEW_ANCHORS, call)
+
     def test_the_bare_anchor_page_carries_the_anchor_and_takes_only_a_view(self):
         # The shim sits in <head>, before the page's data and script, and
         # names the anchor; a fragment outside PAGE.views has no section to
@@ -771,7 +811,7 @@ class DomHtmlGuardTest(unittest.TestCase):
             self.assertIn(f"--virtual-time-budget={call.get('budget_ms', DEFAULT_BUDGET_MS)}", argv, call)
             query = f"?{call['query']}" if call.get("query") else ""
             self.assertEqual(argv[-1], page.as_uri() + query + call.get("fragment", ""), call)
-            self.assertNotIn(urllib.parse.urlparse(argv[-1]).fragment, BRIEF_VIEW_ANCHORS, call)
+            self.assertNotIn(urllib.parse.unquote(urllib.parse.urlparse(argv[-1]).fragment), BRIEF_VIEW_ANCHORS, call)
             if page is anchored:
                 self.assertNotIn("#", argv[-1], "the shimmed copy's URL carries no fragment")
 
