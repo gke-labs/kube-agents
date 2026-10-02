@@ -60,13 +60,11 @@ const (
 	// agree with the session pod's egress fence -- see the comment at its use.
 	defaultAllowedTools = "Read,Write,Glob,Grep,TodoWrite"
 
-	// envClusterView is the spawner's signal that this pod has the credential
-	// broker's read-only kubectl/gcloud wrappers on PATH (a2a/gateway/spawn.go,
-	// the operator's A2A_SESSION_CLUSTER_VIEW). Only then is Bash allowed,
-	// and only with clusterViewPrompt appended: the fence is the broker's
-	// read-only gate, and the prompt tells the model what the fence is so a
-	// refusal is reported rather than retried.
-	envClusterView          = "A2A_CLUSTER_VIEW"
+	// The cluster view's signal is lib.EnvClusterView, shared with the
+	// spawner that sets it. Only then is Bash allowed (confined to the two
+	// shims), and only with clusterViewPrompt appended: the fence is the
+	// broker's read-only gate, and the prompt tells the model what the fence
+	// is so a refusal is reported rather than retried.
 	clusterViewAllowedTools = defaultAllowedTools + ",Bash(kubectl:*),Bash(gcloud:*)"
 	defaultDisallowedTools  = "Bash,Edit,NotebookEdit"
 	clusterViewDisallowed   = "Edit,NotebookEdit"
@@ -183,7 +181,7 @@ func harnessCommand() []string {
 	// credential broker, and Bash is what reaches it.
 	allowed := os.Getenv("A2A_ALLOWED_TOOLS")
 	disallowed := defaultDisallowedTools
-	clusterView := os.Getenv(envClusterView) == "true"
+	clusterView := os.Getenv(lib.EnvClusterView) == "true"
 	if allowed == "" {
 		allowed = defaultAllowedTools
 		if clusterView {

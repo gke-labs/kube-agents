@@ -120,9 +120,6 @@ const (
 	// get-credentials returns ($HERMES_HOME/.kubeconfigs); the pod's
 	// scratch emptyDir, the one writable place.
 	sessionHermesHome = "/scratch"
-	// envClusterView tells the worker adapter to allow Bash and append the
-	// inspect-and-report line (a2a/cmd/worker-adapter).
-	envClusterView = "A2A_CLUSTER_VIEW"
 
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
@@ -434,7 +431,7 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_URL", Value: s.cfg.CredentialProxyURL},
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: credentialProxyTokenMountPath + "/" + credentialProxyTokenFile},
 			corev1.EnvVar{Name: "HERMES_HOME", Value: sessionHermesHome},
-			corev1.EnvVar{Name: envClusterView, Value: "true"},
+			corev1.EnvVar{Name: lib.EnvClusterView, Value: "true"},
 		)
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{

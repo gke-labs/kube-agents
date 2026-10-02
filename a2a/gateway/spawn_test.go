@@ -336,7 +336,7 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	}
 	if env["CREDENTIAL_PROXY_URL"] != cfg.CredentialProxyURL ||
 		env["CREDENTIAL_PROXY_TOKEN_FILE"] != credentialProxyTokenMountPath+"/"+credentialProxyTokenFile ||
-		env["HERMES_HOME"] != sessionHermesHome || env[envClusterView] != "true" {
+		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
 		t.Fatalf("cluster-view env = %v", env)
 	}
 	var mounted bool
@@ -363,7 +363,7 @@ func TestNoClusterViewSpawnsTodaysPod(t *testing.T) {
 	}
 	pod, _ := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-1a2b", metav1.GetOptions{})
 	for _, e := range pod.Spec.Containers[0].Env {
-		if strings.HasPrefix(e.Name, "CREDENTIAL_PROXY_") || e.Name == envClusterView || e.Name == "HERMES_HOME" {
+		if strings.HasPrefix(e.Name, "CREDENTIAL_PROXY_") || e.Name == lib.EnvClusterView || e.Name == "HERMES_HOME" {
 			t.Errorf("%s rendered with the view off", e.Name)
 		}
 	}

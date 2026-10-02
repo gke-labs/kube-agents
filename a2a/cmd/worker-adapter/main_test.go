@@ -118,13 +118,13 @@ func TestClusterViewAllowsBashAndSaysInspectOnly(t *testing.T) {
 		}
 		return
 	}
-	t.Setenv("A2A_CLUSTER_VIEW", "")
-	_ = os.Unsetenv("A2A_CLUSTER_VIEW")
+	t.Setenv(lib.EnvClusterView, "")
+	_ = os.Unsetenv(lib.EnvClusterView)
 	allowed, disallowed, prompt := flags(harnessCommand())
 	if strings.Contains(allowed, "Bash") || !strings.Contains(disallowed, "Bash") || prompt != "" {
 		t.Fatalf("view off: allowed=%q disallowed=%q prompt=%q", allowed, disallowed, prompt)
 	}
-	t.Setenv("A2A_CLUSTER_VIEW", "true")
+	t.Setenv(lib.EnvClusterView, "true")
 	allowed, disallowed, prompt = flags(harnessCommand())
 	if !strings.Contains(allowed, "Bash(kubectl:*)") || !strings.Contains(allowed, "Bash(gcloud:*)") || strings.Contains(disallowed, "Bash") {
 		t.Fatalf("view on: allowed=%q disallowed=%q", allowed, disallowed)
