@@ -334,10 +334,12 @@
 
 # The compliance stream's declared-intent case (#1408): the same seeded-intent
 # namespace, whose missing NetworkPolicy is the 2.6 posture the same
-# knowledge/ note declares, graded on the reply naming the note and closing
-# "missing-NetworkPolicy findings: 0". Red before compliance-audit's SOP had
-# the step, green after, on this case's own pull request. deployer: noop,
-# read-only over the seeded fleet.
+# knowledge/ note declares. It runs the compliance audit and grades the
+# security ledger: no finding id for the namespace, and a Declared intent row
+# naming the note. Red on main's images (the finding published), three greens
+# on the branch's, on a dev install. One case, three units: this file's share
+# is forty-seven cases (141 units) of a sixty-one-case, 183-unit matrix (with
+# the presubmit file's fourteen). deployer: noop, read-only over the seeded fleet.
 ./tasks/compliance-declared-intent-no-finding/task.yaml
 
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────

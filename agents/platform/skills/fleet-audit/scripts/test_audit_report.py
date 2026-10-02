@@ -5228,6 +5228,76 @@ POSTURE_CHECKS = ("no-pdb", "no-hpa", "hpa-cannot-scale")
 FAULT_CHECKS = ("blocking-pdb", "no-requests")
 
 
+class TestComplianceDeclaredShapes(HarnessTestCase):
+    """The two compliance postures: which shapes a declaration may move, and what a declared 2.7 workload does to its siblings."""
+
+    def _netpol_declaration(self, obj):
+        return {"check": "netpol-missing", "namespace": "payments", "object": obj, "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"}
+
+    def test_a_declaration_moves_the_namespace_posture_and_not_the_allow_all_fault(self):
+        posture = make_finding(fid="ns", severity="major", obj="Namespace/payments", check="netpol-missing")
+        fault = make_finding(fid="open", severity="minor", obj="NetworkPolicy/allow-everything", check="netpol-missing")
+        doc = audit_report.validate_findings(make_doc(findings=[posture, fault], audit=AUDIT), AUDIT)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._netpol_declaration("Namespace/payments"), self._netpol_declaration("NetworkPolicy/allow-everything")])
+        self.assertEqual([f["object"] for f in moved], ["Namespace/payments"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPolicy/allow-everything"])
+        self.assertIn("DECLARATION NOT APPLIED", err.getvalue())
+        self.assertIn("allow-all fault", err.getvalue())
+
+    def test_the_validator_rejects_a_declared_entry_naming_a_policy(self):
+        doc = make_doc(findings=[], audit=AUDIT)
+        doc["declared"] = [{"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "NetworkPolicy/allow-everything", "title": "t", "declaration": {"repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x"}}]
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("declared[0].object", str(cm.exception))
+        self.assertIn("allow-all", str(cm.exception))
+        doc["declared"][0]["object"] = "Namespace/payments"
+        audit_report.validate_findings(doc, AUDIT)
+
+    def _sa_finding(self, fid, obj, namespace="payments", cluster="prod-us-east"):
+        return make_finding(fid=fid, severity="major", obj=obj, check="default-sa-automount", namespace=namespace, cluster=cluster, command="kubectl get sa default -n " + namespace, remediation={"kind": "manifest", "path": f"clusters/{cluster}/{namespace}/default-sa-automount.yaml", "note": "shared file"})
+
+    def test_a_declared_workload_makes_its_siblings_fixes_manual(self):
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        elsewhere = self._sa_finding("batch", "Deployment/batch", namespace="billing")
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker, elsewhere], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.apply_declarations(doc, [declaration])
+            changed = audit_report.shield_declared_account_siblings(doc)
+        by_obj = {f["object"]: f for f in doc["findings"]}
+        self.assertEqual(sorted(by_obj), ["Deployment/batch", "Deployment/worker"])
+        self.assertEqual(changed, [by_obj["Deployment/worker"]["id"]])
+        self.assertEqual(by_obj["Deployment/worker"]["remediation"]["kind"], "manual")
+        self.assertEqual(by_obj["Deployment/worker"]["remediation"]["path"], "")
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", by_obj["Deployment/worker"]["remediation"]["note"])
+        self.assertIn("shared file", by_obj["Deployment/worker"]["remediation"]["note"])
+        self.assertEqual(by_obj["Deployment/batch"]["remediation"]["kind"], "manifest")
+        self.assertEqual(audit_report.remediation_groups(doc["findings"]), [[by_obj["Deployment/batch"]]])
+        self.assertIn("MANUAL:", err.getvalue())
+        # Idempotent: a second pass changes nothing more.
+        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+
+    def test_no_declared_workload_leaves_the_shared_file_alone(self):
+        doc = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "Deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
+        self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+        self.assertEqual(len(audit_report.remediation_groups(doc["findings"])), 1)
+
+    def test_another_streams_posture_in_a_note_is_a_note_not_a_warning(self):
+        text = "---\ntype: decision\ntitle: t\ndeclares:\n  - check: no-pdb\n    namespace: seeded-intent\n    object: Deployment/notification-relay\n  - check: netpol-missing\n    namespace: seeded-intent\n    object: Namespace/seeded-intent\n  - check: bogus\n    namespace: x\n    object: Deployment/y\n---\n"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            entries = audit_report.parse_declarations(text, repo="acme/fleet", path="knowledge/n.md", declarable=audit_report.audit_declarable_checks(AUDIT))
+        self.assertEqual([e["check"] for e in entries], ["netpol-missing"])
+        out = err.getvalue()
+        self.assertIn("NOTE: acme/fleet:knowledge/n.md declares[0]: 'no-pdb' is another stream's posture", out)
+        self.assertIn("WARNING: acme/fleet:knowledge/n.md declares[2]: 'bogus' is not a check a declaration may justify", out)
+
+
 class TestDeclaredIntentSearch(HarnessTestCase):
     """`declared_intent_searched`: the record that the §4a step ran, or the postures are withheld.
 

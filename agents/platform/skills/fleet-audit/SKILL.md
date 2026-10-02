@@ -587,7 +587,7 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 ```
 
 (The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
-real compliance document would be rejected for carrying either. `declared[].check` is validated
+real compliance document would be rejected for the `no-hpa` entry, a check outside its roster. `declared[].check` is validated
 against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
 `obtainability-audit` and `compliance-audit` have one today, because their SOPs have a step that writes the list. A
 non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
