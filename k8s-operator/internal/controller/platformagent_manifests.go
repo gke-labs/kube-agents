@@ -4255,12 +4255,33 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	// script arms or prints, so an arbitrary value reaches nothing but that
 	// one message and its own failure report.
 	//
-	// KAGE_SLACK_UX switches the Slack adapter between two code paths already
-	// in the image: which reaction goes on an ask and when it settles. It is
-	// compared against `FLAG_ON_VALUES` in `slack_presenter.py`; any other
-	// value is off, the image default. It names no path, URL, credential or
-	// image, and no value of it reaches anything but the reactions the gateway
-	// adds to messages it already receives.
+	// KAGE_SLACK_UX switches between code paths already in the image, all of
+	// them about Slack. It is compared against `FLAG_ON_VALUES` in
+	// `slack_presenter.py`; any other value is off, the image default. It names
+	// no path, URL, credential or image, and no value of it adds a destination,
+	// a write or a credential. Each effect it switches, one per change that
+	// ships it:
+	//
+	//   - Clicks: a click on a choice runs as the clicker's turn under the
+	//     adapter's own authorization, echoed in the same thread.
+	//   - Harness messages: the harness's own Slack messages (the
+	//     scheduled-report wrapper, the heartbeat, restart and shutdown
+	//     notices, command and system replies) are reworded or left out.
+	//   - Pull requests and questions: an opened pull request and a question a
+	//     card waits on post in the thread as messages of their own, with
+	//     buttons; the wake for a question already posted carries a note
+	//     telling the Planning Agent not to ask it again, the one effect that
+	//     reaches a model.
+	//   - Reactions: which reaction goes on an ask and when it settles.
+	//   - Reports: a fleet-audit cron report and the first inventory report
+	//     post as Block Kit, laid out again as a headline and the top findings
+	//     with the rest behind a "See all" button, through the credential
+	//     proxy's Slack relay to the channel or thread the report was already
+	//     bound for; the audit's counts come from its ledger issue, read
+	//     through the forge broker.
+	//   - Thread status: less of a delegated card's delivery posts in the
+	//     thread, the thread's cards show as one plan message, and Slack shows
+	//     a session status and title on the thread.
 	allowed := map[string]struct{}{
 		"ALERT_DAILY_LIMIT_CRITICAL": {},
 		// Not a severity, unlike its three neighbours: the drift detector's

@@ -6,7 +6,7 @@ with ``no_agent: true``. Its stdout is delivered verbatim by the cron
 scheduler to the job's configured target (``deliver: origin`` — the chat the
 user first spoke in, bound by the ``bootstrap_onboarding`` plugin).
 
-Delivery happens exactly once, and only when discovery has finished AND a
+Delivery is claimed exactly once, and only when discovery has finished AND a
 human has connected:
 
 - ``.user_aligned`` present -> a human has opened the chat (set by the plugin;
@@ -22,7 +22,8 @@ sandbox is on, and from ``HERMES_HOME`` when it is off, and only once both
 markers say a delivery is due — the ssh read is the one check with a cost.
 
 When all three hold, the script claims delivery, prints ``INVENTORY.md``
-(delivered verbatim) and sets the report aside where it was read. Otherwise it
+(verbatim, or reshaped by ``inventory_presenter`` when ``KAGE_SLACK_UX`` is on
+and the job is bound to Slack) and sets the report aside where it was read. Otherwise it
 prints nothing, which the ``no_agent`` cron path treats as a silent run (no
 message). A report it cannot read, or one over ``REPORT_MAX_BYTES``, fails the
 run instead (exit 1), which the scheduler posts as an alert; an unreachable
@@ -30,7 +31,15 @@ sandbox stays silent and is retried on the next tick. The first run
 ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
 cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
-The claim is what makes "exactly once" true rather than merely likely.
+With the flag on, a Slack origin and the credential proxy's Slack relay in the
+environment, the report goes out as Block Kit instead (a headline with the
+total, the top rows, and "Fix the first one" and "See all N" buttons), posted here
+through ``slack_blocks_post`` because the scheduler's delivery takes text only.
+Then nothing is printed; any failure prints the text. A failure after the request was
+sent may have posted, so that path can send the report twice; see
+``_posted_as_blocks``.
+
+The claim is what makes "one delivery run per report" true rather than merely likely.
 ``.bootstrap_completed`` is created with ``O_CREAT | O_EXCL`` *before* anything
 reaches stdout, so of two runs racing on the same report — a scheduled tick and
 the plugin's ``trigger_job``, say — exactly one can win the create and emit;
@@ -40,7 +49,8 @@ sent the entire onboarding report twice.
 
 Because the prioritization stage writes a finished, presentation-ready
 ``INVENTORY.md``, no LLM is involved in delivery: what that stage produced is
-exactly what the user sees. The sweep's complete findings are a different file
+what the user sees, verbatim or, on Slack with the flag on, laid out again by
+``inventory_presenter`` without a model call. The sweep's complete findings are a different file
 (``INVENTORY.raw.md``) and are never delivered from here.
 """
 
@@ -83,6 +93,15 @@ RETIRE_AFTER_SECONDS = 300
 # this name in the ~/.bashrc the model owns still shadows it, since bash allows a
 # slash in a function name; that loses only the rename, as the claim comes first.
 REMOTE_MV = "/bin/mv"
+
+# The only surface the reshaped report is written for; every other one gets it verbatim.
+PRESENTED_PLATFORM = "slack"
+
+# The delivery job's ``origin`` and the keys the plugin writes into it.
+ORIGIN_KEY = "origin"
+PLATFORM_KEY = "platform"
+CHAT_ID_KEY = "chat_id"
+THREAD_ID_KEY = "thread_id"
 
 
 def _data_dir() -> Path:
@@ -180,7 +199,7 @@ def _archive_report(data_dir: Path, in_sandbox: bool) -> None:
 
 
 def _cleanup(data_dir: Path, in_sandbox: bool) -> None:
-    """Tidy up after the report has been emitted to stdout.
+    """Tidy up after the report has been posted as blocks or emitted to stdout.
 
     Onboarding is already marked complete by the delivery claim, so everything
     here is best-effort: a cleanup hiccup must never turn a delivered report
@@ -214,6 +233,87 @@ def _retire_jobs() -> None:
             remove_job(job_id)
         except Exception as e:
             sys.stderr.write(f"bootstrap_delivery: could not remove {job_id}: {e}\n")
+
+
+def _origin() -> dict:
+    """The origin the plugin bound this job's delivery to: ``platform``,
+    ``chat_id`` and ``thread_id``; empty if unknown.
+
+    The plugin writes the origin before ``.user_aligned``, so it is set by the
+    time a delivery can fire.
+    """
+    try:
+        from cron.jobs import get_job  # type: ignore import-not-found
+
+        job = get_job(DELIVERY_JOB_ID) or {}
+        return job.get(ORIGIN_KEY) or {}
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: could not read the delivery origin: {e}\n")
+        return {}
+
+
+def _origin_platform() -> str | None:
+    """The platform the plugin bound this job's delivery to, or None if unknown."""
+    return _origin().get(PLATFORM_KEY)
+
+
+def _presented(content: str) -> str:
+    """The report as delivered: reshaped when ``KAGE_SLACK_UX`` is on and the
+    job is bound to Slack, verbatim otherwise.
+
+    Both helpers ship beside this script in ``/opt/defaults/scripts``. Any
+    failure to load or reshape delivers the report verbatim, since this runs
+    after the claim and a lost report is not retried.
+    """
+    try:
+        import slack_presenter
+
+        if not slack_presenter.enabled() or _origin_platform() != PRESENTED_PLATFORM:
+            return content
+        import inventory_presenter
+
+        return inventory_presenter.present(content)
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: delivering verbatim: {e}\n")
+        return content
+
+
+def _posted_as_blocks(content: str) -> bool:
+    """Whether the report was posted to Slack as Block Kit; False posts nothing.
+
+    False, and the caller prints the text, unless the flag is on, the origin is
+    Slack with a chat id, the relay is configured and the report parses. Any
+    failure is False too, including one that may have posted (a timeout once
+    the request was sent): this report is sent once per install, and a second
+    copy of it is a smaller loss than none.
+    """
+    try:
+        import slack_presenter
+
+        if not slack_presenter.enabled():
+            return False
+        origin = _origin()
+        channel = str(origin.get(CHAT_ID_KEY) or "")
+        if origin.get(PLATFORM_KEY) != PRESENTED_PLATFORM or not channel:
+            return False
+        import inventory_presenter
+        import slack_blocks_post
+
+        if not slack_blocks_post.configured():
+            return False
+        built = inventory_presenter.blocks(content)
+        if built is None:
+            return False
+        blocks, text = built
+        try:
+            slack_blocks_post.post(channel, text, blocks, str(origin.get(THREAD_ID_KEY) or ""))
+        except slack_blocks_post.Refused as e:
+            sys.stderr.write(f"bootstrap_delivery: Slack refused the report blocks ({e})\n")
+            return False
+        return True
+    except Exception as e:
+        sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
+    return False
 
 
 def main(data_dir: Path | None = None) -> int:
@@ -263,11 +363,12 @@ def main(data_dir: Path | None = None) -> int:
     if not _claim_delivery(data_dir):
         return 0  # another run is delivering this report — stay silent
 
-    sys.stdout.write(content)
-    sys.stdout.flush()
+    if not _posted_as_blocks(content):
+        sys.stdout.write(_presented(content))
+        sys.stdout.flush()
 
-    # Cleanup runs only after the report is safely on stdout (already captured
-    # by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
+    # Cleanup runs only after the report is posted or safely on stdout (already
+    # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
     _cleanup(data_dir, in_sandbox)
     return 0
 
