@@ -168,9 +168,15 @@ def sweep(files, jobs, makefile=PROBE_MAKEFILE):
 
 
 def _block(stdout, path):
-    """The captured output printed under `==> path`, up to the next header."""
+    """The captured output printed under `==> path`, up to the next header.
+
+    The probe's own marker line is cut off too. It follows the last block, and
+    `FAILED` is a substring of it, so a block that ran to the end of stdout would
+    satisfy an assertion about a red shard whatever the shard printed.
+    """
     after = stdout.split(f"==> {path}\n", 1)[1]
-    return after.split("\n==> ", 1)[0]
+    block = after.split("\n==> ", 1)[0]
+    return block.split(f"\n{FAILED_MARKER}", 1)[0]
 
 
 class SweepVerdictTest(unittest.TestCase):
@@ -212,7 +218,9 @@ class SweepVerdictTest(unittest.TestCase):
             green_block = _block(done.stdout, green)
             self.assertIn("Ran 1 test", green_block)
             self.assertIn("OK", green_block)
-            self.assertIn("FAILED", _block(done.stdout, red))
+            red_block = _block(done.stdout, red)
+            self.assertIn("Ran 1 test", red_block)
+            self.assertIn("FAILED (failures=1)", red_block)
 
 
 class DerivedDirectoriesTest(unittest.TestCase):
