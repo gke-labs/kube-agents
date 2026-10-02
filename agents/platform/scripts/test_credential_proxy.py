@@ -2441,6 +2441,102 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertIsInstance(seen[0], socket.socket)
 
 
+class SessionSlotCapTest(unittest.TestCase):
+    """A session's share of the broker's command pool is bounded on its own."""
+
+    def test_the_limit_comes_from_the_env_with_a_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS, credential_proxy.session_slot_limit_from_env())
+        with mock.patch.dict(os.environ, {credential_proxy.ENV_SESSION_MAX_CONCURRENT_COMMANDS: "5"}, clear=True):
+            self.assertEqual(5, credential_proxy.session_slot_limit_from_env())
+        for bad in ("0", "-1", "two"):
+            with self.subTest(bad=bad):
+                with mock.patch.dict(os.environ, {credential_proxy.ENV_SESSION_MAX_CONCURRENT_COMMANDS: bad}, clear=True):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                        self.assertEqual(
+                            credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+                            credential_proxy.session_slot_limit_from_env(),
+                        )
+
+    def test_only_the_session_role_is_counted_and_the_count_releases(self):
+        slots = credential_proxy.SessionSlots(1)
+        with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
+                with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+                    pass
+            self.assertIn("session", str(refused.exception))
+            # The shell and a roleless caller are not counted against it.
+            with slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
+                with slots.acquire(""):
+                    pass
+        # Released on exit, so the next session command is admitted.
+        with slots.acquire(credential_proxy.CALLER_ROLE_SESSION):
+            pass
+
+    def test_a_second_concurrent_session_command_is_answered_busy(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        policy_path = Path(temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=10, max_output_bytes=4096, state_dir=str(Path(temp_dir.name) / "state"), scoped_pool=None
+        )
+        stub_dir = Path(temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\nsleep 2\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.session_slots = credential_proxy.SessionSlots(1)
+        self.addCleanup(setattr, CredentialProxyHandler, "session_slots", None)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        # One patch for every thread: the role rides on a request header, so
+        # concurrent requests cannot overwrite each other's principal.
+        def authenticated(handler):
+            return credential_proxy.Principal(
+                workload="system:serviceaccount:ns:x", uid="u", groups=(), role=handler.headers.get("X-Test-Role", "")
+            )
+
+        def post_as(role):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/v1/exec",
+                data=json.dumps({"argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Test-Role": role},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+        results = {}
+        def run(name, role):
+            results[name] = post_as(role)
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", authenticated):
+            first = threading.Thread(target=run, args=("first", credential_proxy.CALLER_ROLE_SESSION))
+            first.start()
+            time.sleep(0.5)
+            second = threading.Thread(target=run, args=("second", credential_proxy.CALLER_ROLE_SESSION))
+            shell = threading.Thread(target=run, args=("shell", credential_proxy.CALLER_ROLE_SHELL))
+            second.start(); shell.start()
+            for thread in (first, second, shell):
+                thread.join(timeout=15)
+        self.assertEqual(200, results["first"][0], results["first"])
+        self.assertEqual(503, results["second"][0], results["second"])
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", results["second"][1]["code"])
+        self.assertIn("session", results["second"][1]["error"])
+        self.assertEqual(200, results["shell"][0], results["shell"])
+
+
 class SessionRoleExecutableTest(unittest.TestCase):
     """The session caller runs kubectl and gcloud through the broker and nothing else."""
 
@@ -2568,8 +2664,14 @@ class SessionRoleExecutableTest(unittest.TestCase):
             (S, ["kubectl", "logs", "deploy/x", "--all-containers", "--prefix"], None),
             (S, ["kubectl", "top", "pods", "-n", "ns", "--containers"], None),
             (S, ["kubectl", "events", "-n", "ns", "--for", "pod/x", "--types=Warning"], None),
-            (S, ["kubectl", "wait", "--for=condition=Ready", "pod/x", "--timeout=30s"], None),
-            (S, ["kubectl", "rollout", "status", "deploy/x", "-n", "ns"], None),
+            (S, ["kubectl", "rollout", "history", "deploy/x", "-n", "ns"], None),
+            # The two read verbs that wait, and the two flags that name a
+            # bound, hold a broker slot past its one-shot deadline.
+            (S, ["kubectl", "wait", "--for=condition=Ready", "pod/x"], "wait"),
+            (S, ["kubectl", "rollout", "status", "deploy/x", "-n", "ns"], "rollout status"),
+            (S, ["kubectl", "-n", "ns", "rollout", "status", "deploy/x"], "rollout status"),
+            (S, ["kubectl", "get", "pods", "--timeout=5m"], "--timeout"),
+            (S, ["kubectl", "get", "pods", "--request-timeout", "0"], "--request-timeout"),
             (S, ["kubectl", "auth", "can-i", "get", "pods", "-n", "ns"], None),
             (S, ["kubectl", "api-resources", "--namespaced=true", "--verbs=list"], None),
             (S, ["kubectl", "explain", "pods.spec.containers"], None),

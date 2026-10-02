@@ -145,6 +145,16 @@ PIPES_CLOSED_POLL_SECONDS = 0.5
 # says which routes hold a slot and why the others take none.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# The session role's own share of that pool. Session pods are opened by chat
+# conversations, and under the cluster-view flag all of them draw on the one
+# pool the platform agent's shell uses, so without a bound of their own a
+# conversation holding slow reads could starve the shell for the slot wait.
+# Counted before the pool is asked, and refused at once rather than queued:
+# a session past its share is answered busy and keeps no place in the line.
+# Deliberately small; CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS is the
+# knob, and the operator's spec.deployment.env reaches it.
+DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
+ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
 # How long a request waits for a slot before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
 # up by long-running commands answers its callers rather than parking them.
@@ -632,9 +642,16 @@ def executable_permitted(role: str, executable: str) -> bool:
 SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
     "--namespace", "--selector", "--field-selector", "--context", "--kubeconfig",
     "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
-    "--limit-bytes", "--chunk-size", "--limit", "--for", "--timeout",
-    "--request-timeout", "--types", "--verbs", "--api-group", "--template",
+    "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
+    "--api-group", "--template",
 })
+# Verbs a session may not run even though they are reads: both wait by
+# default (`rollout status` watches until the rollout completes, `wait` until
+# its condition or `--timeout`), and the broker lifts its one-shot deadline for
+# them, so each would hold a broker slot for as long as the caller likes.
+# `--timeout` and `--request-timeout` are kept out of the flags above for the
+# same reason: naming a bound is how a caller opts out of the broker's.
+SESSION_KUBECTL_REFUSED_VERBS: frozenset[tuple[str, ...]] = frozenset({("wait",), ("rollout", "status")})
 SESSION_KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     "--all-namespaces", "--show-labels", "--show-kind", "--no-headers",
     "--previous", "--timestamps", "--prefix", "--all-containers",
@@ -674,6 +691,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     tokens = argv[1:]
     index = 0
     pending: str | None = None  # a value-taking flag whose value is the next token
+    words: list[str] = []  # bare words in order: the verb first
     while index < len(tokens):
         token = tokens[index]
         index += 1
@@ -718,19 +736,11 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 break
             continue
         # A bare word: the verb, a resource, a name. The read-verb policy
-        # downstream decides what the verb may do.
-    return None
-    refused = SESSION_REFUSED_ARGUMENT_FLAGS.get(argv[0])
-    if not refused:
-        return None
-    for argument in argv[1:]:
-        if argument == "--":
-            break
-        for flag in refused:
-            if argument == flag or argument.startswith(flag + "="):
-                return flag
-            if not flag.startswith("--") and argument.startswith(flag) and not argument.startswith("--"):
-                return flag
+        # downstream decides what the verb may do; the two verbs that wait
+        # are refused here, by name, before it.
+        words.append(token)
+        if len(words) <= 2 and tuple(words) in SESSION_KUBECTL_REFUSED_VERBS:
+            return " ".join(words)
     return None
 
 
@@ -1049,6 +1059,62 @@ class CommandSlotUnavailable(RuntimeError):
     would take the container over its memory limit, and an OOM kill fails every
     request in flight for every caller, not just this one.
     """
+
+
+def session_slot_limit_from_env() -> int:
+    """The session role's concurrent-command bound, from the env or the default.
+
+    Anything that is not a positive integer falls back to the default with a
+    warning, so a typo narrows rather than opens: the default is the small
+    number, and an unset or broken knob is never "unlimited".
+    """
+    raw = os.getenv(ENV_SESSION_MAX_CONCURRENT_COMMANDS, "").strip()
+    if not raw:
+        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        LOGGER.warning(
+            "%s=%r is not a positive integer; using the default of %d",
+            ENV_SESSION_MAX_CONCURRENT_COMMANDS, raw, DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+        )
+        return DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS
+    return value
+
+
+class SessionSlots:
+    """The session role's bounded share of the command pool.
+
+    Only CALLER_ROLE_SESSION is counted; every other role passes through to
+    the pool unchanged. A session at its bound is refused immediately with
+    CommandSlotUnavailable, which the exec route already answers as busy, so
+    the shim prints why and the model reports it rather than retrying.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._in_flight = 0
+        self._lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def acquire(self, role: str) -> Iterator[None]:
+        if role != CALLER_ROLE_SESSION:
+            yield
+            return
+        with self._lock:
+            if self._in_flight >= self.limit:
+                raise CommandSlotUnavailable(
+                    f"the session role is limited to {self.limit} concurrent command(s) through the "
+                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes"
+                )
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._in_flight -= 1
 
 
 class CallerHungUp(Exception):
@@ -5889,6 +5955,9 @@ def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
+    # The session role's bounded share of the command pool, installed by main
+    # beside the executor; None (the route tests' stand-ins) means unbounded.
+    session_slots: "SessionSlots | None" = None
     max_request_bytes: int
     slack_max_request_bytes: int
     enforce_read_only: bool = True
@@ -6368,7 +6437,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
-            with self._request_slot():
+            # The session role's own bound is taken first, so a session past
+            # its share never queues for the pool the shell shares.
+            with self._session_slot(principal.role), self._request_slot():
                 result = self.executor.execute(
                     exec_argv,
                     stdin=stdin,
@@ -7331,6 +7402,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
             )
 
+    def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
+        """The session role's bounded share, or nothing for every other role."""
+        slots = getattr(self, "session_slots", None)
+        if slots is None:
+            return contextlib.nullcontext()
+        return slots.acquire(role)
+
     def _request_slot(self) -> contextlib.AbstractContextManager:
         """This request's concurrency slot, watched on this connection.
 
@@ -7481,6 +7559,7 @@ def serve(args: argparse.Namespace) -> None:
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
     CredentialProxyHandler.base_branch = (
         getattr(args, "base_branch", "")
         or os.getenv("CREDENTIAL_PROXY_BASE_BRANCH", "")
