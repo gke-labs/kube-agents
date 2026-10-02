@@ -268,6 +268,9 @@ def test_here_without_a_results_sentence_does_not_say_where_results_go(opener):
         " I'll use your runbooks for every fix.",
         " Once you share them, I'll be applying your runbooks.",
         " I applied the runbooks you shared.",
+        " Happy to follow your runbooks.",
+        " I'll use your runbooks.",
+        " Many teams keep runbooks, and I'll follow your runbooks.",
     ],
 )
 def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise):
@@ -283,9 +286,27 @@ def test_promising_to_follow_runbooks_fails_the_promise_safeguard(case, promise)
         " Useful context like runbooks helps.",
         " The users of your runbooks are welcome too.",
         " Teams often used to keep runbooks in docs.",
+        " Many teams use runbooks for on-call.",
+        " Most people follow their own runbooks.",
+        " They apply runbooks during incidents.",
     ],
 )
 def test_a_runbook_aside_that_promises_nothing_passes_the_promise_safeguard(case, aside):
     example = _example(case)
     reply = example.replace(INVITATION, INVITATION + aside)
+    assert "no-runbook-promise" not in _failing(case, reply)
+
+
+# The known limits the case's comment names: these promise, and pass.
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize(
+    "promise",
+    [
+        " I'll stick to your runbooks.",
+        " Like most teams, happy to follow your runbooks.",
+    ],
+)
+def test_the_promise_safeguards_known_limits_pass_it(case, promise):
+    example = _example(case)
+    reply = example.replace(INVITATION, INVITATION + promise)
     assert "no-runbook-promise" not in _failing(case, reply)
