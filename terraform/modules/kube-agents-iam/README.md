@@ -42,10 +42,11 @@ default, which the whole-set precondition in `main.tf` tests the counted set aga
 `exclude.clusters`, with the same caps and patterns the CRD enforces, checked at plan time. Each
 project in `projects` other than `project_id` gets the read allowlist in `scope.tf`
 (`roles/container.clusterViewer`, `roles/container.viewer`, `roles/compute.viewer`,
-`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/cloudtrace.user`, `roles/iam.securityReviewer`; the Trace role also
-carries Trace-console writes on analysis tasks and trace scopes, since no predefined role grants the trace reads alone) intersected with
+`roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`) intersected with
 `project_roles`, never `project_roles` itself, so a `custom` list that carries an admin role at
-home carries none of it elsewhere; the plan is refused when the intersection leaves no role that
+home carries none of it elsewhere, and `roles/cloudtrace.user` stays at home with the other
+host-only roles (its Trace-console writes travel with the trace reads, and the helpers that need
+the reads look at the host project's own traces); the plan is refused when the intersection leaves no role that
 lists and gets clusters (`roles/container.clusterViewer` or `roles/container.viewer`;
 `roles/iam.securityReviewer` lists but cannot get). `exclude` binds nothing and revokes nothing: it
 travels in the object so the composition renders the CR from the same value, and a project named
