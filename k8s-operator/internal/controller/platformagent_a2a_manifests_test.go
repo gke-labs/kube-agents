@@ -1088,6 +1088,7 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 		"gateway": {a2aGatewayImageEnvVar, a2aGatewayImage, "a2a-gateway"},
 		"worker":  {a2aWorkerImageEnvVar, a2aWorkerImage, "a2a-worker"},
 		"callout": {a2aCalloutImageEnvVar, a2aCalloutImage, "a2a-authcallout"},
+		"console": {a2aConsoleImageEnvVar, a2aConsoleImage, "a2a-console"},
 	}
 	for label, r := range resolvers {
 		t.Run(label, func(t *testing.T) {
@@ -1151,7 +1152,7 @@ func TestA2AReleaseImagesFollowTheAgentImage(t *testing.T) {
 // TestNoPublicRegistryWhenMirrored states for the agent Deployment.
 func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	const mirror = "mirror.corp.internal:5000/kube-agents"
-	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, operatorImageEnvVar} {
+	for _, v := range []string{a2aGatewayImageEnvVar, a2aWorkerImageEnvVar, a2aCalloutImageEnvVar, a2aConsoleImageEnvVar, operatorImageEnvVar} {
 		t.Setenv(v, "")
 	}
 	t.Setenv(platformAgentImageEnvVar, mirror+"/platform-agent:0.3.0")
@@ -1172,6 +1173,10 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
+	}
+	console := buildA2AConsoleDeployment(agent).Spec.Template.Spec.Containers[0]
+	if console.Image != mirror+"/a2a-console:0.3.0" {
+		t.Errorf("console image %q does not follow the agent image's mirror", console.Image)
 	}
 }
 

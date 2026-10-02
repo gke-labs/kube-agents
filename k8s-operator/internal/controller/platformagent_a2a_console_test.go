@@ -73,8 +73,8 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 		t.Fatalf("containers = %d, want 1", len(pod.Containers))
 	}
 	c := pod.Containers[0]
-	if c.Image != defaultA2AConsoleImage {
-		t.Errorf("image = %q, want the default %q", c.Image, defaultA2AConsoleImage)
+	if want := a2aConsoleImage(); c.Image != want {
+		t.Errorf("image = %q, want the resolved release image %q", c.Image, want)
 	}
 
 	want := map[string]string{

@@ -350,7 +350,7 @@ Before dispatching:
 3. The release images in `REQUIRED_RELEASE_IMAGES`, as `common.sh` lists them at that commit
    (on `main` today `k8s-operator`, `platform-agent`, `credential-proxy`, `agent-sandbox`,
    `replay-proxy`, `pubsub-platform`, `gke-stockout-investigator`, `a2a-gateway`, `a2a-worker`,
-   `a2a-authcallout`, `hermes-bridge`), exist in GHCR under that commit. The gate reads the
+   `a2a-authcallout`, `a2a-console`, `hermes-bridge`), exist in GHCR under that commit. The gate reads the
    candidate's list, not the checkout's (`required_release_images_at`), so a commit or a
    release line from before the list grew needs only the images it was published with.
 4. `gh`, authenticated with `repo` and `workflow` permissions (`gh auth status`).

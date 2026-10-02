@@ -67,7 +67,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-gateway",
       "tagPolicy": "release",
       "override": "A2A_GATEWAY_IMAGE",
-      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker and the callout resolve the same way.",
+      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way.",
       "description": "The chat gateway of the A2A next stack: adapters, the bus relay and the session spawner (a2a/Dockerfile.gateway)."
     },
     {
@@ -87,6 +87,15 @@
       "override": "A2A_CALLOUT_IMAGE",
       "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install.",
       "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
+    },
+    {
+      "name": "a2a-console",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-console",
+      "tagPolicy": "release",
+      "override": "A2A_CONSOLE_IMAGE",
+      "pulledBy": "The console server Deployment the operator renders under spec.mode: next, and nothing on a default install.",
+      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus (a2a/Dockerfile.console)."
     },
     {
       "name": "hermes-bridge",

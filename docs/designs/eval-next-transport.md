@@ -380,7 +380,7 @@ and the `submitted`-only classification above is the backstop rather than the fi
 repetition that reaches the deadline is infrastructure, not a failed case, but it has still
 spent its budget waiting. Two pieces of stage-1 work follow from building against the bridge,
 and both are the CI flag's (decided 2026-09-18 by the A2A owner on gke-labs/kube-agents#1661,
-with the conditions below). `a2a/Dockerfile.hermes-bridge` sits beside the three A2A
+with the conditions below). `a2a/Dockerfile.hermes-bridge` sits beside the other A2A
 Dockerfiles: the platform-agent image plus the bridge binary, built in the same Cloud Build as
 the A2A images (a step of its own, after the platform image) and tagged per pull request into the
 pool project's registry,

@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -44,10 +43,10 @@ import (
 // The Service is ClusterIP and the pod's ingress is deny-all, so the only way
 // in is the node path the port-forward takes.
 const (
-	// A dev registry default, the same as the gateway's. There's no publish
-	// path for the a2a images yet, so an install sets A2A_CONSOLE_IMAGE.
-	defaultA2AConsoleImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/console:latest"
-	a2aConsoleImageEnvVar  = "A2A_CONSOLE_IMAGE"
+	// Release surface, resolved by a2aReleaseImage like the gateway, the
+	// worker and the callout (the comment on a2aGatewayImageName says how).
+	a2aConsoleImageName   = "a2a-console"
+	a2aConsoleImageEnvVar = "A2A_CONSOLE_IMAGE"
 
 	a2aConsoleComponent    = "console"
 	a2aConsoleContainer    = "console"
@@ -111,10 +110,7 @@ const (
 )
 
 func a2aConsoleImage() string {
-	if override := os.Getenv(a2aConsoleImageEnvVar); override != "" {
-		return override
-	}
-	return defaultA2AConsoleImage
+	return a2aReleaseImage(a2aConsoleImageEnvVar, a2aConsoleImageName)
 }
 
 func a2aConsoleName(agent *agentv1alpha1.PlatformAgent) string {

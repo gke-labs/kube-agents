@@ -3,7 +3,7 @@
 # proxies its websocket to the bus.
 #
 # Build from the a2a/ module root:
-#   docker build --platform linux/amd64 -f Dockerfile.console -t <registry>/console:<tag> .
+#   docker build --platform linux/amd64 -f Dockerfile.console -t <registry>/a2a-console:<tag> .
 
 # Bases come from images.json, spelled the way Dockerfile.gateway and
 # Dockerfile.worker spell them, so `make mirror-images` and

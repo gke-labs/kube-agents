@@ -177,10 +177,11 @@ const (
 	a2aCalloutCPULimit    = "500m"
 	a2aGatewayImageEnvVar = "A2A_GATEWAY_IMAGE"
 	// The first-party next-stack images the operator renders — this one, the
-	// worker below and the auth callout (platformagent_a2a_callout.go) — are
-	// release surface: .github/workflows/docker-publish-ghcr.yml builds them
-	// beside the other first-party images, images.json carries them (as
-	// a2a-gateway, a2a-worker and a2a-authcallout), and
+	// worker below, the auth callout (platformagent_a2a_callout.go) and the
+	// console server (platformagent_a2a_console.go) — are release surface:
+	// .github/workflows/docker-publish-ghcr.yml builds them beside the other
+	// first-party images, images.json carries them (as a2a-gateway,
+	// a2a-worker, a2a-authcallout and a2a-console), and
 	// hack/check-image-inventory.sh holds these names to the inventory's
 	// entries (the name, and the repository as that name under the agent
 	// image's registry). Bare names, like shellSandboxRepositoryName: the
@@ -839,8 +840,9 @@ func a2aWorkerImage() string {
 // override if set; else the image name swapped into OPERATOR_IMAGE when it
 // carries a tag (a digest-only operator reference falls through),
 // the rung resolveShellSandboxImage uses and for the same reason - the
-// gateway, the callout and the worker consume what the operator renders (the
-// identity map, the env, the spawn spec), so their version contract is with
+// gateway, the callout, the worker and the console consume what the operator
+// renders (the identity map, the env, the spawn spec, the console's bus
+// login), so their version contract is with
 // the operator, and OPERATOR_IMAGE is set once per install by whoever
 // installed it: the chart sets it, and main.go discovers it from the pod
 // spec only when PLATFORM_AGENT_IMAGE is unset too, so a kustomize install
@@ -853,7 +855,7 @@ func a2aWorkerImage() string {
 // the matching build of each, and a mirror that carries the operator or the
 // agent image carries these under the same prefix. Never a CR's
 // spec.deployment.image: a custom agent image is that agent's choice, and the
-// bus components are not. The three env vars stay the override for an
+// bus components are not. The four env vars stay the override for an
 // install that pins one apart.
 func a2aReleaseImage(envVar, name string) string {
 	if override := os.Getenv(envVar); override != "" {
