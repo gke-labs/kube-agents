@@ -290,7 +290,7 @@ def render_fold(report: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     shown = _before_divider(report)
     if shown != report and parse_triage(shown) != parse_triage(report):
         # The buttons would offer what the fold no longer shows.
-        return _refuse_fold("a divider comes before the last option or link")
+        return _refuse_fold("a divider comes before the headline, an option or a link")
     block_kit = _load_block_kit()
     blocks = block_kit.sanitize_blocks(block_kit.render_blocks(shown, mrkdwn_fn=mrkdwn_fn))
     if not blocks:

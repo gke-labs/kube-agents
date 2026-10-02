@@ -384,7 +384,7 @@ class RuntimeTest(unittest.TestCase):
         with self.assertLogs(runtime.logger) as logs:
             self.assertIs(self.wrap(adapter, result=report), adapter)
         self.assertEqual(len(logs.output), 1)
-        self.assertIn("the fold is refused: a divider comes before the last option or link", logs.output[0])
+        self.assertIn("the fold is refused: a divider comes before the headline, an option or a link", logs.output[0])
 
     def test_a_click_sends_apply_option_as_the_clicker(self):
         adapter = _Adapter()
