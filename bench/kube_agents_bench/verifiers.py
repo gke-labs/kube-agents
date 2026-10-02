@@ -390,29 +390,23 @@ class ToolCalledVerifier(BaseVerifier):
             entries = [entry for entry in entries if not entry.get("agent")]
         elif self.scope == "workers":
             entries = [entry for entry in entries if entry.get("agent")]
+        matched_agent = True
+        seen_agents: list[str] = []
         if self.agent is not None:
+            seen_agents = sorted(
+                {
+                    str(e.get("agent"))
+                    for e in snap.trajectory
+                    if isinstance(e, dict) and e.get("agent")
+                }
+            )
             entries = [
                 entry
                 for entry in entries
                 if entry.get("agent") and re.fullmatch(self.agent, entry["agent"])
             ]
             if not entries:
-                seen_agents = sorted(
-                    {
-                        str(e.get("agent"))
-                        for e in snap.trajectory
-                        if isinstance(e, dict) and e.get("agent")
-                    }
-                )
-                return VerificationResult(
-                    success=False,
-                    status="error",
-                    elapsed_time=time.monotonic() - start,
-                    reason=(
-                        f"no worker trajectory entries matched agent selector {self.agent!r}"
-                        f" (seen agents: {seen_agents})"
-                    ),
-                )
+                matched_agent = False
         wanted = set(self.tool_names)
         calls = [
             entry
@@ -423,13 +417,21 @@ class ToolCalledVerifier(BaseVerifier):
         count = len(calls)
         ok = count >= self.minimum_calls
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
+        if self.agent is not None and not matched_agent:
+            reason = (
+                f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
+                f"{agent_str} (minimum {self.minimum_calls};"
+                f" no worker trajectory entries matched agent selector, seen agents: {seen_agents})"
+            )
+        else:
+            reason = (
+                f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
+                f"{agent_str} (minimum {self.minimum_calls})"
+            )
         return VerificationResult(
             success=ok,
             elapsed_time=time.monotonic() - start,
-            reason=(
-                f"{count} call(s) to {sorted(wanted)} in the {self.scope} trajectory"
-                f"{agent_str} (minimum {self.minimum_calls})"
-            ),
+            reason=reason,
             raw={"matching_calls": count},
         )
 

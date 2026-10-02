@@ -1389,7 +1389,7 @@ def test_tool_called_workers_scope_filters_by_agent():
     assert no_cluster.status == "fail" and no_cluster.raw == {"matching_calls": 0}
 
 
-def test_tool_called_agent_selector_matching_no_worker_is_error():
+def test_tool_called_agent_selector_matching_no_worker_is_fail():
     multi_agent_trajectory = [
         {"name": "kanban_create", "args": {}, "status": "completed"},
         {
@@ -1406,9 +1406,10 @@ def test_tool_called_agent_selector_matching_no_worker_is_error():
         scope="workers",
         agent="platform",
     ).verify(5.0)
-    assert res.status == "error"
-    assert "no worker trajectory entries matched agent selector 'platform'" in res.reason
-    assert "cluster-seeded-a-east" in res.reason
+    assert res.status == "fail"
+    assert res.raw == {"matching_calls": 0}
+    assert "no worker trajectory entries matched agent selector" in res.reason
+    assert "seen agents: ['cluster-seeded-a-east']" in res.reason
 
 
 def test_tool_called_all_scope_counts_both():
