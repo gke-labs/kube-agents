@@ -343,7 +343,8 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
 
 # Known costs of failing closed, one or more examples per kind the case's comment names: after a first-person opener
 # only other people clear the clause, so a "you" that is the subject of an embedded clause fails it too, and so does
-# a negation; a subject outside the clearing list clears nothing; a gerund is the verb; and a sentence-initial
+# a negation; "happy/glad/ready/keen to" restarts the clause whoever precedes it, so the reader as its subject
+# clears nothing; a subject outside the clearing list clears nothing; a gerund is the verb; and a sentence-initial
 # imperative to the reader reads as the promise.
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
@@ -360,6 +361,7 @@ def test_the_promise_safeguards_known_limits_pass_it(case, promise):
         " I'm curious whether you use runbooks.",
         " I'm only reading, so if you follow runbooks, share them here.",
         " I'm read-only, so I won't follow runbooks on my own.",
+        " When you're ready to use runbooks here, share them.",
         " Anyone who follows runbooks will like this.",
         " Following runbooks is common.",
     ],
