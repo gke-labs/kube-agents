@@ -92,6 +92,9 @@ class SlackAdapter:
     def _is_ignored_channel(self, channel_id):
         return False
 
+    def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
+        return True
+
     async def _handle_slack_message(self, event, payload=None):
         return bool(event.get("_hermes_force_process"))
 
@@ -206,6 +209,8 @@ class ApplierTest(unittest.TestCase):
              "_client_for no longer accepts"),
             ("    def _client_for(", "    async def _client_for(", "_client_for is now async"),
             ("def _is_ignored_channel(", "def _ignored(", "_is_ignored_channel"),
+            ("def _is_interactive_user_authorized(", "def _is_user_authorized(", "_is_interactive_user_authorized"),
+            ("user_name=None, team_id=\"\")", "user_name=None)", "_is_interactive_user_authorized no longer accepts"),
             ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
              "_is_ignored_channel no longer accepts"),
             ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
@@ -313,8 +318,12 @@ class _Client:
 
 
 class _Adapter:
-    def __init__(self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=()):
+    def __init__(
+        self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=(), replies=(), unlisted=(),
+    ):
         self.authorized = authorized
+        self.unlisted = set(unlisted)
+        self.asked = []
         self.ignored = set(ignored)
         self.replies = replies
         self.log = []
@@ -346,6 +355,10 @@ class _Adapter:
     def _get_client(self, chat_id, team_id=None):
         return _Client(self.log, self.fail, self.replies)
 
+    def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
+        self.asked.append((user_id, channel_id, team_id))
+        return user_id not in self.unlisted
+
     async def _handle_slack_message(self, event, payload=None):
         self.log.append(("message", event))
 
@@ -369,6 +382,11 @@ def _message(thread=THREAD):
     if thread:
         message["thread_ts"] = thread
     return message
+
+
+def _alert_choice(index, value):
+    """A click on an incident alert's option, on the alert itself: the thread's parent."""
+    return _choice(index, value, prefix=incident.ACTION_PREFIX, thread=None)
 
 
 def _choice(index=1, value="Leave it", shown=None, prefix="kage", **message_kwargs):
@@ -541,8 +559,11 @@ class RuntimeTest(unittest.TestCase):
         _run(presenter.ack_link_click(ack, {}, {"action_id": "kage.link.0"}))
         self.assertEqual(acks, [True])
 
-    def _incident(self, adapter, value="Apply Option B"):
-        self._answer(adapter, *_choice(1, value, prefix=incident.ACTION_PREFIX))
+    def _incident(self, adapter, value="Apply Option B", edited=None):
+        body, action = _alert_choice(1, value)
+        if edited:
+            body["message"]["edited"] = {"user": "B1", "ts": edited}
+        self._answer(adapter, body, action)
 
     def test_the_incident_prefix_is_the_one_the_alert_buttons_carry(self):
         self.assertEqual(
@@ -551,11 +572,12 @@ class RuntimeTest(unittest.TestCase):
 
     def test_a_typed_apply_strikes_the_buttons_and_drops_the_click(self):
         typed = {"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}
-        adapter = _Adapter(replies=[{"type": "message", "bot_id": "B1", "text": "alert", "ts": THREAD}, typed])
+        adapter = _Adapter(replies=[{"type": "message", "bot_id": "B1", "text": "alert", "ts": MESSAGE_TS}, typed])
         self._incident(adapter)
         self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update"])
         read, update = (entry[1] for entry in adapter.log)
-        self.assertEqual((read["channel"], read["ts"]), (CHANNEL, THREAD))
+        self.assertEqual((read["channel"], read["ts"], read["oldest"]), (CHANNEL, MESSAGE_TS, MESSAGE_TS))
+        self.assertEqual(adapter.asked, [("U2", CHANNEL, TEAM)])
         self.assertFalse([b for b in update["blocks"] if b["type"] == "actions" and len(b["elements"]) > 1])
         self.assertEqual(update["blocks"][-1]["elements"][0]["text"], runtime.ANSWERED_IN_THREAD)
         # A second click on the struck message does not read or run either.
@@ -573,8 +595,8 @@ class RuntimeTest(unittest.TestCase):
     def test_what_is_not_a_human_typing_apply_after_the_alert_does_not_drop_the_click(self):
         cases = {
             "a bot": {"type": "message", "user": "U9", "bot_id": "B1", "text": "apply Option B", "ts": "223.000"},
-            "a subtype": {"type": "message", "subtype": "bot_message", "user": "U2", "text": "apply it", "ts": "223.000"},
-            "before the alert": {"type": "message", "user": "U2", "text": "apply the old fix", "ts": "221.000"},
+            "a subtype": {"type": "message", "subtype": "bot_message", "user": "U2", "text": "apply B", "ts": "223.000"},
+            "before the alert": {"type": "message", "user": "U2", "text": "apply Option A", "ts": "221.000"},
             "the alert itself": {"type": "message", "user": "U2", "text": "apply", "ts": MESSAGE_TS},
             "apply mid-sentence": {"type": "message", "user": "U2", "text": "should we apply B?", "ts": "223.000"},
             "a longer word": {"type": "message", "user": "U2", "text": "applying B now", "ts": "223.000"},
@@ -588,6 +610,57 @@ class RuntimeTest(unittest.TestCase):
                     [entry[0] for entry in adapter.log],
                     ["conversations_replies", "chat_update", "chat_postMessage", "message"],
                 )
+
+    def _runs(self, adapter):
+        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update", "chat_postMessage", "message"])
+
+    def _drops(self, adapter):
+        self.assertEqual([entry[0] for entry in adapter.log], ["conversations_replies", "chat_update"])
+
+    def test_a_typed_apply_from_someone_the_adapter_ignores_does_not_drop_the_click(self):
+        adapter = _Adapter(
+            replies=[{"type": "message", "user": "U3", "text": "apply Option B", "ts": "223.000"}], unlisted={"U3"},
+        )
+        self._incident(adapter)
+        self._runs(adapter)
+        self.assertEqual(adapter.asked, [("U3", CHANNEL, TEAM)])
+
+    def test_a_reply_typed_before_the_options_appeared_does_not_drop_the_click(self):
+        # The alert is posted at 222 and edited into its options at 230.
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "225.000"}])
+        self._incident(adapter, edited="230.000")
+        self._runs(adapter)
+        self.assertEqual(adapter.log[0][1]["oldest"], "230.000")
+
+        importlib.reload(runtime)
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "231.000"}])
+        self._incident(adapter, edited="230.000")
+        self._drops(adapter)
+
+    def test_only_the_call_to_actions_forms_drop_the_click(self):
+        drops = (
+            "apply", "apply.", "Apply!", "apply B", "apply Option B", "apply option b: Restore the secret",
+            "yes, apply B", "please apply B", "ok apply", "@kage apply B", "<@U0BOT> <@U0BOT2> apply B",
+            "*apply* B", "'apply'", "`apply Option A`", "&gt; apply B", "> apply B", ":white_check_mark: apply B",
+            "\u2705 apply B",
+        )
+        runs = (
+            "Apply the label later?", "apply nothing", "apply? which one", "Apply Option B - wait, not yet",
+            "apply-now", "reapply B", "applying B now", "should we apply B?", "apply a fix",
+        )
+        for text, check in [*((t, self._drops) for t in drops), *((t, self._runs) for t in runs)]:
+            with self.subTest(text=text):
+                importlib.reload(runtime)
+                adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": text, "ts": "223.000"}])
+                self._incident(adapter)
+                check(adapter)
+
+    def test_a_typed_apply_also_sent_to_the_channel_drops_the_click(self):
+        adapter = _Adapter(replies=[
+            {"type": "message", "subtype": "thread_broadcast", "user": "U2", "text": "apply B", "ts": "223.000"},
+        ])
+        self._incident(adapter)
+        self._drops(adapter)
 
     def test_a_failed_thread_read_runs_the_click_as_before(self):
         adapter = _Adapter(fail=("conversations_replies",))
@@ -605,14 +678,14 @@ class RuntimeTest(unittest.TestCase):
             seen.append([entry[1]["text"] for entry in adapter.log if entry[0] == "chat_update"])
 
         adapter._handle_slack_message = turn
-        body, action = _choice(1, "Apply Option B", prefix=incident.ACTION_PREFIX)
+        body, action = _alert_choice(1, "Apply Option B")
         body["message"]["text"] = report
         self._answer(adapter, body, action)
         self.assertEqual(seen, [[f"✓ <@U1>: Apply Option B\n\n{report}"]])
 
     def test_typed_apply_keeps_the_report_too(self):
         adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
-        body, action = _choice(1, "Apply Option A", prefix=incident.ACTION_PREFIX)
+        body, action = _alert_choice(1, "Apply Option A")
         body["message"]["text"] = "the report"
         self._answer(adapter, body, action)
         self.assertEqual(adapter.log[-1][1]["text"], f"{runtime.ANSWERED_IN_THREAD}\n\nthe report")
@@ -639,9 +712,9 @@ class RuntimeTest(unittest.TestCase):
 
         async def both():
             await asyncio.gather(
-                runtime.answer(adapter, self._ack(adapter), *_choice(1, "Apply Option B", prefix=incident.ACTION_PREFIX),
+                runtime.answer(adapter, self._ack(adapter), *_alert_choice(1, "Apply Option B"),
                                runtime.CHOICE_KIND),
-                runtime.answer(adapter, self._ack(adapter), *_choice(0, "Apply Option A", prefix=incident.ACTION_PREFIX),
+                runtime.answer(adapter, self._ack(adapter), *_alert_choice(0, "Apply Option A"),
                                runtime.CHOICE_KIND),
             )
 
@@ -650,7 +723,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(turns, ["Apply Option B"])
 
     def test_a_click_on_a_card_question_does_not_read_the_thread(self):
-        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply it", "ts": "223.000"}])
+        adapter = _Adapter(replies=[{"type": "message", "user": "U2", "text": "apply Option B", "ts": "223.000"}])
         self._answer(adapter, *_choice())
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_update", "chat_postMessage", "message"])
 

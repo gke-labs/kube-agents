@@ -12,7 +12,7 @@ Two things are checked:
    ``_begin_interaction(ack, body, action, kind)`` returning the eight fields
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
    ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
-   ``_get_client`` and ``_handle_slack_message``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
+   ``_get_client``, ``_handle_slack_message`` and ``_is_interactive_user_authorized``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
    action handlers, and the flag guard calling
@@ -54,7 +54,7 @@ ADAPTER_CLASS = "SlackAdapter"
 #: check ties them to upstream.
 RUNTIME_MEMBERS = (
     "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
-    "_get_client", "_handle_slack_message", "_client_for",
+    "_get_client", "_handle_slack_message", "_client_for", "_is_interactive_user_authorized",
 )
 #: The members the runtime awaits; every other one it calls plainly.
 ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message")
@@ -73,6 +73,7 @@ CALL_SHAPES = {
     "_get_client": ((1, ("team_id",)),),
     "_client_for": ((2, ()),),
     "_handle_slack_message": ((1, ()),),
+    "_is_interactive_user_authorized": ((1, ("channel_id", "team_id")),),
 }
 
 CHANNEL = "C0KAGE"
@@ -318,6 +319,9 @@ class _StubAdapter:
 
     def _get_client(self, chat_id, team_id=None):
         return _Client(self.log)
+
+    def _is_interactive_user_authorized(self, user_id, *, channel_id="", user_name=None, team_id=""):
+        return self.authorized
 
     async def _handle_slack_message(self, event, payload=None):
         self.log.append(("message", event))

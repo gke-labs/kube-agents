@@ -45,10 +45,16 @@ again.
 An incident alert's option buttons (``kage_incident.choice.<n>``) can also be
 answered by typing: someone replies ``apply Option B`` in the thread, the agent
 applies it, and the buttons are still there. So before such a click counts,
-the thread is read once, and if a person (not a bot) has replied starting with
-``apply`` since the alert was posted, the buttons are replaced with "answered
-in the thread" and the click is dropped. A read that fails runs the click as
-if nothing had been typed. Other choice buttons are not checked.
+the thread is read once, and if a person the adapter would answer (its own
+interactive authorization, the check the clicker passed) has replied with one
+of the call to action's forms (``apply``, ``apply Option B``, ``apply B``)
+since the buttons appeared, the buttons are replaced with "answered in the
+thread" and the click is dropped. The buttons appear when the alert is edited
+into its triage, so that edit's time, which the click's payload carries, is
+the start; a reply typed during the diagnosis does not count. The match is a
+heuristic: the agent reads a typed reply as free text, so this guesses what it
+will apply. A read that fails runs the click as if nothing had been typed.
+Other choice buttons are not checked.
 
 Fail-soft throughout: a rewrite or echo that fails is logged and the turn
 still runs, because the click was the user's answer.
@@ -105,9 +111,23 @@ ANSWERED_MAX = 512
 #: presenter's choice segment, copied because that module is not imported here.
 INCIDENT_CHOICE_PREFIX = "kage_incident.choice."
 
-#: A reply typed to apply an option, with or without the leading mention Slack
-#: prepends when the bot is @-mentioned.
-TYPED_APPLY = re.compile(r"^\s*(?:<@[UWB][A-Z0-9]+>\s*)?apply\b", re.IGNORECASE)
+#: Inline markup a reply can wrap the word in, dropped before it is matched.
+TYPED_MARKUP = str.maketrans("", "", "*_~`'\"‘’“”")
+
+#: What can come before a typed apply and is not part of it: mentions (Slack's
+#: ``<@U…>`` or a plain ``@name``), a blockquote (``&gt;`` as Slack sends it), emoji
+#: codes, punctuation, and a yes or a please.
+TYPED_LEAD = re.compile(
+    r"^(?:\s+|<@[UWB][A-Z0-9]+>|@\S+|&gt;|:[\w+-]+:|[^\w\s]|(?:yes|ok|okay|sure|please)\b)*",
+    re.IGNORECASE,
+)
+
+#: The call to action's own forms, ``apply``, ``apply Option B`` or ``apply B``, ending
+#: the reply or followed by ``:`` as a button's text is.
+TYPED_APPLY = re.compile(r"apply(?:\s+(?:option\s+)?[A-Z]\b)?(?::|[.!]*\s*$)", re.IGNORECASE)
+
+#: The one reply subtype that is still a person typing: "also send to channel".
+TYPED_SUBTYPES = frozenset({"thread_broadcast"})
 
 #: The line that replaces an alert's buttons when someone typed the apply first.
 ANSWERED_IN_THREAD = "✓ answered in the thread"
@@ -226,24 +246,40 @@ def _after(ts: Any, msg_ts: str) -> bool:
         return False
 
 
-async def _applied_by_typing(client: Any, channel_id: str, thread_ts: str, msg_ts: str) -> bool:
-    """Whether a person replied ``apply ...`` in the thread after the alert. One read;
-    a read that fails answers no, so the click runs as it would without the check."""
+def _buttons_shown(message: dict, msg_ts: str) -> str:
+    """When the clicked message got its buttons: its last edit, or its post if it was never edited."""
+    edited = message.get("edited")
+    edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
+    return edited_ts if _after(edited_ts, msg_ts) else msg_ts
+
+
+def _typed_apply(text: str) -> bool:
+    """Whether ``text`` is one of the call to action's forms. A guess at what the agent applies."""
+    text = text.translate(TYPED_MARKUP)
+    return bool(TYPED_APPLY.match(text, TYPED_LEAD.match(text).end()))
+
+
+async def _applied_by_typing(
+    adapter: Any, client: Any, channel_id: str, team_id: str, thread_ts: str, since: str,
+) -> bool:
+    """Whether a person the adapter would answer typed an apply in the thread after ``since``.
+    One read; a read that fails answers no, so the click runs as it would without the check."""
     try:
         response = await client.conversations_replies(
-            channel=channel_id, ts=thread_ts, oldest=msg_ts, limit=REPLIES_READ_MAX,
+            channel=channel_id, ts=thread_ts, oldest=since, limit=REPLIES_READ_MAX,
         )
         replies = response.get("messages") or []
     except Exception as exc:  # noqa: BLE001 — the click still answers
-        logger.warning("slack_ux_clicks: could not read the thread of %s; running the click: %s", msg_ts, exc)
+        logger.warning("slack_ux_clicks: could not read the thread of %s; running the click: %s", thread_ts, exc)
         return False
     return any(
         isinstance(reply, dict)
         and reply.get("user")
         and not reply.get("bot_id")
-        and not reply.get("subtype")
-        and _after(reply.get("ts"), msg_ts)
-        and TYPED_APPLY.match(str(reply.get("text") or ""))
+        and (not reply.get("subtype") or reply.get("subtype") in TYPED_SUBTYPES)
+        and _after(reply.get("ts"), since)
+        and _typed_apply(str(reply.get("text") or ""))
+        and adapter._is_interactive_user_authorized(reply["user"], channel_id=channel_id, team_id=team_id)
         for reply in replies
     )
 
@@ -276,7 +312,7 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     thread_ts = _thread_ts(body, message, msg_ts)
     client = adapter._get_client(channel_id, team_id=team_id)
     typed = action_id.startswith(INCIDENT_CHOICE_PREFIX) and await _applied_by_typing(
-        client, channel_id, thread_ts, msg_ts,
+        adapter, client, channel_id, team_id, thread_ts, _buttons_shown(message, msg_ts),
     )
     # Checked again: another click on this message may have landed during the read.
     if key in _answered:
