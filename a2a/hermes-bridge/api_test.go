@@ -89,8 +89,18 @@ func writeCompletion(w http.ResponseWriter, sessionID, text string) {
 	})
 }
 
-// startAPIBridge runs a bridge on the API executor against stub.
+// startAPIBridge runs a bridge on the API executor against stub, with the
+// test's door, on a port the kernel picked, standing in for the address the
+// pod-wide hook posts to.
 func startAPIBridge(t *testing.T, url string, stub *apiStub, mutate func(*Config)) *Bridge {
+	t.Helper()
+	return startAPIBridgeReaching(t, url, stub, mutate, func(net.Addr) bool { return true })
+}
+
+// startAPIBridgeReaching is startAPIBridge with the hook-reach check given.
+// It is set before the bridge starts and restored at cleanup, because the
+// bridge's goroutines read it.
+func startAPIBridgeReaching(t *testing.T, url string, stub *apiStub, mutate func(*Config), reaches func(net.Addr) bool) *Bridge {
 	t.Helper()
 	cfg := Config{
 		NATSURL:      url,
@@ -103,18 +113,11 @@ func startAPIBridge(t *testing.T, url string, stub *apiStub, mutate func(*Config
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	hookAtTheTestDoor(t)
+	prev := activityHookReaches
+	activityHookReaches = reaches
+	t.Cleanup(func() { activityHookReaches = prev })
 	b, _ := startBridgeConfig(t, cfg, nil)
 	return b
-}
-
-// hookAtTheTestDoor makes the test's door, on a port the kernel picked,
-// stand in for the address the pod-wide hook posts to.
-func hookAtTheTestDoor(t *testing.T) {
-	t.Helper()
-	prev := activityHookReaches
-	activityHookReaches = func(net.Addr) bool { return true }
-	t.Cleanup(func() { activityHookReaches = prev })
 }
 
 // submitIn is submit with the caller's contextId, so two tasks can share a
@@ -622,11 +625,10 @@ func TestAPI_DoorElsewhereIsUntraced(t *testing.T) {
 		lines <- run.act.Load().progressLine(time.Now())
 		writeCompletion(w, c.sessionID, "done")
 	})
-	b = startAPIBridge(t, url, stub, func(cfg *Config) {
+	b = startAPIBridgeReaching(t, url, stub, func(cfg *Config) {
 		cfg.ActivityListen = "127.0.0.1:0"
 		cfg.ActivitySecret = "pod-wide-activity-key"
-	})
-	activityHookReaches = doorReceivesHook
+	}, doorReceivesHook)
 	close(ready)
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-elsewhere", "ctx-elsewhere", "go")
