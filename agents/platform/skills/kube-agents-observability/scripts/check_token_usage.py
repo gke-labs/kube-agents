@@ -14,12 +14,21 @@ TIME_SERIES_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeS
 INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_tokens_metric_total/counter"
 OUTPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_output_tokens_metric_total/counter"
 CACHED_INPUT_TOKENS_METRIC = "prometheus.googleapis.com/litellm_input_cached_tokens_metric_total/counter"
-# Points per page (`timeSeries.list` counts points, not series, at the
-# default FULL view). Monitoring's own page holds 100,000 when no size is
-# sent, which crosses the relay's 8 MiB response cap long before it; a day
-# of counter points at this size relays in a fraction of that, and the pages
-# are followed, so the sum covers the whole window or fails saying why.
-PAGE_SIZE = 10000
+# The window is summed on the server. `timeSeries.list` with an aggregation
+# answers the question directly: ALIGN_DELTA turns each cumulative series
+# into its increase over one alignment period the width of the window, with
+# counter resets handled where the series is kept, and REDUCE_SUM adds every
+# series into one, so the reply is one series with one point whatever the
+# install's label cardinality. Read at the FULL view instead, the list pages
+# in points, and a day of points from a few hundred series ran past any page
+# cap a reader could hold; the broker forwards `aggregation.*` as it does
+# every other query key, and fleet_waste.py sends the same keys today.
+ALIGNMENT_PERIOD_PARAM = "aggregation.alignmentPeriod"
+PER_SERIES_ALIGNER_PARAM = "aggregation.perSeriesAligner"
+CROSS_SERIES_REDUCER_PARAM = "aggregation.crossSeriesReducer"
+ALIGN_DELTA = "ALIGN_DELTA"
+REDUCE_SUM = "REDUCE_SUM"
+SECONDS_PER_HOUR = 3600
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -42,58 +51,49 @@ def parse_value(pt) -> float:
     return val
 
 
-def series_key(ts: dict) -> str:
-    """What identifies one series across pages: its metric and resource labels."""
-    return json.dumps({"metric": ts.get("metric"), "resource": ts.get("resource")}, sort_keys=True)
+def aggregation_params(hours: int) -> dict:
+    """The query keys that make Monitoring sum the counters' increase over the window."""
+    return {
+        ALIGNMENT_PERIOD_PARAM: f"{hours * SECONDS_PER_HOUR}s",
+        PER_SERIES_ALIGNER_PARAM: ALIGN_DELTA,
+        CROSS_SERIES_REDUCER_PARAM: REDUCE_SUM,
+    }
 
 
-def counter_delta(series: list) -> float:
-    """The summed increase across every series, counter resets counted from zero.
+def summed_points(series: list) -> float:
+    """Every point of every series returned, added.
 
-    A page boundary can fall inside one series, which then arrives as two
-    entries with the same labels; their points are joined before the diff,
-    or the step across the boundary would be lost.
+    After the reducer there is one series with one point; an aligned delta is
+    additive, so a reply that split the window or the series into more than
+    one still sums to the increase over the window.
     """
-    points_by_series: dict[str, list] = {}
-    for ts in series:
-        points_by_series.setdefault(series_key(ts), []).extend(ts.get("points", []))
-    total_delta = 0
-    for points in points_by_series.values():
-        if len(points) < 2:
-            continue
-        points.sort(key=lambda x: (x.get("interval") or {}).get("endTime", ""))
-        prev_val = None
-        for pt in points:
-            val = parse_value(pt)
-            if prev_val is not None:
-                diff = val - prev_val
-                total_delta += diff if diff >= 0 else val
-            prev_val = val
-    return total_delta
+    return sum(parse_value(pt) for ts in series for pt in ts.get("points", []))
 
 
-def get_token_delta(session, project_id: str, metric_name: str, start_str: str, end_str: str) -> float:
+def get_token_delta(session, project_id: str, metric_name: str, start_str: str, end_str: str, hours: int) -> float:
     params = {
         "filter": f'metric.type="{metric_name}"',
         "interval.startTime": start_str,
         "interval.endTime": end_str,
-        "pageSize": PAGE_SIZE,
+        **aggregation_params(hours),
     }
     url = TIME_SERIES_URL.format(project=urllib.parse.quote(project_id, safe=""))
-    return counter_delta(google_api.get_paginated(session, url, params=params, items_key="timeSeries", whole=True))
+    return summed_points(google_api.get_paginated(session, url, params=params, items_key="timeSeries", whole=True))
 
 
 def main(argv=None, session=None) -> int:
     args = parse_args(argv)
-    start_str, end_str = google_api.window(google_api.DEFAULT_WINDOW_HOURS)
+    hours = google_api.DEFAULT_WINDOW_HOURS
+    start_str, end_str = google_api.window(hours)
     try:
         session = session or google_api.open_session()
         usage = {
-            "input_tokens": get_token_delta(session, args.project_id, INPUT_TOKENS_METRIC, start_str, end_str),
-            "output_tokens": get_token_delta(session, args.project_id, OUTPUT_TOKENS_METRIC, start_str, end_str),
-            "cached_input_tokens": get_token_delta(
-                session, args.project_id, CACHED_INPUT_TOKENS_METRIC, start_str, end_str
-            ),
+            metric_key: get_token_delta(session, args.project_id, metric, start_str, end_str, hours)
+            for metric_key, metric in (
+                ("input_tokens", INPUT_TOKENS_METRIC),
+                ("output_tokens", OUTPUT_TOKENS_METRIC),
+                ("cached_input_tokens", CACHED_INPUT_TOKENS_METRIC),
+            )
         }
     except google_api.RelayError as exc:
         print(f"Error querying the Monitoring API: {exc}", file=sys.stderr)
