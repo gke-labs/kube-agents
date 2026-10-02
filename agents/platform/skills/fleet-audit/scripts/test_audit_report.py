@@ -5492,9 +5492,35 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         (left,) = doc["findings"]
         self.assertEqual(changed, [left["id"]])
         self.assertEqual(left["remediation"]["kind"], "manual")
-        self.assertTrue(left["remediation"]["note"].startswith("Set automountServiceAccountToken: false"))
+        # The shield comes first: the worker's text is the shared-account fix,
+        # and the renderer clips a long note from the end.
+        self.assertTrue(left["remediation"]["note"].startswith(audit_report.SHARED_ACCOUNT_SHIELD_PREFIX))
+        self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
         self.assertEqual(audit_report.shield_declared_account_siblings(doc), [])
+        self.assertEqual(audit_report.shielded_finding_ids(doc), {left["id"]})
+
+    def test_the_shield_folds_cluster_and_namespace_as_the_id_does(self):
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker", namespace="Payments ")
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            changed = audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        self.assertEqual(changed, [left["id"]])
+        self.assertEqual(left["remediation"]["kind"], "manual")
+
+    def test_an_incomplete_search_withholds_the_namespace_posture_and_publishes_the_allow_all_fault(self):
+        posture = make_finding(fid="ns", severity="major", obj="Namespace/payments", check="netpol-missing")
+        fault = make_finding(fid="open", severity="minor", obj="NetworkPolicy/allow-everything", check="netpol-missing")
+        doc = audit_report.validate_findings(make_doc(findings=[posture, fault], audit=AUDIT), AUDIT)
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual([f["object"] for f in withheld], ["Namespace/payments"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NetworkPolicy/allow-everything"])
 
     def test_no_declared_workload_leaves_the_shared_file_alone(self):
         doc = audit_report.validate_findings(make_doc(findings=[self._sa_finding("api", "Deployment/api"), self._sa_finding("worker", "Deployment/worker")], audit=AUDIT), AUDIT)
@@ -15966,6 +15992,43 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
         self.assertTrue(self.harness.forge_calls("proposal-close"))
         self.assertNotIn("NOT being announced as resolved", self.err)
+
+    def account_candidate(self, obj):
+        return {
+            "check": "default-sa-automount",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": obj,
+            "severity": "major",
+            "excerpt": "automountServiceAccountToken unset on the default ServiceAccount",
+        }
+
+    def test_a_shielded_sibling_closes_the_shared_account_pull_request(self):
+        # Run N opened a pull request for api and worker together (the shared
+        # default-sa-automount.yaml); the owner then declared api. Run N+1 moves
+        # api to declared, the shield turns worker manual, and the pull request
+        # that still proposes the shared-account fix is closed with that reason.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        previous_body = published_body(make_doc(findings=[api, worker], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        self.harness.replies["pr list"] = json.dumps(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id]))]
+        )
+        self.touch(path)
+        doc = make_doc(findings=[worker], audit=AUDIT)
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertTrue(self.harness.gh_calls("pr", "close"))
+        comment = " ".join(b for b in self.harness.bodies if b)
+        self.assertIn("declared to need the `default` ServiceAccount's token", comment)
 
     def replay_ledger(self, body):
         """A fresh recorder whose open ledger carries `body`."""

@@ -864,6 +864,15 @@ SHARED_ACCOUNT_SHIELD_NOTE = (
     "set `automountServiceAccountToken: false` on the undeclared workloads' pod specs, or on the "
     "account once the declared workload sets `true` on its own spec.)_"
 )
+# The shield's fixed opening, which marks a finding the shield demoted on any
+# later read of the document, and the reason a pull request opened for the
+# shared-account fix before the declaration is closed.
+SHARED_ACCOUNT_SHIELD_PREFIX = SHARED_ACCOUNT_SHIELD_NOTE.split("{declared}")[0]
+SHARED_ACCOUNT_STALE_REASON = (
+    "Closing unmerged: a workload in this namespace is now declared to need the `default` "
+    "ServiceAccount's token, so the shared-account fix this pull request proposes would remove "
+    "it; the remaining findings are manual, per pod spec."
+)
 
 # Harness-side declaration discovery (the obtainability SOP's §4a). `start`
 # reads every repository the step must search, collects the declarations it
@@ -4571,7 +4580,9 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
 
     What goes: every finding whose check is declarable, the dangling-target
     `hpa-cannot-scale` fault included, because it shares its slug with the
-    `min == max` posture and this side cannot tell them apart. What stays: the
+    `min == max` posture and this side cannot tell them apart; the allow-all
+    `NetworkPolicy/` fault of `netpol-missing` stays, because its object does
+    tell it apart (`_is_namespace_object`). What stays: the
     faults, and every `declared[]` entry, each of which cites the file it
     read. The withheld findings are filed on the document under
     `postures_withheld`, with the repositories not searched, so that
@@ -4595,8 +4606,15 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
     kept: list[dict] = []
     withheld: list[dict] = []
     for finding in data.get("findings") or []:
-        target = withheld if str(finding.get("check", "")) in declarable else kept
-        target.append(finding)
+        check = str(finding.get("check", ""))
+        # The allow-all `NetworkPolicy/` fault shares netpol-missing's slug and
+        # is told apart by its object, as the join tells it apart, so it
+        # publishes; the hpa dual-shape fault cannot be told apart here and
+        # is held with the postures (see the docstring).
+        posture = check in declarable and not (
+            check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(finding.get("object", "")))
+        )
+        (withheld if posture else kept).append(finding)
     data["findings"] = kept
     data[POSTURES_WITHHELD_KEY] = {
         "findings": withheld,
@@ -5192,6 +5210,15 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     return moved
 
 
+def shielded_finding_ids(data: dict) -> set[str]:
+    """The ids `shield_declared_account_siblings` demoted, read back off their notes."""
+    return {
+        str(f.get("id", ""))
+        for f in data.get("findings") or []
+        if SHARED_ACCOUNT_SHIELD_PREFIX in str((f.get("remediation") or {}).get("note", ""))
+    }
+
+
 def shield_declared_account_siblings(data: dict) -> list[str]:
     """Keep a declared 2.7 workload's token by making its siblings' fixes manual.
 
@@ -5204,18 +5231,22 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
     file: `kind: manual`, with a note naming the declared workload and the two
     ways to fix the rest. Returns the ids changed, each logged.
     """
+    # Keyed as the finding id folds its fields, so a sibling the model wrote
+    # as `Payments ` still meets a declaration written as `payments`.
+    def key_of(item: dict) -> tuple[str, str]:
+        return (_id_segment(str(item.get("cluster", ""))), _id_segment(str(item.get("namespace") or "")))
+
     shielded_by: dict[tuple[str, str], list[dict]] = {}
     for entry in data.get("declared") or []:
         if str(entry.get("check", "")) == SHARED_ACCOUNT_CHECK:
-            key = (str(entry.get("cluster", "")), str(entry.get("namespace") or ""))
-            shielded_by.setdefault(key, []).append(entry)
+            shielded_by.setdefault(key_of(entry), []).append(entry)
     if not shielded_by:
         return []
     changed: list[str] = []
     for finding in data.get("findings") or []:
         if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
             continue
-        declared = shielded_by.get((str(finding.get("cluster", "")), str(finding.get("namespace") or "")))
+        declared = shielded_by.get(key_of(finding))
         if not declared:
             continue
         remediation = finding.setdefault("remediation", {})
@@ -5230,11 +5261,13 @@ def shield_declared_account_siblings(data: dict) -> list[str]:
             continue
         # A sibling the worker already filed as manual (2.7's default, since
         # few repositories declare the auto-created `default` ServiceAccount)
-        # keeps its kind and gains the note: its own manual text is 2.7's
-        # shared-account fix, which the reader must not follow here either.
+        # keeps its kind and gains the note. The shield goes first: the
+        # worker's own text is 2.7's shared-account fix, and the renderer
+        # clips a long note from the end, so the part that must survive and
+        # be read first is the one that says not to apply it.
         remediation["kind"] = "manual"
         remediation["path"] = ""
-        remediation["note"] = (f"{note} " if note else "") + shield
+        remediation["note"] = shield + (f" {note}" if note else "")
         fid = str(finding.get("id", ""))
         changed.append(fid)
         log(
@@ -10121,8 +10154,15 @@ def close_stale_remediation_prs(
     generated_at: datetime,
     *,
     branch_by_finding: dict[str, str] | None = None,
+    shielded_ids: set[str] | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
+
+    A third reason, `shielded_ids`: a pull request whose only persisting
+    findings `shield_declared_account_siblings` demoted this run proposes the
+    shared-account fix for a namespace that now holds a declared workload, so
+    it is closed with that reason rather than left open as the only fix there
+    is — merging it would be the harm the shield exists to prevent.
 
     Two reasons a pull request is stale, and the second one is why this cannot
     just read the hidden block. A pull request is stale when every finding it
@@ -10145,6 +10185,7 @@ def close_stale_remediation_prs(
     """
     closed: list[str] = []
     branch_by_finding = branch_by_finding or {}
+    shielded_ids = shielded_ids or set()
     live_branches = set(branch_by_finding.values())
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
@@ -10168,8 +10209,9 @@ def close_stale_remediation_prs(
         # an unjoinable body: that is "cannot tell", not "none of them", and the
         # branch rule below is the only one allowed to act on it.
         persisting = [fid for fid in covered if fid in current_ids] if joinable else []
+        only_shielded = bool(persisting) and all(fid in shielded_ids for fid in persisting)
         if not orphaned:
-            if not covered or not joinable or persisting:
+            if not covered or not joinable or (persisting and not only_shielded):
                 continue
 
         # An orphaned branch means the work *moved* only if the work still has
@@ -10180,7 +10222,7 @@ def close_stale_remediation_prs(
         # of the fix that exists anywhere. Closing it destroys reviewed work to
         # correct a grouping that never changed, and points the reviewer at a
         # replacement branch that was never pushed.
-        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding)
+        stranded = sorted(fid for fid in persisting if fid not in branch_by_finding and fid not in shielded_ids)
         if orphaned and stranded:
             log(
                 f"PR #{number} covers {', '.join(stranded)}, which still "
@@ -10216,7 +10258,9 @@ def close_stale_remediation_prs(
         # came back; over an unjoinable body the branch is the one fact this
         # run actually established, so that is what the comment says.
         reason = ""
-        if persisting or not joinable:
+        if only_shielded:
+            reason = SHARED_ACCOUNT_STALE_REASON
+        elif persisting or not joinable:
             reason = (
                 f"Closing unmerged: the `{audit_id}` audit no longer groups its "
                 f"findings onto `{head}`. The set of files this fix would touch "
@@ -12440,7 +12484,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # not stale either: a pull request whose finding never reached
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
-                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now
+                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
+                shielded_ids=shielded_finding_ids(data),
             )
         )
         conversation_unread = False
@@ -12975,6 +13020,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 for group in remediation_groups(findings)
                 for finding in group
             },
+            shielded_ids=shielded_finding_ids(data),
         )
 
     prs_opened = _open_promoted_prs(
