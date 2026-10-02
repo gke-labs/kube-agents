@@ -396,11 +396,12 @@ ALERT_DAILY_LIMITS = {
 # to dispatch.
 INJECT_KIND_DRIFT = "gitops-drift"
 
-# The `kind` stall_watch.py stamps on a new stall episode (`INJECT_KIND` there).
-# The two spellings are one decision. Change this one alone and the watch,
-# which checks `/healthz` for its kind before every inject, raises nothing at
-# all; a producer that skipped that check would have its record taken down the
-# event path as a Pod alert with reason `Unknown`.
+# The `kind` a stall producer stamps on a new stall episode
+# (docs/designs/stall-watch-inject.md). Producer and daemon spell it once each.
+# A producer that checks `/healthz` for its kind before every inject, as the
+# design has the stall watch do, raises nothing when the two disagree; one that
+# skips the check has its record taken down the event path as a Pod alert with
+# reason `Unknown`.
 INJECT_KIND_STALL = "controller-stall"
 
 # What `GET /healthz` advertises, so a producer can find out whether this daemon
@@ -558,12 +559,14 @@ STALL_LEDGER_OBJECT_KIND = "controllers"
 STALL_UNKNOWN_FIELD = "unknown"
 STALL_HEURISTICS = frozenset({"generation-lag", "stale-condition", "repeating-warnings", "dangling-reference"})
 # stall_report.format_duration's shapes: `<1m`, `14m`, `3h07m`, `2d4h`.
-_STALL_DURATION_RE = re.compile(r"^(?:<1m|\d+m|\d+h\d{2}m|\d+d\d+h)$")
+_STALL_DURATION_RE = re.compile(r"<1m|\d+m|\d+h\d{2}m|\d+d\d+h")
 
 # A Cluster Agent profile name as cluster_agent_profile.profile_name forms it.
 # An assignee that does not match is dropped and the query falls back to
-# naming the cluster, as the event and drift queries do.
-_STALL_ASSIGNEE_RE = re.compile(r"^cluster-[a-z0-9-]+$")
+# naming the cluster, as the event and drift queries do. Both patterns are
+# applied with fullmatch: `$` also matches before a final newline, which is the
+# character the defang layer exists to keep out of the card.
+_STALL_ASSIGNEE_RE = re.compile(r"cluster-[a-z0-9-]+")
 
 # Rows a stall card lists before counting the rest, object names an alert or
 # title spells out, and the title's length: the bounds the stall watch applied
@@ -1905,8 +1908,8 @@ def _stall_rows(payload: Dict[str, Any]) -> list[Dict[str, str]]:
         stalled_for = item.get("stalled_for")
         rows.append({
             "object": obj,
-            "heuristic": heuristic if heuristic in STALL_HEURISTICS else STALL_UNKNOWN_FIELD,
-            "stalled_for": stalled_for if isinstance(stalled_for, str) and _STALL_DURATION_RE.match(stalled_for) else STALL_UNKNOWN_FIELD,
+            "heuristic": heuristic if isinstance(heuristic, str) and heuristic in STALL_HEURISTICS else STALL_UNKNOWN_FIELD,
+            "stalled_for": stalled_for if isinstance(stalled_for, str) and _STALL_DURATION_RE.fullmatch(stalled_for) else STALL_UNKNOWN_FIELD,
         })
     return rows
 
@@ -2046,7 +2049,7 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
     """
     cluster = _stall_field(payload, "cluster")
     assignee = payload.get("assignee")
-    if isinstance(assignee, str) and _STALL_ASSIGNEE_RE.match(assignee):
+    if isinstance(assignee, str) and _STALL_ASSIGNEE_RE.fullmatch(assignee):
         assignee_line = (
             f"- `assignee`: `{assignee}`, the Cluster Agent the stall watch resolved for **{cluster}**. If your "
             f"`[SPECIALIST AGENTS AVAILABLE NOW]` block does not list it, call `list_agents` once to refresh.\n"

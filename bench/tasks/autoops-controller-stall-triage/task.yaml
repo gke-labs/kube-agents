@@ -22,11 +22,15 @@
 #
 # The install's own stall-watch cron sweeps this namespace too, and a tick that
 # lands after the plant passes the ten-minute threshold files a second card for
-# it. The checks hold either way. On a build with the inject path, that card is
-# a stall triage like the one the stack asked for. On one without it, the
-# record the stack posts becomes an event triage, which carries no
-# `stalled resources:` line, and the watch's own card carries no `What to do`
-# section, so whichever card the agent reads, an objective reds.
+# it. The prompt's "title starts with 'Triage'" is what keeps that card from
+# deciding the run. A watch that files its own card titles it "Stalled
+# controllers in ...", so the agent passes over it; that card answers in the
+# skill's own format, with no `What to do` section, and would red a build whose
+# daemon is correct. A watch that raises an alert instead gets a card titled
+# "Triage stalled controllers in ...", a stall triage like the one the stack
+# asked for. On a daemon without the `controller-stall` kind, the stack's record
+# becomes an event triage titled "Triage <namespace>/Pod/ ...", which carries no
+# `stalled resources:` line and reds that objective.
 #
 # Isolation class: namespace-scoped. Eligible tier: nightly.
 ---
@@ -81,7 +85,7 @@ prompt: |
      and 'blocked'. Do not call kanban_list without a status filter -- it
      returns the oldest tasks first and stops at a page, so the newest card is
      not in the default response. The card you want is the most recent one
-     concerning that namespace.
+     concerning that namespace whose title starts with 'Triage'.
   2. If it has not finished, wait for it. Call kanban_show on its id, and keep
      re-checking until its status is 'done', 'blocked' or 'archived'. This
      normally takes several minutes; keep waiting rather than answering with a
