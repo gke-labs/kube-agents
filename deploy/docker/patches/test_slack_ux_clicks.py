@@ -88,6 +88,9 @@ class SlackAdapter:
     def _client_for(self, chat_id, metadata):
         return None
 
+    def _is_ignored_channel(self, channel_id):
+        return False
+
     async def _handle_slack_message(self, event, payload=None):
         return bool(event.get("_hermes_force_process"))
 
@@ -201,6 +204,11 @@ class ApplierTest(unittest.TestCase):
             ("def _client_for(self, chat_id, metadata)", "def _client_for(self, chat_id)",
              "_client_for no longer accepts"),
             ("    def _client_for(", "    async def _client_for(", "_client_for is now async"),
+            ("def _is_ignored_channel(", "def _ignored(", "_is_ignored_channel"),
+            ("def _is_ignored_channel(self, channel_id)", "def _is_ignored_channel(self)",
+             "_is_ignored_channel no longer accepts"),
+            ("    def _is_ignored_channel(", "    async def _is_ignored_channel(",
+             "_is_ignored_channel is now async"),
             ("async def _handle_slack_message(", "def _handle_slack_message(",
              "_handle_slack_message is no longer async"),
             ("def _get_client(self, chat_id, team_id=None)", "def _get_client(self, chat_id, team_id=None, /)",
@@ -296,13 +304,17 @@ class _Client:
 
 
 class _Adapter:
-    def __init__(self, authorized=True, fail=(), allowed_channels=(), disable_dms=False):
+    def __init__(self, authorized=True, fail=(), allowed_channels=(), disable_dms=False, ignored=()):
         self.authorized = authorized
+        self.ignored = set(ignored)
         self.log = []
         self.acks = 0
         self.fail = fail
         self.allowed_channels = set(allowed_channels)
         self.disable_dms = disable_dms
+
+    def _is_ignored_channel(self, channel_id):
+        return channel_id in self.ignored
 
     def _slack_allowed_channels(self):
         return self.allowed_channels
@@ -460,6 +472,7 @@ class RuntimeTest(unittest.TestCase):
         cases = {
             "outside allowed_channels": _Adapter(allowed_channels={"C2"}),
             "dm with dms disabled": _Adapter(disable_dms=True),
+            "an ignored channel": _Adapter(ignored={CHANNEL}),
         }
         for name, adapter in cases.items():
             with self.subTest(name):

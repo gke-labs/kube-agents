@@ -11,8 +11,8 @@ Two things are checked:
 1. The adapter. ``SlackAdapter`` still has the members the runtime calls:
    ``_begin_interaction(ack, body, action, kind)`` returning the eight fields
    :func:`slack_ux_clicks.answer` unpacks, in that order, plus
-   ``_slack_allowed_channels``, ``_slack_disable_dms``, ``_get_client`` and
-   ``_handle_slack_message``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
+   ``_is_ignored_channel``, ``_slack_allowed_channels``, ``_slack_disable_dms``,
+   ``_get_client`` and ``_handle_slack_message``, plus ``_client_for`` for ``slack_ux_incident``, and the adapter file still reads the
    ``_hermes_force_process`` marker the click's message carries.
    ``_register_bolt_handlers`` still wires the plugin
    action handlers, and the flag guard calling
@@ -53,8 +53,8 @@ ADAPTER_CLASS = "SlackAdapter"
 #: ``slack_ux_incident``'s alert edit calls; the stubs supply them, so only this
 #: check ties them to upstream.
 RUNTIME_MEMBERS = (
-    "_begin_interaction", "_slack_allowed_channels", "_slack_disable_dms", "_get_client",
-    "_handle_slack_message", "_client_for",
+    "_begin_interaction", "_is_ignored_channel", "_slack_allowed_channels", "_slack_disable_dms",
+    "_get_client", "_handle_slack_message", "_client_for",
 )
 #: The members the runtime awaits; every other one it calls plainly.
 ASYNC_MEMBERS = ("_begin_interaction", "_handle_slack_message")
@@ -67,6 +67,7 @@ BEGIN_POSITIONAL = ("self", "ack", "body", "action", "kind")
 BEGIN_RETURNS = ("team_id", "action_id", "value", "message", "msg_ts", "channel_id", "user_name", "user_id")
 #: How the runtime calls the other members: positional arguments after ``self``, and keywords.
 CALL_SHAPES = {
+    "_is_ignored_channel": ((1, ()),),
     "_slack_allowed_channels": ((0, ()),),
     "_slack_disable_dms": ((0, ()),),
     "_get_client": ((1, ("team_id",)),),
@@ -305,6 +306,9 @@ class _StubAdapter:
             return None
         message = body["message"]
         return (TEAM, action["action_id"], action["value"], message, message["ts"], CHANNEL, "someone", USER)
+
+    def _is_ignored_channel(self, channel_id):
+        return False
 
     def _slack_allowed_channels(self):
         return set()

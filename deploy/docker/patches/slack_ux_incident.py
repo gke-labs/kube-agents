@@ -19,7 +19,7 @@ the renderer the threaded reply goes through when the adapter sends rich
 blocks. The message's ``text`` is the headline, the choices and then the
 whole report, because the adapter reads a thread back from ``text`` and
 top-level blocks, never a fold's. That holds on a cold read of the thread
-only: a session already open on it fetches just the newer replies, which
+only: a session already open on it fetches at most the newer replies, which
 skips the edited alert, and a typed ``apply`` there finds the report through
 the ``incidents`` row below.
 
